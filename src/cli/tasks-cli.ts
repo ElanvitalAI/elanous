@@ -23,13 +23,16 @@ import { mapInventory, renderMapReduceTable, type MapInventory, type MapItem, ty
 import type { MapRecipe, MapRunRow } from '../task-agent/map-run-ledger.js';
 import { createMapHostLauncher, type HostMapItem } from '../task-agent/map-host-adapter.js';
 import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
+import type { PluginWizardDeps } from '../graph-wizard/mission-compose.js';
+import type { TaskPluginWizardHostPorts } from './task-plugin-wizard-host.js';
 import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import type { LaunchRequestDoor } from '../execution-loop/launch-gate.js';
 import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
 import type { TierSizedDecompose } from '../task-agent/tier-split.js';
 import type { AdvanceMissionResult, MissionDecompose, PieceEvidenceReader } from '../task-agent/mission.js';
 import { formatSevenVerbLive, formatTaskAgentCover, measureSevenVerbLive, measureTaskAgentCover, type CoverRow, type ImplementCardRunBinding, type ImplementRunMergeEvent, type SevenVerbLive, type TaskAgentCoverInput } from '../task-agent/cover.js';
-import { measureRepairOutcomes } from '../task-agent/repair-outcomes.js';
+import { measureRepairOutcomes, measureRepairTierModels } from '../task-agent/repair-outcomes.js';
 import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { resolveLogTargets } from './logs-cli.js';
 import { createTasksCliContext, handleError, NEXUS_DOWN, NexusUnavailable, registerTaskAgentSink, registerTaskListCommand, registerTaskShowCommand, registerTasksRoot, request, responseJson, TASK_AGENT_SINK_SURFACE } from './tasks-read-cli.js';
@@ -66,6 +69,18 @@ export interface TasksCliDeps {
   taskStatePath?: string;
   /** 조합 선택 시험에서만 그래프 저장소 루트를 바꾼다. */
   taskCompositionRoot?: string;
+  /** Isolated task hand launch-door injection; production uses the hand's instance-scoped default. */
+  taskLaunchRequestDoor?: LaunchRequestDoor;
+  /** Optional task-hand smart-plugin host bridge; production defaults use shared question/outbound and side-tab adapters. */
+  taskPluginWizardDeps?: PluginWizardDeps;
+  /** Test-only fake host ports; only consumed by `tasks hand --missing-tool`. */
+  taskPluginWizardHostPorts?: TaskPluginWizardHostPorts;
+  /** Graph-composition LLM seam for isolated `tasks hand --missing-tool` tests. */
+  taskComposeCallLLM?: import('../graph-wizard/generate.js').GraphWizardDeps['callLLM'];
+  /** Isolated plugin install root for the task-hand wizard. */
+  taskPluginInstallRoot?: string;
+  /** Isolated plugin marketplace directory for a task-hand wizard invocation. */
+  taskPluginMarketDir?: string;
   /** COORD-ENTRANCE-FOLD test seam; production uses the invoking repository root. */
   coordinatorShadowRoot?: string;
   /** Deterministic task-hand time in isolated tests. */
@@ -1973,9 +1988,20 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         if (!existsSync(path)) throw new Error('TA 카드 원장 없음 — 수리 0건으로 판정 불가');
         const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(path).tasks;
         if (!tasks || typeof tasks !== 'object' || Array.isArray(tasks)) throw new Error('TA 카드 원장 tasks 없음 — 수리 0건으로 판정 불가');
-        const report = measureRepairOutcomes(Object.values(tasks), { since, until });
-        if (opts.json) out(JSON.stringify(report));
-        else out(`수리 결과(카드 원장) ${report.applied} 적용 · ${report.failed} 실패 · ${report.unconfirmed} 미확정 · 카드 ${report.cards} · 결과 ${report.results} · runId 결손 ${report.missingRunId} · 미지 효과 ${report.unknownEffect} (기간 내 최신 결과 · 판단 로그 아님)`);
+        const cards = Object.values(tasks);
+        const window = { since, until };
+        const report = measureRepairOutcomes(cards, window);
+        const tierModel = measureRepairTierModels(cards, window);
+        if (opts.json) out(JSON.stringify({ ...report,
+          window: { since: new Date(since).toISOString(), until: new Date(until).toISOString() }, tierModel,
+        }));
+        else {
+          out(`수리 결과(카드 원장) ${report.applied} 적용 · ${report.failed} 실패 · ${report.unconfirmed} 미확정 · 카드 ${report.cards} · 결과 ${report.results} · runId 결손 ${report.missingRunId} · 미지 효과 ${report.unknownEffect} (기간 내 최신 결과 · 판단 로그 아님)`);
+          out(`수리 호출 창 ${new Date(since).toISOString()} ≤ at < ${new Date(until).toISOString()} · 시도 ${tierModel.samples} · ${tierModel.measured ? '측정' : '미측정'}`);
+          for (const cell of tierModel.byTierModel) out(`${cell.tier}\t${cell.model}\t${cell.measured ? cell.n : '미측정'}`);
+          out(`Sol 호출 증거 ${tierModel.solCalls.length} · 호출 여부 미측정 ${tierModel.solCallUnmeasured.length}`);
+          for (const call of tierModel.solCalls) out(`Sol\t${call.tier}\t${call.card}\t${call.runId}\t${call.at}`);
+        }
       } catch (error) { out(error instanceof Error ? error.message : '수리 결과 원장 읽기 실패'); process.exitCode = 1; }
     });
 
@@ -2147,6 +2173,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--goal <id>', '보드 소속 목표 id (task board)')
     .option('--milestone <id>', '보드 소속 이정표 id (task board)')
     .option('--target <dir>', '프로젝트 대상 디렉터리(있어야 한다 · 상대 경로는 절대로 · git 이 아니면 --completion 이 code-pr 밖이어야 한다) — 발사기를 이 디렉터리에서 띄운다')
+    .option('--missing-tool <capability>', '능동 비서가 감지한 빠진 도구 — 마켓/스마트 플러그인 마법사를 같은 task-hand 조합 경로에서 실행')
+    .option('--plugin-market-dir <dir>', '스마트 플러그인 마법사가 읽을 신뢰 마켓 인덱스 디렉터리')
     .option('--live', '실제로 발사한다(기본은 shadow — 명령만 출력)')
     .option('--ta-land', 'TA-LIVE-LAND-2 — 호스트는 재게이트만 하고 병합은 TASK-AGENT 의 propose-land(`pr land --expected-head`)에 맡긴다 · 카드 taLand ⊕ 발사 env ELANOUS_TA_LAND=1 · taskAgent.liveMoves 에 propose-land 가 없으면 종전대로 호스트가 병합')
     .option('--child-llm <provider/model>', 'TASKS-HAND-CHILD-LLM — 구현 자식 LLM(예: grok/grok-4.7) → 발사 인자 --child-llm-provider <provider> --child-llm-model <model> · «첫» `/` 에서만 가른다(모델 id 의 `/` 는 보존) · openrouter 는 모델 id 가 openrouter/ 접두를 포함하므로 전체를 모델로(openrouter/z-ai/glm-5.3 → --child-llm-model openrouter/z-ai/glm-5.3) · 카드 childLlm · 안 주면 명령·카드 무변경')
@@ -2156,7 +2184,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--tag <k=v>', 'RUN-IDENTITY-TAGS — 출생 신분을 덮는다(class|care|rights|protect 의 k=v · 반복: --tag class=gate --tag protect=true) — 카드 원장 identity 에 남는다', (value: string, previous: string[] | undefined) => [...(previous ?? []), value])
     .option('--draft-claim <pr>', 'DRAFT-CLAIM-AUTO-2-FU — PR 를 관측(gh pr view)해 draftClaim 을 조립해 넘긴다 · 관측한 PR 머리에서 `elanous self review <pr> --json` 로 손 수확을 먼저 확정한다(확정 못 하면 claim 문면을 만들지 않는다) · claim 문면을 실제 PR 댓글로 게시(gh pr comment)한다 · 같은 PR 의 살아 있는 claim 기록(카드 draftClaim)이 있으면 거부한다')
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; missingTool?: string; pluginMarketDir?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
       const suppliedText = text !== undefined;
       /** RUN-IDENTITY-TAGS — 칸을 찾은 판(출생 신분이 그 판의 칸 우선순위를 읽는다 · 개발 판 밖 칸도). */
       let birthBoardVersion: string | undefined;
@@ -2291,13 +2319,17 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           if (!repo) throw new Error(`현재 worktree origin이 GitHub 저장소가 아니다: ${origin}`);
           const run = deps.handOpenPrRun ?? ((command: string, args: string[]) => spawnSync(command, args,
             { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000, maxBuffer: 16 * 1024 * 1024 }));
-          const listed = run('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '500', '--json', 'number,body']);
+          if (!/^[A-Z][A-Z0-9-]{2,}$/.test(opts.checklist)) throw new Error(`체크리스트 칸 ID 형식이 잘못됐다 — 구현 발사 0: ${opts.checklist}`);
+          const search = `in:body "${opts.checklist}"`;
+          const searchLimit = 1000;
+          const listed = run('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--search', search,
+            '--limit', String(searchLimit), '--json', 'number,body']);
           if (listed.status !== 0) throw new Error(`같은 칸 OPEN PR 조회 실패 — 구현 발사 0: ${opts.checklist}`);
           let rows: unknown;
           try { rows = JSON.parse(listed.stdout); } catch { throw new Error(`OPEN PR 목록 해석 실패 — 구현 발사 0: ${opts.checklist}`); }
-          if (!Array.isArray(rows) || rows.length >= 500 || !rows.every((row) =>
+          if (!Array.isArray(rows) || rows.length >= searchLimit || !rows.every((row) =>
             Number.isSafeInteger(doctorObject(row)?.number) && typeof doctorObject(row)?.body === 'string')) {
-            throw new Error(`OPEN PR 목록 불완전 — 구현 발사 0: ${opts.checklist}`);
+            throw new Error(`칸 ID 검색 결과 불완전 또는 ${searchLimit}건 상한 — 구현 발사 0: ${opts.checklist}`);
           }
           const openPrs = rows.filter((row) => cellIdFromBody(doctorObject(row)!.body as string) === opts.checklist)
             .map((row) => doctorObject(row)!.number as number);
@@ -2338,6 +2370,9 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
             return;
           }
         }
+        const pluginWizardDeps = opts.missingTool
+          ? deps.taskPluginWizardDeps ?? (await import('./task-plugin-wizard-host.js')).createTaskPluginWizardHostDeps(deps.taskPluginWizardHostPorts)
+          : undefined;
         const handOpts = {
           text: resolved.text,
           ...(resolved.kind === 'work-order' ? { workOrder: resolved.order } : {}),
@@ -2357,9 +2392,18 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(opts.roleLlm?.length ? { parentRoleLlm: opts.roleLlm } : {}),
           ...(opts.tier !== undefined ? { tier: opts.tier } : {}),
           ...(opts.tag !== undefined ? { tags: opts.tag } : {}),
+          ...(opts.missingTool && deps.taskComposeCallLLM ? { composeCallLLM: deps.taskComposeCallLLM } : {}),
           ...(birthBoardVersion !== undefined ? { checklistVersion: birthBoardVersion } : {}),
           ...(deps.taskStatePath ? { statePath: deps.taskStatePath } : {}),
           ...(deps.taskCompositionRoot ? { compositionRoot: deps.taskCompositionRoot } : {}),
+          ...(deps.taskLaunchRequestDoor ? { launchRequestDoor: deps.taskLaunchRequestDoor } : {}),
+          ...(opts.missingTool ? { pluginWizard: {
+            missing: opts.missingTool,
+            root: deps.taskPluginInstallRoot ?? effectiveInstanceRoot(),
+            workspace: opts.target ? resolve(opts.target) : process.cwd(),
+            ...(opts.pluginMarketDir ?? deps.taskPluginMarketDir
+              ? { marketDir: resolve(opts.pluginMarketDir ?? deps.taskPluginMarketDir!) } : {}),
+          }, ...(pluginWizardDeps ? { pluginWizardDeps } : {}) } : {}),
           launcher: deps.taskLauncher ?? defaultTaskLauncher,
         };
         // DRAFT-CLAIM-AUTO-2-FU — 생산 배선: `--draft-claim <pr>` 로 관측·게시·수확 리뷰 포트를 끼워 draftClaim(⊕ 손 수확)을
@@ -2405,7 +2449,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           if (result.cwd) out(`(cwd: ${result.cwd})`);
           if (result.card.taLand) out('(ta-land — 발사 env ELANOUS_TA_LAND=1 · 원격 또는 로컬 부모 · taskAgent.liveMoves 에 propose-land 가 있으면 병합은 TASK-AGENT 몫, 없으면 종전대로 호스트 병합)');
           if (!result.launched && result.card.alreadyDoneCandidate) out('(main 증거 통과 — 발사 0 · green 후보만 기록, 주인 판정 대기)');
-          else if (!result.launched) out('(shadow — 띄우지 않았다 · 띄우려면 --live)');
+          else if (!result.launched && result.mode === 'shadow') out('(shadow — 띄우지 않았다 · 띄우려면 --live)');
+          else if (!result.launched) out(`(발사되지 않음 — ${result.reason ?? result.move.reason})`);
         }
       } catch (error) {
         out(error instanceof Error ? error.message : '과제 넘기기 실패');

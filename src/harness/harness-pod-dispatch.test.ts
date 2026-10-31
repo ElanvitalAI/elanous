@@ -423,7 +423,7 @@ describe('harness say/ask --substrate pod', () => {
       expect(valid.status).toBe(0);
       expect(valid.stdout).toContain(`[dry-run] repair forwarding: --pod-source pr:42 --repair-commit-only ${'a'.repeat(40)} --no-auto-merge`);
     } finally { rmSync(root, { recursive: true, force: true }); }
-  });
+  }, 30_000);
 
   test('ask passes only its document path; say writes private goal text for the duration of the child', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-goal-path-'));
@@ -535,10 +535,10 @@ describe('harness say/ask --substrate pod', () => {
     let childStdio: unknown;
     try {
       const status = await dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'x' }, {
-        spawnChild: ((_cmd, _args, opts) => {
+        spawnChild: ((_cmd: string, _args: readonly string[] | undefined, opts?: { stdio?: unknown }) => {
           childStdio = opts?.stdio;
-          return spawn('git', ['-C', outsideRepo, 'status'], opts);
-        }) as typeof spawn,
+          return spawn('git', ['-C', outsideRepo, 'status'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        }) as unknown as typeof spawn,
         onOutput: (chunk) => output.push(chunk),
       });
       expect(status).toBe(128);

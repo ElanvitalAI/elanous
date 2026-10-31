@@ -1,4 +1,4 @@
-import { expect, setDefaultTimeout, test } from 'bun:test';
+import { afterAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,12 +9,18 @@ import { podGitPushGuardScript } from '../task-orchestrator/surfaces/self-implem
 import { debug } from '../debug/log.js';
 
 const head40 = /^[0-9a-f]{40}$/;
+const originalTaskCardId = process.env.ELANOUS_TASK_CARD_ID;
+delete process.env.ELANOUS_TASK_CARD_ID;
+afterAll(() => {
+  if (originalTaskCardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+  else process.env.ELANOUS_TASK_CARD_ID = originalTaskCardId;
+});
 setDefaultTimeout(30_000);
 
 function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = false, moveAtPush = false,
   raceNewBranch = false,
   existingNewBranch = false, runId?: string,
-  falls: { tornUploadReport?: boolean; transientDeleteOnce?: boolean; refusedUpload?: boolean } = {}) {
+  falls: { tornUploadReport?: boolean; transientDeleteOnce?: boolean; refusedUpload?: boolean; createRefResponseLost?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'same-cell-pr-'));
   const bare = join(root, 'origin.git');
   const work = join(root, 'work');
@@ -53,6 +59,9 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
   const calls: string[][] = [];
   let remoteReads = 0;
   let failedDeletes = 0;
+  let createRefReportedLost = false;
+  let draftCreated = false;
+  const retryDraftUrl = 'https://github.com/o/r/pull/8';
   const isScratchUpload = (args: readonly string[]) => args.includes('push')
     && args.some(arg => /^HEAD:refs\/heads\/self-impl\/pr-create-r/.test(arg));
   const isScratchDelete = (args: readonly string[]) => args.includes('push')
@@ -89,14 +98,28 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
       if (!ref || !sha) return { ok: false, out: '', err: 'bad ref request' };
       if (raceNewBranch) git('--git-dir', bare, 'update-ref', ref, mainHead);
       const created = spawnSync('git', ['--git-dir', bare, 'update-ref', ref, sha, '0'.repeat(40)], { encoding: 'utf8' });
+      if (created.status === 0 && falls.createRefResponseLost && !createRefReportedLost) {
+        createRefReportedLost = true;
+        return { ok: false, out: '', err: 'connection closed after create-ref succeeded' };
+      }
       return { ok: created.status === 0, out: '', err: created.stderr.trim() };
     }
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list')
+      return { ok: true, out: JSON.stringify(draftCreated ? [{ url: retryDraftUrl }] : []) };
     if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      if (args.includes(retryDraftUrl)) {
+        const head = git('--git-dir', bare, 'rev-parse', 'refs/heads/new-branch');
+        return { ok: true, out: JSON.stringify({ state: 'OPEN', isDraft: true, headRefOid: head,
+          headRefName: 'new-branch', body, url: retryDraftUrl }) };
+      }
       return { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: oldHead,
         headRefName: 'old-branch', body: oldBody,
         isCrossRepository: false, isDraft: true, labels: [{ name: 'elanous:running' }], url }) };
     }
-    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'create') return { ok: true, out: 'https://github.com/o/r/pull/8' };
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'create') {
+      draftCreated = true;
+      return { ok: true, out: retryDraftUrl };
+    }
     if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'edit') return { ok: true, out: '' };
     throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
   };
@@ -114,6 +137,19 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
     title: 'new work', body, commitMessage: 'new work', base: 'main', ...(runId ? { runId } : {}) });
   return { root, work, oldHead, mainHead, calls, deliver, inWork, remoteHeads, scratchRefs, url };
 }
+
+test('SAME-CELL-RETRY-IDEMPOTENCY: create-ref response loss then same-attempt retry creates one draft and reuses it', () => {
+  const f = fixture(true, false, false, false, false, false, 'run-a1b2c3d4-1111-2222-3333-444444444444',
+    { createRefResponseLost: true });
+  try {
+    expect(f.deliver()).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('connection closed after create-ref succeeded') });
+    expect(f.deliver()).toEqual({ ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7 });
+    expect(f.deliver()).toEqual({ ok: true, url: 'https://github.com/o/r/pull/8', reused: true });
+    expect(f.calls.filter(call => call[0] === 'gh' && call[1] === 'api' && call.includes('POST'))).toHaveLength(1);
+    expect(f.calls.filter(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toHaveLength(1);
+    expect(f.remoteHeads()).toEqual(['refs/heads/main', 'refs/heads/new-branch', 'refs/heads/old-branch']);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
 
 test('real git merges the old PR head and advances its branch without force or a second PR', () => {
   const f = fixture(false);

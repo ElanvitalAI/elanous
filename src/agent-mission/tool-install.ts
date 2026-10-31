@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -33,8 +33,23 @@ export type AgentCliDetection = {
   agent: AgentCli;
   /** null means the executable/version probe could not establish installation state. */
   installed: boolean | null;
+  /** Sanitized semantic version only; raw CLI output is never exposed. */
+  version?: string;
   executable: 'present' | 'missing' | 'unknown';
   login: 'ready' | 'needed' | 'api-key' | 'unknown';
+  message: string;
+};
+
+/** The supported, non-privileged installer for each visible coding CLI. */
+export const AGENT_CLI_INSTALLERS: Record<AgentCli, { command: string; args: string[]; display: string }> = {
+  codex: { command: 'npm', args: ['install', '-g', '@openai/codex@latest'], display: 'npm install -g @openai/codex@latest' },
+  claude: { command: 'npm', args: ['install', '-g', '@anthropic-ai/claude-code'], display: 'npm install -g @anthropic-ai/claude-code' },
+};
+
+export type AgentCliPreparation = {
+  ready: boolean;
+  detection: AgentCliDetection;
+  installation: 'not-needed' | 'declined' | 'installed' | 'failed';
   message: string;
 };
 
@@ -42,11 +57,107 @@ type AgentCliRunner = (command: string, args: string[], options: {
   encoding: 'utf8'; timeout: number; env: Record<string, string>;
 }) => ReturnType<typeof spawnSync>;
 
-function verifiedAgentVersion(agent: AgentCli, raw: string): boolean {
+export interface AgentCliPreparationDeps {
+  env?: Record<string, string | undefined>;
+  detect?: (agent: AgentCli, options: { env: Record<string, string | undefined>; runCli?: AgentCliRunner }) => AgentCliDetection;
+  runCli?: AgentCliRunner;
+  /** Must be an explicit user confirmation; no installer runs when it is absent or declines. */
+  confirmInstall?: (prompt: string) => boolean | Promise<boolean>;
+  /** Injection seam for tests. Production runs npm only after confirmInstall returns true. */
+  install?: (command: string, args: string[], options: { env: Record<string, string>; timeoutMs: number }) => { status: number | null; error?: { code?: string } | null } | Promise<{ status: number | null; error?: { code?: string } | null }>;
+  onStatus?: (line: string) => void;
+}
+
+function runAgentCliInstaller(command: string, args: string[], options: { env: Record<string, string>; timeoutMs: number }): Promise<{ status: number | null; error?: { code?: string } | null }> {
+  return new Promise((resolve) => {
+    const spawnInstaller = spawn as unknown as (file: string, args: string[], options: { env: Record<string, string>; stdio: 'ignore'; windowsHide: true }) => ChildProcess;
+    const child = spawnInstaller(command, args, { env: options.env, stdio: 'ignore', windowsHide: true });
+    let settled = false;
+    let timedOut = false;
+    let forceKill: ReturnType<typeof setTimeout> | undefined;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      forceKill = setTimeout(() => child.kill('SIGKILL'), 2_000);
+    }, options.timeoutMs);
+    const finish = (result: { status: number | null; error?: { code?: string } | null }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      resolve(result);
+    };
+    child.once('error', (error: Error & { code?: string }) => finish({ status: null, error }));
+    child.once('close', (status: number | null) => finish(timedOut
+      ? { status: null, error: { code: 'ETIMEDOUT' } }
+      : { status }));
+  });
+}
+
+function agentCliNotReadyMessage(detection: AgentCliDetection): string {
+  if (detection.installed === false) return `${detection.agent}: 설치되지 않음`;
+  if (detection.installed === null) return `${detection.agent}: 설치 상태 확인 불가`;
+  if (detection.login === 'api-key') return `${detection.agent}: API 키 인증은 감지했지만 구독 로그인이 필요합니다. ${detection.agent} login을 실행해 주세요`;
+  if (detection.login === 'needed') return `${detection.agent}: 로그인이 필요합니다. ${detection.agent} login을 실행해 주세요`;
+  return `${detection.agent}: 로그인 상태를 확인할 수 없습니다`;
+}
+
+/** Detect first, ask once before an official install, then re-detect before the caller launches. */
+export async function prepareAgentCli(
+  agent: AgentCli,
+  deps: AgentCliPreparationDeps = {},
+): Promise<AgentCliPreparation> {
+  const env = deps.env ?? process.env;
+  const detect = deps.detect ?? detectAgentCli;
+  const detectOptions = { env, ...(deps.runCli ? { runCli: deps.runCli } : {}) };
+  const installer = AGENT_CLI_INSTALLERS[agent];
+  let detection = detect(agent, detectOptions);
+  deps.onStatus?.(detection.message);
+  if (detection.installed === true && detection.login === 'ready') {
+    return { ready: true, detection, installation: 'not-needed', message: detection.message };
+  }
+  if (detection.installed !== false) {
+    return { ready: false, detection, installation: 'not-needed', message: agentCliNotReadyMessage(detection) };
+  }
+  if (!deps.confirmInstall || !await deps.confirmInstall(`설치할까요? ${installer.display}`)) {
+    return { ready: false, detection, installation: 'declined', message: `${agent}: 설치를 건너뛰었습니다` };
+  }
+
+  const install = deps.install ?? runAgentCliInstaller;
+  let result: { status: number | null; error?: { code?: string } | null };
+  try {
+    const backend = agent === 'codex' ? codexBackend : claudeBackend;
+    result = await install(installer.command, [...installer.args], {
+      env: resolveBackendSpawn(backend, env).env,
+      timeoutMs: 300_000,
+    });
+  } catch {
+    return { ready: false, detection, installation: 'failed', message: `${agent}: 설치 명령을 실행하지 못했습니다` };
+  }
+  if (result.status !== 0) {
+    const detail = result.error?.code === 'ENOENT' ? 'npm을 찾을 수 없습니다' : '설치 명령이 성공하지 않았습니다';
+    return { ready: false, detection, installation: 'failed', message: `${agent}: ${detail}` };
+  }
+
+  detection = detect(agent, detectOptions);
+  deps.onStatus?.(detection.message);
+  if (detection.installed !== true) {
+    return { ready: false, detection, installation: 'failed', message: `${agent}: 설치 뒤 버전 확인에 실패했습니다` };
+  }
+  if (detection.login !== 'ready') {
+    return { ready: false, detection, installation: 'installed', message: agentCliNotReadyMessage(detection) };
+  }
+  return { ready: true, detection, installation: 'installed', message: detection.message };
+}
+
+function agentVersion(agent: AgentCli, raw: string): { version?: string } | undefined {
   const prefix = agent === 'claude' ? /^(?:Claude(?: Code)?\s+)?v?/i : /^(?:Codex(?:-CLI)?\s+)?v?/i;
   const versioned = raw.replace(prefix, '');
-  // Probe output is untrusted: validate its shape but never return any part of it.
-  return /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?(?: \(Claude Code\))?$/i.test(versioned);
+  // Probe output is untrusted: validate the semver shape but expose only a bounded numeric core.
+  const match = /^(\d+\.\d+\.\d+)(?:[-+][A-Za-z0-9.-]{1,40})?(?: \(Claude Code\))?$/i.exec(versioned);
+  if (!match) return undefined;
+  const parts = match[1]!.split('.');
+  return parts.every((part) => part.length <= 6) ? { version: match[1]! } : undefined;
 }
 
 function agentExecutableExists(command: string, env: Record<string, string>): boolean {
@@ -79,8 +190,8 @@ export function detectAgentCli(
     return { agent, installed: present ? null : false, executable: present ? 'unknown' : 'missing', login: 'unknown', message: present ? `${agent}: 실행 파일을 실행할 수 없어 상태 확인 불가` : `${agent}: 설치되지 않음` };
   }
   const rawVersion = `${versionResult.stdout ?? ''}\n${versionResult.stderr ?? ''}`.trim().split(/\r?\n/, 1)[0] ?? '';
-  const versionVerified = versionResult.status === 0 && verifiedAgentVersion(agent, rawVersion);
-  if (!versionVerified) {
+  const verifiedVersion = versionResult.status === 0 ? agentVersion(agent, rawVersion) : undefined;
+  if (!verifiedVersion) {
     const executable = versionResult.status === null || versionResult.error ? 'unknown' : 'present';
     return {
       agent, installed: null, executable, login: 'unknown',
@@ -103,13 +214,13 @@ export function detectAgentCli(
     } catch { /* Keep authentication unknown when the probe itself fails. */ }
   }
   const message = login === 'ready'
-    ? `${agent}: 설치됨, 로그인 확인됨`
+    ? `${agent}: 설치됨${verifiedVersion.version ? ` v${verifiedVersion.version}` : ''} · 로그인 확인됨`
     : login === 'api-key'
-      ? `${agent}: API 키 로그인됨 (구독 로그인 아님)`
+      ? `${agent}: 설치됨${verifiedVersion.version ? ` v${verifiedVersion.version}` : ''} · API 키 로그인됨 (구독 로그인 아님)`
     : login === 'needed'
-      ? `${agent}: 설치됨, 로그인 필요`
-      : `${agent}: 설치됨, 로그인 상태 확인 불가`;
-  return { agent, installed: true, executable: 'present', login, message };
+      ? `${agent}: 설치됨${verifiedVersion.version ? ` v${verifiedVersion.version}` : ''} · 로그인 필요`
+      : `${agent}: 설치됨${verifiedVersion.version ? ` v${verifiedVersion.version}` : ''} · 로그인 상태 확인 불가`;
+  return { agent, installed: true, ...(verifiedVersion.version ? { version: verifiedVersion.version } : {}), executable: 'present', login, message };
 }
 
 function defaultExec(cmd: string[], opts: { stdin?: string; timeoutMs: number }): ExecResult {

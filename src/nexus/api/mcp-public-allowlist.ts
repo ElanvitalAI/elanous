@@ -14,6 +14,8 @@ export const MCP_PUBLIC_TOOLS = new Set([
   'elanous_obsidian_search',
   'agent_list',
   'agent_output',
+  'graph_compose',
+  'graph_run_status',
 ]);
 
 function catalogId(name: string): string | undefined {

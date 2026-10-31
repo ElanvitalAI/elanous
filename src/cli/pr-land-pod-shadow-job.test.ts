@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,10 +7,22 @@ import { join } from 'node:path';
 import { runPodCommand } from '../task-orchestrator/surfaces/pod-command-job.js';
 import { PodPoolScheduler, type PodPoolMember } from '../task-orchestrator/surfaces/pod-pool.js';
 import { LANDING_POD_SHADOW_HOST_TIMEOUT_MS, LANDING_POD_SHADOW_STATUS_UNREADABLE_MS, landingPodShadowScript, runLandingPodShadowJob, type LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
+import type { WarmReplayInput, WarmReplayResult } from '../task-orchestrator/surfaces/pod-warm-worker-provider.js';
 import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
 
 const head = 'a'.repeat(40);
 const main = 'b'.repeat(40);
+
+function coldWarmArtifacts(root: string, file: string, cutSha: string, attemptId: string): void {
+  const prefix = join(root, 'outbox', 'pr-land-warm', '0');
+  mkdirSync(join(root, 'outbox', 'pr-land-warm'), { recursive: true });
+  const junit = `<testsuites tests="1"><testsuite name="${file}" file="${file}" tests="1"><testcase name="works" file="${file}"/></testsuite></testsuites>`;
+  const log = `[warm-worker] file=${file}\n[warm-worker] cut=${cutSha} attempt=${attemptId}\nbun test v1.4.2\n${file}:\n(pass) works\n1 pass\n0 fail\n0 errors\nRan 1 test across 1 file.\n[warm-worker] junit-sha256=${createHash('sha256').update(junit).digest('hex')}\n`;
+  writeFileSync(`${prefix}.junit.xml`, junit);
+  writeFileSync(`${prefix}.log`, log);
+  writeFileSync(`${prefix}.json`, JSON.stringify({ commit: cutSha, attemptId, files: [file], rc: 0, jobFailed: false, jobExitCode: 0 }));
+  writeFileSync(`${prefix}.rc`, '0');
+}
 
 test('shadow Pod runs the reviewed head merged with pinned main, then both landing checks', async () => {
   let options: Record<string, unknown> | undefined;
@@ -100,6 +113,107 @@ test('failed check is measured failure; missing or wrong identity marker is unme
     runPod, readLog: () => `ELANOUS_PRLAND_SHADOW head=${main} main=${head} tsc=0 gate=0\n`,
   });
   expect(wrong).toMatchObject({ measured: false, ok: false });
+});
+
+test('land warm canary compares the same per-file cold JUnit set and records only a real warm lease', async () => {
+  const artifactsDir = mkdtempSync(join(tmpdir(), 'land-warm-shadow-'));
+  const file = 'src/cli/pr-land-heavy-remote.test.ts';
+  let requestInput: WarmReplayInput | undefined;
+  let finalized = 0;
+  const requestWarm = async (input: WarmReplayInput): Promise<WarmReplayResult> => {
+    requestInput = input;
+    const command = { ...input, leaseId: 'real-lease-77', generation: 8, workerId: 'worker-77',
+      key: { context: 'pool-node-b', imageDigest: `sha256:${'c'.repeat(64)}`, lockHash: 'd'.repeat(64), architecture: 'arm64' } };
+    return { command, transport: { status: 'observed', reason: 'complete', reply: {
+      protocol: 1, runId: input.runId, attemptId: input.attemptId, cutSha: input.cutSha,
+      baselineSha: input.baselineSha, leaseId: command.leaseId, generation: command.generation,
+      workerId: command.workerId, key: command.key, envProfile: input.envProfile,
+      startedAt: Date.now() - 20, finishedAt: Date.now(), files: [{ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true }],
+    } } };
+  };
+  const verdict = await runLandingPodShadowJob({ pr: 77, repo: '/repo', host: 'node-b', head, main }, {
+    testFiles: [file], warmConfig: () => ({ land: true }), warmReplay: requestWarm,
+    finalizeWarm: async () => { finalized++; },
+    runPod: async (options) => {
+      const script = (options.command as string[])[2]!;
+      const attemptId = /"attemptId":"([0-9a-f-]{36})"/.exec(script)?.[1];
+      expect(attemptId).toBeDefined();
+      coldWarmArtifacts(artifactsDir, file, head, attemptId!);
+      return { exitCode: 0, artifactsDir, job: 'land-shadow-77' };
+    },
+    readLog: () => `ELANOUS_PRLAND_SHADOW_TSC_PLAN {"mode":"affected","roots":1,"promoted":false,"reason":null}\nELANOUS_PRLAND_SHADOW head=${head} main=${main} tsc=0 gate=0\n`,
+  });
+  try {
+    expect(requestInput?.files).toEqual([file]);
+    expect(finalized).toBe(1);
+    expect(verdict.warmEvidence).toMatchObject({ leaseId: 'real-lease-77', generation: 8,
+      expectedLockHash: 'd'.repeat(64), workerLockHash: 'd'.repeat(64), leaseValid: true, canaryPassed: true, agree: true });
+  } finally { rmSync(artifactsDir, { recursive: true, force: true }); }
+});
+
+test('cold fallback and warm result mismatch stay unmeasured or fail closed without changing cold verdict', async () => {
+  const artifactsDir = mkdtempSync(join(tmpdir(), 'land-warm-shadow-'));
+  const file = 'src/cli/pr-land-heavy-remote.test.ts';
+  let quarantined = 0;
+  const verdict = await runLandingPodShadowJob({ pr: 78, repo: '/repo', host: 'node-b', head, main }, {
+    testFiles: [file], warmConfig: () => ({ land: true }),
+    warmReplay: async (input) => {
+      const command = { ...input, leaseId: 'real-lease-78', generation: 9, workerId: 'worker-78',
+        key: { context: 'pool-node-b', imageDigest: `sha256:${'c'.repeat(64)}`, lockHash: 'e'.repeat(64), architecture: 'arm64' } };
+      return { command, transport: { status: 'observed', reason: 'complete', reply: {
+        protocol: 1, runId: input.runId, attemptId: input.attemptId, cutSha: input.cutSha,
+        baselineSha: input.baselineSha, leaseId: command.leaseId, generation: command.generation,
+        workerId: command.workerId, key: command.key, envProfile: input.envProfile,
+        startedAt: Date.now() - 20, finishedAt: Date.now(), files: [{ file, rc: 1, failureIds: [`${file} > drift`], errorIds: [], junitComplete: true }],
+      } } };
+    },
+    quarantineWarm: async () => { quarantined++; },
+    runPod: async (options) => {
+      const script = (options.command as string[])[2]!;
+      const attemptId = /"attemptId":"([0-9a-f-]{36})"/.exec(script)?.[1]!;
+      coldWarmArtifacts(artifactsDir, file, head, attemptId);
+      return { exitCode: 0, artifactsDir, job: 'land-shadow-78' };
+    },
+    readLog: () => `ELANOUS_PRLAND_SHADOW_TSC_PLAN {"mode":"affected","roots":1,"promoted":false,"reason":null}\nELANOUS_PRLAND_SHADOW head=${head} main=${main} tsc=0 gate=0\n`,
+  });
+  try {
+    expect(verdict).toMatchObject({ measured: true, ok: true, warmEvidence: { leaseValid: false, canaryPassed: false, agree: false } });
+    expect(quarantined).toBe(1);
+  } finally { rmSync(artifactsDir, { recursive: true, force: true }); }
+
+  const cold = await runLandingPodShadowJob({ pr: 79, repo: '/repo', host: 'node-c', head, main }, {
+    warmConfig: () => ({ land: true }),
+    runPod: async () => ({ exitCode: 0, artifactsDir: '/unused', job: 'cold-fallback' }),
+    readLog: () => `ELANOUS_PRLAND_SHADOW_TSC_PLAN {"mode":"affected","roots":1,"promoted":false,"reason":null}\nELANOUS_PRLAND_SHADOW head=${head} main=${main} tsc=0 gate=0\n`,
+  });
+  expect(cold).toMatchObject({ measured: true, ok: true, warmReason: 'canary-host-mismatch' });
+});
+
+test('late warm lease is quarantined after the shadow request deadline', async () => {
+  const artifactsDir = mkdtempSync(join(tmpdir(), 'land-warm-late-'));
+  const file = 'src/cli/pr-land-heavy-remote.test.ts';
+  const quarantined: string[] = [];
+  const verdict = await runLandingPodShadowJob({ pr: 80, repo: '/repo', host: 'node-b', head, main }, {
+    testFiles: [file], warmConfig: () => ({ land: true }), warmTimeoutMs: 1,
+    warmReplay: async (input) => new Promise((resolve) => setTimeout(() => {
+      const command = { ...input, leaseId: 'late-lease-80', generation: 1, workerId: 'late-worker-80',
+        key: { context: 'pool-node-b', imageDigest: `sha256:${'c'.repeat(64)}`, lockHash: 'd'.repeat(64), architecture: 'arm64' } };
+      resolve({ command, transport: { status: 'observed', reason: 'complete', reply: null } });
+    }, 20)),
+    quarantineWarm: async (_command, reason) => { quarantined.push(reason); },
+    runPod: async (options) => {
+      const script = (options.command as string[])[2]!;
+      const attemptId = /"attemptId":"([0-9a-f-]{36})"/.exec(script)?.[1]!;
+      coldWarmArtifacts(artifactsDir, file, head, attemptId);
+      return { exitCode: 0, artifactsDir, job: 'land-shadow-80' };
+    },
+    readLog: () => `ELANOUS_PRLAND_SHADOW_TSC_PLAN {"mode":"affected","roots":1,"promoted":false,"reason":null}\nELANOUS_PRLAND_SHADOW head=${head} main=${main} tsc=0 gate=0\n`,
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    expect(verdict).toMatchObject({ measured: true, ok: true, warmReason: 'warm-request-timeout' });
+    expect(quarantined).toEqual(['land-shadow-late-after-timeout']);
+  } finally { rmSync(artifactsDir, { recursive: true, force: true }); }
 });
 
 test('shadow observation retains separate Pod typecheck and gate exit codes', async () => {

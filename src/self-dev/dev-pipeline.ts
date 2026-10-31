@@ -68,6 +68,8 @@ export interface DevMissionOpts {
   resources?: 'on' | 'off';
   backendExplicit?: string;
   headless?: boolean;
+  /** Optional second user turn resumed in the same Claude/Codex CLI session. */
+  followUp?: string;
   evidence?: EvidenceMode;
   maxRounds?: number;
   commit?: boolean;
@@ -643,6 +645,7 @@ export function toAgentMissionSpec(
     evidence: m.evidence ?? { kind: 'tsc' }, // 기본 tsc(mission 옵션 미지정 시)
     agent: resolveBackend(plan.executor.backend),
     ...(m.headless === true ? { headless: true } : {}),
+    ...(m.followUp !== undefined ? { followUp: m.followUp } : {}),
     ...(m.chain ? { chain: m.chain } : {}),
     ...(m.plugin ? { plugin: m.plugin } : {}),
     ...(m.resources !== undefined ? { resources: m.resources } : {}),
@@ -670,6 +673,7 @@ export function buildAgentMissionDevSpec(o: {
   branch: string;
   base?: string;
   headless?: boolean;
+  followUp?: string;
   chain?: readonly ('codex' | 'claude' | 'elanous')[];
   plugin?: { plugin: string; marketplace: string };
   resources?: 'on' | 'off';
@@ -691,6 +695,7 @@ export function buildAgentMissionDevSpec(o: {
     mission: {
       evidence: o.evidence,
       ...(o.headless === true ? { headless: true } : {}),
+      ...(o.followUp !== undefined ? { followUp: o.followUp } : {}),
       ...(o.chain ? { chain: o.chain } : {}),
       ...(o.plugin ? { plugin: o.plugin } : {}),
       ...(o.resources !== undefined ? { resources: o.resources } : {}),

@@ -63,7 +63,7 @@ test('host executor drives the remote (non-pod) sweep: commands go to the remote
 });
 
 test('explicit pod without a pool is refused; a pod verdict names no SSH host even when gateRemote is set', () => {
-  withContext({ gateExecutor: 'pod' }, (env) => {
+  withContext({ gateExecutor: 'pod', gateImagePin: 'cut-commit' }, (env) => {
     expect(() => parseOptions(['--json'], env)).toThrow('gateExecutor pod requires gatePodPool');
   });
   withContext({ gatePodPool: 'x', gateRemote: 'node-b' }, (env) => {
@@ -90,7 +90,7 @@ test('(b) default input with gatePodPool is a pod gate exactly as before (no exe
     expect('executor' in opts).toBe(false);
     expect(gateExecutorOf(opts)).toEqual({ executor: 'pod', host: null });
   });
-  withContext({ gateExecutor: 'pod', gatePodPool: 'x' }, (env) => {
+  withContext({ gateExecutor: 'pod', gatePodPool: 'x', gateImagePin: 'cut-commit' }, (env) => {
     const opts = parseOptions(['--json'], env);
     if (opts === 'help') throw new Error('unexpected help');
     expect(opts.pod).toEqual({ pool: 'x' });
@@ -108,25 +108,36 @@ test('(c) host executor without gateRemote fails clearly; an unknown executor is
   expect(() => parseOptions(['--commit', CUT, '--version', '1.0.1', '--executor', 'host'], {})).toThrow('gateExecutor host requires gateRemote');
 });
 
-test('release run input: pod stays fail-closed on a missing pool; an explicit host executor does not need one', () => {
+test('release run input: the policy-selected Pod needs a pool and rejects host overrides', () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-host-run-input-'));
   try {
     mkdirSync(join(root, 'release', '0.10.0'), { recursive: true });
     writeFileSync(join(root, 'release', '0.10.0', 'release.json'), JSON.stringify({ version: '0.10.0', publishedAt: 'now' }));
-    expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} })).toThrow('release.loop.gatePodPool is required');
-    expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'pod' })).toThrow('release.loop.gatePodPool is required');
-    // Default (no choice) stays byte-identical: no gateExecutor key.
-    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gatePodPool: 'pool' });
-    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'host', host: 'node-b' }))
-      .toEqual({ version: '0.11.0', previousVersion: '0.10.0', gateExecutor: 'host', gateRemote: 'node-b' });
-    // --gate-host overrides release.loop.gateRemote; without it the configured host is used.
-    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool', gateRemote: 'old' } }, undefined, { executor: 'host', host: 'node-b' }))
-      .toMatchObject({ gateExecutor: 'host', gateRemote: 'node-b', gatePodPool: 'pool' });
-    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gateRemote: 'node-b' } }, undefined, { executor: 'host' })).toMatchObject({ gateExecutor: 'host', gateRemote: 'node-b' });
+    expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} })).toThrow('release.loop.gatePodPool is required by release ops policy');
+    expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'pod' })).toThrow('release.loop.gatePodPool is required by release ops policy');
+    // The release policy selects the measured Pod method and pins its image to the resolved cut.
+    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit' });
+    expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'host', host: 'node-b' }))
+      .toThrow('gate executor host conflicts with release policy pod');
+    expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool', gateRemote: 'old' } }, undefined, { executor: 'host', host: 'node-b' }))
+      .toThrow('gate executor host conflicts with release policy pod');
+    expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gateRemote: 'node-b' } })).toThrow('release.loop.gatePodPool is required by release ops policy');
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'host' })).toThrow('requires a gate host');
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } }, undefined, { host: 'node-b' })).toThrow('--gate-host requires --gate-executor host');
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } }, undefined, { executor: 'pod', host: 'node-b' })).toThrow('only to --gate-executor host');
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'host', host: 'node-b; rm -rf /' })).toThrow('invalid gate host');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release run input reads an injected operations policy path', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-policy-path-'));
+  try {
+    mkdirSync(join(root, 'release', '0.10.0'), { recursive: true });
+    writeFileSync(join(root, 'release', '0.10.0', 'release.json'), JSON.stringify({ version: '0.10.0', publishedAt: 'now' }));
+    const policyPath = join(root, 'policy.yaml');
+    writeFileSync(policyPath, `schemaVersion: 1\ngate:\n  default: { executor: host, poolSource: config.release.loop.gatePodPool, imagePin: cut-commit }\n  rehearsalDecisions: []\nknownInterferences: []\n`);
+    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gateRemote: 'node-b' }, policyPath }))
+      .toMatchObject({ gateExecutor: 'host', gateRemote: 'node-b', gateImagePin: 'cut-commit' });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -56,6 +56,7 @@ import { installHarnessCliSinkHook } from './harness-cli-sink.js';
 import { addHarnessQueue, HarnessQueueDuplicateError, harnessQueueReceiptPath, listHarnessQueue, queueSeatForCwd, reconcileHarnessQueue, removeHarnessQueue, setHarnessQueuePriority, tickHarnessQueue, type HarnessQueueDeps, type QueueItem, type QueueSeat } from './harness-queue.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
 import { decideBackpressure, readBackpressureSignals, type BackpressureReadDeps } from './dispatch-backpressure.js';
+import { DISPATCH_SHADOW_COMPARE_ENV, recordDispatchShadowCompareFromEnv } from './dispatch-shadow-compare.js';
 import { parseDoorSince, queryLaunchDoors, renderLaunchDoors, type DoorTable } from './launch-stamp.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { podChildProviderRefusal } from '../task-orchestrator/surfaces/pod-child-providers.js';
@@ -1061,6 +1062,13 @@ async function dispatchHarnessAskSay(
     const takeQueue = intakeTakesQueue(intakeLabel, intakeRoute, queueEligible);
     // 실제로 탄 간선을 전제 검사 «뒤»에 남긴다(그래프 답과 다르면 honored=false · 이유).
     recordJourneyEdge(intakeRoute, takeQueue ? 'queue' : 'launch-gate', intakeRoute.to === 'queue' && !takeQueue ? (opts.queue === false ? '--no-queue' : process.env.ELANOUS_HARNESS_QUEUE_LAUNCH ? 'queue-child' : 'no-seat') : undefined);
+    // OP TA dispatcher injects its decision snapshot. Join both policies at the product entry;
+    // this is observation only and must not change queue/direct routing.
+    recordDispatchShadowCompareFromEnv(process.env[DISPATCH_SHADOW_COMPARE_ENV], {
+      entrance: dryRunPreview.entrance,
+      productEntryAction: takeQueue ? 'queue' : 'launch-gate',
+      productEntryReason: takeQueue ? 'graph-intake-queue' : `graph-intake-${intakeRoute.to}`,
+    });
     if (directSay && opts.queue === false) {
       try { debug.log('harness.queue', 'bypass', { seat: stampedSeat ?? null, reason: '--no-queue' }); }
       catch { /* Observation must not prevent an emergency launch. */ }
@@ -1190,7 +1198,9 @@ async function dispatchHarnessAskSay(
     delete process.env[LAUNCH_DOOR_RECEIPT_ENV];
     // 주입된 문이 없으면 생산 우주의 기본 문을 쓴다(시험 환경은 관문 관례와 같이 건너뛴다 — 시험 단언이 단일문 때문에 바뀌지 않는다).
     const launchDoor = gate.launchDoor ?? (process.env.NODE_ENV === 'test' ? undefined : openLaunchRequestDoor({ source: dryRunPreview.entrance }));
-    const launchDoorRequestId = launchDoor?.requestId(identity);
+    // A hand parent already consumed a card/attempt-scoped request id. Reuse that id here;
+    // direct harness requests still derive their stable id from the authored ask.
+    const launchDoorRequestId = inheritedLaunchDoorReceipt ?? launchDoor?.requestId(identity);
     const decision = await withJourneyNode('launch-gate', journey, async () => {
       const { budget, budgetSource, snapshotAgeSec } = await resolveLaunchBudget({
         provider: opts.childLlmProvider,

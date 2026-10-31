@@ -19,6 +19,7 @@ import {
   type GoalAuthorDeps,
   type GoalAuthorGradeSelection,
   resolveGoalAuthorGrade,
+  resolveGoalAuthorReviewerPrecheckEnabled,
   type GoalType,
   type GoalFileLintFinding,
 } from './goal-author.js';
@@ -292,9 +293,10 @@ export async function runGoalAuthorCli(
     ? { passed: false }
     : { passed: true, titleChars: proseTitle.length });
   const gradeDeps = authorGrade.grade === 'lite' || opts.authorGrade ? { authorGrade } : {};
+  const reviewerPrecheckDeps = { reviewerPrecheckEnabled: resolveGoalAuthorReviewerPrecheckEnabled() };
   const authorDeps: Partial<GoalAuthorDeps> = parentGoalFile && parentQuestionId
-    ? { parent: { goalFile: parentGoalFile, questionId: parentQuestionId }, parentDocument, clarificationAnswers, ...(decomposeSteps ? { decomposeSteps } : {}), ...gradeDeps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps }
-    : { ...(clarificationAnswers && { clarificationAnswers }), ...(decomposeSteps ? { decomposeSteps } : {}), ...gradeDeps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps };
+    ? { parent: { goalFile: parentGoalFile, questionId: parentQuestionId }, parentDocument, clarificationAnswers, ...(decomposeSteps ? { decomposeSteps } : {}), ...gradeDeps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...reviewerPrecheckDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps }
+    : { ...(clarificationAnswers && { clarificationAnswers }), ...(decomposeSteps ? { decomposeSteps } : {}), ...gradeDeps, ...selfResolutionDeps, ...progressDeps, ...launchPreflightDeps, ...reviewerPrecheckDeps, ...(opts.rootIntent !== undefined && { rootIntent: opts.rootIntent }), ...(goalType !== undefined && { goalType }), ...goalTitleDeps };
   const write = deps.write ?? writeAuthoredGoal;
   const result = opts.groundingCwd === undefined
     ? await write(ask, opts.cwd, authorDeps, superseded ? { supersedes: superseded } : undefined)

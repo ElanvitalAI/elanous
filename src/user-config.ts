@@ -187,6 +187,8 @@ export interface LLMConfig {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
+  /** Host that owns Codex OAuth refresh authority. Defaults to the HQ's mbp host. */
+  codexTokenOwnerHost?: string;
   /** Override the text stream idle watchdog in milliseconds. Omitted keeps provider/family defaults. */
   streamIdleTimeoutMs?: number;
   /** OpenRouter 설정 한 곳(두 골이 같은 키를 쓴다):
@@ -1177,6 +1179,8 @@ export interface SelfImplementToolConfig {
   goalRecordInDoc: boolean;
   /** Controls the persistent grounding loop used while authoring goals; absent preserves it. */
   goalAuthorPersistentGrounding?: boolean;
+  /** Explicit opt-in for the one-shot Terra medium goal-author reviewer precheck; absent/off preserves legacy authoring. */
+  goalAuthorReviewerPrecheck?: boolean;
   /** Uses the Fabric decomposer for SelfOrchestrate requests that omit `fabric_decompose`. */
   fabricDecompose: boolean;
   /** Normalized SelfOrchestrate goal count that automatically selects Fabric; null disables auto-selection. */
@@ -1294,7 +1298,7 @@ const TOOLS_DEFAULTS: ToolsConfig = {
   selfOrchestrate: {},
   nativeStructure: { enabled: false },
   // 대표 결정(2026-07-26): 오토 선호 — 기본 ON.
-  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, goalRecordInDoc: true, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, supervisor: { reasonRepair: false }, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
+  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, goalRecordInDoc: true, goalAuthorReviewerPrecheck: false, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, supervisor: { reasonRepair: false }, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
 };
 
 // ── Debug ────────────────────────────────────────────────────────────
@@ -2664,6 +2668,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
   const goalAuthorPersistentGrounding = typeof selfImplRaw.goalAuthorPersistentGrounding === 'boolean'
     ? selfImplRaw.goalAuthorPersistentGrounding
     : undefined;
+  const goalAuthorReviewerPrecheck = selfImplRaw.goalAuthorReviewerPrecheck === true;
   const fabricDecompose = selfImplRaw.fabricDecompose === true;
   const fabricDecomposeAutoPathThresholdRaw = selfImplRaw.fabricDecomposeAutoPathThreshold;
   const fabricDecomposeAutoPathThreshold = fabricDecomposeAutoPathThresholdRaw === null
@@ -2813,7 +2818,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, supervisor, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(escalateChild && Object.keys(escalateChild).length ? { escalateChild } : {}), ...(selfImplRaw.podChildDefault !== undefined ? { podChildDefault: selfImplRaw.podChildDefault } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, goalAuthorReviewerPrecheck, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, supervisor, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(escalateChild && Object.keys(escalateChild).length ? { escalateChild } : {}), ...(selfImplRaw.podChildDefault !== undefined ? { podChildDefault: selfImplRaw.podChildDefault } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
   };
 }
 
@@ -3948,8 +3953,8 @@ export interface UserConfig {
   nexus?: { demoMode?: boolean };
   /** Execution-phase HITL answer deadline; absent means 30 minutes. */
   hitl?: { executionDeadlineMinutes?: number };
-  /** Deferred (quiet-hours) outbound queue. `deferredMaxAttempts`: failed flushes before an item is quarantined; absent = env ELANOUS_OUTBOUND_DEFERRED_MAX_ATTEMPTS, else 5. */
-  outbound?: { deferredMaxAttempts?: number };
+  /** Outbound notifications. quietHours is `off` or `HH:MM-HH:MM` KST; absent keeps 00:00-06:30. */
+  outbound?: { deferredMaxAttempts?: number; quietHours?: 'off' | string };
   coo?: { linearProject?: string };
   decisions?: { linearProjection: { enabled: boolean }; requireCrossCheck: boolean;
     crossCheckNeighbor: Record<EventSeat, EventSeat>; crossCheckWaitMinutes: number };
@@ -5032,6 +5037,21 @@ export function parseHqConfig(raw: unknown): HqConfig | undefined {
   return Object.keys(out).length ? out : undefined;
 }
 
+function parseOutboundConfig(raw: unknown): UserConfig['outbound'] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const outbound = raw as Record<string, unknown>;
+  const attempts = outbound.deferredMaxAttempts;
+  const quietHours = outbound.quietHours;
+  const validQuietHours = quietHours === 'off'
+    || (typeof quietHours === 'string'
+      && /^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$/.test(quietHours)
+      && quietHours.slice(0, 5) !== quietHours.slice(6));
+  const result: NonNullable<UserConfig['outbound']> = {};
+  if (Number.isSafeInteger(attempts) && (attempts as number) > 0) result.deferredMaxAttempts = attempts as number;
+  if (validQuietHours) result.quietHours = quietHours as 'off' | string;
+  return Object.keys(result).length ? result : undefined;
+}
+
 export function buildUserConfig(path: string = defaultPath()): UserConfig {
   if (!existsSync(path)) return defaultConfigWithRuntimeProvider();
   let raw: unknown;
@@ -5156,6 +5176,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const tuiRaw = rawObj.tui && typeof rawObj.tui === 'object' && !Array.isArray(rawObj.tui) ? rawObj.tui as Record<string, unknown> : {};
   const gateRemoteConfig = parseGateRemoteConfig(rawObj.gateRemote);
   const projects = parseProjectsConfig(rawObj.projects);
+  const outboundConfig = parseOutboundConfig(rawObj.outbound);
   return {
     tui: {
       sidetab: tuiRaw.sidetab === 'off' || tuiRaw.sidetab === 'open' ? tuiRaw.sidetab : 'collapsed',
@@ -5330,6 +5351,9 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         };
       })(),
       model: resolveRuntimeLlmModel(baseProvider, selectedProvider, str(llm.model), escalationProvider || undefined),
+      codexTokenOwnerHost: typeof llm.codexTokenOwnerHost === 'string'
+        && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(llm.codexTokenOwnerHost.trim())
+        ? llm.codexTokenOwnerHost.trim() : undefined,
       streamIdleTimeoutMs: positiveFiniteNumber(llm.streamIdleTimeoutMs),
       openrouter: (() => {
         const router = llm.openrouter;
@@ -5954,11 +5978,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       && typeof (rawObj.hitl as Record<string, unknown>).executionDeadlineMinutes === 'number'
       ? { hitl: { executionDeadlineMinutes: (rawObj.hitl as { executionDeadlineMinutes: number }).executionDeadlineMinutes } }
       : {}),
-    ...(rawObj.outbound && typeof rawObj.outbound === 'object' && !Array.isArray(rawObj.outbound)
-      && Number.isSafeInteger((rawObj.outbound as Record<string, unknown>).deferredMaxAttempts)
-      && ((rawObj.outbound as { deferredMaxAttempts: number }).deferredMaxAttempts) > 0
-      ? { outbound: { deferredMaxAttempts: (rawObj.outbound as { deferredMaxAttempts: number }).deferredMaxAttempts } }
-      : {}),
+    ...(outboundConfig ? { outbound: outboundConfig } : {}),
     ...(parseHqConfig(rawObj.hq) ? { hq: parseHqConfig(rawObj.hq)! } : {}),
     ...(gateRemoteConfig ? { gateRemote: gateRemoteConfig } : {}),
     cli: { helpRole: parseCliHelpRole(rawObj.cli) },
@@ -6527,6 +6547,9 @@ export function saveUserConfig(
     },
   };
   const rawRest = { ...(cfg.raw ?? {}) };
+  const rawOutbound = rawRest.outbound && typeof rawRest.outbound === 'object' && !Array.isArray(rawRest.outbound)
+    ? rawRest.outbound as Record<string, unknown> : undefined;
+  delete rawRest.outbound;
   const rawTui = rawRest.tui && typeof rawRest.tui === 'object' && !Array.isArray(rawRest.tui)
     ? rawRest.tui as Record<string, unknown> : {};
   // projects: raw entries are kept verbatim — an invalid entry loaded from disk is preserved, not blocked (its error
@@ -6680,6 +6703,7 @@ export function saveUserConfig(
       // picks up capability fallback 'medium' → user thinks fix
       // regressed).
       reasoningLevel: cfg.llm.reasoningLevel,
+      codexTokenOwnerHost: cfg.llm.codexTokenOwnerHost,
       codexReasoning: cfg.llm.codexReasoning,
       goalLoop: cfg.llm.goalLoop,
       memoryJudge: cfg.llm.memoryJudge,
@@ -6974,6 +6998,7 @@ export function saveUserConfig(
     // M1-2b: sparse — emit only when explicitly set. Keeps Path-A-only
     // users' file clean (no empty modelTier:{} blobs).
     ...(cfg.modelTier ? { modelTier: parseModelTierConfig(cfg.modelTier) } : {}),
+    ...((cfg.outbound || rawOutbound) ? { outbound: stripUndef({ ...rawOutbound, ...cfg.outbound }) } : {}),
     ...(cfg.sessionFabric ? { sessionFabric: cfg.sessionFabric } : {}),
     ...(cfg.nextFluent ? { nextFluent: cfg.nextFluent } : {}),
     ...(cfg.taste ? { taste: cfg.taste } : {}),

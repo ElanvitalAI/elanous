@@ -59,6 +59,36 @@ test('authenticated stream receives a post within one second; missing and wrong 
   } finally { service.stop(); readOnly.close(); store.close(); }
 });
 
+test('group SSE delivery reaches active subscribers only', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-sse-group-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const writer = new MsgStore(path);
+  const group = writer.createGroup('release-window', 'OP');
+  writer.joinGroup(group, 'TC');
+  const message = writer.post({ from: 'OP', to: group, body: 'subscribers only' });
+  const readOnly = new MsgStore(path, { readOnly: true });
+  const service = startMsgSseServer({ store: readOnly, token: 'same-nexus-token', port: 0, pollMs: 100 });
+  const open = async (to: string) => fetch(`http://127.0.0.1:${service.port}/stream?to=${to}&since=0`, {
+    headers: { Authorization: 'Bearer same-nexus-token' },
+  });
+  try {
+    const tc = await open('TC');
+    const tcReader = tc.body!.getReader();
+    expect(await nextEvent(tcReader)).toEqual({ id: message.id, body: 'subscribers only' });
+    await tcReader.cancel();
+    const ux = await open('UX');
+    const uxReader = ux.body!.getReader();
+    await uxReader.read(); // connected comment
+    const result = await Promise.race([
+      uxReader.read().then(() => 'event'),
+      new Promise<'quiet'>(resolve => setTimeout(() => resolve('quiet'), 350)),
+    ]);
+    expect(result).toBe('quiet');
+    await uxReader.cancel();
+  } finally { service.stop(); readOnly.close(); writer.close(); }
+});
+
 test('replayed SSE reply keeps the durable question link', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'msg-sse-thread-'));
   dirs.push(dir);

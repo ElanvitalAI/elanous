@@ -31,6 +31,8 @@ import type {
 } from './types.js';
 import { PROVIDER_CAPABILITIES_NONE } from './types.js';
 import { readDiscoveryCache, type DiscoverySnapshot } from './discovery/cache.js';
+import { debug } from '../debug/log.js';
+import { readVerifiedCatalogCache, scheduleServerCatalogRefresh } from './catalog-server.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -83,6 +85,15 @@ function listYamlFiles(dir: string): string[] {
   return entries
     .filter((e) => e.endsWith('.yaml') || e.endsWith('.yml'))
     .map((e) => join(dir, e));
+}
+
+function readCatalogVersion(builtinDir: string): number {
+  const path = join(builtinDir, 'meta', 'catalogVersion.yaml');
+  if (!existsSync(path)) return 1;
+  const raw = safeReadYaml(path) as { catalogVersion?: unknown } | null;
+  return Number.isSafeInteger(raw?.catalogVersion) && (raw?.catalogVersion as number) >= 1
+    ? raw?.catalogVersion as number
+    : 1;
 }
 
 // ── Provider parse + validate ─────────────────────────────────────────
@@ -282,11 +293,13 @@ let cachedCatalog: Catalog | null = null;
 
 function buildCatalog(): Catalog {
   const builtinDir = resolveBuiltinCatalogDir();
+  const catalogVersion = readCatalogVersion(builtinDir);
   const globalDir = resolveGlobalCatalogDir();
 
   const providers = new Map<string, ProviderRegistration>();
   const models = new Map<string, ModelSpec>();
   const patterns = new Map<string, ModelPatternFallback>();
+  const sourceLayers = ['package'];
   let fileCount = 0;
 
   // --- builtin tier ---
@@ -326,12 +339,36 @@ function buildCatalog(): Catalog {
     }
   }
 
+  // --- signed server catalog; package YAML remains available if cache is absent/stale-invalid ---
+  // Keep isolated tests hermetic; an explicit cache path opts a test into the signed-server layer.
+  const serverCatalog = isolatedCatalogTestUniverse() && !process.env.ELANOUS_CATALOG_SERVER_CACHE?.trim()
+    ? null
+    : readVerifiedCatalogCache();
+  if (serverCatalog) {
+    sourceLayers.push('server-cache');
+    for (const raw of serverCatalog.payload.providers) {
+      const provider = parseProvider(raw, 'signed-server-catalog');
+      if (!provider) continue;
+      const base = providers.get(provider.id);
+      providers.set(provider.id, base ? mergeProviders(base, provider) : provider);
+      fileCount++;
+    }
+    for (const raw of serverCatalog.payload.models) {
+      const model = parseModel(raw, 'signed-server-catalog');
+      if (!model) continue;
+      models.set(model.id, model);
+      fileCount++;
+    }
+  }
+
   // --- global tier overlay ---
   const globalProviderDir = join(globalDir, 'providers');
+  let hasUserOverlay = false;
   for (const path of listYamlFiles(globalProviderDir)) {
     const raw = safeReadYaml(path);
     const overlay = parseProvider(raw, path);
     if (!overlay) continue;
+    hasUserOverlay = true;
     fileCount++;
     const base = providers.get(overlay.id);
     providers.set(overlay.id, base ? mergeProviders(base, overlay) : overlay);
@@ -359,6 +396,7 @@ function buildCatalog(): Catalog {
         }
         const model = parseModel(raw, path);
         if (model) {
+          hasUserOverlay = true;
           // global wins on dup id (RFC §6.4 — single-value fields replace).
           models.set(model.id, model);
           fileCount++;
@@ -370,9 +408,14 @@ function buildCatalog(): Catalog {
   // --- discovery fold (대표 2026-09-23 «파생한다») ---
   const folded = foldDiscoveredModels(providers, models, loadFoldSnapshot());
   for (const m of folded) models.set(m.id, m);
+  if (hasUserOverlay) sourceLayers.push('user');
+  if (folded.length > 0) sourceLayers.push('live-discovery');
+  debug.log('registry.catalog', 'catalog.source', {
+    source: 'merged', layers: sourceLayers, ...(serverCatalog ? { stale: serverCatalog.stale } : {}),
+  });
 
   return {
-    catalogVersion: 1,
+    catalogVersion,
     providers,
     models,
     patterns,
@@ -435,6 +478,7 @@ export function foldDiscoveredModels(
 export function getCatalog(): Catalog {
   if (cachedCatalog) return cachedCatalog;
   cachedCatalog = buildCatalog();
+  scheduleServerCatalogRefresh(() => { cachedCatalog = buildCatalog(); });
   return cachedCatalog;
 }
 

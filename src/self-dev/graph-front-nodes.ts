@@ -220,7 +220,8 @@ export function observeFrontNodeExit(exit: FrontNodeExit, data: FrontNodeExitDat
     const graphRoute: JourneyRoute = { ...route, to: budget.to };
     const taken = data.taken ?? budget.to ?? exit.outcome;
     const reason = [budget.budgetReason, data.reason].filter((part): part is string => part !== undefined).join(' · ');
-    recordJourneyEdge(graphRoute, taken, reason.length > 0 ? reason : undefined);
+    recordJourneyEdge(graphRoute, taken, reason.length > 0 ? reason : undefined,
+      data.runId === undefined ? {} : { runId: data.runId });
     recorded = graphRoute;
     const payload = {
       graphId: 'self-implement',

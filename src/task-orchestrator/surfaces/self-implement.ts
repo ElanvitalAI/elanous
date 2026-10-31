@@ -31,6 +31,7 @@ import { isAbandonedClassification, type AbandonedClassificationResult } from '.
 import { createExecution, type Task, type TaskExecution } from '../types.js';
 import type { DispatchContext, DispatchResult } from '../surface-registry.js';
 import { nestedPodResult } from './pod-failure-reason.js';
+import { isTddRecordTag, TDD_RECORD_TAGS, type TddRecordTag } from '../../self-implement/tdd-evidence-tags.js';
 import { SCOPE_EXPANSION_CAP, SCOPE_STOP_REASONS, isProtectedScopePath, type ScopeStopReason } from '../../self-implement/scope-adjacency.js';
 
 /** Result of one self-implement subprocess. */
@@ -145,6 +146,8 @@ export interface PodChildEvidence {
   supervisorVerdict?: unknown;
   goalCauseObserved?: true;
   terminationReason?: unknown;
+  /** TDD report-deficit facts carried as named fields, independent of clipped detail text. */
+  tddEvidenceFailure?: { reason: 'tdd-evidence-missing'; round: number; missing: TddRecordTag[] };
   accountAvailability?: Record<string, unknown>;
   prFailure?: {
     stage: 'pr-open-failed';
@@ -217,6 +220,20 @@ export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChild
     if (o.ok !== false || typeof value !== 'string' || !value.trim()) return undefined;
     return redactSecretText(value).slice(0, 4_000);
   };
+  const rawTddEvidenceFailure = object(o.tddEvidenceFailure);
+  const rawTddMissing = rawTddEvidenceFailure?.missing;
+  const tddEvidenceFailure = o.ok === false && o.terminationReason === 'tdd-evidence-missing'
+    && rawTddEvidenceFailure?.reason === 'tdd-evidence-missing'
+    && typeof rawTddEvidenceFailure.round === 'number' && Number.isSafeInteger(rawTddEvidenceFailure.round) && rawTddEvidenceFailure.round >= 1
+    && Array.isArray(rawTddMissing) && rawTddMissing.length > 0 && rawTddMissing.length <= TDD_RECORD_TAGS.length
+    && rawTddMissing.every(isTddRecordTag)
+    && new Set(rawTddMissing).size === rawTddMissing.length
+    ? {
+        reason: 'tdd-evidence-missing' as const,
+        round: rawTddEvidenceFailure.round,
+        missing: rawTddMissing as TddRecordTag[],
+      }
+    : undefined;
   const failureExitCode = o.ok === false && typeof o.exitCode === 'number'
     && Number.isInteger(o.exitCode) && o.exitCode >= 0 && o.exitCode <= 255 ? o.exitCode : undefined;
   const outOfScopeEdits = scrubValue(o.outOfScopeEdits);
@@ -248,7 +265,10 @@ export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChild
     ...(abandoned ? { abandonedClassification: abandoned } : {}),
     ...(o.supervisorVerdict !== undefined ? { supervisorVerdict: scrubValue(o.supervisorVerdict) } : {}),
     ...(o.goalCauseObserved === true ? { goalCauseObserved: true } : {}),
-    ...(o.terminationReason !== undefined ? { terminationReason: scrubValue(o.terminationReason) } : {}),
+    ...(o.terminationReason === 'tdd-evidence-missing'
+      ? (tddEvidenceFailure ? { terminationReason: 'tdd-evidence-missing' } : {})
+      : o.terminationReason !== undefined ? { terminationReason: scrubValue(o.terminationReason) } : {}),
+    ...(tddEvidenceFailure ? { tddEvidenceFailure } : {}),
     ...(accountAvailability ? { accountAvailability } : {}),
     ...(o.harvestable === true && typeof o.branch === 'string' && o.branch.trim() ? { harvestable: true } : {}),
     ...(typeof o.prNumber === 'number' && Number.isSafeInteger(o.prNumber) && o.prNumber > 0 ? { prNumber: o.prNumber } : {}),
@@ -294,6 +314,8 @@ export interface SelfImplementJobSpawn {
     draft?: boolean;
     /** Distinct-per-job harness-space id → own screen/log buffer. */
     spaceId: string;
+    /** Orchestrator task identity, preserved with terminal Pod failure evidence. */
+    taskId?: string;
     signal?: AbortSignal;
     /** Optional TC-owned warm-worker command. The warm request is advisory; this feature Job remains authoritative. */
     warmWorkerCommand?: WarmWorkerCommand;
@@ -394,6 +416,7 @@ export function createSelfImplementAdapter(opts: SelfImplementAdapterOptions) {
         ...(surface.openPr !== undefined ? { openPr: surface.openPr } : {}),
         ...(surface.draft !== undefined ? { draft: surface.draft } : {}),
         spaceId,
+        taskId: task.id,
         ...(ctx.signal ? { signal: ctx.signal } : {}),
       });
       address = res.address;
@@ -606,8 +629,9 @@ export function reviewGateFields(o: Record<string, unknown>): Pick<SelfImplement
 export function reportUnmappedDispositionFields(
   raw: Record<string, unknown>,
   mapped: SelfImplementDisposition,
+  knownRawFields: readonly string[] = [],
 ): readonly string[] {
-  const known = new Set(Object.keys(mapped));
+  const known = new Set([...Object.keys(mapped), ...knownRawFields]);
   const unmapped = Object.keys(raw).filter((key) => !known.has(key) && raw[key] !== undefined);
   if (unmapped.length > 0) {
     try {
@@ -716,7 +740,7 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
             && ((o.review as { mustFix: unknown[] }).mustFix).every((item) => typeof item === 'string')
             ? { mustFix: (o.review as { mustFix: string[] }).mustFix } : {}),
       };
-      reportUnmappedDispositionFields(o, mapped);
+      reportUnmappedDispositionFields(o, mapped, ['terminationReason', 'tddEvidenceFailure']);
       return mapped;
     } catch { /* not this line */ }
   }

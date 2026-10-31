@@ -747,6 +747,7 @@ describe('release checklist CLI', () => {
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
       expect(release.commands.find((c) => c.name() === 'run')!.helpInformation()).toContain('--if-ready');
+      expect(release.commands.find((c) => c.name() === 'preflight')!.helpInformation()).toContain('--countdown');
       expect(release.commands.find((c) => c.name() === 'resume')!.helpInformation()).toContain('--dry-run');
     } finally {
       jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
@@ -1311,9 +1312,9 @@ describe('release run CLI', () => {
       await run('--if-ready', '--publish-at', '2099-10-09T20:00+09:00');
       await run();
       expect(inputs).toEqual([
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', branchCut: true },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true },
       ]);
       process.exitCode = 0;
       await run('--publish-at', '2099-10-09T20:00');
@@ -1521,7 +1522,7 @@ describe('release run CLI', () => {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--json'], { from: 'user' });
       expect(stdout).toHaveLength(1);
       expect(stdout[0]!.endsWith('\n')).toBe(true);
-      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { ...loop, version: '0.2.4', previousVersion: '0.2.3', branchCut: true } });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { ...loop, version: '0.2.4', previousVersion: '0.2.3', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true } });
       expect(stderr.join('\n')).toContain('"previousVersion":"0.2.3"');
       expect([checklistCalls, graphCalls]).toEqual([0, 0]);
       expect(process.exitCode ?? 0).toBe(0);
@@ -1588,9 +1589,9 @@ describe('release run CLI', () => {
       for (const flags of [[], ['--cut-commit', 'a'.repeat(40)], ['--if-ready', '--cut-commit', 'b'.repeat(40)]])
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', ...flags], { from: 'user' });
       expect(inputs).toEqual([
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', branchCut: true },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', cutCommit: 'a'.repeat(40) },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', cutCommit: 'b'.repeat(40) },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: 'a'.repeat(40) },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: 'b'.repeat(40) },
       ]);
     } finally { output.mockRestore(); process.exitCode = previous ?? 0; rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1617,14 +1618,14 @@ describe('release run CLI', () => {
           graph: async () => { graphCalls++; throw new Error('preview invoked graph'); } });
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready', '--json'], { from: 'user' });
         expect(stdout).toHaveLength(1);
-        expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', branchCut: true } });
+        expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true } });
         expect([checklistCalls, graphCalls]).toEqual([0, 0]);
         expect(existsSync(target)).toBe(false);
         expect(process.exitCode).toBe(0);
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready'], { from: 'user' });
         expect(human).toHaveLength(1);
         expect(human[0]).toStartWith('· 드라이런 0.2.4 · 입력 ');
-        expect(JSON.parse(human[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', branchCut: true });
+        expect(JSON.parse(human[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true });
         expect([checklistCalls, graphCalls]).toEqual([0, 0]);
         expect(existsSync(target)).toBe(false);
         expect(process.exitCode).toBe(0);
@@ -1646,7 +1647,7 @@ describe('release run CLI', () => {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run'], { from: 'user' });
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain('드라이런');
-      expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateRemote: 'node-b', branchCut: true });
+      expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', gateRemote: 'node-b', branchCut: true });
       expect(process.exitCode ?? 0).toBe(0);
     } finally { process.exitCode = before ?? 0; output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1810,7 +1811,7 @@ describe('release run CLI', () => {
       graph: async (path, opts) => { expect(path).toEndWith('graphs/release/release-loop.yaml'); expect(opts.input.previousVersion).toBe('0.2.3'); graphCalls++; return { status: 'awaiting-approval', runId: 'run-1' } as never; } });
     try {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
-      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', branchCut: true }, state: { status: 'awaiting-approval', runId: 'run-1' } });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true }, state: { status: 'awaiting-approval', runId: 'run-1' } });
       expect([checklistCalls, graphCalls]).toEqual([1, 1]);
       expect(process.exitCode ?? 0).toBe(0);
       const blocked = new Command();
@@ -2285,7 +2286,7 @@ test('RELEASE-REHEARSAL-RC CLI: --prerelease rc numbers the run, never reads che
     process.exitCode = 0;
     await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'rc', '--if-ready', '--json'], { from: 'user' });
     expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: true, input: { version: '0.2.18-rc.1', branchCut: true } });
-    expect(inputs).toEqual([{ version: '0.2.18-rc.1', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }]);
+    expect(inputs).toEqual([{ version: '0.2.18-rc.1', previousVersion: '0.2.17', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true }]);
     expect(process.exitCode).toBe(0);
     await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'beta', '--json'], { from: 'user' });
     expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: false, error: '--prerelease supports rc only: beta' });

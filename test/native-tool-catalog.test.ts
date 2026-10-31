@@ -327,10 +327,10 @@ describe('nativeToolCatalog — metadata invariants', () => {
 
     // Nine seat-message/checklist tools are skill+tui only. Keep the exact
     // distribution so a new host exposure (notably MCP/chat) fails here.
-    expect(nativeToolCatalog).toHaveLength(192);
+    expect(nativeToolCatalog).toHaveLength(198);
     expect([...distribution.entries()].sort()).toEqual([
       // CTX2 #23185 — context_now(맥락 한 문 · READ-ONLY 자기관측)가 MCP 에 더해졌다.
-      ['mcp', 17],
+      ['mcp', 21],
       ['skill', 33],
       ['skill,tui', 99],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).
@@ -341,7 +341,19 @@ describe('nativeToolCatalog — metadata invariants', () => {
       //   ⭐ 이 툴은 «헤드리스 자식»을 띄우므로 ***부르는 쪽에 PTY 가 필요 없다.***
       ['skill,tui,mcp,chat', 1],
       ['tui', 6],
+      ['tui,mcp', 2],
     ]);
+  });
+
+  test('Linear issue action is advertised only to the TUI/MCP hosts with mutating network metadata', () => {
+    expect(findNativeTool('elanous_linear_issue')).toEqual(expect.objectContaining({
+      id: 'elanous_linear_issue',
+      aliases: ['ElanousLinearIssue'],
+      host: ['tui', 'mcp'],
+      safety: ['mutating', 'network'],
+      supportsParallel: false,
+      defaultEnabled: true,
+    }));
   });
 
 

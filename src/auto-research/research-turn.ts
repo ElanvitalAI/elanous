@@ -1,5 +1,6 @@
 import { streamLLM } from '../llm.js';
 import { invokeResearchAxes } from '../research-bridge/index.js';
+import { RESEARCH_TURN_DEADLINE_STOP_ERROR } from '../core-turn/research-policy.js';
 import { invokeResearch } from '../research-bridge/invoke.js';
 import type { AxisFanoutResult } from '../research/axis-fanout.js';
 import { routeResearchOutput } from '../research/output-router.js';
@@ -18,9 +19,12 @@ import { attachResearchEvidence, buildResearchQuestionLadderPrompt,
 
 export interface ResearchQuestionLadderRunOptions {
   signal?: AbortSignal;
+  admitToolCall?: (toolName: string) => boolean;
+  allowPartialOnAbort?: boolean;
+  allowOutputSkill?: boolean;
   generateContract?: (prompt: string, signal?: AbortSignal) => Promise<string>;
   generate?: (prompt: string, signal?: AbortSignal) => Promise<string>;
-  invokeAxes?: (questions: SixLevelResearchQuestionLadder['questions'], signal?: AbortSignal) => Promise<AxisFanoutResult>;
+  invokeAxes?: (questions: SixLevelResearchQuestionLadder['questions'], signal?: AbortSignal, admitToolCall?: (toolName: string) => boolean) => Promise<AxisFanoutResult>;
   routeOutput?: typeof routeResearchOutput;
   invokeOutputSkill?: (skill: string, args: string, signal?: AbortSignal) => Promise<{ ok: boolean; output: string; error?: string }>;
   /** Test seam for the bounded Bloom 4/5 evidence-gap follow-up. */
@@ -35,6 +39,14 @@ export interface ResearchGroundingResult {
   ok: boolean;
   output: string;
   error?: string;
+}
+
+function invokeProductionResearchAxes(
+  questions: SixLevelResearchQuestionLadder['questions'],
+  signal?: AbortSignal,
+  admitToolCall?: (toolName: string) => boolean,
+): Promise<AxisFanoutResult> {
+  return invokeResearchAxes(questions, { signal, admitToolCall });
 }
 
 export interface ResearchQuestionLadderRunResult {
@@ -71,6 +83,15 @@ export interface WorkingBackwardsCompletionBoundary {
   nodePlan: WorkingBackwardsPlannedNode[];
   /** 모든 출력 계약 슬롯이 채워졌다 — 호출자는 이때 추가 research를 멈춘다. */
   complete: boolean;
+}
+
+function partialResearchOutput(request: string, ladder: SixLevelResearchQuestionLadder, note: string): string {
+  const evidence = ladder.evidence.map(item => `- [${item.outcome}] ${item.sourceKind} · ${item.source}: ${item.content}`);
+  return [
+    `# Partial research: ${request}`,
+    `Research stopped at its wall-clock limit (${note}). Synthesize only the evidence listed here and state remaining uncertainty.`,
+    ...(evidence.length ? ['', '## Evidence collected before stopping', ...evidence] : ['', 'No source evidence was collected before the deadline.']),
+  ].join('\n');
 }
 
 /**
@@ -212,9 +233,20 @@ export async function runResearchQuestionLadder(
     contractRaw = await (options.generateContract ?? ((prompt, signal) => defaultGenerate(prompt, 'research-working-backwards-contract', signal)))(
       buildWorkingBackwardsContractPrompt(request), options.signal,
     );
-    if (options.signal?.aborted) return { ok: false, ladder: initial, output: '', error: 'research aborted' };
+    if (options.signal?.aborted) {
+      return options.allowPartialOnAbort
+        ? { ok: false, ladder: initial, output: partialResearchOutput(request, initial, 'before question generation'), error: RESEARCH_TURN_DEADLINE_STOP_ERROR }
+        : { ok: false, ladder: initial, output: '', error: 'research aborted' };
+    }
   } catch (error) {
     const reason = errorText(error);
+    if (options.signal?.aborted) {
+      return {
+        ok: false, ladder: initial,
+        output: options.allowPartialOnAbort ? partialResearchOutput(request, initial, 'output-contract generation') : '',
+        error: RESEARCH_TURN_DEADLINE_STOP_ERROR,
+      };
+    }
     debug.log('research.lens', 'working-backwards-contract-failed', { reason }, { level: 'warn' });
     return { ok: false, ladder: initial, output: '', error: `output contract generation failed: ${reason}` };
   }
@@ -247,18 +279,31 @@ export async function runResearchQuestionLadder(
     const sectionIds = outputContract.sections.map((section) => section.id);
     // Keep the premium exemplar bank outside the TUI's static import closure.
     const { getBloomExemplarContext } = await import('../research/bloom-exemplars.js');
+    const { buildResearchBloom45Directive } = await import('../core-turn/deep-turn-bloom.js');
+    const bloom45Directive = await buildResearchBloom45Directive();
     const exemplar = getBloomExemplarContext(request, options.bloomExemplarPackPath);
     debug.log('research.turn', 'bloom-exemplars-selected', {
       domain: exemplar.domain, domainSignal: exemplar.domainSignal,
       source: exemplar.source, count: exemplar.count, levels: exemplar.levels,
     });
     raw = await (options.generate ?? ((prompt, signal) => defaultGenerate(prompt, 'research-question-ladder', signal)))(
-      `${buildResearchQuestionLadderPrompt(request, sectionIds)}\n\n${exemplar.context ? `${exemplar.context}\n\n` : ''}${ladderContext}${retroGroundingContext(request)}`,
+      `${buildResearchQuestionLadderPrompt(request, sectionIds)}\n\n${bloom45Directive}\n\n${exemplar.context ? `${exemplar.context}\n\n` : ''}${ladderContext}${retroGroundingContext(request)}`,
       options.signal,
     );
-    if (options.signal?.aborted) return { ok: false, ladder: initial, outputContract, output: '', error: 'research aborted' };
+    if (options.signal?.aborted) {
+      return options.allowPartialOnAbort
+        ? { ok: false, ladder: initial, outputContract, output: partialResearchOutput(request, initial, 'before axis searches'), error: RESEARCH_TURN_DEADLINE_STOP_ERROR }
+        : { ok: false, ladder: initial, outputContract, output: '', error: 'research aborted' };
+    }
     debug.log('research.turn', 'bloom-generated', { questionCount: 6 });
   } catch (error) {
+    if (options.signal?.aborted) {
+      return {
+        ok: false, ladder: initial, outputContract,
+        output: options.allowPartialOnAbort ? partialResearchOutput(request, initial, 'question generation') : '',
+        error: RESEARCH_TURN_DEADLINE_STOP_ERROR,
+      };
+    }
     debug.log('research.turn', 'bloom-failed', { reason: errorText(error) }, { level: 'warn' });
     return { ok: false, ladder: initial, outputContract, output: '', error: `question generation failed: ${errorText(error)}` };
   }
@@ -280,11 +325,16 @@ export async function runResearchQuestionLadder(
 
   const ladder = parsed.value;
   debug.log('research.turn', 'bloom-ladder-validated', { questionCount: ladder.questions.length });
+  debug.log('research.turn', 'deep-bloom-applied', {
+    levels: [4, 5], trigger: 'research-intent',
+    stage: 'research-ladder',
+    questionCount: ladder.questions.filter((question) => question.level === 4 || question.level === 5).length,
+  });
   const observedAt = new Date().toISOString();
   let fanout: AxisFanoutResult;
   try {
-    fanout = await (options.invokeAxes ?? ((questions, signal) => invokeResearchAxes(questions, { signal })))(ladder.questions, options.signal);
-    if (options.signal?.aborted) return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
+    fanout = await (options.invokeAxes ?? invokeProductionResearchAxes)(ladder.questions, options.signal, options.admitToolCall);
+    if (options.signal?.aborted && !options.allowPartialOnAbort) return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
     debug.log('research.turn', 'axis-evidence-collected', {
       axisCount: fanout.axes.length,
       evidenceCount: fanout.axes.reduce((count, axis) => count + axis.evidence.length, 0),
@@ -334,6 +384,10 @@ export async function runResearchQuestionLadder(
     debug.log('research.turn', 'completion-boundary-stop', {
       stage: 'axis-fanout', reason: 'every output-contract section slot is filled',
     });
+    debug.log('research.stop', 'stage', {
+      stage: 'axis-fanout', reason: 'completion-boundary-satisfied',
+      evidenceCount: ladder.evidence.length,
+    });
   }
   if (!finalBoundary.complete && !options.signal?.aborted) {
     const followupStartedAt = performance.now();
@@ -373,6 +427,10 @@ export async function runResearchQuestionLadder(
         classifications: followupPlan.classifications.length,
         timeBudgetMs: followupPlan.timeBudgetMs,
       });
+      debug.log('research.stop', 'stage', {
+        stage: 'gap-followup', reason: 'no-runnable-followup-calls',
+        classifications: followupPlan.classifications.length,
+      });
     } else {
       const executionStartedAt = performance.now();
       debug.log('research.turn', 'gap-followup-started', {
@@ -411,6 +469,10 @@ export async function runResearchQuestionLadder(
           debug.log('research.turn', 'completion-boundary-stop', {
             stage: 'gap-followup', reason: 'every output-contract section slot is filled',
           });
+          debug.log('research.stop', 'stage', {
+            stage: 'gap-followup', reason: 'completion-boundary-satisfied',
+            evidenceCount: ladder.evidence.length,
+          });
         }
       } catch (error) {
         debug.log('research.turn', 'gap-followup-failed', {
@@ -420,12 +482,29 @@ export async function runResearchQuestionLadder(
       }
     }
   }
-  if (options.signal?.aborted) return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
+  if (options.signal?.aborted && !options.allowPartialOnAbort) return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
 
   const outputContractSectionIndex = sections.findIndex((section) => section.startsWith('## Output contract\n'));
   if (outputContractSectionIndex < 0) throw new Error('output contract section is missing from research output');
   sections.splice(outputContractSectionIndex + 1, 0,
     formatWorkingBackwardsSkeleton(outputContract, finalBoundary, evidenceRejected));
+
+  // The axis fanout is the last stage allowed to spend the research budget.
+  // Once it returns after an abort, keep whatever evidence it collected and
+  // return it directly; no post-deadline router/skill stage may discard it or
+  // attempt more model work with the already-aborted signal.
+  if (options.signal?.aborted && options.allowPartialOnAbort) {
+    const partialOutput = sections.join('\n\n');
+    saveRetroRecord(request, ladder, ladder.evidence);
+    debug.log('research.stop', 'stopped', {
+      reason: 'wall-clock-budget', stage: 'after-axis-evidence',
+      evidenceCount: ladder.evidence.length,
+    });
+    return {
+      ok: false, ladder, outputContract, output: partialOutput,
+      error: RESEARCH_TURN_DEADLINE_STOP_ERROR,
+    };
+  }
 
   const incompleteQuestions = ladder.questions.filter((question) =>
     !ladder.evidence.some((item) => item.questionId === question.id && item.outcome === 'complete')).length;
@@ -459,7 +538,13 @@ export async function runResearchQuestionLadder(
   });
   let routedOutput = '';
   const hasCompleteEvidence = ladder.evidence.some((item) => item.outcome === 'complete');
-  if (route?.skillCallPlan && !hasCompleteEvidence) {
+  if (route?.skillCallPlan && options.allowOutputSkill === false) {
+    debug.log('research.turn', 'output-skill-skipped', {
+      skill: route.skillCallPlan.skill,
+      reason: 'research turn tool allowlist excludes skill execution',
+      evidenceCount: ladder.evidence.length,
+    });
+  } else if (route?.skillCallPlan && !hasCompleteEvidence) {
     debug.log('research.turn', 'output-skill-skipped', {
       skill: route.skillCallPlan.skill,
       reason: 'no-complete-evidence',
@@ -500,11 +585,11 @@ export async function runResearchQuestionLadder(
   }
   saveRetroRecord(request, ladder, ladder.evidence);
   return {
-    ok: allOk,
+    ok: allOk && !options.signal?.aborted,
     ladder,
     outputContract,
     output: output + routedOutput,
-    ...(allOk ? {} : { error: `${incompleteQuestions} of ${ladder.questions.length} question searches were incomplete` }),
+    ...(!allOk || options.signal?.aborted ? { error: options.signal?.aborted ? RESEARCH_TURN_DEADLINE_STOP_ERROR : `${incompleteQuestions} of ${ladder.questions.length} question searches were incomplete` } : {}),
   };
 }
 

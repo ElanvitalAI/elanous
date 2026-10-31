@@ -9,13 +9,21 @@ import { streamCodexResponsesEvents } from '../llm.js';
 import { LogStore, StoreSink, type LogStoreRow } from '../mss/logging/log-store.js';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { simRenderLogFrame } from './render-frame.js';
+import { assessDraftInventory, buildDraftInventory } from './draft-inventory-builder.js';
+
+export type ScenarioTrigger = {
+  id: string;
+  type: 'codex.responses.fetch' | 'codex.responses.fetch-network-error' | 'ux.draft-inventory.evaluate';
+  status?: number;
+  count?: number;
+};
 
 export interface ScenarioV0 {
   version: 0;
   id: string;
   isolation: 'test';
   seed: number;
-  triggers: [{ id: string; type: 'codex.responses.fetch' | 'codex.responses.fetch-network-error'; status?: number; count?: number }];
+  triggers: [ScenarioTrigger];
   expect: {
     screen: { mode: 'widget'; snapshot: { contains: string[]; excludes?: string[] } };
     logs: [{ category: string; event: string; level: string; count?: number; data?: Record<string, unknown> }];
@@ -82,10 +90,11 @@ export function parseScenarioV0(source: string): ScenarioV0 {
   const trigger = record(value.triggers[0], 'scenario.triggers[0]');
   exactKeys(trigger, ['id', 'type', 'status', 'count'], 'scenario.triggers[0]');
   const triggerId = requiredString(trigger.id, 'scenario.triggers[0].id');
-  if (trigger.type !== 'codex.responses.fetch' && trigger.type !== 'codex.responses.fetch-network-error') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
+  if (trigger.type !== 'codex.responses.fetch' && trigger.type !== 'codex.responses.fetch-network-error' && trigger.type !== 'ux.draft-inventory.evaluate') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
   if (trigger.type === 'codex.responses.fetch' && (!Number.isInteger(trigger.status) || (trigger.status as number) < 400 || (trigger.status as number) > 499)) throw new Error('codex.responses.fetch.status must be an HTTP 4xx status');
-  if (trigger.type === 'codex.responses.fetch-network-error' && trigger.status !== undefined) throw new Error('codex.responses.fetch-network-error does not accept status');
+  if ((trigger.type === 'codex.responses.fetch-network-error' || trigger.type === 'ux.draft-inventory.evaluate') && trigger.status !== undefined) throw new Error(`${trigger.type} does not accept status`);
   if (trigger.count !== undefined && (!Number.isInteger(trigger.count) || (trigger.count as number) < 1)) throw new Error('codex.responses.fetch.count must be a positive integer');
+  if (trigger.type === 'ux.draft-inventory.evaluate' && trigger.count !== 200) throw new Error('ux.draft-inventory.evaluate.count must be 200');
 
   const expect = record(value.expect, 'scenario.expect');
   exactKeys(expect, ['screen', 'logs'], 'scenario.expect');
@@ -125,7 +134,7 @@ export function parseScenarioV0(source: string): ScenarioV0 {
     id,
     isolation: 'test',
     seed: value.seed as number,
-    triggers: [{ id: triggerId, type: trigger.type, ...(trigger.status !== undefined ? { status: trigger.status as number } : {}), ...(trigger.count !== undefined ? { count: trigger.count as number } : {}) }],
+    triggers: [{ id: triggerId, type: trigger.type as ScenarioTrigger['type'], ...(trigger.status !== undefined ? { status: trigger.status as number } : {}), ...(trigger.count !== undefined ? { count: trigger.count as number } : {}) }],
     expect: {
       screen: {
         mode: 'widget',
@@ -243,6 +252,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
   const store = new LogStore(logsPath, { instance });
   const storeSink = new StoreSink(store, instance, { installExitHandlers: false });
   const expectedLog = scenario.expect.logs[0];
+  const trigger = scenario.triggers[0];
   const sink: LogSink = {
     name: storeSink.name,
     emit(rec) {
@@ -260,36 +270,69 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
           category: rec.category,
           event: rec.event,
           level: rec.level,
-          ...(expectedLog.data ? { data: projectSubset(rec.data, expectedLog.data) } : {}),
+          ...(expectedLog.data ? {
+            data: trigger.type === 'ux.draft-inventory.evaluate'
+              ? { runId, ...projectSubset(rec.data, expectedLog.data) }
+              : projectSubset(rec.data, expectedLog.data),
+          } : {}),
         });
       }
     },
   };
   const off = debug.registerSink(sink);
   const originalFetch = globalThis.fetch;
-  const trigger = scenario.triggers[0];
   let errorMessage: string | null = null;
   let fetchCount = 0;
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
-    fetchCount++;
-    if (String(input) !== 'https://chatgpt.com/backend-api/codex/responses') throw new Error('scenario fake fetch received an unregistered URL');
-    if (trigger.type === 'codex.responses.fetch-network-error') throw new Error(`scenario network error seed=${scenario.seed}`);
-    return new Response('{"detail":"Bad Request"}', { status: trigger.status!, headers: { 'content-type': 'application/json' } });
-  }) as unknown as typeof fetch;
+  let triggerObserved = false;
+  let screenLines: string[] = [];
+  if (trigger.type.startsWith('codex.')) {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      fetchCount++;
+      if (String(input) !== 'https://chatgpt.com/backend-api/codex/responses') throw new Error('scenario fake fetch received an unregistered URL');
+      if (trigger.type === 'codex.responses.fetch-network-error') throw new Error(`scenario network error seed=${scenario.seed}`);
+      return new Response('{"detail":"Bad Request"}', { status: trigger.status!, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+  }
 
   try {
-    try {
-      for await (const _event of streamCodexResponsesEvents('https://chatgpt.com/backend-api/codex/responses', 'scenario-fake-token', {
-        model: 'gpt-6-sol',
-        instructions: 'scenario test request',
-        input: [{ role: 'user', content: [{ type: 'input_text', text: `scenario test input seed=${scenario.seed}` }] }],
-        tools: [{ type: 'function', name: 'RunShell', description: 'test tool', parameters: {} }],
-      }, undefined, { promptCache: false })) { /* consume the deterministic fake response */ }
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
+    if (trigger.type === 'ux.draft-inventory.evaluate') {
+      const result = assessDraftInventory(buildDraftInventory(trigger.count));
+      const data = {
+        runId,
+        total: result.total,
+        byScenario: result.byScenario,
+        byAction: result.byAction,
+        triageByAction: result.triageByAction,
+        mismatchCount: result.mismatches.length,
+        protectedOrRunningClosed: result.protectedOrRunningClosed,
+      };
+      debug.log('ux.sim.draft-inventory', 'assessed', data);
+      screenLines = [
+        'Draft inventory simulation',
+        `total=${result.total}`,
+        `mismatches=${result.mismatches.length}`,
+        `protectedOrRunningClosed=${result.protectedOrRunningClosed}`,
+      ];
+      triggerObserved = result.total === trigger.count
+        && Object.values(result.byScenario).every((count) => count === 25)
+        && result.mismatches.length === 0
+        && result.protectedOrRunningClosed === 0;
+    } else {
+      try {
+        for await (const _event of streamCodexResponsesEvents('https://chatgpt.com/backend-api/codex/responses', 'scenario-fake-token', {
+          model: 'gpt-6-sol',
+          instructions: 'scenario test request',
+          input: [{ role: 'user', content: [{ type: 'input_text', text: `scenario test input seed=${scenario.seed}` }] }],
+          tools: [{ type: 'function', name: 'RunShell', description: 'test tool', parameters: {} }],
+        }, undefined, { promptCache: false })) { /* consume the deterministic fake response */ }
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
+      triggerObserved = fetchCount === (trigger.count ?? 1) && errorMessage !== null;
+      screenLines = errorMessage ? [errorMessage] : [];
     }
 
-    const screenText = simRenderLogFrame({ phase: 'idle', lines: errorMessage ? [errorMessage] : [] }, { width: 100, height: 12 }).text;
+    const screenText = simRenderLogFrame({ phase: 'idle', lines: screenLines }, { width: 100, height: 12 }).text;
     const containsMissing = scenario.expect.screen.snapshot.contains.filter((fragment) => !screenText.includes(fragment));
     const excludesFound = (scenario.expect.screen.snapshot.excludes ?? []).filter((fragment) => screenText.includes(fragment));
 
@@ -302,9 +345,10 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
     const logPass = rows.length === expectedCount && !levelMismatch && dataMismatch.length === 0;
     const screenPass = containsMissing.length === 0 && excludesFound.length === 0;
     const failureReasons: string[] = [];
-    const expectedTriggerCount = trigger.count ?? 1;
-    if (fetchCount !== expectedTriggerCount) failureReasons.push(`trigger-count-mismatch:expected-${expectedTriggerCount}-observed-${fetchCount}`);
-    if (errorMessage === null) failureReasons.push('provider-error-not-observed');
+    const expectedTriggerCount = trigger.type.startsWith('codex.') ? trigger.count ?? 1 : 1;
+    const observedTriggerCount = trigger.type.startsWith('codex.') ? fetchCount : triggerObserved ? 1 : 0;
+    if (trigger.type.startsWith('codex.') && fetchCount !== expectedTriggerCount) failureReasons.push(`trigger-count-mismatch:expected-${expectedTriggerCount}-observed-${fetchCount}`);
+    if (!triggerObserved) failureReasons.push(trigger.type.startsWith('codex.') ? 'provider-error-not-observed' : 'draft-inventory-evaluation-failed');
     if (!screenPass) failureReasons.push('screen-snapshot-mismatch');
     if (rows.length === 0 && expectedCount > 0) failureReasons.push('expected-log-event-absent');
     else if (rows.length !== expectedCount) failureReasons.push(`log-event-count-mismatch:expected-${expectedCount}-observed-${rows.length}`);
@@ -331,7 +375,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
       evidenceArtifact: '',
       runEvidence: { ...runEvidence, persisted: runEventPersisted },
       pass: failureReasons.length === 0,
-      trigger: { id: trigger.id, type: trigger.type, status: trigger.status ?? null, expectedCount: expectedTriggerCount, fetchCount, error: errorMessage },
+      trigger: { id: trigger.id, type: trigger.type, status: trigger.status ?? null, expectedCount: expectedTriggerCount, fetchCount: observedTriggerCount, error: errorMessage },
       screen: { pass: screenPass, containsMissing, excludesFound, snapshot: screenText },
       logs: {
         pass: logPass,

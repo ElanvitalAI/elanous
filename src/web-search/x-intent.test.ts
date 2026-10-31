@@ -4,7 +4,7 @@ import { dispatchWebSearch as dispatchModelWebSearch } from '../skills/tools/web
 import { dispatchWebSearch as dispatchDaemonWebSearch } from '../boot/daemon-tools/web-search.js';
 import { buildGrokWebSearchProvider } from './grok.js';
 import { _resetWebSearchProvidersForTests, addWebSearchProvider, searchWeb } from './index.js';
-import { wantsXSearch } from './x-intent.js';
+import { wantsGrokSearch, wantsXSearch } from './x-intent.js';
 
 const xQuery = { query: 'X에서 엘라누스 반응' };
 
@@ -18,6 +18,51 @@ describe('X search intent', () => {
     for (const query of ['X축 그래프', '엑셀 xlsx', 'next index', 'Xcode 개발', '서울 날씨', 'examplex.com', 'twittering']) {
       expect(wantsXSearch(query)).toBe(false);
     }
+    expect(wantsGrokSearch('반응형 웹 레이아웃')).toBe(false);
+    expect(wantsGrokSearch('부작용 반응을 정리해줘')).toBe(false);
+    expect(wantsGrokSearch('mx 반응')).toBe(false);
+    expect(wantsGrokSearch('사용자 반응 분석')).toBe(false);
+    expect(wantsGrokSearch('최신 모델 스펙')).toBe(false);
+    expect(wantsGrokSearch('latest community reactions')).toBe(false);
+    expect(wantsGrokSearch('chemical reactions of the compound')).toBe(false);
+    expect(wantsGrokSearch('Hacker News community guidelines')).toBe(false);
+    expect(wantsGrokSearch('community feedback about the release')).toBe(false);
+    expect(wantsGrokSearch('market sentiment this week')).toBe(false);
+    expect(wantsGrokSearch('X에서 최신 반응')).toBe(true);
+  });
+
+  test('routes explicit X requests to Grok and general queries through Exa/Firecrawl only', async () => {
+    _resetWebSearchProvidersForTests(false);
+    const calls: string[] = [];
+    for (const id of ['exa', 'firecrawl', 'ddg', 'grok']) {
+      addWebSearchProvider({
+        id, displayName: id, available: () => true,
+        search: async () => {
+          calls.push(id);
+          if (id === 'exa') throw new Error('offline');
+          return { hits: [{ url: `https://${id}.example`, title: id, snippet: id }], providerName: id, durationMs: 1 };
+        },
+      });
+    }
+    expect(wantsGrokSearch('최신 반도체 여론')).toBe(false);
+    expect(wantsGrokSearch('X에서 최신 반도체 여론')).toBe(true);
+    expect((await searchWeb({ query: '반도체 공급망 구조' })).providerName).toBe('firecrawl');
+    expect(calls).toEqual(['exa', 'firecrawl']);
+    calls.length = 0;
+    expect((await searchWeb({ query: '최신 반도체 여론' })).providerName).toBe('firecrawl');
+    expect(calls).toEqual(['exa', 'firecrawl']);
+    calls.length = 0;
+    expect((await searchWeb({ query: 'X에서 최신 반도체 여론' })).providerName).toBe('grok');
+    expect(calls).toEqual(['grok']);
+  });
+
+  test('explains when Grok is configured but ordinary search providers are unavailable', async () => {
+    _resetWebSearchProvidersForTests(false);
+    addWebSearchProvider({ id: 'grok', displayName: 'grok', available: () => true,
+      search: async () => ({ hits: [], providerName: 'grok', durationMs: 1 }) });
+    await expect(searchWeb({ query: 'ordinary product architecture' })).rejects.toThrow(
+      'Grok is reserved for explicit X/Twitter searches. Configure Exa or Firecrawl for general web search.',
+    );
   });
 
   test('routes X intent to grok, ordinary query to first provider, and falls back when grok is unavailable', async () => {
@@ -25,10 +70,10 @@ describe('X search intent', () => {
     const calls: string[] = [];
     let grokAvailable = true;
     addWebSearchProvider({
-      id: 'tavily', displayName: 'tavily fake', available: () => true,
+      id: 'firecrawl', displayName: 'firecrawl fake', available: () => true,
       search: async () => {
-        calls.push('tavily');
-        return { hits: [{ url: 'https://example.org/news', title: 'News', snippet: '' }], providerName: 'tavily', durationMs: 0 };
+        calls.push('firecrawl');
+        return { hits: [{ url: 'https://example.org/news', title: 'News', snippet: '' }], providerName: 'firecrawl', durationMs: 0 };
       },
     });
     addWebSearchProvider({
@@ -47,18 +92,18 @@ describe('X search intent', () => {
     expect(JSON.stringify(debug.events().at(-1))).not.toContain(xQuery.query);
 
     const weather = await searchWeb({ query: '서울 날씨' });
-    expect(calls).toEqual(['grok', 'tavily']);
+    expect(calls).toEqual(['grok', 'firecrawl']);
     expect(weather).not.toHaveProperty('xSearch');
 
     grokAvailable = false;
     const fallback = await searchWeb(xQuery);
-    expect(calls).toEqual(['grok', 'tavily', 'tavily']);
+    expect(calls).toEqual(['grok', 'firecrawl', 'firecrawl']);
     expect(fallback.xSearch).toBe('unavailable');
-    expect(debug.events().at(-1)).toMatchObject({ category: 'web-search.route', event: 'x-intent', data: { provider: 'tavily', xIntent: true, fallback: true } });
+    expect(debug.events().at(-1)).toMatchObject({ category: 'web-search.route', event: 'x-intent', data: { provider: 'firecrawl', xIntent: true, fallback: true } });
     expect(JSON.stringify(debug.events().at(-1))).not.toContain(xQuery.query);
 
-    const forced = await searchWeb(xQuery, { providerId: 'tavily' });
-    expect(calls).toEqual(['grok', 'tavily', 'tavily', 'tavily']);
+    const forced = await searchWeb(xQuery, { providerId: 'firecrawl' });
+    expect(calls).toEqual(['grok', 'firecrawl', 'firecrawl', 'firecrawl']);
     expect(forced).not.toHaveProperty('xSearch');
 
     grokAvailable = true;
@@ -88,8 +133,8 @@ describe('X search intent', () => {
     try {
       _resetWebSearchProvidersForTests(false);
       addWebSearchProvider({
-        id: 'tavily', displayName: 'tavily fake', available: () => true,
-        search: async () => ({ hits: [{ url: 'https://example.org/fallback', title: 'Fallback', snippet: '' }], providerName: 'tavily', durationMs: 0 }),
+        id: 'firecrawl', displayName: 'firecrawl fake', available: () => true,
+        search: async () => ({ hits: [{ url: 'https://example.org/fallback', title: 'Fallback', snippet: '' }], providerName: 'firecrawl', durationMs: 0 }),
       });
       addWebSearchProvider(buildGrokWebSearchProvider());
       const result = await searchWeb(xQuery);
@@ -132,10 +177,10 @@ describe('X search intent', () => {
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
     addWebSearchProvider({
-      id: 'tavily', displayName: 'tavily fake', available: () => true,
+      id: 'firecrawl', displayName: 'firecrawl fake', available: () => true,
       search: async () => {
-        calls.push('tavily');
-        return { hits: [], providerName: 'tavily', durationMs: 0 };
+        calls.push('firecrawl');
+        return { hits: [], providerName: 'firecrawl', durationMs: 0 };
       },
     });
     addWebSearchProvider({
@@ -143,7 +188,7 @@ describe('X search intent', () => {
       search: async () => { calls.push('grok'); throw new Error('search failed'); },
     });
     const result = await searchWeb(xQuery);
-    expect(calls).toEqual(['grok', 'tavily']);
+    expect(calls).toEqual(['grok', 'firecrawl']);
     expect(result.xSearch).toBe('unavailable');
   });
 });

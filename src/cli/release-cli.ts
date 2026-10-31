@@ -52,7 +52,7 @@ import type { PrereleaseKind } from '../../scripts/release-loop/release-version.
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
 import { ReleaseRunClaimConflict, findActiveReleaseRun, readActiveForceReleaseRun, isPidAlive, readReleaseRunLock, withDirectReleaseRunLock, withForceReleaseRunMarker } from './release-single-flight.js';
-import { formatPreflight, releasePreflight } from '../../scripts/release-loop/preflight.js';
+import { formatCountdown, formatPreflight, releasePreflight, runReleaseCountdown } from '../../scripts/release-loop/preflight.js';
 import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindow, proposePublishAt, publishWindowWarning } from '../../scripts/release-loop/publish-window.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
 import { runRehearsalTick, type RehearsalDeps } from '../release-loop/rehearsal.js';
@@ -62,6 +62,7 @@ import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/lig
 import { applyWatchList, formatGateHistory, gateHistory, ghMergedPrs } from '../../scripts/release-loop/gate-history.js';
 import { registerRfcCommands } from './rfc-cli.js';
 import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistContext, registerChecklistReadCommands, type ChecklistEvidenceReader } from './release-checklist-read-cli.js';
+import { syncLinearProgress } from '../decisions/linear-progress-sync.js';
 
 export { isReleaseVersion } from './release-checklist-read-cli.js';
 
@@ -814,6 +815,16 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       console.log(`칸 ${rows.length} · 🟢 ${byStatus.green} · 🟡 ${byStatus.yellow} · 🔴 ${byStatus.red} · ✅ ${byStatus.done}`);
     });
   registerChecklistReadCommands(checklist, checklistEvidenceReader);
+  withContext(checklist.command('progress-sync').description('Linear 일일 진행 요약 계획 · --live 에서만 댓글 발송'))
+    .option('--live', '요약을 Linear 에 댓글로 발송(판별 뒤에만 사용)')
+    .action(async (opts: { live?: boolean }, cmd: Command) => {
+      const { version, json } = context(cmd);
+      if (!version) throw new CliUserError('조회할 판을 지정하라', '--version <v>');
+      const result = await syncLinearProgress({ version, live: opts.live === true });
+      if (json) { await writeStdoutJson(`${JSON.stringify(result)}\n`); return; }
+      console.log(`Linear 진행 요약 ${result.day} · 계획 ${result.planned} · 발송 ${result.posted} · 중복 건너뜀 ${result.skipped} · 실패 ${result.failed}`);
+      for (const row of result.plan) console.log(`· ${row.issue} ${row.action}: ${row.body.split('\n').slice(0, 4).join(' / ')}`);
+    });
   withContext(checklist.command('landed-but-yellow').description('병합 PR 이 있지만 노랑·빨강인 칸(기본 읽기 전용)'))
     .option('--owner <owner>', '자리 또는 하위 자리로 거르기')
     .option('--open', '미발행 일정 판 중 칸이 있는 판 전부')
@@ -1261,12 +1272,21 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
     .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
   release.command('preflight')
-    .description('컷 전 사전 점검(읽기 전용) — 체크리스트·런 입력·동결·일정 + 컷 − 60분 origin/main export(자동 예약 없음). ⛔ 있으면 exit 1')
+    .description('컷 전 사전 점검(기본 읽기 전용) — --countdown 은 단계 판정 모델만 표시하고 컷을 실행하지 않는다. --allow-side-effects 를 명시해야 실패 우편·원장을 기록한다.')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')
     .option('--publish-at <iso>', '계획 발행 시각(기본: 컷 뒤 첫 07·18시 KST)')
+    .option('--countdown', '발사 카운트다운 — T−120 노트·export·게이트 모의 → T−60 컷 트리 고정⊕node-b 자리 → T−30 gate 모드 → T0 컷 · 기본 dry-run')
+    .option('--allow-side-effects', '카운트다운 실패 때 담당 자리 우편·부적합 보고 원장 기록 허용(명시적 opt-in)')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { version: string; publishAt?: string; json?: boolean }) => {
+    .action(async (o: { version: string; publishAt?: string; countdown?: boolean; allowSideEffects?: boolean; json?: boolean }) => {
       try {
+        if (o.countdown) {
+          const countdown = await runReleaseCountdown(o.version, { publishAt: o.publishAt, releaseRunDeps, allowSideEffects: o.allowSideEffects });
+          if (o.json) await writeStdoutJson(`${JSON.stringify(countdown)}\n`);
+          else for (const line of formatCountdown(countdown)) console.log(line);
+          if (countdown.verdict === 'block') process.exitCode = 1;
+          return;
+        }
         const result = await releasePreflight(o.version, { publishAt: o.publishAt, releaseRunDeps });
         if (o.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
         else for (const line of formatPreflight(result)) console.log(line);

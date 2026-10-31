@@ -340,6 +340,64 @@ export interface LaunchPreflightInput {
 /** AUTO-TARGET: blocker name for a NOT-GROUNDED goal whose only target paths were machine-suggested (a scope card). */
 export const NOT_GROUNDED_SCOPE_CARD_BLOCKER = '(NOT-GROUNDED 범위 카드)';
 
+/** CARD-TARGET-PATHS 가 읽기 전용으로 제공하는 같은-경로 카드 맥락. */
+export interface SiblingContextCard {
+  readonly cardId: string;
+  readonly runId?: string;
+  readonly overlapPaths: readonly string[];
+}
+
+function siblingContextPaths(result: LaunchPreflightResult, warning: LaunchPreflightBlocker): readonly string[] {
+  return warning.overlapPaths?.map(({ path }) => path)
+    ?? result.paths.filter((path) => warning.detail.includes(path));
+}
+
+function siblingContextAxis(
+  label: string,
+  status: PreflightAxisStatus,
+  entries: readonly string[],
+): string {
+  if (status.state === 'unknown') return `[sibling-context] ${label}: 못 쟀다 (${status.reason})`;
+  if (entries.length === 0) return `[sibling-context] ${label}: 없음`;
+  const partial = status.state === 'truncated' ? ` · 부분 측정(상한 ${status.limit})` : '';
+  return `[sibling-context] ${label}: ${entries.join(' · ')}${partial}`;
+}
+
+/** 같은 대상 경로의 비차단 형제 관측을 골 문서 머리에 넣을 정확히 세 줄로 렌더한다. */
+export function renderSiblingContextLines(
+  result: LaunchPreflightResult,
+  cards: readonly SiblingContextCard[] = [],
+): readonly [string, string, string] {
+  const liveRuns = result.warnings
+    .filter((warning) => warning.kind === 'live-run')
+    .map((warning) => {
+      const paths = siblingContextPaths(result, warning);
+      const cardIds = cards
+        .filter((card) => card.runId === warning.name && card.overlapPaths.some((path) => paths.includes(path)))
+        .map((card) => card.cardId);
+      return [warning.name, ...cardIds.map((cardId) => `카드 ${cardId}`), ...paths].join(' · ');
+    });
+  const openPrs = result.warnings
+    .filter((warning) => warning.kind === 'open-pr' || warning.kind === 'sibling-pr')
+    .map((warning) => {
+      const draft = /\bdraft\b|초안/u.test(warning.detail) ? ' (draft)' : '';
+      const paths = siblingContextPaths(result, warning);
+      return `${warning.name}${draft}${paths.length > 0 ? ` · ${paths.join(', ')}` : ''}`;
+    });
+  const recentLanded = result.warnings
+    .filter((warning) => warning.kind === 'recent-change' && result.paths.includes(warning.name))
+    .map((warning) => {
+      const count = /최근 \d+일 안에 (\d+)건 변경됨/u.exec(warning.detail)?.[1];
+      return `sha·PR 미상 · ${warning.name}${count === undefined ? '' : ` ${count}건`}`;
+    });
+
+  return [
+    siblingContextAxis('같은 경로 도는 런', result.liveRuns, liveRuns),
+    siblingContextAxis('같은 경로 열린 PR', result.openPrs, openPrs),
+    siblingContextAxis(`같은 경로 최근 ${result.recentChangeWindowDays}일 착지`, result.recentChanges, recentLanded),
+  ];
+}
+
 export function evaluateLaunchPreflight(input: LaunchPreflightInput): LaunchPreflightResult {
   const paths = [...new Set(input.paths.filter((path) => path.trim().length > 0))];
   const blockers: LaunchPreflightBlocker[] = [];

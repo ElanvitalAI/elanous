@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { tddPlanFromGoal } from './off-diff-evidence.js';
 import { authorGoal, runGoalAuthorSelfReview, GOAL_AUTHOR_SELF_REVIEW_CHECKS, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, selectRelevantAuthoringLessons, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
 import { GOAL_AUTHOR_GROUND_TIMEBOX_MS, readGoalAuthorGroundingTimebox } from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
@@ -259,13 +260,134 @@ describe('goal author grade', () => {
       '완료 경계 증거 명령: bun test src/self-dev/dev-pipeline.test.ts',
     ].join('\n');
     const source = `대상 경로: src/self-dev/dev-pipeline.ts\n판정선(반증): 누락 골 발사는 거부된다.\n${explicit}`;
-    expect(explicitGoalDoneBoundaryLines(source)).toHaveLength(3);
+    expect(explicitGoalDoneBoundaryLines(source, process.cwd())).toContain('- 완료 경계 코드: src/self-dev/dev-pipeline.ts 에 세 필드 검사');
+    expect(explicitGoalDoneBoundaryLines(source, process.cwd())).toContain('- 완료 경계 증거 명령: bun test src/self-dev/dev-pipeline.test.ts');
+    expect(explicitGoalDoneBoundaryLines(source, process.cwd()).some((line) => line.startsWith('- 장치: '))).toBe(true);
     for (const grade of ['full', 'lite'] as const) {
       const authored = await authorGoal(source, { ...deps, authorGrade: { grade, source: 'flag' } });
       expect(inspectGoalDoneBoundary(authored.document).missing).toEqual([]);
       expect(markdownSection(authored.document, 'ACCEPTANCE CRITERIA')).toContain('- 완료 경계 코드: src/self-dev/dev-pipeline.ts');
       expect(authored.document).not.toContain('## 완료 경계');
     }
+  });
+
+  test('typecheck-only evidence is rewritten to a target test and creates a TDD green command', async () => {
+    const repositoryRoot = mkdtempSync(join(tmpdir(), 'goal-author-tdd-evidence-'));
+    temporaryDirectories.push(repositoryRoot);
+    mkdirSync(join(repositoryRoot, 'src', 'self-implement'), { recursive: true });
+    writeFileSync(join(repositoryRoot, 'src', 'self-implement', 'goal-author-fixture.ts'), 'export const target = true;\n');
+    const ask = [
+      '대상 경로: src/self-implement/goal-author-fixture.ts',
+      '기능을 구현한다.',
+      '판정선(반증): 테스트 명령이 구현 대상의 회귀 시험 파일을 가리킨다.',
+      '완료 경계 코드: src/self-implement/goal-author-fixture.ts의 동작을 구현한다.',
+      '완료 경계 실물: 격리 시험에서 요청 동작을 관측한다.',
+      '완료 경계 증거 명령: bun run scripts/ci-typecheck-changed.ts',
+    ].join('\n');
+    const authored = await authorGoal(ask, {
+      ...deps,
+      repositoryRoot,
+      authorGrade: { grade: 'lite', source: 'flag' },
+    });
+    const testPath = 'src/self-implement/goal-author-fixture.test.ts';
+    expect(authored.document).toContain(`- 완료 경계 증거 명령: bun test ${testPath}`);
+    expect(authored.document).toContain(`- 신설: ${testPath}`);
+    expect(authored.document).toContain('bun run scripts/ci-typecheck-changed.ts (타입검사는 보조 검증)');
+    expect(authored.document).toContain('- 장치: product-devices');
+    expect(authored.document).toContain('시나리오: 신설 초안 (MS-id 후보: MK-GOAL-AUTHOR-FIXTURE-TDD-EVIDENCE-01)');
+    expect(authored.document).toContain('«src/self-implement/goal-author-fixture.ts의 동작을 구현한다.»');
+    expect(authored.document).toContain('카탈로그 API·ScenarioV0 형식');
+    const plan = tddPlanFromGoal(authored.document);
+    expect(plan.greenCommand).toBe(`bun test ${testPath}`);
+
+    const existingScenarioLines = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts',
+      '완료 경계 코드: child report-deficit remains distinct',
+      '완료 경계 실물: a later PR remains harvestable',
+      '완료 경계 증거 명령: bun run scripts/ci-typecheck-changed.ts',
+    ].join('\n'), process.cwd());
+    expect(existingScenarioLines.some((line) => line.includes('장치: fault-injection'))).toBe(true);
+    expect(existingScenarioLines.some((line) => line.includes('시나리오: UX-MS-01'))).toBe(true);
+    const oppositeScenarioLines = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts',
+      '완료 경계 코드: child report-deficit is not preserved as distinct',
+      '완료 경계 실물: a later PR harvest result is not visible',
+      '완료 경계 증거 명령: bun run scripts/ci-typecheck-changed.ts',
+    ].join('\n'), process.cwd());
+    expect(oppositeScenarioLines.some((line) => line.includes('시나리오: UX-MS-01'))).toBe(false);
+    expect(oppositeScenarioLines.some((line) => line.includes('시나리오: 신설 초안'))).toBe(true);
+    const conflictingOutcomeLines = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts',
+      '완료 경계 코드: child report-deficit becomes indistinguishable',
+      '완료 경계 실물: a later PR harvest result becomes unharvestable',
+      '완료 경계 증거 명령: bun run scripts/ci-typecheck-changed.ts',
+    ].join('\n'), process.cwd());
+    expect(conflictingOutcomeLines.some((line) => line.includes('시나리오: UX-MS-01'))).toBe(false);
+    expect(conflictingOutcomeLines.some((line) => line.includes('시나리오: 신설 초안'))).toBe(true);
+
+    const matchingMissingTest = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/self-implement/goal-author-fixture.ts',
+      `완료 경계 증거 명령: bun test ${testPath}`,
+    ].join('\n'), repositoryRoot);
+    expect(matchingMissingTest).toContain(`- 완료 경계 증거 명령: bun test ${testPath}`);
+    expect(matchingMissingTest).toContain(`- 신설: ${testPath}`);
+
+    const specPath = 'src/self-implement/goal-author-spec-fixture.spec.ts';
+    writeFileSync(join(repositoryRoot, 'src', 'self-implement', 'goal-author-spec-fixture.ts'), 'export const specTarget = true;\n');
+    writeFileSync(join(repositoryRoot, specPath), 'export {};\n');
+    const specLines = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/self-implement/goal-author-spec-fixture.ts',
+      '완료 경계 증거 명령: bun run scripts/ci-typecheck-changed.ts',
+    ].join('\n'), repositoryRoot);
+    expect(specLines).toContain(`- 완료 경계 증거 명령: bun test ${specPath}`);
+    expect(specLines.some((line) => line === `- 신설: ${specPath}`)).toBe(false);
+
+    const pairedSource = 'src/self-implement/goal-author-paired-fixture.ts';
+    const pairedTest = 'src/self-implement/goal-author-paired-fixture.test.ts';
+    const pairedSpec = 'src/self-implement/goal-author-paired-fixture.spec.ts';
+    writeFileSync(join(repositoryRoot, pairedSource), 'export const paired = true;\n');
+    writeFileSync(join(repositoryRoot, pairedTest), 'export {};\n');
+    writeFileSync(join(repositoryRoot, pairedSpec), 'export {};\n');
+    const pairedLines = explicitGoalDoneBoundaryLines([
+      `대상 경로: src/self-implement/goal-author-fixture.ts · ${pairedSource}`,
+      `완료 경계 증거 명령: bun test ${pairedSpec}`,
+    ].join('\n'), repositoryRoot);
+    expect(pairedLines).toContain(`- 완료 경계 증거 명령: bun test ${pairedSpec}`);
+    expect(pairedLines.some((line) => line === `- 검증 계획(TDD): 장치 product-devices · 시나리오 신설 초안 · 기존 시험에 요청 동작 회귀 사례 추가 ${pairedSpec} · 피처 시험 bun test ${pairedSpec}를 구현 전에 RED로 확인한다.`)).toBe(true);
+
+    rmSync(join(repositoryRoot, pairedSpec));
+    const missingPairedSpecLines = explicitGoalDoneBoundaryLines([
+      `대상 경로: ${pairedSource}`,
+      `완료 경계 증거 명령: bun test ${pairedSpec}`,
+    ].join('\n'), repositoryRoot);
+    expect(missingPairedSpecLines).toContain(`- 신설: ${pairedSpec}`);
+    expect(missingPairedSpecLines.some((line) => line.includes(`신설 시험 ${pairedSpec}`))).toBe(true);
+
+    const tsxPath = 'src/self-implement/goal-author-jsx-fixture.tsx';
+    const tsxSpec = 'src/self-implement/goal-author-jsx-fixture.test.ts';
+    writeFileSync(join(repositoryRoot, tsxPath), 'export const jsxTarget = true;\n');
+    writeFileSync(join(repositoryRoot, tsxSpec), 'export {};\n');
+    const tsxLines = explicitGoalDoneBoundaryLines([
+      `대상 경로: ${tsxPath}`,
+      '완료 경계 증거 명령: bun run scripts/ci-typecheck-changed.ts',
+    ].join('\n'), repositoryRoot);
+    expect(tsxLines).toContain(`- 완료 경계 증거 명령: bun test ${tsxSpec}`);
+    expect(tsxLines.some((line) => line === `- 신설: ${tsxSpec}`)).toBe(false);
+
+    const weakPathLines = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/shared/pod.ts',
+      '완료 경계 증거 명령: bun run scripts/ci-typecheck-changed.ts',
+    ].join('\n'), process.cwd());
+    expect(weakPathLines.some((line) => line.includes('시나리오: UX-MS-01'))).toBe(false);
+
+    const unrelatedScenarioLines = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts',
+      '완료 경계 코드: payment refund rejects an expired authorization token',
+      '완료 경계 실물: a repeated refund creates no second ledger entry',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(unrelatedScenarioLines.some((line) => line.includes('시나리오: UX-MS-01'))).toBe(false);
+    expect(unrelatedScenarioLines.some((line) => line.includes('시나리오: 신설 초안'))).toBe(true);
   });
 
   test('missing hand completion boundaries are drafted from target paths while explicit lines stay intact', () => {
@@ -291,8 +413,10 @@ describe('goal author grade', () => {
         authorGrade: { grade, source: 'flag' },
         enhance: async (original) => ({ original, checklist: invented, verbatimPreserved: true }),
       });
-      expect(inspectGoalDoneBoundary(markdownSection(authored.document, 'ACCEPTANCE CRITERIA') ?? '').missing)
-        .toHaveLength(3);
+      const acceptance = markdownSection(authored.document, 'ACCEPTANCE CRITERIA') ?? '';
+      expect(inspectGoalDoneBoundary(acceptance).missing).toEqual(['완료 경계 코드', '완료 경계 실물']);
+      expect(acceptance).toContain('- 완료 경계 증거 명령: bun test src/example.test.ts');
+      expect(acceptance).not.toMatch(/^- 완료 경계 (?:코드|실물):/mu);
     }
   });
 

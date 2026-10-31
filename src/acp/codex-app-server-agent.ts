@@ -31,6 +31,7 @@
 import {
   CodexAppServerClient,
   spawnCodexAppServer,
+  spawnCodexRemoteTui,
   type SpawnCodexAppServerOpts,
   type SpawnedCodexAppServer,
 } from './codex-app-server-client.js';
@@ -713,6 +714,8 @@ export interface CodexAppServerAgentOpts {
   readonly codexBinary?: string;
   /** Session-scoped argv forwarded to `spawnCodexAppServer`. */
   readonly codexArgs?: readonly string[];
+  /** Explicit opt-in Codex remote side-tab Unix socket path. */
+  readonly remoteSocketPath?: string;
   readonly env?: Record<string, string>;
   readonly log?: (msg: string) => void;
   /** Called after a successful initialize with this backend's advertised capabilities.
@@ -770,6 +773,7 @@ export interface CodexAppServerAgentOpts {
   readonly _spawnFactory?: (
     opts: SpawnCodexAppServerOpts,
   ) => SpawnedCodexAppServer;
+  readonly _remoteTuiSpawnForTesting?: typeof spawnCodexRemoteTui;
 }
 
 export class CodexAppServerAgent {
@@ -777,12 +781,14 @@ export class CodexAppServerAgent {
   private readonly cwd?: string;
   private readonly codexBinary?: string;
   private readonly codexArgs?: readonly string[];
+  private readonly remoteSocketPath?: string;
   private readonly env?: Record<string, string>;
   private readonly log: (msg: string) => void;
   private readonly onCapabilities: ((capabilities: ElanousCapabilities) => void) | undefined;
 
   private client: CodexAppServerClient | null;
   private child: SpawnedCodexAppServer['child'] | null = null;
+  private remoteTuiChild: ReturnType<typeof spawnCodexRemoteTui> | null = null;
   private initialized = false;
 
   private readonly approvalAdapter: CodexApprovalAdapter;
@@ -877,12 +883,14 @@ export class CodexAppServerAgent {
   private readonly _spawnFactory:
     | ((opts: SpawnCodexAppServerOpts) => SpawnedCodexAppServer)
     | undefined;
+  private readonly _remoteTuiSpawnForTesting: typeof spawnCodexRemoteTui | undefined;
 
   constructor(opts: CodexAppServerAgentOpts) {
     this.backendId = opts.backendId;
     this.cwd = opts.cwd;
     this.codexBinary = opts.codexBinary;
     this.codexArgs = opts.codexArgs ? [...opts.codexArgs] : undefined;
+    this.remoteSocketPath = opts.remoteSocketPath;
     this.env = opts.env;
     this.log = opts.log ?? ((msg) => debug.log('acp.cxn.appserver.agent', msg));
     this.onCapabilities = opts.onCapabilities;
@@ -894,6 +902,7 @@ export class CodexAppServerAgent {
     this.imageTempDir = opts.imageTempDir ?? defaultImageTempDir();
     this._clientForTesting = opts._clientForTesting;
     this._spawnFactory = opts._spawnFactory;
+    this._remoteTuiSpawnForTesting = opts._remoteTuiSpawnForTesting;
     this.threadIndex = opts._threadIndexForTesting ?? globalCasThreadIndex();
     // M6 · idle hibernate config. Env override only applies when opts
     // didn't set it explicitly so tests can pin a value regardless of
@@ -979,6 +988,7 @@ export class CodexAppServerAgent {
         env: { ...rotatedCodexChildEnv(childEnv), ...(this.env ?? {}) },
         codexBinary,
         codexArgs: this.codexArgs,
+        remoteSocketPath: this.remoteSocketPath,
       };
       const spawned = spawnFn(spawnOpts);
       this.client = spawned.client;
@@ -1069,6 +1079,13 @@ export class CodexAppServerAgent {
         /* swallow */
       }
     }
+    if (this.remoteTuiChild) {
+      try {
+        this.remoteTuiChild.kill('SIGTERM');
+      } catch {
+        /* swallow */
+      }
+    }
     if (this.child) {
       try {
         this.child.kill('SIGTERM');
@@ -1078,6 +1095,7 @@ export class CodexAppServerAgent {
     }
     this.client = null;
     this.child = null;
+    this.remoteTuiChild = null;
     this.initialized = false;
     this.sessionToThread.clear();
     this.threadToSession.clear();
@@ -1110,6 +1128,7 @@ export class CodexAppServerAgent {
    *  disabled. unref() so a CLI can still exit cleanly when the daemon
    *  is the only thing keeping the loop alive. */
   private armIdleTimer(): void {
+    if (this.remoteSocketPath) return;
     if (this.idleTimerHandle !== null) return;
     if (this.idleTimeoutMs <= 0) return;
     this.idleTimerHandle = setInterval(() => {
@@ -1328,6 +1347,20 @@ export class CodexAppServerAgent {
     // M6 · brand-new sessions are alive in the current daemon by
     // definition · no thread/resume needed before the first turn.
     this.currentDaemonSessions.add(sessionId);
+    if (this.remoteSocketPath && !this.remoteTuiChild) {
+      const explicitEnv = this.env ?? {};
+      const tuiEnv = {
+        ...rotatedCodexChildEnv({ ...process.env, ...explicitEnv }),
+        ...explicitEnv,
+      };
+      const spawnRemoteTui = this._remoteTuiSpawnForTesting ?? spawnCodexRemoteTui;
+      this.remoteTuiChild = spawnRemoteTui({
+        codexBinary: this.codexBinary ?? resolvePreferredCodexBinary(),
+        socketPath: this.remoteSocketPath,
+        cwd: this.cwd,
+        env: tuiEnv,
+      });
+    }
     debug.log('acp.client', 'session-new', { backendId: this.backendId, sessionId });
     return sessionId;
   }

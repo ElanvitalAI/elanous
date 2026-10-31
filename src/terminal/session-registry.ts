@@ -33,7 +33,7 @@ import { defaultControlSignalBus, type ControlSignalBus } from '../input/control
 
 export type SessionState = 'foreground' | 'background' | 'exited';
 export type SessionKind = 'shell' | 'coding-agent';
-export type CodingAgentBrand = 'claude-code' | 'codex' | 'gemini';
+export type CodingAgentBrand = 'claude-code' | 'codex' | 'gemini' | 'grok';
 
 export interface TerminalSession {
   readonly id: string;

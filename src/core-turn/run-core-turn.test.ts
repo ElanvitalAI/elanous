@@ -4,7 +4,7 @@ import * as llmModule from '../llm.js';
 import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 import { debug } from '../debug/log.js';
-import { runCoreTurn } from './run-core-turn.js';
+import { requestsNamedSkill, runCoreTurn } from './run-core-turn.js';
 import type { CoreTurnResult } from './types.js';
 
 const tool: LLMToolSpec = {
@@ -50,6 +50,64 @@ beforeEach(() => {
 });
 
 afterEach(() => mock.restore());
+
+describe('named installed skill research routing', () => {
+  test.each([
+    ['CEO original', 'omni crawl 로 grokbot 사용사례를 찾아주고 elanous 와 어떤 연계를 하면 될까요?', true],
+    ['hyphenated slug', 'omni-crawl 로 사용사례를 찾아줘', true],
+    ['spaced slug', 'omni crawl로 사용사례를 조사해줘', true],
+    ['concatenated slug', 'omnicrawl으로 사례를 정리해줘', true],
+    ['installed skill without action', 'omni crawl 에 대해 알려줘', false],
+    ['uninstalled slug', 'other-crawl 로 사용사례를 찾아줘', false],
+    ['no skill name', 'grokbot 사용사례를 찾아줘', false],
+  ])('%s', (_name, prompt, expected) => {
+    expect(requestsNamedSkill(prompt, ['omni-crawl'])).toBe(expected);
+  });
+
+  test('the CEO original prompt bypasses the text-only research pre-answer when skill_exec is available', async () => {
+    const prompt = 'omni crawl 로 grokbot 사용사례를 찾아주고 elanous 와 어떤 연계를 하면 될까요?';
+    const statuses: string[] = [];
+    const events: string[] = [];
+    let researchCalls = 0;
+    let researchTurn: boolean | undefined;
+    let toolChoice: unknown;
+    let answerGuidance: string | undefined;
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, opts) => {
+      events.push('llm');
+      answerGuidance = _messages.find((message) => message.role === 'system'
+        && typeof message.content === 'string'
+        && message.content.includes('<research-answer-guidance>'))?.content as string | undefined;
+      researchTurn = opts?.researchTurn;
+      toolChoice = opts?.toolChoice;
+      return 'done';
+    });
+    await runCoreTurn({
+      sessionId: 'named-skill-first-routing',
+      messages: [{ role: 'user', content: prompt }],
+      tools: [{ ...tool, name: 'skill_exec' }],
+      dispatchTool: async () => null,
+      signal,
+      userText: prompt,
+      callbacks: { onStatus: (line) => { statuses.push(line); events.push('status'); } },
+    }, { runResearch: async () => {
+      researchCalls += 1;
+      return { ok: true, output: 'mock evidence' };
+    } });
+    expect(researchTurn).toBe(true);
+    expect(toolChoice).toEqual({ name: 'skill_exec' });
+    expect(answerGuidance).toContain('작은 후속 작업은 추가 질문 없이 현재 턴에서 먼저 처리한다.');
+    expect(answerGuidance).toContain('답은 결론(무엇을 찾았고 무엇을 해 두었는지)을 먼저 말하고, 근거를 짧게 덧붙인다.');
+    expect(answerGuidance).toContain('비용·외부 노출·되돌리기 어려움이 큰 다음 단계만 그 하나를 확인한다. 그 밖에는 묻지 않는다.');
+    expect(answerGuidance).toContain('다음 할 일 목록을 형식으로 요구하지 않는다.');
+    expect(answerGuidance).toContain('질문에 필요한 만큼 읽기 좋게 설명하며, 고정 줄 수나 글자 수로 자르지 않는다.');
+    expect(answerGuidance).not.toContain('추천 하나');
+    expect(researchCalls).toBe(0);
+    expect(statuses).toEqual(['omni-crawl로 요청한 주제의 근거를 찾습니다.\n질문 범위에 맞춰 결론과 근거를 정리합니다.']);
+    expect(statuses[0]!.split('\n')).toHaveLength(2);
+    expect(events).toEqual(['status', 'llm']);
+    expect(statuses).not.toContain('먼저 답변을 시작하고 근거를 확인합니다.');
+  });
+});
 
 async function run(messages: LLMMessage[], userText?: string): Promise<void> {
   await runCoreTurn({

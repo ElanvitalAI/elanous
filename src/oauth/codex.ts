@@ -29,7 +29,8 @@ import { join } from 'node:path';
 import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, resolveCodexAccount, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
 import { decodeJWTPayload } from './jwt.js';
-import { authStorePath } from './store.js';
+import { authStorePath, isUnderTestRunner } from './store.js';
+import { codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { platform, release, arch } from 'node:os';
 import {
   saveTokens, loadTokens, expiresAtFromSeconds,
@@ -428,8 +429,22 @@ function remainingSeconds(state: ProviderAuthState | null): number | null {
 }
 
 export async function loadFreshCodexAuthState(
-  opts: { fetchImpl?: typeof fetch; mirrorCodex?: boolean } = {},
+  opts: { fetchImpl?: typeof fetch; mirrorCodex?: boolean; ownerMirrorPath?: string } = {},
 ): Promise<ProviderAuthState | null> {
+  let tokenOwnerHost = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && isUnderTestRunner();
+  if (!tokenOwnerHost && process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && isCodexTokenOwnerHost()) {
+    const { hqFenceDecision } = await import('../hq/hq.js');
+    tokenOwnerHost = hqFenceDecision('ledger-cli').run;
+  }
+  if (!tokenOwnerHost) {
+    // A non-owner host reads only the HQ-pushed access snapshot. It never
+    // reconciles ~/.codex or reaches the refresh endpoint with local credentials.
+    const mirrorPath = opts.ownerMirrorPath ?? codexOwnerMirrorAuthPath();
+    const account = resolveCodexAccountForRun(process.env, { storePath: mirrorPath });
+    const state = readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath });
+    observeCodexAuth('fresh', { storeKey: account.storeKey, remainingSeconds: remainingSeconds(state), refreshed: false, source: 'owner-cli-mirror' });
+    return state;
+  }
   // ⭐ 어느 «계정»의 토큰인가 — 기본 계정이면 종전과 동일한 키(`openai-codex`)다.
   //   ⛔ 이름 계정이면 그 계정의 스토어 키와 «그 계정의 홈» 미러를 쓴다(A 가 B 를 덮지 않게).
   // ⭐⭐ 그리고 «리밋에 걸렸으면 다른 계정으로 넘긴다»(S4 · 대표 결정).

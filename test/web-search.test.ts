@@ -179,7 +179,7 @@ describe('web-search registry', () => {
 
   test('searchWeb routes to the first available provider', async () => {
     _resetWebSearchProvidersForTests();
-    addWebSearchProviderFirst(stubProvider());
+    addWebSearchProviderFirst(stubProvider({ id: 'exa' }));
     const r = await searchWeb({ query: 'hello' });
     expect(r.providerName).toBe('stub');
     expect(r.hits).toHaveLength(2);
@@ -188,9 +188,9 @@ describe('web-search registry', () => {
 
   test('searchWeb falls through when first provider is unavailable', async () => {
     _resetWebSearchProvidersForTests(false);
-    addWebSearchProvider(stubProvider({ id: 'unavailable', available: () => false }));
+    addWebSearchProvider(stubProvider({ id: 'exa', available: () => false }));
     // Keep the test independent of built-in providers such as ddg-free.
-    addWebSearchProvider(stubProvider());
+    addWebSearchProvider(stubProvider({ id: 'firecrawl' }));
     const r = await searchWeb({ query: 'x' });
     expect(r.providerName).toBe('stub');
   });
@@ -209,10 +209,10 @@ describe('web-search registry', () => {
   test('cascades through providers when earlier ones throw', async () => {
     _resetWebSearchProvidersForTests(false);
     addWebSearchProviderFirst(stubProvider({
-      id: 'broken',
+      id: 'exa',
       search: async () => { throw new Error('boom'); },
     }));
-    addWebSearchProvider(stubProvider({ id: 'working' }));
+    addWebSearchProvider(stubProvider({ id: 'firecrawl' }));
     const r = await searchWeb({ query: 'x' });
     expect(r.providerName).toBe('stub');
   });
@@ -231,7 +231,7 @@ describe('WebSearch tool', () => {
 
   test('formats hits as a numbered list with URL + snippet', async () => {
     _resetWebSearchProvidersForTests();
-    addWebSearchProviderFirst(stubProvider());
+    addWebSearchProviderFirst(stubProvider({ id: 'exa' }));
     const r = await dispatchWebSearch({ query: 'koalas' });
     expect(r.numHits).toBe(2);
     expect(r.output).toContain('2 results for "koalas"');
@@ -249,7 +249,7 @@ describe('WebSearch tool', () => {
   });
 
   test('zero-hit results are labelled distinctly', async () => {
-    addWebSearchProviderFirst(stubProvider({
+    addWebSearchProviderFirst(stubProvider({ id: 'exa',
       search: async () => ({ hits: [], providerName: 'empty', durationMs: 5 }),
     }));
     const r = await dispatchWebSearch({ query: 'nothing-here' });

@@ -9,6 +9,7 @@ import type { DashboardTurnBlockAttachLike } from '../turn-message-runtime.js';
 import type { DashboardAssistantRenderState } from '../turn-tail-runtime.js';
 import type { SearchPlannerState } from '../../session-runtime/index.js';
 import { runDashboardPlainTurnStream } from './dashboard-plain-turn-stream.js';
+import { runConfiguredTurnThrowSim, type TurnThrowSim } from '../../ux-sim/turn-throw-sim.js';
 import {
   formatFailureNotice, matchFailureText, recordFailureSignatureMatch,
 } from '../../self-health/signatures.js';
@@ -103,6 +104,8 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
   readToolDispatchCount?: () => number | null;
 
   attachChatStreamingKeys: (abortCtrl: AbortController) => () => void;
+  /** Test-injectable turn-body failure. Omitted in ordinary callers; the configured simulation remains inert by default. */
+  turnThrowSim?: TurnThrowSim;
   /** ⭐ 관측 심 — 형제 `chat-main-entry-runtime` 과 «같은 형태»다(재발명 0 · `OBS-T124`). */
   debugLog?: (category: string, event: string, payload: Record<string, unknown>, opts?: { level?: 'warn' }) => void;
   createOptionalSpecs: () => Promise<unknown[]>;
@@ -228,6 +231,7 @@ export async function runDashboardChatMainPlainTurn(
       cleanedUp = true;
       attachedCleanupEsc();
     };
+    await (deps.turnThrowSim ?? runConfiguredTurnThrowSim)(stage);
     // ⛔⭐⭐⭐ **「스트리밍 키 사다리가 «이 턴»에 걸렸나」를 값으로 남긴다**(2026-08-19 · `OBS-T124`).
     //
     // 🚨 왜 필요한가 — 대표 제보(*"스트리밍 중 친 발화가 큐에 안 쌓인다"*)를 라이브로 재현했더니
@@ -270,6 +274,7 @@ export async function runDashboardChatMainPlainTurn(
     // message actually carries the pixels/bytes, not just the token.
     await deps.loadAttachments(deps.contextRegistry);
     stage = 'loadAttachments';
+    await (deps.turnThrowSim ?? runConfiguredTurnThrowSim)(stage);
     if (finishIfAborted()) return;
 
     const { userMsg } = deps.buildTurnMessage({
@@ -290,6 +295,7 @@ export async function runDashboardChatMainPlainTurn(
       typeof userMsg.content === 'string' ? userMsg.content : '',
     );
     stage = 'beginCodeEditTurn';
+    await (deps.turnThrowSim ?? runConfiguredTurnThrowSim)(stage);
     if (finishIfAborted()) return;
 
     const preamble = deps.buildTurnPreamble({
@@ -309,6 +315,7 @@ export async function runDashboardChatMainPlainTurn(
     const compactChanged = prePassApplied && (deps.chat.history.length !== beforeCompact.length
       || deps.chat.history.some((message, index) => message !== beforeCompact[index]));
     stage = 'runAutoCompact';
+    await (deps.turnThrowSim ?? runConfiguredTurnThrowSim)(stage);
     if (finishIfAborted()) return;
 
     deps.pushChatLine('');
@@ -317,6 +324,7 @@ export async function runDashboardChatMainPlainTurn(
     let assistantStart = deps.chatLines.length;
     let optionalSpecs = await deps.createOptionalSpecs();
     stage = 'createOptionalSpecs';
+    await (deps.turnThrowSim ?? runConfiguredTurnThrowSim)(stage);
     if (finishIfAborted()) return;
     if (deps.control) {
       const signal = findRecentQuickPassSignal({

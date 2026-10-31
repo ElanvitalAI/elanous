@@ -18,7 +18,7 @@ describe('checkClaudeSubscription', () => {
       return response({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', email: 'private@example.com', accessToken: 'private-token' });
     } });
     expect(calls).toEqual([['claude', ['auth', 'status', '--json'], {
-      env: { PATH: '/bin', HOME: '/home/test' }, encoding: 'utf8', timeout: 5_000,
+      env: { PATH: '/bin', HOME: '/home/test', DISABLE_AUTOUPDATER: '1' }, encoding: 'utf8', timeout: 5_000,
     }]]);
     expect(result).toEqual({ ok: true, authMethod: 'claude.ai', apiProvider: 'firstParty', reason: 'subscription' });
     expect(env.ANTHROPIC_API_KEY).toBe('secret-key');

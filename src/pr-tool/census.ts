@@ -44,6 +44,30 @@ export interface GuardVerdict { status: 'allow' | 'refuse' | 'unknown'; reasons:
   sameCellConflicts?: readonly { pr: number; branch: string | null; headSha: string; cardId: string | null; slice?: { slice: number; total: number } | null }[];
   sameCellReuse?: { number: number; branch: string; headSha: string; cellId: string; cardId: string; legacyBound?: true } }
 
+export interface PrLineageField<T> {
+  status: 'observed' | 'unknown';
+  value: T | null;
+  evidence: string;
+  reason?: string;
+}
+
+/** First, read-only slice: report observed PR facts and leave every unmeasured close criterion unknown. */
+export interface PrLineageObservation {
+  status: 'observed' | 'unknown';
+  pr: number;
+  observedAt: string;
+  currentHead: PrLineageField<string>;
+  supersedes: PrLineageField<number>;
+  sourceCard: PrLineageField<string>;
+  olderScopeCarriedForward: PrLineageField<boolean>;
+  newerProtected: PrLineageField<boolean>;
+  cellStatus: PrLineageField<string>;
+  owner: PrLineageField<string>;
+  mergeSubstitution: PrLineageField<boolean>;
+  closeEligible: false;
+  reason?: string;
+}
+
 const SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 const DEFAULT_SEAT_CAP = 30;
 const DRAFT_STALE_MS = 2 * 24 * 60 * 60 * 1000;
@@ -553,4 +577,110 @@ export function recordGuardUnmeasured(input: { seat: Seat | null; reason: string
     debug.log('pr-tool.open-guard', 'guard-unmeasured', { seat, host, blocked: true, reason: `원장 오류: ${reason}` });
     return { count: 0, blocked: true, reason };
   }
+}
+
+const LINEAGE_READ_FIELDS = 'number,headRefOid,body';
+const LINEAGE_NOT_MEASURED = '첫 PR lineage 조각의 관측 범위 밖이라 아직 판정하지 않음';
+
+function lineageUnknown<T>(reason: string, evidence: string): PrLineageField<T> {
+  return { status: 'unknown', value: null, evidence, reason };
+}
+
+function lineageUnmeasured<T>(): PrLineageField<T> {
+  return lineageUnknown<T>(LINEAGE_NOT_MEASURED, '이 필드는 조회하지 않음');
+}
+
+/**
+ * Read only the PR head and explicit `Supersedes: #N` marker. This deliberately
+ * does not infer whether the PR is safe to close; later lineage fields remain unknown.
+ */
+export function observePrLineage(input: {
+  pr: number;
+  run?: PrToolCommand;
+  cwd?: string;
+  now?: () => Date;
+}): PrLineageObservation {
+  const observedAt = (input.now ?? (() => new Date()))().toISOString();
+  const readEvidence = `gh pr view #${input.pr} --json ${LINEAGE_READ_FIELDS}`;
+  const unknownObservation = (reason: string, currentHead = lineageUnknown<string>(reason, readEvidence),
+    supersedes = lineageUnknown<number>(reason, readEvidence)): PrLineageObservation => ({
+    status: 'unknown', pr: input.pr, observedAt, currentHead, supersedes,
+    sourceCard: lineageUnmeasured<string>(),
+    olderScopeCarriedForward: lineageUnmeasured<boolean>(),
+    newerProtected: lineageUnmeasured<boolean>(),
+    cellStatus: lineageUnmeasured<string>(),
+    owner: lineageUnmeasured<string>(),
+    mergeSubstitution: lineageUnmeasured<boolean>(),
+    closeEligible: false,
+    reason,
+  });
+
+  if (!Number.isSafeInteger(input.pr) || input.pr < 1) return unknownObservation('PR 번호는 1 이상의 정수여야 함');
+  const run = input.run ?? ((command: string, args: readonly string[], options?: { cwd?: string }): PrToolCommandResult => {
+    try {
+      const r = spawnSync(command, [...args], {
+        encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024,
+        ...(options?.cwd ? { cwd: options.cwd } : {}),
+      });
+      return {
+        ok: r.status === 0 && !r.error,
+        out: (r.stdout ?? '').trim(),
+        err: [(r.stderr ?? '').trim(), r.error?.message ?? ''].filter(Boolean).join('\n'),
+      };
+    } catch (error) {
+      return { ok: false, out: '', err: error instanceof Error ? error.message : String(error) };
+    }
+  });
+  const result = run('gh', ['pr', 'view', String(input.pr), '--json', LINEAGE_READ_FIELDS], { cwd: input.cwd });
+  if (!result.ok) return unknownObservation(`PR 읽기 실패: ${result.err?.trim() || '명령 실패'}`);
+
+  let value: unknown;
+  try { value = JSON.parse(result.out); }
+  catch { return unknownObservation('PR 읽기 결과가 JSON이 아님'); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return unknownObservation('PR 읽기 결과가 객체가 아님');
+  const pr = value as Record<string, unknown>;
+  if (pr.number !== input.pr) return unknownObservation('응답 PR 번호가 요청한 번호와 다름');
+
+  const head = typeof pr.headRefOid === 'string' && pr.headRefOid.trim() !== ''
+    ? { status: 'observed' as const, value: pr.headRefOid.trim(), evidence: `${readEvidence}: headRefOid` }
+    : lineageUnknown<string>('headRefOid가 응답에 없어 현재 head를 확인할 수 없음', `${readEvidence}: headRefOid 누락`);
+
+  const bodyWasRead = Object.hasOwn(pr, 'body') && (typeof pr.body === 'string' || pr.body === null);
+  let supersedes: PrLineageField<number>;
+  if (!bodyWasRead) {
+    supersedes = lineageUnknown<number>('body가 응답에 없어 Supersedes 관계를 확인할 수 없음', `${readEvidence}: body 누락`);
+  } else {
+    const lines = (typeof pr.body === 'string' ? pr.body : '').split(/\r?\n/);
+    const markers = lines.filter(line => /^\s*Supersedes\s*:/i.test(line));
+    if (markers.length === 0) {
+      supersedes = { status: 'observed', value: null, evidence: `${readEvidence}: body에서 명시적 Supersedes 줄 0개` };
+    } else if (markers.length !== 1) {
+      supersedes = lineageUnknown<number>('Supersedes 표지가 둘 이상이라 관계가 모호함', `${readEvidence}: Supersedes 줄 ${markers.length}개`);
+    } else {
+      const match = /^\s*Supersedes:\s*#([1-9]\d*)\s*$/i.exec(markers[0]!);
+      const number = match ? Number(match[1]) : NaN;
+      if (!Number.isSafeInteger(number) || number < 1 || number === input.pr) {
+        supersedes = lineageUnknown<number>('Supersedes 줄이 유효한 다른 PR 번호가 아님', `${readEvidence}: Supersedes 형식 오류`);
+      } else {
+        supersedes = { status: 'observed', value: number, evidence: `${readEvidence}: body의 명시적 줄 “Supersedes: #${number}”` };
+      }
+    }
+  }
+
+  const status = head.status === 'observed' && supersedes.status === 'observed' ? 'observed' : 'unknown';
+  return {
+    status,
+    pr: input.pr,
+    observedAt,
+    currentHead: head,
+    supersedes,
+    sourceCard: lineageUnmeasured<string>(),
+    olderScopeCarriedForward: lineageUnmeasured<boolean>(),
+    newerProtected: lineageUnmeasured<boolean>(),
+    cellStatus: lineageUnmeasured<string>(),
+    owner: lineageUnmeasured<string>(),
+    mergeSubstitution: lineageUnmeasured<boolean>(),
+    closeEligible: false,
+    ...(status === 'unknown' ? { reason: '일부 PR 사실을 읽지 못함' } : {}),
+  };
 }

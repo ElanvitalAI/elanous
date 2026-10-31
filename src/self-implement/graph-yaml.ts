@@ -37,6 +37,8 @@ export interface GraphNodeSpec {
   /** Entry selected by this call when a unit exposes more than one entry. */
   readonly callEntry?: string;
   readonly budget?: { readonly innerSteps: number };
+  /** ARG L upper bound inherited by this child graph call. */
+  readonly allowance?: { readonly innerSteps: number };
   /** L1: skip this optional node when a measured state condition holds. */
   readonly skipWhen?: string;
 }
@@ -65,6 +67,8 @@ export interface GraphTemplateSpec {
   /** 문서 전용 변경이면 gate 노드를 건너뛸 수 있다는 템플릿 정책. */
   readonly docsOnlyGateSkip?: boolean;
   readonly state?: readonly string[];
+  /** ARG L upper bound for this graph's total executed steps. */
+  readonly allowance?: { readonly innerSteps: number };
   /** ⭐ 런 계약(선택) — 이 그래프가 «기본으로» 요구하는 실행 칸 등. 발사 인자가 덮는다(graph-run-contract.ts). */
   readonly runContract?: GraphRunContractSpec;
   readonly unit?: { readonly inputs: readonly string[]; readonly outputs: readonly string[]; readonly exits: readonly string[]; readonly entries?: readonly string[] };
@@ -148,6 +152,14 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
 
   const terminalNodes = asArray(doc.terminal_nodes).filter((v): v is string => typeof v === 'string');
   if (terminalNodes.length === 0) errors.push({ path: `${label}/terminal_nodes`, message: 'terminal_nodes 가 비었다 — 끝날 수 없는 그래프다' });
+  let allowance: GraphTemplateSpec['allowance'];
+  if (doc.allowance !== undefined) {
+    const value = doc.allowance as Record<string, unknown> | undefined;
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !Number.isSafeInteger(value.inner_steps) ||
+        (value.inner_steps as number) < 1 || Object.keys(value).some(key => key !== 'inner_steps'))
+      errors.push({ path: `${label}/allowance/inner_steps`, message: 'inner_steps 는 1 이상의 안전한 정수여야 한다' });
+    else allowance = { innerSteps: value.inner_steps as number };
+  }
 
   const journeyStages = doc.journey_stages;
   if (journeyStages !== undefined && (!Array.isArray(journeyStages) || journeyStages.length === 0
@@ -202,21 +214,28 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       : undefined;
     // A subgraph node becomes a unit call only when it names `call:`; without it the node keeps the
     // pre-unit meaning (catalog role / recipe node), so existing declarations stay valid.
-    if (kind === 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.call_entry !== undefined)) {
+    if (kind === 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.allowance !== undefined || n.call_entry !== undefined)) {
       if (typeof n.call !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*@(?:\^?[1-9]\d*)$/.test(n.call))
         errors.push({ path: `${at}/call`, message: 'call 은 id@정수판 또는 id@^주판이어야 한다' });
       const budget = n.budget as Record<string, unknown> | undefined;
       if (!budget || typeof budget !== 'object' || Array.isArray(budget) ||
           !Number.isSafeInteger(budget.inner_steps) || (budget.inner_steps as number) < 1 || Object.keys(budget).some(key => key !== 'inner_steps'))
         errors.push({ path: `${at}/budget/inner_steps`, message: 'inner_steps 는 1 이상의 안전한 정수여야 한다' });
+      if (n.allowance !== undefined) {
+        const childAllowance = n.allowance as Record<string, unknown> | undefined;
+        if (!childAllowance || typeof childAllowance !== 'object' || Array.isArray(childAllowance) ||
+            !Number.isSafeInteger(childAllowance.inner_steps) || (childAllowance.inner_steps as number) < 1 ||
+            Object.keys(childAllowance).some(key => key !== 'inner_steps'))
+          errors.push({ path: `${at}/allowance/inner_steps`, message: 'inner_steps 는 1 이상의 안전한 정수여야 한다' });
+      }
       if (!contractRaw || !Array.isArray(contractRaw.inputs) || !contractRaw.inputs.every(v => typeof v === 'string') ||
           !Array.isArray(contractRaw.outputs) || !contractRaw.outputs.every(v => typeof v === 'string'))
         errors.push({ path: `${at}/contract`, message: 'subgraph 에는 inputs·outputs 계약이 필요하다' });
       if (recipe !== 'none') errors.push({ path: `${at}/recipe`, message: 'subgraph 는 recipe 를 실행하지 않는다' });
       if (n.call_entry !== undefined && (typeof n.call_entry !== 'string' || !n.call_entry.trim()))
         errors.push({ path: `${at}/call_entry`, message: 'call_entry 는 비어 있지 않은 노드 id 여야 한다' });
-    } else if (kind !== 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.call_entry !== undefined)) {
-      errors.push({ path: at, message: 'call·call_entry·budget 은 subgraph 전용이다' });
+    } else if (kind !== 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.allowance !== undefined || n.call_entry !== undefined)) {
+      errors.push({ path: at, message: 'call·call_entry·budget·allowance 은 subgraph 전용이다' });
     }
     // ⛔ 계약이 없으면 「이 노드가 무엇을 할 수 있나」를 답할 수 없다 — 경고로 남긴다(거절은 오버레이 쪽).
     if (contract === undefined) warnings.push({ path: `${at}/contract`, message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' });
@@ -235,6 +254,9 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(kind === 'subgraph' && n.budget && typeof n.budget === 'object' && !Array.isArray(n.budget) &&
         typeof (n.budget as Record<string, unknown>).inner_steps === 'number'
         ? { budget: { innerSteps: (n.budget as { inner_steps: number }).inner_steps } } : {}),
+      ...(kind === 'subgraph' && n.allowance && typeof n.allowance === 'object' && !Array.isArray(n.allowance) &&
+        typeof (n.allowance as Record<string, unknown>).inner_steps === 'number'
+        ? { allowance: { innerSteps: (n.allowance as { inner_steps: number }).inner_steps } } : {}),
       ...(typeof n.skip_when === 'string' ? { skipWhen: n.skip_when } : {}),
     });
   }
@@ -358,6 +380,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(loop ? { loop } : {}),
       ...(typeof doc.docs_only_gate_skip === 'boolean' ? { docsOnlyGateSkip: doc.docs_only_gate_skip } : {}),
       ...(Array.isArray(doc.state) ? { state: doc.state.filter((v): v is string => typeof v === 'string') } : {}),
+      ...(allowance ? { allowance } : {}),
       ...(runContract.spec ? { runContract: runContract.spec } : {}),
     },
     errors, warnings,

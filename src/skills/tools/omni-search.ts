@@ -2,8 +2,8 @@
 //
 // Skill-essence extraction of ~/.claude/skills/omni-crawl/. Different
 // from WebSearch (cascade — first available wins): omni_search runs
-// EVERY available web-search provider in PARALLEL and merges their
-// hits, so the LLM gets a wider net for research-intent queries.
+// every selected provider in parallel and merges hits. Research dispatch
+// has a narrower Exa/Firecrawl allowlist; Grok is reserved for explicit X intent.
 //
 // Probe: at least 2 providers available. With only 1, plain WebSearch
 // is sufficient — no point paying the parallel-fan-out cost.
@@ -13,7 +13,7 @@
 //   by-engine   — group hits under per-provider headings
 
 import type { LLMToolSpec } from '../../llm.js';
-import { getAvailableWebSearchProviders } from '../../web-search/index.js';
+import { getAvailableResearchWebSearchProviders, getAvailableWebSearchProviders } from '../../web-search/index.js';
 import type { WebSearchHit } from '../../web-search/provider.js';
 
 export interface OmniSearchArgs {
@@ -43,6 +43,8 @@ export interface OmniSearchDispatchOpts {
   /** Observational only: callback failures must not interrupt a provider search. */
   onEngine?: (event: OmniSearchEngineEvent) => void;
   onSource?: (source: WebSearchHit & { engine: string }) => void;
+  /** Test seam for verifying that sequential research providers share one deadline. */
+  now?: () => number;
 }
 
 const DEFAULT_LIMIT = 5;
@@ -52,9 +54,9 @@ export function buildOmniSearchTool(): LLMToolSpec {
   return {
     name: 'OmniSearch',
     description:
-      'Multi-provider web search — fans out to every configured search provider in parallel and ' +
-      'merges hits. Wider coverage than WebSearch (cascade). Use for research-intent queries ' +
-      'where you want triangulation across Grok / Firecrawl / etc. Probe-gated: requires at ' +
+      'Multi-provider web search — fans out to configured search providers in parallel and ' +
+      'merges hits. Wider coverage than WebSearch (cascade). Research searches use bounded ' +
+      'Exa / Firecrawl routes; Grok is reserved for explicit X/Twitter intent. Probe-gated: requires at ' +
       'least 2 available providers (otherwise WebSearch already covers it).',
     parameters: {
       type: 'object',
@@ -73,13 +75,22 @@ export function buildOmniSearchTool(): LLMToolSpec {
   };
 }
 
-const RESEARCH_GROK_TIMEOUT_MS = 8_000;
+const RESEARCH_SEARCH_BUDGET_MS = 14_500;
+const RESEARCH_WEB_FALLBACK_IDS = ['exa', 'firecrawl'];
+const RESEARCH_EXA_TIMEOUT_MS = 4_500;
+const researchHits = new WeakMap<OmniSearchResult, Record<string, WebSearchHit[]>>();
 
 export async function dispatchOmniSearch(
   rawArgs: Record<string, unknown>,
   opts: OmniSearchDispatchOpts = {},
 ): Promise<OmniSearchResult> {
-  return dispatchWithProviders(validate(rawArgs), opts);
+  const args = validate(rawArgs);
+  const allowed = getAvailableResearchProviders();
+  const requested = args.engines === undefined ? undefined : new Set(args.engines.map(id => id.toLowerCase()));
+  const providers = requested === undefined
+    ? allowed
+    : allowed.filter(provider => requested.has(provider.id.toLowerCase()));
+  return dispatchWithProviders(args, opts, providers);
 }
 
 export async function dispatchResearchOmniSearch(
@@ -87,19 +98,104 @@ export async function dispatchResearchOmniSearch(
   opts: OmniSearchDispatchOpts = {},
 ): Promise<OmniSearchResult> {
   const args = validate(rawArgs);
+  const now = opts.now ?? Date.now;
+  const deadlineAt = now() + RESEARCH_SEARCH_BUDGET_MS;
   const selected = getAvailableResearchProviders();
   const requested = args.engines === undefined ? undefined : new Set(args.engines.map(id => id.toLowerCase()));
   const providers = requested === undefined
     ? selected
     : selected.filter(provider => requested.has(provider.id.toLowerCase()));
-  return dispatchWithProviders(args, opts, providers, { grokTimeoutMs: RESEARCH_GROK_TIMEOUT_MS });
+  const webFallback = providers.filter(provider => RESEARCH_WEB_FALLBACK_IDS.includes(provider.id));
+  const webResult = await dispatchResearchWebFallback(args, opts, webFallback, deadlineAt);
+  return combineResearchResults(args, emptyOmniSearchResult(args), webResult);
+}
+
+function emptyOmniSearchResult(args: OmniSearchArgs): OmniSearchResult {
+  const result: OmniSearchResult = {
+    output: '',
+    metadata: { perEngine: {}, totalHits: 0, merge: args.merge ?? 'interleave' },
+  };
+  researchHits.set(result, {});
+  return result;
+}
+
+async function dispatchResearchWebFallback(
+  args: OmniSearchArgs,
+  opts: OmniSearchDispatchOpts,
+  providers: ReturnType<typeof getAvailableWebSearchProviders>,
+  deadlineAt: number,
+): Promise<OmniSearchResult> {
+  const accumulated = emptyOmniSearchResult(args);
+  for (const provider of providers) {
+    const result = await dispatchWithProviders(args, opts, [provider], {
+      deadlineAt,
+      now: opts.now ?? Date.now,
+    });
+    Object.assign(accumulated.metadata.perEngine, result.metadata.perEngine);
+    accumulated.metadata.totalHits += result.metadata.totalHits;
+    accumulated.output += accumulated.output && result.output ? `\n\n${result.output}` : result.output;
+    Object.assign(researchHits.get(accumulated)!, researchHits.get(result));
+    const details = result.metadata.perEngine[provider.id];
+    // A successful but empty response is no usable research evidence, so continue to the next provider.
+    if (details && !details.error && details.hits > 0) break;
+  }
+  return accumulated;
+}
+
+function combineResearchResults(
+  args: OmniSearchArgs,
+  grokResult: OmniSearchResult,
+  webResult: OmniSearchResult,
+): OmniSearchResult {
+  const perEngine = { ...grokResult.metadata.perEngine, ...webResult.metadata.perEngine };
+  const hitsByEngine = { ...researchHits.get(grokResult), ...researchHits.get(webResult) };
+  const merge = args.merge ?? 'interleave';
+  const limit = Math.max(1, Math.min(args.limit ?? DEFAULT_LIMIT, MAX_LIMIT));
+  const merged = (merge === 'interleave'
+    ? interleaveHits(Object.fromEntries(Object.entries(hitsByEngine).map(([id, hits]) => [id, { hits }])))
+    : groupByEngine(Object.fromEntries(Object.entries(hitsByEngine).map(([id, hits]) => [id, { hits }]))))
+    .slice(0, limit);
+  const selectedByEngine = new Map<string, WebSearchHit[]>();
+  for (const [id, hits] of Object.entries(hitsByEngine)) selectedByEngine.set(id, []);
+  // Keep merge order for the global limit while retaining each source heading.
+  for (const hit of merged) {
+    const id = Object.keys(hitsByEngine).find(engine => hitsByEngine[engine]!.includes(hit));
+    if (id) selectedByEngine.get(id)!.push(hit);
+  }
+  const output: string[] = [`omni_search "${args.query}" — ${merged.length} hits across ${Object.keys(perEngine).length} provider${Object.keys(perEngine).length === 1 ? '' : 's'}`];
+  for (const [id, info] of Object.entries(perEngine)) {
+    output.push(`  ${id}: ${selectedByEngine.get(id)?.length ?? 0} hits in ${info.durationMs}ms${info.error ? ` ERROR: ${info.error}` : ''}`);
+  }
+  output.push('');
+  if (merge === 'by-engine') {
+    for (const [id, hits] of selectedByEngine) {
+      if (hits.length === 0) continue;
+      output.push(`## ${id}`);
+      for (const hit of hits) output.push(formatHit(hit));
+      output.push('');
+    }
+  } else {
+    for (const hit of merged) output.push(formatHit(hit));
+  }
+  const result: OmniSearchResult = {
+    output: output.join('\n'),
+    metadata: {
+      perEngine: Object.fromEntries(Object.entries(perEngine).map(([id, info]) => [id, {
+        ...info, hits: selectedByEngine.get(id)?.length ?? 0,
+      }])),
+      totalHits: merged.length,
+      merge,
+    },
+  };
+  researchHits.set(result, hitsByEngine);
+  return result;
 }
 
 async function dispatchWithProviders(
   args: OmniSearchArgs,
   opts: OmniSearchDispatchOpts,
   selectedProviders?: ReturnType<typeof getAvailableWebSearchProviders>,
-  researchLimits?: { grokTimeoutMs: number },
+  researchLimits?: { deadlineAt: number; now: () => number },
 ): Promise<OmniSearchResult> {
   const merge = args.merge ?? 'interleave';
   const limit = Math.max(1, Math.min(args.limit ?? DEFAULT_LIMIT, MAX_LIMIT));
@@ -136,7 +232,12 @@ async function dispatchWithProviders(
         recencyDays: args.recency_days,
       };
       let result;
-      if (researchLimits && (p.id === 'grok' || p.id === 'grok-api')) {
+      if (researchLimits) {
+        const remainingMs = researchLimits.deadlineAt - researchLimits.now();
+        const timeoutMs = p.id === 'exa'
+          ? Math.min(RESEARCH_EXA_TIMEOUT_MS, remainingMs)
+          : remainingMs;
+        if (timeoutMs <= 0) throw new DOMException('Research search budget exhausted', 'TimeoutError');
         const controller = new AbortController();
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
@@ -145,8 +246,8 @@ async function dispatchWithProviders(
             new Promise<never>((_, reject) => {
               timer = setTimeout(() => {
                 controller.abort();
-                reject(new DOMException(`Grok research search timed out after ${researchLimits.grokTimeoutMs}ms`, 'TimeoutError'));
-              }, researchLimits.grokTimeoutMs);
+                reject(new DOMException(`Research search timed out after ${timeoutMs}ms`, 'TimeoutError'));
+              }, timeoutMs);
             }),
           ]);
         } finally {
@@ -196,7 +297,7 @@ async function dispatchWithProviders(
     for (const h of merged) lines.push(formatHit(h));
   }
 
-  return {
+  const result: OmniSearchResult = {
     output: lines.join('\n'),
     metadata: {
       perEngine: Object.fromEntries(Object.entries(perEngine).map(([k, v]) => [k, {
@@ -206,16 +307,18 @@ async function dispatchWithProviders(
       merge,
     },
   };
+  researchHits.set(result, Object.fromEntries(Object.entries(perEngine).map(([id, info]) => [id, info.hits])));
+  return result;
 }
 
-/** Probe-compatible: at least 2 search providers available for ordinary omni_search. */
+/** Probe-compatible: at least 2 Exa/Firecrawl providers available for omni_search. */
 export function omniSearchAvailable(): boolean {
-  return getAvailableWebSearchProviders().length >= 2;
+  return getAvailableResearchProviders().length >= 2;
 }
 
-/** Research-only probe: require the bounded Grok/Firecrawl research pair. */
+/** Research-only probe: require one bounded Exa/Firecrawl web route. */
 export function researchOmniSearchAvailable(): boolean {
-  return getAvailableResearchProviders().length >= 2;
+  return getAvailableResearchProviders().some(provider => RESEARCH_WEB_FALLBACK_IDS.includes(provider.id));
 }
 
 export function getAvailableResearchSearchEngineIds(): string[] {
@@ -223,13 +326,8 @@ export function getAvailableResearchSearchEngineIds(): string[] {
 }
 
 function getAvailableResearchProviders(): ReturnType<typeof getAvailableWebSearchProviders> {
-  const available = getAvailableWebSearchProviders();
-  const grok = available.find(provider => provider.id === 'grok')
-    ?? available.find(provider => provider.id === 'grok-api');
-  return [
-    ...(grok ? [grok] : []),
-    ...available.filter(provider => provider.id === 'firecrawl'),
-  ];
+  const available = getAvailableResearchWebSearchProviders();
+  return RESEARCH_WEB_FALLBACK_IDS.flatMap(id => available.filter(provider => provider.id === id));
 }
 
 function interleaveHits(perEngine: Record<string, { hits: WebSearchHit[] }>): WebSearchHit[] {

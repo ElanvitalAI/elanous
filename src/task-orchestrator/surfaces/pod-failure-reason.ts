@@ -1,3 +1,5 @@
+import { podChildProviderOf, type PodChildProvider } from './pod-child-providers.js';
+
 /** STOP-RECORD stop_class values used by the card terminal classifier. */
 export const STOP_CLASS_POD_FAILURE = 'pod-failure' as const;
 export const STOP_CLASS_NO_LAUNCH = 'no-launch' as const;
@@ -20,12 +22,19 @@ export function nestedPodResult(row: Record<string, unknown>): {
   const result = row.result as Record<string, unknown>;
   if (typeof result.stage !== 'string' || typeof result.ok !== 'boolean') return null;
   if (result.ok) return { stage: result.stage, ok: true };
+  // The terminal stage/node/outcome often says only `aborted` or `abandoned`.
+  // Keep the child's explicit stop detail (for example a same-cell PR guard
+  // failure) while retaining the established node/outcome/classification text.
+  // Forward only the typed guard failure this path owns. Other aborted children
+  // can carry verbose PTY summaries in `detail`; those are not parent attribution.
+  const explicitDetail = result.detailKind === 'blocked-draft-pr-guard' ? ledgerString(result.detail) : '';
   const classification = result.abandonedClassification;
   const detail = typeof result.supervisorVerdict === 'string' ? result.supervisorVerdict
     : classification && typeof classification === 'object' && !Array.isArray(classification)
       ? (classification as Record<string, unknown>).classification : undefined;
   const reason = [result.node, result.outcome].filter((part): part is string => typeof part === 'string' && part.length > 0).join(' ');
-  const error = [reason || (typeof result.error === 'string' ? result.error : ''), typeof detail === 'string' && detail ? detail : ''].filter(Boolean).join(' · ');
+  const error = [reason || (typeof result.error === 'string' ? result.error : ''), typeof detail === 'string' && detail ? detail : '', explicitDetail]
+    .filter(Boolean).join(' · ');
   // PREFLIGHT-RESULT-LINE: a nested preflight rejection carries its blockers under result.blockers — the same ledger fields as the flat row.
   const blockers = result.stage === 'preflight-blocked' ? preflightBlockerText(result.blockers)
     : { error: '', preflightChecks: [] as PreflightCheck[] };
@@ -121,6 +130,15 @@ export function podTerminalRow(row: Record<string, unknown>): {
   return nestedPodResult(row);
 }
 
+/**
+ * OBS-GAP-BATCH-1030 — 자식 LLM 실패의 «누가·어떤 HTTP status 로» 죽었나를 부모 원장에 얹는 두 스칼라.
+ * ⛔ 응답 본문·메시지·자격증명은 담지 않는다 — provider 는 정규 id, status 는 4xx/5xx 숫자뿐이다.
+ */
+export interface PodProviderFailureFact {
+  readonly provider?: PodChildProvider;
+  readonly httpStatusCode?: number;
+}
+
 export const POD_EXIT_CLASSES = ['oom-killed', 'deadline-exceeded', 'gh-login-failed', 'pod-secret', 'ask-reprompt', 'provider-error', 'child-unconverged', 'child-error', 'no-result-line', 'unknown'] as const;
 
 export type PodExitClass = typeof POD_EXIT_CLASSES[number];
@@ -143,6 +161,8 @@ export function podChildEvidenceLedgerRow(input: {
   noResultDiagnostic?: string | null;
   noResultLogEvidence?: Record<string, unknown> | null;
   podTermination?: PodTermination | null;
+  /** OBS-GAP-BATCH-1030 — 실패 행에만 붙는 두 스칼라(provider · HTTP status). 없으면 종전 행 그대로. */
+  providerFailure?: PodProviderFailureFact | null;
 }): Record<string, unknown> | null {
   const { result } = input;
   const persist = input.state === 'failed' || input.state === 'aborted' || input.noResultLogEvidence != null
@@ -163,6 +183,8 @@ export function podChildEvidenceLedgerRow(input: {
     childEvidence,
     childRunId: input.childRunId,
     job: input.job,
+    ...(input.providerFailure?.provider ? { provider: input.providerFailure.provider } : {}),
+    ...(input.providerFailure?.httpStatusCode !== undefined ? { httpStatusCode: input.providerFailure.httpStatusCode } : {}),
     ...(input.podTermination ? { podTermination: input.podTermination } : {}),
     ...(childResult && Object.keys(childResult).length > 0 ? { childResult } : {}),
   };
@@ -193,6 +215,75 @@ function isPodProviderErrorLine(line: string): boolean {
     } catch { /* 일반 줄이 중괄호로 시작할 수 있다. */ }
   }
   return POD_PROVIDER_ERROR_LINE.test(line);
+}
+
+/** 401·429·503 같은 «상태 숫자»만 — 응답 본문·메시지는 돌려주지 않는다. 4xx/5xx 밖의 수는 상태가 아니다. */
+function podProviderHttpStatus(line: string): number | undefined {
+  const explicit = /"status"\s*:\s*(\d{3})/u.exec(line) ?? /\b(?:LLM API|HTTP|status(?:[ _-]?code)?)\b\s*[:=]?\s*(\d{3})\b/iu.exec(line);
+  // 맨숫자 형태는 «상태 자리»에 선 것만 — `500ms`·`1.5e3` 같은 수를 상태로 세지 않는다.
+  const digits = (explicit ?? /(?:^|[^\d])([45]\d{2})(?![\d\p{L}.])/u.exec(line))?.[1];
+  const value = digits === undefined ? NaN : Number(digits);
+  return Number.isSafeInteger(value) && value >= 400 && value <= 599 ? value : undefined;
+}
+
+/** 줄이 이름한 provider — `llm.<id>` 접두 우선, 없으면 줄 안의 정식 이름/별칭. 목록 밖 이름은 세지 않는다. */
+function podLineProvider(line: string): PodChildProvider | undefined {
+  const scoped = /\bllm\.([a-z0-9_-]+)\b/iu.exec(line)?.[1];
+  const scopedProvider = podChildProviderOf(scoped);
+  if (scopedProvider) return scopedProvider;
+  for (const token of line.match(/[A-Za-z][A-Za-z0-9_-]{1,31}/gu) ?? []) {
+    const provider = podChildProviderOf(token);
+    if (provider) return provider;
+  }
+  return undefined;
+}
+
+/** provider 실패를 «말하는» 줄 — 분류기가 provider-error 로 읽는 줄, 또는 자식이 낸 `LLM API <status>` 문면. */
+const isPodProviderFailureSource = (line: string): boolean => isPodProviderErrorLine(line) || /\bLLM API\s+\d{3}\b/iu.test(line);
+
+/**
+ * 마지막 canonical 자식 terminal 과 «그 직전» 구간 — duplicate-cap 귀속의 한 자리(classifyPodExit 과 같은 규칙).
+ * terminal 이 없으면 구간은 전체 로그다(결과행 없는 자식도 provider 실패는 귀속된다).
+ */
+function podTerminalWindow(logs: string): { terminal: ReturnType<typeof podTerminalRow>; window: string[] } {
+  const lines = logs.split(/\r\n|\n|\r/u);
+  let terminal: ReturnType<typeof podTerminalRow> = null;
+  let lastIndex = -1;
+  let previousIndex = -1;
+  for (const [index, raw] of lines.entries()) {
+    const line = raw.trim();
+    if (!line.startsWith('{')) continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const row = podTerminalRow(parsed as Record<string, unknown>);
+    if (!row) continue;
+    previousIndex = lastIndex;
+    terminal = row;
+    lastIndex = index;
+  }
+  const window = lines.slice(previousIndex + 1, lastIndex === -1 ? undefined : lastIndex)
+    .map((line) => line.trim()).filter(Boolean);
+  return { terminal, window };
+}
+
+/**
+ * OBS-GAP-BATCH-1030 — 자식 실패를 «공급자 + HTTP status» 로 귀속한다(응답 본문·자격증명 제외).
+ * 마지막 canonical terminal 이 성공이면 null — 과거(재시도 전) provider 실패를 성공한 결과에 재사용하지 않는다.
+ * 줄이 공급자를 이름하지 않으면 호출자가 준 hint(Pod 의 자식 provider)를 정규 id 로만 쓴다.
+ */
+export function podChildProviderFailureFact(logs: string, opts?: { providerHint?: string }): PodProviderFailureFact | null {
+  const { terminal, window } = podTerminalWindow(logs);
+  if (terminal?.ok === true) return null;
+  const terminalErrors = typeof terminal?.error === 'string'
+    ? terminal.error.split(/\r\n|\n|\r/u).map((line) => line.trim()).filter(Boolean) : [];
+  const sources = [...window, ...terminalErrors].filter((line) => isPodProviderFailureSource(line)).reverse();
+  if (!sources.length) return null;
+  // 마지막 줄이 `LLM API <status>` 만 말할 수 있다 — 공급자는 «이름한» 줄에서 따로 찾는다.
+  const provider = sources.map(podLineProvider).find((named) => named !== undefined) ?? podChildProviderOf(opts?.providerHint);
+  const httpStatusCode = sources.map(podProviderHttpStatus).find((status) => status !== undefined);
+  if (!provider && httpStatusCode === undefined) return null;
+  return { ...(provider ? { provider } : {}), ...(httpStatusCode !== undefined ? { httpStatusCode } : {}) };
 }
 
 /**

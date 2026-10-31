@@ -23,6 +23,15 @@ test('virtual-window control and context tools are absent while essential tools 
   }
   expect(mcpNames.has('GetDashboardState')).toBe(true);
   expect(mcpNames.has('ContextBootstrap')).toBe(true);
+  const tuiNames = new Set(listNativeToolsForHost('tui').flatMap(tool => [tool.id, tool.displayName, ...tool.aliases]));
+  expect(tuiNames.has('elanous_linear_secretary')).toBe(true);
+  expect(tuiNames.has('elanous_linear_issue')).toBe(true);
+  expect(nativeToolCatalog.find(tool => tool.id === 'elanous_linear_issue')).toMatchObject({
+    host: ['tui', 'mcp'], safety: ['mutating', 'network'], supportsParallel: false, defaultEnabled: true,
+  });
+  expect(nativeToolCatalog.find(tool => tool.id === 'elanous_linear_secretary')).toMatchObject({
+    host: ['tui', 'mcp'], safety: ['mutating', 'network'], supportsParallel: false, defaultEnabled: true,
+  });
 });
 
 describe('solve_mission native catalog entry', () => {

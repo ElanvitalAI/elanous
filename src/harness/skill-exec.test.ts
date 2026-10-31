@@ -8,7 +8,7 @@ function entry(over: Partial<SkillIndexEntry>): SkillIndexEntry {
   return { name: 'x', description: 'd', triggers: [], extractedTriggers: [], autoTrigger: false, category: 'c', skillDir: '/x', ...over } as SkillIndexEntry;
 }
 
-// omni-digest = allowlist / stochastic-multi-agent-consensus = allowlist 밖(에이전트 배치).
+// OP-approved research skills are allowlisted / stochastic-multi-agent-consensus stays blocked.
 const index = [
   entry({ name: 'omni-digest', description: 'URL 요약', triggers: ['요약', 'digest', 'summarize'] }),
   entry({ name: 'stochastic-multi-agent-consensus', description: 'N 에이전트', triggers: ['consensus', 'poll agents'] }),
@@ -52,15 +52,17 @@ describe('execHarnessSkill', () => {
     expect(r).toBeNull();
   });
 
-  test('allowlist 는 에이전트 배치 skill 제외(안전)', () => {
+  test('allowlist has OP-approved research skills while keeping stochastic batches excluded', () => {
     expect(HARNESS_EXEC_ALLOWLIST.has('omni-digest')).toBe(true);
+    for (const skill of ['omni-crawl', 'asset-attractiveness', 'social-pulse', 'attractiveness-panel', 'factor-backtest']) {
+      expect(HARNESS_EXEC_ALLOWLIST.has(skill)).toBe(true);
+    }
     expect(HARNESS_EXEC_ALLOWLIST.has('stochastic-multi-agent-consensus')).toBe(false);
-    expect(HARNESS_EXEC_ALLOWLIST.has('omni-crawl')).toBe(false);   // research seam 이 커버(중복 회피)
   });
 });
 
 describe('resolveHarnessExecAllowlist — S2 config 확장(config-first·안전 블록리스트)', () => {
-  test('미설정/빈 배열 → 기본 3개 그대로(무회귀·동일 참조)', () => {
+  test('미설정/빈 배열 → 승인 기본 목록 그대로(무회귀·동일 참조)', () => {
     expect(resolveHarnessExecAllowlist()).toBe(HARNESS_EXEC_ALLOWLIST);
     expect(resolveHarnessExecAllowlist([])).toBe(HARNESS_EXEC_ALLOWLIST);
   });
@@ -72,16 +74,23 @@ describe('resolveHarnessExecAllowlist — S2 config 확장(config-first·안전 
     expect(r.has('psd-korea-trader')).toBe(true);
   });
 
+  test('OP-approved attractiveness-panel exception is consistent for config resolution', () => {
+    const rejected: string[] = [];
+    const r = resolveHarnessExecAllowlist(['attractiveness-panel'], skill => rejected.push(skill));
+    expect(r.has('attractiveness-panel')).toBe(true);
+    expect(rejected).toEqual([]);
+  });
+
   test('위험 패턴(stochastic/-panel/consensus)은 config 에 있어도 강제 제외 + onReject 관측', () => {
     const rejected: Array<{ skill: string; reason: string }> = [];
     const r = resolveHarnessExecAllowlist(
-      ['stochastic-multi-agent-consensus', 'attractiveness-panel', 'safe-skill'],
+      ['stochastic-multi-agent-consensus', 'generic-panel', 'safe-skill'],
       (skill, reason) => rejected.push({ skill, reason }),
     );
     expect(r.has('stochastic-multi-agent-consensus')).toBe(false);
-    expect(r.has('attractiveness-panel')).toBe(false);   // -panel
+    expect(r.has('generic-panel')).toBe(false);   // -panel
     expect(r.has('safe-skill')).toBe(true);
-    expect(rejected.map((x) => x.skill).sort()).toEqual(['attractiveness-panel', 'stochastic-multi-agent-consensus']);
+    expect(rejected.map((x) => x.skill).sort()).toEqual(['generic-panel', 'stochastic-multi-agent-consensus']);
     for (const { reason } of rejected) {
       expect(reason).toContain('자동 실행 대상 아님');
       expect(reason).toContain('Agent 배치·고비용 자동실행 금지');

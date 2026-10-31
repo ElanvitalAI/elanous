@@ -13,6 +13,7 @@ import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp, toolsForTuiRoute } from './core-turn-bridge.js';
 import { buildWebSearchTool } from '../boot/daemon-tools/web-search.js';
 import { buildUserConfig } from '../user-config.js';
+import { RESEARCH_TURN_MAX_TOOL_TURNS } from '../core-turn/research-policy.js';
 
 const question = 'OpenAI 최근 모델이 뭐야?';
 const search = { name: 'WebSearch', description: '', parameters: { type: 'object' as const } };
@@ -20,6 +21,7 @@ const search = { name: 'WebSearch', description: '', parameters: { type: 'object
 function fixture(text = question, overrides: { max?: number; configMax?: number; grant?: boolean } = {}) {
   const calls: CoreTurnContext[] = [];
   const pushes: string[] = [];
+  const metaPushes: Array<{ text: string; meta?: Record<string, unknown> }> = [];
   const persisted: string[] = [];
   const completed: LLMMessage[][] = [];
   const updates: Array<{ update: Record<string, unknown>; meta?: Record<string, unknown> }> = [];
@@ -49,14 +51,28 @@ function fixture(text = question, overrides: { max?: number; configMax?: number;
     sessionId: 'fact-test', cwd: '/tmp', userText: text,
     promptBlocks: [{ type: 'text', text }], isAborted: () => false,
     push: async (delta: string) => { pushes.push(delta); },
-    pushWithMeta: async () => {}, pushSessionUpdate: async (update: Record<string, unknown>, meta?: Record<string, unknown>) => { updates.push({ update, ...(meta ? { meta } : {}) }); },
+    pushWithMeta: async (text: string, meta?: Record<string, unknown>) => { metaPushes.push({ text, ...(meta ? { meta } : {}) }); },
+    pushSessionUpdate: async (update: Record<string, unknown>, meta?: Record<string, unknown>) => { updates.push({ update, ...(meta ? { meta } : {}) }); },
     pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
     requestApproval: async () => 'deny-once' as const,
   } as unknown as AcpTurnContext;
-  return { runTurn: () => runTurn(turn), calls, pushes, persisted, completed, dispatched, updates, log };
+  return { runTurn: () => runTurn(turn), calls, pushes, metaPushes, persisted, completed, dispatched, updates, log };
 }
 
 afterEach(() => mock.restore());
+
+test('provisional research text is replaced by an explicitly marked final answer', async () => {
+  const f = fixture('최근 채권 금리 분석');
+  await f.runTurn();
+  f.calls[0]!.callbacks?.onText?.('선답', '선답');
+  f.calls[0]!.callbacks?.onReplaceText?.('최종 답변');
+
+  expect(f.pushes).toEqual(['선답']);
+  expect(f.metaPushes).toEqual([{
+    text: '최종 답변',
+    meta: { elanous: { textOperation: 'replace' } },
+  }]);
+});
 
 test('user config parses a positive fact budget and falls back to six for malformed values', () => {
   const root = mkdtempSync(join(tmpdir(), 'fact-question-config-'));
@@ -100,11 +116,11 @@ test('fact question adds one-turn instruction, six-turn cap and search evidence 
   expect(buildWebSearchTool().description).toContain('answer directly from the snippets and URLs');
 });
 
-test('explanatory research bypasses the fact-question cap while a simple price lookup keeps it', async () => {
+test('explanatory research uses the bounded research budget while a simple price lookup keeps the fact cap', async () => {
   const research = fixture('현재 채권 금리가 왜 올라가나요?');
   await research.runTurn();
   expect(research.calls[0]!.surfaceProfile?.domain).toBe('research');
-  expect(research.calls[0]!.maxToolTurns).toBeUndefined();
+  expect(research.calls[0]!.maxToolTurns).toBe(RESEARCH_TURN_MAX_TOOL_TURNS);
   expect(research.calls[0]!.messages[0]).toEqual({ role: 'system', content: 'base' });
   mock.restore();
   const fact = fixture('현재 채권 금리 얼마야?');
@@ -206,7 +222,11 @@ test('budget followup targets last assistant rather than trailing tool result', 
   expect(completed[1]).toEqual(trailing);
   expect(f.completed[0]![1]).toEqual(trailing);
   expect(f.persisted).toEqual(['근거 [출처](https://example.com/model)\n더 찾아볼까요?']);
-  expect(f.pushes).toEqual(['', '근거 [출처](https://example.com/model)\n더 찾아볼까요?']);
+  expect(f.pushes).toEqual([]);
+  expect(f.metaPushes).toEqual([{
+    text: '근거 [출처](https://example.com/model)\n더 찾아볼까요?',
+    meta: { elanous: { textOperation: 'replace' } },
+  }]);
 });
 
 test('streamed synthesis appends only the followup and preserves tool-use blocks', async () => {
@@ -291,13 +311,13 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
   });
   const routeLog = spyOn(debug, 'log');
   const specs = ['Edit', 'Write', 'Bash', 'Agent', 'decisions_pending', 'ops_seats', 'logs_query',
-    'DashboardConfigSet', 'WebSearch', 'schedule_manage', 'Read'].map((name) => ({
+    'DashboardConfigSet', 'OmniSearch', 'schedule_manage', 'Read'].map((name) => ({
     name, description: '', parameters: { type: 'object' as const },
   }));
   for (const [text, expected, preferred] of [
     ['나한테 온 결정 카드 있어?', '조회', 'decisions_pending'],
     ['답변을 좀 더 빠른 모델로 바꿔줘', '설정 변경', 'DashboardConfigSet'],
-    ['이번 주 업계 소식 조사', '조사', 'WebSearch'],
+    ['이번 주 업계 소식 조사', '조사', 'OmniSearch'],
     ['매일 아침 8시 뉴스', '상시 일', 'schedule_manage'],
   ] as const) {
     const pushes: string[] = [];
@@ -537,6 +557,7 @@ test('TUI-SPEECH-STYLE-DAEMON: 자동 수복 1회 — aborted(수렴 실패)를 
   const attempts: CoreTurnContext[] = [];
   const completed: LLMMessage[][] = [];
   const pushes: string[] = [];
+  const metaPushes: Array<{ text: string; meta?: Record<string, unknown> }> = [];
   spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
     attempts.push(ctx);
     if (attempts.length === 1) return { stopReason: 'aborted', finalText: '' };
@@ -552,7 +573,8 @@ test('TUI-SPEECH-STYLE-DAEMON: 자동 수복 1회 — aborted(수렴 실패)를 
     sessionId: 'autoheal-once', cwd: '/tmp', userText: '구현 계속해줘',
     promptBlocks: [{ type: 'text', text: '구현 계속해줘' }], isAborted: () => false,
     push: async (delta: string) => { pushes.push(delta); },
-    pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushWithMeta: async (text: string, meta?: Record<string, unknown>) => { metaPushes.push({ text, ...(meta ? { meta } : {}) }); },
+    pushSessionUpdate: async () => {},
     pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
   } as unknown as AcpTurnContext);
   // 정확히 1회 재시도 — 재시도 0회(1 호출)·2회(3 호출) 모두 이 단언에서 실패한다.
@@ -560,6 +582,7 @@ test('TUI-SPEECH-STYLE-DAEMON: 자동 수복 1회 — aborted(수렴 실패)를 
   // 원래 완료 경계 보존 — 턴 완료(onTurnComplete)는 복구된 시도에서 «한 번»만 지속되고 최종 답이 표면화된다.
   expect(completed).toEqual([[{ role: 'assistant', content: '복구 후 최종 답' }]]);
   expect(pushes).toEqual(['', '복구 후 최종 답']);
+  expect(metaPushes).toEqual([]);
   expect(log).toHaveBeenCalledWith('acp.turn', 'autoheal-retry', expect.objectContaining({ sessionId: 'autoheal-once', attempt: 2 }));
 
   // ⛔ 사용자 중단(isAborted)은 수복 대상이 아니다 — 재시도 없이 그대로 끝난다.

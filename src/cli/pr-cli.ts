@@ -37,6 +37,7 @@ import {
   type CmdRunner,
   type PrManager,
 } from '../autopilot/pr-manager.js';
+import { observePrLineage } from '../pr-tool/census.js';
 import {
   collectBaseLandingCommits,
   computeGranularityStats,
@@ -68,6 +69,7 @@ import { ensurePrLandHeavyRemote, type HeavyRemoteInput, type HeavyRemoteResult 
 import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
 import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
 import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
+import { recordWarmReuseEvidence, warmReuseEvidencePath } from '../task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { readTaskAgentState, taskAgentStatePath, type TaskCard } from '../task-agent/task-hand.js';
 import { INFLIGHT_REGISTRY_FILE, removeInflightForPr } from '../pr-tool/inflight-registry.js';
 import { PR_LABEL_NAMES } from '../github/pr-labels.js';
@@ -1899,10 +1901,19 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
         local: { measured: verdict.rootPlan != null, ok: verdict.ok, rootPlan: verdict.rootPlan ?? null },
         runPod: async () => {
           const runPod = deps.runLandingPodShadow ?? (await import('./pr-land-pod-shadow-job.js')).runLandingPodShadowJob;
-          return runPod({ head: opts.expectedHead!, main });
+          return runPod({ pr: Number(opts.pr), repo: cwd, host: verdict.host ?? '', head: opts.expectedHead!, main });
         },
         log: (category, event, data) => debug.log(category, event, { ...data, main, phase: 'initial' }),
         warn: (message) => out.error(`⚠ heavy-on-pod-shadow: ${message}`),
+        onShadow: ({ pod, agree }) => {
+          const shadow = pod && typeof pod === 'object' ? pod as LandingPodShadowVerdict : undefined;
+          const warm = shadow?.warmEvidence;
+          recordWarmReuseEvidence(warmReuseEvidencePath(), {
+            schema: 1, consumer: 'land', pr: Number(opts.pr), head: opts.expectedHead!, main, recordedAt: new Date().toISOString(),
+            ...(warm ? { ...warm, agree: warm.agree && agree } : {}),
+            ...(!warm ? { reason: shadow?.warmReason ?? 'warm-shadow-unmeasured' } : {}),
+          });
+        },
       });
     }
   }
@@ -2535,6 +2546,15 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
       if (!Number.isSafeInteger(number) || number < 1) { prToolOut.error('✗ supersede-drafts: 올바른 --pr 번호 필요'); prToolExit(1); return; }
       try { await supersedeMerged(number, opts.cwd ?? process.cwd()); }
       catch (error) { prToolOut.error(`✗ supersede-drafts: ${String(error)}`); prToolExit(1); }
+    });
+  pr.command('lineage <pr>')
+    .description('PR 계보의 관측 사실만 JSON으로 읽기 (첫 조각 · 닫기 판정 없음)')
+    .requiredOption('--json', 'JSON 관측 결과 출력')
+    .option('--cwd <path>', '저장소 경로')
+    .action((rawPr: string, opts: { cwd?: string }) => {
+      const result = observePrLineage({ pr: Number(rawPr), run: prToolRun, cwd: opts.cwd });
+      prToolOut.log(JSON.stringify(result));
+      if (result.status === 'unknown') prToolExit(1);
     });
   pr.command('census')
     .description('열린 PR 전체·골 문서만·2일 무커밋 draft·미닫힌 superseded 집계')

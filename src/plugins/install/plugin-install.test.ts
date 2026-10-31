@@ -7,10 +7,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
+import { debug } from '../../debug/log.js';
 import { installPlugin, listInstalledPlugins, pluginInstallPath, removePlugin, resolvePluginSource, withLedgerLock, type InstallEvent } from './plugin-install.js';
 import { loadPluginManifestFromDir } from '../core/manifest.js';
 import { addMarket } from './market-fetch.js';
+import { composeMissionGraph, composePluginMission } from '../../graph-wizard/mission-compose.js';
+import { createClassicSidetabMissionPairSessionRegistry } from '../../dashboard/classic-sidetab-mission.js';
+import { startClassicSidetabMissionPair } from '../../dashboard/classic-sidetab-mission-pair.js';
 import { getNodeKind, registerNodeKind, unregisterPluginNodeKind, getNodeKindRegistration } from '../../graph-kinds/registry.js';
+import { handTask, selectTaskComposition } from '../../task-agent/task-hand.js';
 
 const dirs: string[] = [];
 const fixture = () => { const root = mkdtempSync(join(tmpdir(), 'elanous-plugin-install-test-')); dirs.push(root); return root; };
@@ -720,4 +725,326 @@ describe('plugin installation — normalized manifest wiring ([wiring] installPl
     expect(installed.path).toBe(join(root, 'plugins', 'wiring-market', 'wiring-plugin', '3.1.4'));
     expect(installed.path).not.toContain('undefined');
   });
+
+});
+
+// 정본: seat-state/OP/DEMO-1104-THREE-SCENES.md «하나의 유기체 시나리오» 5막 ⊕ 씬 2 2:20 줄.
+// mock 무대: 도구 없음 → 마켓 후보 부족 → 손 둘 mock 개발 → 비교 → 채택 → installPlugin 설치 → 같은 흐름 사용 → Done.
+describe('smart plugin wizard — 도구 없음 → 마켓 → 손 둘 개발 → 채택 → 설치 → 사용 → Done', () => {
+  test('classic sidetab result callback reaches wizard comparison, winner step, install, use and Done in a local mock run', async () => {
+    const root = fixture();
+    const workspace = join(root, 'workroom');
+    mkdirSync(workspace, { recursive: true });
+    const claude = packageAt(join(workspace, 'claude-scenario-plugin'), 'claude-scenario-plugin');
+    const codex = packageAt(join(workspace, 'codex-scenario-plugin'), 'codex-scenario-plugin');
+    const runId = 'DEMO1104-SELF-PLUGIN-mock-20261031T0543KST';
+    const visibleResults = new Map<string, { ok: boolean; content: string }>();
+    const registry = createClassicSidetabMissionPairSessionRegistry();
+    let pairCompletion: { codex: { ok: boolean; content?: string }; claude: { ok: boolean; content?: string }; status: string } | undefined;
+    const started = startClassicSidetabMissionPair({
+      agent: 'claude', mission: 'Build the local scenario plugin.', parallelMission: 'Build the local scenario plugin.',
+      spawnVisible: (agent) => ({ id: `${agent}-mock-pty`, cwd: workspace }),
+      runVisible: async (agent, prompt) => {
+        expect(prompt).toBe('Build the local scenario plugin.');
+        const path = agent === 'claude' ? claude : codex;
+        const result = { ok: true, content: `Implemented local candidate.\nPLUGIN_SPEC=${path}` };
+        visibleResults.set(agent, result);
+        return result;
+      },
+      registry,
+      hasSession: () => true,
+      killSession: () => {},
+      enqueue: () => {},
+      createId: (() => { let id = 0; return () => `mock-mission-${++id}`; })(),
+      now: () => 100,
+      onComplete: result => { pairCompletion = result; },
+    });
+    await started.completion;
+
+    const wizardEvents: Array<{ ts: string; wizardId: string; step: string; text: string; detail?: unknown }> = [];
+    const candidate = { name: 'market-scenario-plugin', version: '1.0.0', market: 'mock-market',
+      path: join(root, 'market-candidate'), sha256: null };
+    const result = await composePluginMission({ mission: 'scenario report', missing: 'scenario simulator', root, workspace, wizardId: runId }, {
+      ask: async () => ({ scenario: 'default values only' }),
+      searchMarket: async () => ({ candidates: [{ market: 'mock-market', name: candidate.name,
+        version: candidate.version, spec: 'market-scenario-plugin@mock-market', score: 1 }], unavailable: [] }),
+      install: async (spec, options) => spec === 'market-scenario-plugin@mock-market'
+        ? candidate
+        : installPlugin(spec, { ...options, root, yes: true }),
+      trial: async request => request.origin === 'market'
+        ? { ok: false, score: 1, detail: 'scenario defaults cannot be changed' }
+        : { ok: true, score: request.maker === 'codex' ? 9 : 6, detail: `${request.maker} scenario fixture passed` },
+      developPair: async ({ makers, goal, workspace: pairedWorkspace }) => {
+        expect(goal).toContain('scenario simulator');
+        expect(pairedWorkspace).toBe(workspace);
+        expect(makers).toEqual(['claude', 'codex']);
+        expect(pairCompletion).toMatchObject({ status: 'done', codex: { ok: true }, claude: { ok: true } });
+        const spec = (maker: 'claude' | 'codex') => {
+          const content = pairCompletion?.[maker].content ?? '';
+          return { spec: content.split('PLUGIN_SPEC=')[1]!.trim() };
+        };
+        return { claude: spec('claude'), codex: spec('codex') };
+      },
+      onEvent: event => wizardEvents.push(event),
+      notify: () => {},
+    });
+
+    expect(started.result.codex.interactionId).toBeTruthy();
+    expect(visibleResults.size).toBe(2);
+    expect(result).toMatchObject({ status: 'done', origin: 'maker', plugin: { name: 'codex-scenario-plugin' } });
+    expect(result.trials.map(item => [item.origin, item.maker ?? '-', item.ok, item.score])).toEqual([
+      ['market', '-', false, 1], ['maker', 'claude', true, 6], ['maker', 'codex', true, 9],
+    ]);
+    expect(listInstalledPlugins(root)).toEqual([result.plugin!]);
+    const comparison = wizardEvents.find(event => event.step === 'validate');
+    expect(comparison).toMatchObject({ wizardId: runId,
+      detail: { winner: { maker: 'codex', spec: codex, score: 9 } } });
+    expect(comparison && Date.parse(comparison.ts)).toBeGreaterThan(0);
+    expect(wizardEvents.at(-1)).toMatchObject({ step: 'done', wizardId: runId, detail: { ok: true } });
+    expect(result.report).toContain('Done · codex-scenario-plugin@1.2.3');
+    expect(result.report).toContain(`작업실: ${workspace}`);
+  });
+
+  test('마켓 후보 부족 → Claude Code·Codex 동시 개발 → 시험 비교·채택 → plugin-install 설치 → 같은 흐름 사용 → Done 보고', async () => {
+    const root = fixture();
+    const workspace = join(root, 'session-workroom');
+    mkdirSync(workspace, { recursive: true });
+    const claude = packageAt(join(root, 'makers', 'claude', 'claude-plugin'), 'claude-plugin');
+    const codex = packageAt(join(root, 'makers', 'codex', 'codex-plugin'), 'codex-plugin');
+    const asked: string[][] = [];
+    const makers: Array<{ maker: string; goal: string; workspace: string }> = [];
+    const trials: string[] = [];
+    const installed: string[] = [];
+    const used: string[] = [];
+    const reports: string[] = [];
+    const steps: string[] = [];
+    const result = await composePluginMission({
+      mission: '월간 보고서를 PDF 로 발행', missing: 'pdf-export', root, workspace, wizardId: 'wiz-mock',
+    }, {
+      ask: async questions => { asked.push([...questions]); return { [questions[0]!]: '보고서를 PDF 로 내보낸다' }; },
+      searchMarket: async () => ({ candidates: [], unavailable: ['elanous: 시험 무대에는 마켓 인덱스가 없다'] }),
+      develop: async request => { makers.push(request); return { spec: request.maker === 'claude' ? claude : codex }; },
+      trial: async request => {
+        trials.push(`${request.origin}:${request.maker ?? '-'}`);
+        return request.maker === 'claude'
+          ? { ok: true, score: 6, detail: 'claude 시험 통과' }
+          : { ok: true, score: 9, detail: 'codex 시험 통과' };
+      },
+      use: async (plugin, request) => {
+        used.push(`${plugin.name}@${plugin.version}`);
+        expect(request.missing).toBe('pdf-export');
+        return { ok: true, detail: '보고서 발행에 사용' };
+      },
+      notify: report => { reports.push(report); },
+      onEvent: event => { steps.push(event.step); if (event.step === 'install') installed.push(event.text); },
+    });
+
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.length).toBeGreaterThanOrEqual(1);
+    expect(asked[0]!.length).toBeLessThanOrEqual(2);
+    // Both side tabs get the same plugin goal in the same session workroom, at the same time.
+    expect(makers.map(item => item.maker)).toEqual(['claude', 'codex']);
+    expect(makers[0]!.goal).toBe(makers[1]!.goal);
+    expect(makers[0]!.goal).toContain('pdf-export');
+    expect(new Set(makers.map(item => item.workspace))).toEqual(new Set([workspace]));
+    expect(trials).toEqual(['maker:claude', 'maker:codex']);
+    expect(result.status).toBe('done');
+    expect(result.origin).toBe('maker');
+    expect(result.trials.map(item => [item.maker, item.score])).toEqual([['claude', 6], ['codex', 9]]);
+    // The higher trial wins and is installed through plugin-install — nothing else is installed.
+    expect(result.plugin).toMatchObject({ name: 'codex-plugin', version: '1.2.3', market: 'local' });
+    expect(listInstalledPlugins(root)).toEqual([result.plugin!]);
+    expect(existsSync(join(result.plugin!.path, 'plugin.ts'))).toBe(true);
+    // The same installed plugin is used in the same flow, then Done is reported.
+    expect(used).toEqual(['codex-plugin@1.2.3']);
+    expect(steps).toEqual(['request', 'research', 'draft', 'validate', 'install', 'install', 'done']);
+    expect(installed[0]).toContain('plugin-install 설치');
+    expect(reports).toEqual([result.report]);
+    expect(result.report).toContain('Done · codex-plugin@1.2.3');
+    expect(result.report).toContain(`작업실: ${workspace}`);
+  });
+
+  test('CLI 가 없으면 개발 계약 전에 설치 계약을 부르고 설치된 CLI 로 개발한다', async () => {
+    const root = fixture();
+    const pkg = packageAt(join(root, 'maker', 'cli-plugin'), 'cli-plugin');
+    const installedClis: string[] = [];
+    const result = await composePluginMission({ mission: '보고서 발행', missing: 'pdf-export', root, workspace: join(root, 'room') }, {
+      makerCli: {},
+      installMakerCli: async maker => { installedClis.push(maker); return `/opt/${maker}`; },
+      searchMarket: async () => ({ candidates: [], unavailable: [] }),
+      develop: async () => ({ spec: pkg }),
+      trial: async () => ({ ok: true, score: 3, detail: '시험 통과' }),
+      notify: () => {},
+    });
+    expect(installedClis).toEqual(['claude', 'codex']);
+    expect(result.events.find(event => event.step === 'draft')?.detail)
+      .toMatchObject({ cli: ['claude: 설치됨 /opt/claude', 'codex: 설치됨 /opt/codex'] });
+    expect(result.status).toBe('done');
+    expect(result.plugin?.name).toBe('cli-plugin');
+  });
+
+  test('마켓 후보가 시험을 통과하면 개발을 띄우지 않고 설치·사용한다', async () => {
+    const root = fixture();
+    const market = join(root, 'markets', 'test-market');
+    mkdirSync(market, { recursive: true });
+    packageAt(join(market, 'source'), 'market-plugin');
+    writeFileSync(join(market, 'marketplace.json'), JSON.stringify({ name: 'test-market', sequence: 1,
+      interface: { displayName: 'Test' },
+      plugins: [{ name: 'market-plugin', version: '1.2.3', source: { source: 'local', path: 'source' } }] }));
+    const queried: string[] = [];
+    let developed = 0;
+    const result = await composePluginMission({ mission: '보고서 발행', missing: 'pdf-export', root,
+      workspace: join(root, 'room'), marketDir: join(root, 'markets'), allowUnsigned: true }, {
+      searchMarket: async request => {
+        queried.push(request.query);
+        return { candidates: [{ market: 'test-market', name: 'market-plugin', version: '1.2.3',
+          spec: 'market-plugin@test-market', score: 2 }], unavailable: [] };
+      },
+      develop: async () => { developed++; return { spec: join(root, 'unused') }; },
+      notify: () => {},
+    });
+    expect(queried).toEqual(['pdf-export 보고서 발행']);
+    expect(developed).toBe(0);
+    expect(result.status).toBe('done');
+    expect(result.origin).toBe('market');
+    expect(result.plugin).toMatchObject({ name: 'market-plugin', version: '1.2.3', market: 'test-market' });
+    expect(result.trials[0]).toMatchObject({ origin: 'market', spec: 'market-plugin@test-market', ok: true });
+    expect(result.trials[0]!.score).toBeGreaterThan(0);
+    expect(listInstalledPlugins(root)).toEqual([result.plugin!]);
+  });
+
+  test('마켓 후보가 plugin-install 검증을 통과하지 못하면 원장에 아무것도 남지 않는다', async () => {
+    const root = fixture();
+    const broken = packageAt(join(root, 'broken'), 'broken-plugin');
+    rmSync(join(broken, 'plugin.ts'));
+    const result = await composePluginMission({ mission: '보고서 발행', missing: 'pdf-export', root,
+      workspace: join(root, 'room') }, {
+      searchMarket: async () => ({ candidates: [{ market: 'local', name: 'broken-plugin', version: '1.2.3',
+        spec: broken, score: 1 }], unavailable: [] }),
+      notify: () => {},
+    });
+    expect(result.status).toBe('failed');
+    expect(result.trials[0]).toMatchObject({ origin: 'market', ok: false });
+    expect(result.reason).toContain('plugin main');
+    expect(result.events.at(-1)).toMatchObject({ step: 'done', detail: { ok: false } });
+    expect(listInstalledPlugins(root)).toEqual([]);
+  });
+
+  test('질문 어댑터 거부는 hand 흐름 밖으로 던지지 않고 failed 결과로 남긴다', async () => {
+    const root = fixture();
+    const result = await composePluginMission({ mission: '보고서 발행', missing: 'pdf-export', root,
+      workspace: join(root, 'room') }, {
+      ask: async () => { throw new Error('Telegram unavailable'); },
+    });
+    expect(result.status).toBe('failed');
+    expect(result.reason).toContain('Telegram unavailable');
+    expect(result.events.at(-1)).toMatchObject({ step: 'done', detail: { ok: false } });
+  });
+
+  test('trial 어댑터 거부는 후보 실패로 기록하고 마법사 실패로 수렴한다', async () => {
+    const root = fixture();
+    const pkg = packageAt(join(root, 'market', 'plugin'), 'trial-plugin');
+    const result = await composePluginMission({ mission: '보고서 발행', missing: 'pdf-export', root,
+      workspace: join(root, 'room'), makers: [] }, {
+      searchMarket: async () => ({ candidates: [{ market: 'local', name: 'trial-plugin', version: '1.2.3',
+        spec: pkg, score: 1 }], unavailable: [] }),
+      trial: async () => { throw new Error('trial host unavailable'); },
+    });
+    expect(result.status).toBe('failed');
+    expect(result.trials).toContainEqual(expect.objectContaining({ ok: false, detail: expect.stringContaining('trial host unavailable') }));
+    expect(result.events.at(-1)).toMatchObject({ step: 'done', detail: { ok: false } });
+  });
+
+  test('use 어댑터 거부는 Done으로 보고하지 않고 failed 결과로 남긴다', async () => {
+    const root = fixture();
+    const pkg = packageAt(join(root, 'market', 'plugin'), 'use-plugin');
+    const result = await composePluginMission({ mission: '보고서 발행', missing: 'pdf-export', root,
+      workspace: join(root, 'room') }, {
+      searchMarket: async () => ({ candidates: [{ market: 'local', name: 'use-plugin', version: '1.2.3',
+        spec: pkg, score: 1 }], unavailable: [] }),
+      use: async () => { throw new Error('runtime unavailable'); },
+    });
+    expect(result.status).toBe('failed');
+    expect(result.reason).toContain('runtime unavailable');
+    expect(result.report).toContain('[스마트 플러그인 마법사] 실패');
+    expect(result.report).not.toContain('[스마트 플러그인 마법사] Done');
+    expect(result.events.at(-1)).toMatchObject({ step: 'done', detail: { ok: false } });
+  });
+
+  test('마법사는 질문 1~2개만 던진다', async () => {
+    const root = fixture();
+    await expect(composePluginMission({ mission: '보고서 발행', missing: 'pdf-export', root,
+      workspace: join(root, 'room'), questions: ['a', 'b', 'c'] }, {})).rejects.toThrow('one or two questions');
+  });
+
+  test('composeMissionGraph 가 마법사 접합부를 지나 채택 플러그인을 기존 조합·검증 경로에 넣는다', async () => {
+    const repo = join(import.meta.dir, '..', '..', '..');
+    const standardYaml = readFileSync(join(repo, 'graphs/work/research-report.yaml'), 'utf8');
+    const dir = fixture();
+    const wizardRoot = fixture();
+    const pkg = packageAt(join(wizardRoot, 'maker', 'wiring-plugin'), 'wiring-plugin');
+    const prompts: string[] = [];
+    const result = await composeMissionGraph({
+      text: '보고서 작성 검증', completion: 'research-report', ledgerPath: join(dir, 'task-agent-actions.json'),
+      cardId: 'ta-plugin-wizard', root: repo, standard: selectTaskComposition('research-report'),
+      pluginWizard: { mission: '보고서 작성 검증', missing: 'pdf-export', root: wizardRoot,
+        workspace: join(wizardRoot, 'room'), wizardId: 'wiz-wiring' },
+    }, {
+      callLLM: async prompt => {
+        prompts.push(prompt);
+        return `BASE: work-research-report-rehearsal\nSLUG: mission-report\nSUMMARY: 보고서 작성 검증\n\`\`\`yaml\n${standardYaml}\`\`\``;
+      },
+      pluginWizard: {
+        searchMarket: async () => ({ candidates: [], unavailable: [] }),
+        develop: async () => ({ spec: pkg }),
+        trial: async () => ({ ok: true, score: 4, detail: '시험 통과' }),
+        notify: () => {},
+      },
+    });
+    expect(result.plugin?.status).toBe('done');
+    expect(result.plugin?.plugin?.name).toBe('wiring-plugin');
+    expect(result.reason).toContain('플러그인 채택 wiring-plugin@1.2.3');
+    expect(prompts[0]).toContain('wiring-plugin');
+    const recorded = JSON.parse(readFileSync(join(dir, 'ta-plugin-wizard.composition.json'), 'utf8'));
+    expect(recorded.plugin).toMatchObject({ status: 'done', origin: 'maker', name: 'wiring-plugin' });
+    expect(recorded.base).toBe('graphs/work/research-report.yaml');
+    expect(listInstalledPlugins(wizardRoot).map(item => item.name)).toEqual(['wiring-plugin']);
+  }, 30_000);
+
+  test('production task-hand caller routes an explicit missing-tool signal through the wizard and records adoption', async () => {
+    const taskRoot = fixture();
+    const installRoot = fixture();
+    const compositionRoot = join(taskRoot, 'compositions');
+    const workGraphs = join(compositionRoot, 'graphs', 'work');
+    mkdirSync(workGraphs, { recursive: true });
+    const standardYaml = readFileSync(join(import.meta.dir, '../../..', 'graphs/work/research-report.yaml'), 'utf8');
+    writeFileSync(join(workGraphs, 'research-report.yaml'), standardYaml);
+    writeFileSync(join(workGraphs, 'csv-export.yaml'), standardYaml.replace('work-research-report', 'work-csv-export'));
+    const pkg = packageAt(join(taskRoot, 'maker', 'task-plugin'), 'task-plugin', '0.1.0');
+    const events: string[] = [];
+    const off = debug.registerSink({ name: 'task-hand-plugin-wizard-test', emit: record => {
+      if (record.category === 'graph.compose') {
+        const reason = (record.data as { reason?: unknown } | undefined)?.reason;
+        events.push(String(reason ?? ''));
+      }
+    } });
+    try {
+      const result = await handTask({
+        id: 'ta-plugin-wizard-production-path', text: 'csv export monthly report',
+        completion: 'research-report', statePath: join(taskRoot, 'task-state.json'), compositionRoot,
+        pluginWizard: { missing: 'csv-export', root: installRoot, workspace: taskRoot },
+        pluginWizardDeps: {
+          ask: async questions => { expect(questions.length).toBeGreaterThanOrEqual(1); return { [questions[0]!]: '월간 보고서 CSV' }; },
+          searchMarket: async () => ({ candidates: [], unavailable: [] }),
+          develop: async () => ({ spec: pkg }),
+          trial: async () => ({ ok: true, score: 5, detail: 'fixture plugin passed its trial' }),
+          use: async plugin => ({ ok: true, detail: `${plugin.name} used for CSV export` }),
+          notify: () => {},
+        },
+      });
+      expect(result.mode).toBe('shadow');
+      expect(listInstalledPlugins(installRoot).map(plugin => plugin.name)).toEqual(['task-plugin']);
+      expect(events.some(reason => reason.includes('플러그인 채택 task-plugin@0.1.0'))).toBe(true);
+    } finally { off(); }
+  }, 30_000);
 });

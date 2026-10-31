@@ -62,7 +62,9 @@ export interface WarmPodProviderOptions {
   transport?: (spec: WarmPodSpec) => Pick<WarmPodTransport, 'request'>;
   maxShadowMs?: number;
   now?: () => number;
-  kubectl?: (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
+  kubectl?: (args: readonly string[], input?: string) => {
+    status: number | null; stdout: string; stderr: string; error?: NodeJS.ErrnoException;
+  };
   /** Private directory for cross-process prepare leases; defaults to a per-user directory under tmpdir(). */
   prepareLockDirectory?: string;
   /** Cancels a prepare waiting for another process to finish the same host/worker slot. */
@@ -431,7 +433,8 @@ export class WarmPodProvider {
       const result = spawnSync('kubectl', argv, { encoding: 'utf8', input, env,
         timeout: argv[4] === 'wait' ? (POD_READY_WAIT_SECONDS + 30) * 1000 : 360_000,
         maxBuffer: 2 * 1024 * 1024 });
-      return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+      return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '',
+        error: result.error };
     };
     const parse = (result: { status: number | null; stdout: string }) => {
       if (result.status !== 0) return null;
@@ -483,11 +486,25 @@ export class WarmPodProvider {
       && Object.entries(metadata.annotations).every(([key, value]) => pod.metadata.annotations?.[key] === value)
       && pod.spec?.nodeName === nodeName
       && sameSpec(normalizedSpec(pod.spec), template);
+    const skipDiscovery = (reason: string): false => {
+      debug.log('pod.warm', 'warm-pod-list-skipped', { reason }, { level: 'warn' });
+      return false;
+    };
+    const kubectlErrorCode = (error: unknown): string | undefined => {
+      if (!error || typeof error !== 'object' || !('code' in error)) return undefined;
+      return typeof error.code === 'string' ? error.code : undefined;
+    };
     // Resolve the pinned Pod independently; namespace size must not affect this read.
-    const namedResult = kubectl(['get', 'pods', `--field-selector=metadata.name=${spec.name}`, '-o', 'json']);
+    let namedResult: ReturnType<typeof kubectl>;
+    try { namedResult = kubectl(['get', 'pods', `--field-selector=metadata.name=${spec.name}`, '-o', 'json']); }
+    catch (error) {
+      return skipDiscovery(kubectlErrorCode(error) === 'ENOBUFS' ? 'output-too-large' : 'kubectl-failed');
+    }
+    if (kubectlErrorCode(namedResult.error) === 'ENOBUFS') return skipDiscovery('output-too-large');
+    if (namedResult.status !== 0) return skipDiscovery('kubectl-failed');
     const namedList = parse(namedResult);
     if (!Array.isArray(namedList?.items) || !namedList.metadata || typeof namedList.metadata !== 'object'
-      || Array.isArray(namedList.metadata)) return false;
+      || Array.isArray(namedList.metadata)) return skipDiscovery('malformed-output');
     const namedMatches = namedList.items.filter((row: any) => row?.metadata?.name === spec.name);
     if (namedMatches.length > 1) return false;
     const namedPod = namedMatches[0] ?? null;
@@ -497,20 +514,29 @@ export class WarmPodProvider {
     const warmPods: any[] = [];
     let continuation = '';
     const seenContinuations = new Set<string>();
+    let completedPages = false;
     for (let page = 0; page < 100; page++) {
-      const args = ['get', 'pods', '-l', 'elanous.kind=warm-worker', '--limit=10', '-o', 'json'];
+      const args = ['get', 'pods', '-l', 'elanous.kind=warm-worker', '--chunk-size=50', '-o', 'json'];
       if (continuation) args.splice(5, 0, '--continue', continuation);
-      const result = kubectl(args);
+      let result: ReturnType<typeof kubectl>;
+      try { result = kubectl(args); }
+      catch (error) {
+        return skipDiscovery(kubectlErrorCode(error) === 'ENOBUFS' ? 'output-too-large' : 'kubectl-failed');
+      }
+      if (kubectlErrorCode(result.error) === 'ENOBUFS') return skipDiscovery('output-too-large');
+      if (result.status !== 0) return skipDiscovery('kubectl-failed');
       const listed = parse(result);
       if (!listed || !Array.isArray(listed.items) || !listed.metadata || typeof listed.metadata !== 'object'
         || Array.isArray(listed.metadata)
-        || (listed.metadata.continue !== undefined && typeof listed.metadata.continue !== 'string')) return false;
+        || (listed.metadata.continue !== undefined && typeof listed.metadata.continue !== 'string'))
+        return skipDiscovery('malformed-output');
       warmPods.push(...listed.items);
       continuation = listed.metadata?.continue ?? '';
-      if (!continuation) break;
-      if (seenContinuations.has(continuation) || page === 99) return false;
+      if (!continuation) { completedPages = true; break; }
+      if (seenContinuations.has(continuation) || page === 99) return skipDiscovery('malformed-output');
       seenContinuations.add(continuation);
     }
+    if (!completedPages) return skipDiscovery('malformed-output');
     const hostPods = warmPods.filter((row: any) => row?.metadata?.name === spec.name
       || row?.metadata?.annotations?.['elanous.dev/warm-worker-id'] === spec.workerId);
     if (namedPod && !hostPods.some((row: any) => row?.metadata?.name === spec.name)) hostPods.push(namedPod);

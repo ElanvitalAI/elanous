@@ -54,7 +54,8 @@ describe('HT3 — native-tool wiring lint', () => {
   test('self-implement P2 — implementation catalog ID inventory', () => {
     const implementationCatalogEntries = nativeToolCatalog.slice(SELF_COGNITION_MCP_CATALOG_ENTRIES.length);
     const ids = implementationCatalogEntries.map(entry => entry.id);
-    expect(ids).toHaveLength(187);
+    // Linear tools and graph MCP tools extend the historical implementation baseline.
+    expect(ids).toHaveLength(193);
     expect(new Set(ids).size).toBe(ids.length);
     expect(Object.keys(retiredCatalogIds).sort()).toEqual(['baselineIds', 'retiredIds']);
     expect(retiredCatalogIds.retiredIds).toHaveLength(18);
@@ -62,10 +63,16 @@ describe('HT3 — native-tool wiring lint', () => {
     expect(ids.filter(id => retiredCatalogIds.retiredIds.includes(id))).toEqual([]);
     expect(retiredCatalogIds.baselineIds).toHaveLength(204);
     expect(new Set(retiredCatalogIds.baselineIds).size).toBe(retiredCatalogIds.baselineIds.length);
-    // NTC1 baseline is historical: the new MsgAsk is an intentional addition,
-    // not part of the pre-retirement catalog snapshot.
+    // NTC1 baseline is historical: MsgAsk, Linear tools and graph MCP controls
+    // are intentional additions, not part of the pre-retirement catalog snapshot.
+    const postBaselineAdditions = new Set([
+      'msg_ask', 'elanous_linear_secretary', 'elanous_linear_issue',
+      'graph_compose', 'graph_run_start', 'graph_run_status', 'graph_node_op',
+    ]);
     expect(ids).toContain('msg_ask');
-    expect([...ids.filter(id => id !== 'msg_ask'), ...retiredCatalogIds.retiredIds].sort())
+    expect(ids).toContain('elanous_linear_secretary');
+    expect(ids).toContain('elanous_linear_issue');
+    expect([...ids.filter(id => !postBaselineAdditions.has(id)), ...retiredCatalogIds.retiredIds].sort())
       .toEqual([...retiredCatalogIds.baselineIds].sort());
     expect(ids).toContain('self_implement');
   });

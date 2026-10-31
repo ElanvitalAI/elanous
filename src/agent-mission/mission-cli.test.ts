@@ -2,7 +2,11 @@
 //   exit-code·에러경로를 process.exit/console 없이 커버(source-grep Goodhart 대체).
 
 import { describe, it, expect } from 'bun:test';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runAgentMissionCliCommand, type MissionCliOpts, type MissionCliDeps } from './mission-cli.js';
+import { detectAgentCli, prepareAgentCli } from './tool-install.js';
 import type { AgentBackend, AgentMissionResult } from './driver.js';
 import { planDevPipeline, toAgentMissionSpec, type DevPipelineSpec, type DevPipelineDeps, type ResolvedDevPlan } from '../self-dev/dev-pipeline.js';
 
@@ -41,6 +45,55 @@ describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => 
     expect(order).toEqual(['detect:codex', 'status:codex: 설치됨 · 로그인 확인됨', 'launch']);
   });
 
+  it('DEMO1104-ORCHESTRATE-CLAUDE-CODEX: 한 CLI 과제가 Codex와 Claude driver를 함께 시작하고 두 줄 요약을 돌려준다', async () => {
+    const started: AgentMissionResult['branch'][] = [];
+    const release: Array<() => void> = [];
+    const pending = runAgentMissionCliCommand(['작은 기능과 문서를 구현한다'], baseOpts({ duo: true }), {
+      resolveBackend: (name) => ({ name: (name ?? 'codex') as 'codex' | 'claude', cmd: 'fake', args: [] }),
+      detectAgentCli: (agent) => ({ agent, installed: true, executable: 'present', login: 'ready', message: `${agent}: ready` }),
+      duoDeps: {
+        id: () => 'demo',
+        runMission: async (spec) => {
+          started.push(spec.branch!);
+          await new Promise<void>((resolve) => release.push(resolve));
+          return { ...RESULT, branch: spec.branch!, ptyId: `pty-${spec.agent!.name}`, evidenceSatisfied: true };
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(['wt/a-codex', 'wt/a-claude']);
+    release.forEach((resolve) => resolve());
+    const out = await pending;
+    expect(out).toMatchObject({ ok: true, exitCode: 0 });
+    if (out.ok) {
+      expect(out.duo?.missionId).toBe('duo-demo');
+      expect(out.duo?.lines).toHaveLength(2);
+      expect(out.duo?.lines.join('\n')).toContain('codex');
+      expect(out.duo?.lines.join('\n')).toContain('claude');
+    }
+  });
+
+  it('DEMO1104-ORCHESTRATE-CLAUDE-CODEX: 둘 중 하나가 준비되지 않으면 두 driver 모두 시작하지 않는다', async () => {
+    const detections: string[] = [];
+    const statuses: string[] = [];
+    let launches = 0;
+    const out = await runAgentMissionCliCommand(['작은 기능과 문서를 구현한다'], baseOpts({ duo: true }), {
+      resolveBackend: (name) => ({ name: (name ?? 'codex') as 'codex' | 'claude', cmd: 'fake', args: [] }),
+      detectAgentCli: (agent) => {
+        detections.push(agent);
+        return agent === 'claude'
+          ? { agent, installed: true, executable: 'present', login: 'needed', message: 'claude: login needed' }
+          : { agent, installed: true, executable: 'present', login: 'ready', message: 'codex: ready' };
+      },
+      onStatus: (line) => { statuses.push(line); },
+      duoDeps: { runMission: async () => { launches += 1; return RESULT; } },
+    });
+    expect(detections).toEqual(['codex', 'claude']);
+    expect(statuses).toEqual(['codex: ready · claude: login needed']);
+    expect(launches).toBe(0);
+    expect(out).toMatchObject({ ok: false, exitCode: 1, message: 'claude: login needed; claude login 후 다시 실행' });
+  });
+
   it.each([
     [{ installed: false, executable: 'missing', login: 'unknown', message: 'codex: 설치되지 않음' }, '공식 설치'],
     [{ installed: null, executable: 'present', login: 'unknown', message: 'codex: 실행 파일 있음, 버전 확인 불가' }, '확인한 뒤'],
@@ -62,6 +115,74 @@ describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => 
     expect(shownStatus).toBe(detection.message);
     if (!out.ok) expect(out.message).toContain(guidance);
     expect(launched).toBe(false);
+  });
+
+  it('finishes the injected CLI install preflight before starting the mission pipeline', async () => {
+    const order: string[] = [];
+    const out = await runAgentMissionCliCommand(['M'], baseOpts(), {
+      resolveBackend: () => BACKEND,
+      prepareAgentCli: async (agent) => {
+        order.push(`prepare:${agent}`);
+        return {
+          ready: true,
+          detection: { agent, installed: true, version: '1.2.3', executable: 'present', login: 'ready', message: 'codex: 설치됨 v1.2.3 · 로그인 확인됨' },
+          installation: 'installed',
+          message: 'codex: 설치됨 v1.2.3 · 로그인 확인됨',
+        };
+      },
+      runDevPipeline: async (spec, deps) => {
+        order.push('launch');
+        const cap = captureRun();
+        await cap.fn(spec, deps);
+        return { plan: {} as ResolvedDevPlan, kind: 'agent-mission' as const, result: RESULT };
+      },
+    });
+    expect(out.ok).toBe(true);
+    expect(order).toEqual(['prepare:codex', 'launch']);
+  });
+
+  it('fake Codex install is version/login-verified before the mission launch seam is reached', async () => {
+    const bin = mkdtempSync(join(tmpdir(), 'mission-cli-confirm-install-'));
+    try {
+      const codex = join(bin, 'codex');
+      const env = { ...process.env, PATH: bin, HOME: tmpdir() };
+      const order: string[] = [];
+      const cap = captureRun();
+      const out = await runAgentMissionCliCommand(['M'], baseOpts(), {
+        resolveBackend: () => BACKEND,
+        prepareAgentCli: (agent) => prepareAgentCli(agent, {
+          env,
+          detect: (candidate, options) => {
+            const detection = detectAgentCli(candidate, options);
+            order.push(`detect:${detection.version ?? 'missing'}:${detection.login}`);
+            return detection;
+          },
+          confirmInstall: (prompt) => { order.push(`confirm:${prompt}`); return true; },
+          install: (_command, _args, options) => {
+            order.push('install');
+            expect(options.env.OPENAI_API_KEY).toBeUndefined();
+            writeFileSync(codex, `#!/bin/sh\nprintf '%s\\n' "$1" >> '${codex}.probes'\ncase "$1" in\n  --version) echo "Codex 0.123.4" ;;\n  login) echo "Logged in using ChatGPT" ;;\n  *) exit 2 ;;\nesac\n`);
+            chmodSync(codex, 0o755);
+            return { status: 0 };
+          },
+        }),
+        runDevPipeline: async (spec, deps) => {
+          order.push('mission-launch');
+          return cap.fn(spec, deps);
+        },
+      });
+      expect(out.ok).toBe(true);
+      expect(order).toEqual([
+        'detect:missing:unknown',
+        'confirm:설치할까요? npm install -g @openai/codex@latest',
+        'install',
+        'detect:0.123.4:ready',
+        'mission-launch',
+      ]);
+      expect(readFileSync(`${codex}.probes`, 'utf8').trim().split('\n')).toEqual(['--version', 'login']);
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it('SIGINT signal reaches the pipeline and preserves the interrupted exit code', async () => {
@@ -253,6 +374,15 @@ describe('runAgentMissionCliCommand — 에러경로', () => {
     expect(cap.last().spec).toBeUndefined();
   });
 
+  it('--follow-up rejects unsupported backends before pipeline execution', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: 'gemini', followUp: 'second turn' }), {
+      resolveBackend: () => ({ ...BACKEND, name: 'gemini' }), runDevPipeline: cap.fn,
+    });
+    expect(out).toEqual({ ok: false, message: '--follow-up 은 Claude 또는 Codex backend 전용입니다', exitCode: 1 });
+    expect(cap.last().spec).toBeUndefined();
+  });
+
   it('--headless with Claude reaches the mission execution spec', async () => {
     const cap = captureRun();
     const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: 'claude', headless: true }), {
@@ -263,6 +393,17 @@ describe('runAgentMissionCliCommand — 에러경로', () => {
     expect(cap.last().spec!.executor).toEqual({ kind: 'external', backend: 'claude' });
     const plan = planDevPipeline(cap.last().spec!);
     expect(toAgentMissionSpec('M', plan, () => ({ ...BACKEND, name: 'claude' })).headless).toBe(true);
+  });
+
+  it('--follow-up reaches the mission execution spec for Codex', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: 'codex', followUp: 'Use the first result' }), {
+      resolveBackend: () => ({ ...BACKEND, name: 'codex' }), runDevPipeline: cap.fn,
+    });
+    expect(out.ok).toBe(true);
+    const plan = planDevPipeline(cap.last().spec!);
+    expect(cap.last().spec!.mission!.followUp).toBe('Use the first result');
+    expect(toAgentMissionSpec('M', plan, () => ({ ...BACKEND, name: 'codex' })).followUp).toBe('Use the first result');
   });
 
   it.each(['codex', 'gemini', 'grok', 'aside'])('pipeline also rejects --headless on %s', (name) => {

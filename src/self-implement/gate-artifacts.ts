@@ -52,6 +52,7 @@ export interface GateArtifactRun {
 export interface GateArtifactShard {
   shardId: string;
   attempt: number;
+  elapsedMs?: number;
   files: string[];
   current: GateArtifactRun;
   baseline: GateArtifactRun;
@@ -210,7 +211,7 @@ export function writeGateArtifacts(input: GateArtifactInput): { summaryPath: str
       return run;
     };
     shardsDetail.push({
-      shardId: attempt.shardId, attempt: attempt.attempt, files, current: side('current'), baseline: side('baseline'),
+      shardId: attempt.shardId, attempt: attempt.attempt, ...(attempt.elapsedMs !== undefined ? { elapsedMs: attempt.elapsedMs } : {}), files, current: side('current'), baseline: side('baseline'),
       ...(input.sharded?.unmeasuredByShard?.[attempt.shardId] !== undefined
         && attempt === input.sharded.attempts.filter((item) => item.shardId === attempt.shardId).at(-1)
         ? { unmeasuredReason: input.sharded.unmeasuredByShard[attempt.shardId] } : {}),

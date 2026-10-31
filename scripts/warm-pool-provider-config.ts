@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { userConfigPath } from '../src/user-config.js';
+import type { WarmWorkerCandidate } from '../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
 
 const TOKEN = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{40}$/;
@@ -14,7 +15,7 @@ const TIERS = new Set(['lite', 'standard']);
 type JsonObject = Record<string, unknown>;
 
 export interface WarmPoolProviderConfig {
-  candidates: [];
+  candidates: WarmWorkerCandidate[];
   poolTemplates: Array<{
     host: string;
     tier: 'lite' | 'standard';
@@ -45,6 +46,25 @@ export interface AssembleWarmPoolProviderConfigInput {
   controlUrl: string;
   memberToken: string;
   machineTokens: Record<string, string>;
+}
+
+/** Keep a deployment canary to one explicit worker instead of expanding its profile quota. */
+export function selectSingleWarmPoolCandidate(config: WarmPoolProviderConfig, selection: string): WarmPoolProviderConfig {
+  const match = /^([a-zA-Z0-9][a-zA-Z0-9._-]*)\/(lite|standard)$/.exec(selection);
+  if (!match) throw new Error('--single-candidate must be HOST/lite or HOST/standard');
+  const [, host, tier] = match;
+  const template = config.poolTemplates.find(candidate => candidate.host === host && candidate.tier === tier);
+  if (!template) throw new Error(`warm pool template not found: ${host}/${tier}`);
+  const index = 1;
+  return {
+    ...config,
+    candidates: [{ host, tier: tier as 'lite' | 'standard', spec: {
+      ...template.spec,
+      name: `warm-${host}-${tier}-${index}`,
+      workerId: `${template.spec.workerId}-${tier}-${index}`,
+    } }],
+    poolTemplates: [],
+  };
 }
 
 function object(value: unknown, label: string): JsonObject {
@@ -183,11 +203,12 @@ interface CliOptions {
   output: string;
   dryRun: boolean;
   serve: boolean;
+  singleCandidate?: string;
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
   let configPath = userConfigPath(), controlUrl = '', memberTokenFile = '', output = '';
-  let dryRun = false, serve = false;
+  let dryRun = false, serve = false, singleCandidate: string | undefined;
   const machineTokenFiles: Record<string, string> = {};
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
@@ -206,14 +227,15 @@ function parseArgs(argv: readonly string[]): CliOptions {
     } else if (arg === '--output') output = next();
     else if (arg === '--dry-run') dryRun = true;
     else if (arg === '--serve') serve = true;
+    else if (arg === '--single-candidate') singleCandidate = next();
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!isAbsolute(configPath) || !controlUrl || !isAbsolute(memberTokenFile))
-    throw new Error('usage: --config ABSOLUTE --control-url URL --member-token-file ABSOLUTE --machine-token HOST=ABSOLUTE [--output ABSOLUTE] [--dry-run|--serve]');
+    throw new Error('usage: --config ABSOLUTE --control-url URL --member-token-file ABSOLUTE --machine-token HOST=ABSOLUTE [--output ABSOLUTE] [--single-candidate HOST/TIER] [--dry-run|--serve]');
   if (Object.values(machineTokenFiles).some(file => !isAbsolute(file))) throw new Error('machine token files must be absolute');
   if (dryRun && serve) throw new Error('--dry-run and --serve cannot be combined');
   return { configPath, controlUrl, memberTokenFile, machineTokenFiles,
-    output: output || join(dirname(configPath), 'warm-pod-provider.json'), dryRun, serve };
+    output: output || join(dirname(configPath), 'warm-pod-provider.json'), dryRun, serve, singleCandidate };
 }
 
 function readPrivateToken(path: string, label: string): string {
@@ -228,8 +250,9 @@ export async function runWarmPoolProviderConfig(argv: readonly string[]): Promis
     .map(([host, path]) => [host, readPrivateToken(path, `machine token for ${host}`)]));
   const assembled = assembleWarmPoolProviderConfig({ config, controlUrl: options.controlUrl,
     memberToken: readPrivateToken(options.memberTokenFile, 'member token'), machineTokens });
-  if (!options.dryRun) writeWarmPoolProviderConfig(options.output, assembled);
-  process.stdout.write(`${JSON.stringify({ output: options.output, config: redact(assembled),
+  const selected = options.singleCandidate ? selectSingleWarmPoolCandidate(assembled, options.singleCandidate) : assembled;
+  if (!options.dryRun) writeWarmPoolProviderConfig(options.output, selected);
+  process.stdout.write(`${JSON.stringify({ output: options.output, config: redact(selected),
     ...(options.serve ? { serve: { command: `ELANOUS_WARM_POD_PROVIDER_CONFIG=${shellQuote(options.output)} bun src/task-orchestrator/surfaces/pod-warm-worker-provider.ts --serve` } } : {}) })}\n`);
   if (!options.serve) return;
   const provider = fileURLToPath(new URL('../src/task-orchestrator/surfaces/pod-warm-worker-provider.ts', import.meta.url));

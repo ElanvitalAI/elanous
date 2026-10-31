@@ -93,6 +93,9 @@ export interface NexusEvent {
     // SSE 로 **내용을 담은** 메시지레벨 갱신을 받는다(content-less `session.updated` 와 달리
     // role/text 포함). 스트리밍(ACP peer broadcast)은 C5 별도. `detail` = { sessionId, role, text }.
     | 'session.output'
+    // Hand mission addressed line. Durable rows live in agent-missions; this event
+    // is only the existing /v1/events SSE notification edge.
+    | 'mission.line'
     // Rich-dev-feedback opportunistic followup §6.2 #3 (2026-05-13) —
     // AgentStatusStore lifecycle fan-out. The bridge in
     // `agent-status-event-bridge.ts` subscribes to the store and

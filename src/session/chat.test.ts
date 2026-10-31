@@ -673,10 +673,38 @@ describe('Next TUI research turn routing', () => {
         userConfig: testConfig(provider, false), sessionId: session.id,
         userText: '이번 주 한국 시장과 업계 변화를 조사해 비교해줘', utteranceSurface: 'tui', systemPrompt: 'TUI prompt',
         skipMemoryInjection: true, tools: [tool('Read')], dispatchTool: async () => 'read result', provider,
+        llmOpts: { reasoningEffort: 'high' },
       });
       expect(core).toHaveBeenCalledTimes(1);
       expect(core.mock.calls[0]?.[0].userText).toBe('이번 주 한국 시장과 업계 변화를 조사해 비교해줘');
+      expect(core.mock.calls[0]?.[0].reasoningEffort).toBe('high');
       expect(result.text).toBe('fast research answer');
+    } finally {
+      core.mockRestore();
+    }
+  });
+
+  test('routes a headless ask research intent through the shared core turn', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-headless-ask-research-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'test-provider', defaultModel: 'test-model', available: () => true,
+      async *chat() { yield 'plain'; }, async *streamChat() { yield { type: 'text', delta: 'plain' } as const; },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'cli' });
+    const core = spyOn(coreTurnModule, 'runCoreTurn').mockImplementation(async () => ({
+      stopReason: 'end_turn', finalText: 'headless research answer',
+    }));
+    try {
+      const result = await runTurn({
+        userConfig: testConfig(provider, false), sessionId: session.id,
+        userText: '이번 주 한국 시장과 업계 변화를 조사해 비교해줘', utteranceSurface: 'ask', systemPrompt: 'CLI prompt',
+        skipMemoryInjection: true, tools: [tool('Read')], dispatchTool: async () => 'read result', provider,
+      });
+      expect(core).toHaveBeenCalledTimes(1);
+      expect(core.mock.calls[0]?.[0].userText).toBe('이번 주 한국 시장과 업계 변화를 조사해 비교해줘');
+      expect(result.text).toBe('headless research answer');
     } finally {
       core.mockRestore();
     }

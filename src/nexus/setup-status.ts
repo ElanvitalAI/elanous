@@ -33,6 +33,15 @@ export interface SetupCheckResult {
 
 export type SetupBootMode = 'normal' | 'setup' | 'refuse';
 
+export function shouldCheckHeadlessSetup(opts: {
+  headless: boolean;
+  detachedForTesting: boolean;
+  skipForTesting: boolean;
+  testInstance: boolean;
+}): boolean {
+  return opts.headless && !opts.detachedForTesting && !opts.skipForTesting && !opts.testInstance;
+}
+
 export interface SetupBootDecision {
   mode: SetupBootMode;
   missing: string[];

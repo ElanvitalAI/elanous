@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleGraphRunRoute, type GraphRunView } from './graph-run-api.js';
+import { runGraph, type GraphRunOptions } from './runner.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -59,6 +60,20 @@ describe('CGE-RUN graph run API', () => {
     expect(view.path).toEqual(['plan', 'build', 'review', 'build', 'review', 'done']);
     expect(view.nodes.filter((node) => node.nodeId === 'review').map((node) => node.ok)).toEqual([true, true]);
     expect(view.nodes.every((node) => node.ok)).toBe(true);
+  });
+
+  test('forwards a host cancellation signal to the asynchronous graph runner', async () => {
+    const base = setup();
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    const deps = { ...base.deps, signal: controller.signal, run: async (_path: string, options: GraphRunOptions = {}) => {
+      received = options.signal;
+      return runGraph(_path, options);
+    } };
+    const response = handleGraphRunRoute('POST', '/v1/graphs/demo-review-mine/run', deps)!;
+    expect(response.status).toBe(202);
+    expect(received).toBe(controller.signal);
+    controller.abort();
   });
 
   test('a graph the runner cannot finish is refused before it starts, in words the editor can show', async () => {

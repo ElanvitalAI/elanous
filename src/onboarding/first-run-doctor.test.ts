@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { delimiter, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { DoctorFixDeps } from '../cli/doctor-fix.js';
-import { runFirstRunDoctor } from './first-run-doctor.js';
+import { runFirstRunDoctor, safeDoctorReason } from './first-run-doctor.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -96,7 +96,7 @@ test('service-file, node-pty rebuild, and managed python stay untouched even whe
   };
   f.deps.realpath = () => '/installed/elanous/versions/1.0';
   f.deps.readFile = (path) => path.endsWith('/package.json')
-    ? JSON.stringify({ optionalDependencies: { 'node-pty': '^1.1.0' } }) : f.files.get(path)?.text ?? '';
+    ? JSON.stringify({ elanousOptionalIntegrations: { 'node-pty': '^1.1.0' } }) : f.files.get(path)?.text ?? '';
   const exists = f.deps.exists!;
   f.deps.exists = (path) => path === '/installed/elanous/current/node_modules/elanous/' || exists(path);
   const result = runFirstRunDoctor(f.deps);
@@ -166,6 +166,12 @@ test('item failure shows only its reason and continues other safe repairs', () =
     '나중에: elanous doctor --fix (셸 시작 파일 수정)',
   ]);
   expect(JSON.stringify(result)).not.toContain('SECRET');
+});
+
+test('secret-bearing doctor errors are reduced to a value-free reason', () => {
+  const unsafe = 'api_key=doctor-secret-must-not-render';
+  expect(safeDoctorReason(unsafe)).toBe('민감 정보가 포함된 오류');
+  expect(safeDoctorReason(unsafe)).not.toContain('doctor-secret-must-not-render');
 });
 
 test('planning exception and logging exception never escape first run', () => {

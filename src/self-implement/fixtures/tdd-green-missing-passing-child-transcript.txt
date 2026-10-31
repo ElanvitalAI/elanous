@@ -1,0 +1,2 @@
+⏺ Bash({\"command\":\"bun test -- 'src/ux-sim/service-key-setup.test.ts'\",\"timeout\":120000,\"sandbox\":\"off\",\"network\":\"inherit\"})
+     ↳ bun test v1.4.2 (744846f84) --- stderr --- 2 pass 0 fail 32 expect() calls Ran 2 tests across 1 file. [1099.00ms]

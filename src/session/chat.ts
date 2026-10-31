@@ -511,8 +511,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     // streamLLMWithTools)으로 라우팅. 미아밍이면 아래 기존 single-turn 경로 그대로(회귀 0).
     const goalLoopCfg = opts.userConfig.llm.goalLoop;
     const armGoalLoop = opts.goalLoop === true || goalLoopCfg?.enabled === true;
-    const armTuiResearchTurn = opts.utteranceSurface === 'tui' && turnTools.length > 0 && isResearchAgentIntent(opts.userText);
-    if (armGoalLoop || armTuiResearchTurn) {
+    const armResearchTurn = (opts.utteranceSurface === 'tui' || opts.utteranceSurface === 'ask')
+      && turnTools.length > 0 && isResearchAgentIntent(opts.userText);
+    if (armGoalLoop || armResearchTurn) {
       // ⭐ CHILD-CONTEXT-BUDGET(0.2.35 칸) — 구현 자식(self-implement 공간)의 첫 goal-loop
       //    턴에서 실제 effectiveSystemPrompt·turnTools 스키마·userText(골)의 구성 바이트를
       //    composeChildContext 로 계측해 child.context-composition 사건 1회로 남긴다.
@@ -563,6 +564,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           },
         },
         ...(turnLlmOpts?.model ? { modelOverride: turnLlmOpts.model } : {}),
+        ...(turnLlmOpts?.reasoningEffort ? { reasoningEffort: turnLlmOpts.reasoningEffort } : {}),
         ...(turnLlmOpts?.budgetGrant ? { budgetGrant: turnLlmOpts.budgetGrant } : {}),
         ...(guardedTurnLlmOpts?.requestSizeGuard
           ? { requestSizeGuard: guardedTurnLlmOpts.requestSizeGuard } : {}),

@@ -60,6 +60,31 @@ test('post reads piped stdin, accepts literal body and kind; human and JSON outp
   expect(JSON.parse(f.stdout[0]!).body).toBe('from flag');
 });
 
+test('MSG-CHANNELS CLI creates groups, gates delivery by subscriptions, and accepts seat: DM addresses', async () => {
+  const f = fixture();
+  await f.run('group', 'create', 'release-window', '--from', 'OP', '--json');
+  await f.run('group', 'join', 'release-window', '--seat', 'TC', '--json');
+  await f.run('group', 'join', 'release-window', '--seat', 'MK', '--json');
+  await f.run('group', 'list', '--seat', 'TC', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual(['group:release-window']);
+  await f.run('post', 'subscribers only', '--from', 'OP', '--to', 'group:release-window', '--json');
+  const posted = JSON.parse(f.stdout.at(-1)!);
+  expect(posted.to).toBe('group:release-window');
+  const store = f.store();
+  try {
+    expect(store.list('TC').map(row => row.body)).toEqual(['subscribers only']);
+    expect(store.list('MK').map(row => row.body)).toEqual(['subscribers only']);
+    expect(store.list('UX')).toEqual([]);
+  } finally { store.close(); }
+  await f.run('group', 'leave', 'release-window', '--seat', 'TC', '--json');
+  await f.run('post', 'after leave', '--from', 'OP', '--to', 'group:release-window', '--json');
+  const afterLeave = f.store();
+  try { expect(afterLeave.list('TC').map(row => row.body)).toEqual(['subscribers only']); }
+  finally { afterLeave.close(); }
+  await f.run('post', 'direct', '--from', 'OP', '--to', 'seat:cmo', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ to: 'MK', body: 'direct' });
+});
+
 test('msg mirror with no configured target or pointer fails closed before opening the ledger or GitHub transport', async () => {
   const f = fixture('', () => ({
     mirrorTarget: null,

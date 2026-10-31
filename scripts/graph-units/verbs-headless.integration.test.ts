@@ -45,8 +45,8 @@ test('headless goal-loop evidence contract rejects a child commit', () => {
 test('real verb-make-doc unit executes its headless goal-loop with AIMock and records a document draft', async () => {
   const session = await startAimockLocal((mock) => {
     mock.on({ hasToolResult: false }, {
-      toolCalls: [{ id: 'write-research-report', name: 'Bash', arguments: JSON.stringify({
-        command: "echo '# Research report' | tee docs/research-report.md",
+      toolCalls: [{ id: 'write-research-report', name: 'Write', arguments: JSON.stringify({
+        file_path: 'docs/research-report.md', content: '# research report',
       }) }],
     });
     mock.on({ hasToolResult: true }, {
@@ -160,7 +160,7 @@ test('real verb-make-doc unit executes its headless goal-loop with AIMock and re
     expect(changedFiles).toContain('docs/research-report.md');
     expect(parentOutput).toContain('"evidence"');
     expect(parentOutput).toContain('"terminal-status"');
-    expect(readFileSync(join(target, 'docs/research-report.md'), 'utf8')).toContain('# Research report');
+    expect(readFileSync(join(target, 'docs/research-report.md'), 'utf8')).toContain('# research report');
     const actualEnv = JSON.parse(readFileSync(childEnvProbe, 'utf8')) as NodeJS.ProcessEnv;
     expect(actualEnv.HOME).toBe(homeRoot);
     expect(actualEnv.ELANOUS_STATE_DIR).toBe(stateRoot);

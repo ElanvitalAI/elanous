@@ -471,3 +471,29 @@ test('a nested child-result preflight rejection keeps reason code, check name, a
     { reasonCode: 'missing-traced-path', checkName: 'not-file', targetPath: 'src/b' },
   ] });
 });
+
+test.each([
+  ['same-cell', 'draft PR 생성 실패: self-implement PR guard 실패: same-cell TEST-PROD-LEAK-AUDIT OPEN PR이 있음 (#33887, #33885); blockers=#33887:ta-existing,#33885:ta-current'],
+  ['goal-only', 'draft PR 생성 실패: self-implement PR guard 실패: goal-only: 골 문서만 변경 · 구현 0'],
+])('nested aborted child result preserves explicit %s PR guard detail', (_kind, detail) => {
+  const row = { kind: 'self', ok: false, result: {
+    stage: 'aborted', ok: false, node: 'implement', outcome: 'abandoned',
+    abandonedClassification: { classification: 'implementation-deficit' }, detailKind: 'blocked-draft-pr-guard', detail,
+  } };
+
+  const combinedError = `implement abandoned · implementation-deficit · ${detail}`;
+  expect(nestedPodResult(row)).toEqual({ stage: 'aborted', ok: false, error: combinedError });
+  expect(podChildFailureAttribution(JSON.stringify(row))).toEqual({ stage: 'aborted', error: combinedError });
+  expect(classifyPodExit({ logs: JSON.stringify(row) })).toMatchObject({ class: 'child-unconverged', tail: [combinedError] });
+});
+
+test('nested aborted child result ignores unrelated PTY detail and retains established attribution', () => {
+  const row = { kind: 'self', ok: false, result: {
+    stage: 'aborted', ok: false, node: 'implement', outcome: 'abandoned',
+    abandonedClassification: { classification: 'implementation-deficit' }, detail: 'PTY output mentions timeout 429',
+  } };
+
+  expect(nestedPodResult(row)).toEqual({
+    stage: 'aborted', ok: false, error: 'implement abandoned · implementation-deficit',
+  });
+});

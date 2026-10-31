@@ -27,6 +27,7 @@ import { isOldDoorInternalCall, refuseOldDoor } from './self-dev/old-door.js';
 import { collectCommandEntrances, renderCommandEntrances } from './self-dev/entrance-inventory.js';
 import { isGoalAuthorFileName } from './self-implement/goal-document.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surface.js';
+import { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } from './self-implement/elanous-tui-spawn.js';
 
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
 import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
@@ -97,6 +98,7 @@ function selectedIndexNextTuiRoot(args: readonly string[]): '__tui_next__' | und
 const isCliEntry = import.meta.main || /[\\/]bin[\\/]elanous\.mjs$/.test(process.argv[1] ?? '');
 const INDEX_FAST_ROOT = selectedIndexFastRoot(process.argv.slice(2))
   ?? (isCliEntry ? selectedIndexNextTuiRoot(process.argv.slice(2)) : undefined);
+const shouldRegisterSetupCommand = !INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'setup';
 // Keep the historical index exports without forcing the agent engine into
 // unrelated CLI commands at module load time.
 export const runChatTurnCli: typeof import('./cli/agent-cli.js').runChatTurnCli =
@@ -153,6 +155,10 @@ const registerPrivateLedgerCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '_
 const registerKnowCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'know'
   ? (() => undefined)
   : (require('./cli/know-cli.js') as typeof import('./cli/know-cli.js')).registerKnowCommand) as typeof import('./cli/know-cli.js').registerKnowCommand;
+// LIFE-KINDS(0.2.43) — 생애 종류·끝의 증거·반복 실행 시리즈의 생산 진입점(`eln life …`).
+const registerLifeCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./life/life-cli.js') as typeof import('./life/life-cli.js')).registerLifeCommands) as typeof import('./life/life-cli.js').registerLifeCommands;
 const registerSeatRequestsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'seat'
   ? (() => undefined)
   : (require('./cli/seat-requests-cli.js') as typeof import('./cli/seat-requests-cli.js')).registerSeatRequestsCommands) as typeof import('./cli/seat-requests-cli.js').registerSeatRequestsCommands;
@@ -278,6 +284,9 @@ const registerDoctorCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'doctor'
 const registerProviderCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'provider'
   ? (() => undefined)
   : (require('./cli/provider-cli.js') as typeof import('./cli/provider-cli.js')).registerProviderCommands) as typeof import('./cli/provider-cli.js').registerProviderCommands;
+const registerCatalogCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'catalog'
+  ? (() => undefined)
+  : (require('./cli/catalog-cli.js') as typeof import('./cli/catalog-cli.js')).registerCatalogCommands) as typeof import('./cli/catalog-cli.js').registerCatalogCommands;
 const registerAgentCommands = (INDEX_FAST_ROOT
   ? (() => undefined)
   : (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).registerAgentCommands) as typeof import('./cli/agent-cli.js').registerAgentCommands;
@@ -287,9 +296,9 @@ const registerControlCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'control
 const registerHooksCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
   ? (() => undefined)
   : (require('./cli/hooks-cli.js') as typeof import('./cli/hooks-cli.js')).registerHooksCommands) as typeof import('./cli/hooks-cli.js').registerHooksCommands;
-const registerSetupCommand = (INDEX_FAST_ROOT === '__tui_next__'
-  ? (() => undefined)
-  : (require('./cli/setup-cli.js') as typeof import('./cli/setup-cli.js')).registerSetupCommand) as typeof import('./cli/setup-cli.js').registerSetupCommand;
+const registerSetupCommand = (shouldRegisterSetupCommand
+  ? (require('./cli/setup-cli.js') as typeof import('./cli/setup-cli.js')).registerSetupCommand
+  : (() => undefined)) as typeof import('./cli/setup-cli.js').registerSetupCommand;
 const registerStartCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'start'
   ? (() => undefined)
   : (require('./cli/start-cli.js') as typeof import('./cli/start-cli.js')).registerStartCommand) as typeof import('./cli/start-cli.js').registerStartCommand;
@@ -330,6 +339,7 @@ import { filterCliRootHelp } from './maturity/cli-maturity.js';
 import type { AdPipelinePlan, AdPipelineResult } from './ad-pipeline/run.js';
 import type { AcpPermissionApprover } from './acp/client.js';
 import { runGitCommand } from './git-fs/runner.js';
+import { loadWarmReuseEvidenceByConsumer } from './task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { debug, redactSecretText, redactSecrets } from './debug/log.js';
 import type { HarnessAskSayChildLlmOptions, HarnessAskSayOptions, HarnessPlanOptions } from './harness/harness-cli-command.js';
 import { CliUserError, formatCliUserError, isCliUserError } from './cli/cli-user-error.js';
@@ -1121,6 +1131,22 @@ async function runDevSayFromWords(
 
 registerPtyTakeoverCommands(program);
 registerPtyRecordCommand(program.commands.find((command) => command.name() === 'pty')!);
+program.command('tui')
+  .description('test-universe TUI helpers')
+  .command('test')
+  .description('Prepare latest-main isolated test universe and return a held TUI PTY, runId, and snapshot')
+  .option('--ready-timeout-ms <ms>', 'single held-PTY readiness deadline', String(DEFAULT_TUI_TEST_READY_TIMEOUT_MS))
+  .option('--with-pwa-build', 'install/build PWA when its static export is missing')
+  .action(async (opts: { readyTimeoutMs?: string; withPwaBuild?: boolean }) => {
+    try {
+      const { runTuiTestUniverse } = await import('./cli/tui-test-cli.js');
+      const result = await runTuiTestUniverse({ readyTimeoutMs: Number(opts.readyTimeoutMs), withPwaBuild: opts.withPwaBuild });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } catch (error) {
+      process.stderr.write(`tui test: ${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    }
+  });
 // Keep the public PR help slot but defer its large CI/landing import graph
 // until the PR command is actually selected (including direct Commander use).
 const prCommandOrder = program.commands.length;
@@ -1129,6 +1155,9 @@ const prShell = program.command('pr').description('PR landing commands');
 // lightweight declarations visible without importing the CI/landing graph.
 prShell.command('supersede-drafts').description('확인된 병합 PR의 명시 Supersedes 같은 칸 draft만 정리')
   .requiredOption('--pr <number>', '병합 PR 번호')
+  .option('--cwd <path>', '저장소 경로');
+prShell.command('lineage <pr>').description('PR 계보의 관측 사실만 JSON으로 읽기 (첫 조각 · 닫기 판정 없음)')
+  .requiredOption('--json', 'JSON 관측 결과 출력')
   .option('--cwd <path>', '저장소 경로');
 prShell.command('census').description('열린 PR 전체·골 문서만·2일 무커밋 draft·미닫힌 superseded 집계').option('--cwd <path>', '저장소 경로');
 prShell.command('open-guard').description('새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
@@ -1252,6 +1281,7 @@ registerLiveCommands(program);
 registerResearchCommand(program);
 registerReleaseCommands(program);
 registerKnowCommand(program);
+registerLifeCommands(program);
 registerNotifyCommand(program);
 registerAwayCommand(program);
 registerFreezeCommands(program);
@@ -1590,7 +1620,7 @@ registerDoctorCommand(program);
 registerControlCommands(program);
 registerHooksCommands(program);
 registerSetupCommand(program);
-if (INDEX_FAST_ROOT !== '__tui_next__') {
+if (shouldRegisterSetupCommand) {
   program.commands.find(command => command.name() === 'setup')!
     .option('--terminal', 'Run the terminal onboarding wizard')
     .hook('preAction', async (_command, action) => {
@@ -1700,6 +1730,27 @@ linearCmd.command('sync').requiredOption('--team <key>', 'Linear team key')
     const { runLinearSync } = await import('./cli/connector-cli.js');
     try { process.exitCode = await runLinearSync(opts); }
     catch (error) { console.error(`connector linear sync: ${(error as Error).message}`); process.exitCode = 1; }
+  });
+linearCmd.command('daily-summary').description('Post one public-safe daily progress summary per referenced Linear issue')
+  .option('--version <version>', 'Release checklist version (defaults to the current development version)')
+  .option('--send', 'Post comments; without this flag only print the planned summaries')
+  .option('--json', 'JSON output')
+  .action(async (opts: { send?: boolean; json?: boolean; version?: string }) => {
+    const { runLinearDailyProgress } = await import('./cli/connector-cli.js');
+    try { process.exitCode = await runLinearDailyProgress(opts); }
+    catch (error) { console.error(`connector linear daily-summary: ${(error as Error).message}`); process.exitCode = 1; }
+  });
+linearCmd.command('secretary').description('Ground a request and create a Linear parent with 3–5 assigned subtasks')
+  .argument('<request>', 'Request to break down; quote multi-word text, e.g. "11-04 demo preparation"')
+  .action(async (request: string) => {
+    const { runLinearSecretaryRequest } = await import('./intake-plane/linear-secretary-runtime.js');
+    try {
+      const result = await runLinearSecretaryRequest(request);
+      console.log(result.replyCard);
+    } catch (error) {
+      console.error(`connector linear secretary: ${(error as Error).message}`);
+      process.exitCode = 1;
+    }
   });
 linearCmd.command('receive').description('Internal signed webhook receiver; read raw payload from stdin')
   .requiredOption('--signature <hex>', 'Linear-Signature header')
@@ -5642,7 +5693,17 @@ const selfOrchestrateCmd = selfCmd
         if (childFlags.childLlmProvider?.trim()) debug.log('self-implement.pod', 'child-provider-named', { provider: childFlags.childLlmProvider.trim(), model: childFlags.childLlmModel ?? null, podProvider });
         // BEDROCK-POD-PROVIDER-DROP — provider·account 는 한 곳(podLaunchProviderOptions)에서 — 손 나열이 bedrock 을 떨궈 codex(team)로 돌았다(10-11).
         const podProviderOptions = (await import('./task-orchestrator/surfaces/pod-child-providers.js')).podLaunchProviderOptions(podProvider, { explicitPodAccount, grokApiKeyOptIn });
-        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence: () => undefined, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
+        const warmReuseEvidence = () => {
+          const sourceRef = opts.base ?? 'origin/HEAD';
+          const source = runGitCommand(process.cwd(), ['rev-parse', '--verify', '--quiet', '--end-of-options', `${sourceRef}^{commit}`], { encoding: 'utf8', timeout: 5_000 });
+          const main = runGitCommand(process.cwd(), ['rev-parse', '--verify', '--quiet', '--end-of-options', 'refs/remotes/origin/main^{commit}'], { encoding: 'utf8', timeout: 5_000 });
+          const headSha = source.status === 0 ? source.stdout.trim() : '';
+          const mainSha = main.status === 0 ? main.stdout.trim() : '';
+          const identity = /^[a-f0-9]{40}$/i.test(headSha) && /^[a-f0-9]{40}$/i.test(mainSha)
+            ? { head: headSha, main: mainSha } : undefined;
+          return loadWarmReuseEvidenceByConsumer(identity);
+        };
+        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -6904,6 +6965,7 @@ registerFleetCommands(program);
 
 // ── ops (운영 관측 — 지금 뭐 도나·이상 없나·상태 전이) ──
 registerOpsCommands(program);
+registerCatalogCommands(program);
 registerOutputsCommands(program);
 
 registerPublishCommands(program);
@@ -6989,6 +7051,37 @@ agentCmd.hook('preAction', async (_thisCommand, actionCommand) => {
     }
   } catch { /* fail-soft — 관측 실패가 명령 실행을 막지 않음 */ }
 });
+
+agentCmd.command('mirror')
+  .description('Codex 주인 호스트의 refresh 없는 접근 미러')
+  .command('push <host>')
+  .description('현재 주인 호스트의 사용 가능한 Codex 계정들을 원격 CLI 미러로 보낸다')
+  .action(async (host: string) => {
+    try {
+      const [{ getUserConfig }, { hqFenceDecision }, parentHost, pod, auth, accountsStore] = await Promise.all([
+        import('./user-config.js'), import('./hq/hq.js'), import('./task-agent/parent-host.js'),
+        import('./task-orchestrator/surfaces/self-implement-pod.js'), import('./oauth/store.js'), import('./oauth/codex-account-store.js'),
+      ]);
+      const { isCodexTokenOwnerHost } = await import('./oauth/codex-owner-mirror.js');
+      if (!isCodexTokenOwnerHost(getUserConfig())) throw new Error('Codex 토큰 주인 호스트에서만 mirror push 를 실행할 수 있다');
+      if (!hqFenceDecision('ledger-cli').run) throw new Error('HQ 주인 임대가 없어 Codex mirror push 를 거부한다');
+      const target = parentHost.resolveParentHost({ host, cwd: process.cwd() }, { ...process.env, ELANOUS_TA_PARENT_HOST: undefined });
+      if (!target) throw new Error('잘못된 원격 호스트 이름');
+      const accounts = accountsStore.listCodexAccountsInStore();
+      if (!accounts.length) throw new Error('주인 Codex 계정이 없다');
+      if (accounts.length > 16) throw new Error('Codex 계정이 16개를 넘어 미러를 안전하게 교체할 수 없다');
+      const mirrors: Array<{ account: string; elanousAuth: string; codexAuth: string }> = [];
+      for (const account of accounts) {
+        const credential = pod.hostCredentials(account.name, auth.authStorePath(), () => '', { requireExplicitChatgptAuthMode: true });
+        mirrors.push({ account: account.name, elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth });
+      }
+      parentHost.installRemoteCodexCliMirror(target, mirrors);
+      console.log(`Codex 접근 미러 설치 완료 · host=${target.host} · accounts=${mirrors.length} · refresh=미포함`);
+    } catch (error) {
+      console.error(`codex mirror push 실패: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  });
 
 registerCapabilitiesCommand(agentCmd);
 registerSupervisorMetricsCommand(agentCmd);
@@ -7086,9 +7179,11 @@ agentCmd
   .option('--screens <dir>', '스크린 캡처 디렉토리')
   .option('--backend <id>', `외부 에이전트 backend (${agentBackendHelpList}). 각 CLI auto-approve 모드로 PTY 구동. 미등록 지정 시 명시 에러(조용한 codex 폴백 없음·애그노스틱)`)
   .option('--chain <backends>', '한 미션의 backend 사슬 (예: codex,claude,elanous)')
+  .option('--duo', 'Codex와 Claude Code를 같은 과제로 병렬 실행하고 에이전트별 결과와 요약을 출력')
   .option('--plugin <name@market>', '에이전트 화면 안에서 플러그인을 설치하고 그 스킬로 미션 실행 (codex/claude)')
   .addOption(new Option('--resources <mode>', '미션 전 자원 판단 사다리 (on|off, 기본 on)').choices(['on', 'off']).default('on'))
   .option('--headless', 'Claude 구독 CLI를 비대화형 stream-json 모드로 실행 (claude backend 전용)')
+  .option('--follow-up <prompt>', '같은 Claude/Codex CLI 세션을 재개해 두 번째 사용자 턴을 보냄 (비대화형 선택 경로)')
   .action(async (textParts: string[], opts: Record<string, any>) => {
     // 구독 모드 보장 — 브레인(streamLLM)·codex 둘 다 ChatGPT 구독으로 (API 과금 회피).
     delete process.env.OPENAI_API_KEY;
@@ -7096,7 +7191,7 @@ agentCmd
     // ★ U4b — 액션 글루(backend 검증·mission-file/text·evidence·spec 빌드·통일 진입점 실행)는
     //   runAgentMissionCliCommand(테스트 가능 seam)로 추출. 액션은 I/O(print/exit)만 담당.
     const { resolveBackend } = await import('./agent-mission/driver.js');
-    const { detectAgentCli } = await import('./agent-mission/tool-install.js');
+    const { detectAgentCli, prepareAgentCli } = await import('./agent-mission/tool-install.js');
     const { runAgentMissionCliCommand } = await import('./agent-mission/mission-cli.js');
     const controller = new AbortController();
     const onSigint = (): void => { controller.abort(); };
@@ -7105,12 +7200,25 @@ agentCmd
     try {
       outcome = await runAgentMissionCliCommand(textParts, opts as import('./agent-mission/mission-cli.js').MissionCliOpts,
         { resolveBackend, detectAgentCli, onStatus: (line) => console.error(`[agent-mission] ${line}`), signal: controller.signal,
+          prepareAgentCli: (agent) => prepareAgentCli(agent, {
+            onStatus: (line) => console.error(`[agent-mission] ${line}`),
+            confirmInstall: async (prompt) => {
+              if (!process.stdin.isTTY || !process.stderr.isTTY) {
+                console.error('[agent-mission] 설치 확인은 대화형 터미널에서만 받을 수 있습니다.');
+                return false;
+              }
+              const { createInterface } = await import('node:readline/promises');
+              const readline = createInterface({ input: process.stdin, output: process.stderr });
+              try { return /^(?:y|yes|예)$/i.test((await readline.question(`${prompt} [y/N] `)).trim()); }
+              finally { readline.close(); }
+            },
+          }),
           ...agentMissionCliDepsForTesting });
     } finally {
       process.removeListener('SIGINT', onSigint);
     }
     if (!outcome.ok) { console.error(`❌ ${outcome.message}`); process.exit(outcome.exitCode); }
-    await writeStdoutJson(JSON.stringify(outcome.result, null, 2) + '\n');
+    await writeStdoutJson(JSON.stringify(outcome.duo ?? outcome.result, null, 2) + '\n');
     process.exit(outcome.exitCode);
   });
 
@@ -7727,7 +7835,7 @@ const selfDevCmd = program
   .option('--implement', 'self: headless implementation chat turn(--new·--tools·--goal-loop·interactive dispatch)')
   .option('--elanous', 'self: 격리 bare elanous TUI child를 LLM 제어 루프로 목표까지 구동')
   .option('--hold', 'elanous: brain 없이 띄우고 elanous pty 로 밖에서 몬다(--elanous 전용·--goal과 동시 사용 불가)')
-  .option('--ready-timeout-ms <ms>', 'elanous hold: PTY readiness 대기 상한(ms·양의 정수·기본 30000)')
+  .option('--ready-timeout-ms <ms>', `elanous hold: PTY readiness 대기 상한(ms·양의 정수·기본 ${DEFAULT_TUI_TEST_READY_TIMEOUT_MS})`)
   .option('-g, --goal <goal>', 'elanous 또는 셸 drive: child가 달성할 목표(--elanous 또는 <command> 또는 --attach와 함께)')
   .option('-n, --max-steps <n>', 'elanous 또는 셸 drive: 최대 제어 스텝(기본 30)')
   .option('-p, --poll-ms <ms>', 'elanous 또는 셸 drive: 제어 스텝 간 폴 간격(ms·0 허용·기본 800)')
@@ -8844,7 +8952,7 @@ program
       return;
     }
     const cfg = reloadUserConfig();
-    await (await import('./cli/agent-cli.js')).runChatTurnCli({
+    await runChatTurnCli({
       cfg,
       userText: parts.join(' '),
       explicitSessionId: opts.session,
@@ -12707,7 +12815,16 @@ async function main(): Promise<void> {
       if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: false }) === 'link-shown') return;
     }
     const { runFirstRun } = await import('./onboarding/first-run.js');
-    if ((await runFirstRun({ config: cfg })).outcome !== 'ready') return;
+    if (process.stdin.isTTY === true) {
+      const setupIO = (await import('./onboarding.js')).realIO();
+      try {
+        const result = await runFirstRun({ config: cfg, setupWhenNoProvider: async (config) => {
+          const { runFirstRunProviderSetup } = await import('./cli/setup-keys.js');
+          return runFirstRunProviderSetup(setupIO, { config });
+        } });
+        if (result.outcome !== 'ready') return;
+      } finally { setupIO.close(); }
+    } else if ((await runFirstRun({ config: cfg })).outcome !== 'ready') return;
   }
 
   // Active-provider banner so users know WHICH model/auth is about to

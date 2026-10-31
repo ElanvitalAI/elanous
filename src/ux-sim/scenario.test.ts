@@ -30,6 +30,9 @@ test('YAML scenario runs the real Codex 400 path, compares widget plus stored lo
       const linked = store.queryByDataKeys({ exactCategories: ['ux.sim.scenario'], runIds: [run.runId] }).filter((row) => row.event === 'completed');
       expect(linked).toHaveLength(1);
       expect(JSON.parse(linked[0]!.data!)).toMatchObject({ runId: run.runId, scenarioId: run.id, deviceVerdict: 'PASS' });
+      const codexRows = store.query({ exactCategories: ['llm.codex'], events: ['request-rejected-shape'], instances: [`ux-sim:${run.id}:${run.runId}`], limit: 10 });
+      expect(codexRows).toHaveLength(1);
+      expect(JSON.parse(codexRows[0]!.data!)).not.toHaveProperty('runId');
     } finally { store.close(); }
     expect(JSON.stringify(artifact)).not.toContain('scenario-fake-token');
     expect(JSON.stringify(artifact)).not.toContain('scenario test input');
@@ -42,6 +45,34 @@ test('YAML scenario runs the real Codex 400 path, compares widget plus stored lo
   expect(result.screen).toMatchObject({ pass: true, containsMissing: [], excludesFound: [] });
   expect(result.logs).toMatchObject({ pass: true, category: 'llm.codex', event: 'request-rejected-shape', expectedCount: 1, observedCount: 1, matchedData: { status: 400 }, dataMismatch: [] });
   expect(result.logs.evidenceLine).toContain('"status":400');
+});
+
+test('UX-MS-09 scenario evaluates real draft triage and persists runId-scoped completion evidence', async () => {
+  await withTestState(async () => {
+    const run = await runScenarioFile('scenarios/ux-sim/draft-inventory-200.yaml');
+    expect(run.pass).toBe(true);
+    expect(run.trigger).toMatchObject({ id: 'draft-inventory-200', type: 'ux.draft-inventory.evaluate', expectedCount: 1, fetchCount: 1 });
+    expect(run.screen).toMatchObject({ pass: true, containsMissing: [], excludesFound: [] });
+    expect(run.logs).toMatchObject({ pass: true, category: 'ux.sim.draft-inventory', event: 'assessed', observedCount: 1, dataMismatch: [] });
+    const store = new LogStore(join(getTestStateRoot()!, 'logs', 'logs.db'), { readonly: true });
+    try {
+      const assessed = store.queryByDataKeys({ exactCategories: ['ux.sim.draft-inventory'], runIds: [run.runId] }).filter((row) => row.event === 'assessed');
+      const completed = store.queryByDataKeys({ exactCategories: ['ux.sim.scenario'], runIds: [run.runId] }).filter((row) => row.event === 'completed');
+      expect(assessed).toHaveLength(1);
+      expect(JSON.parse(assessed[0]!.data!)).toMatchObject({
+        runId: run.runId,
+        total: 200,
+        byScenario: { 'merged-twin': 25, 'duplicate-open': 25, 'harvest-reference': 25, 'all-files-landed': 25, 'protected-label': 25, running: 25, stale: 25, harvestable: 25 },
+        byAction: { close: 125, keep: 75 },
+        triageByAction: { 'close-a': 0, 'close-b': 75, 'close-c': 25, harvest: 25, human: 75 },
+        mismatchCount: 0,
+        protectedOrRunningClosed: 0,
+      });
+      expect(completed).toHaveLength(1);
+      expect(JSON.parse(completed[0]!.data!)).toMatchObject({ runId: run.runId, scenarioId: 'ux-draft-inventory-200', deviceVerdict: 'PASS' });
+      expect(readFileSync(run.evidenceArtifact, 'utf8')).toContain(run.runId);
+    } finally { store.close(); }
+  });
 });
 
 test('repeated ScenarioV0 runs keep distinct evidence artifacts and correlated logs rows', async () => {

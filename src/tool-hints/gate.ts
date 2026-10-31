@@ -144,6 +144,7 @@ export function evaluateGate(
   if (signals.intentResearch) {
     bumpIfEnabled(enabled, boost, 'web_search', 2);
     bumpIfEnabled(enabled, boost, 'omni_search', 2);
+    bumpIfEnabled(enabled, boost, 'web_fetch', 2);
   }
   if (signals.intentDiagram) {
     bumpIfEnabled(enabled, boost, 'mermaid_render', 2);

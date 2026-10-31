@@ -77,6 +77,28 @@ test('research turns keep a finite wider tool catalog while ordinary GPT turns k
   expect(research.filtered).toHaveLength(16);
 });
 
+test('research tool budget keeps WebSearch, OmniSearch, and WebFetch in the selected set', () => {
+  resetGateCache();
+  const catalog = [
+    ...['web_search', 'omni_search', 'web_fetch'].map(id => ({
+      ...catalogWithDefaultEnabled(true)[0]!, id,
+    })),
+    ...Array.from({ length: 18 }, (_, index) => ({
+      ...catalogWithDefaultEnabled(true)[0]!, id: `other_${index}`,
+    })),
+  ];
+  const research = evaluateGate(catalog, [], {
+    ...signals,
+    modelFamily: 'gpt',
+    intentResearch: true,
+    researchAgent: true,
+    fingerprint: 'research-tools-survive-gpt-cap',
+  });
+  expect(research.filtered).toContain('web_search');
+  expect(research.filtered).toContain('omni_search');
+  expect(research.filtered).toContain('web_fetch');
+});
+
 test('tool hints recognize explanatory research without widening a code repair or simple fact', () => {
   expect(collectSignals({ recentUserText: '현재 채권 금리가 계속 올라가는 이유는요? omni market 활용' }).intentResearch).toBe(true);
   expect(collectSignals({ recentUserText: '현재 채권 금리가 계속 올라가는 이유는요? omni market 활용' }).researchAgent).toBe(true);

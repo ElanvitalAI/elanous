@@ -17,7 +17,8 @@ test('an auto-approve process spawned like the graph does writes release-loop.ap
   // NODE_ENV=test turns the default store off; the graph child runs without it, and the state dir above keeps it isolated.
   delete env.NODE_ENV;
   // Minimal graph context: every metric is unmeasured, so the outcome is fail (rc 1), but the decision is still logged.
-  env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.0.1', previousVersion: '0.0.0' }, outputs: {} });
+  env.ELANOUS_RUN_ID = 'process-run';
+  env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId: 'graph-run', input: { version: '0.0.1', previousVersion: '0.0.0' }, outputs: {} });
   const run = spawnSync('bun', ['scripts/release-loop/auto-approve-node.ts'], { cwd: REPO, env, encoding: 'utf8', timeout: 60_000 });
   expect(run.error).toBeUndefined();
   expect({ status: run.status, stderr: run.status === 1 ? '' : run.stderr }).toEqual({ status: 1, stderr: '' });
@@ -28,5 +29,10 @@ test('an auto-approve process spawned like the graph does writes release-loop.ap
     const rows = store.query({ exactCategories: ['release-loop.approve'] });
     expect(rows.map((row) => row.event)).toContain('auto-decision');
     expect(rows.every((row) => row.surface === 'release-loop')).toBe(true);
+    const decision = rows.find((row) => row.event === 'auto-decision');
+    expect(decision).toBeDefined();
+    const data = JSON.parse(decision!.data ?? '{}') as { runId?: string; tuiSubcheck?: { runId?: string | null } };
+    expect(data.runId).toBe('graph-run');
+    expect(data.tuiSubcheck?.runId).toBe(data.runId);
   } finally { store.close(); }
 }, 60_000);

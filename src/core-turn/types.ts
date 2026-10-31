@@ -149,6 +149,8 @@ export interface CoreTurnContext {
   /** Optional provider request-size hook. Only providers with a measured
    *  serializer consume it; all others retain their existing request path. */
   requestSizeGuard?: LLMOpts['requestSizeGuard'];
+  /** Optional per-turn reasoning effort; high/xhigh/max also opts into the default deep Bloom frame. */
+  reasoningEffort?: LLMOpts['reasoningEffort'];
   /** Tool catalog the model may call this turn. Empty array means
    *  "text-only" — the loop delegates to plain `streamLLM`. */
   tools: LLMToolSpec[];

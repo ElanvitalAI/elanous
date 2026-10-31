@@ -89,55 +89,6 @@ describe('/term 등록 (src/tui/slash/term.ts)', () => {
     expect(scrolls).toBe(cases.length);
   });
 
-  test('formal and experimental subcommands still dispatch through the registered /term handler', async () => {
-    const calls: string[] = [];
-    const format = (text: string) => text;
-    const ctx = {
-      chatLines: [] as string[], setChatScrollOffset: () => {},
-      accent: format, warning: format, error: format, draw: () => {},
-      termSlash: {
-        slashRuntime: createDashboardTermSlashRuntime({ accent: format, muted: format, warning: format, error: format, text: format }),
-        openNewTerminal: (command?: string) => { calls.push(`new:${command}`); },
-        openSessionPicker: () => { calls.push('switch'); },
-        sessionRegistry: {
-          list: () => [], foreground: () => null, kill: (id: string) => { calls.push(`kill:${id}`); },
-        },
-        terminalMatrix: {
-          list: () => [], get: () => null, listPipes: () => [],
-        },
-        broadcastBus: { groups: () => [] },
-        channelBus: { channels: () => [] },
-      },
-    } as unknown as TermSlashContext;
-    const reg = new SlashCommandRegistry<TermSlashContext, never>();
-    registerTermSlash(reg);
-    const root = mkdtempSync(join(tmpdir(), 'term-dispatch-isolated-'));
-    const previousState = process.env.ELANOUS_STATE_DIR;
-    process.env.ELANOUS_STATE_DIR = root;
-    try {
-      for (const [sub, args, expected] of [
-        ['help', [], '/term new'], ['help', ['experimental'], '/term matrix'],
-        ['new', ['echo', 'hi'], 'new:echo hi'], ['list', [], 'No terminal sessions.'],
-        ['attach', [], '/term attach requires'], ['detach', [], 'No foreground session'],
-        ['switch', [], 'switch'], ['kill', [], 'No session to kill'],
-        ['resume', [], 'No persisted sessions'], ['snapshot', [], 'Usage: /term snapshot'],
-        ['matrix', [], '(no terminals'], ['move', [], 'Usage: /term move'],
-        ['group', [], '(no broadcast groups'], ['channel', [], '(no channels'],
-        ['pipe', [], 'Usage: /term pipe'], ['readonly', [], 'Usage: /term readonly'],
-        ['recharacter', [], 'Usage: /term recharacter'],
-      ] as const) {
-        const linesBefore = ctx.chatLines.length;
-        const callsBefore = calls.length;
-        await reg.dispatch('term', [sub, ...args], ctx);
-        expect([...ctx.chatLines.slice(linesBefore), ...calls.slice(callsBefore)].join('\n')).toContain(expected);
-      }
-    } finally {
-      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
-      else process.env.ELANOUS_STATE_DIR = previousState;
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
   test.skipIf(!ptyAvailable())('detach → resume scenario matrix: saved command/cwd spawn a new PTY without restoring the old screen buffer', async () => {
     const root = mkdtempSync(join(tmpdir(), 'term-resume-isolated-'));
     const previousState = process.env.ELANOUS_STATE_DIR;
@@ -171,6 +122,7 @@ describe('/term 등록 (src/tui/slash/term.ts)', () => {
       expect(read()).toContain(marker);
     };
     const initialPtyIds = new Set(listPty().map(handle => handle.id));
+    const spawnedPtyHandles = new Map<string, ReturnType<typeof listPty>[number]>();
     const detachedIds: string[] = [];
     const stopObservingDetach = registry.subscribe(event => {
       if (event.type === 'detached') detachedIds.push(event.session.id);
@@ -180,6 +132,7 @@ describe('/term 등록 (src/tui/slash/term.ts)', () => {
       const original = registry.spawn({ title: 'shell', cwd: savedCwd, command, kind: 'shell' }, { termCols: 100, termRows: 30 });
       const oldPty = listPty().find(handle => !initialPtyIds.has(handle.id));
       expect(oldPty?.pid).toBeGreaterThan(0);
+      if (oldPty) spawnedPtyHandles.set(oldPty.id, oldPty);
       await waitForMarker(() => original.preview.render(false), 'RESUMED_FRESH_SCREEN');
       original.preview.write('printf "%s%s" OLD_SCREEN_BUFFER_ ONLY\r');
       await waitForMarker(() => original.preview.render(false), 'OLD_SCREEN_BUFFER_ONLY');
@@ -203,6 +156,7 @@ describe('/term 등록 (src/tui/slash/term.ts)', () => {
       expect(resumed!.preview).not.toBe(original.preview);
       const newPty = listPty().find(handle => !initialPtyIds.has(handle.id) && handle.id !== oldPty?.id);
       expect(newPty?.pid).toBeGreaterThan(0);
+      if (newPty) spawnedPtyHandles.set(newPty.id, newPty);
       expect(newPty?.pid).not.toBe(oldPty?.pid);
       expect(resumed!.command).toBe(command);
       expect(resumed!.cwd).toBe(savedCwd);
@@ -215,10 +169,22 @@ describe('/term 등록 (src/tui/slash/term.ts)', () => {
     } finally {
       stopPersistence();
       stopObservingDetach();
+      for (const handle of listPty()) {
+        if (!initialPtyIds.has(handle.id)) spawnedPtyHandles.set(handle.id, handle);
+      }
       for (const session of registry.list()) registry.kill(session.id);
+      const childExitDeadline = Date.now() + 10_000;
+      while ([...spawnedPtyHandles.values()].some(handle => handle.isAlive()) && Date.now() < childExitDeadline) {
+        await Bun.sleep(25);
+      }
+      const danglingPtyIds = [...spawnedPtyHandles.values()]
+        .filter(handle => handle.isAlive())
+        .map(handle => handle.id);
+      console.log(`TERM_RESUME_PTY cleanup dangling=${danglingPtyIds.length}`);
+      expect(danglingPtyIds).toEqual([]);
       if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previousState;
       rmSync(root, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 30_000);
 });

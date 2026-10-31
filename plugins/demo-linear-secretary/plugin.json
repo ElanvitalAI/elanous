@@ -1,0 +1,15 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "demo-linear-secretary",
+  "version": "0.1.0",
+  "description": "Linear secretary scene package: issue creation, sub-issues, comments, checklists, and progress sync.",
+  "extensions": {
+    "ai.elanous": {
+      "connectors": [
+        { "id": "linear", "required": true, "fields": [{ "name": "apiKey", "secret": true, "env": "LINEAR_API_KEY" }] },
+        { "id": "telegram", "required": false, "fields": [{ "name": "botToken", "secret": true, "env": "ELANOUS_TELEGRAM_BOT_TOKEN" }] },
+        { "id": "telegram-chat", "required": false, "fields": [{ "name": "chatId", "secret": false, "env": "ELANOUS_TELEGRAM_CHAT_ID" }] }
+      ]
+    }
+  }
+}

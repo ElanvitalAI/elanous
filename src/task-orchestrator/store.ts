@@ -56,7 +56,8 @@ import type {
 // v3 (Mission Fabric 통합 U1 · 2026-07-09) — tox_missions.autopilot_json
 //    (PFC Layer2 자율 메타 흡수 · apm Mission 병렬 table 제거 준비)
 // v4 — external task identity and approval
-export const TOX_SCHEMA_VERSION = 4;
+// v5 — run-scoped browser capture artifacts on executions
+export const TOX_SCHEMA_VERSION = 5;
 
 // ─────────────────────── Row shapes ────────────────────────────────
 
@@ -114,6 +115,8 @@ interface ExecutionRow {
   model_id: string | null;
   host_id: string | null;
   hostname: string | null;
+  run_id: string | null;
+  capture_artifacts_json: string | null;
 }
 
 interface EventRow {
@@ -262,7 +265,9 @@ export class TaskStore {
         token_input INTEGER,
         token_output INTEGER,
         cost_usd REAL,
-        model_id TEXT
+        model_id TEXT,
+        run_id TEXT,
+        capture_artifacts_json TEXT
       );
 
       CREATE TABLE IF NOT EXISTS tox_events (
@@ -314,6 +319,8 @@ export class TaskStore {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tox_missions_project ON tox_missions(project_id)');
     this.addColumnIfMissing('tox_executions', 'host_id', 'TEXT');
     this.addColumnIfMissing('tox_executions', 'hostname', 'TEXT');
+    this.addColumnIfMissing('tox_executions', 'run_id', 'TEXT');
+    this.addColumnIfMissing('tox_executions', 'capture_artifacts_json', 'TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tox_executions_host ON tox_executions(host_id, started_at)');
     this.addColumnIfMissing('tox_tasks', 'approval_json', 'TEXT');
     this.addColumnIfMissing('tox_tasks', 'external_provider', 'TEXT');
@@ -477,8 +484,8 @@ export class TaskStore {
         `INSERT OR REPLACE INTO tox_executions (
           id, task_id, started_at, ended_at, duration_ms, status, surface_json,
           surface_address, output, output_path, error_json, token_input,
-          token_output, cost_usd, model_id, host_id, hostname
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          token_output, cost_usd, model_id, host_id, hostname, run_id, capture_artifacts_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         exec.id,
@@ -497,7 +504,9 @@ export class TaskStore {
         exec.costUsd ?? null,
         exec.modelId ?? null,
         hostId ?? null,
-        hostname ?? null
+        hostname ?? null,
+        exec.runId ?? null,
+        exec.captureArtifacts ? JSON.stringify(exec.captureArtifacts) : null
       ));
   }
 
@@ -769,6 +778,8 @@ export class TaskStore {
       modelId: row.model_id ?? undefined,
       ...(row.host_id !== null ? { hostId: row.host_id } : {}),
       ...(row.hostname !== null ? { hostname: row.hostname } : {}),
+      ...(row.run_id !== null ? { runId: row.run_id } : {}),
+      ...(row.capture_artifacts_json ? { captureArtifacts: JSON.parse(row.capture_artifacts_json) as TaskExecution['captureArtifacts'] } : {}),
     };
   }
 }

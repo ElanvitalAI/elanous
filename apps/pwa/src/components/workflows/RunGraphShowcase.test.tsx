@@ -35,16 +35,16 @@ const GRAPH: RunGraphDetail = {
     { node_id: 'failed', kind: 'gate', recipe: '', max_visits: 1 },
   ],
   edges: [
-    { from: 'resync', to: 'rejudge', outcomes: ['ok', 'fail'] },
-    { from: 'rejudge', to: 'sync', outcomes: ['ok', 'fail'] },
-    { from: 'sync', to: 'triage', outcomes: ['ok'] },
-    { from: 'sync', to: 'failed', outcomes: ['fail'] },
-    { from: 'triage', to: 'schedule', outcomes: ['ok'] },
-    { from: 'triage', to: 'failed', outcomes: ['fail'] },
-    { from: 'schedule', to: 'report', outcomes: ['ok'] },
-    { from: 'schedule', to: 'failed', outcomes: ['fail'] },
-    { from: 'report', to: 'done', outcomes: ['ok'] },
-    { from: 'report', to: 'failed', outcomes: ['fail'] },
+    { from: 'resync', to: 'rejudge' },
+    { from: 'rejudge', to: 'sync' },
+    { from: 'sync', to: 'triage' },
+    { from: 'sync', to: 'failed' },
+    { from: 'triage', to: 'schedule' },
+    { from: 'triage', to: 'failed' },
+    { from: 'schedule', to: 'report' },
+    { from: 'schedule', to: 'failed' },
+    { from: 'report', to: 'done' },
+    { from: 'report', to: 'failed' },
   ],
 };
 const RUNS = {
@@ -71,10 +71,10 @@ const nodeMock = (width: number) => () => ({
   clientWidth: width, clientHeight: 700, offsetWidth: width, offsetHeight: 700, style: {}, ownerDocument: globalThis.document,
 });
 
-async function mount(width: number) {
+async function mount(width: number, traversal: HarnessRunTraversal = TRAVERSAL) {
   const fetchImpl = (async (url: string) => {
     if (String(url).includes('/v1/harness/runs')) return new Response(JSON.stringify(RUNS), { status: 200 });
-    if (String(url).includes('/v1/harness/run-traversal')) return new Response(JSON.stringify(TRAVERSAL), { status: 200 });
+    if (String(url).includes('/v1/harness/run-traversal')) return new Response(JSON.stringify(traversal), { status: 200 });
     if (String(url).includes('/v1/graphs/')) return new Response(JSON.stringify(GRAPH), { status: 200 });
     return new Response('{}', { status: 200 });
   }) as unknown as typeof fetch;
@@ -91,7 +91,7 @@ async function mount(width: number) {
       { createNodeMock: nodeMock(width) },
     );
   });
-  await waitUntil(() => root.root.findAllByProps({ 'data-testid': `showcase-run-${TRAVERSAL.runId}` }).length > 0);
+  await waitUntil(() => root.root.findAllByProps({ value: TRAVERSAL.runId }).length > 0);
   return root;
 }
 
@@ -109,7 +109,7 @@ async function waitUntil(ready: () => boolean) {
 
 async function pickRun(root: ReturnType<typeof create>) {
   await act(async () => {
-    root.root.findByProps({ 'data-testid': `showcase-run-${TRAVERSAL.runId}` }).props.onClick();
+    root.root.findByProps({ 'data-testid': 'showcase-run-select-0' }).props.onChange({ target: { value: TRAVERSAL.runId } });
   });
   await waitUntil(() => root.root.findAllByType(ReactFlow).length > 0);
 }
@@ -159,9 +159,15 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
   test('발표 폭(1280px) — 원장 사건이 노드를 밝히고 다음 간선에 흐르는 표식이 움직인다', async () => {
     (g.window as { innerWidth: number }).innerWidth = 1280;
     root = await mount(1280);
-    expect(text(root.root.findByProps({ 'data-testid': `showcase-run-${TRAVERSAL.runId}` }))).toContain('● 도는 중');
+    expect(text(root.root.findByProps({ 'data-testid': 'showcase-run-select-0' }))).toContain('도는 중');
     await pickRun(root);
     expectCurrentSceneOnly(root);
+    expect([0, 1, 2].every((index) => root!.root.findAllByProps({ 'data-testid': `showcase-panel-${index}` }).length === 1)).toBe(true);
+    expect(root.root.findAllByProps({ role: 'group', 'aria-label': '리서치 적응형 그래프 사건' })).toHaveLength(1);
+    expect(root.root.findByProps({ 'data-testid': 'arg-added-count-0' }).children).toEqual(['0']);
+    expect(root.root.findByProps({ 'data-testid': 'arg-depth-count-0' }).children).toEqual(['0']);
+    expect(root.root.findByProps({ 'data-testid': 'arg-repair-count-0' }).children).toEqual(['0']);
+    expect(text(root.root.findByProps({ 'data-testid': 'arg-hand-card-0' }))).toContain('이 런 원장에 기록된 손 노드 없음');
     const flow = root.root.findByType(ReactFlow);
     const nodes = flow.props.nodes as Array<{ id: string; data: { state: string; visits: number } }>;
     expect(nodes.find((node) => node.id === 'resync')?.data).toMatchObject({ state: 'passed', visits: 1 });
@@ -177,6 +183,35 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
     const liveEdge = (flow.props.edgeTypes as { live: (props: unknown) => ReactNode }).live({ id: active.id, data: active.data, markerEnd: undefined, style: undefined });
     expect(countTag(liveEdge, 'animateMotion')).toBe(2);
     expect(root.root.findByProps({ 'aria-label': '실행 그래프' }).props['data-viewport']).toBe('wide');
+  });
+
+  test('기록된 적응 사건은 세 패널과 손 카드에만 실측값으로 표시한다', async () => {
+    const traversal: HarnessRunTraversal = {
+      ...TRAVERSAL,
+      graphEvents: [
+        { seq: 5, ts: '2026-10-29T09:26:43.000Z', type: 'node-added', node: 'source-check', kind: 'search', decider: 'runtime-overlay', reason: 'source evidence missing' },
+        { seq: 6, ts: '2026-10-29T09:26:44.000Z', type: 'unit-expanded', node: 'research', unit: 'source-check', childRunId: 'child-research', resolution: 3, decider: 'runtime-overlay', reason: 'deepen source review' },
+        { seq: 7, ts: '2026-10-29T09:26:45.000Z', type: 'edge-rerouted', from: 'triage', outcome: '$default', was: 'schedule', to: 'source-check', decider: 'runtime-overlay', reason: 'retry source with alternate route' },
+        { seq: 8, ts: '2026-10-29T09:26:46.000Z', type: 'node-added', node: 'codex-hand', kind: 'hand', decider: 'runtime-overlay', reason: 'agent mission hand', who: 'codex', what: 'compare independent research angle', missionId: 'mission-research' },
+        { seq: 9, ts: '2026-10-29T09:26:47.000Z', type: 'node-added', node: 'source-check-2', kind: 'search', decider: 'runtime-overlay', reason: 'compare second source' },
+        { seq: 10, ts: '2026-10-29T09:26:48.000Z', type: 'node-added', node: 'source-check-3', kind: 'search', decider: 'runtime-overlay', reason: 'compare third source' },
+      ],
+    };
+    root = await mount(1280, traversal);
+    await pickRun(root);
+    expect(root.root.findByProps({ 'data-testid': 'arg-added-count-0' }).children).toEqual(['4']);
+    expect(root.root.findByProps({ 'data-testid': 'arg-depth-count-0' }).children).toEqual(['1']);
+    expect(root.root.findByProps({ 'data-testid': 'arg-repair-count-0' }).children).toEqual(['1']);
+    expect(root.root.findByProps({ 'data-testid': 'arg-added-panel-0' }).props.className).toContain('animate-pulse');
+    expect(root.root.findByProps({ 'data-testid': 'arg-depth-panel-0' }).props.className).toContain('animate-pulse');
+    expect(root.root.findByProps({ 'data-testid': 'arg-repair-panel-0' }).props.className).toContain('animate-pulse');
+    expect(root.root.findAllByProps({ 'data-event-seq': 5 })).toHaveLength(1);
+    expect(root.root.findAllByProps({ 'data-event-seq': 6 })).toHaveLength(1);
+    expect(root.root.findAllByProps({ 'data-event-seq': 7 })).toHaveLength(1);
+    expect(text(root.root.findByProps({ 'data-testid': 'arg-hand-card-0' })).includes('codex → compare independent research angle · mission-research')).toBe(true);
+    const nodes = root.root.findByType(ReactFlow).props.nodes as Array<{ id: string }>;
+    expect(nodes.some((node) => node.id === 'source-check')).toBe(true);
+    expect(nodes.some((node) => node.id === 'codex-hand')).toBe(true);
   });
 
   test('태블릿 폭(820px) — 실제 진행 노드와 현재 간선을 넓은 배치로 유지한다', async () => {

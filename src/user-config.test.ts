@@ -33,6 +33,21 @@ function writeConfig(value: unknown): void {
   writeFileSync(configPath, JSON.stringify(value));
 }
 
+test('outbound quietHours accepts off and KST ranges and survives config save', () => {
+  writeConfig({ outbound: { quietHours: 'off', deferredMaxAttempts: 7 } });
+  const off = buildUserConfig(configPath);
+  expect(off.outbound).toEqual({ quietHours: 'off', deferredMaxAttempts: 7 });
+  saveUserConfig(off, configPath);
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).outbound).toEqual({ quietHours: 'off', deferredMaxAttempts: 7 });
+
+  writeConfig({ outbound: { quietHours: '22:00-06:30' } });
+  expect(buildUserConfig(configPath).outbound?.quietHours).toBe('22:00-06:30');
+  for (const invalid of ['24:00-06:30', '06:30-06:30', 'off ', 10]) {
+    writeConfig({ outbound: { quietHours: invalid } });
+    expect(buildUserConfig(configPath).outbound?.quietHours).toBeUndefined();
+  }
+});
+
 test('tui.sidetab validates values and survives config save', () => {
   writeConfig({ tui: { sidetab: 'open', role: 'contributor', showBeta: true } });
   const cfg = buildUserConfig(configPath);
@@ -509,6 +524,22 @@ describe('llm.reviewFallbackModels persistence', () => {
     const reloaded = buildUserConfig(savedPath);
     expect(reloaded.llm.reviewFallbackModels).toEqual(['grok', 'grok-fast']);
     expect(reloaded.llm.fallbackChain).toEqual(['codex-rotate', 'grok']);
+  });
+});
+
+describe('llm.codexTokenOwnerHost persistence', () => {
+  test('keeps a valid owner host and drops malformed values', () => {
+    writeConfig({ llm: { codexTokenOwnerHost: 'mbp' } });
+    const cfg = buildUserConfig(configPath);
+    expect(cfg.llm.codexTokenOwnerHost).toBe('mbp');
+    const savedPath = join(root, 'codex-owner-config.json');
+    saveUserConfig(cfg, savedPath);
+    expect(buildUserConfig(savedPath).llm.codexTokenOwnerHost).toBe('mbp');
+
+    for (const invalid of ['../mbp', 'node-b;touch', '', 7]) {
+      writeConfig({ llm: { codexTokenOwnerHost: invalid } });
+      expect(buildUserConfig(configPath).llm.codexTokenOwnerHost).toBeUndefined();
+    }
   });
 });
 

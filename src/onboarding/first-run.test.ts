@@ -9,11 +9,14 @@ import { unattendedNextStepLine } from './entry-hints.js';
 import { buildUserConfig, saveUserConfig } from '../user-config.js';
 import { needsFirstRun, needsOnboarding } from '../onboarding.js';
 import type { DetectedProvider } from '../llm/provider-detect.js';
+import { FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES } from '../cli/setup-keys.js';
 import {
   FIRST_RUN_MENU_ANSWERS,
+  FIRST_RUN_MENU_CHOICE_MARKERS,
   FIRST_RUN_MENU_CHOICES,
-  FIRST_RUN_MENU_MARKER,
+  FIRST_RUN_MENU_MARKERS,
   FIRST_RUN_SETUP_HINT,
+  countFirstRunMenuRenders,
   driveFirstRunMenu,
   firstRunPtySupport,
 } from '../ux-sim/onboarding-first-run-device.js';
@@ -34,6 +37,58 @@ function fixture() {
 }
 
 describe('first run', () => {
+  test('DEMO1104 first-run stores and probes a missing chosen key without marking the runtime ready', async () => {
+    const f = fixture();
+    const secret = 'first-run-secret-must-not-render';
+    const stored = new Map<string, string>();
+    const output: string[] = [];
+    try {
+      const result = await runFirstRun({
+        path: f.path,
+        config: buildUserConfig(f.path),
+        isTTY: true,
+        locale: 'ko',
+        detectProviders: async () => [],
+        chooseProvider: async () => 'anthropic',
+        promptSecret: async () => `ANTHROPIC_API_KEY=${secret}`,
+        getSecretAsync: async (id) => stored.get(id),
+        setSecretAsync: async (id, value) => { stored.set(id, value); },
+        probeKey: async () => ({ success: true, durationMs: 0, model: 'mock' }),
+        print: (line) => output.push(line),
+      });
+      expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
+      expect(stored).toEqual(new Map([['ANTHROPIC_API_KEY', secret]]));
+      expect(output.join('\n')).toContain('✅ Anthropic');
+      expect(output.join('\n')).toContain('키를 저장하고 검증했지만 첫 실행에서 사용할 provider 연결은 아직 완료되지 않았습니다.');
+      expect(output.join('\n')).not.toContain(secret);
+      expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
+      expect(buildUserConfig(f.path).llm.provider).toBe('auto');
+    } finally { f.cleanup(); }
+  });
+
+  test('DEMO1104 first-run hides SecretStore exception text and returns a safe setup failure', async () => {
+    const f = fixture();
+    const secret = 'secret-store-error-must-not-render';
+    const output: string[] = [];
+    try {
+      const result = await runFirstRun({
+        path: f.path,
+        config: buildUserConfig(f.path),
+        isTTY: true,
+        locale: 'ko',
+        detectProviders: async () => [],
+        chooseProvider: async () => 'anthropic',
+        promptSecret: async () => `ANTHROPIC_API_KEY=${secret}`,
+        getSecretAsync: async () => undefined,
+        setSecretAsync: async () => { throw new Error(secret); },
+        print: (line) => output.push(line),
+      });
+      expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
+      expect(output.join('\n')).toContain('키 설정을 완료하지 못했습니다. 비밀 값을 표시하지 않고 중단했습니다.');
+      expect(output.join('\n')).not.toContain(secret);
+    } finally { f.cleanup(); }
+  });
+
   test('ready is optional and survives parsing and saving without completing detailed onboarding', () => {
     const f = fixture();
     try {
@@ -117,12 +172,44 @@ describe('first run', () => {
       const lines: string[] = [];
       let calls = 0;
       const result = await runFirstRun({ path: f.path, isTTY: true, locale: 'ko', detectProviders: async () => [],
-        chooseProvider: async () => { calls++; return 'grok'; }, print: (line) => lines.push(line),
+        chooseProvider: async () => { calls++; return 'grok'; },
+        promptSecret: async () => '',
+        print: (line) => lines.push(line),
       });
       expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
       expect(calls).toBe(1);
-      expect(lines).toEqual(['eln setup llm 으로 고르세요']);
+      expect(lines).toContain('건너뜀 Grok');
+      expect(lines).toContain('eln setup llm 으로 고르세요');
       expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
+    } finally { f.cleanup(); }
+  });
+
+  test('SETUP-FIRST-RUN-NO-PROVIDER-FLOW: provider setup returns to first-run and saves the selected default', async () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.rotation = [{ provider: 'grok', apiKey: 'selected-key' }];
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
+        detectProviders: async () => [], setupWhenNoProvider: async () => 'grok',
+        chooseProvider: async () => { throw new Error('old chooser must not run'); },
+      });
+      expect(result).toEqual({ outcome: 'ready', provider: 'grok', inputs: 1 });
+      expect(buildUserConfig(f.path).llm).toMatchObject({ provider: 'grok', apiKey: 'selected-key' });
+      expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  test('SETUP-FIRST-RUN-NO-PROVIDER-FLOW: skip explains unavailable LLM features and keeps the first screen reachable', async () => {
+    const f = fixture();
+    try {
+      const lines: string[] = [];
+      const result = await runFirstRun({ path: f.path, isTTY: true, detectProviders: async () => [],
+        setupWhenNoProvider: async () => null, print: line => lines.push(line),
+      });
+      expect(result).toEqual({ outcome: 'ready', inputs: 1 });
+      expect(lines.join('\n')).toContain('LLM 기능은 사용할 수 없습니다');
+      expect(lines.join('\n')).toContain('elanous setup keys');
+      expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
     } finally { f.cleanup(); }
   });
 
@@ -205,11 +292,12 @@ describe('first run', () => {
       const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true, print: () => {},
         detectProviders: async () => [detected('claude-code', 'agent-cli'), detected('grok'), detected('openai-codex')],
         chooseProvider: async (list) => { seen.push(list); return 'grok'; },
+        setupWhenNoProvider: async () => { throw new Error('detected subscriptions must keep the existing provider chooser'); },
       });
       expect(result).toEqual({ outcome: 'ready', provider: 'grok', inputs: 1 });
       expect(seen).toEqual([['openai-codex', 'grok']]);
-      expect(orderProviderChoices(['openai-codex', 'grok'])).toEqual(['openai-codex', 'grok', 'anthropic']);
-      expect(orderProviderChoices(['grok'])).toEqual(['grok', 'openai-codex', 'anthropic']);
+      expect(orderProviderChoices(['openai-codex', 'grok'])).toEqual(['openai-codex', 'grok', 'anthropic', 'openrouter', 'glm']);
+      expect(orderProviderChoices(['grok'])).toEqual(['grok', 'openai-codex', 'anthropic', 'openrouter', 'glm']);
       expect(buildUserConfig(f.path).llm.provider).toBe('grok');
     } finally { f.cleanup(); }
   });
@@ -368,7 +456,7 @@ describe('first run', () => {
   // FIRST10-FIX 판정선: 오타가 first-run 전체를 취소(구 동작)하는지, 재질문(신 동작)하는지.
   test('a menu typo no longer cancels the first run — every miss re-asks instead of cancelling', () => {
     const choices = orderProviderChoices(['grok']);
-    expect(parseMenuAnswer('4', choices).kind).toBe('miss'); // out of range
+    expect(parseMenuAnswer('6', choices).kind).toBe('miss'); // out of range
     expect(parseMenuAnswer('0', choices).kind).toBe('miss'); // not an offered index
     expect(parseMenuAnswer('-1', choices).kind).toBe('miss');
     expect(parseMenuAnswer('grok', choices).kind).toBe('miss'); // provider names are not menu input
@@ -387,7 +475,7 @@ describe('first run', () => {
     const prompts: string[] = [];
     const ask = async (prompt: string): Promise<string> => {
       prompts.push(prompt);
-      return ['4', 'abc', ' 2 '][prompts.length - 1] ?? '';
+      return ['6', 'abc', ' 2 '][prompts.length - 1] ?? '';
     };
     await expect(promptProviderMenu(ask, ['grok'])).resolves.toBe('openai-codex');
     expect(prompts).toHaveLength(3);
@@ -474,10 +562,9 @@ describe('first run', () => {
     } finally { f.cleanup(); }
   }, 60000);
 
-  // 칸 판정선 실물(0.2.33 수용선 · 🧪맨기계): bin/elanous.mjs bare 진입 → src/index.ts main() →
-  // runFirstRun → promptProviderMenu → parseMenuAnswer 생산 경로 그대로 — 빈 기계 메뉴에서
-  // 범위 밖·수식 표기·전각 오타가 취소가 아니라 같은 메뉴의 재질문이 되고, 진짜 선택이
-  // needs-llm 로 착지한다. 합성 fixture 나 소스 문자열이 아니라 진짜 프로세스다.
+  // 칸 판정선 실물: bin/elanous.mjs bare 진입 → src/index.ts main() →
+  // runFirstRun → runFirstRunProviderSetup 생산 경로 그대로 — 빈 기계 메뉴에서
+  // 범위 밖·수식 표기·전각 오타를 재질문하고 miss 상한 뒤 needs-llm 안내로 끝난다.
   test.skipIf(process.platform === 'darwin')('bare process: real menu re-asks every miss on the production path before the first run lands', async () => {
     const f = fixture();
     try {
@@ -501,17 +588,22 @@ describe('first run', () => {
         { cwd: resolve(import.meta.dir, '../..'), env, stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
-      const answers = ['4\n', '1e0\n', '１\n', '1\n']; // 범위 밖 → 수식 표기 → 전각 → 진짜 선택
+      const answers = ['4\n', '1e0\n', '１\n']; // 범위 밖 → 수식 표기 → 전각 miss 상한
       let menus = 0;
       let sent = 0;
+      let keyPasteAnswered = false;
       let timedOut = false;
       processChild.stdout.setEncoding('utf8').on('data', (chunk: string) => {
         stdout += chunk;
-        const shown = stdout.split(FIRST_RUN_MENU_MARKER).length - 1;
+        const shown = countFirstRunMenuRenders(stdout);
         if (shown > menus) {
           menus = shown;
           const answer = answers[sent++];
           if (answer !== undefined) setTimeout(() => processChild.stdin.write(answer), 300);
+        }
+        if (!keyPasteAnswered && stdout.includes('.env 형식 키를 붙여 넣고 빈 줄로 끝내세요')) {
+          keyPasteAnswered = true;
+          setTimeout(() => processChild.stdin.write('\n'), 300);
         }
       });
       processChild.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
@@ -522,10 +614,11 @@ describe('first run', () => {
       }).finally(() => clearTimeout(timeout));
       expect(timedOut).toBe(false);
       expect(status).toBe(0);
-      // 판정선: 첫 질문 + miss 세 번(4=범위 밖 · 1e0=수식 표기 · １=전각) = 같은 메뉴 네 번
-      expect(stdout.split(FIRST_RUN_MENU_MARKER).length - 1).toBe(4);
-      expect(stdout).toContain(FIRST_RUN_MENU_CHOICES);
-      // needs-llm 착지: 선택은 했지만 쓸 수 있는 자격이 없어 ready 는 기록되지 않는다
+      // 판정선: miss 한도까지 메뉴를 재질문한 뒤 안내로 끝나고 onboarding.ready 를 쓰지 않는다.
+      expect(countFirstRunMenuRenders(stdout)).toBe(3);
+      expect(FIRST_RUN_MENU_MARKERS.some((marker) => stdout.includes(marker))).toBe(true);
+      expect(FIRST_RUN_MENU_CHOICE_MARKERS.some((choices) => stdout.includes(choices))).toBe(true);
+      // needs-llm 착지: 유효한 선택 없이 miss 상한에 도달했으므로 ready 는 기록되지 않는다
       expect(stdout).toContain('eln setup llm 으로 고르세요');
       expect(buildUserConfig(join(configDir, 'config.json')).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }
@@ -636,35 +729,31 @@ describe('first run', () => {
   }, 65000);
 
   // 완료 경계 실물: src/ux-sim first-run device — 격리 HOME/config 아래 생산 CLI 를 util-linux PTY 로 띄워
-  // 4 → 1e0 → １ → 1 을 넣고, 동일 메뉴 4회(개수·문면)·invalid 재발문 3회·최종 `eln setup llm 으로 고르세요`·
+  // 4 → 1e0 → １ 을 넣고, miss 상한에서 종료하는 생산 메뉴·최종 `eln setup llm 으로 고르세요`·
   // ready 미기록을 잰다. Darwin skip 이유: BSD `script` 는 util-linux `script -q -e -c` 와 플래그가 달라
   // 이 PTY 무대를 못 만든다(firstRunPtySupport().reason 이 같은 뜻을 반환한다).
   test.skipIf(!firstRunPtySupport().available)(
-    'FIRST10-FIX-FU: PTY에 주입하는 입력은 4, 1e0, 전각 １, 1 순서 그대로다',
+    'FIRST10-FIX-FU: PTY re-asks invalid answers and stops at the miss cap',
     async () => {
       const observed = await driveFirstRunMenu();
       // 생산 프롬프트 문면(promptProviderMenu) — 메뉴 문면 동일성은 이 줄 전체로 잰다.
-      const promptLine = `Choose LLM (${FIRST_RUN_MENU_CHOICES}; Enter to cancel): `;
-      const promptPrints = observed.stdout.split(promptLine).length - 1;
+      const recognizedMenuRenders = countFirstRunMenuRenders(observed.stdout);
       // 실측 기록(보고서 행): 실행한 정확한 명령과 stdout/stderr 발췌를 남긴다.
       console.log(JSON.stringify({
         command: `script -q -e -c '${observed.childCommand.join(' ')}' /dev/null`,
         menuRenderCount: observed.menuRenderCount,
-        promptPrints,
+        recognizedMenuRenders,
         status: observed.status,
         stdoutExcerpt: observed.stdout.slice(-420),
         stderrExcerpt: observed.stderr.slice(-240),
       }));
       expect(observed.timedOut).toBe(false);
       expect(observed.status).toBe(0);
-      // 입력 순서: 4(범위 밖) → 1e0(수식 표기) → １(전각) → 1(정상 선택).
+      // 입력 순서: 4(범위 밖) → 1e0(수식 표기) → １(전각). 세 번째 miss에서 끝난다.
       expect(observed.answersSent).toEqual([...FIRST_RUN_MENU_ANSWERS]);
-      // 동일 메뉴 4회 — 개수(marker 기준)와 문면(전체 프롬프트 줄) 둘 다 4.
-      expect(observed.menuRenderCount).toBe(4);
-      expect(promptPrints).toBe(4);
-      // invalid 진단 3회 — 생산 처방은 별도 문구가 아니라 동일 문면 재발문(miss 루프)이므로
-      // 첫 렌더 이후 재발문 수 = 4 - 1 = 3 이 곧 invalid 진단 횟수다.
-      expect(observed.menuRenderCount - 1).toBe(3);
+      // 동일 메뉴는 입력을 받기 전에 miss cap=3회 렌더된다.
+      expect(observed.menuRenderCount).toBe(FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES);
+      expect(recognizedMenuRenders).toBe(FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES);
       // 최종 needs-llm/next-step 안내.
       expect(observed.finalPhrase).toBe(FIRST_RUN_SETUP_HINT);
       // 격리 config 에 onboarding.ready 부재.

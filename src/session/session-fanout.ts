@@ -224,6 +224,8 @@ export interface SessionChunkEvent {
   seq: number;
   /** 텍스트 델타(누적은 sink 의 라이브핸들이). */
   delta?: string;
+  /** Replace the current assistant text accumulated for this stream. */
+  textOperation?: 'replace';
   /** 툴 활동(⚙️…✓ inline 렌더용). */
   tool?: { id: string; name: string; phase: 'call' | 'result'; ok?: boolean };
   /** 🧠 추론(모드 gated·선택). */

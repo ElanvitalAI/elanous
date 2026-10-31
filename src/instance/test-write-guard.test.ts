@@ -1,6 +1,6 @@
 // TEST-PROD-LEAK — the guard refuses a test's writes/sends into an «ops-like» root and allows an isolated one.
 // The ops root is injected (setOpsRootsForTesting) so nothing here touches the real ~/.elanous.
-import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, setSystemTime, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -347,7 +347,8 @@ describe('ops-like root → refused · isolated root → allowed', () => {
       expect(spy).toHaveBeenCalled();
     } finally { spy.mockRestore(); }
     const calls: string[] = [];
-    expect(sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw: (_t, chat) => { calls.push(String(chat)); return true; } })).toBe(true);
+    const sendRaw = mock((_t: string, chat: string | number) => { calls.push(String(chat)); return true; });
+    expect(sendTelegramDirect('body', 'ops-alert', { config: configured, sendRaw })).toBe(true);
     expect(calls).toEqual(['2']);
   });
 
@@ -514,5 +515,68 @@ console.log(JSON.stringify(process.argv.slice(-4).map(probe)));`;
     expect(ledger.refusalReason).toContain('[test-guard] refused');
     expect(ledger.curlCalls).toBe(0);
     expect(ledger.s3Uploads).toBe(0);
+  }, 120_000);
+
+  test('TEST-PROD-LEAK-AUDIT: 대상 경로를 src/instance/test-write-guard.test.ts, src/instance/test-write-guard.ts, src/domains/outbound-alert.ts로 한정해 확인한다', () => {
+    const pathInventory = [
+      { file: 'src/instance/test-write-guard.test.ts', caller: 'TEST-PROD-LEAK-AUDIT test', transport: 'childProcess.spawnSync fixture runner' },
+      { file: 'src/instance/test-write-guard.ts', caller: 'assertNoRealSendFromTest', transport: 'TestOpsWriteRefusedError refusal' },
+      { file: 'src/domains/outbound-alert.ts', caller: 'sendTelegramDirect', transport: 'curl via childProcess.execFileSync' },
+    ];
+    expect(pathInventory).toEqual([
+      { file: 'src/instance/test-write-guard.test.ts', caller: 'TEST-PROD-LEAK-AUDIT test', transport: 'childProcess.spawnSync fixture runner' },
+      { file: 'src/instance/test-write-guard.ts', caller: 'assertNoRealSendFromTest', transport: 'TestOpsWriteRefusedError refusal' },
+      { file: 'src/domains/outbound-alert.ts', caller: 'sendTelegramDirect', transport: 'curl via childProcess.execFileSync' },
+    ]);
+    const r = childProcess.spawnSync(process.execPath, [join(import.meta.dir, 'test-write-guard-real-transport.fixture.ts')], {
+      env: { ...process.env, NODE_ENV: 'test' }, encoding: 'utf8', timeout: 90_000,
+    });
+    expect(r.status).toBe(0);
+    const ledger = JSON.parse(r.stdout.trim().split('\\n').at(-1)!) as { refused: boolean; refusalReason: string; curlCalls: number; s3Uploads: number };
+    expect(ledger.refused).toBe(true);
+    expect(ledger.refusalReason).toContain('TestOpsWriteRefusedError');
+    expect(ledger.refusalReason).toContain('[test-guard] refused');
+    expect(ledger.curlCalls).toBe(0);
+    expect(ledger.s3Uploads).toBe(0);
+  }, 120_000);
+
+  test('TEST-PROD-LEAK-AUDIT: isolated --test instance refuses an injected real transport', () => {
+    const pathInventory = [
+      { file: 'src/instance/test-write-guard.test.ts', caller: 'spawnSync probe in TEST-PROD-LEAK-AUDIT', transport: 'childProcess.spawnSync with ELANOUS_STATE_DIR' },
+      { file: 'src/instance/test-write-guard.ts', caller: 'assertNoRealSendFromTest', transport: 'TestOpsWriteRefusedError' },
+      { file: 'src/domains/outbound-alert.ts', caller: 'sendTelegramDirect → assertTestSendFaked', transport: 'injected sendRaw' },
+    ];
+    expect(pathInventory.map(({ file }) => file)).toEqual([
+      'src/instance/test-write-guard.test.ts',
+      'src/instance/test-write-guard.ts',
+      'src/domains/outbound-alert.ts',
+    ]);
+    expect(pathInventory.map(({ caller, transport }) => [caller, transport])).toEqual([
+      ['spawnSync probe in TEST-PROD-LEAK-AUDIT', 'childProcess.spawnSync with ELANOUS_STATE_DIR'],
+      ['assertNoRealSendFromTest', 'TestOpsWriteRefusedError'],
+      ['sendTelegramDirect → assertTestSendFaked', 'injected sendRaw'],
+    ]);
+    const probe = `
+      const { setElanousConfigDir } = await import('./src/elanous-config-dir.ts');
+      setElanousConfigDir(process.env.ELANOUS_STATE_DIR!);
+      const { sendTelegramDirect } = await import('./src/domains/outbound-alert.ts');
+      const { getUserConfig } = await import('./src/user-config.ts');
+      const base = getUserConfig();
+      const config = { ...base, telegram: { ...base.telegram, channels: undefined, botToken: '2:fake', homeChannel: 2 } };
+      let externalCalls = 0;
+      let refused = false;
+      let refusalReason = '';
+      try { sendTelegramDirect('private-alert-body', 'ops-alert', { config, sendRaw: () => { externalCalls += 1; return true; } }); }
+      catch (e) { refused = true; refusalReason = e instanceof Error ? e.message : String(e); }
+      console.log(JSON.stringify({ refused, refusalReason, externalCalls }));
+    `;
+    const r = childProcess.spawnSync(process.execPath, ['-e', probe], {
+      cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'test', ELANOUS_STATE_DIR: isolated }, encoding: 'utf8', timeout: 90_000,
+    });
+    expect(r.status).toBe(0);
+    const ledger = JSON.parse(r.stdout.trim().split('\\n').at(-1)!) as { refused: boolean; refusalReason: string; externalCalls: number };
+    expect(ledger.refused).toBe(true);
+    expect(ledger.refusalReason).toBe('[test-guard] refused: a test process (NODE_ENV=test) tried to send a real Telegram message in the operational root (a real third-party bot API). Point the test at an isolated root (ELANOUS_STATE_DIR / --config-dir tmp) or inject a fake sender.');
+    expect(ledger.externalCalls).toBe(0);
   }, 120_000);
 });

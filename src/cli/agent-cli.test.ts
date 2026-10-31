@@ -19,7 +19,13 @@ test('CLI tool turn passes SIGINT cancellation to a running skill_exec result', 
   const home = mkdtempSync(join(tmpdir(), 'elanous-cli-skill-cancel-'));
   const script = `
     const { runChatTurnCli } = await import('./src/cli/agent-cli.ts');
+    const { setSkillExecIndexProvider } = await import('./src/tool-runtime/skill-exec-runtime.ts');
     const { setResearchInvoker } = await import('./src/research-bridge/invoke.ts');
+    setSkillExecIndexProvider(() => [{
+      name: 'omni-digest', description: 'test skill', triggers: [], extractedTriggers: [],
+      triggerSource: 'none', autoTrigger: false, composes: [], skillDir: '/skills/omni-digest',
+      rootDir: '/skills', sideEffects: 'none', cost: 'light',
+    }]);
     setResearchInvoker(async () => new Promise(() => {}));
     await runChatTurnCli({
       cfg: { llm: { provider: 'auto', model: '' }, chat: { toolDeny: [] } },
@@ -27,7 +33,7 @@ test('CLI tool turn passes SIGINT cancellation to a running skill_exec result', 
       reuseActive: false, forceNew: true, json: true, enableTools: true,
       runTurn: async ({ dispatchTool, sessionId }) => {
         const pending = dispatchTool('skill_exec', { skill: 'omni-digest', task: 'research' });
-        setTimeout(() => process.emit('SIGINT'), 10);
+        setTimeout(() => process.kill(process.pid, 'SIGINT'), 10);
         const result = await pending;
         return { text: JSON.stringify(result), provider: 'test', model: 'test',
           meta: { id: sessionId }, usedTokens: 0, droppedMessages: 0, memoryIds: [] };

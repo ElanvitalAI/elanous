@@ -54,6 +54,7 @@ describe('decideWarmReuse — flag on but evidence short stays off', () => {
     ['lease invalid', fullEvidence({ leaseValid: false }), 'lease-invalid'],
     ['canary unmeasured', fullEvidence({ canaryPassed: undefined }), 'canary-unmeasured'],
     ['canary failed', fullEvidence({ canaryPassed: false }), 'canary-failed'],
+    ['measured mismatch outranks its failed canary status', fullEvidence({ canaryPassed: false, recentMismatchCount: 1 }), 'recent-mismatch'],
     ['head unmeasured', fullEvidence({ worker: { ...identity, head: undefined } }), 'identity-unmeasured:head'],
     ['main empty', fullEvidence({ expected: { ...identity, main: '' } }), 'identity-unmeasured:main'],
     ['main blank', fullEvidence({ expected: { ...identity, main: '  ' } }), 'identity-malformed:main'],

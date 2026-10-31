@@ -30,11 +30,15 @@ describe('TaskStore execution origin', () => {
     try {
       const task = createTask({ title: 'origin', surface: { kind: 'llm-direct', prompt: 'origin test' } });
       store.saveTask(task);
-      store.saveExecution(execution(task.id, 'exec:default'));
+      const captureArtifacts = [{ path: '/state/artifacts/capture/demo.png', mimeType: 'image/png', runId: 'run-1',
+        linearIssueId: 'parent-1', externalShare: true, sensitivity: 'public', createdAt: 1236 }];
+      store.saveExecution(execution(task.id, 'exec:default', { runId: 'run-1', captureArtifacts }));
       store.saveExecution(execution(task.id, 'exec:pod', { startedAt: 1235, hostId: '01PODHOST', hostname: 'pod-name' }));
 
       expect(store.getExecution('exec:default')?.hostId).toBe('01THISHOST');
       expect(store.getExecution('exec:default')?.hostname).toBe(hostname());
+      expect(store.getExecution('exec:default')?.runId).toBe('run-1');
+      expect(store.getExecution('exec:default')?.captureArtifacts).toEqual(captureArtifacts);
       expect(store.getExecution('exec:pod')?.hostId).toBe('01PODHOST');
       expect(store.getExecution('exec:pod')?.hostname).toBe('pod-name');
       expect(store.listExecutions(task.id).map((row) => row.hostId)).toEqual(['01PODHOST', '01THISHOST']);

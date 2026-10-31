@@ -518,6 +518,75 @@ const seams = (over: Parameters<typeof baseSeams>[0]): SelfImplementSeams => {
 import type { DecisionSignalPressResult } from './decision-signal-press.js';
 import type { SoftStopRequestRead } from '../harness/control-inbox.js';
 
+test('exhausted TDD evidence repair returns exact missing tags and retry round', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'tdd-terminal-evidence-'));
+  const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  try {
+    git('init', '-b', 'main');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'Test');
+    writeFileSync(join(repo, 'README.md'), 'base\n');
+    git('add', '-A');
+    git('commit', '-m', 'base');
+    const base = git('rev-parse', 'HEAD').stdout.trim();
+    git('checkout', '-b', 'self-impl/tdd-terminal-evidence');
+    const goal = [
+      '## PROBLEM', '', '### 검증 계획(TDD)',
+      '- ① 증명할 동작: RED/GREEN 기록을 재검증한다.',
+      '- ② 무대: unit · 격리 저장소',
+      "- ③ 먼저 쓸 시험(RED): `bun test tdd.test.ts`",
+      '- ④ GREEN 뒤 같은 명령: `bun test tdd.test.ts` → 0 fail',
+      '- ⑤ 생산 진입점 배선(MS-05): runSelfImplementInner 라운드 루프에서 호출',
+    ].join('\n');
+    const goalFile = join(repo, 'GOAL.md');
+    writeFileSync(goalFile, goal);
+    let implementCalls = 0;
+    const result = await runSelfImplement({
+      feature: goal,
+      goalFile,
+      seams: seams({
+        createWorktree: async () => ({ path: repo, branch: 'self-impl/tdd-terminal-evidence', resolvedBase: base, invokedHead: base }),
+        implement: async () => { implementCalls += 1; return { ok: true, summary: 'implementation ended without TDD records' }; },
+        preservationHasChanges: () => false,
+      }),
+    });
+
+    expect(implementCalls).toBe(2);
+    expect(result).toMatchObject({
+      stage: 'aborted', node: 'implement', ok: false,
+      terminationReason: 'tdd-evidence-missing',
+      tddEvidenceFailure: { reason: 'tdd-evidence-missing', round: 1, missing: ['tdd-red', 'tdd-green'] },
+    });
+    const { parseSelfImplementJson } = await import('../task-orchestrator/surfaces/self-implement.js');
+    const { podChildEvidenceLedgerRow } = await import('../task-orchestrator/surfaces/pod-failure-reason.js');
+    // `self implement --json` writes JSON.stringify(result) directly (src/index.ts); verify the exact flat line too.
+    const cliStdoutLine = `${JSON.stringify(result)}\n`;
+    const cliDisposition = parseSelfImplementJson(cliStdoutLine);
+    expect(cliDisposition?.childEvidence).toMatchObject({
+      terminationReason: 'tdd-evidence-missing',
+      tddEvidenceFailure: { reason: 'tdd-evidence-missing', round: 1, missing: ['tdd-red', 'tdd-green'] },
+    });
+    // The Pod harness `kind:self` envelope is parsed by the same mapper.
+    const disposition = parseSelfImplementJson(`${JSON.stringify({ kind: 'self', ok: false, result })}\n`);
+    expect(disposition?.childEvidence).toMatchObject({
+      terminationReason: 'tdd-evidence-missing',
+      tddEvidenceFailure: { reason: 'tdd-evidence-missing', round: 1, missing: ['tdd-red', 'tdd-green'] },
+    });
+    const ledgerRow = podChildEvidenceLedgerRow({
+      job: 'job-tdd-terminal', childRunId: result.runId, state: 'complete', result: disposition,
+    });
+    expect(ledgerRow).toMatchObject({
+      childRunId: result.runId,
+      childEvidence: {
+        terminationReason: 'tdd-evidence-missing',
+        tddEvidenceFailure: { reason: 'tdd-evidence-missing', round: 1, missing: ['tdd-red', 'tdd-green'] },
+      },
+    });
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test('observes the rebind result returned by the production openPr caller', async () => {
   const originalLog = debug.log;
   const observations: unknown[] = [];
@@ -892,6 +961,26 @@ beforeEach(() => {
 afterEach(() => { setUserConfigOverlay(null); });
 
 describe('L0 graph.path skipped-node attribution', () => {
+  test('local and pod route evidence gets distinct signatures only on the same path basis', async () => {
+    const localRunId = `run-path-local-${crypto.randomUUID()}`;
+    const podRunId = `run-path-pod-${crypto.randomUUID()}`;
+    appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: localRunId, event: 'graph.path',
+      data: { event: 'edge-taken', from: 'decompose', taken: 'implement', profileIds: [], runId: localRunId } }, runLedgerDir());
+    appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: podRunId, event: 'graph.path',
+      data: { event: 'edge-taken', from: 'decompose', taken: 'pool-admit', profileIds: ['pod'], runId: podRunId } }, runLedgerDir());
+    const localEntries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const podEntries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    expect((await runSelfImplement({ feature: 'path local', runId: localRunId, memory: false,
+      seams: seams({ writeRunLedger: (entry) => localEntries.push(entry) }) })).ok).toBe(true);
+    expect((await runSelfImplement({ feature: 'path pod', runId: podRunId, memory: false,
+      seams: seams({ writeRunLedger: (entry) => podEntries.push(entry) }) })).ok).toBe(true);
+    const local = localEntries.find((entry) => entry.event === 'path-signature')!.data;
+    const pod = podEntries.find((entry) => entry.event === 'path-signature')!.data;
+    expect(local.pathBasis).toBe(pod.pathBasis);
+    expect(local.pathSignature).not.toBe(pod.pathSignature);
+    expect(pod.profileIds).toEqual(['pod']);
+  });
+
   test('joined journey entries are not mislabeled skipped', async () => {
     const { LogStore, logsDbPath } = await import('../mss/logging/log-store.js');
     const { mkdirSync } = await import('node:fs');
@@ -922,6 +1011,8 @@ describe('L0 graph.path skipped-node attribution', () => {
           data: { journeyKey: key, runId: 'another-run', phase: 'journey', graphId: 'self-implement', graphVersion: GRAPH_TEMPLATES['self-implement']!.version, node: 'credential-refresh' },
         }, surface: 'test' },
       ]);
+      appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'graph.path',
+        data: { event: 'edge-taken', from: 'decompose', taken: 'pool-admit', profileIds: ['pod'], runId } }, runLedgerDir());
       const result = await runSelfImplement({ feature: 'L0 joined journey', runId, autoMerge: false, seams: revSeams({}) });
       expect(result.ok).toBe(true);
       expect(entries.filter((entry) => entry.event === 'node-skipped' && entry.data.node === 'pool-admit')).toHaveLength(0);
@@ -933,8 +1024,10 @@ describe('L0 graph.path skipped-node attribution', () => {
       expect(coverage?.unjoinedNodes).toEqual(expect.arrayContaining(['image-sync', 'credential-refresh']));
       expect(coverage?.unjoinedNodes).not.toContain('pool-admit');
       expect(coverage?.traversalCoverage as number).toBeLessThan(1);
+      const signature = entries.find((entry) => entry.event === 'path-signature');
+      expect(signature?.data).toMatchObject({ pathBasis: 'self-implement-pipeline-and-journey-v1', profileIds: ['pod'], pathSignature: expect.stringMatching(/^[a-f0-9]{12}$/) });
+      expect(signature?.data.visitedNodes).toEqual(expect.arrayContaining(['decompose', 'pool-admit']));
     } finally {
-      store.close();
       (debug as { log: typeof debug.log }).log = original;
       if (previousKey === undefined) delete process.env.ELANOUS_JOURNEY_KEY;
       else process.env.ELANOUS_JOURNEY_KEY = previousKey;
@@ -975,6 +1068,9 @@ describe('L0 graph.path skipped-node attribution', () => {
       listedStageCount: template.journeyStages!.length });
     expect(entries.some((entry) => entry.event === 'pipeline-node-entry' && entry.data.node === 'implement')).toBe(true);
     expect(entries.some((entry) => entry.event === 'pipeline-traversal-shadow')).toBe(true);
+    expect(entries.find((entry) => entry.event === 'path-signature')?.data).toMatchObject({
+      pathBasis: 'self-implement-pipeline-and-journey-v1', pathSignature: expect.stringMatching(/^[a-f0-9]{12}$/),
+    });
   });
 
   test('aborted run does not fabricate a completed skip accounting', async () => {
@@ -4191,7 +4287,7 @@ describe('runSelfImplement — Fix A rework', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 20_000); // 📏 2026-09-26: 부하 아래 5~6초 — 기본 5초에 걸려 하루 세 번 «통합 깨짐»·기준선 오진을 냈다(run-c6292393 등)
+  }, 30_000); // 📏 2026-09-26: 부하 아래 5~6초 — 기본 5초에 걸려 하루 세 번 «통합 깨짐»·기준선 오진을 냈다(run-c6292393 등); allow loaded worktree runs
 
   test('rework note 전문을 artifact로 보존하고 기존 tail·감독 입력을 유지한다', async () => {
     const original = (debug as { log: typeof debug.log }).log;
@@ -15127,6 +15223,37 @@ describe('runSelfImplement — all non-convergence preservation exits', () => {
     }
   });
 
+  test.each([
+    ['same-cell', 'self-implement PR guard 실패: same-cell TEST-PROD-LEAK-AUDIT OPEN PR이 있음 (#33887, #33885); blockers=#33887:ta-existing,#33885:ta-current'],
+    ['goal-only', 'self-implement PR guard 실패: goal-only: 골 문서만 변경 · 구현 0'],
+  ])('failed blocked-draft open returns its explicit %s guard reason in the terminal detail', async (_kind, guardFailure) => {
+    const result = await runSelfImplement({
+      feature: 'aborted implementation with PR guard failure',
+      seams: seams({
+        implement: async () => ({ ok: false, summary: 'PTY summary clipped before the stop reason', toolCalls: 0 }),
+        preservationHasChanges: () => true,
+        openPr: async () => { throw new Error(guardFailure); },
+      }),
+    });
+
+    expect(result).toMatchObject({ ok: false, stage: 'aborted', detailKind: 'blocked-draft-pr-guard', detail: `draft PR 생성 실패: ${guardFailure}` });
+    expect(String(result.detail)).not.toContain('PTY summary clipped');
+  });
+
+  test('a non-guard blocked-draft PR-open failure does not claim the structured guard detail kind', async () => {
+    const result = await runSelfImplement({
+      feature: 'aborted implementation with PR transport failure',
+      seams: seams({
+        implement: async () => ({ ok: false, summary: 'implementation did not finish', toolCalls: 0 }),
+        preservationHasChanges: () => true,
+        openPr: async () => { throw new Error('GitHub 503 unavailable'); },
+      }),
+    });
+
+    expect(result).toMatchObject({ ok: false, stage: 'aborted', detail: 'draft PR 생성 실패: GitHub 503 unavailable' });
+    expect(result).not.toHaveProperty('detailKind');
+  });
+
   test('all PR-opening paths cap oversized bodies, persist their full artifacts, preserve follow-up must-fix, and observe truncation', async () => {
     const hugeSummary = `summary ${'x'.repeat(GITHUB_PR_BODY_MAX_CHARS)}`;
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -15509,9 +15636,11 @@ describe('assembleBlockedDraftPrBody — unfinished-run classification', () => {
     });
     const assembled = assembleBlockedDraftPrBody('unfinished classification', 'summary', {
       ...interruptionState,
+      stopStage: 'gate-failed',
+      stopClass: 'gate-failed',
       abandonedClassification,
     });
-    const record = blockedDraftClassificationRecord(abandonedClassification);
+    const record = blockedDraftClassificationRecord(abandonedClassification, { stage: 'gate-failed', class: 'gate-failed' });
 
     expect(abandonedClassification.classification).toBe('contract-conflict');
     expect(assembled.body.split('\n')).toContain('## 사람 판단 필요');
@@ -15520,13 +15649,19 @@ describe('assembleBlockedDraftPrBody — unfinished-run classification', () => {
     expect(assembled.body).toContain(`- 중단 원인: ${record.classification}`);
     expect(assembled.body).toContain(`- classification: ${record.classification}`);
     expect(assembled.body).toContain(`- classificationBasis: ${record.classificationBasis}`);
+    expect(assembled.body).toContain('- stop.class: gate-failed');
+    expect(assembled.body).toContain('- stop.stage: gate-failed');
     expect(assembled.body).toContain(JSON.stringify(record));
     expect(formatBlockedDraftClassificationSection(abandonedClassification).join('\n').trim()).not.toBe('');
   });
 
   test('names an unclassified outcome instead of leaving a blank slot', () => {
-    const assembled = assembleBlockedDraftPrBody('unclassified unfinished', 'summary', interruptionState);
-    const record = blockedDraftClassificationRecord(undefined);
+    const assembled = assembleBlockedDraftPrBody('unclassified unfinished', 'summary', {
+      ...interruptionState,
+      stopStage: 'aborted',
+      stopClass: 'implement-aborted',
+    });
+    const record = blockedDraftClassificationRecord(undefined, { stage: 'aborted', class: 'implement-aborted' });
 
     expect(record.classification).toBe(BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION);
     expect(assembled.body.split('\n')).toContain('## 사람 판단 필요');
@@ -15534,6 +15669,8 @@ describe('assembleBlockedDraftPrBody — unfinished-run classification', () => {
     expect(assembled.body).toContain('## 중단 원인 분류');
     expect(assembled.body).toContain(`- 중단 원인: ${BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION} (분류를 못 함)`);
     expect(assembled.body).toContain(`- classification: ${BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION}`);
+    expect(assembled.body).toContain('- stop.class: implement-aborted');
+    expect(assembled.body).toContain('- stop.stage: aborted');
     expect(assembled.body).toContain(JSON.stringify(record));
     expect(assembled.body).not.toMatch(/- classification:\s*$/m);
     expect(formatBlockedDraftClassificationSection(undefined).join('\n').trim()).not.toBe('');
@@ -15564,9 +15701,39 @@ describe('assembleBlockedDraftPrBody — unfinished-run classification', () => {
         classification: String(observed[0]!.data.classification),
         classificationBasis: String(observed[0]!.data.classificationBasis),
         worktreeClean: observed[0]!.data.worktreeClean ?? null,
+        stop: observed[0]!.data.stop,
       };
       expect(body).toContain(`- classification: ${record.classification}`);
       expect(body).toContain(JSON.stringify(record));
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
+  test('a new terminal-stop event and PR body carry the actual gate-failed route', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    let body = '';
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const s = seams({ gateResults: [false, false] });
+      s.diagnose = async () => 'BUDGET: UNCONVERGEABLE\nREASON: 반복 지적';
+      s.judgmentCallLLM = async () => 'UNCONVERGEABLE';
+      s.openPr = async (opts) => { body = opts.body; return { url: 'https://pr/classified-stop', number: 12 }; };
+      const result = await runSelfImplement({ feature: 'F', maxReworkRounds: 2, seams: s });
+      expect(result.outcome).toBe('abandoned');
+      const stopEvents = events.filter((entry) => entry.event === 'draft-stop-classified');
+      expect(stopEvents).toHaveLength(1);
+      expect(stopEvents[0]!.data).toMatchObject({
+        stage: 'gate-failed',
+        stop: { class: 'gate-failed', stage: 'gate-failed' },
+        classification: expect.any(String),
+        classificationBasis: expect.any(String),
+      });
+      expect(body).toContain('- stop.class: gate-failed');
+      expect(body).toContain('- stop.stage: gate-failed');
     } finally {
       (debug as { log: typeof debug.log }).log = original;
     }
@@ -15588,6 +15755,7 @@ describe('assembleBlockedDraftPrBody — unfinished-run classification', () => {
       const result = await runSelfImplement({ feature: 'F', autoMerge: true, seams: s });
       expect(result).toMatchObject({ stage: 'merged', merged: true, outcome: 'completed' });
       expect(events.filter((entry) => entry.event === 'blocked-draft-classification')).toEqual([]);
+      expect(events.filter((entry) => entry.event === 'draft-stop-classified')).toEqual([]);
       expect(body).not.toContain('## 중단 원인 분류');
       expect(body).not.toContain('## 사람 판단 필요');
     } finally {

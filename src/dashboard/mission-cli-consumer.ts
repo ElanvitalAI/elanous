@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnElanous } from '../instance/spawn-elanous.js';
+import type { AgentCliPreparation } from '../agent-mission/tool-install.js';
 
 export interface ClassicMissionCliResult {
   ok: boolean;
@@ -58,6 +59,7 @@ export interface MissionCliConsumerDeps {
   runCli?: typeof runCli;
   delay?: (ms: number) => Promise<void>;
   now?: () => number;
+  prepareAgentCli?: (agent: 'codex' | 'claude') => Promise<AgentCliPreparation>;
 }
 
 export interface StartedClassicMissionCliJob {
@@ -92,11 +94,20 @@ export async function cancelClassicMissionCli(interactionId: string, executeCli:
 export async function startClassicMissionCli(input: {
   agent: 'codex' | 'claude';
   prompt: string;
+  linearIssueId?: string;
   onInteractionId?: (interactionId: string) => void;
 }, deps: MissionCliConsumerDeps = {}): Promise<StartClassicMissionCliResult> {
   const executeCli = deps.runCli ?? runCli;
   const wait = deps.delay ?? delay;
   const now = deps.now ?? Date.now;
+  if (deps.prepareAgentCli) {
+    try {
+      const prepared = await deps.prepareAgentCli(input.agent);
+      if (!prepared.ready) return { ok: false, status: 'failed', path: '', error: prepared.message };
+    } catch {
+      return { ok: false, status: 'failed', path: '', error: `${input.agent}: 설치·로그인 상태를 확인하지 못했습니다` };
+    }
+  }
   const tempRoot = mkdtempSync(join(tmpdir(), 'elanous-classic-mission-'));
   const promptPath = join(tempRoot, 'prompt.txt');
   const outputPath = join(tempRoot, 'result.md');
@@ -105,7 +116,8 @@ export async function startClassicMissionCli(input: {
   try {
     writeFileSync(promptPath, input.prompt, { encoding: 'utf8', mode: 0o600 });
     const launched = parseJson<{ missionId: string; status: 'running' }>(await executeCli([
-      'mission', 'run', '--agent', input.agent, '--prompt-file', promptPath, '--out', outputPath, '--json',
+      'mission', 'run', '--agent', input.agent, '--prompt-file', promptPath, '--out', outputPath,
+      ...(input.linearIssueId ? ['--linear-issue-id', input.linearIssueId] : []), '--json',
     ]));
     if (!isClassicMissionId(launched.missionId) || launched.status !== 'running') throw new Error('Mission CLI returned an invalid interaction ID');
     interactionId = launched.missionId;
@@ -113,17 +125,17 @@ export async function startClassicMissionCli(input: {
     const completion = (async (): Promise<ClassicMissionCliResult> => {
       try {
         while (now() - startedAt < MAX_WAIT_MS) {
-          const status: MissionStatus = parseJson<MissionStatus>(await executeCli(['mission', 'status', interactionId!, '--json']));
-          if (status.missionId !== interactionId) throw new Error('Mission status did not match its interaction ID');
+          const missionStatus: MissionStatus = parseJson<MissionStatus>(await executeCli(['mission', 'status', interactionId!, '--json']));
+          if (missionStatus.missionId !== interactionId) throw new Error('Mission status did not match its interaction ID');
           // `eln mission status --json` exposes completed records as `done`.
           // Keep `completed` accepted for compatible bridges and existing callers.
-          if (status.status === 'done' || status.status === 'completed') {
-            if (typeof status.result !== 'string' || !status.result.trim()) throw new Error('Mission completed without a final answer');
-            return { ok: true, status: 'completed', interactionId, path: outputPath, content: status.result };
+          if (missionStatus.status === 'done' || missionStatus.status === 'completed') {
+            if (typeof missionStatus.result !== 'string' || !missionStatus.result.trim()) throw new Error('Mission completed without a final answer');
+            return { ok: true, status: 'completed', interactionId, path: outputPath, content: missionStatus.result };
           }
-          if (status.status !== 'running') return {
+          if (missionStatus.status !== 'running') return {
             ok: false,
-            status: status.status === 'cancelled' ? 'cancelled' : 'failed',
+            status: missionStatus.status === 'cancelled' ? 'cancelled' : 'failed',
             interactionId,
             path: outputPath,
             error: 'Mission did not complete successfully',

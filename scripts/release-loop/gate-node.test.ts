@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, runGateNode, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, planGateRiskLaneShards, reconcileStaleGateShardBoard, type GateAdmission, type GateRunner } from './gate-node';
+import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, planGateRiskLaneShards, reconcileStaleGateShardBoard, type GateAdmission, type GateRunner } from './gate-node';
 import { cleanRetryVerdict, failedJunitFiles } from './gate-shard-load-flaky';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { resetUserConfig } from '../../src/user-config.js';
@@ -121,7 +121,7 @@ test('graph-runner context reserves the gate host during the real judge sweep', 
   const sweep = runner.sweep.bind(runner);
   runner.sweep = async (tree, logDir, pod, only) => { entered(); await wait; return sweep(tree, logDir, pod, only); };
   const running = runGraph(graph, { runId: 'gate-live-run', pinChildUniverse: true,
-    input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateExecutor: 'host', gateRemote: 'node-b' },
+    input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateExecutor: 'host', gateRemote: 'node-b', gateImagePin: 'cut-commit' },
     deps: { root: instanceRoot, runBash: async (_body, opts) => {
       const rc = await runGateNode(['--json'], opts.env!, runner);
       return { exitCode: rc, stdout: JSON.stringify({ outcome: rc === 0 ? 'ok' : 'fail', verdict: rc === 0 ? 'pass' : 'fail' }), stderr: '' };
@@ -2308,7 +2308,7 @@ test('judgeGate plans cut and swept baseline from the prior ledger JUnit; the lo
     expect(board.shards.map((row) => row.plannedMin)).toEqual([1.7, 0.1]);
     for (const row of board.shards) {
       expect(Object.keys(row).sort()).toEqual(['endedAt', 'id', 'plannedMin', 'rc', 'startedAt', 'state']);
-      expect(Number.isFinite(Date.parse(row.startedAt!))).toBe(true);
+      expect(Number.isFinite(Date.parse(String(row.startedAt)))).toBe(true);
       expect(row.state).toBe('done');
     }
   } finally { spy.mockRestore(); }
@@ -3414,6 +3414,18 @@ test('graph context supplies input values and an un-runnable gate emits JSON err
   expect(JSON.parse(result.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'error', commit: 'invalid', introduced: [], error: 'invalid commit or version' });
 });
 
+test('release policy gate image pin is explicit and rejects unsupported policies', () => {
+  const { root } = fixture();
+  const context = join(root, 'graph-context-image-pin.json');
+  writeFileSync(context, JSON.stringify({ runId: 'gate-image-pin', input: { version: '1.0.1', previousVersion: '1.0.0', gateExecutor: 'pod', gatePodPool: 'pool', gateImagePin: 'cut-commit' },
+    outputs: { 'version-release': { commit: 'a'.repeat(40) } } }));
+  expect(parseOptions(['--json'], { ...process.env, ELANOUS_GRAPH_CONTEXT: context })).toMatchObject({ imagePin: 'cut-commit', commit: 'a'.repeat(40) });
+  writeFileSync(context, JSON.stringify({ runId: 'gate-image-pin-missing', input: { version: '1.0.1', previousVersion: '1.0.0', gateExecutor: 'pod' }, outputs: {} }));
+  expect(() => parseOptions(['--json'], { ...process.env, ELANOUS_GRAPH_CONTEXT: context })).toThrow('gateImagePin cut-commit is required');
+  writeFileSync(context, JSON.stringify({ runId: 'gate-image-pin-invalid', input: { version: '1.0.1', previousVersion: '1.0.0', gateImagePin: 'floating' }, outputs: {} }));
+  expect(() => parseOptions(['--json'], { ...process.env, ELANOUS_GRAPH_CONTEXT: context })).toThrow('unsupported gate image pin');
+});
+
 test('explicit CLI arguments do not read an ambient graph context file', () => {
   const result = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--commit', 'invalid', '--version', '1.0.1', '--json'], {
     encoding: 'utf8', timeout: 15_000, env: { ...process.env, ELANOUS_GRAPH_CONTEXT: '/nonexistent/context.json' },
@@ -4305,7 +4317,96 @@ test('GATE-WARM-ADOPT: only exact, finalized shadow parity in the recent verdict
   expect(warmEvidenceFromVerdicts([{ ...history[0]!, warmShadow: [{ ...row, files: ['../src/b.test.ts'] }] }],
     '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
   expect(warmEvidenceFromVerdicts([{ ...history[0]!, commit: 'c'.repeat(40) }, history[0]!],
-    '1.0.1', CUT, BASE, 'lock')).toBeUndefined();
+    '1.0.1', CUT, BASE, 'lock')).toMatchObject({ consecutiveMatchSamples: 3, recentMismatchCount: 0 });
+});
+
+test('WARM-GATE-EVIDENCE-PRECUT-CANARY: CLI selects the explicit two-sample pre-cut mode', () => {
+  expect(parseOptions(['--commit', CUT, '--version', '1.0.1', '--baseline-commit', BASE, '--pod-pool', 'node-b',
+    '--precut-canary-file', 'src/warm.test.ts'], {})).toMatchObject({
+    warmPrecutCanary: { file: 'src/warm.test.ts' }, pod: { pool: 'node-b' },
+  });
+});
+
+async function expectWarmCanaryPreflightRejects(verdict: unknown): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), 'warm-precut-malformed-'));
+  try {
+    const historyPath = join(root, 'gate-verdict.json');
+    const original = JSON.stringify(verdict);
+    writeFileSync(historyPath, original);
+    let calls = 0;
+    const runner = { localCommand: async () => { calls++; return { rc: 0, output: '' }; },
+      recheckPod: async () => { calls++; return { rc: 0, output: '' }; } } as unknown as GateRunner;
+    const opts = { ...options(root), version: '1.0.1', commit: CUT, baselineCommit: BASE,
+      pod: { pool: 'test', warmReplay: async () => ({}), warmFinalize: async () => {}, warmQuarantine: async () => {} } };
+    await expect(runWarmPrecutCanary({ opts, runner, file: 'src/a.test.ts', config: {}, historyPath })).rejects
+      .toThrow('malformed warm history or current sample');
+    expect(calls).toBe(0);
+    expect(readFileSync(historyPath, 'utf8')).toBe(original);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+test('WARM-GATE-EVIDENCE-PRECUT-CANARY: malformed warmHistoryOnly current identity is rejected before any canary command or write', async () => {
+  await expectWarmCanaryPreflightRejects({ warmHistoryOnly: true, version: '1.0.1', commit: CUT,
+    baselineCommit: BASE, warmShadow: 'bad', warmHistory: [] });
+});
+
+test('WARM-GATE-EVIDENCE-PRECUT-CANARY: validates the entire history before bounded-window slicing', async () => {
+  const valid = Array.from({ length: 5 }, () => ({ version: '1.0.1', commit: CUT, baselineCommit: BASE, warmShadow: [] }));
+  await expectWarmCanaryPreflightRejects({ warmHistoryOnly: true,
+    warmHistory: [{ version: '1.0.1', commit: CUT, baselineCommit: BASE, warmShadow: 'bad' }, ...valid] });
+});
+
+test('WARM-GATE-EVIDENCE-PRECUT-CANARY: two real-match observations enable the same-cut gate and any mismatch stays off', async () => {
+  for (const scenario of [
+    { mismatch: false, minimum: 2, expected: { live: true, reason: 'live' } },
+    { mismatch: true, minimum: 2, expected: { live: false, reason: 'recent-mismatch' } },
+    { mismatch: false, minimum: 3, expected: { live: false, reason: 'samples-short' } },
+  ]) {
+    const { root, instanceRoot } = fake([B], []);
+    const historyPath = join(instanceRoot, 'release/1.0.1/gate-verdict.json');
+    mkdirSync(dirname(historyPath), { recursive: true });
+    writeFileSync(historyPath, JSON.stringify({ version: '1.0.1', commit: 'b'.repeat(40), baselineCommit: 'c'.repeat(40),
+      outcome: 'ok', previousNote: 'preserve', warmHistory: [], warmShadow: [] }));
+    const lockHash = createHash('sha256').update('cut lock bytes').digest('hex');
+    const key = { context: 'pool-test', imageDigest: 'sha256:abc', lockHash, architecture: 'arm64' };
+    const file = 'src/a.test.ts';
+    let call = 0;
+    const source = warmReferenceRunner(root, file);
+    source.localCommand = async (_cmd, args) => args[0] === 'show'
+      ? { rc: 0, output: 'cut lock bytes' } : { rc: 0, output: '' };
+    const hooks = { warmReplay: async (input: Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>) => {
+        const command = { ...input, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key };
+        return { command, transport: { status: 'observed' as const, reason: 'complete' as const, reply: { ...command,
+        startedAt: Date.now() - 10, finishedAt: Date.now(), files: [{ file, rc: scenario.mismatch && call === 2 ? 1 : 0,
+            failureIds: scenario.mismatch && call === 2 ? [`${file} > failure`] : [], errorIds: [], junitComplete: true }] } } };
+      }, warmFinalize: async () => {}, warmQuarantine: async () => {},
+      warmReuseConfig: { gateRecheck: true, minMatchSamples: scenario.minimum } };
+    const originalRecheck = source.recheckPod!;
+    source.recheckPod = async (...args) => {
+      call++;
+      return originalRecheck(...args);
+    };
+    Object.assign(source, { warmPrecutCanaryTestSeam: {
+      config: { pod: { warmReuse: { gateRecheck: true, minMatchSamples: scenario.minimum } } }, hooks,
+    } });
+    setElanousConfigDir(instanceRoot);
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    let code = -1;
+    let result: { samples: unknown[]; decision: { live: boolean; reason: string } };
+    try {
+      code = await runGateNode(['--commit', CUT, '--version', '1.0.1', '--baseline-commit', BASE,
+        '--pod-pool', 'pool-test', '--precut-canary-file', file], {}, source);
+      result = JSON.parse(String(output.mock.calls.at(-1)?.[0]));
+    } finally { output.mockRestore(); resetElanousConfigDir(); }
+    expect(code).toBe(0);
+    expect(result.samples).toHaveLength(2);
+    expect(call).toBe(2);
+    expect(result.decision).toMatchObject(scenario.expected);
+    const saved = JSON.parse(readFileSync(historyPath, 'utf8'));
+    expect(saved.warmHistoryOnly).toBe(true);
+    expect(saved.previousNote).toBe('preserve');
+    expect(saved.warmHistory).toHaveLength(3);
+  }
 });
 
 test('GATE-WARM-ADOPT: verified history skips a fresh Job; bad reply, key or history falls back', async () => {
@@ -4502,9 +4603,9 @@ test.each([
   resetUserConfig();
   const printed: string[] = [];
   const out = spyOn(console, 'log').mockImplementation((line: unknown) => { printed.push(String(line)); });
-  const judge = async () => ({ outcome, commit: CUT, introduced, preexisting: 0, fixed: 0, knownEnv: 0,
+  const judge: Parameters<typeof runGateNode>[3] = async () => ({ outcome, commit: CUT, introduced: [...introduced], preexisting: 0, fixed: 0, knownEnv: 0,
     knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 25,
-    stalledShards: [{ shard: 2, files: ['src/stalled.test.ts'], reason }] });
+    stalledShards: [{ shard: 2, files: ['src/stalled.test.ts'], reason: reason as 'timeout' | 'admission-error' }] });
   try {
     const expectedExit = outcome === 'regression' ? 1 : 2;
     expect(await runGateNode(['--commit', CUT, '--version', '1.0.1', '--json'], {}, undefined, judge)).toBe(expectedExit);
@@ -5089,7 +5190,7 @@ test('GATE-WARM-SHADOW: an actual late lease acquisition is fenced after its req
     sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha: CUT, key, memoryLimit: '16Gi',
     hostProbeUrl: 'http://host.orb.internal:10001/health', prodProbeUrl: 'http://core.elanous-prod:10002/' };
   const manifest = warmWorkerPodManifest(spec);
-  const pod: any = { metadata: { ...manifest.metadata, uid: 'pod-late-uid', resourceVersion: '1' } };
+  const pod: any = { metadata: { ...(manifest.metadata as Record<string, unknown>), uid: 'pod-late-uid', resourceVersion: '1' } };
   const controlCalls: string[] = [];
   const leaseEvents: string[] = [];
   const leaseLog = spyOn(debug, 'log').mockImplementation(((category: string, event: string) => {

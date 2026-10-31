@@ -1185,7 +1185,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     const taskId = [...spaceIdByTask.entries()].find(([, id]) => id === input.spaceId)?.[0];
     const goal = taskId ? taskByGoal.get(taskId) : undefined;
     if (cancelling) throw new Error('orchestration cancelled by signal');
-    const started = baseSpawn({ ...input, feature: dependencyOutputFeature(input.spaceId, input.feature) });
+    const started = baseSpawn({ ...input, ...(taskId ? { taskId } : {}), feature: dependencyOutputFeature(input.spaceId, input.feature) });
     if (goal && taskId) {
       try { opts.onTaskLaunched?.(goal, taskId, priorByResumeKey.get(resumeKey(goal.feature))?.taskId); }
       catch { /* observation must not interrupt execution */ }

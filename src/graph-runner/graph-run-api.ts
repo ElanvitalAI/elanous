@@ -29,6 +29,8 @@ export interface GraphRunApiDeps {
   root?: string;
   run?: typeof runGraph;
   now?: () => number;
+  /** Allows a host-owned preview/demo request to stop an in-flight editor graph run. */
+  signal?: AbortSignal;
 }
 
 /** 시작 전에 죽은 런(레시피 없음 등)은 원장 파일이 안 생긴다 — 그 이유를 여기 잠깐 들고 있다가 상태 조회에 돌려준다. */
@@ -187,7 +189,7 @@ export function handleGraphRunStart(rawId: string, deps: GraphRunApiDeps = {}): 
     return jsonResponse({ error: 'run-workspace-failed', reason: error instanceof Error ? error.message.slice(0, 200) : 'unknown' }, 500);
   }
   debug.log('graphs.run', 'started', { id, runId });
-  void (deps.run ?? runGraph)(join(work, 'graph.yaml'), { runId, input: { source: 'editor' }, deps: { root } })
+  void (deps.run ?? runGraph)(join(work, 'graph.yaml'), { runId, input: { source: 'editor' }, ...(deps.signal ? { signal: deps.signal } : {}), deps: { root } })
     .then((state) => debug.log('graphs.run', 'finished', { id, runId, status: state.status, executed: state.executed }))
     .catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);

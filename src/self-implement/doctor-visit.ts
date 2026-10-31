@@ -484,6 +484,26 @@ export interface DoctorComparisonRecord {
 }
 
 /**
+ * 하류 계약: 비교 판정의 명명된 실패는 message 문자열이 아니라 typed identity(`reason`)로도 도착한다.
+ * 사람이 읽는 문면은 종전과 같은 문장 그대로다(문장 접두사 = reason). 실제로 없는 원장만
+ * `run-ledger-missing` 이고, 운영/시험 원장 쓰기 거부는 이 클래스가 아니라
+ * `DoctorComparisonLedgerWriteRefusedError` 다.
+ */
+export type DoctorComparisonFailureReason =
+  | 'run-ledger-missing'
+  | 'shadow-rx-missing'
+  | 'visit-missing'
+  | 'comparison-corrupt'
+  | 'comparison-conflict';
+
+export class DoctorComparisonFailureError extends Error {
+  constructor(readonly reason: DoctorComparisonFailureReason, message: string) {
+    super(message);
+    this.name = 'DoctorComparisonFailureError';
+  }
+}
+
+/**
  * 하류 계약: 운영/시험 원장 쓰기 거부는 message 문자열이 아니라 typed identity(`reason`·`runId`·
  * `ledgerDir`)로 도착한다. 사람이 읽는 문면은 종전과 같은 문장 그대로다.
  */
@@ -507,8 +527,10 @@ export class DoctorComparisonLedgerWriteRefusedError extends Error {
  * 하류 계약(typed identity) — ① 원장 쓰기 거부는 DoctorComparisonLedgerWriteRefusedError
  * (`reason='ledger-write-refused'`·`runId`·`ledgerDir`), ② runId 불일치는 원장 바이트와 checked
  * append 양쪽 모두 RunLedgerCheckedAppendRunIdMismatchError(`reason='runId-mismatch'`·
- * `decisionRunId`·`lockedRunId`)로 도착한다. 문자열 파싱 없이 분류하고, 실제로 없는 원장만
- * `run-ledger-missing` 이다.
+ * `decisionRunId`·`lockedRunId`)로 도착한다, ③ 나머지 명명된 실패(run-ledger-missing·
+ * shadow-rx-missing·visit-missing·comparison-corrupt·comparison-conflict)는
+ * DoctorComparisonFailureError(`reason` = 그 이름, 사람 문면은 접두사 그대로)로 도착한다.
+ * 문자열 파싱 없이 분류하고, 실제로 없는 원장만 `run-ledger-missing` 이다.
  *
  * 배선 경계(의도적): 이 슬라이스의 호출자는 시험 경로뿐이다 — live dispatch·stall-watch retirement
  * 은 후속 cross-judgment 증거 슬라이스에서 붙는다(현행 `eln doctor status --json` = total 0
@@ -531,7 +553,7 @@ export function recordDoctorComparison(input: RecordDoctorComparisonInput): Doct
   // lock 안에서 appendRunLedgerEntry 를 다시 부르지 않는다(중첩 lock 시간초과).
   const outcome: RunLedgerCheckedAppendOutcome<DoctorComparisonRecord> = appendRunLedgerEntryChecked<DoctorComparisonRecord>(runId, (entries) => {
     if (entries === null) {
-      throw new Error(`run-ledger-missing: 런 원장이 없습니다 (runId=${runId}) — 새 원장을 만들지 않습니다`);
+      throw new DoctorComparisonFailureError('run-ledger-missing', `run-ledger-missing: 런 원장이 없습니다 (runId=${runId}) — 새 원장을 만들지 않습니다`);
     }
     let shadowRxIndex = -1;
     for (let index = 0; index < entries.length; index++) {
@@ -539,7 +561,7 @@ export function recordDoctorComparison(input: RecordDoctorComparisonInput): Doct
       if (entry.event === 'doctor-rx' && entry.data.shadow === true) shadowRxIndex = index;
     }
     if (shadowRxIndex < 0) {
-      throw new Error(`shadow-rx-missing: 이 runId 의 shadow doctor-rx 가 없습니다 (runId=${runId}) — shadow 결과를 지어내지 않습니다`);
+      throw new DoctorComparisonFailureError('shadow-rx-missing', `shadow-rx-missing: 이 runId 의 shadow doctor-rx 가 없습니다 (runId=${runId}) — shadow 결과를 지어내지 않습니다`);
     }
     const shadowRx = entries[shadowRxIndex]!;
     const rx = typeof shadowRx.data.rx === 'string' ? shadowRx.data.rx : null;
@@ -547,17 +569,17 @@ export function recordDoctorComparison(input: RecordDoctorComparisonInput): Doct
     const visitIndex = typeof shadowRx.data.visitIndex === 'number' ? shadowRx.data.visitIndex : -1;
     const visit = visitIndex >= 0 && visitIndex < entries.length ? entries[visitIndex] : undefined;
     if (visit === undefined || visit.event !== 'doctor-visit' || visit.runId !== runId) {
-      throw new Error(`visit-missing: shadow doctor-rx 가 가리키는 doctor-visit 행이 없습니다 (runId=${runId}, visitIndex=${visitIndex})`);
+      throw new DoctorComparisonFailureError('visit-missing', `visit-missing: shadow doctor-rx 가 가리키는 doctor-visit 행이 없습니다 (runId=${runId}, visitIndex=${visitIndex})`);
     }
     const existing = entries.find((entry) => entry.event === 'doctor-compare' && entry.data.shadowRxIndex === shadowRxIndex);
     if (existing !== undefined) {
       const stored = existing.data.opJudgment as { timestamp?: unknown; result?: unknown };
       if (typeof stored?.timestamp !== 'string' || stored.timestamp.length === 0
         || typeof stored?.result !== 'string' || stored.result.length === 0) {
-        throw new Error(`comparison-corrupt: 이미 기록된 doctor-compare 의 저장 판단이 손상됐습니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}) — 거짓 already-recorded 를 승인하지 않습니다`);
+        throw new DoctorComparisonFailureError('comparison-corrupt', `comparison-corrupt: 이미 기록된 doctor-compare 의 저장 판단이 손상됐습니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}) — 거짓 already-recorded 를 승인하지 않습니다`);
       }
       if (stored.timestamp !== judgment.timestamp || stored.result !== judgment.result) {
-        throw new Error(`comparison-conflict: 이미 기록된 doctor-compare 와 손판정이 다릅니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}, received=${JSON.stringify(judgment)}) — 기존 행을 유지합니다`);
+        throw new DoctorComparisonFailureError('comparison-conflict', `comparison-conflict: 이미 기록된 doctor-compare 와 손판정이 다릅니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}, received=${JSON.stringify(judgment)}) — 기존 행을 유지합니다`);
       }
       return { append: false as const, result: { status: 'already-recorded' as const, visitIndex, shadowRxIndex, rx, outcome: shadowOutcome, opResult: judgment.result } };
     }
@@ -579,7 +601,7 @@ export function recordDoctorComparison(input: RecordDoctorComparisonInput): Doct
     return outcome.result;
   }
   if (holder.recorded === undefined) {
-    throw new Error(`run-ledger-missing: 런 원장이 없습니다 (runId=${runId}) — 새 원장을 만들지 않습니다`);
+    throw new DoctorComparisonFailureError('run-ledger-missing', `run-ledger-missing: 런 원장이 없습니다 (runId=${runId}) — 새 원장을 만들지 않습니다`);
   }
   const record = holder.recorded;
   debug.log('run-doctor', 'compare', { runId, visitIndex: record.visitIndex, shadowRxIndex: record.shadowRxIndex, opResult: judgment.result, executed: false });

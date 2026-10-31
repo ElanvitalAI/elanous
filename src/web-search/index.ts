@@ -6,12 +6,13 @@
 // provider pass `providerId` to force the choice.
 
 import { buildGrokSubscriptionWebSearchProvider, buildGrokWebSearchProvider } from './grok.js';
+import { buildExaWebSearchProvider } from './exa.js';
 import { buildFirecrawlWebSearchProvider } from './firecrawl.js';
 import { buildTavilyWebSearchProvider } from './tavily.js';
 import { buildFreeWebSearchProvider } from './free.js';
 import { isPaidWebSearchEnabled, isTavilySearchEnabled } from '../user-config.js';
 import { debug } from '../debug/log.js';
-import { wantsXSearch } from './x-intent.js';
+import { wantsGrokSearch, wantsXSearch } from './x-intent.js';
 import {
   type WebSearchProvider,
   type WebSearchQuery,
@@ -27,17 +28,17 @@ export { WebSearchUnavailableError } from './provider.js';
  *  module load (before first call). Tests reset via
  *  _resetWebSearchProvidersForTests. */
 const providers: WebSearchProvider[] = [];
+let includeEnvironmentResearchExa = true;
 
 function registerBuiltins(): void {
-  // 순서 = 선호도. ⛔⭐ **tavily 는 config 게이트 뒤에 있다**(대표 2026-08-06 · 기본 OFF) —
-  //   상시 유료 검색이 고정비였다. 종전 근거(basic 1cr·~1s 로 grok 대비 30배 저렴·20배 빠름)는
-  //   여전히 참이지만 ***「싸다」와 「늘 켜 둔다」는 다른 축***이고, 지시는 후자를 껐다.
-  //   ⇒ 켜면 종전과 «똑같이» 1순위로 복귀한다: `elanous config set webSearch.tavily.enabled true`.
-  //   ⚠️ 등록 시점이라 config 변경은 **다음 기동부터** 먹는다(이미 뜬 프로세스엔 안 먹는다).
+  // General web cascade is Exa → Firecrawl; Grok is reserved for explicit X/Twitter intent.
+  // Other providers remain registered for explicit provider selection only.
+  // Provider registration snapshots config at module load; changing these gates requires a process restart.
+  providers.push(buildExaWebSearchProvider());
+  if (isPaidWebSearchEnabled('firecrawl')) providers.push(buildFirecrawlWebSearchProvider());
   if (isTavilySearchEnabled()) providers.push(buildTavilyWebSearchProvider());
   providers.push(buildGrokSubscriptionWebSearchProvider());
   if (isPaidWebSearchEnabled('grokApi')) providers.push(buildGrokWebSearchProvider({ id: 'grok-api' }));
-  if (isPaidWebSearchEnabled('firecrawl')) providers.push(buildFirecrawlWebSearchProvider());
   providers.push(buildFreeWebSearchProvider());
 }
 registerBuiltins();
@@ -70,14 +71,22 @@ export async function searchWeb(
   opts: { providerId?: string; signal?: AbortSignal } = {},
 ): Promise<WebSearchResult> {
   const xIntent = !opts.providerId && wantsXSearch(q.query);
+  const grokIntent = !opts.providerId && wantsGrokSearch(q.query);
   const candidates = opts.providerId
     ? providers.filter(p => p.id === opts.providerId || (opts.providerId === 'grok' && p.id === 'grok-api'))
-    : providers.filter(p => p.available());
-  if (xIntent) {
+    : providers.filter(p => p.available() && (grokIntent
+      ? p.id === 'grok' || p.id === 'grok-api' || p.id === 'exa' || p.id === 'firecrawl'
+      : p.id === 'exa' || p.id === 'firecrawl'));
+  if (grokIntent) {
     const grokIndex = candidates.findIndex(p => p.id === 'grok' || p.id === 'grok-api');
     if (grokIndex > 0) candidates.unshift(...candidates.splice(grokIndex, 1));
   }
   if (candidates.length === 0) {
+    const ordinaryProviderAvailable = providers.some(provider => provider.available() && (provider.id === 'exa' || provider.id === 'firecrawl'));
+    const grokAvailable = providers.some(provider => provider.available() && (provider.id === 'grok' || provider.id === 'grok-api'));
+    if (!opts.providerId && !grokIntent && grokAvailable && !ordinaryProviderAvailable) {
+      throw new WebSearchUnavailableError(['grok'], ['policy:Grok is reserved for explicit X/Twitter searches. Configure Exa or Firecrawl for general web search.']);
+    }
     throw new WebSearchUnavailableError(
       providers.map(p => p.id),
       providers.map(p => p.available() ? 'available (but id filter skipped)' : 'unavailable (check keys/binaries)'),
@@ -123,6 +132,8 @@ export async function searchWeb(
  *  providers. Kept separate from the public API. */
 export function _resetWebSearchProvidersForTests(includeBuiltins = true): void {
   providers.length = 0;
+  // `false` means tests want a credential-independent provider set, including research discovery.
+  includeEnvironmentResearchExa = includeBuiltins;
   if (includeBuiltins) registerBuiltins();
 }
 
@@ -131,4 +142,14 @@ export function _resetWebSearchProvidersForTests(includeBuiltins = true): void {
  *  want the cascade semantics of `searchWeb()`. */
 export function getAvailableWebSearchProviders(): WebSearchProvider[] {
   return providers.filter(p => p.available());
+}
+
+/** Research-only provider snapshot. Exa stays out of the general registry/cascade so
+ * adding a research credential cannot change ordinary WebSearch or OmniSearch defaults. */
+export function getAvailableResearchWebSearchProviders(): WebSearchProvider[] {
+  const available = getAvailableWebSearchProviders();
+  if (available.some(provider => provider.id === 'exa')) return available;
+  if (!includeEnvironmentResearchExa) return available;
+  const exa = buildExaWebSearchProvider();
+  return exa.available() ? [...available, exa] : available;
 }

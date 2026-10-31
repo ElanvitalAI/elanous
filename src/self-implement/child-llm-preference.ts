@@ -10,6 +10,7 @@ import type {
 } from '../user-config.js';
 import { DEFAULT_BUDGET_GATE } from '../user-config.js';
 import { debug } from '../debug/log.js';
+import { fallbackChainForProvider, normalizeFallbackChain } from '../oauth/fallback-chain.js';
 
 /** 체인 한 칸. `codexCredits` = `llm.fallbackChain` 의 `codex-credits` 칸(codex 를 선불 크레딧으로 · 마지막 수단). */
 export type ChildLlmChainSlot = ChildLlmChainEntry & { readonly codexCredits?: true };
@@ -32,6 +33,8 @@ const FALLBACK_NAME_TO_PROVIDER: Readonly<Record<string, string>> = {
   grok: 'grok',
   // CODEX-CREDITS-STEP — provider 는 같은 codex 지만 «크레딧 칸»이라 따로 센다(아래 중복 판정).
   'codex-credits': 'openai-codex',
+  zai: 'glm',
+  openrouter: 'openrouter',
 };
 
 function warnPreference(detail: string): void {
@@ -83,7 +86,13 @@ export function resolveChildLlmPreference(config: ChildLlmPreferenceInput): Reso
     }));
     chainSource = 'config';
   } else {
-    chain = chainFromFallbackNames(config.llm.fallbackChain);
+    const configuredFallback = config.llm.fallbackChain;
+    const derived = normalizeFallbackChain(configuredFallback, config.llm.provider);
+    // Preserve auto's empty preference: the launch gate applies its legacy code
+    // default there. An explicitly selected provider gets its own derived chain.
+    const steps = configuredFallback === undefined && !fallbackChainForProvider(config.llm.provider)
+      ? [] : derived.chain;
+    chain = chainFromFallbackNames(steps);
     chainSource = 'fallbackChain';
   }
 

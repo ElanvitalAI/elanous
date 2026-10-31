@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
+import { canonicalMessageAddress, canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
 import { clearPostOffice, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { GitHubMsgMirrorTransport } from '../msg/msg-mirror-github.js';
@@ -325,7 +325,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       const from = seat(opts.from, '--from');
       const unsupported = opts.to === undefined ? null : unsupportedLoopAddressNotice(opts.to);
       if (unsupported) out.error(unsupported);
-      const to = seat(opts.to, '--to');
+      if (opts.to === undefined) throw new Error('--to is required');
+      const to = canonicalMessageAddress(opts.to);
       // Validate the auto-reply target before saving — a mismatched flag must not leave a stored message behind.
       const agentAddress = agentReplyAddress(opts.agentReply);
       if (agentAddress !== null) requireAgentTarget(agentAddress, to);
@@ -364,12 +365,40 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   msg.command('route <address>').description('Show how a post to this address is read (replyBody) and woken (wake)')
     .option('--json')
     .action((address: string, opts: CommonOptions) => run(() => {
-      const to = canonicalSeatId(address);
+      const to = canonicalMessageAddress(address);
       const wake = resolveWake(to, deps.wakeDeps);
       const row = { msgAddress: to, replyBody: messageRouteFor(to)?.replyBody ?? null, ...wake };
       emit(row, opts.json, () => out.log(`${to}\treplyBody=${row.replyBody ?? '모름'}\twake=${wake.wake}`
         + `${wake.target ? `\ttarget=${wake.target}` : ''}${wake.optIn === undefined ? '' : `\toptIn=${wake.optIn ? 'yes' : 'no(주입 0)'}`}`
         + `\t(${wake.source}${wake.reason ? `: ${wake.reason}` : ''})`));
+    })());
+
+  const group = msg.command('group').description('Manage local message group subscriptions');
+  group.command('create <name>').description('Create a group and subscribe its owner')
+    .requiredOption('--from <seat>', 'seat creating and owning the group').option('--json')
+    .action((name: string, opts: { from: string; json?: boolean }) => run(() => {
+      const address = withStore(store => store.createGroup(name, opts.from));
+      emit({ address, owner: canonicalSeatId(opts.from) }, opts.json, () => out.log(`${address} created; ${canonicalSeatId(opts.from)} subscribed`));
+    })());
+  group.command('join <name>').description('Subscribe a seat to a group')
+    .requiredOption('--seat <seat>').option('--json')
+    .action((name: string, opts: { seat: string; json?: boolean }) => run(() => {
+      const joined = withStore(store => store.joinGroup(name, opts.seat));
+      const row = { group: canonicalMessageAddress(name.startsWith('group:') ? name : `group:${name}`), seat: canonicalSeatId(opts.seat), joined };
+      emit(row, opts.json, () => out.log(`${row.seat} ${row.joined ? 'joined' : 'already subscribed'} ${row.group}`));
+    })());
+  group.command('leave <name>').description('Unsubscribe a seat from a group')
+    .requiredOption('--seat <seat>').option('--json')
+    .action((name: string, opts: { seat: string; json?: boolean }) => run(() => {
+      const left = withStore(store => store.leaveGroup(name, opts.seat));
+      const row = { group: canonicalMessageAddress(name.startsWith('group:') ? name : `group:${name}`), seat: canonicalSeatId(opts.seat), left };
+      emit(row, opts.json, () => out.log(`${row.seat} ${row.left ? 'left' : 'was not subscribed to'} ${row.group}`));
+    })());
+  group.command('list').description('List a seat’s active group subscriptions')
+    .requiredOption('--seat <seat>').option('--json')
+    .action((opts: { seat: string; json?: boolean }) => run(() => {
+      const groups = withStore(store => store.listGroups(opts.seat));
+      emit(groups, opts.json, () => { if (!groups.length) out.log('No groups.'); else for (const address of groups) out.log(address); });
     })());
 
   msg.command('list').description('List messages for one recipient or one thread without acknowledging them')

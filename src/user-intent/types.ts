@@ -3,8 +3,8 @@
 // PLAN: 내부 문서 `PLAN-user-intent-logging-2026-05-12` §2
 // MANUAL: 내부 문서 `MANUAL-user-intent-logging-2026-05-12`
 //
-// Single shape for every user-intent signal across the 7 surfaces
-// (tui · pwa · ios · watch · airpods · discord · telegram) and 7
+// Single shape for every user-intent signal across the 8 surfaces
+// (tui · ask · pwa · ios · watch · airpods · discord · telegram) and 7
 // layers (utterance · gesture · selection · navigation · ambient ·
 // device_state · system). Patcher (Y3) consumes the JSONL stream as
 // raw input; KGS card conversion happens in the Patcher, not here.
@@ -21,6 +21,7 @@
 export type UserIntentSurface =
   | 'unknown'
   | 'tui'
+  | 'ask'
   | 'pwa'
   | 'ios'
   | 'watch'
@@ -29,7 +30,7 @@ export type UserIntentSurface =
   | 'telegram';
 
 export const USER_INTENT_SURFACES: readonly UserIntentSurface[] = [
-  'unknown', 'tui', 'pwa', 'ios', 'watch', 'airpods', 'discord', 'telegram',
+  'unknown', 'tui', 'ask', 'pwa', 'ios', 'watch', 'airpods', 'discord', 'telegram',
 ];
 
 export type UserIntentLayer =

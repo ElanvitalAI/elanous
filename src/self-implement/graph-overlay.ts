@@ -26,7 +26,9 @@ export type OverlayRejection =
 
 export type OverlayPatch =
   | { readonly overlayId: string; readonly field: 'maxVisits'; readonly node: string; readonly before: number; readonly after: number }
-  | { readonly overlayId: string; readonly field: 'routes'; readonly node: string; readonly before: readonly string[]; readonly after: readonly string[] };
+  | { readonly overlayId: string; readonly field: 'routes'; readonly node: string; readonly before: readonly string[]; readonly after: readonly string[] }
+  | { readonly overlayId: string; readonly field: 'node-added'; readonly node: string; readonly kind: string; readonly maxVisits: number }
+  | { readonly overlayId: string; readonly field: 'edge-rerouted'; readonly from: string; readonly outcome: string; readonly was: string; readonly to: string };
 
 export type OverlayResult =
   | { ok: true; template: GraphTemplate; patches: readonly OverlayPatch[] }

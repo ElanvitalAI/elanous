@@ -7,7 +7,7 @@ export interface DashboardLocalAgentSession {
   id: string;
   title: string;
   kind: 'shell' | 'coding-agent';
-  agentBrand?: 'claude-code' | 'codex' | 'gemini';
+  agentBrand?: 'claude-code' | 'codex' | 'gemini' | 'grok';
   state: 'foreground' | 'background' | 'exited';
 }
 

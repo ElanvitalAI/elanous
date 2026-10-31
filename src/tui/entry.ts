@@ -99,6 +99,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let sidetabChordTimer: ReturnType<typeof setTimeout> | null = null;
   let sidetabRemoteFrame: string | null = null;
   let sidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
+  let herdrSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
+  let herdrSidetabRefreshPending = false;
+  let herdrSidetabPortal: import('./sidetab/herdr-portal.js').HerdrSidetabPortal | null = null;
   let sidetabApi: typeof import('./sidetab/list.js') | null = null;
   // ⚠️ `as` 단언은 «null 로 좁혀지는» 흐름 분석을 푸는 것 — 값은 클로저(ensureSidetabAttachments) 안에서만 바뀐다.
   let sidetabAttachments: import('./sidetab/attach.js').SidetabAttachmentController | null = null as import('./sidetab/attach.js').SidetabAttachmentController | null;
@@ -357,6 +360,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
 
   const ensureSidetabAttachments = async (): Promise<void> => {
     if (sidetabAttachments) return;
+    const herdrPortalModule = await import('./sidetab/herdr-portal.js');
+    herdrSidetabPortal ??= herdrPortalModule.createHerdrSidetabPortal();
     const installer = await import('../agent-mission/tool-install.js') as unknown as {
       detectAgentCli?: (agent: 'codex' | 'claude') => Promise<{
         agent: 'codex' | 'claude'; installed: boolean; version: string | null;
@@ -364,6 +369,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       }>;
     };
     sidetabAttachments = (await import('./sidetab/attach.js')).createSidetabAttachmentController({
+      herdrPortal: herdrSidetabPortal,
+      logEvent: (category, event, data) => debug.log(category, event, data),
       drawBase: () => {
         paintingCoordinatorFrame = true;
         try { render(); } finally { paintingCoordinatorFrame = false; }
@@ -403,9 +410,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabSelected = next.selected;
     sidetabMode = 'list';
     if (sidetabOpen && sidetabRefreshTimer === null) {
+      void refreshHerdrSidetabRows();
       sidetabRefreshTimer = setInterval(() => {
         if (!sidetabOpen || !sidetabApi) return;
         refreshSidetabRows();
+        void refreshHerdrSidetabRows();
         render();
       }, 1000);
     } else if (!sidetabOpen && sidetabRefreshTimer !== null) {
@@ -417,11 +426,23 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const refreshSidetabRows = (): void => {
     if (!sidetabApi) return;
     const selectedId = sidetabRows[sidetabSelected]?.id;
-    sidetabRows = sidetabApi.loadSidetabRows(sidetabAll);
+    sidetabRows = [...sidetabApi.loadSidetabRows(sidetabAll), ...herdrSidetabRows];
     const preservedIndex = selectedId ? sidetabRows.findIndex((row) => row.id === selectedId) : -1;
     sidetabSelected = preservedIndex >= 0
       ? preservedIndex
       : Math.min(sidetabSelected, Math.max(0, sidetabRows.length - 1));
+  };
+  const refreshHerdrSidetabRows = async (): Promise<void> => {
+    if (herdrSidetabRefreshPending) return;
+    herdrSidetabRefreshPending = true;
+    try {
+      const portal = await import('./sidetab/herdr-portal.js');
+      herdrSidetabPortal ??= portal.createHerdrSidetabPortal();
+      await herdrSidetabPortal.refreshRows();
+      herdrSidetabRows = [...herdrSidetabPortal.rows()];
+      refreshSidetabRows();
+    } catch { /* Herdr is optional; TUI rows remain available. */ }
+    finally { herdrSidetabRefreshPending = false; }
   };
   const switchSidetabSession = async (requestedSessionId?: string): Promise<void> => {
     const selected = sidetabRows[sidetabSelected];
@@ -667,9 +688,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   if (sidetabOpen) {
     sidetabApi = await import('./sidetab/list.js');
     sidetabRows = sidetabApi.loadSidetabRows(sidetabAll);
+    void refreshHerdrSidetabRows();
     sidetabRefreshTimer = setInterval(() => {
       if (!sidetabApi || !sidetabOpen) return;
       refreshSidetabRows();
+      void refreshHerdrSidetabRows();
       render();
     }, 1_000);
   }

@@ -30,6 +30,7 @@ import { requireInProcessHandler, type InProcessHandlerRegistry } from './in-pro
 import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride, type GateShardRerouteOverride } from '../../scripts/release-loop/resume.js';
+import { resolveChildAllowance } from './arg-allowance.js';
 
 type BashRun = WorkflowDeps['runBash'];
 const DEFAULT_BASH_TIMEOUT_MS = 5 * 60 * 1_000;
@@ -91,6 +92,7 @@ const LOOP_TERMINAL_STATUS: Readonly<Record<string, Readonly<Record<string, 'don
 function topLevelTerminalStatus(graphId: string, terminal: string): 'done' | 'failed' | undefined {
   const aliases = Object.hasOwn(LOOP_TERMINAL_STATUS, graphId) ? LOOP_TERMINAL_STATUS[graphId] : undefined;
   if (aliases) return Object.hasOwn(aliases, terminal) ? aliases[terminal] : undefined;
+  if (terminal === 'needs-human' || terminal === 'rework') return 'failed';
   return terminal === 'done' || terminal === 'failed' ? terminal : undefined;
 }
 
@@ -166,7 +168,10 @@ export interface GraphRunState {
   parentRunId?: string;
   /** The entry chosen by a parent call; absent for existing single-entry runs. */
   entryNodeId?: string;
-  unitCalls?: Array<{ node: string; unit: string; version: number; hash: string; childRunId: string; exit: string; steps: number; entry?: string }>;
+  unitCalls?: Array<{ node: string; unit: string; version: number; hash: string; childRunId: string; exit: string; steps: number; entry?: string; visit?: number; enteredAtMs?: number; exitedAtMs?: number; durationMs?: number }>;
+  /** Highest visit number handed to each unit in this run; not rewound by a restart, so
+   *  a resumed run never reuses a (runId, unit, visit) span. */
+  unitVisitSeq?: Record<string, number>;
   growth?: GraphGrowth[];
   growthRejections?: Array<{ from: string; outcome: string; reason: string }>;
   growthPark?: { from: string; outcome: string; reason: string; decisionId: string; decisionRef: string; growth: GraphGrowth; command?: GrowthCommand; approval?: string };
@@ -225,6 +230,8 @@ export async function runGraphClassifyNode(node: ClassifyNode, ctx: NodeExecCont
 
 export interface GraphRunOptions {
   input?: unknown;
+  /** Abort an active graph command and stop before dispatching the next node. */
+  signal?: AbortSignal;
   /** Bytes already checked by the tick gate, used for a current-graph start or legacy resume. */
   graphSource?: string;
   dryRun?: boolean;
@@ -258,7 +265,7 @@ export interface GraphRunOptions {
   releaseCommandSource?: { root: string; cutTip: string; git?: (args: string[]) => string };
   /** Optional per-run Bloom edge policy hook. */
   researchEdgeDecisionRegistry?: ResearchEdgeDecisionRegistry;
-  deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] }; inProcessHandlers?: InProcessHandlerRegistry };
+  deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; monotonicMs?: () => number; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] }; inProcessHandlers?: InProcessHandlerRegistry };
 }
 
 /** The command directory must itself be the checkout at the cut tip. */
@@ -582,7 +589,8 @@ export function lastJsonObject(stdout: unknown): Record<string, unknown> | undef
 }
 
 /** Reconstruct the run-local edges from the ledger without rewriting the YAML snapshot. */
-function withGrowth(graph: GraphTemplateSpec, growth: readonly GraphGrowth[]): GraphTemplateSpec {
+/** Apply validated, run-local edge growth to a graph snapshot. Exported for the graph simulator device. */
+export function withGrowth(graph: GraphTemplateSpec, growth: readonly GraphGrowth[]): GraphTemplateSpec {
   return growth.reduce<GraphTemplateSpec>((current, item) => {
     const edge = current.edges.find((candidate) => candidate.from === item.undo.removeOutcome.from);
     if (!edge || !edge.map || !item.node || item.undo.removeNode !== item.node.nodeId ||
@@ -598,7 +606,8 @@ function withGrowth(graph: GraphTemplateSpec, growth: readonly GraphGrowth[]): G
 }
 
 /** 이름 붙은 결과: 산출의 `outcome` 이 그 간선 map 의 키면 그 목적지 — 아니면 종전 ok/fail(exit) → fallback. */
-function nextNode(edges: readonly GraphEdgeSpec[], nodeId: string, exitOutcome: 'ok' | 'fail', namedOutcome?: string): string | undefined {
+/** Production edge selection shared by runGraph and the graph simulator device. */
+export function nextNode(edges: readonly GraphEdgeSpec[], nodeId: string, exitOutcome: 'ok' | 'fail', namedOutcome?: string): string | undefined {
   const edge = edges.find((e) => e.from === nodeId);
   if (!edge) return undefined;
   if (edge.to !== undefined) return edge.to;
@@ -1035,6 +1044,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     : baseLog;
   const visits = new Map<string, number>();
   for (const nodeId of state.path) visits.set(nodeId, (visits.get(nodeId) ?? 0) + 1);
+  // GRAPH-UNIT-SPAN-DURATION: visit index per unit within this run, so enter/exit of
+  // the same (runId, unit, visit) can be paired. The clock source is monotonic and
+  // injectable (fake clock in tests); it never goes backwards in production. The
+  // sequence is carried on the run state so a restart continues it.
+  const unitVisits = new Map<string, number>(Object.entries(state.unitVisitSeq ?? {}));
+  const monotonicMs = options.deps?.monotonicMs ?? (() => performance.now());
   let current: string | undefined = options.fromNodeId ?? state.pending?.nodeId ?? state.path.at(-1) ?? unitEntryNode;
   if (!options.resumeRunId) {
     mkdirSync(dirname(statePath), { recursive: true });
@@ -1051,6 +1066,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     writeFileSync(join(`${statePath}.graph`, 'recipes.yaml'), recipeSource, { flag: 'wx' });
   }
   while (current !== undefined) {
+    if (options.signal?.aborted) {
+      state.status = 'failed';
+      state.reason = 'cancelled';
+      persist();
+      break;
+    }
     options.deps?.beforeNode?.();
     const node = graph.nodes.find((n) => n.nodeId === current);
     if (!node) throw new Error(`undeclared node: ${current}`);
@@ -1059,8 +1080,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const resumingCompleted = options.resumeRunId !== undefined && !options.fromNodeId && completed?.nodeId === current &&
       state.path.at(-1) === current && !resumingPending;
     const usedSteps = state.path.length + (state.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);
+    const effectiveRemaining = Math.min(
+      graph.allowance ? graph.allowance.innerSteps - usedSteps : Infinity,
+      options.unitContext ? options.unitContext.remainingSteps - usedSteps : Infinity,
+    );
     if (!resumingPending && !resumingCompleted && ((visits.get(current) ?? 0) >= node.maxVisits ||
-        (options.unitContext && usedSteps >= options.unitContext.remainingSteps))) {
+        (effectiveRemaining <= 0 && !graph.terminalNodes.includes(current)))) {
       state.status = 'budget-exceeded';
       log('budget-exceeded', { graphId, runId, nodeId: current });
       persist();
@@ -1196,7 +1221,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       env.ELANOUS_GRAPH_CONTEXT = contextPath;
       env.ELANOUS_GRAPH_DRY_RUN = state.dryRun ? '1' : '0';
       env.ELANOUS_GRAPH_DIR = dirname(resolve(path));
-      const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env } as NodeExecContext;
+      const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env,
+        ...(options.signal ? { signal: options.signal } : {}) } as NodeExecContext;
       const result = await executeBashNode({ id: current, type: 'bash', bash: state.dryRun ? command.dry_run_command! : command.command,
         idle_timeout: command.timeout_ms ?? DEFAULT_BASH_TIMEOUT_MS } as BashNode, ctx, { runBash } as WorkflowDeps);
       output = result.output;
@@ -1231,25 +1257,53 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         if (value !== undefined) inputs[key] = value;
       }
       const alreadySpent = state.path.length + (state.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);
-      const remaining = options.unitContext ? options.unitContext.remainingSteps - alreadySpent : Infinity;
+      const remaining = Math.min(
+        graph.allowance ? graph.allowance.innerSteps - alreadySpent : Infinity,
+        options.unitContext ? options.unitContext.remainingSteps - alreadySpent : Infinity,
+      );
+      const requested = Math.min(node.budget!.innerSteps, node.allowance?.innerSteps ?? node.budget!.innerSteps);
+      const allowance = resolveChildAllowance(requested, Math.max(0, remaining));
       const childRunId = randomUUID();
       const selectedEntry = node.callEntry ?? unit.template.entryNode;
       const recordEntry = node.callEntry !== undefined || unit.template.unit?.entries !== undefined;
       const info = { graphId, runId, nodeId: current, unit: unit.template.graphId, childRunId, parentRunId: runId,
         ...(recordEntry ? { entry: selectedEntry } : {}) };
       let entered = false;
-      try {
+      let span: { visit: number; enteredAtMs: number } | undefined;
+      if (allowance.kind === 'needs-human') {
+        const exitName = unit.template.unit!.exits.includes('needs-human') ? 'needs-human'
+          : unit.template.unit!.exits.includes('rework') ? 'rework' : undefined;
+        if (!exitName) throw new Error(`unit has no needs-human or rework exit for zero allowance: ${current}`);
+        output = JSON.stringify({ outcome: exitName });
+        ok = false;
+        error = `unit allowance exhausted before execution: ${current}`;
+        debug.log('graph.unit', 'allowance-exhausted', { ...info, requested: allowance.requested, remaining: 0, exit: exitName });
+        log('graph.unit', { ...info, phase: 'allowance-exhausted', requested: allowance.requested, remaining: 0, exit: exitName });
+      } else try {
         for (const key of contract.inputs) if (!Object.hasOwn(inputs, key)) throw new Error(`unit input missing: ${current}.${key}`);
         if (createHash('sha256').update(readFileSync(unit.path, 'utf8')).digest('hex') !== unit.hash)
           throw new Error(`unit source changed before call: ${current}`);
-        debug.log('graph.unit', 'enter', info);
-        log('graph.unit', { ...info, phase: 'enter' });
+        const visitIndex = (unitVisits.get(unit.template.graphId) ?? 0) + 1;
+        unitVisits.set(unit.template.graphId, visitIndex);
+        (state.unitVisitSeq ??= {})[unit.template.graphId] = visitIndex;
+        const enteredAtMs = monotonicMs();
+        span = { visit: visitIndex, enteredAtMs };
+        debug.log('graph.unit', 'enter', { ...info, ...span });
+        log('graph.unit', { ...info, phase: 'enter', ...span });
+        if (allowance.clamped) {
+          debug.log('graph.unit', 'allowance-clamped', { ...info, requested: allowance.requested, granted: allowance.granted, remaining });
+          log('graph.unit', { ...info, phase: 'allowance-clamped', requested: allowance.requested, granted: allowance.granted, remaining });
+        }
         entered = true;
         const child = await runGraph(unit.path, { runId: childRunId, input: inputs, dryRun: false,
+          ...(options.signal ? { signal: options.signal } : {}),
           pinChildUniverse: options.pinChildUniverse,
           unitContext: { parentRunId: runId, ancestors: [...(options.unitContext?.ancestors ?? []), graphId],
-            remainingSteps: Math.min(node.budget!.innerSteps, remaining),
+            remainingSteps: allowance.granted,
             ...(recordEntry ? { entryNodeId: selectedEntry } : {}) }, deps: options.deps });
+        const exitedAtMs = monotonicMs();
+        // Same (runId, unit, visit): never let a clock that went backwards emit a negative span.
+        const durationMs = Math.max(0, exitedAtMs - enteredAtMs);
         const steps = child.path.length + (child.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);
         const childExit = child.status === 'done' || child.status === 'failed' ? child.path.at(-1) : undefined;
         // The last successful record carrying every contracted output is the source;
@@ -1264,9 +1318,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         state.unitCalls ??= [];
         state.unitCalls.push({ node: current, unit: unit.template.graphId, version: unit.template.version,
           hash: unit.hash, childRunId, exit: childExit ?? child.status, steps,
+          visit: visitIndex, enteredAtMs, exitedAtMs, durationMs,
           ...(recordEntry ? { entry: selectedEntry } : {}) });
         if (child.status === 'awaiting-approval') throw new Error(`unit cannot pause for approval: ${current}`);
-        if (child.status === 'budget-exceeded' || steps > node.budget!.innerSteps || steps > remaining) {
+        if (child.status === 'budget-exceeded' || steps > allowance.granted || steps > remaining) {
           debug.log('graph.unit', 'budget-exhausted', { ...info, steps, innerSteps: node.budget!.innerSteps });
           log('graph.unit', { ...info, phase: 'budget-exhausted', steps });
           throw new Error(`unit inner_steps exceeded: ${current}`);
@@ -1280,14 +1335,21 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         }
         output = JSON.stringify(result);
         ok = child.status === 'done';
-        debug.log('graph.unit', 'exit', { ...info, exit: childExit, steps });
-        log('graph.unit', { ...info, phase: 'exit', exit: childExit, steps });
+        debug.log('graph.unit', 'exit', { ...info, exit: childExit, steps, visit: visitIndex, enteredAtMs, exitedAtMs, durationMs });
+        log('graph.unit', { ...info, phase: 'exit', exit: childExit, steps, visit: visitIndex, enteredAtMs, exitedAtMs, durationMs });
       } catch (cause) {
         ok = false;
         error = redactCredentials(cause instanceof Error ? cause.message : String(cause));
-        if (entered) {
-          debug.log('graph.unit', 'exit', { ...info, error });
-          log('graph.unit', { ...info, phase: 'exit', error });
+        if (entered && span) {
+          const exitedAtMs = monotonicMs();
+          const durationMs = Math.max(0, exitedAtMs - span.enteredAtMs);
+          const call = state.unitCalls?.at(-1);
+          if (call && call.childRunId === childRunId) {
+            call.exitedAtMs = exitedAtMs;
+            call.durationMs = durationMs;
+          }
+          debug.log('graph.unit', 'exit', { ...info, error, ...span, exitedAtMs, durationMs });
+          log('graph.unit', { ...info, phase: 'exit', error, ...span, exitedAtMs, durationMs });
         }
       }
       // A rejected invocation has no child ledger and did not execute a unit.
@@ -1406,6 +1468,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       observeModelInputTokens({ scope: 'harness-node', nodeKind: node.kind, runId, nodeId: current });
     }
     persist();
+    if (options.signal?.aborted) {
+      state.status = 'failed';
+      state.reason = 'cancelled';
+      persist();
+      break;
+    }
     if (graph.terminalNodes.includes(current)) {
       state.status = !ok ? 'failed' : graph.unit ? (current === 'failed' ? 'failed' : 'done')
         : topLevelTerminalStatus(graph.graphId, current)!;

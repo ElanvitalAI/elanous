@@ -9,6 +9,18 @@ import { leaseKubectl, measurePoolLease, recommendConcurrency } from '../task-or
 import { parsePodPool, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { defaultSshRunner, resolveParentHosts, type SshRunner } from '../task-agent/parent-host.js';
+import { debug } from '../debug/log.js';
+import type { LiveSupplySnapshot } from '../live-supply/snapshot.js';
+
+// Backpressure is a synchronous CLI command. Load supply only when that command runs so its
+// collector graph does not enter the static TUI startup path.
+function supplyReader(): typeof import('../live-supply/snapshot.js') {
+  return require('../live-supply/snapshot.js') as typeof import('../live-supply/snapshot.js');
+}
+
+function observeSupply(event: string, data: Record<string, unknown>): void {
+  try { debug.log('live-supply', event, data); } catch { /* observation never changes admission */ }
+}
 
 export const BUILD_STOP = 4;
 export const BUILD_SLOW = 2;
@@ -126,8 +138,49 @@ function readPodRecommendation(): number | null {
   const measure = measurePoolLease(members, { measureUsage: true, skipDnsProbe: true });
   let accounts = -1;
   try { accounts = listCodexAccountsInStore().length; } catch { /* Accounts are only observed, not a limit. */ }
-  return recommendConcurrency(measure, { capacity: members.reduce((sum, member) => sum + member.capacity, 0),
+  const direct = recommendConcurrency(measure, { capacity: members.reduce((sum, member) => sum + member.capacity, 0),
     accounts, perAccount: config.pod?.lease?.perAccount ?? 4 }).recommended;
+  return narrowPodRecommendationFromSupply(direct, members, supplyReader().loadLiveSupplySnapshot());
+}
+
+/** Pool supply can only reduce a direct recommendation when every member matches the current spec. */
+export function narrowPodRecommendationFromSupply(
+  direct: number | null,
+  members: readonly { context: string; capacity: number }[],
+  snapshot: LiveSupplySnapshot | null,
+  nowMs = Date.now(),
+): number | null {
+  const supply = supplyReader().freshSupplyAxis(snapshot, 'pool', nowMs);
+  if (supply.status !== 'fresh') {
+    observeSupply('snapshot-unavailable', { site: 'harness-backpressure', axis: 'pool', reason: supply.reason });
+    return direct;
+  }
+  // A pool sample can only narrow current admission, never override memory/DNS policy or raise its result.
+  if (!Array.isArray(supply.value?.members)) {
+    observeSupply('snapshot-unavailable', { site: 'harness-backpressure', axis: 'pool', reason: 'malformed' });
+    return direct;
+  }
+  const sampleRows = supply.value.members;
+  const sampled = new Map(sampleRows
+    .filter(member => member && typeof member.context === 'string')
+    .map(member => [member.context, member]));
+  if (sampled.size !== sampleRows.length || sampled.size !== members.length
+    || new Set(members.map(member => member.context)).size !== members.length) {
+    observeSupply('snapshot-unavailable', { site: 'harness-backpressure', axis: 'pool', reason: 'pool-spec-mismatch' });
+    return direct;
+  }
+  const cap = members.reduce<number | null>((sum, member) => {
+    const seen = sampled.get(member.context);
+    if (sum === null || !seen || seen.capacity !== member.capacity || typeof seen.occupied !== 'number'
+      || !Number.isSafeInteger(seen.occupied) || seen.occupied < 0) return null;
+    return sum + Math.max(0, member.capacity - seen.occupied);
+  }, 0);
+  if (cap === null) {
+    observeSupply('snapshot-unavailable', { site: 'harness-backpressure', axis: 'pool', reason: 'pool-spec-mismatch' });
+    return direct;
+  }
+  observeSupply('snapshot-consumed', { site: 'harness-backpressure', axis: 'pool', sequence: supply.sequence, cap });
+  return direct === null ? null : Math.min(direct, cap);
 }
 
 function readLocalAdmission(query: LogQuery): readonly AdmissionRow[] {

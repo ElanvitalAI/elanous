@@ -46,9 +46,10 @@ export function createCompositorState(): CompositorState {
 /** 청크 이벤트를 상태에 반영(순수·in-place). delta/reasoning/tool 을 흡수. */
 export function applyChunk(
   state: CompositorState,
-  ev: { delta?: string; reasoning?: string; tool?: { id: string; name: string; phase: 'call' | 'result'; ok?: boolean } },
+  ev: { delta?: string; textOperation?: 'replace'; reasoning?: string; tool?: { id: string; name: string; phase: 'call' | 'result'; ok?: boolean } },
 ): void {
-  if (ev.delta) state.text += ev.delta;
+  if (ev.textOperation === 'replace') state.text = ev.delta ?? '';
+  else if (ev.delta) state.text += ev.delta;
   if (ev.reasoning) state.reasoning = ev.reasoning; // keep-latest(추론은 누적 아닌 최신 요약)
   if (ev.tool) {
     if (ev.tool.phase === 'call') {

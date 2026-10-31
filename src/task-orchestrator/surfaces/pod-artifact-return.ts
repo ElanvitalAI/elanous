@@ -102,6 +102,10 @@ export function podNoResultDiagnostic(ledger: string): string | null {
     try {
       const entry = JSON.parse(line) as { event?: unknown; data?: Record<string, unknown> };
       if (!entry || typeof entry !== 'object' || !entry.data || typeof entry.data !== 'object' || typeof entry.event !== 'string' || entry.event === 'pod-ledger-incomplete') continue;
+      // Route evidence is not a child execution stage. The observer writes the category
+      // (`graph.path`) only to the log store; the run ledger keeps the event name
+      // (`path-signature`), which may be appended after the child failure.
+      if (entry.event === 'graph.path' || entry.event === 'path-signature') continue;
       if (typeof entry.data.round === 'number' && Number.isSafeInteger(entry.data.round)) round = entry.data.round;
       if (entry.event !== 'run-origin') stage = entry.event;
       // `reviewed` carries pointers only (count + finding ids); the text stays in the review artifact.

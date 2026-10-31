@@ -76,6 +76,7 @@ export class AcpAgentManager {
       agent = new CodexAppServerAgent({
         backendId,
         ...opts,
+        remoteSocketPath: process.env.ELANOUS_CODEX_REMOTE_SIDETAB_SOCKET || undefined,
         elicitationHandler: createAskUserElicitationHandler(),
       }) as unknown as AcpAgent;
     } else {

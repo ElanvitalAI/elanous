@@ -30,14 +30,16 @@ function cli(maxDetailOn: () => boolean) {
   const output: string[] = [];
   const errors: string[] = [];
   const events: Array<{ category: string; event: string; data: any }> = [];
+  const registeredSurfaces: string[] = [];
   const command = new Command().exitOverride();
   registerResearchCommand(command, {
     out: { log: line => output.push(line), error: line => errors.push(line) },
     maxDetailOn,
+    registerLogSink: async surface => { registeredSurfaces.push(surface); },
     log: (category, event, data) => { events.push({ category, event, data }); },
   });
   return {
-    output, errors, events,
+    output, errors, events, registeredSurfaces,
     run: (...args: string[]) => command.parseAsync(['node', 'elanous', 'research', ...args]),
   };
 }
@@ -45,17 +47,18 @@ function cli(maxDetailOn: () => boolean) {
 test('registry fan-out, --engines, --limit and human / JSON rendering', async () => {
   _resetWebSearchProvidersForTests(false);
   const calls: Array<{ id: string; query: string; limit?: number }> = [];
-  addWebSearchProvider(provider('grok', calls));
+  addWebSearchProvider(provider('exa', calls));
   addWebSearchProvider(provider('firecrawl', calls));
   const c = cli(() => false);
   await c.run('hello', 'world', '--engines', 'FIRECRAWL', '--limit', '3');
+  expect(c.registeredSurfaces).toEqual(['research']);
   expect(calls).toEqual([{ id: 'firecrawl', query: 'hello world', limit: 3 }]);
   expect(c.output[0]).toContain('[firecrawl title](https://firecrawl.example/a)');
   await c.run('second', '--json');
-  expect(calls.slice(1).map(v => v.id)).toEqual(['grok', 'firecrawl']);
-  expect(JSON.parse(c.output[1]!)).toMatchObject({ query: 'second', metadata: { totalHits: 2, perEngine: { grok: { hits: 1 }, firecrawl: { hits: 1 } } } });
-  expect(c.events.filter(e => e.category === 'research.query').map(e => e.data.engine)).toEqual(['firecrawl', 'grok', 'firecrawl']);
-  expect(c.events.filter(e => e.category === 'research.result').map(e => e.data.engine).sort()).toEqual(['firecrawl', 'firecrawl', 'grok']);
+  expect(calls.slice(1).map(v => v.id)).toEqual(['exa']);
+  expect(JSON.parse(c.output[1]!)).toMatchObject({ query: 'second', metadata: { totalHits: 1, perEngine: { exa: { hits: 1 } } } });
+  expect(c.events.filter(e => e.category === 'research.query').map(e => e.data.engine)).toEqual(['firecrawl', 'exa', 'firecrawl']);
+  expect(c.events.filter(e => e.category === 'research.result').map(e => e.data.engine)).toEqual(['firecrawl', 'exa']);
   expect(c.events.some(e => e.category === 'research.source')).toBe(false);
 });
 
@@ -93,7 +96,7 @@ test('Firecrawl-only HBM4 mock stores five injected hits and 949ms in the resear
 test('MAX-only per-source events use the live detail switch; summaries remain outside MAX', async () => {
   _resetWebSearchProvidersForTests(false);
   const calls: Array<{ id: string; query: string; limit?: number }> = [];
-  addWebSearchProvider(provider('grok', calls));
+  addWebSearchProvider(provider('exa', calls));
   const dir = mkdtempSync(join(tmpdir(), 'research-cli-'));
   dirs.push(dir);
   const path = liveDetailPath(dir);
@@ -103,7 +106,7 @@ test('MAX-only per-source events use the live detail switch; summaries remain ou
   writeLiveDetail({ ttlMin: 1 }, { path });
   await c.run('during', '--json');
   expect(c.events.filter(e => e.category === 'research.source').map(e => e.data)).toEqual([
-    { url: 'https://grok.example/a', title: 'grok title', engine: 'grok', dedup: false },
+    { url: 'https://exa.example/a', title: 'exa title', engine: 'exa', dedup: false },
   ]);
   writeLiveDetail({ ttlMin: 0 }, { path });
   await c.run('after');
@@ -114,24 +117,26 @@ test('MAX-only per-source events use the live detail switch; summaries remain ou
 test('MAX source events flag duplicate URLs across providers', async () => {
   _resetWebSearchProvidersForTests(false);
   const calls: Array<{ id: string; query: string; limit?: number }> = [];
-  addWebSearchProvider(provider('grok', calls));
   addWebSearchProvider({ ...provider('firecrawl', calls), search: async q => {
     calls.push({ id: 'firecrawl', query: q.query, limit: q.limit });
-    return { providerName: 'firecrawl', durationMs: 1, hits: [{ url: 'https://grok.example/a', title: 'same URL', snippet: '' }] };
+    return { providerName: 'firecrawl', durationMs: 1, hits: [
+      { url: 'https://firecrawl.example/a', title: 'first hit', snippet: '' },
+      { url: 'https://firecrawl.example/a', title: 'duplicate hit', snippet: '' },
+    ] };
   } });
   const c = cli(() => true);
-  await c.run('topic');
+  await c.run('topic', '--engines', 'firecrawl');
   expect(c.events.filter(e => e.category === 'research.source').map(e => e.data.dedup)).toEqual([false, true]);
 });
 
 test('provider failures stay visible in result events without failing other engines', async () => {
   _resetWebSearchProvidersForTests(false);
   const calls: Array<{ id: string; query: string; limit?: number }> = [];
-  addWebSearchProvider(provider('grok', calls, 'rate limited'));
+  addWebSearchProvider(provider('exa', calls, 'rate limited'));
   addWebSearchProvider(provider('firecrawl', calls));
   const c = cli(() => false);
   await c.run('test', '--json');
-  expect(JSON.parse(c.output[0]!).metadata).toMatchObject({ totalHits: 1, perEngine: { grok: { hits: 0, error: 'rate limited' }, firecrawl: { hits: 1 } } });
+  expect(JSON.parse(c.output[0]!).metadata).toMatchObject({ totalHits: 1, perEngine: { exa: { hits: 0, error: 'rate limited' }, firecrawl: { hits: 1 } } });
   expect(c.events.filter(e => e.category === 'research.result').map(e => e.data.hits).sort()).toEqual([0, 1]);
 });
 
@@ -145,6 +150,7 @@ test('invalid engine and limit do not dispatch; unavailable registry reports zer
   await c.run('topic', '--limit', '0');
   expect(process.exitCode).toBe(2);
   process.exitCode = 0;
+  expect(c.registeredSurfaces).toEqual([]);
   await c.run('topic', '--json');
   expect(JSON.parse(c.output[0]!).metadata.totalHits).toBe(0);
   expect(c.events.filter(e => e.category === 'research.result')).toHaveLength(1);

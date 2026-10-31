@@ -51,7 +51,7 @@ describe('session-runtime autonomous tool dispatch', () => {
       const withoutResearchPair = resolveDynamicSessionNativeToolSpecs({ userText: 'Research HBM4 vendors and compare sources.' });
       expect(withoutResearchPair.map(spec => spec.name)).not.toContain('OmniSearch');
       addWebSearchProvider(searchProvider('firecrawl'));
-      addWebSearchProvider(searchProvider('grok-api'));
+      addWebSearchProvider(searchProvider('exa'));
       const withResearchPair = resolveDynamicSessionNativeToolSpecs({ userText: 'Research HBM4 vendors and compare sources.' });
       expect(withResearchPair.map(spec => spec.name)).toContain('OmniSearch');
     } finally {
@@ -62,7 +62,7 @@ describe('session-runtime autonomous tool dispatch', () => {
   test('OmniSearch surface dispatch uses the research-only provider route', async () => {
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
-    for (const id of ['grok', 'grok-api', 'firecrawl', 'tavily', 'ddg']) {
+    for (const id of ['grok', 'grok-api', 'firecrawl', 'tavily', 'ddg', 'exa']) {
       const source = searchProvider(id);
       addWebSearchProvider({ ...source, search: async query => {
         calls.push(id);
@@ -73,8 +73,8 @@ describe('session-runtime autonomous tool dispatch', () => {
       const result = await dispatchSessionRuntimeTool('OmniSearch', { query: 'HBM4' }, depsFor([])) as {
         metadata: { perEngine: Record<string, unknown> };
       };
-      expect(calls.sort()).toEqual(['firecrawl', 'grok']);
-      expect(Object.keys(result.metadata.perEngine).sort()).toEqual(['firecrawl', 'grok']);
+      expect(calls.sort()).toEqual(['exa']);
+      expect(Object.keys(result.metadata.perEngine)).toEqual(['exa']);
     } finally {
       _resetWebSearchProvidersForTests();
     }

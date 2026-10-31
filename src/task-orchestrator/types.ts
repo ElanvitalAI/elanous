@@ -531,6 +531,17 @@ export type TaskExecutionStatus =
   | 'timeout'
   | 'cancelled';
 
+/** Explicit browser capture provenance forwarded from the run-scoped harness event. */
+export interface TaskCaptureArtifact {
+  path: string;
+  mimeType: string;
+  runId: string;
+  linearIssueId: string;
+  externalShare: boolean;
+  sensitivity: string;
+  createdAt: number;
+}
+
 export interface TaskExecution {
   readonly id: string;             // 'exec:<hex>'
   readonly taskId: string;
@@ -548,6 +559,9 @@ export interface TaskExecution {
   /** The agent ran, but its reported outcome needs human review rather than automatic completion. */
   reviewRequired?: boolean;
   outputPath?: string;
+  /** Harness run identity and approved captures observed during this exact execution window. */
+  runId?: string;
+  captureArtifacts?: TaskCaptureArtifact[];
   error?: { code: string; message: string; stack?: string };
   tokenUsage?: { input: number; output: number };
   costUsd?: number;

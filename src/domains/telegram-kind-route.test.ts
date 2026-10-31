@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { UserConfig } from '../user-config.js';
+import { deleteSecret, setSecret } from '../nexus/config/secrets/index.js';
 import { debug } from '../debug/log.js';
 import { resolveReportTarget, sendReportPhoto, sendReportPhotoBuffer, sendTelegramReport } from '../telegram-report.js';
 import { flushDeferred, sendTelegramDirect, setInProcessOutbound } from './outbound-alert.js';
@@ -129,6 +130,50 @@ test('each kind resolves to its own bot; an absent exact role fails closed', () 
   expect(resolveReportTarget(cfg, 'brief')).toBeNull();
   delete cfg.telegram.reportChannel;
   expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+});
+
+test('op-report and ops-alert use the explicit main system channel; report stays on the trading bot', async () => {
+  const cfg = config();
+  cfg.telegram.botToken = trading;
+  cfg.telegram.channels = [
+    { name: 'main', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+  ];
+  expect(resolveReportTarget(cfg, 'op-report')).toEqual({ botToken: main, chatId: 303 });
+  expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: trading, chatId: 404 });
+
+  const calls: Array<{ url: string; chatId: number }> = [];
+  const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    calls.push({ url: String(url), chatId: body.chat_id });
+    return Response.json({ ok: true, result: { message_id: 1 } });
+  }) as typeof fetch;
+  expect(await sendTelegramReport(cfg, 'ops', { kind: 'op-report', markdown: false, fetchImpl })).toBe(true);
+  expect(await sendTelegramReport(cfg, 'alert', { kind: 'ops-alert', markdown: false, fetchImpl })).toBe(true);
+  expect(await sendTelegramReport(cfg, 'trade', { kind: 'report', markdown: false, fetchImpl })).toBe(true);
+  expect(calls).toEqual([
+    { url: `https://api.telegram.org/bot${main}/sendMessage`, chatId: 303 },
+    { url: `https://api.telegram.org/bot${main}/sendMessage`, chatId: 303 },
+    { url: `https://api.telegram.org/bot${trading}/sendMessage`, chatId: 404 },
+  ]);
+});
+
+test('an explicit main system channel wins over the unrelated tab tokenRef', () => {
+  const secretId = 'telegram-route-ops-tab-conflict';
+  setSecret(secretId, 'TAB:token-not-real');
+  try {
+    const cfg = config();
+    delete cfg.telegram.botToken;
+    cfg.tabs = { 'telegram:1': { tokenRef: `ref:secret:${secretId}` } };
+    cfg.telegram.channels = [
+      { name: 'main', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+      { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+    ];
+    expect(resolveReportTarget(cfg, 'op-report')).toEqual({ botToken: main, chatId: 303 });
+    expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: trading, chatId: 404 });
+  } finally {
+    deleteSecret(secretId);
+  }
 });
 
 test('safe kindRoles select alternate channels on the correct bot; unsafe overrides cannot cross the bot boundary', () => {
@@ -310,7 +355,7 @@ test('direct ops-alert ignores both trading envs even without a daemon; sends to
     expect(sendTelegramDirect('ops', 'ops-alert', {
       config: config(),
       legacyEnv: () => { throw new Error('conatus must not be read'); },
-      sendRaw: (token, chatId, text) => { calls.push([token, chatId, text]); return true; },
+      sendRaw: mock((token, chatId, text) => { calls.push([token, chatId, text]); return true; }),
     })).toBe(true);
     expect(calls).toEqual([[main, '101', 'ops']]);
     fallback('ops-alert', 'main-home', false);
@@ -384,7 +429,7 @@ test('direct trading report preserves the legacy conatus-env fallback', () => {
   expect(sendTelegramDirect('trade', 'report', {
     config: config(),
     legacyEnv: () => ({ TELEGRAM_BOT_TOKEN: trading, TELEGRAM_CHAT_ID: '202' }),
-    sendRaw: (token, chatId) => { calls.push(`${token}/${chatId}`); return true; },
+    sendRaw: mock((token, chatId) => { calls.push(`${token}/${chatId}`); return true; }),
   })).toBe(true);
   expect(calls).toEqual([`${trading}/202`]);
   fallback('report', 'conatus-env', false);

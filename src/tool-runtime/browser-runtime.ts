@@ -34,6 +34,7 @@ import { decideTypeAction } from '../harness/browser-act-type.js';
 import { requestConfirmation } from '../hitl/confirm.js';
 import type { TypeTarget } from '../harness/bot-type-request.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
+import { browserHandRuntime } from './browser-hand-runtime.js';
 
 // ─── Dependency injection ───────────────────────────────────────
 
@@ -496,4 +497,4 @@ export const browserReadRuntime: ToolRuntime<BrowserReadArgs, BrowserReadResult>
 
 // ─── Barrel ─────────────────────────────────────────────────────
 
-export const ALL_BROWSER_RUNTIMES = [browserNavigateRuntime, browserReadRuntime];
+export const ALL_BROWSER_RUNTIMES = [browserNavigateRuntime, browserReadRuntime, browserHandRuntime];

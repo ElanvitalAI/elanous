@@ -29,6 +29,7 @@
 
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { debug } from '../debug/log.js';
+import { PROVIDER_ENV_SPEC } from '../setup/llm-env-detect.js';
 
 /** provider → API-key env var. catalog 이 envKey 를 안 다는 provider 의 명시 보정.
  *  ⚠️ catalog 파생이 이미 값을 주는 provider 는 **여기 적지 않는다** — 이중 진실을 만들지 않기 위해. */
@@ -221,8 +222,13 @@ export function resolveProviderCredential(input: ResolveCredentialInput): Resolv
 
   // ② env — provider 별 표준 env var.
   const envKey = providerEnvKey(provider);
-  const fromEnv = envKey ? env[envKey]?.trim() : undefined;
-  if (fromEnv) return { apiKey: fromEnv, source: 'env', ...(envKey ? { envKey } : {}), ...withUrl };
+  const envSpec = PROVIDER_ENV_SPEC.find((spec) => spec.provider === provider);
+  const envCandidates = [...new Set([envKey, envSpec?.primaryKeyEnv, ...(envSpec?.aliasKeyEnvs ?? [])]
+    .filter((name): name is string => Boolean(name)))];
+  for (const candidate of envCandidates) {
+    const fromEnv = env[candidate]?.trim();
+    if (fromEnv) return { apiKey: fromEnv, source: 'env', envKey: candidate, ...withUrl };
+  }
 
   // ③ 상속 — **provider 가 확실히 그대로일 때만.** 바뀌었으면 base 키는 다른 provider 것이라 틀렸다.
   //   ⚠️ 리뷰 must-fix(#5488 2R): 종전 판정은 `!switched` 였는데 `baseProvider` 가 없으면 switched=false

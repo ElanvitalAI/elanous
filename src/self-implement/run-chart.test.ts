@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendRunLedgerEntry, loadRunLedger } from './run-ledger.js';
-import { projectRunChart, readRunChart, recordRunChartDecision, runChartMetrics, type RunChartDevice } from './run-chart.js';
+import { projectRunChart, readRunChart, recordRunChartDecision, recordRunChartWaitHandoff, runChartMetrics, type RunChartDevice } from './run-chart.js';
+import { runDoctorHandoff } from './doctor-visit.js';
+import { decideNextRun, type SupervisorJobResult } from '../self-dev/run-supervisor.js';
 import { debug } from '../debug/log.js';
 
 const roots: string[] = [];
@@ -41,7 +43,51 @@ test('same run chart is pulled and appended by all four devices in judgment orde
   expect(chart.length).toBeLessThanOrEqual(20);
   expect(chart[0]?.verdict).toBe('summary');
   expect(readRunChart(runId, 'run-doctor', dir)).toHaveLength(5);
-  expect(runChartMetrics(loadRunLedger(runId, dir) ?? []).emptyHandoffs).toBeGreaterThan(0);
+  expect(runChartMetrics(loadRunLedger(runId, dir) ?? []).emptyHandoffs).toBe(0);
+  expect(chart.filter((cell) => cell.verdict !== 'summary').every((cell) => cell.handoff === 'none')).toBe(true);
+});
+
+test('mock supervisor→doctor→macrophage→outer-supervisor handoff is read before each next decision and exhausted retry budget reaches a person', async () => {
+  const { runId, dir } = fixture();
+  const waitStopKey = `${runId}:wait-streak:1`;
+  expect(recordRunChartWaitHandoff({ runId, stopKey: waitStopKey, waitCount: 3, dir, readStopKeys: [] })).toBe('recorded');
+
+  const doctor = await runDoctorHandoff({ runId, stopKey: waitStopKey, dir,
+    dispatch: (action) => ({ outcome: action === 'reauthor-from-materialized' ? 'heal-graph-requested' : 'unexpected' }) });
+  expect(doctor).toMatchObject({ status: 'acted', action: 'reauthor-from-materialized' });
+
+  const macrophageBefore = readRunChart(runId, 'macrophage', dir);
+  expect(macrophageBefore.map((cell) => cell.stopKey)).toContain(waitStopKey);
+  const macrophageStopKey = `${runId}:macrophage:1`;
+  expect(recordRunChartDecision({ runId, dir, device: 'macrophage', stopKey: macrophageStopKey,
+    observed: 'doctor reauthor handoff', verdict: 'needs-owner', action: 'route-to-supervisor', handoff: 'outer-supervisor',
+    why: 'outer supervisor must consume the reauthor result', readStopKeys: macrophageBefore.map((cell) => cell.stopKey) })).toBe('recorded');
+
+  const failed = { taskId: 'chart-reauthor-candidate', feature: 'chart-reauthor-candidate', status: 'failed', stage: 'error',
+    error: { code: 'BOOM', message: 'needs human without the reauthor handoff' } } as unknown as SupervisorJobResult;
+  const outerBefore = readRunChart(runId, 'outer-supervisor', dir);
+  expect(outerBefore.map((cell) => cell.stopKey)).toContain(macrophageStopKey);
+  const reauthorDecision = decideNextRun({ results: [failed], runChart: outerBefore });
+  expect(reauthorDecision).toMatchObject({ action: 'relaunch', rerunnable: ['chart-reauthor-candidate'], needsHuman: [] });
+  expect(recordRunChartDecision({ runId, dir, device: 'outer-supervisor', stopKey: `${runId}:outer:reauthor`,
+    observed: 'consumed doctor reauthor', verdict: reauthorDecision.action, action: reauthorDecision.action,
+    handoff: 'macrophage', why: reauthorDecision.why, readStopKeys: outerBefore.map((cell) => cell.stopKey) })).toBe('recorded');
+
+  const budgetCandidate = { taskId: 'budget-candidate', feature: 'budget-candidate', status: 'failed', stage: 'error',
+    error: { code: 'BOOM', message: 'TypeError: undefined is not a function' },
+    decomposeProposal: { pieces: [{ id: 'piece-a', feature: 'bounded repair a', dependsOn: [] },
+      { id: 'piece-b', feature: 'bounded repair b', dependsOn: [] }] } } as unknown as SupervisorJobResult;
+  const exhausted = decideNextRun({ results: [budgetCandidate], decompositionExecution: true, limits: { maxRounds: 0 } });
+  expect(exhausted).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+  const beforeHuman = readRunChart(runId, 'outer-supervisor', dir);
+  expect(recordRunChartDecision({ runId, dir, device: 'outer-supervisor', stopKey: `${runId}:outer:human`,
+    observed: 'relaunch budget exhausted', verdict: exhausted.action, action: exhausted.stopReason ?? exhausted.action,
+    handoff: 'human', why: exhausted.why, readStopKeys: beforeHuman.map((cell) => cell.stopKey) })).toBe('recorded');
+
+  const chart = projectRunChart(runId, dir);
+  expect(chart.map((cell) => cell.device)).toEqual(['run-supervisor', 'run-doctor', 'macrophage', 'outer-supervisor', 'outer-supervisor']);
+  expect(chart.map((cell) => cell.handoff)).toEqual(['run-doctor', 'reauthor', 'outer-supervisor', 'macrophage', 'human']);
+  expect(chart.slice(1).every((cell) => cell.readStopKeys.length > 0)).toBe(true);
 });
 
 test('run-chart debug metrics count unread handoffs and conflicting verdicts and emit all three degeneration fields', () => {
@@ -61,6 +107,6 @@ test('run-chart debug metrics count unread handoffs and conflicting verdicts and
     readRunChart(runId, 'outer-supervisor', dir);
   } finally { log.mockRestore(); }
   const metrics = runChartMetrics(loadRunLedger(runId, dir) ?? []);
-  expect(metrics).toEqual({ emptyHandoffs: 3, unreadHandoffs: 0, conflictingVerdicts: 1 });
+  expect(metrics).toEqual({ emptyHandoffs: 2, unreadHandoffs: 0, conflictingVerdicts: 1 });
   expect(events).toContainEqual(['run-chart', 'metrics', expect.objectContaining(metrics)]);
 });

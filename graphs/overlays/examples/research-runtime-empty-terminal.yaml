@@ -1,0 +1,28 @@
+overlay_id: research-runtime-empty-terminal
+target: research-loop
+stage: runtime
+applies_when: attempts >= 1
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      node_id: source-audit
+      kind: judge
+      recipe: observe-only
+      max_visits: 1
+      contract:
+        inputs: [worktree]
+        tools: read-only
+        outputs: [findings]
+  - op: add
+    path: /edges/-
+    value:
+      from: judge
+      on: outcome
+      map:
+        source-missing: source-audit
+  - op: add
+    path: /edges/-
+    value:
+      from: source-audit
+      to: merge

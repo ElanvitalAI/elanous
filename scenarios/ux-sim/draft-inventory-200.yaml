@@ -1,0 +1,44 @@
+version: 0
+id: ux-draft-inventory-200
+isolation: test
+seed: 2431031
+triggers:
+  - id: draft-inventory-200
+    type: ux.draft-inventory.evaluate
+    count: 200
+expect:
+  screen:
+    mode: widget
+    snapshot:
+      contains:
+        - "Draft inventory simulation"
+        - "total=200"
+        - "mismatches=0"
+        - "protectedOrRunningClosed=0"
+  logs:
+    - category: ux.sim.draft-inventory
+      event: assessed
+      level: debug
+      count: 1
+      data:
+        total: 200
+        byScenario:
+          merged-twin: 25
+          duplicate-open: 25
+          harvest-reference: 25
+          all-files-landed: 25
+          protected-label: 25
+          running: 25
+          stale: 25
+          harvestable: 25
+        byAction:
+          close: 125
+          keep: 75
+        triageByAction:
+          close-a: 0
+          close-b: 75
+          close-c: 25
+          harvest: 25
+          human: 75
+        mismatchCount: 0
+        protectedOrRunningClosed: 0

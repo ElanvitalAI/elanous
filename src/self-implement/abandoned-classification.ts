@@ -68,6 +68,7 @@ type AbandonedClassificationBasis =
   | 'merge-approval-received'
   // 기한 사망은 호스트가 읽은 Job 종료 이유다. 사후 쿼터 상관보다 앞선다.
   | 'substrate-deadline-outranks-postmortem-quota'
+  | 'tdd-evidence-missing'
   // 🩸 2026-09-20: 이 셋은 분류 «이름을 되풀이»했다 — 근거 칸이 동어반복이면 중재를 못 한다.
   //   📏 실물(block 아티팩트)에서 네 칸이 2:2 로 갈렸다:
   //        reason·stage = 게이트   ↔   중단원인·classification = 쿼타
@@ -115,6 +116,8 @@ interface AbandonedClassificationInput {
   /** 호스트가 k8s Job 종료 reason `DeadlineExceeded` 를 읽었을 때만 참이다.
    *  ⛔ 사후 쿼터 상관(`quotaExhausted`)보다 앞선다 — 기한 사망을 할당량 소진으로 읽지 않는다. */
   readonly substrateDeadlineExceeded?: boolean;
+  /** Structured child termination cause survives classification instead of being flattened into report-deficit. */
+  readonly terminationReason?: 'tdd-evidence-missing';
   /** ⭐ provider 쿼터가 «찬 것으로 관측»되었을 때만 참이다.
    *  ⛔ 이 값은 «추론하지 않는다» — 호출자가 provider 응답(`rateLimitReachedType`)을 읽어 넘긴다.
    *  ⚠️ 그 읽기는 런이 죽은 «뒤»에 일어나므로 「죽은 원인」이 아니라 「죽을 무렵 쿼터가 찼다」는 상관이다.
@@ -151,6 +154,7 @@ export interface AbandonedClassificationResult {
   readonly classification: AbandonedClassification;
   /** The condition that selected `classification`, so consumers need not reconstruct the branch. */
   readonly classificationBasis: AbandonedClassificationBasis;
+  readonly terminationReason?: 'tdd-evidence-missing';
   readonly worktreeClean: boolean | undefined;
   readonly completionDisposition?: SelfImplementCompletionDisposition;
   readonly supervisorVerdict?: ReworkBudgetVerdict;
@@ -221,6 +225,8 @@ export function classifyAbandonedRun(input: AbandonedClassificationInput): Aband
         ? 'credential-failure'
         : input.providerError === true
         ? 'provider-error'
+        : input.terminationReason === 'tdd-evidence-missing'
+        ? 'implementation-deficit'
         // A candidate is selected only from two structured observations. This deliberately does not prove a defect.
         : input.supervisorVerdict === 'UNCONVERGEABLE' && input.goalCauseObserved === true
         ? 'goal-unconvergeable-candidate'
@@ -247,6 +253,11 @@ export function classifyAbandonedRun(input: AbandonedClassificationInput): Aband
       case 'provider-error': return input.providerErrorCategory === 'request'
         ? 'provider-request-rejection-outranks-account-availability'
         : 'environment-provider-error-outranks-run-stage-evidence';
+      case 'implementation-deficit': return input.terminationReason === 'tdd-evidence-missing'
+        ? 'tdd-evidence-missing'
+        : mustFixReported
+          ? 'must-fix-reported'
+          : 'no-must-fix-without-clean-worktree-or-completed-without-changes';
       case 'already-satisfied': return 'cited-evidence-exists-without-changes';
       case 'report-deficit': return input.reviewResultObserved === true
         ? input.citedEvidenceExists === false
@@ -259,9 +270,6 @@ export function classifyAbandonedRun(input: AbandonedClassificationInput): Aband
         : input.reviewResultObserved === false
           ? 'terminal-state-not-reviewed'
           : 'review-result-observation-unmeasured';
-      case 'implementation-deficit': return mustFixReported
-        ? 'must-fix-reported'
-        : 'no-must-fix-without-clean-worktree-or-completed-without-changes';
     }
   })();
 
@@ -269,6 +277,7 @@ export function classifyAbandonedRun(input: AbandonedClassificationInput): Aband
   return {
     classification,
     classificationBasis,
+    ...(input.terminationReason ? { terminationReason: input.terminationReason } : {}),
     worktreeClean,
     ...(input.completionDisposition ? { completionDisposition: input.completionDisposition } : {}),
     ...(input.supervisorVerdict ? { supervisorVerdict: input.supervisorVerdict } : {}),

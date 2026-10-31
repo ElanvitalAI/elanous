@@ -5,7 +5,7 @@ import { Database } from 'bun:sqlite';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { listSchedules } from '../../src/release-loop/release-schedule.js';
-import { devVersion, listChecklist } from '../../src/release-loop/checklist.js';
+import { checklistDevVersion, devVersion, listChecklist } from '../../src/release-loop/checklist.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
 import { selectProact1Lite, type ProactSignals } from '../../src/decisions/proact1-lite.js';
 import { trafficTick, seatOfTree } from '../../src/loops/orchestrator/traffic.js';
@@ -21,6 +21,7 @@ import { BriefItemsLedger } from '../../src/briefing/brief-items.js';
 import { debug } from '../../src/debug/log.js';
 import { retroBriefingLines } from '../../src/retro/daily.js';
 import { dispatchCooAdmin } from '../../src/domains/coo-admin-tool.js';
+import { runLinearProgressSync, type ProgressSyncResult } from './linear-progress-sync.js';
 
 export type Section<T> = { status: 'ok'; value: T } | { status: 'unreadable'; reason: string };
 export type Landing = { title: string; seat: string; mergedAt: string; prNumber?: number };
@@ -542,6 +543,7 @@ export type DailyDeps = { now?: () => Date; root?: string; vaultRoot?: string | 
   target?: { chatId: number; botToken: string };
   send?: (request: DailySendRequest) => DailySendConfirmation | null; receipt?: (key: string) => DeliveryReceipt;
   recordDelivery?: (text: string, kind: 'ops-report') => void;
+  linearProgressSync?: typeof runLinearProgressSync;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   proactSignals?: () => Promise<ProactSignals>;
   proactPreviouslySuggested?: ReadonlySet<string>;
@@ -593,6 +595,8 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
     let sendError: string | null = null;
     let recordError: string | null = null;
     let newsState: string | null = null;
+    let linearProgress: ProgressSyncResult | undefined;
+    let linearProgressError: string | null = null;
     let enabled = deps.sendEnabled === true;
     if (deps.sendEnabled === undefined && options.stage === 'deliver' && !options.dryRun) {
       try { enabled = record(record(record(getUserConfig().raw.loops).rhythm).daily).send === true; }
@@ -613,11 +617,39 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
       deliveryState = delivery.deliveryState;
       if (resolved) newsState = sendNewsAfterReview(delivery, file, markdown, resolved, deps);
     }
+    if (options.stage === 'deliver' && !options.dryRun) {
+      try {
+        const dailyConfig = record(record(record(getUserConfig().raw.loops).rhythm).daily);
+        if (dailyConfig.linearProgressSync === true) {
+          const allowIssueIdentifiers = Array.isArray(dailyConfig.linearProgressIssueAllowlist)
+            ? dailyConfig.linearProgressIssueAllowlist.filter((value): value is string => typeof value === 'string') : [];
+          if (!allowIssueIdentifiers.length) {
+            linearProgressError = 'issue allowlist missing; no Linear comments sent';
+            if (deps.log) deps.log('loop.rhythm-daily', 'linear-progress-config-blocked', { reason: 'issue-allowlist-missing' });
+            else loopEvent('rhythm-daily', 'linear-progress-config-blocked', { reason: 'issue-allowlist-missing' });
+          } else {
+            linearProgress = await (deps.linearProgressSync ?? runLinearProgressSync)({ version: checklistDevVersion(devVersion()), now, root: deps.root,
+              apply: true, allowIssueIdentifiers,
+              log: (event, data) => deps.log ? deps.log('loop.rhythm-daily.linear-progress', event, data)
+                : loopEvent('rhythm-daily.linear-progress', event, data) });
+            if (linearProgress.failures.length) {
+              linearProgressError = `${linearProgress.failures.length} Linear summary failure(s); see loop.rhythm-daily.linear-progress logs`;
+            }
+          }
+        }
+      } catch (error) {
+        linearProgressError = shortReason(reasonOf(error));
+        if (deps.log) deps.log('loop.rhythm-daily', 'linear-progress-failed', { reason: linearProgressError });
+        else loopEvent('rhythm-daily', 'linear-progress-failed', { reason: linearProgressError });
+      }
+    }
     tick.sent = sent;
-    const status = vault.vaultFatal || Object.values(sections).includes('unreadable') ? 'degraded'
+    if (linearProgress) tick.linearProgress = linearProgress;
+    if (linearProgressError) tick.linearProgressError = linearProgressError;
+    const status = vault.vaultFatal || Object.values(sections).includes('unreadable') || !!linearProgressError ? 'degraded'
       : deliveryState === 'pending' ? 'pending'
       : ['sent', 'already-sent', 'receipt-sent'].includes(deliveryState) ? 'ok' : 'degraded';
-    const deliveryLine = `${options.stage} ${status} · target=${target} · ${deliveryState} · sent=${sent} · chars=${chars} · receipt=${receiptKey}${recordError ? ` · ${recordError}` : ''}${newsState ? ` · news=${newsState}` : ''}`;
+    const deliveryLine = `${options.stage} ${status} · target=${target} · ${deliveryState} · sent=${sent} · chars=${chars} · receipt=${receiptKey}${recordError ? ` · ${recordError}` : ''}${newsState ? ` · news=${newsState}` : ''}${linearProgressError ? ` · linear=${linearProgressError}` : ''}`;
     if (options.stage === 'deliver') {
       Object.assign(tick, { status, deliveryState, target, chars, receiptKey, deliveryLine, recordError });
       if (!options.dryRun) {
@@ -625,7 +657,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
         else loopEvent('rhythm-daily', 'tick', tick);
       }
     }
-    return { file, markdown, header, risks, sections, sent, ...vault, sendError, recordError, status, deliveryState, deliveryLine,
+    return { file, markdown, header, risks, sections, sent, ...vault, sendError, recordError, status, deliveryState, deliveryLine, linearProgress, linearProgressError,
       draftCloseSummary: undefined };
   }
   const safe = async <T>(fetch: () => Promise<T>): Promise<Section<T>> => {

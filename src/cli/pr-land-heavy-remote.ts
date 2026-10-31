@@ -8,6 +8,7 @@ import { debug, redactSecretText } from '../debug/log.js';
 import { gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type RemoteRunOutcome } from '../self-implement/gate-remote.js';
 import { decideWarmReuse, type WarmReuseEvidenceByConsumer, type WarmReuseSwitchConfig } from '../task-orchestrator/surfaces/pod-warm-switch.js';
 import { buildLandWarmEvidence, type LandShadowSampleWindow } from './pr-land-pod-shadow-job.js';
+import { readWarmReuseEvidence, warmReuseEvidencePath, type WarmReuseEvidenceRow } from '../task-orchestrator/surfaces/warm-reuse-evidence.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 // This is the stable fallback order when settings.host is unavailable; an explicitly configured allowlisted host
@@ -18,7 +19,7 @@ export type PrLandHeavyHost = typeof PR_LAND_HEAVY_HOSTS[number];
 const allowedHost = (host: string): host is PrLandHeavyHost => PR_LAND_HEAVY_HOSTS.some((candidate) => candidate === host);
 
 export interface HeavyRemoteEvidence {
-  schema: 2;
+  schema: 3;
   pr: number;
   head: string;
   main: string;
@@ -72,6 +73,42 @@ export interface HeavyRemoteDeps {
   warmReuseConfig?: () => WarmReuseSwitchConfig | undefined;
   /** WARM-REUSE-LAND-CONSUMER-WIRE — land shadow Job 결과 창 seam(기본 없음 = 증거 없음 = off). */
   landShadowSamples?: () => LandShadowSampleWindow | undefined;
+  /** Durable shadow journal reader seam. */
+  readWarmEvidence?: (identity: { consumer: 'land' | 'gate-recheck'; pr: number; head: string; main: string }) => WarmReuseEvidenceRow[] | undefined;
+  warmEvidencePath?: () => string;
+}
+
+function journalLandShadowSamples(input: HeavyRemoteInput, deps: HeavyRemoteDeps): LandShadowSampleWindow | undefined {
+  const read = deps.readWarmEvidence ?? ((identity) => readWarmReuseEvidence(
+    (deps.warmEvidencePath ?? warmReuseEvidencePath)(), identity));
+  const rows = read({ consumer: 'land', pr: input.pr, head: input.head, main: input.main });
+  if (!rows?.length) return undefined;
+  const samples = rows.map((row) => ({ head: row.head, main: row.main,
+    lock: row.expectedLockHash ?? '', leaseValid: row.leaseValid === true && !!row.leaseId && !!row.workerId
+      && row.generation !== undefined && row.expectedLockHash === row.workerLockHash,
+    canaryPassed: row.canaryPassed === true, agree: row.agree === true }));
+  const latest = rows[rows.length - 1]!;
+  const gateRows = read({ consumer: 'gate-recheck', pr: input.pr, head: input.head, main: input.main });
+  let gateRecheck: LandShadowSampleWindow['gateRecheck'];
+  if (gateRows?.length) {
+    let consecutiveMatchSamples = 0;
+    for (let i = gateRows.length - 1; i >= 0; i--) {
+      const row = gateRows[i]!;
+      if (row.workerId !== latest.workerId || row.expectedLockHash !== latest.expectedLockHash
+        || row.workerLockHash !== row.expectedLockHash || row.leaseValid !== true
+        || !row.leaseId || row.generation === undefined
+        || row.canaryPassed !== true || row.agree !== true) break;
+      consecutiveMatchSamples++;
+    }
+    const latestGate = gateRows[gateRows.length - 1]!;
+    gateRecheck = { consecutiveMatchSamples, recentMismatchCount: gateRows.filter((row) => row.agree === false).length,
+      leaseValid: latestGate.leaseValid === true && !!latestGate.leaseId && !!latestGate.workerId && latestGate.generation !== undefined,
+      canaryPassed: latestGate.canaryPassed === true,
+      expected: { head: input.head, main: input.main, lock: latestGate.expectedLockHash },
+      worker: { head: input.head, main: input.main, lock: latestGate.workerLockHash } };
+  }
+  const lock = latest.expectedLockHash ?? '';
+  return { samples, lock, ...(gateRecheck ? { gateRecheck } : {}) };
 }
 
 function evidencePath(input: HeavyRemoteInput): string {
@@ -83,7 +120,7 @@ function validRootPlan(value: unknown): value is RootPlanSummary | null {
   if (!value || typeof value !== 'object') return false;
   const plan = value as Partial<RootPlanSummary>;
   return (plan.mode === 'affected' || plan.mode === 'full')
-    && (plan.roots === null || (Number.isSafeInteger(plan.roots) && plan.roots >= 0))
+    && (plan.roots === null || (typeof plan.roots === 'number' && Number.isSafeInteger(plan.roots) && plan.roots >= 0))
     && typeof plan.promoted === 'boolean'
     && (plan.reason === null || typeof plan.reason === 'string');
 }
@@ -92,7 +129,7 @@ function matchingEvidence(path: string, input: HeavyRemoteInput): HeavyRemoteEvi
   if (!existsSync(path)) return null;
   try {
     const data: HeavyRemoteEvidence = JSON.parse(readFileSync(path, 'utf8'));
-    return data.schema === 2 && data.pr === input.pr && data.head === input.head
+    return data.schema === 3 && data.pr === input.pr && data.head === input.head
       && data.main === input.main && allowedHost(data.host) && Number.isFinite(data.elapsedMs)
       && typeof data.interferenceMeasured === 'boolean' && validRootPlan(data.rootPlan) ? data : null;
   } catch { return null; }
@@ -232,7 +269,8 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   }
   try {
     warmStage = 'evidence';
-    warmEvidence = buildLandWarmEvidence(deps.landShadowSamples?.(), { head: input.head, main: input.main });
+    const samples = deps.landShadowSamples ? deps.landShadowSamples() : journalLandShadowSamples(input, deps);
+    warmEvidence = buildLandWarmEvidence(samples, { head: input.head, main: input.main });
   } catch (error) {
     debug.log('pod.warm', 'land-shadow-unavailable', {
       pr: input.pr, stage: warmStage, reason: 'warm-evidence-read-failed',
@@ -266,7 +304,7 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
           // then run typecheck and self gate (changed tests and PWA reach/build) at that exact pair.
           // The detached integration commit stays on the selected host and never changes the PR branch.
           argv: (sha) => ['sh', '-c',
-          'git -c user.name=elanous-gate -c user.email=gate@localhost -c commit.gpgsign=false merge --no-ff --no-edit "$1" && TSC_BASE_REF="$1" bun run scripts/ci-typecheck-changed.ts --local && bun bin/elanous.mjs self gate --changed --base "$1" --local --shards 4 && bun scripts/pr-land-extra-remote-gates.ts "$1"',
+          'git -c user.name=elanous-gate -c user.email=gate@localhost -c commit.gpgsign=false merge --no-ff --no-edit "$1" && bash scripts/ci-typecheck-main-delta.sh "$1" && bun bin/elanous.mjs self gate --changed --base "$1" --local --shards 4 && bun scripts/pr-land-extra-remote-gates.ts "$1"',
           'sh', sha(input.main)],
         }, deps.runner ?? realGateRemoteRunner);
       } catch (error) {
@@ -309,7 +347,7 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
     return { ok: false, host: selectedHost, attemptedHost: selectedHost, source: 'unmeasured', reason, elapsedMs, evidencePath: path, ...(failureLogPath ? { failureLogPath } : {}) };
   }
   const evidence: HeavyRemoteEvidence = {
-    schema: 2, pr: input.pr, head: input.head, main: input.main, host: selectedHost,
+    schema: 3, pr: input.pr, head: input.head, main: input.main, host: selectedHost,
     passedAt: new Date().toISOString(), elapsedMs: outcome.ms, rootPlan: rootPlanFromOutput(outcome.stdout),
     interferenceMeasured: extraGates.interferenceMeasured,
   };

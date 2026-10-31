@@ -14,6 +14,15 @@ export interface OutboundMsg {
   kind: string;
   /** Optional routing role; absent preserves per-kind fan-out. */
   role?: string;
+  /** Optional transport metadata. A router must not send these fields to a connector that does not declare support. */
+  threadId?: string;
+  topicId?: string;
+  persona?: { name: string; avatarUrl?: string };
+  attachments?: readonly { url: string; name?: string }[];
+  buttons?: readonly { label: string; value: string }[];
+  choices?: readonly { label: string; value: string }[];
+  /** Requested channel-side authorization; delivery fails closed when unsupported or denied. */
+  permissionAction?: string;
 }
 
 export interface FormattedMessage {

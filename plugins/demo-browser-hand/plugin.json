@@ -1,0 +1,13 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "demo-browser-hand",
+  "version": "0.1.0",
+  "description": "Browser hand scene package: navigation, capture, bypass guidance, and human interaction handoff.",
+  "extensions": {
+    "ai.elanous": {
+      "connectors": [
+        { "id": "linear", "required": false, "fields": [{ "name": "apiKey", "secret": true, "env": "LINEAR_API_KEY" }] }
+      ]
+    }
+  }
+}

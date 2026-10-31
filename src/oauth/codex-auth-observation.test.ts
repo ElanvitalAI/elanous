@@ -8,6 +8,7 @@ import {
   CODEX_AUTH_EVENTS,
   _setCodexAuthObserverForTesting,
 } from './codex.js';
+import { CODEX_OWNER_MIRROR_REQUIRED } from './codex-owner-mirror.js';
 import { authStorePath } from './store.js';
 
 // ⛔⭐ 관측을 «넣었는데 무는 테스트가 없었다»를 고치는 파일 (리뷰 3·4라운드 must-fix).
@@ -102,15 +103,13 @@ describe('codex 갱신 관측 — 일곱 갈래를 «실제로 태워» 문다',
     expectNoSecrets();
   });
 
-  test('remote access-only host refuses refresh before a network call', async () => {
-    setStore(state(1_000));
+  test('remote access-only host without the owner mirror fails before a network call', async () => {
     process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
     let calls = 0;
     const fetchImpl = (async () => { calls++; throw new Error('network must not be called'); }) as unknown as typeof fetch;
-    expect(await loadFreshCodexAuthState({ fetchImpl })).toBeNull();
+    await expect(loadFreshCodexAuthState({ fetchImpl })).rejects.toThrow(CODEX_OWNER_MIRROR_REQUIRED);
     expect(calls).toBe(0);
     expect(events()).not.toContain('refresh-start');
-    expect(events()).toContain('no-credential');
   });
 
   test('③④ refresh-start → refreshed (성공) ⊕ 회전 여부를 값으로', async () => {

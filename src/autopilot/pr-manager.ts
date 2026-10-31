@@ -548,10 +548,37 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
       return fail('PR changed before superseding draft');
     const newRef = `refs/heads/${input.branch}`;
     if (!run('git', ['-C', cwd, 'check-ref-format', '--branch', input.branch]).ok) return fail('new run branch name invalid');
-    const newRemote = run('git', ['-C', cwd, 'ls-remote', '--heads', 'origin', newRef]);
-    if (!newRemote.ok || newRemote.out.trim()) return fail('new run branch already exists or remote unreadable');
     const localHead = run('git', ['-C', cwd, 'rev-parse', 'HEAD']);
-    if (!localHead.ok || !/^[0-9a-f]{40}$/i.test(localHead.out.trim())) return fail('new run head unreadable');
+    const localHeadSha = localHead.out.trim();
+    if (!localHead.ok || !/^[0-9a-f]{40}$/i.test(localHeadSha)) return fail('new run head unreadable');
+    const newRemote = run('git', ['-C', cwd, 'ls-remote', '--heads', 'origin', newRef]);
+    if (!newRemote.ok) return fail('new run branch already exists or remote unreadable');
+    let retryBranchAlreadyExists = false;
+    if (newRemote.out.trim()) {
+      if (newRemote.out.trim() !== `${localHeadSha}\t${newRef}`) return fail('new run branch already exists or remote unreadable');
+      const existingDrafts = run('gh', ['pr', 'list', '--head', input.branch, '--state', 'open', '--json', 'url'], { cwd });
+      let existingRows: Array<{ url?: unknown }>;
+      try { existingRows = JSON.parse(existingDrafts.out) as Array<{ url?: unknown }>; }
+      catch { return fail('existing retry draft listing malformed'); }
+      if (!existingDrafts.ok) return fail('existing retry draft lookup failed');
+      if (!existingRows.length) retryBranchAlreadyExists = true;
+      else {
+        if (existingRows.length !== 1 || typeof existingRows[0]?.url !== 'string') return fail('existing retry draft lookup ambiguous');
+        const existingUrl = existingRows[0].url;
+        const existingView = run('gh', ['pr', 'view', existingUrl, '--json', 'state,isDraft,headRefOid,headRefName,body,url'], { cwd });
+        let existingFields: Record<string, unknown>;
+        try { existingFields = JSON.parse(existingView.out) as Record<string, unknown>; }
+        catch { return fail('existing retry draft identity malformed'); }
+        if (!existingView.ok || existingFields.state !== 'OPEN' || existingFields.isDraft !== true
+          || existingFields.headRefOid !== localHeadSha || existingFields.headRefName !== input.branch
+          || existingFields.url !== existingUrl || typeof existingFields.body !== 'string'
+          || cellIdFromBody(existingFields.body) !== cellIdFromBody(input.body)
+          || cardIdFromBody(existingFields.body) !== cardIdFromBody(input.body))
+          return fail('existing retry draft identity mismatch');
+        return { ok: true, url: existingUrl, reused: true };
+      }
+    }
+    if (!retryBranchAlreadyExists) {
     // Upload the commit through a unique scratch ref. GitHub's create-ref API then
     // atomically refuses a concurrent writer of the intended branch name.
     const runKey = input.runId ? runSuffixKey(input.runId) : null;
@@ -590,6 +617,7 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
       : { ok: false, out: '', err: 'repository identity unavailable' };
     reapScratchRef(createdRef.ok ? 'branch-created' : 'create-refused');
     if (!createdRef.ok) return fail(`new run branch create refused: ${(createdRef.err || createdRef.out).slice(0, 220)}`);
+    }
     const stateLabels = new Set(labelsForAxis('state').map(label => label.name));
     const labels = [...new Set([...(input.labels ?? []).filter(label => !stateLabels.has(label as typeof PR_LABEL_NAMES.running)),
       PR_LABEL_NAMES.running, ...(input.seat ? [`seat:${input.seat}`] : [])])];

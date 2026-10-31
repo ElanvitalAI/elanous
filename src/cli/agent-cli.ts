@@ -540,7 +540,7 @@ export async function runChatTurnCli(opts: {
     tools = built;
     dispatchTool = (name, args) => built.dispatch(name, args, { signal: toolAbort.signal });
     enabledToolNames = built.specs.map(s => s.name);
-    process.once('SIGINT', abortToolsOnSigint);
+    process.on('SIGINT', abortToolsOnSigint);
   }
   // Wire the universal preamble (project anchor + project tree +
   // family addendum + session-specific guidance) into every CLI system
@@ -600,6 +600,7 @@ export async function runChatTurnCli(opts: {
       userConfig: opts.cfg,
       sessionId: session.id,
       userText: opts.userText,
+      ...(opts.surface === 'ask' ? { utteranceSurface: 'ask' as const } : {}),
       systemPrompt: agentSystemPrompt,
       onDelta: (d) => {
         replyChunks.push(d);

@@ -283,6 +283,19 @@ describe('resolveAgentLayered', () => {
     expect(def?.source).toBe('builtin');
   });
 
+  test('ships general-purpose with its standard CLI tool allowlist', () => {
+    const def = resolveAgentLayered('general-purpose', {
+      builtinDir: join(import.meta.dir, '../src/agents'),
+      skipUser: true,
+      skipProject: true,
+      skipPlugin: true,
+      projectRoot: tmpRoot,
+    });
+
+    expect(def?.name).toBe('general-purpose');
+    expect(def?.tools).toEqual(['Bash', 'Read', 'Edit', 'Grep', 'WebFetch']);
+  });
+
   test('project layer overrides builtin', async () => {
     const builtin = join(tmpRoot, 'builtin');
     const projectAgents = join(tmpRoot, 'project', '.elanous', 'agents');

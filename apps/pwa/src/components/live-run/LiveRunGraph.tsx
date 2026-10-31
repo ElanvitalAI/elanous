@@ -15,7 +15,7 @@ import '@/components/workflows/node-status.css';
 import '@/lib/graph-wiring.css';
 import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
 import type { HarnessRunTraversal, RunGraphDetail } from '@/nexus/client';
-import { RUN_NODE_WIDTH, runGraphToFlow, type RunGraphNodeData } from '@/lib/run-graph-flow';
+import { applyRunGraphEvents, RUN_NODE_WIDTH, runGraphToFlow, type RunGraphNodeData } from '@/lib/run-graph-flow';
 import { EDGE_FAMILY_COLOR, hoverFocus, WIRING_STYLE, wiringEdgeStyle } from '@/lib/graph-edge-route';
 import type { TidyEdgeData } from '@/components/workflows/TidyEdge';
 import { durationLabel, kstClock, replayDelayMs, sceneAt, type LiveNodeState, type SceneEdge, type TraversalStep } from '@/lib/live-run-scene';
@@ -55,13 +55,15 @@ interface LiveNodeData extends RunGraphNodeData {
   unrecorded: boolean;
   visits: number;
   focused: boolean;
+  adaptiveLabel?: string;
 }
 
 function LiveNode({ data }: NodeProps) {
   const node = data as LiveNodeData;
   return (
     <div data-testid={`live-node-${node.label}`} data-state={node.state}
-      className={`relative rounded-lg border-2 bg-surface px-3 py-2 shadow-sm transition-opacity duration-300 ${STATE_CLASS[node.state]} ${node.state === 'pending' ? node.unrecorded ? 'opacity-35' : 'opacity-60' : ''}`}
+      data-adaptive-event={node.adaptiveLabel}
+      className={`relative rounded-lg border-2 bg-surface px-3 py-2 shadow-sm transition-opacity duration-300 ${STATE_CLASS[node.state]} ${node.state === 'pending' ? node.unrecorded ? 'opacity-35' : 'opacity-60' : ''} ${node.adaptiveLabel ? 'animate-pulse ring-2 ring-primary/60' : ''}`}
       style={{ width: RUN_NODE_WIDTH, height: node.height, borderColor: STATE_RING[node.state], borderLeft: `5px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, outline: node.focused ? '2px solid var(--accent, #8b5cf6)' : undefined, outlineOffset: 3 }}>
       <Handle id="in" type="target" position={Position.Left} className="!pointer-events-none !opacity-0" />
       {/* 고정 폭 카드(RUN_NODE_WIDTH) 안에서 상태 말이 밀려나 잘리지 않게 — 종류 말이 대신 줄어든다. */}
@@ -69,6 +71,7 @@ function LiveNode({ data }: NodeProps) {
         <span className="truncate">{node.kind === 'subgraph' ? '묶음 · 눌러서 펼치기' : node.kind}</span>
         {node.entry && <span className="shrink-0 rounded bg-success/15 px-1 text-success">시작</span>}
         {node.terminal && <span className="shrink-0 rounded bg-accent/15 px-1 text-accent">끝</span>}
+        {node.adaptiveLabel && <span data-testid={`adaptive-event-${node.label}`} className="shrink-0 rounded bg-primary/15 px-1 text-primary animate-pulse">{node.adaptiveLabel}</span>}
         <span data-state-word className="ml-auto shrink-0 font-medium" style={{ color: STATE_RING[node.state] }}>{node.unrecorded ? '기록 없음' : STATE_WORD[node.state]}</span>
       </div>
       <div className="overflow-x-auto whitespace-nowrap font-mono text-sm font-semibold text-text-primary" title={node.label}>{isGroupNodeId(node.label) ? `▣ ${node.label.slice(GROUP_NODE_PREFIX.length)}` : node.label}</div>
@@ -157,9 +160,12 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
     const real = graphQuery.data;
     // 선언된 그래프를 그리고, 런이 선언 밖 노드를 밟았으면 그것만 더한다(선언 노드는 지우지 않는다).
     // 그래프 정의를 못 읽었을 때만 «밟은 길»로 세운다(지어내지 않는다).
-    if (real) return mergeWalked(real, steps);
-    if (graphQuery.isLoading && run.graphId) return null;
-    return graphFromSteps(run.graphId ?? run.runId, steps);
+    const declared = real
+      ? mergeWalked(real, steps)
+      : graphQuery.isLoading && run.graphId
+        ? null
+        : graphFromSteps(run.graphId ?? run.runId, steps);
+    return declared ? applyRunGraphEvents(declared, run.graphEvents ?? []) : null;
   }, [run, graphQuery.data, graphQuery.isLoading, steps]);
   // 묶음: 접은 묶음은 노드 하나로, 펼친 묶음은 이름 붙은 상자로. 기본 = 통합 보기(전부 펼침).
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
@@ -233,6 +239,15 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
   }, [effectiveMode, playing, cursor, speed, steps]);
 
   const visited = useMemo(() => new Set(viewSteps.map((step) => step.node)), [viewSteps]);
+  const adaptiveLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    for (const event of (run?.graphEvents ?? []).slice(-8)) {
+      if (event.type === 'node-added') labels.set(event.node, event.kind === 'hand' ? '손 노드' : '새 노드');
+      else if (event.type === 'unit-expanded') labels.set(event.node, '깊이 상승');
+      else if (event.type === 'edge-rerouted') { labels.set(event.from, '경로 수리'); labels.set(event.to, '경로 수리'); }
+    }
+    return labels;
+  }, [run?.graphEvents]);
   const scene = useMemo(() => sceneAt(flow?.nodes.map((node) => node.id) ?? [], sceneEdges, viewSteps, cursor, entering), [flow, sceneEdges, viewSteps, cursor, entering]);
   const toggleUnit = useCallback((group: string) => setCollapsed((current) => {
     const next = new Set(current);
@@ -251,6 +266,7 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
       ...(hover && !hover.nodes.has(node.id) ? { style: { ...node.style, opacity: WIRING_STYLE.dimNode } } : {}),
       data: {
         ...node.data, state: scene.nodeState[node.id] ?? 'pending', visits: scene.visits[node.id] ?? 0, focused: focus === node.id,
+        ...(adaptiveLabels.has(node.id) ? { adaptiveLabel: adaptiveLabels.get(node.id) } : {}),
         unrecorded: !live && !visited.has(node.id),
       } satisfies LiveNodeData,
     }));
@@ -264,7 +280,7 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
         } satisfies GroupBoxData,
       }));
     return [...boxes, ...cards];
-  }, [flow, scene, focus, hover, live, visited, unitOf, toggleUnit]);
+  }, [flow, scene, focus, hover, live, visited, unitOf, toggleUnit, adaptiveLabels]);
   const edges = useMemo(() => flow?.edges.map((edge) => ({
     ...edge, type: 'live',
     ...wiringEdgeStyle(hover, edge.id),

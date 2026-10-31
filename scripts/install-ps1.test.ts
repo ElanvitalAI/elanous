@@ -79,8 +79,10 @@ describe('scripts/install.ps1', () => {
     expect(source).toContain('Get-RequiredCommands $installerPath');
     expect(source).not.toMatch(/\$requiredCommands\s*=\s*@\(/);
     expect(source).toContain("return @('bun')");
+    // The external-command catalog is the source of truth; Git is a capability, not a boot requirement.
     expect(requiredFromBash()).toEqual(requiredFromCatalog('required'));
-    expect(requiredFromBash()).toEqual(['bun', 'git']);
+    // Pin the boot contract as well as cross-platform parity; update this when that policy changes.
+    expect(requiredFromBash()).toEqual(['bun']);
   });
 
   test('declares the four named installer parameters and append-only marker PATH contract', () => {

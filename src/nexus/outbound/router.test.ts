@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { openDeliveryDb } from './delivery-ledger.js';
-import { normalizeOutbound, outboundAdapters, registerOutboundAdapter, routeOutbound, type ChannelAdapter } from './router.js';
+import { normalizeOutbound, outboundAdapters, registerOutboundAdapter, routeOutbound, type ChannelAdapter, type OutboundMsg } from './router.js';
 import type { UserConfig } from '../../user-config.js';
 
 const cfg = (outbound?: unknown) => ({ raw: outbound ? { outbound } : {} }) as UserConfig;
@@ -162,7 +162,11 @@ test('a connector exception containing a credential-bearing webhook URL is not r
 
 test('built-in connectors declare receive only for existing bot paths, never for pushcut', () => {
   expect([...outboundAdapters.keys()]).toEqual(['telegram', 'discord', 'pushcut']);
+  const expectedKeys = ['send', 'receive', 'thread', 'topic', 'persona', 'channelLifecycle', 'permissions', 'commands',
+    'attachments', 'buttons', 'choices', 'deliveryConfirmation', 'rateLimit'].sort();
   for (const adapter of outboundAdapters.values()) {
+    expect(Object.keys(adapter.capabilities).sort()).toEqual(expectedKeys);
+    expect(Object.values(adapter.capabilities).every(value => typeof value === 'boolean')).toBe(true);
     expect(adapter.capabilities.send).toBe(true);
     expect(adapter.capabilities.receive).toBe(adapter.type !== 'pushcut');
     expect(adapter.capabilities.buttons).toBe(false);
@@ -200,6 +204,34 @@ test('registered connector is selected as main, backs up on failure, and is remo
       expect(() => registerOutboundAdapter({ ...adapter, type: 'telegram' })).toThrow('duplicate');
       expect(() => registerOutboundAdapter({ ...adapter, type: 'invalid-receiver', receive: undefined,
         capabilities: { ...adapter.capabilities, receive: true } })).toThrow('invalid');
+      const missingCapability = { ...adapter.capabilities };
+      delete (missingCapability as Partial<ChannelAdapter['capabilities']>).choices;
+      const malformedCapabilities: ChannelAdapter['capabilities'][] = [
+        missingCapability as ChannelAdapter['capabilities'],
+        { ...adapter.capabilities, unexpected: false } as ChannelAdapter['capabilities'],
+        { ...adapter.capabilities, buttons: 'yes' } as unknown as ChannelAdapter['capabilities'],
+      ];
+      malformedCapabilities.forEach((capabilities, index) => {
+        expect(() => registerOutboundAdapter({ ...adapter, type: `invalid-capabilities-${index}`, capabilities }))
+          .toThrow('invalid');
+      });
+      const accessorCapabilities = { ...adapter.capabilities };
+      Object.defineProperty(accessorCapabilities, 'thread', { enumerable: true, get: () => false });
+      expect(() => registerOutboundAdapter({ ...adapter, type: 'invalid-capabilities-accessor',
+        capabilities: accessorCapabilities })).toThrow('invalid');
+      const inheritedCapabilities = Object.assign(Object.create({ inherited: false }), adapter.capabilities);
+      const disposeInherited = registerOutboundAdapter({ ...adapter, type: 'valid-capabilities-inherited',
+        capabilities: inheritedCapabilities });
+      disposeInherited();
+      const symbolCapabilities = { ...adapter.capabilities, [Symbol('unexpected')]: false };
+      expect(() => registerOutboundAdapter({ ...adapter, type: 'invalid-capabilities-symbol',
+        capabilities: symbolCapabilities })).toThrow('invalid');
+      const throwingProxy = new Proxy({ ...adapter.capabilities }, { ownKeys: () => { throw new Error('proxy trap'); } });
+      expect(() => registerOutboundAdapter({ ...adapter, type: 'invalid-capabilities-proxy',
+        capabilities: throwingProxy })).toThrow('invalid');
+      const throwingAdapterGetter = { ...adapter, type: 'invalid-capabilities-getter' };
+      Object.defineProperty(throwingAdapterGetter, 'capabilities', { get: () => { throw new Error('getter trap'); } });
+      expect(() => registerOutboundAdapter(throwingAdapterGetter as ChannelAdapter)).toThrow('invalid');
       expect(normalizeOutbound(outbound)?.channels.map(ch => ch.type)).toEqual(['slack', 'telegram']);
       expect((await routeOutbound(cfg(outbound), msg, routerDeps)).channels).toEqual([{ type: 'slack', ok: true }]);
       succeed = false;
@@ -209,6 +241,126 @@ test('registered connector is selected as main, backs up on failure, and is remo
       expect(calls).toBe(2);
     } finally { dispose(); }
     expect(normalizeOutbound(outbound)?.channels).toEqual([{ type: 'telegram' }]);
+  } finally { deliveryDb.close(); }
+});
+
+test('unsupported outbound metadata is rejected before a connector can silently drop it', async () => {
+  const { calls, deliveryDb, routerDeps } = deps();
+  try {
+    const result = await routeOutbound(cfg(config), { ...msg, threadId: 'thread-7', attachments: [{ url: 'https://example.test/file' }] }, routerDeps);
+    expect(result.delivered).toBe(false);
+    expect(result.channels).toEqual([
+      { type: 'telegram', ok: false, error: 'unsupported-capability' },
+      { type: 'discord', ok: false, error: 'unsupported-capability' },
+    ]);
+    expect(calls).toEqual([]);
+  } finally { deliveryDb.close(); }
+});
+
+test('explicit empty metadata still requires connector capabilities', async () => {
+  const { calls, deliveryDb, routerDeps } = deps();
+  const cases: Array<Partial<OutboundMsg>> = [
+    { attachments: [] },
+    { buttons: [] },
+    { choices: [] },
+    { threadId: '' },
+  ];
+  try {
+    for (const metadata of cases) {
+      const result = await routeOutbound(cfg(config), { ...msg, ...metadata }, routerDeps);
+      expect(result.delivered).toBe(false);
+      expect(result.channels).toEqual([
+        { type: 'telegram', ok: false, error: 'unsupported-capability' },
+        { type: 'discord', ok: false, error: 'unsupported-capability' },
+      ]);
+    }
+    expect(calls).toEqual([]);
+  } finally { deliveryDb.close(); }
+});
+
+test('invalid permission actions and permission-check errors fail closed before send', async () => {
+  const { calls, deliveryDb, routerDeps } = deps();
+  const checked: string[] = [];
+  const base = outboundAdapters.get('telegram')!;
+  const adapter: ChannelAdapter = {
+    ...base,
+    type: 'permission-test',
+    capabilities: { ...base.capabilities, permissions: true },
+    parseConfig: raw => raw.type === 'permission-test' ? { type: 'permission-test' } : undefined,
+    checkPermission: async action => { checked.push(action); throw new Error('sensitive permission detail'); },
+    send: async () => { calls.push('permission-test'); return { type: 'permission-test', ok: true }; },
+  };
+  const dispose = registerOutboundAdapter(adapter);
+  try {
+    const outbound = { channels: [{ type: 'permission-test' }] };
+    const invalid = await routeOutbound(cfg(outbound), { ...msg, permissionAction: '  ' }, routerDeps);
+    expect(invalid.channels).toEqual([{ type: 'permission-test', ok: false, error: 'invalid-permission-action' }]);
+    const failed = await routeOutbound(cfg(outbound), { ...msg, permissionAction: 'delete-channel' }, routerDeps);
+    expect(failed.channels).toEqual([{ type: 'permission-test', ok: false, error: 'permission-check-failed' }]);
+    expect(checked).toEqual(['delete-channel']);
+    expect(calls).toEqual([]);
+  } finally { dispose(); deliveryDb.close(); }
+});
+
+test('unsupported permission action is reported before validating its payload', async () => {
+  const { calls, deliveryDb, routerDeps } = deps();
+  try {
+    const result = await routeOutbound(cfg({ channels: [{ type: 'telegram' }] }),
+      { ...msg, permissionAction: '  ' }, routerDeps);
+    expect(result.channels).toEqual([{ type: 'telegram', ok: false, error: 'unsupported-capability' }]);
+    expect(calls).toEqual([]);
+  } finally { deliveryDb.close(); }
+});
+
+test('capable connectors receive outbound metadata only after the requested permission check succeeds', async () => {
+  const { deliveryDb, routerDeps } = deps();
+  const received: unknown[] = [];
+  const checked: string[] = [];
+  const base = outboundAdapters.get('telegram')!;
+  const adapter: ChannelAdapter = {
+    ...base,
+    type: 'contract-test',
+    capabilities: { ...base.capabilities, thread: true, topic: true, persona: true, permissions: true,
+      attachments: true, buttons: true, choices: true },
+    parseConfig: raw => raw.type === 'contract-test' ? { type: 'contract-test' } : undefined,
+    checkPermission: async action => { checked.push(action); return true; },
+    send: async (_channel, message) => { received.push(message); return { type: 'contract-test', ok: true }; },
+  };
+  const payload = { ...msg, threadId: 'thread-7', topicId: 'topic-3', persona: { name: 'MK' },
+    attachments: [{ url: 'https://example.test/file', name: 'brief.txt' }],
+    buttons: [{ label: 'Open', value: 'open' }], choices: [{ label: 'Later', value: 'later' }], permissionAction: 'send:release' };
+  try {
+    const remove = registerOutboundAdapter(adapter);
+    try {
+      const result = await routeOutbound(cfg({ channels: [{ type: 'contract-test' }], routes: { alert: ['contract-test'] } }), payload, routerDeps);
+      expect(result.delivered).toBe(true);
+      expect(received).toEqual([payload]);
+      expect(checked).toEqual(['send:release']);
+    } finally { remove(); }
+  } finally { deliveryDb.close(); }
+});
+
+test('denied or unavailable channel permission checks never call the connector', async () => {
+  const { deliveryDb, routerDeps } = deps();
+  const checked: string[] = [];
+  const base = outboundAdapters.get('telegram')!;
+  const adapter: ChannelAdapter = {
+    ...base,
+    type: 'permission-test',
+    capabilities: { ...base.capabilities, permissions: true },
+    parseConfig: raw => raw.type === 'permission-test' ? { type: 'permission-test' } : undefined,
+    checkPermission: async action => { checked.push(action); return false; },
+    send: async () => { throw new Error('send must not run'); },
+  };
+  try {
+    const remove = registerOutboundAdapter(adapter);
+    try {
+      const result = await routeOutbound(cfg({ channels: [{ type: 'permission-test' }], routes: { alert: ['permission-test'] } }),
+        { ...msg, permissionAction: 'send:release' }, routerDeps);
+      expect(result.delivered).toBe(false);
+      expect(result.channels).toEqual([{ type: 'permission-test', ok: false, error: 'permission-denied' }]);
+      expect(checked).toEqual(['send:release']);
+    } finally { remove(); }
   } finally { deliveryDb.close(); }
 });
 

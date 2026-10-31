@@ -11,6 +11,7 @@ import {
   readNexusSetupMode,
   setupBootMode,
   setupModeBootPlan,
+  shouldCheckHeadlessSetup,
   type SetupCheckResult,
   type SetupItem,
 } from './setup-status.js';
@@ -46,6 +47,13 @@ test('empty setup status keeps the five checks and gives actionable onboarding h
   expect(result.recommended[1]!.hint).toContain('create the missing skill directories');
   expect(result.required[0]!.hint).toContain('elanous onboarding llm');
   expect(result.required[1]!.hint).toBe('run `elanous nexus build`');
+});
+
+test('headless setup prerequisite is skipped only for isolated/test or explicit test harness runs', () => {
+  expect(shouldCheckHeadlessSetup({ headless: true, detachedForTesting: false, skipForTesting: false, testInstance: true })).toBe(false);
+  expect(shouldCheckHeadlessSetup({ headless: true, detachedForTesting: false, skipForTesting: false, testInstance: false })).toBe(true);
+  expect(shouldCheckHeadlessSetup({ headless: false, detachedForTesting: false, skipForTesting: false, testInstance: false })).toBe(false);
+  expect(shouldCheckHeadlessSetup({ headless: true, detachedForTesting: true, skipForTesting: false, testInstance: false })).toBe(false);
 });
 
 test('existing skill directory retains the passed status without a missing-dir hint', () => {

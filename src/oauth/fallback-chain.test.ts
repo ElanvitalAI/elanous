@@ -9,6 +9,7 @@ import {
   DEFAULT_FALLBACK_CHAIN,
   decideFallback,
   describeFallback,
+  fallbackChainForProvider,
   isFallbackStep,
   normalizeFallbackChain,
   stayReasonWhenCodexAxisEnds,
@@ -22,6 +23,23 @@ const CAND: RotationCandidate = { name: 'work', storeKey: 'k', home: '/h/work', 
 const CHAIN_BOTH: readonly FallbackStep[] = ['codex-rotate', 'grok'];
 
 describe('normalizeFallbackChain — 「설정이 있다」와 「유효하다」는 다르다', () => {
+  it('명시한 공급자의 체인 기본은 그 공급자 하나로 제한한다', () => {
+    expect(fallbackChainForProvider('openai-codex')).toBeUndefined();
+    expect(fallbackChainForProvider('grok')).toBeUndefined();
+    expect(fallbackChainForProvider('glm')).toEqual(['zai']);
+    expect(fallbackChainForProvider('openrouter')).toEqual(['openrouter']);
+    expect(normalizeFallbackChain(undefined, 'openrouter').chain).toEqual(['openrouter']);
+    expect(normalizeFallbackChain([], 'glm').chain).toEqual(['zai']);
+    expect(normalizeFallbackChain(undefined, 'grok').chain).toEqual(DEFAULT_FALLBACK_CHAIN);
+    expect(normalizeFallbackChain(undefined, 'openai-codex').chain).toEqual(DEFAULT_FALLBACK_CHAIN);
+    expect(normalizeFallbackChain(undefined, 'auto').chain).toEqual(DEFAULT_FALLBACK_CHAIN);
+  });
+
+  it('GLM(Z.ai) 단독 체인은 키가 있을 때만 직접 전환한다', () => {
+    const input = { rotation: { reason: 'no-candidate' } as const, chain: ['zai'] as const, grokAvailable: false };
+    expect(decideFallback({ ...input, zaiAvailable: true })).toEqual({ action: 'switch-backend', backend: 'zai' });
+    expect(decideFallback({ ...input, zaiAvailable: false })).toEqual({ action: 'stay', why: 'zai-unavailable' });
+  });
   it('정상 배열을 그대로 받는다', () => {
     expect(normalizeFallbackChain(['codex-rotate', 'grok']))
       .toEqual({ chain: ['codex-rotate', 'grok'], dropped: [], usedDefault: false });
@@ -299,6 +317,12 @@ describe('describeFallback — 관측 한 줄 (⛔ 토큰·홈 경로를 안 넣
     expect(describeFallback({ action: 'codex-rotate', to: CAND })).toContain('work');
     expect(describeFallback({ action: 'switch-backend', backend: 'grok' })).toContain('grok');
     expect(describeFallback({ action: 'stay', why: 'explicit' })).toContain('explicit');
+  });
+
+  it('Z.ai 자격 존재만으로 코딩 플랜 종류를 단정하지 않는다', () => {
+    const line = describeFallback({ action: 'switch-backend', backend: 'zai' });
+    expect(line).toContain('Z.ai GLM');
+    expect(line).not.toContain('코딩 플랜');
   });
 
   it('계정 «홈 경로»는 새지 않는다', () => {

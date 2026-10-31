@@ -8,6 +8,36 @@ import { gateChangedFiles } from '../../self-implement/seams.js';
 import { packSourceBundle } from './pod-source-bundle.js';
 import { podSourceScript, PodSourceShaFormatError, type PodSource } from './pod-source-receive.js';
 
+function makeBaseShaFallbackFixture(root: string, options: { originHasBase: boolean; withMirror: boolean }) {
+  const work = join(root, 'origin-work');
+  const origin = join(root, 'origin.git');
+  const mirror = join(root, 'mirror.git');
+  const image = join(root, 'image');
+  const imageGit = join(root, 'image.git');
+  const marker = join(root, 'image-commit');
+  for (const path of [work, image]) mkdirSync(path);
+  execFileSync('git', ['init', '-q', '-b', 'main', work]);
+  execFileSync('git', ['-C', work, 'config', 'user.email', 'pod@example.com']);
+  execFileSync('git', ['-C', work, 'config', 'user.name', 'pod']);
+  writeFileSync(join(work, 'README'), 'pinned image contents\n');
+  execFileSync('git', ['-C', work, 'add', 'README']);
+  execFileSync('git', ['-C', work, 'commit', '-qm', 'pin']);
+  const pinSha = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  execFileSync('git', ['clone', '-q', '--bare', '--depth', '1', `file://${work}`, imageGit]);
+  copyFileSync(join(work, 'README'), join(image, 'README'));
+  writeFileSync(marker, `${pinSha}\n`);
+  let baseSha = 'f'.repeat(40);
+  if (options.originHasBase) {
+    writeFileSync(join(work, 'next.txt'), 'next commit\n');
+    execFileSync('git', ['-C', work, 'add', 'next.txt']);
+    execFileSync('git', ['-C', work, 'commit', '-qm', 'next']);
+    baseSha = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  }
+  execFileSync('git', ['clone', '-q', '--bare', work, origin]);
+  if (options.withMirror) execFileSync('git', ['clone', '-q', '--bare', work, mirror]);
+  return { baseSha, origin, mirror: options.withMirror ? mirror : null, imageOptions: { imageSourceDir: image, imageCommitFile: marker, imageGitDir: imageGit } };
+}
+
 describe('podSourceScript', () => {
   test('default source uses the parent-resolved base SHA from the host mirror without Pod origin calls', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-sha-'));
@@ -57,23 +87,41 @@ describe('podSourceScript', () => {
     expect(() => podSourceScript({ kind: 'default', baseSha: `${metachar}\\n` }, 'https://github.com/unused/repo')).toThrow(PodSourceShaFormatError);
   });
 
-  test('parent-resolved default SHA fails closed when neither image nor host mirror has a checkout', () => {
-    const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-missing-'));
+  test('parent-resolved SHA missing from image and mirror is fetched once from origin and recorded', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-origin-fallback-'));
     try {
+      const fixture = makeBaseShaFallbackFixture(root, { originHasBase: true, withMirror: false });
       const cwd = join(root, 'job');
       mkdirSync(cwd);
-      const baseSha = '1'.repeat(40);
-      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', join(root, 'missing-mirror'), { imageCommitFile: join(root, 'absent-image-commit') });
+      const script = podSourceScript({ kind: 'default', baseSha: fixture.baseSha }, fixture.origin, join(root, 'missing-mirror'), fixture.imageOptions);
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH complete ${fixture.baseSha}`);
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE default ${fixture.baseSha}`);
+      const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(JSON.parse(io!)).toMatchObject({ originCalls: 1, baseShaOriginFallback: true, sourceVia: 'origin', sourceStatus: 'complete' });
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(fixture.baseSha);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('parent-resolved SHA absent from both mirror and origin still exits 5 after one origin attempt', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-origin-missing-'));
+    try {
+      const fixture = makeBaseShaFallbackFixture(root, { originHasBase: false, withMirror: true });
+      const cwd = join(root, 'job');
+      mkdirSync(cwd);
+      const script = podSourceScript({ kind: 'default', baseSha: fixture.baseSha }, fixture.origin, fixture.mirror!, fixture.imageOptions);
       const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
       expect(result.exitCode).toBe(5);
-      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE ${baseSha}`);
-      const outcome = /^ELANOUS_POD_SOURCE_RESULT (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
-      expect(outcome).toBeTruthy();
-      expect(JSON.parse(outcome!)).toMatchObject({ sourceStage: 'base-sha', sourceKind: 'default', sourceStatus: 'failed', baseSha, exitCode: 5, failureCode: 'base-sha-unavailable' });
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_MIRROR_FETCH failed ${fixture.baseSha}`);
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH failed ${fixture.baseSha}`);
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE ${fixture.baseSha}`);
       const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
-      expect(io).toBeTruthy();
-      expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceStatus: 'incomplete' });
-      expect(script).not.toContain('git clone -q --depth 50');
+      expect(JSON.parse(io!)).toMatchObject({ originCalls: 1, baseShaOriginFallback: true, sourceStatus: 'incomplete' });
+      const resultLine = /^ELANOUS_POD_SOURCE_RESULT (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(JSON.parse(resultLine!)).toMatchObject({ sourceStage: 'base-sha', sourceStatus: 'failed', baseSha: fixture.baseSha, exitCode: 5, failureCode: 'base-sha-unavailable' });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

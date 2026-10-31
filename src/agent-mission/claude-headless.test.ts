@@ -57,6 +57,18 @@ describe('runClaudeHeadless', () => {
     expect((await running).ok).toBe(true);
   });
 
+  it('resumes the exact Claude session id for a follow-up turn', async () => {
+    const f = fakeProcess();
+    const running = runClaudeHeadless({ ...options, prompt: 'follow-up', resumeSessionId: 'session-1', spawn: f.spawn });
+    expect(f.calls[0]?.args).toEqual([
+      '-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions', '--resume', 'session-1',
+    ]);
+    expect(Buffer.concat(f.writes).toString()).toBe('follow-up');
+    f.stdout.write('{"type":"result","subtype":"success","is_error":false,"result":"revised","session_id":"session-1"}\n');
+    f.child.emit('close', 0);
+    expect(await running).toMatchObject({ ok: true, sessionId: 'session-1', result: 'revised' });
+  });
+
   it('rejects an invalid maxTurns before spawning', async () => {
     const f = fakeProcess();
     await expect(runClaudeHeadless({ ...options, spawn: f.spawn, maxTurns: 0 }))

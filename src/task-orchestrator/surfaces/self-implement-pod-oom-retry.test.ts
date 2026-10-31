@@ -1,5 +1,5 @@
 import { describe, expect, test, spyOn } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -58,6 +58,26 @@ function simulation(reasons: string[], tier?: 'high' | 'standard') {
   return { kubectl, jobs, secrets, calls, pool, root, env, get leases() { return leases; }, get releases() { return releases; } };
 }
 
+/** A pool whose single member can hold at most `memberMaxGi` — the LAUNCH-STALL `unfitMembers` reading. */
+function pooledSimulation(reasons: string[], memberMaxGi: number) {
+  const s = simulation(reasons);
+  const memberBytes = memberMaxGi * 2 ** 30;
+  const members = [{ context: 'ctx', capacity: 2 }];
+  Object.assign(s.pool, {
+    members,
+    unfitMembers: async (limitBytes: number) => limitBytes > memberBytes
+      ? members.map(() => ({ context: 'ctx', allocatableMemoryBytes: memberBytes })) : [],
+  });
+  return s;
+}
+
+function ledgerRows(root: string) {
+  const path = runLedgerPath('run-parent-1', runLedgerDir(root));
+  return existsSync(path)
+    ? readFileSync(path, 'utf8').trimEnd().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> })
+    : [];
+}
+
 describe('Pod OOM retry', () => {
   test('automatic document lite OOM retries exactly once at standard with durable tier and reason', async () => {
     const s = simulation(['OOMKilled', 'Complete']);
@@ -109,6 +129,12 @@ describe('Pod OOM retry', () => {
       expect(result.error?.code).toBe('pod-oom-killed');
       expect(result.error?.message).toContain('OOM · standard 에서도');
       expect(s.jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['2Gi', '16Gi']);
+      const ledger = (readFileSync(runLedgerPath('run-parent-1', runLedgerDir(s.root)), 'utf8').trimEnd().split('\n') as string[])
+        .map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+      const failures = ledger.filter((entry) => entry.event === 'pod-task-failure');
+      expect(failures).toHaveLength(1);
+      expect(failures[0]?.data).toMatchObject({ job: podJobName('document-twice'), attempt: 2,
+        childRunId: ledger.filter((entry) => entry.event === 'pod-child-run').at(-1)?.data.childRunId });
     } finally { rmSync(s.root, { recursive: true, force: true }); }
   });
 
@@ -565,6 +591,38 @@ describe('Pod OOM retry', () => {
       expect(result.error?.message).toContain('container=OOMKilled/1');
       expect(s.jobs).toHaveLength(1);
     } finally { rmSync(s.root, { recursive: true, force: true }); }
+  });
+
+  test('PRLAND-OOM-RETRY-POOL-FIT: 다음 메모리 한도가 풀에 입장 가능한지 «의도 기록과 Job 삭제 전에» 판단한다', async () => {
+    // 24Gi-max pool, 16Gi first Job OOM, next limit 32Gi: no member can ever take it.
+    const unfit = pooledSimulation(['OOMKilled', 'Complete'], 24);
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: unfit.kubectl, pool: unfit.pool as never, env: unfit.env, credentials: creds })({ feature: 'same goal', spaceId: 'pool-fit-unfit' }).done;
+      expect(result.error?.code).toBe('pod-pool-unfit');
+      expect(unfit.jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['16Gi']);
+      expect(unfit.calls.some((call) => call.includes('delete job'))).toBe(false);
+      const ledger = ledgerRows(unfit.root);
+      expect(ledger.filter((entry) => entry.event === 'pod-oom-retry-intent')).toEqual([]);
+      expect(result.error?.message).toContain('OOMKilled(137)');
+      expect(result.error?.message).toContain('32Gi');
+      expect(result.error?.message).toContain('24GiB');
+      expect(ledger.filter((entry) => entry.data?.attempt === 2 && entry.event === 'pod-child-run')).toEqual([]);
+      expect(unfit.leases).toBe(1);
+      expect(unfit.releases).toBe(1);
+    } finally { rmSync(unfit.root, { recursive: true, force: true }); }
+
+    // A 40Gi member can hold the 32Gi retry: the single retry and the finished ledger row are preserved.
+    const fit = pooledSimulation(['OOMKilled', 'Complete'], 40);
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: fit.kubectl, pool: fit.pool as never, env: fit.env, credentials: creds })({ feature: 'same goal', spaceId: 'pool-fit-ok' }).done;
+      expect(result.exitCode).toBe(0);
+      expect(fit.jobs.map((job) => job.spec.template.spec.containers[0].resources.limits.memory)).toEqual(['16Gi', '32Gi']);
+      expect(fit.calls.filter((call) => call.includes('delete job') && call.includes('--wait=true'))).toHaveLength(1);
+      const ledger = ledgerRows(fit.root);
+      expect(ledger.filter((entry) => entry.event === 'pod-oom-retry-intent')).toHaveLength(1);
+      expect(ledger.filter((entry) => entry.event === 'pod-oom-retry-finished')).toHaveLength(1);
+      expect(ledger.find((entry) => entry.event === 'pod-oom-retry-intent')?.data).toMatchObject({ attempt: 2, from: '16Gi', to: '32Gi' });
+    } finally { rmSync(fit.root, { recursive: true, force: true }); }
   });
 
   test('parent goal memory phrase warns even when shard explicitly selects high', async () => {

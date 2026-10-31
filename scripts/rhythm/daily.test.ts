@@ -71,6 +71,67 @@ test('⑧ 행정 reads verified dates in deadline order, with priority ties, rep
   }
 });
 
+test('daily Linear sync is opt-in and runs independently of Telegram send enablement', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-linear-optin-'));
+  const oldState = process.env.ELANOUS_STATE_DIR;
+  let calls: Array<{ version: string; apply?: boolean; allowIssueIdentifiers?: readonly string[] }> = [];
+  try {
+    setElanousConfigDir(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ loops: { rhythm: { daily: {
+      linearProgressSync: true, linearProgressIssueAllowlist: ['DEMO-1'],
+    } } } }));
+    const deps: DailyDeps = { now: () => now, root, vaultRoot: null, sendEnabled: false,
+      landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+      loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [], log: () => {}, print: () => {},
+      linearProgressSync: async options => {
+        calls.push(options);
+        return { day: '2026-10-05', candidates: [], posted: [], alreadyPresent: [], skipped: [], failures: [] };
+      },
+    };
+    await runDaily({ stage: 'collect' }, deps);
+    const result = await runDaily({ stage: 'deliver' }, deps);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ version: '0.2.43', apply: true, allowIssueIdentifiers: ['DEMO-1'] });
+    expect('linearProgress' in result).toBe(true);
+    if ('linearProgress' in result) expect(result.linearProgress).toMatchObject({ posted: [], failures: [] });
+  } finally {
+    resetElanousConfigDir();
+    if (oldState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = oldState;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('daily Linear sync failures are recorded and degrade an otherwise successful delivery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-linear-failure-'));
+  const oldState = process.env.ELANOUS_STATE_DIR;
+  const ticks: Record<string, unknown>[] = [];
+  try {
+    setElanousConfigDir(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ loops: { rhythm: { daily: {
+      linearProgressSync: true, linearProgressIssueAllowlist: ['DEMO-1'],
+    } } } }));
+    const deps: DailyDeps = { now: () => now, root, vaultRoot: null, sendEnabled: true, target: { chatId: 42, botToken: 't' },
+      landings: async () => [], release: async () => (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value,
+      loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [],
+      send: () => ({ chatId: 42, messageId: 1 }), log: (_category, _event, data) => { ticks.push(data); }, print: () => {},
+      linearProgressSync: async () => ({ day: '2026-10-05', candidates: [], posted: [], alreadyPresent: [], skipped: [],
+        failures: [{ identifier: 'DEMO-1', reason: 'post-verification-marker-count=0' }] }),
+    };
+    await runDaily({ stage: 'collect' }, deps);
+    const result = await runDaily({ stage: 'deliver' }, deps);
+    expect(result).toMatchObject({ sent: true, deliveryState: 'sent', status: 'degraded' });
+    expect('linearProgressError' in result).toBe(true);
+    if ('linearProgressError' in result) expect(result.linearProgressError).toContain('1 Linear summary failure');
+    expect(ticks.at(-1)).toMatchObject({ status: 'degraded', linearProgressError: expect.stringContaining('1 Linear summary failure') });
+  } finally {
+    resetElanousConfigDir();
+    if (oldState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = oldState;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('⑧ 행정 preserves a Linear title containing a section delimiter and the following due item through collect and deliver', async () => {
   const root = mkdtempSync(join(tmpdir(), 'rhythm-coo-delimiter-'));
   const today = new Date('2026-10-09T00:00:00Z');

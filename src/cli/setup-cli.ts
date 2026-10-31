@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { addSource, listSources } from '../intake-plane/intake-sources.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -11,6 +11,18 @@ import { recommendedSetup } from './setup-recommend.js';
 import { detectSkillCliAuth, type CliAuthStatus } from '../onboarding/cli-auth-status.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig, saveUserConfig, userConfigPath, type UserConfig } from '../user-config.js';
+import { collectServiceKeys, printKeySetupReport } from '../onboarding/key-setup.js';
+import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js';
+import { probeProvider } from '../llm/provider-probe.js';
+import { createSecretPrompt } from '../onboarding/secret-prompt.js';
+import { realIO } from '../onboarding.js';
+import { parseServiceKeyEnv, readMaskedServiceEnvPaste } from '../setup/service-keys.js';
+import { importServiceKeys, renderServiceKeyStatus, runSetupKeys } from './setup-keys.js';
+import { SERVICE_KEY_CATALOG, type ServiceKeyCatalogEntry } from '../setup/llm-env-detect.js';
+import { serviceKeyStatus } from '../setup/service-keys.js';
+import { detectProviders } from '../llm/provider-detect.js';
+import { DEFAULT_PLUGIN_GROUP, defaultPluginStatuses } from '../plugins/install/plugin-install.js';
+import type { DefaultPluginStatus } from '../plugins/install/plugin-install.js';
 
 const ELANOUS_LOGIN_COMMAND = 'elanous login openai-codex';
 const PROVIDER_COMMAND = 'elanous config set llm.provider openai-codex';
@@ -38,11 +50,18 @@ export interface SetupCliDeps extends DoctorOptions {
   planClaudePluginSetup?: typeof planClaudePluginSetup;
   applyClaudePluginSetup?: typeof applyClaudePluginSetup;
   prompt?: (message: string) => Promise<string | undefined>;
+  promptSecret?: (message: string) => Promise<string | undefined>;
+  getSecretAsync?: typeof getSecretAsync;
+  setSecretAsync?: typeof setSecretAsync;
+  probeKey?: typeof probeProvider;
   isStdinTty?: () => boolean;
   out?: { log: (value: string) => void; error?: (value: string) => void };
   setExitCode?: (code: number) => void;
   /** 런타임이 이 config 로 «실제로» 고르는 provider(`decideProviderForConfig().provider`). 시험 seam. */
   resolveRuntimeProvider?: (config: UserConfig) => string | undefined;
+  detectProviders?: typeof detectProviders;
+  getServiceKeyStatus?: typeof serviceKeyStatus;
+  isCommandAvailable?: (command: string) => boolean;
 }
 
 /** ⛔ 2026-09-23 — provider 단계는 «문자열 비교»가 아니라 ***런타임의 최종 결정***으로 잰다.
@@ -118,6 +137,10 @@ function missingRequiredCommands(doctor: DoctorReport): boolean {
   return doctor.externalCommands.some((command) => command.status === 'missing' && command.tier === 'required');
 }
 
+function missingGitCapability(doctor: DoctorReport): boolean {
+  return doctor.externalCommands.some((command) => command.name === 'git' && command.status !== 'found');
+}
+
 function displayCommand(command: string[]): string {
   return command.map((arg) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(arg)
     ? arg
@@ -128,7 +151,7 @@ export function formatSetupReport(doctor: DoctorReport, steps: SetupStep[], nonI
   const elanousLogin = steps[0]!.complete;
   const provider = steps[1]!.complete;
   const codexLogin = steps[2]!.complete;
-  const externalReady = doctor.ok && !missingRequiredCommands(doctor);
+  const externalReady = doctor.ok && !missingRequiredCommands(doctor) && !missingGitCapability(doctor);
   const capabilities = [
     { name: 'OpenAI Codex-backed elanous sessions', ready: elanousLogin && provider },
     { name: 'Codex app-server integration', ready: codexLogin && externalReady },
@@ -215,13 +238,82 @@ function formatDefaultBundleProposal(): string[] {
   ];
 }
 
+/** Check the default plugin group's required/optional connector declarations against the runtime catalog. */
+export function validateDefaultPluginServiceKeys(
+  group: readonly { id: string; requiredServiceKeys: readonly string[]; optionalServiceKeys: readonly string[] }[] = DEFAULT_PLUGIN_GROUP,
+  catalog: readonly Pick<ServiceKeyCatalogEntry, 'id' | 'kind'>[] = SERVICE_KEY_CATALOG,
+): string[] {
+  const errors: string[] = [];
+  const catalogIds = new Set<string>();
+  for (const item of catalog) {
+    if (catalogIds.has(item.id)) errors.push(`중복 서비스 카탈로그 id: ${item.id}`);
+    catalogIds.add(item.id);
+  }
+  for (const plugin of group) {
+    const required = new Set<string>();
+    const optional = new Set<string>();
+    for (const id of plugin.requiredServiceKeys) {
+      if (required.has(id)) errors.push(`${plugin.id}: 필수 키 중복 ${id}`);
+      required.add(id);
+    }
+    for (const id of plugin.optionalServiceKeys) {
+      if (optional.has(id)) errors.push(`${plugin.id}: 선택 키 중복 ${id}`);
+      optional.add(id);
+      if (required.has(id)) errors.push(`${plugin.id}: required/optional 중복 ${id}`);
+    }
+    for (const id of [...required, ...optional]) {
+      const item = catalog.find(candidate => candidate.id === id);
+      if (!item) errors.push(`${plugin.id}: 서비스 카탈로그에 없는 키 ${id}`);
+      else if (item.kind !== 'api-key') errors.push(`${plugin.id}: API 키가 아닌 서비스 참조 ${id} (${item.kind})`);
+    }
+  }
+  return errors;
+}
+
+function commandAvailable(command: string): boolean {
+  const path = process.env.PATH ?? '';
+  return path.split(delimiter).some(directory => {
+    try { accessSync(join(directory, command), constants.X_OK); return true; } catch { return false; }
+  });
+}
+
+function formatDefaultPluginStatuses(statuses: readonly DefaultPluginStatus[]): string[] {
+  return [
+    'Setup: 기본 플러그인 묶음 상태 (실제 키·선행 조건)',
+    ...statuses.map(plugin => {
+      const missing = [
+        ...(plugin.missingRequiredKeys.length ? [`필수 키 ${plugin.missingRequiredKeys.join(', ')}`] : []),
+        ...(plugin.missingPrerequisites.length ? [`선행 조건 ${plugin.missingPrerequisites.join(', ')}`] : []),
+      ];
+      const optional = plugin.optionalKeysMissing.length
+        ? ` · 선택 키 미설정 ${plugin.optionalKeysMissing.join(', ')}` : '';
+      return `${plugin.status === 'ready' ? '✓' : '○'} ${plugin.label}: ${plugin.status}${missing.length ? ` · ${missing.join(' · ')}` : ''}${optional}`;
+    }),
+  ];
+}
+
+async function readDefaultPluginStatuses(deps: SetupCliDeps): Promise<DefaultPluginStatus[]> {
+  const catalogErrors = validateDefaultPluginServiceKeys();
+  if (catalogErrors.length) throw new Error(`기본 플러그인 서비스 카탈로그 오류: ${catalogErrors.join('; ')}`);
+  const keys = (deps.getServiceKeyStatus ?? serviceKeyStatus)()
+    .filter(item => item.configured).map(item => item.id);
+  const providers = await (deps.detectProviders ?? detectProviders)();
+  const prerequisites = new Set<string>();
+  if (providers.some(provider => provider.available && provider.auth !== 'agent-cli')) prerequisites.add('llm-provider');
+  if ((deps.isCommandAvailable ?? commandAvailable)('aside')) prerequisites.add('aside');
+  if ((deps.isCommandAvailable ?? commandAvailable)('claude')) prerequisites.add('claude-cli');
+  if ((deps.isCommandAvailable ?? commandAvailable)('gh')) prerequisites.add('github-cli');
+  return defaultPluginStatuses({ readyServiceKeyIds: keys, satisfiedPrerequisites: [...prerequisites] });
+}
+
 export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}): void {
   const out = deps.out ?? { log: (value: string) => console.log(value), error: (value: string) => console.error(value) };
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
   const doctorRunner = deps.runDoctor ?? runDoctor;
   const isFirstRunSetup = (): boolean => deps.firstRunTopics ?? (!deps.getUserConfig && !existsSync(userConfigPath()));
-  const showDefaultBundleProposal = (): void => {
+  const showDefaultBundleProposal = async (): Promise<void> => {
     for (const line of formatDefaultBundleProposal()) out.log(line);
+    for (const line of formatDefaultPluginStatuses(await readDefaultPluginStatuses(deps))) out.log(line);
   };
   const showCliSkills = (apply: boolean) => {
     out.log('Setup: CLI skills (public GitHub repository reads remain available without login)');
@@ -233,6 +325,8 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try { return await rl.question(message); } finally { rl.close(); }
   });
+  // API keys must never fall back to the ordinary (echoing) setup prompt.
+  const askSecret = deps.promptSecret ?? createSecretPrompt();
 
   const setup = program.command('setup')
     .description('Check OpenAI Codex setup and guide each missing credential step')
@@ -243,7 +337,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       if (opts.nonInteractive) {
         out.log(formatSetupReport(doctor, setupSteps(deps), true));
         showCliSkills(false);
-        if (isFirstRunSetup()) showDefaultBundleProposal();
+        if (isFirstRunSetup()) await showDefaultBundleProposal();
         for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
         setExitCode(0);
         return;
@@ -268,7 +362,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       }
       out.log(formatSetupReport(doctor, steps, false));
       showCliSkills(false);
-      if (isFirstRun) showDefaultBundleProposal();
+      if (isFirstRun) await showDefaultBundleProposal();
       for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
       let configured = (deps.getUserConfig ?? getUserConfig)();
       if (!configured.starter?.topics && configured.watch?.enabled !== false
@@ -312,6 +406,31 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         return;
       }
       setExitCode(0);
+    });
+
+  setup.command('service-keys')
+    .description('Import and verify service API keys without rendering their values')
+    .action(async () => {
+      if (!isStdinTty()) {
+        (out.error ?? out.log)('키 설정은 stdin TTY가 있는 자리에서만 실행할 수 있다.');
+        setExitCode(1);
+        return;
+      }
+      try {
+        const results = await collectServiceKeys({
+          config: (deps.getUserConfig ?? getUserConfig)(),
+          promptSecret: askSecret,
+          print: out.log,
+          getSecret: deps.getSecretAsync,
+          setSecret: deps.setSecretAsync,
+          probe: deps.probeKey,
+        });
+        printKeySetupReport(results, out.log);
+        setExitCode(results.some((result) => result.status === 'failed') ? 1 : 0);
+      } catch {
+        (out.error ?? out.log)('키 설정을 완료하지 못했습니다. 민감한 오류 내용은 숨겼습니다.');
+        setExitCode(1);
+      }
     });
 
   setup.command('claude-code')
@@ -361,6 +480,47 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         debug.log('setup.claude-code', 'failed', { ready, needed, executed, mcpVerified });
+        (out.error ?? out.log)(message.replace(/\r?\n/g, ' '));
+        setExitCode(1);
+      }
+    });
+
+  setup.command('keys')
+    .description('Set up service credentials without printing secret values')
+    .option('--status', 'Show credential presence only')
+    .option('--import-env-file <path>', 'Import catalogued keys from a dotenv file')
+    .option('--paste-env', 'Paste a dotenv block into a hidden terminal prompt')
+    .option('--all', 'Include optional service keys during interactive setup; --status always shows all services')
+    .action(async (opts: { status?: boolean; importEnvFile?: string; pasteEnv?: boolean; all?: boolean }) => {
+      const keyConfig = (deps.getUserConfig ?? getUserConfig)();
+      const keyOptions = { config: keyConfig, includeOptional: opts.all === true };
+      try {
+        if (opts.status) {
+          if (opts.all) throw new Error('--status already shows the full catalog; omit --all');
+          for (const line of renderServiceKeyStatus()) out.log(line);
+          for (const line of formatDefaultPluginStatuses(await readDefaultPluginStatuses(deps))) out.log(line);
+          setExitCode(0);
+          return;
+        }
+        let text: string | undefined;
+        if (opts.importEnvFile) text = readFileSync(opts.importEnvFile, 'utf8');
+        else if (opts.pasteEnv) {
+          if (!isStdinTty()) throw new Error('hidden paste import requires a terminal');
+          text = await readMaskedServiceEnvPaste();
+        }
+        if (text !== undefined) {
+          const parsed = parseServiceKeyEnv(text);
+          const result = await importServiceKeys(parsed, { print: (line) => out.log(line) }, keyOptions);
+          setExitCode(result.rejected.length ? 1 : 0);
+          return;
+        }
+        if (!isStdinTty()) throw new Error('secret input requires a terminal; use --import-env-file for a protected dotenv file');
+        const io = realIO();
+        try { await runSetupKeys(io, keyOptions); }
+        finally { io.close(); }
+        setExitCode(0);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'setup keys failed';
         (out.error ?? out.log)(message.replace(/\r?\n/g, ' '));
         setExitCode(1);
       }

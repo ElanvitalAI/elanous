@@ -20,8 +20,8 @@ function authorized(request: Request, token: string): boolean {
   return expected.length > 0 && received.length === expected.length && timingSafeEqual(received, expected);
 }
 
-function addressed(message: Message, to: string): boolean {
-  return message.to === to || (message.to === 'ALL' && message.from !== to);
+function addressed(message: Message, to: string, store: MsgStore): boolean {
+  return message.to === to || (message.to === 'ALL' && message.from !== to) || store.isGroupDelivery(message, to);
 }
 
 /** The SQLite ledger remains authoritative; this independent process only accelerates delivery. */
@@ -42,7 +42,7 @@ export function startMsgSseServer(input: {
   let maxQueuedEvents = 0;
   let scanned = input.store.latestId();
   const send = (subscriber: Subscriber, message: Message) => {
-    if (message.id <= subscriber.lastId || !addressed(message, subscriber.to)) return;
+    if (message.id <= subscriber.lastId || !addressed(message, subscriber.to, input.store)) return;
     if ((subscriber.controller.desiredSize ?? 0) < -256) throw new Error('slow SSE subscriber; reconnect for ledger replay');
     subscriber.controller.enqueue(encoder.encode(`id: ${message.id}\ndata: ${JSON.stringify(message)}\n\n`));
     maxQueuedEvents = Math.max(maxQueuedEvents, Math.max(0, 1 - (subscriber.controller.desiredSize ?? 0)));

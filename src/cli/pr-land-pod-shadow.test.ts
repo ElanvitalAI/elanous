@@ -85,6 +85,18 @@ test('enabled logs disagreeing Pod verdict without changing local verdict', asyn
   expect(result).toBe(local);
 });
 
+test('shadow evidence callback records agreement but cannot change the landing verdict', async () => {
+  const h = harness(() => pod);
+  let observation: { pod: unknown; agree: boolean } | undefined;
+  const result = await runHeavyOnPodShadow({
+    enabled: true, pr: 7, head: 'deadbeef', local, runPod: h.runPod, log: h.log, warn: h.warn,
+    onShadow: (value) => { observation = value; throw new Error('journal unavailable'); },
+  });
+  expect(observation).toEqual({ pod, agree: true });
+  expect(h.warns).toEqual(['shadow evidence write failed: journal unavailable']);
+  expect(result).toBe(local);
+});
+
 test('pod throw only warns and keeps local verdict', async () => {
   const h = harness(() => {
     throw new Error('pod-down');

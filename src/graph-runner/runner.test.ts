@@ -189,6 +189,22 @@ function fixture(command: string, loop = false): { graph: string; root: string }
   return { graph, root };
 }
 
+test('aborting a graph cancels the active command and prevents dispatch of later nodes', async () => {
+  const { graph, root } = fixture('sleep 30');
+  const controller = new AbortController();
+  let commandSignal: AbortSignal | undefined;
+  const running = runGraph(graph, { signal: controller.signal, deps: { root, runBash: async (_command, options) => {
+    commandSignal = options.signal;
+    return new Promise((resolve, reject) => options.signal?.addEventListener('abort', () => reject(new Error('command aborted')), { once: true }));
+  } } });
+  await Bun.sleep(0);
+  controller.abort();
+  const run = await running;
+  expect(commandSignal).toBe(controller.signal);
+  expect(run).toMatchObject({ status: 'failed', reason: 'cancelled', path: ['first'] });
+  expect(run.path).not.toContain('second');
+});
+
 // A real ledger resolves release versions from git (seconds); park tests only need a card id.
 function fakeGrowthDecision() {
   const entries: DecisionEntry[] = [];
@@ -224,7 +240,7 @@ edges:
   return { graph, root };
 }
 
-function unitFixture(innerSteps = 3): { graph: string; root: string; unit: string } {
+function unitFixture(innerSteps = 3, parentAllowance?: number, callAllowance?: number): { graph: string; root: string; unit: string } {
   const root = mkdtempSync(join(tmpdir(), 'graph-unit-'));
   dirs.push(root);
   const unitDir = join(root, 'units');
@@ -239,7 +255,8 @@ function unitFixture(innerSteps = 3): { graph: string; root: string; unit: strin
   writeFileSync(graph, `graph_id: parent
 version: 1
 entry_node: invoke
-terminal_nodes: [done, failed]
+terminal_nodes: ${parentAllowance === undefined ? '[done, failed]' : '[done, failed, needs-human]'}
+${parentAllowance === undefined ? '' : `allowance: { inner_steps: ${parentAllowance} }\n`}
 nodes:
   - node_id: invoke
     kind: subgraph
@@ -247,21 +264,24 @@ nodes:
     max_visits: 1
     call: worker@1
     budget: { inner_steps: ${innerSteps} }
+${callAllowance === undefined ? '' : `    allowance: { inner_steps: ${callAllowance} }\n`}
     contract: { inputs: [request], tools: read-only, outputs: [answer] }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
+${parentAllowance === undefined ? '' : '  - { node_id: needs-human, kind: gate, max_visits: 1 }\n'}
 edges:
-  - { from: invoke, on: outcome, map: { done: done, failed: failed } }
+  - { from: invoke, on: outcome, map: { done: done, failed: failed${parentAllowance === undefined ? '' : ', needs-human: needs-human, rework: needs-human'} } }
 `);
   writeFileSync(unit, `graph_id: worker
 version: 1
-unit: { inputs: [request], outputs: [answer], exits: [done, failed] }
+unit: { inputs: [request], outputs: [answer], exits: ${parentAllowance === undefined ? '[done, failed]' : '[done, failed, needs-human, rework]'} }
 entry_node: produce
-terminal_nodes: [done, failed]
+terminal_nodes: ${parentAllowance === undefined ? '[done, failed]' : '[done, failed, needs-human, rework]'}
 nodes:
   - { node_id: produce, kind: agent, recipe: 'cmd:produce', max_visits: 1 }
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+${parentAllowance === undefined ? '' : '  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }\n'}
 edges:
   - { from: produce, on: outcome, map: { ok: done, fail: failed } }
 `);
@@ -306,6 +326,173 @@ test('subgraph runs a child with contracted input/output and linked ledgers plus
   ]);
   expect(debug.events(500).filter(entry => entry.category === 'graph.unit' &&
     (entry.data as { runId?: string })?.runId === parent.runId).map(entry => entry.event)).toEqual(['enter', 'exit']);
+});
+
+test('GRAPH-UNIT-SPAN-DURATION: one unit visit carries monotonic enter/exit stamps and a non-negative duration', async () => {
+  const { graph, root } = unitFixture();
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  let clock = 5_000;
+  const parent = await runGraph(graph, { runId: 'parent-span', input: { request: 'hello' }, deps: { root,
+    monotonicMs: () => { const now = clock; clock += 250; return now; },
+    log: (event, data) => { events.push({ event, data }); },
+  } });
+  expect(parent.status).toBe('done');
+  expect(parent.path).toEqual(['invoke', 'done']);
+  const unitEvents = events.filter(entry => entry.event === 'graph.unit');
+  const enter = unitEvents.find(entry => entry.data.phase === 'enter');
+  const exit = unitEvents.find(entry => entry.data.phase === 'exit')!;
+  const childRunId = parent.unitCalls![0]!.childRunId;
+  // Same (runId, unit, visit): the two originals name the same visit and carry its bounds.
+  expect(enter?.data).toMatchObject({ runId: parent.runId, childRunId, nodeId: 'invoke', unit: 'worker', visit: 1, enteredAtMs: 5_000 });
+  expect(exit.data).toMatchObject({ runId: parent.runId, childRunId, nodeId: 'invoke', unit: 'worker', visit: 1,
+    enteredAtMs: 5_000, exitedAtMs: 5_250, durationMs: 250 });
+  const durationMs = exit.data.durationMs as number;
+  expect(durationMs).toBe((exit.data.exitedAtMs as number) - (enter?.data.enteredAtMs as number));
+  expect(durationMs).toBeGreaterThanOrEqual(0);
+  // The span rides the ledger entry the run persists, not only the event stream.
+  expect(parent.unitCalls![0]).toMatchObject({ visit: 1, enteredAtMs: 5_000, exitedAtMs: 5_250, durationMs });
+  expect(JSON.parse(readFileSync(parent.statePath, 'utf8')).unitCalls[0])
+    .toMatchObject({ visit: 1, enteredAtMs: 5_000, exitedAtMs: 5_250, durationMs });
+  expect(debug.events(500).filter(entry => entry.category === 'graph.unit' &&
+    (entry.data as { runId?: string }).runId === parent.runId)
+    .map(entry => ({ event: entry.event, visit: (entry.data as { visit?: number }).visit })))
+    .toEqual([{ event: 'enter', visit: 1 }, { event: 'exit', visit: 1 }]);
+  // Replayable receipt for the cell's «실물» box: GRAPH_UNIT_SPAN_RECEIPT=1 prints the
+  // enter/exit originals of this production run and the duration computed from them.
+  if (process.env.GRAPH_UNIT_SPAN_RECEIPT === '1') {
+    console.log(`[span] enter ${JSON.stringify(enter?.data)}`);
+    console.log(`[span] exit ${JSON.stringify(exit.data)}`);
+    console.log(`[span] duration ${JSON.stringify({ runId: parent.runId, unit: 'worker', visit: 1,
+      entered: enter?.data.enteredAtMs, exited: exit.data.exitedAtMs, durationMs })}`);
+  }
+});
+
+test('GRAPH-UNIT-SPAN-DURATION: a clock that runs backwards clamps the visit duration to zero', async () => {
+  const { graph, root } = unitFixture();
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const readings = [9_000, 8_000];
+  let cursor = 0;
+  const parent = await runGraph(graph, { runId: 'parent-span-backwards', input: { request: 'hello' }, deps: { root,
+    monotonicMs: () => readings[Math.min(cursor++, readings.length - 1)]!,
+    log: (event, data) => { events.push({ event, data }); },
+  } });
+  expect(parent.status).toBe('done');
+  const exit = events.find(entry => entry.event === 'graph.unit' && entry.data.phase === 'exit')!;
+  expect(exit.data).toMatchObject({ visit: 1, enteredAtMs: 9_000, exitedAtMs: 8_000, durationMs: 0 });
+  expect(parent.unitCalls![0]).toMatchObject({ visit: 1, enteredAtMs: 9_000, exitedAtMs: 8_000, durationMs: 0 });
+});
+
+test('GRAPH-UNIT-SPAN-DURATION: two visits of one unit get distinct visit ids and their own span', async () => {
+  const { graph, root } = unitFixture();
+  writeFileSync(graph, `graph_id: parent
+version: 1
+entry_node: first
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: first
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: worker@1
+    budget: { inner_steps: 3 }
+    contract: { inputs: [request], tools: read-only, outputs: [answer] }
+  - node_id: second
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: worker@1
+    budget: { inner_steps: 3 }
+    contract: { inputs: [request], tools: read-only, outputs: [answer] }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: first, on: outcome, map: { done: second, failed: failed } }
+  - { from: second, on: outcome, map: { done: done, failed: failed } }
+`);
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  let clock = 1_000;
+  const parent = await runGraph(graph, { runId: 'parent-span-twice', input: { request: 'hello' },
+    deps: { root, monotonicMs: () => { const now = clock; clock += 250; return now; },
+      log: (event, data) => { events.push({ event, data }); } } });
+  expect(parent.status).toBe('done');
+  expect(parent.path).toEqual(['first', 'second', 'done']);
+  expect(parent.unitCalls!.map(call => call.visit)).toEqual([1, 2]);
+  expect(new Set(parent.unitCalls!.map(call => call.childRunId)).size).toBe(2);
+  const spans = events.filter(entry => entry.event === 'graph.unit' && entry.data.phase !== undefined)
+    .map(entry => entry.data as { phase: string; visit: number; enteredAtMs: number; exitedAtMs?: number; durationMs?: number });
+  expect(spans.map(span => `${span.phase}:${span.visit}`)).toEqual(['enter:1', 'exit:1', 'enter:2', 'exit:2']);
+  for (const visit of [1, 2]) {
+    const enter = spans.find(span => span.phase === 'enter' && span.visit === visit)!;
+    const exit = spans.find(span => span.phase === 'exit' && span.visit === visit)!;
+    expect(exit.enteredAtMs).toBe(enter.enteredAtMs);
+    expect(exit.durationMs).toBe(exit.exitedAtMs! - enter.enteredAtMs);
+    expect(exit.durationMs).toBeGreaterThanOrEqual(0);
+    expect(parent.unitCalls![visit - 1]).toMatchObject({ visit, enteredAtMs: enter.enteredAtMs, durationMs: exit.durationMs });
+  }
+  expect(spans[1]!.exitedAtMs!).toBeLessThan(spans[2]!.enteredAtMs!);
+});
+
+test('GRAPH-UNIT-SPAN-DURATION: a resumed run continues the visit sequence instead of reusing visit 1', async () => {
+  const { graph, root } = unitFixture();
+  writeFileSync(join(root, 'recipes.yaml'), "post:\n  command: 'printf posted'\n");
+  writeFileSync(graph, readFileSync(graph, 'utf8')
+    .replace('    max_visits: 1\n    call: worker@1', '    max_visits: 2\n    call: worker@1')
+    .replace('  - { node_id: done', "  - { node_id: post, kind: agent, recipe: 'cmd:post', max_visits: 2 }\n  - { node_id: done")
+    .replace('edges:\n  - { from: invoke, on: outcome, map: { done: done, failed: failed } }',
+      'edges:\n  - { from: invoke, on: outcome, map: { done: post, failed: failed } }\n  - { from: post, on: outcome, map: { ok: done, fail: failed } }'));
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  let postRuns = 0;
+  let clock = 1_000;
+  const deps = { root,
+    monotonicMs: () => { const now = clock; clock += 100; return now; },
+    log: (event: string, data: Record<string, unknown>) => { events.push({ event, data }); },
+    runBash: async (body: string) => body === 'printf posted'
+      ? { stdout: 'posted', stderr: '', exitCode: postRuns++ === 0 ? 1 : 0 }
+      : { stdout: JSON.stringify({ answer: 'world' }), stderr: '', exitCode: 0 } };
+  const first = await runGraph(graph, { runId: 'parent-span-resume', input: { request: 'hello' }, deps });
+  expect(first.status).toBe('failed');
+  expect(first.unitCalls!.map(call => call.visit)).toEqual([1]);
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'invoke', deps });
+  expect(resumed.status).toBe('done');
+  // A restart rewinds the ledger, but the same runId must not hand out visit 1 twice:
+  // the two lifetimes of this run are two distinct (runId, unit, visit) spans.
+  expect(resumed.unitCalls!.map(call => call.visit)).toEqual([2]);
+  const visitIds = events.filter(entry => entry.event === 'graph.unit' && entry.data.phase === 'enter')
+    .map(entry => (entry.data as { visit: number }).visit);
+  expect(visitIds).toEqual([1, 2]);
+  const resumedCall = resumed.unitCalls![0]!;
+  expect(resumedCall.durationMs).toBe(resumedCall.exitedAtMs! - resumedCall.enteredAtMs!);
+  expect(resumedCall.durationMs).toBeGreaterThanOrEqual(0);
+});
+
+test('child allowance clamps to the parent remainder and records the clamp before the child runs', async () => {
+  const { graph, root } = unitFixture(8, 3, 6);
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const result = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => ({ stdout: '{"answer":"world"}', stderr: '', exitCode: 0 }),
+    log: (event, data) => { events.push({ event, data }); },
+  } });
+  expect(result.status).toBe('done');
+  expect(result.path).toEqual(['invoke', 'done']);
+  expect(result.unitCalls?.[0]?.steps).toBe(2);
+  expect(events.find(entry => entry.event === 'graph.unit' && entry.data.phase === 'allowance-clamped')?.data)
+    .toMatchObject({ requested: 6, granted: 2, remaining: 2 });
+});
+
+test('zero inherited allowance skips child execution and follows needs-human', async () => {
+  const { graph, root } = unitFixture(8, 1);
+  let executions = 0;
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const result = await runGraph(graph, { input: { request: 'hello' }, deps: { root,
+    runBash: async () => { executions++; return { stdout: '{"answer":"world"}', stderr: '', exitCode: 0 }; },
+    log: (event, data) => { events.push({ event, data }); },
+  } });
+  expect(result.status).toBe('failed');
+  expect(result.path).toEqual(['invoke', 'needs-human']);
+  expect(executions).toBe(0);
+  expect(result.unitCalls).toBeUndefined();
+  expect(JSON.parse(result.nodes[0]!.output as string)).toEqual({ outcome: 'needs-human' });
+  expect(events.some(entry => entry.event === 'graph.unit' && entry.data.phase === 'allowance-exhausted' && entry.data.remaining === 0)).toBe(true);
 });
 
 test('subgraph prior input receives the previous node result', async () => {

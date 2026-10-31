@@ -185,6 +185,7 @@ export interface SessionRuntimeDispatchDeps {
     dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
     workingDirectory: string;
   };
+  inheritGeneralPurposeToolCatalog?: boolean;
   searchPlannerState?: SearchPlannerState;
   /** CC (2026-04-25) — forwarded from the LLM router's dispatch ctx
    *  (`turnIndex`). Lets the planner allow same-turn parallel fan-out
@@ -439,6 +440,7 @@ interface SessionNativeToolRule {
         dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
         workingDirectory: string;
       };
+      inheritGeneralPurposeToolCatalog?: boolean;
     },
   ): Promise<unknown>;
   /** ⛔ Opt-IN to the ToolRuntime registry path instead of `dispatch` above.
@@ -520,6 +522,7 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
       hostTools: opts?.agentHostTools,
       dispatchTool: opts?.agentDispatchTool,
       buildChildToolCatalog: opts?.buildChildToolCatalog,
+      inheritGeneralPurposeToolCatalog: opts?.inheritGeneralPurposeToolCatalog,
     }),
     preferRuntime: true,
   },
@@ -843,7 +846,7 @@ const SESSION_SURFACE_PROFILES: Record<SessionSurfaceId, Omit<SessionSurfaceProf
     baselineContexts: ['external-world-guidance'],
     defaultHostFamilyIds: ['self-ops'],
     defaultRuntimeFamilyIds: [],
-    defaultNativeFamilyIds: ['web-search'],
+    defaultNativeFamilyIds: ['web-search', 'deep-research', 'web-fetch'],
   },
   'control/agent': {
     id: 'control/agent',
@@ -1811,6 +1814,38 @@ function buildEssentialSessionRuntimeToolSpecs(opts: {
   return [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...mcpProxySpecs, ...optionalSpecs];
 }
 
+/** Build the full TUI-visible catalog for Agent children. The parent model's
+ *  turn catalog is intentionally surface/tier narrowed; children inherit the
+ *  available TUI catalog instead, while `dispatchSessionRuntimeTool` remains
+ *  the policy boundary and `dispatchAgent` still strips recursive Agent. */
+export function buildSubagentSessionRuntimeToolSpecs(opts: {
+  hostTools: readonly LLMToolDef[];
+  runtimeTools: readonly ToolRuntime<Record<string, unknown>, ToolRunResult>[];
+  optionalTools: readonly LLMToolSpec[];
+  toolAvailability?: Readonly<Record<string, boolean>>;
+}): LLMToolSpec[] {
+  const nativeSpecs = SESSION_NATIVE_TOOL_RULES.flatMap(rule => {
+    const spec = rule.build();
+    const catalogEntry = findNativeTool(spec.name);
+    return (!catalogEntry || isNativeToolModelExposed(catalogEntry))
+      && isNativeToolAvailable(spec.name, rule, opts.toolAvailability)
+      ? [spec]
+      : [];
+  });
+  const hostSpecs = opts.hostTools
+    .filter(tool => isToolAvailable(tool.name, opts.toolAvailability))
+    .map(toSpec);
+  const runtimeSpecs = opts.runtimeTools
+    .filter(tool => isToolAvailable(tool.spec.name, opts.toolAvailability))
+    .map(tool => tool.spec);
+  const optionalSpecs = opts.optionalTools
+    .filter(tool => isToolAvailable(tool.name, opts.toolAvailability));
+  return [...new Map(
+    [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...optionalSpecs]
+      .map(spec => [spec.name, spec] as const),
+  ).values()];
+}
+
 export function buildSessionRuntimeToolSpecs(opts: {
   userText: string;
   hostTools: readonly LLMToolDef[];
@@ -2122,6 +2157,7 @@ export async function dispatchSessionRuntimeTool(
         agentHostTools: deps.agentHostTools,
         agentDispatchTool: deps.agentDispatchTool,
         buildChildToolCatalog: deps.buildChildToolCatalog,
+        inheritGeneralPurposeToolCatalog: deps.inheritGeneralPurposeToolCatalog,
       });
     }
     rememberCandidateListingResult(name, normalizedArgs, result, scopedAnalysis, deps.searchPlannerState);

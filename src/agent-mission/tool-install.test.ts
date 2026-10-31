@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { detectAgentCli, installMissingTool, smokeCheck, SMOKE_CHECKS, waitForPtyCompletion, type ToolInstallDeps } from './tool-install.js';
+import { detectAgentCli, installMissingTool, prepareAgentCli, smokeCheck, SMOKE_CHECKS, waitForPtyCompletion, type ToolInstallDeps } from './tool-install.js';
 import { remediesFor, toolInstallLine } from '../cli/doctor-distro.js';
 
 const noSideEffects = {
@@ -40,8 +40,8 @@ test('agent CLI detection follows PATH from absent to present and reports login 
     writeFileSync(codex, '#!/bin/sh\ncase "$1" in\n  --version) echo "codex 9.8.7" ;;\n  login) echo "Logged in" ;;\n  *) exit 2 ;;\nesac\n');
     chmodSync(codex, 0o755);
     expect(detectAgentCli('codex', { env })).toEqual({
-      agent: 'codex', installed: true, executable: 'present', login: 'ready',
-      message: 'codex: 설치됨, 로그인 확인됨',
+      agent: 'codex', installed: true, version: '9.8.7', executable: 'present', login: 'ready',
+      message: 'codex: 설치됨 v9.8.7 · 로그인 확인됨',
     });
   } finally {
     rmSync(bin, { recursive: true, force: true });
@@ -80,14 +80,20 @@ test('agent CLI detection treats an empty PATH segment as the current directory'
   }
 });
 
-test.each(['codex 1.2.3-secret-token', 'codex 1.2.1234567890123456'])('agent CLI detection never returns raw version output: %s', (stdout) => {
+test.each([
+  ['codex 1.2.3-secret-token', '1.2.3', 'codex: 설치됨 v1.2.3 · 로그인 확인됨'],
+  ['codex 1.2.1234567890123456', undefined, 'codex: 실행 파일 있음, 버전 확인 불가'],
+] as const)('agent CLI detection never returns raw version output: %s', (stdout, version, message) => {
   const result = detectAgentCli('codex', {
     env: { ...process.env, PATH: '/bin' },
     runCli: (_command, args) => args[0] === '--version'
       ? { status: 0, stdout } as ReturnType<typeof import('node:child_process').spawnSync>
       : { status: 0, stdout: 'Logged in' } as ReturnType<typeof import('node:child_process').spawnSync>,
   });
-  expect(result).toMatchObject({ installed: true, message: 'codex: 설치됨, 로그인 확인됨' });
+  expect(result.message).toBe(message);
+  if (version) expect(result).toMatchObject({ installed: true, executable: 'present', login: 'ready' });
+  else expect(result).toMatchObject({ installed: null, executable: 'present', login: 'unknown' });
+  expect(result.version).toBe(version);
   expect(JSON.stringify(result)).not.toContain(stdout.replace('codex ', ''));
   expect(JSON.stringify(result)).not.toContain('secret-token');
 });
@@ -134,6 +140,77 @@ test('agent CLI detection reports Claude login state without leaking auth probe 
   expect(JSON.stringify(result)).not.toContain('secret-auth-value');
 });
 
+test('prepareAgentCli asks once, runs the injected official Codex installer, and verifies the new version and login', async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'agent-cli-install-flow-'));
+  try {
+    const env = { ...process.env, PATH: bin, HOME: tmpdir() };
+    const codex = join(bin, 'codex');
+    const order: string[] = [];
+    const statuses: string[] = [];
+    const result = await prepareAgentCli('codex', {
+      env,
+      onStatus: (line) => { statuses.push(line); },
+      confirmInstall: (prompt) => {
+        order.push(prompt);
+        return true;
+      },
+      install: (command, args, options) => {
+        order.push(`${command} ${args.join(' ')}`);
+        expect(options.env.PATH).toBe(bin);
+        expect(options.env.OPENAI_API_KEY).toBeUndefined();
+        writeFileSync(codex, '#!/bin/sh\ncase "$1" in\n  --version) echo "Codex 0.123.4" ;;\n  login) echo "Logged in using ChatGPT" ;;\n  *) exit 2 ;;\nesac\n');
+        chmodSync(codex, 0o755);
+        return { status: 0 };
+      },
+    });
+    expect(result).toMatchObject({ ready: true, installation: 'installed', detection: { installed: true, version: '0.123.4', login: 'ready' } });
+    expect(order).toEqual([
+      '설치할까요? npm install -g @openai/codex@latest',
+      'npm install -g @openai/codex@latest',
+    ]);
+    expect(statuses).toEqual(['codex: 설치되지 않음', 'codex: 설치됨 v0.123.4 · 로그인 확인됨']);
+  } finally {
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test('prepareAgentCli launches an already installed CLI without asking or reinstalling', async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'agent-cli-already-installed-'));
+  try {
+    const codex = join(bin, 'codex');
+    writeFileSync(codex, '#!/bin/sh\ncase "$1" in\n  --version) echo "Codex 1.2.3" ;;\n  login) echo "Logged in" ;;\n  *) exit 2 ;;\nesac\n');
+    chmodSync(codex, 0o755);
+    const result = await prepareAgentCli('codex', {
+      env: { ...process.env, PATH: bin },
+      confirmInstall: () => { throw new Error('installed CLI must not prompt'); },
+      install: () => { throw new Error('installed CLI must not reinstall'); },
+    });
+    expect(result).toMatchObject({ ready: true, installation: 'not-needed', detection: { installed: true, version: '1.2.3' } });
+  } finally {
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test('default installer runs asynchronously and rechecks the fake CLI before resolving', async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'agent-cli-async-installer-'));
+  try {
+    const npm = join(bin, 'npm');
+    writeFileSync(npm, '#!/bin/sh\n/bin/sleep 0.05\nbin=${0%/*}\nprintf \'#!/bin/sh\\ncase "$1" in\\n  --version) echo "Codex 0.123.4" ;;\\n  login) echo "Logged in using ChatGPT" ;;\\n  *) exit 2 ;;\\nesac\\n\' > "$bin/codex"\n/bin/chmod 755 "$bin/codex"\n', { mode: 0o755 });
+    chmodSync(npm, 0o755);
+    const order: string[] = [];
+    setTimeout(() => order.push('timer'), 0);
+    const result = await prepareAgentCli('codex', {
+      env: { ...process.env, PATH: bin },
+      confirmInstall: async () => true,
+      onStatus: (line) => { if (line.includes('로그인 확인됨')) order.push('verified'); },
+    });
+    expect(result).toMatchObject({ ready: true, installation: 'installed', detection: { version: '0.123.4', login: 'ready' } });
+    expect(order).toEqual(['timer', 'verified']);
+  } finally {
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
 test.each([
   ['not currently logged in', 'needed'],
   ['account status: Logged in', 'unknown'],
@@ -146,7 +223,7 @@ test.each([
   });
   expect(result).toMatchObject({ installed: true, login });
   if (login === 'api-key') expect(result.message).toContain('API 키 로그인됨 (구독 로그인 아님)');
-  if (login !== 'ready') expect(result.message).not.toContain('로그인 확인됨');
+  expect(result.message).not.toContain('로그인 확인됨');
 });
 
 test('Claude auth probe failures remain unknown and their stderr is never returned', () => {
@@ -154,7 +231,7 @@ test('Claude auth probe failures remain unknown and their stderr is never return
     env: { ...process.env, PATH: '/bin' },
     runCli: (_command, args) => args[0] === '--version'
       ? { status: 0, stdout: '2.1.3' } as ReturnType<typeof import('node:child_process').spawnSync>
-      : { status: null, stderr: 'secret-auth-value timed out', error: Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }) } as ReturnType<typeof import('node:child_process').spawnSync>,
+      : { status: null, stderr: 'secret-auth-value timed out', error: Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }) } as unknown as ReturnType<typeof import('node:child_process').spawnSync>,
   });
   expect(result).toMatchObject({ installed: true, executable: 'present', login: 'unknown' });
   expect(result.message).toContain('로그인 상태 확인 불가');

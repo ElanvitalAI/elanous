@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { addSource, dueSources, listSources, removeSource, runDue, sourcesFile } from './intake-sources.js';
 import { readStarSnapshots } from './collect-github.js';
 import { ingestIntakeItems, listIntakeItems, markIntakeItem } from './items.js';
+import { loadIntakeLedger } from './items.js';
+import { BriefItemsLedger, type AddBriefItem } from '../briefing/brief-items.js';
 
 const now = new Date('2026-10-01T12:00:00.000Z');
 function fixture(fn: (root: string) => Promise<void> | void) {
@@ -28,6 +30,116 @@ test('registry persists canonical seat, 0600 file, removal and due/expiration bo
   expect(dueSources(new Date('2026-10-02T00:00:00Z'), root).map((s) => s.id)).toEqual(['mk']);
   expect(removeSource('mk', root)).toBe(true);
   expect(removeSource('mk', root)).toBe(false);
+}));
+
+test('topic-search runs the research bridge seam, keeps parent Linear UUID in subscription/intake/brief, and stamps success', fixture(async (root) => {
+  const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  const source = addSource({ id: 'topic-linear', seat: 'MK', kind: 'topic-search', spec: 'battery storage', every: '1d',
+    scheduleCron: '0 8 * * *', linearIssueId }, root);
+  expect(listSources({}, root)[0]).toMatchObject({ kind: 'topic-search', linearIssueId });
+  const briefInputs: AddBriefItem[] = [];
+  const projected: Array<{ id: string; items: number }> = [];
+  const result = await runDue({ now, seat: 'MK', deps: {
+    stateDir: root,
+    searchTopic: async (topic) => {
+      expect(topic).toBe('battery storage');
+      return Array.from({ length: 5 }, (_, index) => ({ url: `https://example.com/storage-${index + 1}`,
+        title: `Storage outlook ${index + 1}`, text: 'Demand rising', kind: 'article' as const }));
+    },
+    addBriefItem: (input) => briefInputs.push(input),
+    projectTopicBriefing: async (registered, items) => { projected.push({ id: registered.id, items: items.length }); },
+  } });
+  expect(result.ran).toEqual([{ id: source.id, items: 5 }]);
+  expect([...loadIntakeLedger(root).items.values()]).toHaveLength(5);
+  expect([...loadIntakeLedger(root).items.values()][0]).toMatchObject({ source: 'topic-search', linearIssueId, seat: 'MK' });
+  expect(briefInputs).toHaveLength(5);
+  expect(briefInputs[0]).toMatchObject({ domain: '흡수', source: 'intake.topic-search:topic-linear', linearIssueId,
+    evidence: 'https://example.com/storage-1' });
+  // Test addBriefItem is a sink-only seam; production ledger projections are exercised with the concrete ledger below.
+  expect(projected).toEqual([]);
+  expect(listSources({}, root)[0]?.lastRunAt).toBe(now.toISOString());
+}));
+
+test('topic-search only accepts parent Linear UUID metadata', fixture((root) => {
+  expect(() => addSource({ id: 'bad-id', seat: 'MK', kind: 'topic-search', spec: 'topic', every: '1d', scheduleCron: '0 8 * * *', linearIssueId: 'ENG-123' }, root))
+    .toThrow('부모 Linear issue UUID');
+  expect(() => addSource({ id: 'wrong-kind', seat: 'MK', kind: 'rss', spec: 'https://example.com/feed', every: '1d',
+    linearIssueId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479' }, root)).toThrow('부모 Linear issue UUID');
+  expect(listSources({}, root)).toEqual([]);
+}));
+
+test('topic-search projects the persisted issue-linked briefing items after each scheduled source run', fixture(async (root) => {
+  const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  addSource({ id: 'topic-project', seat: 'MK', kind: 'topic-search', spec: 'HBM', every: '1w',
+    scheduleCron: '0 8 * * 1', linearIssueId }, root);
+  let projected: import('../briefing/brief-items.js').BriefItem[] = [];
+  const result = await runDue({ now, sourceId: 'topic-project', deps: { stateDir: root,
+    searchTopic: async () => [{ url: 'https://example.com/hbm', title: 'HBM order cut', text: 'Order cut announced' }],
+    projectTopicBriefing: async (_source, items) => { projected = [...items]; },
+  } });
+  expect(result.ran).toEqual([{ id: 'topic-project', items: 1 }]);
+  expect(projected).toHaveLength(1);
+  expect(projected[0]).toMatchObject({ linearIssueId, evidence: 'https://example.com/hbm', text: '새 토픽 자료: HBM order cut' });
+}));
+
+test('weekly topic-search retries an undelivered deduped item and does not lose it after a failed projection', fixture(async (root) => {
+  const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  addSource({ id: 'topic-weekly-dedupe', seat: 'MK', kind: 'topic-search', spec: 'HBM', every: '1w',
+    scheduleCron: '0 8 * * 1', linearIssueId }, root);
+  const projected: string[][] = [];
+  let failProjection = true;
+  const runAt = async (at: Date) => runDue({ now: at, sourceId: 'topic-weekly-dedupe', deps: {
+    stateDir: root,
+    searchTopic: async () => [{ url: 'https://example.com/hbm', title: 'HBM order update' }],
+    projectTopicBriefing: async (_source, items) => {
+      if (failProjection) { failProjection = false; throw new Error('temporary Linear outage'); }
+      if (items.length) projected.push(items.map(item => item.evidence ?? ''));
+    },
+  } });
+  const failed = await runAt(now);
+  expect(failed.ran).toEqual([{ id: 'topic-weekly-dedupe', items: 0, error: 'temporary Linear outage' }]);
+  expect(listSources({}, root)[0]?.lastRunAt).toBeUndefined();
+  await runAt(new Date(now.getTime() + 7 * 86_400_000));
+  expect(projected).toEqual([['https://example.com/hbm']]);
+  const afterRetry = new BriefItemsLedger({ stateDir: root });
+  expect(afterRetry.list().filter(item => item.linearIssueId === linearIssueId)).toHaveLength(1);
+  await runAt(new Date(now.getTime() + 14 * 86_400_000));
+  expect(projected).toEqual([['https://example.com/hbm'], ['https://example.com/hbm']]);
+  const ledger = new BriefItemsLedger({ stateDir: root });
+  expect(ledger.list().filter(item => item.linearIssueId === linearIssueId)).toHaveLength(2);
+}));
+
+test('source-id runDue scopes a scheduled fire and does not double-gate it on the source cadence', fixture(async (root) => {
+  const idA = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  const idB = 'b47ac10b-58cc-4372-a567-0e02b2c3d479';
+  addSource({ id: 'topic-a', seat: 'MK', kind: 'topic-search', spec: 'A', every: '1d', scheduleCron: '0 8 * * *', linearIssueId: idA }, root);
+  addSource({ id: 'topic-b', seat: 'MK', kind: 'topic-search', spec: 'B', every: '1d', scheduleCron: '0 9 * * *', linearIssueId: idB }, root);
+  const searched: string[] = [];
+  const result = await runDue({ now, sourceId: 'topic-b', deps: { stateDir: root,
+    searchTopic: async (topic) => { searched.push(topic); return [{ url: `https://example.test/${topic}`, title: topic }]; },
+    projectTopicBriefing: async () => {},
+    addBriefItem: () => undefined,
+  } });
+  expect(result.ran).toEqual([{ id: 'topic-b', items: 1 }]);
+  expect(searched).toEqual(['B']);
+  const scheduledFire = await runDue({ now: new Date(now.getTime() + 60 * 60_000), sourceId: 'topic-b', deps: { stateDir: root,
+    searchTopic: async (topic) => { searched.push(`${topic}-scheduled`); return []; }, addBriefItem: () => undefined,
+    projectTopicBriefing: async () => {},
+  } });
+  expect(scheduledFire.ran).toEqual([{ id: 'topic-b', items: 0 }]);
+  expect(searched).toEqual(['B', 'B-scheduled']);
+}));
+
+test('the shared intake-daily run skips per-topic sources unless their issue projector is enabled', fixture(async (root) => {
+  addSource({ id: 'topic-owned-schedule', seat: 'MK', kind: 'topic-search', spec: 'HBM', every: '1d',
+    scheduleCron: '0 8 * * *', linearIssueId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479' }, root);
+  let searches = 0;
+  const result = await runDue({ now, deps: { stateDir: root,
+    searchTopic: async () => { searches++; return [{ url: 'https://example.test/hbm' }]; },
+  } });
+  expect(result.ran).toEqual([]);
+  expect(searches).toBe(0);
+  expect(listSources({}, root)[0]?.lastRunAt).toBeUndefined();
 }));
 
 test('one failed command does not stamp itself or prevent two other due sources; seat-filtered ledger excludes legacy', fixture(async (root) => {

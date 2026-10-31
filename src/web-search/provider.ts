@@ -70,8 +70,11 @@ export interface WebSearchResult {
  *  a clear hint instead of treating it as a generic tool error. */
 export class WebSearchUnavailableError extends Error {
   constructor(public providers: string[], public reasons: string[]) {
+    const policyMessage = providers.length === 1 && reasons[0]?.startsWith('policy:') ? reasons[0]!.slice('policy:'.length) : undefined;
     super(
-      providers.length === 0
+      policyMessage
+        ? policyMessage
+        : providers.length === 0
         ? 'No web-search providers are registered. Register one via addWebSearchProvider() or enable the built-in Grok adapter by setting a Grok API key.'
         : `All registered web-search providers failed: ${providers.map((p, i) => `${p}: ${reasons[i] ?? 'unknown'}`).join('; ')}`,
     );

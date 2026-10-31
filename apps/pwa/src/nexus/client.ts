@@ -1002,7 +1002,7 @@ export interface HarnessTraversalStepWire {
   sourceSeq?: number;
 }
 export type HarnessGraphEventWire =
-  | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; trigger?: unknown; undo?: unknown }
+  | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; who?: string; what?: string; missionId?: string; trigger?: unknown; undo?: unknown }
   | { seq: number; ts: string; type: 'edge-rerouted'; from: string; outcome: string; to: string; was: string; decider: string; reason: string }
   | { seq: number; ts: string; type: 'unit-expanded'; node: string; unit: string; childRunId: string; resolution: number; decider: string; reason: string }
   | { seq: number; ts: string; type: 'unit-collapsed'; node: string; resolution: number; decider: string; reason: string };

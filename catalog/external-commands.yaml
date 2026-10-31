@@ -36,15 +36,17 @@ meta:
   # ⛔ 이 저장소의 `rg` 는 셸 함수 래퍼라 RG_REPLACE=1 없이는 --replace 를 막고
   #    그 거부가 「0건」으로 «보인다». 재현할 때 그 접두를 빼지 마라.
   command_count: 22
-  tier_counts: { required: 2, harness: 3, capability: 14, platform: 3 }
+  tier_counts: { required: 1, harness: 3, capability: 15, platform: 3 }
   unmeasured_breaks: 9   # ⛔ 「없다」가 아니라 「아무도 안 재 봤다」
 
 commands:
   - name: git
-    tier: required
+    tier: capability
     spawn_sites: 36
     used_for: worktrees, commits, diffs, every harness phase
-    breaks: elanous does not boot
+    breaks: >-
+      the core TUI still boots; repository, worktree, commit, diff, and harness
+      operations that invoke Git are unavailable
 
   - name: bun
     tier: required

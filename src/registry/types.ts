@@ -196,8 +196,7 @@ export interface ModelPatternFallback {
 // ── Top-level catalog (loader output) ─────────────────────────────────
 
 export interface Catalog {
-  /** Schema version — bumps when ProviderRegistration / ModelSpec
-   *  shape changes in a non-backwards-compat way. */
+  /** Catalog release version from catalog/meta/catalogVersion.yaml. */
   catalogVersion: number;
   /** Indexed by provider id. */
   providers: Map<string, ProviderRegistration>;

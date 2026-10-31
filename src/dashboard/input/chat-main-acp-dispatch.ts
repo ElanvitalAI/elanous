@@ -127,6 +127,29 @@ export function dispatchDashboardChatMainAcpSend(
       else interimBodyRanges.push({ start: assistantBodyStart, end: assistantBodyEnd });
       deps.setChatScrollToTail();
     },
+    replaceText: (fullText) => {
+      const insertionIndex = interimBodyRanges.length > 0
+        ? Math.min(...interimBodyRanges.map((range) => range.start))
+        : deps.chatLines.length;
+      for (const { start, end } of [...interimBodyRanges].reverse()) {
+        deps.chatLines.splice(start, end - start);
+      }
+      interimBodyRanges.length = 0;
+      accumulated = fullText;
+      firstChunk = false;
+      assistantTextActive = true;
+      assistantRunUsesPrefix = true;
+      assistantBodyText = fullText;
+      assistantBodyStart = insertionIndex;
+      const rendered = deps.formatAssistantLines(fullText);
+      rendered.forEach((line, index) => {
+        deps.chatLines.splice(insertionIndex + index, 0,
+          index === 0 ? `${deps.formatAssistantPrefix(display)} ${line}` : `  ${line}`);
+      });
+      assistantBodyEnd = insertionIndex + rendered.length;
+      interimBodyRanges.push({ start: insertionIndex, end: assistantBodyEnd });
+      deps.setChatScrollToTail();
+    },
     foldGoalInterim: (text) => {
       const verdict = classifyInterimReply(text.split('\n'));
       if (verdict.interim && interimBodyRanges.length > 0) {

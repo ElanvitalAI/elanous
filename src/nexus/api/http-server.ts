@@ -32,8 +32,10 @@ import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } fro
 import { SKILL_EXEC_PATH, createSkillExecJobs, type SkillExecJobs } from './skill-exec-route.js';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
 import { ensureAuthToken } from '../../auth/acp-token.js';
-import type { NexusState } from '../state/state.js';
+import { pushEvent, type NexusState } from '../state/state.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
+import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
 
 export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 import type { TabRegistry } from '../state/tab-registry.js';
@@ -497,6 +499,8 @@ export interface NexusHttpServerOpts {
   projectFolderRoots?: string[];
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
+  /** Mission-addressed hand line storage; production uses the current instance state root. */
+  missionLineRoot?: string;
   outputs?: OutputsDeps;
   /** Read-only grid measurement seam; omitted in production for live HQ and Pod pool reads. */
   grid?: GridDeps;
@@ -1008,6 +1012,38 @@ export async function routeRequest(
   registerAuthPeerAddress(req, (server as BunServerLike & {
     requestIP?: (request: Request) => { address: string } | null;
   }).requestIP?.(req)?.address);
+  // Mission lines use a scoped per-mission bearer issued by the mission
+  // parent, not the owner/API bearer checked by the general scope guard.
+  if (new URL(req.url).pathname.startsWith('/v1/missions/')) {
+    // MissionOutStore uses effectiveInstanceRoot too; share the resolver
+    // directly so custom ELANOUS_STATE_DIR/config-dir cannot split the token
+    // authority from the reply ledger.
+    const root = opts.missionLineRoot ?? effectiveInstanceRoot();
+    const response = await handleMissionLineRequest(req, root, async (input, authority) => {
+      const { createMissionOutStore, MissionReplyStateError } = await import('../../agent-mission/mission-out.js');
+      const reply = await createMissionOutStore(root).reply(input.missionId, input.text, input.type === 'final', {
+          lineId: input.lineId,
+          ...(input.runId ? { runId: input.runId } : {}), ...(input.ptyId ? { ptyId: input.ptyId } : {}),
+          ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+          attemptId: input.attemptId, agent: input.agent, lineType: input.type, source: input.source,
+          ...(input.kind ? { kind: input.kind } : {}),
+          ...(input.defaults ? { defaults: input.defaults } : {}),
+          ...(input.deadline ? { deadline: input.deadline } : {}),
+          ...(input.scope ? { scope: input.scope } : {}),
+          ...(input.stop !== undefined ? { stop: input.stop } : {}),
+          ...(input.priority ? { priority: input.priority } : {}),
+          ...(input.state ? { state: input.state } : {}), who: authority.who, what: authority.what,
+          ...(input.type === 'ask' || input.type === 'answer' || input.type === 'correct' ? { kind: input.type } : {}),
+        }).catch((error: unknown) => {
+        if (error instanceof MissionReplyStateError) throw new MissionLineHttpError(error.status);
+        throw error;
+      });
+      return { ...input, sequence: reply.sequence, createdAt: reply.createdAt, done: reply.done, ...(reply.deadline ? { deadline: reply.deadline } : {}), ...(reply.replyTo ? { replyTo: reply.replyTo } : {}), ...(reply.graphEvents ? { graphEvents: reply.graphEvents } : {}) };
+    }, (event) => {
+      pushEvent(opts.state, { kind: 'mission.line', detail: event as unknown as Record<string, unknown> });
+    });
+    if (response) return response;
+  }
   if (opts.metaApi && setupBearerScopeDenied(req, opts.metaApi)) {
     return jsonResponse({ error: 'forbidden' }, 403);
   }

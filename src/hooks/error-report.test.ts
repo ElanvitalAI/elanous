@@ -2,12 +2,17 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { handleReportPost, newReportId, REPORT_MAX_BYTES, REPORT_QUEUE_MAX_AGE_MS, ReportLimiter, ReportQueue, reportDedupe, validateErrorReport } from './error-report.js';
+import { debug } from '../debug/log.js';
+import { handleReportPost, newReportId, REPORT_MAX_BYTES, REPORT_QUEUE_MAX_AGE_MS, ReportLimiter, ReportQueue, reportDedupe, validateErrorReport, type ReceivedReport } from './error-report.js';
 import { startHookReceiver } from './receiver.js';
 
 const roots: string[] = [];
 const tmp = () => { const r = mkdtempSync(join(tmpdir(), 'er2-')); roots.push(r); return r; };
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let i = 0; i < 100; i++) { if (predicate()) return; await Bun.sleep(20); }
+  throw new Error('timeout waiting for report delivery');
+}
 
 const INSTALL = '3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b';
 function report(extra: Record<string, unknown> = {}) {
@@ -109,6 +114,69 @@ describe('real receiver', () => {
       const health = await (await fetch(new URL('/hooks/health', server.url))).json() as { reportsQueued: number };
       expect(health.reportsQueued).toBe(0);
     } finally { server.stop(); }
+  });
+
+  test('cloud publication drains accepted reports without also sending the Primary fallback', async () => {
+    const root = tmp();
+    const cloud: ReceivedReport[] = [];
+    const events: Array<{ category: string; event: string; data?: unknown }> = [];
+    const off = debug.registerSink({ name: 'error-report-cloud-success-test', emit: ({ category, event, data }) => {
+      if (category === 'error-collect') events.push({ category, event, data });
+    } });
+    let primaryCalls = 0;
+    const server = startHookReceiver({ port: 0, secrets: {}, root, cloudReportsEnabled: true, retryBaseMs: 1,
+      publishCloudReport: async (item) => { cloud.push(item); },
+      forwardReport: async () => { primaryCalls++; return true; } });
+    try {
+      const response = await fetch(new URL('/v1/reports', server.url), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report()) });
+      expect(response.status).toBe(202);
+      await waitFor(() => cloud.length === 1);
+      expect(cloud[0]?.report.code).toBe('skill-index');
+      expect(primaryCalls).toBe(0);
+      expect(readdirSync(join(root, 'hooks', 'reports'))).toHaveLength(0);
+      expect(events.map((entry) => entry.event)).toEqual(['cloud-enabled', 'published', 'drained']);
+    } finally { off(); server.stop(); }
+  });
+
+  test('failed cloud publication uses the existing Primary path and keeps accepted delivery', async () => {
+    const root = tmp();
+    const cloud: ReceivedReport[] = [];
+    const primary: ReceivedReport[] = [];
+    const events: Array<{ category: string; event: string; data?: unknown }> = [];
+    const off = debug.registerSink({ name: 'error-report-cloud-fallback-test', emit: ({ category, event, data }) => {
+      if (category === 'error-collect') events.push({ category, event, data });
+    } });
+    const server = startHookReceiver({ port: 0, secrets: {}, root, cloudReportsEnabled: true, retryBaseMs: 1,
+      publishCloudReport: async (item) => { cloud.push(item); throw new Error('cloud transport detail'); },
+      forwardReport: async (item) => { primary.push(item); return true; } });
+    try {
+      const response = await fetch(new URL('/v1/reports', server.url), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report()) });
+      expect(response.status).toBe(202);
+      await waitFor(() => primary.length === 1);
+      expect(cloud).toHaveLength(1);
+      expect(primary[0]?.report.code).toBe('skill-index');
+      expect(readdirSync(join(root, 'hooks', 'reports'))).toHaveLength(0);
+      expect(events.map((entry) => entry.event)).toEqual(['cloud-enabled', 'publish-failed']);
+      expect(events[1]?.data).toMatchObject({ stage: 'unknown' });
+    } finally { off(); server.stop(); }
+  });
+
+  test('cloud-disabled mode keeps the Primary path and emits only the fixed disabled event', async () => {
+    const root = tmp();
+    const events: string[] = [];
+    const off = debug.registerSink({ name: 'error-report-cloud-disabled-test', emit: ({ category, event }) => {
+      if (category === 'error-collect') events.push(event);
+    } });
+    let primaryCalls = 0;
+    const server = startHookReceiver({ port: 0, secrets: {}, root, cloudReportsEnabled: false, retryBaseMs: 1,
+      publishCloudReport: async () => { throw new Error('disabled path must not call cloud'); },
+      forwardReport: async () => { primaryCalls++; return true; } });
+    try {
+      const response = await fetch(new URL('/v1/reports', server.url), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report()) });
+      expect(response.status).toBe(202);
+      await waitFor(() => primaryCalls === 1);
+      expect(events).toEqual(['cloud-disabled']);
+    } finally { off(); server.stop(); }
   });
 });
 

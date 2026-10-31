@@ -63,7 +63,7 @@ export async function selectHarnessSkill(
   try { index = (deps.index ?? getSkillIndex()) as SkillIndexEntry[]; } catch { return null; }
   if (!index.length) return null;
   const invoke: InvokeFn = deps.invoke ?? ((obj, skill) => invokeResearch(obj, { skill }).then((r) => ({ ok: r.ok, output: r.output })));
-  const allowlist = deps.allowlist ?? HARNESS_EXEC_ALLOWLIST;   // S2 — config 확장 주입(기본 3개·무회귀)
+  const allowlist = deps.allowlist ?? HARNESS_EXEC_ALLOWLIST;   // S2 — config 확장 주입(기본 승인 목록·무회귀)
 
   // 1) luna 의미매칭(주경로) — allowlist ∩ luna픽 을 격리 실행. null=luna 실패(→fallback)·[]=관련없음(fallback 도 시도).
   let picked: string[] = [];

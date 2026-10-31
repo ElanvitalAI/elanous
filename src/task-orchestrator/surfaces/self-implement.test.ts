@@ -34,6 +34,34 @@ test('failed child detail tail is capped and redacted independently of the leadi
   expect(evidence?.detailTail).not.toContain(secret);
 });
 
+test('malformed TDD report-deficit fields stay unknown instead of inventing a reason or round', () => {
+  const valid = { reason: 'tdd-evidence-missing', round: 1, missing: ['tdd-red'] };
+  expect(podChildEvidenceFromResult({ ok: false,
+    terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: { ...valid, reason: 'other' },
+  })).not.toHaveProperty('tddEvidenceFailure');
+  expect(podChildEvidenceFromResult({ ok: false,
+    terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: { ...valid, round: -1 },
+  })).not.toHaveProperty('tddEvidenceFailure');
+  expect(podChildEvidenceFromResult({ ok: false,
+    terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: { ...valid, round: 1.5 },
+  })).not.toHaveProperty('tddEvidenceFailure');
+  expect(podChildEvidenceFromResult({ ok: false,
+    terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: { ...valid, missing: ['tdd-red', 'tdd-red'] },
+  })).not.toHaveProperty('tddEvidenceFailure');
+  expect(podChildEvidenceFromResult({ ok: false,
+    terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: { ...valid, missing: ['tdd-red', 'invented'] },
+  })).not.toHaveProperty('tddEvidenceFailure');
+  expect(podChildEvidenceFromResult({ ok: false,
+    terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: { ...valid, missing: [] },
+  })).not.toHaveProperty('tddEvidenceFailure');
+  expect(podChildEvidenceFromResult({ ok: true,
+    terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: valid,
+  })).not.toHaveProperty('terminationReason');
+  expect(podChildEvidenceFromResult({ ok: false,
+    terminationReason: 'other', tddEvidenceFailure: valid,
+  })).not.toHaveProperty('tddEvidenceFailure');
+});
+
 function makeTask(feature = 'add a helper', extra: Record<string, unknown> = {}): Task {
   return createTask({
     title: 'self-dev job',
@@ -348,6 +376,7 @@ mock.module(${JSON.stringify(orchestrator)}, () => ({ ...original, runSelfImplem
     expect(seen!.draft).toBe(false);
     // space id is derived from the task id → distinct per job.
     expect(seen!.spaceId).toContain(task.id.replace('task:', ''));
+    expect(seen!.taskId).toBe(task.id);
   });
 
   test('a task surface forwards its after goal ID or PR number to the Pod spawn input', async () => {
@@ -580,6 +609,14 @@ describe('reportUnmappedDispositionFields — 파서가 «버린 칸»을 말한
 
   test('전부 인식했으면 빈 목록 — 소음을 만들지 않는다', () => {
     expect(reportUnmappedDispositionFields({ stage: 'm' }, { stage: 'm' })).toEqual([]);
+  });
+
+  test('child evidence로 접은 종료 사유 필드는 미매핑 소음을 만들지 않는다', () => {
+    expect(reportUnmappedDispositionFields(
+      { stage: 'aborted', ok: false, terminationReason: 'tdd-evidence-missing', tddEvidenceFailure: { reason: 'tdd-evidence-missing' } },
+      { stage: 'aborted', ok: false, childEvidence: {} },
+      ['terminationReason', 'tddEvidenceFailure'],
+    )).toEqual([]);
   });
 
   test('⛔ undefined 값은 «버린 것»이 아니다', () => {

@@ -15,6 +15,8 @@ export interface HeavyOnPodShadowInput<T> {
   runPod: () => T | Promise<T>;
   log: (category: string, event: string, data: Record<string, unknown>) => void;
   warn: (message: string) => void;
+  /** Evidence persistence is best effort; it must never change the cold landing verdict. */
+  onShadow?: (observation: { pod: unknown; agree: boolean }) => void;
 }
 
 function agree(local: unknown, pod: unknown): boolean {
@@ -38,22 +40,25 @@ function elapsedMs(started: number): number {
 }
 
 export async function runHeavyOnPodShadow<T>(input: HeavyOnPodShadowInput<T>): Promise<T> {
-  const { enabled, pr, head, local, runPod, log, warn } = input;
+  const { enabled, pr, head, local, runPod, log, warn, onShadow } = input;
   if (!enabled) return local;
 
   const localMs = 0;
   const started = performance.now();
   try {
     const pod = await runPod();
+    const agrees = agree(local, pod);
     log('pr.land', 'heavy-on-pod-shadow', {
       pr,
       head,
       local,
       pod,
-      agree: agree(local, pod),
+      agree: agrees,
       podMs: elapsedMs(started),
       localMs,
     });
+    try { onShadow?.({ pod, agree: agrees }); }
+    catch (error) { warn(`shadow evidence write failed: ${error instanceof Error ? error.message : String(error)}`); }
   } catch (error) {
     warn(error instanceof Error ? error.message : String(error));
     log('pr.land', 'heavy-on-pod-shadow', {
@@ -62,6 +67,8 @@ export async function runHeavyOnPodShadow<T>(input: HeavyOnPodShadowInput<T>): P
       agree: false,
       podMs: elapsedMs(started), localMs,
     });
+    try { onShadow?.({ pod: { measured: false, ok: false, reason: `pod-exception:${error instanceof Error ? error.name : 'unknown'}` }, agree: false }); }
+    catch (writeError) { warn(`shadow evidence write failed: ${writeError instanceof Error ? writeError.message : String(writeError)}`); }
   }
   return local;
 }

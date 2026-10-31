@@ -61,6 +61,23 @@ export interface ChannelCapabilities {
   rateLimit: boolean;
 }
 
+const CHANNEL_CAPABILITY_KEYS = {
+  send: true,
+  receive: true,
+  thread: true,
+  topic: true,
+  persona: true,
+  channelLifecycle: true,
+  permissions: true,
+  commands: true,
+  attachments: true,
+  buttons: true,
+  choices: true,
+  deliveryConfirmation: true,
+  rateLimit: true,
+} satisfies Record<keyof ChannelCapabilities, true>;
+const CHANNEL_CAPABILITY_KEY_LIST = Object.keys(CHANNEL_CAPABILITY_KEYS) as (keyof ChannelCapabilities)[];
+
 export interface ChannelEnvelope {
   text: string;
   kind: string;
@@ -98,7 +115,34 @@ export interface ChannelAdapter {
 export function receiveChannelEvent(type: string, payload: unknown): ChannelEnvelope | null | Promise<ChannelEnvelope | null> {
   const adapter = outboundAdapters.get(type) ?? installedAdapters.get(type);
   if (!adapter?.capabilities.receive || !adapter.receive) return null;
-  return adapter.receive(payload);
+  const recordOutcome = (outcome: 'accepted' | 'rejected' | 'error'): void => {
+    try {
+      const runId = process.env.ELANOUS_RUN_ID;
+      debug.log('nexus.outbound', 'receive-conformance', {
+        ...(runId ? { runId } : {}),
+        provider: type,
+        outcome,
+      });
+    } catch { /* observation must not change channel receive behavior */ }
+  };
+  const recordResult = (envelope: ChannelEnvelope | null): ChannelEnvelope | null => {
+    recordOutcome(envelope ? 'accepted' : 'rejected');
+    return envelope;
+  };
+
+  try {
+    const result = adapter.receive(payload);
+    if (result && typeof (result as Promise<ChannelEnvelope | null>).then === 'function') {
+      return Promise.resolve(result).then(recordResult, error => {
+        recordOutcome('error');
+        throw error;
+      });
+    }
+    return recordResult(result as ChannelEnvelope | null);
+  } catch (error) {
+    recordOutcome('error');
+    throw error;
+  }
 }
 
 export interface OutboundChannelConfig {
@@ -113,21 +157,43 @@ export interface OutboundChannelConfig {
 }
 
 /** Connector providers register while the host is running; unregister on plugin
- * deactivation. Built-ins cannot be replaced by a plugin or removed. */
+ * deactivation. Invalid contracts throw so the plugin host can fail activation
+ * closed. Built-ins cannot be replaced by a plugin or removed. */
 const installedAdapters = new Map<string, ChannelAdapter>();
 export function registerOutboundAdapter(adapter: ChannelAdapter): () => void {
-  if (!/^[a-z][a-z0-9-]*$/.test(adapter.type) || outboundAdapters.has(adapter.type) || installedAdapters.has(adapter.type)
-    || !adapter.capabilities.send || typeof adapter.send !== 'function' || typeof adapter.parseConfig !== 'function'
-    || (adapter.capabilities.receive && typeof adapter.receive !== 'function')
-    || (adapter.capabilities.channelLifecycle && (typeof adapter.createChannel !== 'function' || typeof adapter.archiveChannel !== 'function'))
-    || (adapter.capabilities.permissions && typeof adapter.checkPermission !== 'function')
-    || (adapter.capabilities.commands && typeof adapter.registerCommands !== 'function')
-    || (adapter.capabilities.deliveryConfirmation && typeof adapter.confirmDelivery !== 'function')
-    || (adapter.capabilities.rateLimit && typeof adapter.retryAfterMs !== 'function')) {
-    throw new Error(`invalid or duplicate outbound connector: ${adapter.type}`);
+  let adapterType = '';
+  let validContract = false;
+  try {
+    adapterType = adapter?.type ?? '';
+    const capabilities = adapter?.capabilities;
+    let completeCapabilities = false;
+    if (capabilities && typeof capabilities === 'object') {
+      const ownKeys = Reflect.ownKeys(capabilities);
+      completeCapabilities = ownKeys.length === CHANNEL_CAPABILITY_KEY_LIST.length
+        && ownKeys.every((key) => typeof key === 'string' && CHANNEL_CAPABILITY_KEY_LIST.includes(key as keyof ChannelCapabilities))
+        && CHANNEL_CAPABILITY_KEY_LIST.every((key) => {
+          const descriptor = Object.getOwnPropertyDescriptor(capabilities, key);
+          return !!descriptor && Object.hasOwn(descriptor, 'value') && typeof descriptor.value === 'boolean';
+        });
+    }
+    validContract = /^[a-z][a-z0-9-]*$/.test(adapterType)
+      && !outboundAdapters.has(adapterType) && !installedAdapters.has(adapterType)
+      && completeCapabilities && !!capabilities?.send
+      && typeof adapter.send === 'function' && typeof adapter.parseConfig === 'function'
+      && (!capabilities.receive || typeof adapter.receive === 'function')
+      && (!capabilities.channelLifecycle || (typeof adapter.createChannel === 'function' && typeof adapter.archiveChannel === 'function'))
+      && (!capabilities.permissions || typeof adapter.checkPermission === 'function')
+      && (!capabilities.commands || typeof adapter.registerCommands === 'function')
+      && (!capabilities.deliveryConfirmation || typeof adapter.confirmDelivery === 'function')
+      && (!capabilities.rateLimit || typeof adapter.retryAfterMs === 'function');
+  } catch {
+    // Capability objects with throwing reflection traps fail closed at the plugin boundary.
   }
-  installedAdapters.set(adapter.type, adapter);
-  return () => { if (installedAdapters.get(adapter.type) === adapter) installedAdapters.delete(adapter.type); };
+  if (!validContract) {
+    throw new Error(`invalid or duplicate outbound connector: ${adapterType || '[unknown]'}`);
+  }
+  installedAdapters.set(adapterType, adapter);
+  return () => { if (installedAdapters.get(adapterType) === adapter) installedAdapters.delete(adapterType); };
 }
 
 export interface OutboundFanoutConfig {
@@ -394,6 +460,25 @@ export async function routeOutbound(cfg: UserConfig, msg: OutboundMsg, deps: Rou
     try {
       const adapter = deps.adapters?.get(ch.type) ?? outboundAdapters.get(ch.type) ?? installedAdapters.get(ch.type);
       if (!adapter?.capabilities.send) return { type: ch.type, ok: false, error: 'unsupported-channel' };
+      const requirements: Array<[keyof ChannelCapabilities, boolean]> = [
+        ['thread', outMsg.threadId !== undefined],
+        ['topic', outMsg.topicId !== undefined],
+        ['persona', outMsg.persona !== undefined],
+        ['attachments', outMsg.attachments !== undefined],
+        ['buttons', outMsg.buttons !== undefined],
+        ['choices', outMsg.choices !== undefined],
+      ];
+      if (requirements.some(([capability, requested]) => requested && !adapter.capabilities[capability]))
+        return { type: ch.type, ok: false, error: 'unsupported-capability' };
+      if (outMsg.permissionAction !== undefined) {
+        if (!adapter.capabilities.permissions || typeof adapter.checkPermission !== 'function')
+          return { type: ch.type, ok: false, error: 'unsupported-capability' };
+        if (!outMsg.permissionAction.trim()) return { type: ch.type, ok: false, error: 'invalid-permission-action' };
+        let allowed = false;
+        try { allowed = await adapter.checkPermission(outMsg.permissionAction); }
+        catch { return { type: ch.type, ok: false, error: 'permission-check-failed' }; }
+        if (!allowed) return { type: ch.type, ok: false, error: 'permission-denied' };
+      }
       const result = await adapter.send(ch, outMsg, cfg, deps);
       // A connector may not impersonate another channel or echo credentials
       // through the response. Legacy built-in result fields stay unchanged.

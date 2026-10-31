@@ -130,6 +130,8 @@ export function maxAutomaticShardCount(requested: number, budgetGiB: number, res
 export type ShardProcess = (cwd: string, files: readonly string[]) => {
   exitCode: number | null;
   signal?: string | null;
+  elapsedMs?: number;
+  unmeasuredReason?: string;
   junit?: string;
   rssMb?: number;
   seconds?: number;
@@ -337,12 +339,16 @@ function runPlannedShards(
         if (baselineFiles.length < shard.files.length) {
           debug.log('self-dev.shard', 'baseline-files-absent', { shardId: shard.id, round, absent: shard.files.filter((file) => !baselineFiles.includes(file)) });
         }
+        const shardStartedAt = performance.now();
         const current = runSafely(cwd, shard.files);
         const base = baselineFiles.length ? runSafely(dir, baselineFiles) : { exitCode: 0 };
         keepFailure(shard.id, 'current', round, shard.files, current);
         keepFailure(shard.id, 'baseline', round, baselineFiles, base);
         attempts.push({
           shardId: shard.id, attempt: round,
+          elapsedMs: Math.round(performance.now() - shardStartedAt),
+          currentUnmeasuredReason: current.unmeasuredReason,
+          baselineUnmeasuredReason: base.unmeasuredReason,
           currentJUnit: current.junit, baselineJUnit: base.junit,
           currentExitCode: current.exitCode, baselineExitCode: base.exitCode,
           currentSignal: current.signal, baselineSignal: base.signal,
@@ -471,6 +477,8 @@ export async function runShardedGateTestsAsync(
           if (concurrency > 1 && baselineFiles.length && base.exitCode === 0 && !base.signal && base.junit) baselinePassCache.set(shard.id, base);
           roundAttempts[index] = {
             shardId: shard.id, attempt: round, currentJUnit: current.junit, baselineJUnit: base.junit,
+            elapsedMs: Math.round(performance.now() - currentStartedAt),
+            currentUnmeasuredReason: current.unmeasuredReason, baselineUnmeasuredReason: base.unmeasuredReason,
             currentExitCode: current.exitCode, baselineExitCode: base.exitCode,
             currentSignal: current.signal, baselineSignal: base.signal,
             currentDiagnostic: current.diagnostic, baselineDiagnostic: base.diagnostic,
@@ -523,23 +531,31 @@ function incompleteShardReasons(shardIds: readonly string[], attempts: readonly 
   return Object.fromEntries(shardIds.map((id) => {
     const latest = attempts.filter((attempt) => attempt.shardId === id).at(-1);
     if (!latest) return [id, 'no shard attempt recorded'];
-    const side = (name: string, rc: number | null, signal: string | null | undefined, junit: string | undefined, diagnostic: string | undefined): string => {
+    const side = (name: string, rc: number | null, signal: string | null | undefined, junit: string | undefined, diagnostic: string | undefined, unmeasuredReason?: string): string => {
+      if (unmeasuredReason) return `${name}: ${unmeasuredReason}`;
       const safeDiagnostic = diagnostic ? redactSecretText(diagnostic).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500) : undefined;
       return `${name}: exit ${rc ?? 'unavailable'}, signal ${signal ?? 'none'}, JUnit ${junit === undefined ? 'missing' : 'present'}`
         + (safeDiagnostic ? `; ${safeDiagnostic}` : '');
     };
     const statuses = [
-      side('current', latest.currentExitCode, latest.currentSignal, latest.currentJUnit, latest.currentDiagnostic),
-      ...(latest.baselineFiles?.length === 0 ? [] : [side('baseline', latest.baselineExitCode, latest.baselineSignal, latest.baselineJUnit, latest.baselineDiagnostic)]),
+      side('current', latest.currentExitCode, latest.currentSignal, latest.currentJUnit, latest.currentDiagnostic, latest.currentUnmeasuredReason),
+      ...(latest.baselineFiles?.length === 0 ? [] : [side('baseline', latest.baselineExitCode, latest.baselineSignal, latest.baselineJUnit, latest.baselineDiagnostic, latest.baselineUnmeasuredReason)]),
     ];
     return [id, `${statuses.join(' · ')} · aggregate rejected (incomplete, malformed JUnit, or exit/JUnit mismatch)`];
   }));
 }
 
-export function selfGateShardTimeoutMs(files: readonly string[]): number {
+export const DEFAULT_SELF_GATE_SHARD_TIMEOUT_MS = 900_000;
+export const SELF_GATE_SHARD_TIMEOUT_ENV = 'ELANOUS_SELF_GATE_SHARD_TIMEOUT_MS';
+
+export function selfGateShardTimeoutMs(files: readonly string[], env: NodeJS.ProcessEnv = process.env): number {
   const spawnFiles = files.filter(isGateSpawnLaneFile);
   if (spawnFiles.length && spawnFiles.length !== files.length) throw new Error('self gate spawn lane mixed with regular tests');
-  return spawnFiles.length ? 120_000 : 300_000;
+  const configured = env[SELF_GATE_SHARD_TIMEOUT_ENV];
+  if (configured !== undefined && (!/^\d+$/.test(configured) || !Number.isSafeInteger(Number(configured)) || Number(configured) < 1)) {
+    throw new Error(`${SELF_GATE_SHARD_TIMEOUT_ENV} must be a positive integer number of milliseconds`);
+  }
+  return configured === undefined ? (spawnFiles.length ? 120_000 : DEFAULT_SELF_GATE_SHARD_TIMEOUT_MS) : Number(configured);
 }
 
 export function runBunShard(cwd: string, files: readonly string[]): ReturnType<ShardProcess> {
@@ -547,25 +563,29 @@ export function runBunShard(cwd: string, files: readonly string[]): ReturnType<S
 }
 
 /** Child launch seam for verifying the actual command and process timeout. */
-export function runBunShardWithSpawn(cwd: string, files: readonly string[], spawn: typeof Bun.spawnSync): ReturnType<ShardProcess> {
-  const timeout = selfGateShardTimeoutMs(files);
-  const spawnLane = timeout === 120_000;
+export function runBunShardWithSpawn(cwd: string, files: readonly string[], spawn: typeof Bun.spawnSync, env: NodeJS.ProcessEnv = process.env): ReturnType<ShardProcess> {
+  const timeout = selfGateShardTimeoutMs(files, env);
+  const spawnLane = files.some(isGateSpawnLaneFile);
   const dir = mkdtempSync(join(tmpdir(), 'elanous-shard-junit-'));
   const report = join(dir, 'result.xml');
   const isolated = prepareDeterministicChildEnvironment('elanous-shard-test-env-', { env: withGateTestEnv(process.env) });
   try {
     const measured = files.length === 1;
-    const args = ['test', ...(spawnLane ? ['--timeout=120000'] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
+    const args = ['test', ...(spawnLane ? [`--timeout=${timeout}`] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
     const started = performance.now();
     const result = spawn(['bun', ...args], {
       cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe', timeout,
     });
     const durationMs = performance.now() - started;
     const junit = existsSync(report) ? readFileSync(report, 'utf8') : undefined;
+    const timedOut = (result as typeof result & { error?: { code?: string } }).error?.code === 'ETIMEDOUT'
+      || (durationMs >= timeout && (result.exitCode !== 0 || !!result.signalCode));
     const failed = result.exitCode !== 0 || !!result.signalCode || junit === undefined;
     return {
       exitCode: result.exitCode,
-      signal: result.signalCode ? String(result.signalCode) : undefined,
+      signal: timedOut ? undefined : result.signalCode ? String(result.signalCode) : undefined,
+      elapsedMs: Math.round(durationMs),
+      ...(timedOut ? { unmeasuredReason: `timeout ${timeout / 1000}s 초과` } : {}),
       junit,
       ...(junit === undefined && (result.exitCode !== 0 || result.signalCode)
         ? { diagnostic: boundedDiagnostic(result.stdout, result.stderr) } : {}),
@@ -580,9 +600,9 @@ export function runBunShardWithSpawn(cwd: string, files: readonly string[], spaw
 }
 
 /** Nonblocking child runner; each bundle still owns its own deterministic environment and JUnit path. */
-export async function runBunShardAsync(cwd: string, files: readonly string[], drainTimeoutMs = 5_000): Promise<ReturnType<ShardProcess>> {
-  const timeout = selfGateShardTimeoutMs(files);
-  const spawnLane = timeout === 120_000;
+export async function runBunShardAsync(cwd: string, files: readonly string[], drainTimeoutMs = 5_000, env: NodeJS.ProcessEnv = process.env): Promise<ReturnType<ShardProcess>> {
+  const timeout = selfGateShardTimeoutMs(files, env);
+  const spawnLane = files.some(isGateSpawnLaneFile);
   const dir = mkdtempSync(join(tmpdir(), 'elanous-shard-junit-'));
   const report = join(dir, 'result.xml');
   const isolated = prepareDeterministicChildEnvironment('elanous-shard-test-env-', { env: withGateTestEnv(process.env) });
@@ -590,7 +610,7 @@ export async function runBunShardAsync(cwd: string, files: readonly string[], dr
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
   const drainAbort = new AbortController();
   try {
-    const args = ['test', ...(spawnLane ? ['--timeout=120000'] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
+    const args = ['test', ...(spawnLane ? [`--timeout=${timeout}`] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
     const started = performance.now();
     const child = Bun.spawn(['bun', ...args], { cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe' });
     let timedOut = false;
@@ -624,7 +644,8 @@ export async function runBunShardAsync(cwd: string, files: readonly string[], dr
     const signal = drainTimedOut ? 'DRAIN_TIMEOUT' : timedOut ? 'SIGKILL' : child.signalCode ? String(child.signalCode) : undefined;
     const failed = exitCode !== 0 || !!signal || junit === undefined;
     return {
-      exitCode, signal, junit,
+      exitCode, signal: timedOut ? undefined : signal, elapsedMs: Math.round(durationMs),
+      ...(timedOut ? { unmeasuredReason: `timeout ${timeout / 1000}s 초과` } : {}), junit,
       ...(files.length === 1 ? { rssMb: usage ? usage.maxRSS / (1024 * 1024) : undefined, seconds: durationMs / 1000 } : {}),
       ...(junit === undefined && (exitCode !== 0 || signal) ? { diagnostic: boundedDiagnostic(stdout, stderr) } : {}),
       ...(failed ? { failure: { durationMs: Math.round(durationMs), stdoutTail: outputTail(stdout), stderrTail: outputTail(stderr) } } : {}),

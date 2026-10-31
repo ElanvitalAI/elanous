@@ -167,8 +167,10 @@ export function applyGraphOverlays(
       rejections.push({ kind: 'unknown-target', overlayId: overlay.overlayId, target: overlay.target });
       continue;
     }
+    const beforeNodes = new Map(next.nodes.map((node) => [node.nodeId, node]));
     const beforeVisits = new Map(next.nodes.map((node) => [node.nodeId, node.maxVisits]));
-    const beforeRoutes = edgeMapOf(next);
+    const beforeRoutes = graphRouteMap(next);
+    const beforeEdgeMap = edgeMapOf(next);
     for (const op of overlay.patch) {
       const resolved = resolvePointer(next, op.path);
       if (!resolved) { rejections.push({ kind: 'bad-pointer', overlayId: overlay.overlayId, path: op.path }); continue; }
@@ -191,14 +193,26 @@ export function applyGraphOverlays(
       } else rejections.push({ kind: 'bad-pointer', overlayId: overlay.overlayId, path: op.path });
     }
     for (const node of next.nodes) {
+      if (beforeNodes.has(node.nodeId)) continue;
+      patches.push({ overlayId: overlay.overlayId, field: 'node-added', node: node.nodeId, kind: node.kind, maxVisits: node.maxVisits });
+    }
+    const afterRoutes = graphRouteMap(next);
+    for (const [key, route] of afterRoutes) {
+      const before = beforeRoutes.get(key);
+      if (before && before.to !== route.to) {
+        patches.push({ overlayId: overlay.overlayId, field: 'edge-rerouted', from: route.from, outcome: route.outcome, was: before.to, to: route.to });
+      }
+    }
+    for (const node of next.nodes) {
       const before = beforeVisits.get(node.nodeId);
       if (before !== undefined && before !== node.maxVisits) {
         patches.push({ overlayId: overlay.overlayId, field: 'maxVisits', node: node.nodeId, before, after: node.maxVisits });
       }
     }
-    const afterRoutes = edgeMapOf(next);
-    for (const [node, before] of Object.entries(beforeRoutes)) {
-      const after = afterRoutes[node] ?? [];
+    const afterEdgeMap = edgeMapOf(next);
+    for (const node of Object.keys(beforeEdgeMap)) {
+      const before = beforeEdgeMap[node] ?? [];
+      const after = afterEdgeMap[node] ?? [];
       if (before.length !== after.length || before.some((destination, index) => destination !== after[index])) {
         patches.push({ overlayId: overlay.overlayId, field: 'routes', node, before, after });
       }
@@ -244,6 +258,18 @@ export function applyGraphOverlays(
 
   if (rejections.length > 0) return { ok: false, rejections };
   return { ok: true, template: next, overlayIds: applied, patches };
+}
+
+/** Keep outcome names while comparing route changes; the compiled edge map deliberately drops them. */
+function graphRouteMap(template: GraphTemplateSpec): Map<string, { from: string; outcome: string; to: string }> {
+  const routes = new Map<string, { from: string; outcome: string; to: string }>();
+  for (const [index, edge] of template.edges.entries()) {
+    if (edge.to) routes.set(`${edge.from}\u0000direct\u0000${index}`, { from: edge.from, outcome: '', to: edge.to });
+    for (const [outcome, to] of Object.entries(edge.map ?? {})) {
+      routes.set(`${edge.from}\u0000${edge.on ?? 'outcome'}\u0000${outcome}`, { from: edge.from, outcome, to });
+    }
+  }
+  return routes;
 }
 
 export interface OverlayLoadResult {

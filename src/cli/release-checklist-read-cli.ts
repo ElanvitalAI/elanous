@@ -76,6 +76,26 @@ function evidenceJson(stdout: string): Record<string, unknown> | null {
   return null;
 }
 
+// E4 reads only the exact event near the evidence timestamp; absent timestamps fail closed.
+const E4_LOG_WINDOW_MS = 30 * 60_000;
+const EVIDENCE_ISO_TIMESTAMP = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b/gu;
+
+function evidenceTimestampNearIdentity(evidence: string, identity: string): number | null {
+  const identityAt = evidence.indexOf(identity);
+  if (identityAt < 0) return null;
+  const lineStart = evidence.lastIndexOf('\n', identityAt) + 1;
+  const lineEnd = evidence.indexOf('\n', identityAt);
+  const identityLine = evidence.slice(lineStart, lineEnd < 0 ? undefined : lineEnd);
+  let nearest: { distance: number; timestamp: number } | null = null;
+  for (const match of identityLine.matchAll(EVIDENCE_ISO_TIMESTAMP)) {
+    const timestamp = Date.parse(match[0]);
+    if (!Number.isFinite(timestamp)) continue;
+    const distance = Math.abs((match.index ?? 0) - (identityAt - lineStart));
+    if (!nearest || distance < nearest.distance) nearest = { distance, timestamp };
+  }
+  return nearest?.timestamp ?? null;
+}
+
 export function collectChecklistEvidenceStages(item: ReturnType<typeof listChecklist>['items'][number], run: ChecklistEvidenceCommandRunner = evidenceCommand): ChecklistEvidenceStage[] {
   const measuredAt = new Date().toISOString();
   const evidence = item.evidence ?? '';
@@ -135,22 +155,30 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
   const verificationCommand = /(?:완료 경계 증거 명령|증거 명령|verification command)\s*[:=]\s*([^\r\n]+)/iu.exec(`${item.title}\n${evidence}`)?.[1]?.trim() ?? null;
   const e4: ChecklistEvidenceStage = { id: 'E4', state: 'missing', source: null, measuredAt, verificationCommand, reason: '근거에 runId·missionId·taskId 중 하나와 event·원문 검증 명령이 모두 필요하다' };
   if (runId && event && verificationCommand) {
-    const logs = run('eln', ['logs', '--grep', runId, '--since', '365d', '--all', '--include-test', '--limit', '1000', '--json'], 30_000);
-    if (logs.status !== 0) { e4.state = 'unmeasurable'; e4.reason = `runId 로그 조회 실패${logs.error ? `: ${logs.error}` : ''}`; }
-    else {
-      const rows = logs.stdout.split(/\r?\n/u).flatMap((line) => { try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; } });
-      const truncated = rows.length >= 1000 || rows.some((row) => row._meta && typeof row._meta === 'object' && (row._meta as { limitReached?: unknown }).limitReached === true);
-      const observed = rows.some((row) => {
-        if (row.event !== event || typeof row.data !== 'string') return false;
-        try {
-          const data = JSON.parse(row.data) as { runId?: unknown; missionId?: unknown; taskId?: unknown };
-          return data[identityField] === runId;
-        } catch { return false; }
-      });
-      e4.source = `eln logs --grep ${runId} --since 365d --all --include-test --limit 1000 --json (${identityField}=${runId}, event=${event})`;
-      if (observed) { e4.state = 'observed'; e4.reason = `같은 ${identityField}의 ${event} 실물 이벤트를 찾았다`; }
-      else if (truncated) { e4.state = 'unmeasurable'; e4.reason = '로그 결과가 잘려 사건 부재를 판정할 수 없다'; }
-      else { e4.reason = `같은 ${identityField}의 ${event} 이벤트가 없다`; }
+    const identityAt = evidenceTimestampNearIdentity(evidence, runId);
+    if (identityAt === null) {
+      e4.state = 'unmeasurable';
+      e4.reason = `근거의 ${identityField}=${runId} 주변에 시간대가 명시된 ISO 시각이 없어 로그 조회 창을 만들 수 없다`;
+    } else {
+      const since = new Date(identityAt - E4_LOG_WINDOW_MS).toISOString();
+      const until = new Date(identityAt + E4_LOG_WINDOW_MS).toISOString();
+      const logs = run('eln', ['logs', '--event', event, '--since', since, '--until', until, '--all', '--include-test', '--limit', '1000', '--json'], 30_000);
+      if (logs.status !== 0) { e4.state = 'unmeasurable'; e4.reason = `runId 로그 조회 실패${logs.error ? `: ${logs.error}` : ''}`; }
+      else {
+        const rows = logs.stdout.split(/\r?\n/u).flatMap((line) => { try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; } });
+        const truncated = rows.length >= 1000 || rows.some((row) => row._meta && typeof row._meta === 'object' && (row._meta as { limitReached?: unknown }).limitReached === true);
+        const observed = rows.some((row) => {
+          if (row.event !== event || typeof row.data !== 'string') return false;
+          try {
+            const data = JSON.parse(row.data) as { runId?: unknown; missionId?: unknown; taskId?: unknown };
+            return data[identityField] === runId;
+          } catch { return false; }
+        });
+        e4.source = `eln logs --event ${event} --since ${since} --until ${until} --all --include-test --limit 1000 --json (${identityField}=${runId})`;
+        if (observed) { e4.state = 'observed'; e4.reason = `같은 ${identityField}의 ${event} 실물 이벤트를 찾았다`; }
+        else if (truncated) { e4.state = 'unmeasurable'; e4.reason = '로그 결과가 잘려 사건 부재를 판정할 수 없다'; }
+        else { e4.reason = `같은 ${identityField}의 ${event} 이벤트가 없다`; }
+      }
     }
   }
 

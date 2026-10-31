@@ -12,6 +12,7 @@ import {
   deliver,
   type DaemonPathClass,
   FLUSH_LAG_WARN_MIN_ENV,
+  OUTBOUND_QUIET_HOURS_ENV,
   flushDeferred,
   flushLagWarnMin,
   inQuietHours,
@@ -26,6 +27,7 @@ import { setUserConfigOverlay } from '../user-config.js';
 
 const TOUCHED_ENV = [
   FLUSH_LAG_WARN_MIN_ENV,
+  OUTBOUND_QUIET_HOURS_ENV,
   'SEND_VIA_ELANOUS',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_CHAT_ID',
@@ -232,7 +234,7 @@ describe('flushDeferred 관측 — 경로 · 밀림 경고 등급', () => {
 type LogFn = typeof debug.log;
 type Logged = { category: string; event: string; data: unknown };
 
-const ENV_KEYS = ['SEND_VIA_ELANOUS', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'ELANOUS_TELEGRAM_BOT_TOKEN', 'ELANOUS_NEXUS_URL', 'ELANOUS_DISCORD_BOT_TOKEN'] as const;
+const ENV_KEYS = ['SEND_VIA_ELANOUS', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'ELANOUS_TELEGRAM_BOT_TOKEN', 'ELANOUS_NEXUS_URL', 'ELANOUS_DISCORD_BOT_TOKEN', OUTBOUND_QUIET_HOURS_ENV] as const;
 
 const savedEnv: Record<string, string | undefined> = {};
 const logged: Logged[] = [];
@@ -374,6 +376,33 @@ describe('sendOutbound outcome ledger', () => {
     expectOutcome('deferred', text, kind);
   });
 
+  test('config can replace the quiet window and env can turn it off when config is unset', () => {
+    setUserConfigOverlay(cfg => ({ ...cfg, outbound: { ...cfg.outbound, quietHours: '22:00-02:00' } }));
+    try {
+      expect(inQuietHours(new Date('2026-10-01T14:30:00Z'))).toBe(true); // 23:30 KST
+      expect(inQuietHours(new Date('2026-10-01T16:30:00Z'))).toBe(true); // 01:30 KST
+      expect(inQuietHours(new Date('2026-10-01T17:00:00Z'))).toBe(false); // 02:00 KST, end exclusive
+    } finally { setUserConfigOverlay(null); }
+    process.env[OUTBOUND_QUIET_HOURS_ENV] = 'off';
+    setUserConfigOverlay(cfg => ({ ...cfg, outbound: { ...cfg.outbound, quietHours: undefined } }));
+    try { expect(inQuietHours(new Date('2026-10-01T16:00:00Z'))).toBe(false); }
+    finally { setUserConfigOverlay(null); }
+  });
+
+  test('config off sends during the former quiet window and flushes earlier deferred alerts first', () => {
+    setSystemTime(new Date('2026-10-01T16:00:00Z'));
+    expect(sendOutbound('queued-before-off', kind)).toBe(true);
+    expect(outboundUrls).toHaveLength(0);
+
+    setUserConfigOverlay(cfg => ({ ...cfg, outbound: { ...cfg.outbound, quietHours: 'off' } }));
+    try {
+      expect(sendOutbound(text, kind)).toBe(true);
+      expect(outboundUrls).toHaveLength(2); // queued batch first, then the current alert
+      expect(logged.some(row => row.category === 'outbound.send' && row.data
+        && (row.data as { quietMode?: string }).quietMode === 'off')).toBe(true);
+    } finally { setUserConfigOverlay(null); }
+  });
+
   test('daemon rejection and direct fallback failure record one failed', () => {
     daemonBody = JSON.stringify({ error: 'unauthorized' });
     curlSpy?.mockImplementation(((_cmd: string, args: readonly string[] | undefined) => {
@@ -453,7 +482,7 @@ describe('sendOutbound outcome ledger', () => {
       });
       expect(outcomeLogs()).toHaveLength(1);
       expect(outcomeLogs()[0]!.event).toBe('failed');
-      expect(outcomeLogs()[0]!.data).toEqual({ kind, source: 'codex-quota-alert', chars: text.length, bot: 'unknown', path: 'queue-failed' });
+      expect(outcomeLogs()[0]!.data).toEqual({ kind, source: 'codex-quota-alert', chars: text.length, bot: 'unknown', quietMode: 'window:00:00-06:30', path: 'queue-failed' });
       expect(JSON.stringify(outcomeLogs()[0]!.data)).not.toContain(text);
       expect(outboundUrls).toHaveLength(0);
       expect(telegramUrls).toHaveLength(0);

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Task, TaskExecution, TaskStatus } from '../task-orchestrator/types.js';
 import { EventLedger } from './event-ledger.js';
+import { parseLinearSecretaryManifest, readApprovedLinearCapture, updateLinearSecretaryProgress } from '../intake-plane/linear-wish.js';
 
 const LINEAR_GRAPHQL_URL = 'https://api.linear.app/graphql';
 const STATE_NAMES: Partial<Record<TaskStatus, string>> = {
@@ -10,7 +11,7 @@ const STATE_NAMES: Partial<Record<TaskStatus, string>> = {
   failed: 'Todo',
 };
 
-type ProjectableTask = Pick<Task, 'id' | 'status' | 'generatedBy' | 'lastExecutionId' | 'notes'>;
+type ProjectableTask = Pick<Task, 'id' | 'status' | 'generatedBy' | 'lastExecutionId' | 'notes'> & Pick<Partial<Task>, 'description' | 'title'>;
 
 export interface LinearProjectionOptions {
   task: ProjectableTask;
@@ -19,7 +20,7 @@ export interface LinearProjectionOptions {
   ledger?: EventLedger;
   /** Linear user ID for the elanous agent, when configured. */
   assigneeId?: string;
-  execution?: Pick<TaskExecution, 'output' | 'error'>;
+  execution?: Pick<TaskExecution, 'output' | 'error' | 'runId' | 'captureArtifacts'>;
 }
 
 async function graphql<T>(apiKey: string, fetchFn: typeof fetch, query: string, variables: Record<string, unknown>): Promise<T> {
@@ -34,25 +35,46 @@ async function graphql<T>(apiKey: string, fetchFn: typeof fetch, query: string, 
   return result.data;
 }
 
-function projectionComment(task: ProjectableTask, execution?: LinearProjectionOptions['execution']): string | null {
+function projectionComment(task: ProjectableTask): string | null {
   switch (task.status) {
     case 'running': return `elanous 실행 시작 (task: ${task.id}${task.lastExecutionId ? `, execution: ${task.lastExecutionId}` : ''}).`;
-    case 'review': return `elanous 실행 결과가 사람 확인을 기다립니다 (task: ${task.id}).${execution?.output ? `\n\n${execution.output.slice(0, 2000)}` : ''}`;
-    case 'done': return `elanous 실행 완료 (task: ${task.id}).${execution?.output ? `\n\n${execution.output.slice(0, 2000)}` : ''}`;
-    case 'failed': {
-      const reason = execution?.error?.message ?? task.notes.at(-1);
-      return `elanous 실행 실패 (task: ${task.id}).${reason ? `\n\n${reason.slice(0, 2000)}` : ''}`;
-    }
+    case 'review': return `elanous 실행 결과가 사람 확인을 기다립니다 (task: ${task.id}).`;
+    case 'done': return `elanous 실행 완료 (task: ${task.id}).`;
+    case 'failed': return `elanous 실행 실패 (task: ${task.id}).`;
     default: return null;
   }
 }
 
 /** Project only Linear-origin task transitions. Every successful write is recorded for inbound echo filtering. */
 export async function projectLinearTask({ task, apiKey, fetch: fetchFn = fetch, ledger, assigneeId, execution }: LinearProjectionOptions): Promise<boolean> {
-  if (task.generatedBy?.kind !== 'external' || task.generatedBy.provider !== 'linear' || !task.generatedBy.ref || !STATE_NAMES[task.status]) return false;
-  if (!apiKey) throw new Error('Linear API key is required for projection');
+  if (task.generatedBy?.kind !== 'external' || task.generatedBy.provider !== 'linear' || !task.generatedBy.ref) return false;
   const issueId = task.generatedBy.ref;
   const events = ledger ?? new EventLedger();
+  const secretary = parseLinearSecretaryManifest(task.description ?? '', issueId);
+  if (secretary) {
+    if (task.status !== 'running' && task.status !== 'review' && task.status !== 'done' && task.status !== 'failed') return false;
+    if (!apiKey) throw new Error('Linear API key is required for projection');
+    const state = task.status === 'running' ? 'started' : task.status === 'done' ? 'completed' : 'comment';
+    const captureCandidate = execution?.captureArtifacts?.find(capture =>
+      capture.runId === execution.runId && capture.runId.trim().length > 0 &&
+      capture.linearIssueId === secretary.parentIssueId && capture.externalShare === true && capture.sensitivity === 'public');
+    let captureArtifact: typeof captureCandidate;
+    if (captureCandidate) {
+      try { readApprovedLinearCapture(captureCandidate); captureArtifact = captureCandidate; }
+      catch { /* Invalid, stale, or unavailable captures fail closed; progress still syncs without a URL. */ }
+    }
+    await updateLinearSecretaryProgress({ apiKey, parentIssueId: secretary.parentIssueId, taskIssueId: issueId,
+      taskTitle: secretary.tasks.find(item => item.issueId === issueId)!.title, tasks: secretary.tasks, state,
+      summary: task.status === 'running' ? '하위 작업을 시작했습니다.'
+        : task.status === 'done' ? '하위 작업을 완료했습니다.'
+          : task.status === 'failed' ? '하위 작업이 실패했습니다.' : '하위 작업 진행 상태를 갱신했습니다.',
+      workaround: task.status === 'failed' ? 'Linear 상태는 In Progress로 유지하고 실패 내용을 기록했습니다.' : undefined,
+      captureArtifact,
+      ledger: events, fetch: fetchFn });
+    return true;
+  }
+  if (!STATE_NAMES[task.status]) return false;
+  if (!apiKey) throw new Error('Linear API key is required for projection');
   const { issue, viewer } = await graphql<{
     issue?: { team?: { states?: { nodes?: Array<{ id: string; name: string }> } } };
     viewer?: { id?: string };
@@ -72,7 +94,7 @@ export async function projectLinearTask({ task, apiKey, fetch: fetchFn = fetch, 
   events.record('linear', `outgoing:state:${issueId}:${update.issueUpdate.issue.updatedAt}:${stateHash}`,
     { ref: issueId, occurredAt: update.issueUpdate.issue.updatedAt });
 
-  const comment = projectionComment(task, execution);
+  const comment = projectionComment(task);
   if (comment) {
     const created = await graphql<{ commentCreate?: { success?: boolean; comment?: { id?: string; updatedAt?: string; issue?: { updatedAt?: string } } } }>(apiKey, fetchFn,
       'mutation ProjectorComment($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id updatedAt issue { updatedAt } } } }',

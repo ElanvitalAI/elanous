@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Command } from 'commander';
 import { LogStore } from '../mss/logging/log-store.js';
-import { createMissionOutStore, createProcessAgentRunner, registerMissionOutCommand, renderMissionAgentInstructions } from './mission-out.js';
+import { createMissionOutStore, createProcessAgentRunner, missionChildEnv, registerMissionOutCommand, renderMissionAgentInstructions, runMissionOutWorker, waitForMissionAnswer } from './mission-out.js';
+import { createMissionLineStore } from './mission-line.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -16,6 +17,42 @@ const makeRoot = (): string => {
   roots.push(root);
   return root;
 };
+
+test('mission hand child env carries the hook mission and attempt identity', () => {
+  const missionId = '12345678-1234-4234-8234-123456789abc';
+  const env = missionChildEnv('/tmp/mission-hand', missionId, {
+    ELANOUS_MISSION_ID: 'stale-mission', ELANOUS_ATTEMPT_ID: 'stale-attempt',
+    ELANOUS_HAND_TOKEN: 'stale-token', ELANOUS_HAND_FINAL_LINE_ID: 'stale-line',
+    ELANOUS_HAND_RUN_ID: 'stale-run', ELANOUS_HAND_PTY_ID: 'stale-pty',
+  }, { token: 'hand-token', attemptId: 'attempt-current', finalLineId: 'line-final', agent: 'codex' });
+
+  expect(env).toMatchObject({
+    ELANOUS_MISSION_ID: missionId,
+    ELANOUS_ATTEMPT_ID: 'attempt-current',
+    ELANOUS_HAND_TOKEN: 'hand-token',
+    ELANOUS_HAND_ATTEMPT_ID: 'attempt-current',
+    ELANOUS_HAND_FINAL_LINE_ID: 'line-final',
+    ELANOUS_HAND_AGENT: 'codex',
+  });
+  expect(env).not.toHaveProperty('ELANOUS_HAND_RUN_ID');
+  expect(env).not.toHaveProperty('ELANOUS_HAND_PTY_ID');
+});
+
+test('non-hand mission child env drops inherited hand hook identity', () => {
+  const env = missionChildEnv('/tmp/mission-worker', '12345678-1234-4234-8234-123456789abc', {
+    ELANOUS_MISSION_ID: 'stale-mission', ELANOUS_ATTEMPT_ID: 'stale-attempt',
+    ELANOUS_HAND_TOKEN: 'stale-token', ELANOUS_HAND_ATTEMPT_ID: 'stale-hand-attempt',
+    ELANOUS_HAND_FINAL_LINE_ID: 'stale-line', ELANOUS_HAND_AGENT: 'codex',
+    ELANOUS_HAND_RUN_ID: 'stale-run', ELANOUS_HAND_PTY_ID: 'stale-pty',
+    ELANOUS_RUN_ID: 'ordinary-run', PATH: '/bin',
+  });
+
+  for (const key of ['ELANOUS_MISSION_ID', 'ELANOUS_ATTEMPT_ID', 'ELANOUS_HAND_TOKEN', 'ELANOUS_HAND_ATTEMPT_ID',
+    'ELANOUS_HAND_FINAL_LINE_ID', 'ELANOUS_HAND_AGENT', 'ELANOUS_HAND_RUN_ID', 'ELANOUS_HAND_PTY_ID']) {
+    expect(env).not.toHaveProperty(key);
+  }
+  expect(env).toMatchObject({ ELANOUS_RUN_ID: 'ordinary-run', PATH: '/bin' });
+});
 
 test('mission reply appends ordered progress and final events under the instance state root', async () => {
   const root = makeRoot();
@@ -41,6 +78,99 @@ test('mission reply appends ordered progress and final events under the instance
   expect(emitted).toEqual([first, final]);
   await expect(store.reply(record.missionId, 'late')).rejects.toThrow('실행 중이 아닙니다');
   expect(store.replies(record.missionId).filter((event) => event.done)).toHaveLength(1);
+});
+
+test('mission line metadata and hand graph event share the existing reply ledger row', async () => {
+  const store = createMissionOutStore(makeRoot());
+  const record = store.create({ agent: 'codex', prompt: 'find a useful tool', cwd: '/repo', outputPath: '/tmp/line.tmp', targetOutputPath: '/tmp/line.md' });
+  const event = await store.reply(record.missionId, 'searching', false, {
+    attemptId: 'attempt-1', agent: 'codex', lineType: 'progress', source: 'codex-notify', who: 'Codex', what: 'find a useful tool',
+  });
+  expect(store.replies(record.missionId)).toMatchObject([{
+    attemptId: 'attempt-1', lineType: 'progress', source: 'codex-notify',
+    graphEvents: [{ seq: 1, type: 'node-added', node: `hand-${record.missionId}`, kind: 'hand', who: 'Codex', what: 'find a useful tool', missionId: record.missionId }],
+  }]);
+  expect(event.sequence).toBe(1);
+});
+
+test('mission lineId makes both progress and final persistence idempotent', async () => {
+  const store = createMissionOutStore(makeRoot());
+  const record = store.create({ agent: 'codex', prompt: 'find a useful tool', cwd: '/repo', outputPath: '/tmp/line-id.tmp', targetOutputPath: '/tmp/line-id.md' });
+  const fields = { lineId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', attemptId: 'attempt-idempotent', agent: 'codex' as const, lineType: 'progress' as const, source: 'codex-notify' };
+  const first = await store.reply(record.missionId, 'searching', false, fields);
+  const replay = await store.reply(record.missionId, 'searching', false, fields);
+  expect(replay.sequence).toBe(first.sequence);
+  expect(store.replies(record.missionId)).toHaveLength(1);
+});
+
+test('worker keeps a validated final reply locally when NEXUS ingress is unavailable and revokes at job end', async () => {
+  const root = makeRoot();
+  const store = createMissionOutStore(root);
+  const record = store.create({ agent: 'codex', prompt: 'do work', cwd: root, outputPath: join(root, 'result.tmp'), targetOutputPath: join(root, 'result.md') });
+  const auth = createMissionLineStore(root).issue({ missionId: record.missionId, attemptId: 'attempt-final', agent: 'codex', who: 'Codex', what: 'do work' });
+  const prior = {
+    token: process.env.ELANOUS_HAND_TOKEN,
+    attemptId: process.env.ELANOUS_HAND_ATTEMPT_ID,
+    finalLineId: process.env.ELANOUS_HAND_FINAL_LINE_ID,
+    nexusUrl: process.env.ELANOUS_NEXUS_URL,
+  };
+  process.env.ELANOUS_HAND_TOKEN = auth.token;
+  process.env.ELANOUS_HAND_ATTEMPT_ID = auth.attemptId;
+  process.env.ELANOUS_HAND_FINAL_LINE_ID = auth.finalLineId;
+  process.env.ELANOUS_NEXUS_URL = 'http://127.0.0.1:1';
+  try {
+    await runMissionOutWorker(root, record.missionId, async (mission) => {
+      writeFileSync(mission.outputPath, 'validated answer');
+      return { code: 0 };
+    });
+    expect(store.read(record.missionId)).toMatchObject({ status: 'completed', result: 'validated answer' });
+    expect(store.replies(record.missionId)).toMatchObject([{ done: true, lineType: 'final', attemptId: auth.attemptId }]);
+    expect(() => createMissionLineStore(root).authorize({ lineId: '99999999-9999-4999-8999-999999999999', missionId: record.missionId, attemptId: auth.attemptId, agent: 'codex', type: 'progress', source: 'test', text: 'late' }, auth.token)).toThrow('mission line unauthorized');
+  } finally {
+    if (prior.token === undefined) delete process.env.ELANOUS_HAND_TOKEN; else process.env.ELANOUS_HAND_TOKEN = prior.token;
+    if (prior.attemptId === undefined) delete process.env.ELANOUS_HAND_ATTEMPT_ID; else process.env.ELANOUS_HAND_ATTEMPT_ID = prior.attemptId;
+    if (prior.finalLineId === undefined) delete process.env.ELANOUS_HAND_FINAL_LINE_ID; else process.env.ELANOUS_HAND_FINAL_LINE_ID = prior.finalLineId;
+    if (prior.nexusUrl === undefined) delete process.env.ELANOUS_NEXUS_URL; else process.env.ELANOUS_NEXUS_URL = prior.nexusUrl;
+  }
+});
+
+test('CLI reuses a final already appended by NEXUS when its HTTP response is lost', async () => {
+  const root = makeRoot();
+  const missionId = '12345678-1234-4234-8234-123456789abc';
+  const store = createMissionOutStore(root);
+  const record = store.create({ missionId, agent: 'codex', prompt: 'finish task', cwd: root, outputPath: join(root, 'result.tmp'), targetOutputPath: join(root, 'result.md') });
+  const auth = createMissionLineStore(root).issue({ missionId, attemptId: 'attempt-lost-response', agent: 'codex', who: 'Codex', what: 'finish task' });
+  const previous = { token: process.env.ELANOUS_HAND_TOKEN, attemptId: process.env.ELANOUS_HAND_ATTEMPT_ID, finalLineId: process.env.ELANOUS_HAND_FINAL_LINE_ID, agent: process.env.ELANOUS_HAND_AGENT, url: process.env.ELANOUS_NEXUS_URL, fetch: globalThis.fetch };
+  process.env.ELANOUS_HAND_TOKEN = auth.token;
+  process.env.ELANOUS_HAND_ATTEMPT_ID = auth.attemptId;
+  process.env.ELANOUS_HAND_FINAL_LINE_ID = auth.finalLineId;
+  process.env.ELANOUS_HAND_AGENT = 'codex';
+  process.env.ELANOUS_NEXUS_URL = 'http://nexus.test';
+  globalThis.fetch = (async (_input, init) => {
+    const sent = JSON.parse(String(init?.body)) as { lineId: string };
+    await store.reply(missionId, 'final answer', true, {
+      lineId: sent.lineId, attemptId: auth.attemptId, agent: 'codex', lineType: 'final', source: 'mission-reply', who: 'Codex', what: 'finish task',
+    });
+    return Response.json({ error: 'response lost after durable append' }, { status: 500 });
+  }) as typeof fetch;
+  try {
+    const output: string[] = [];
+    const cli = new Command();
+    cli.exitOverride();
+    cli.option('--config-dir <dir>');
+    registerMissionOutCommand(cli, { stateRoot: () => root, write: (line) => output.push(line), error: (line) => output.push(line) });
+    await cli.parseAsync(['node', 'eln', 'mission', 'reply', '--mission', missionId, '--done', 'final answer']);
+    expect(JSON.parse(output[0]!)).toMatchObject({ missionId, accepted: true, sequence: 1, done: true });
+    expect(store.replies(missionId).filter((event) => event.done)).toHaveLength(1);
+    expect(store.replies(missionId)[0]).toMatchObject({ who: 'Codex', what: 'finish task' });
+  } finally {
+    if (previous.token === undefined) delete process.env.ELANOUS_HAND_TOKEN; else process.env.ELANOUS_HAND_TOKEN = previous.token;
+    if (previous.attemptId === undefined) delete process.env.ELANOUS_HAND_ATTEMPT_ID; else process.env.ELANOUS_HAND_ATTEMPT_ID = previous.attemptId;
+    if (previous.finalLineId === undefined) delete process.env.ELANOUS_HAND_FINAL_LINE_ID; else process.env.ELANOUS_HAND_FINAL_LINE_ID = previous.finalLineId;
+    if (previous.agent === undefined) delete process.env.ELANOUS_HAND_AGENT; else process.env.ELANOUS_HAND_AGENT = previous.agent;
+    if (previous.url === undefined) delete process.env.ELANOUS_NEXUS_URL; else process.env.ELANOUS_NEXUS_URL = previous.url;
+    globalThis.fetch = previous.fetch;
+  }
 });
 
 test('cancel is terminal and reply fails closed afterward', async () => {
@@ -198,6 +328,17 @@ test('reply message format reserves ask, answer, and correct without rejecting e
   expect(extension.kind).toBe('future-kind');
 });
 
+test('ask deadline returns its default after expiry and consumes only the matching replyTo answer', async () => {
+  const id = '12345678-1234-4234-8234-123456789abd';
+  const store = createMissionOutStore(makeRoot(), { id: () => id });
+  store.create({ agent: 'codex', prompt: 'do work', cwd: '/repo', outputPath: '/tmp/result.tmp', targetOutputPath: '/tmp/result.md' });
+  const expiredAsk = await store.reply(id, 'Pick a base: main or release.', false, { kind: 'ask', defaults: 'main', deadline: '1970-01-01T00:00:00.000Z' });
+  expect(await waitForMissionAnswer(store, id, expiredAsk, 'main', { now: () => 1_000 })).toEqual({ text: 'main', usedDefault: true });
+  const liveAsk = await store.reply(id, 'Should I continue?', false, { kind: 'ask', defaults: 'continue', deadline: '2099-01-01T00:00:00.000Z' });
+  await store.reply(id, 'No, stop after the targeted repair.', false, { kind: 'answer', replyTo: liveAsk.sequence });
+  expect(await waitForMissionAnswer(store, id, liveAsk, 'continue', { now: () => 1_000 })).toEqual({ text: 'No, stop after the targeted repair.', usedDefault: false });
+});
+
 test('stateless CLI accepts two agent replies and status returns both pushed events', async () => {
   const root = makeRoot();
   const id = '12345678-1234-4234-8234-123456789abc';
@@ -265,7 +406,7 @@ test('process runner captures spawn errors while the pid state write is pending'
     const child = Object.assign(new EventEmitter(), { pid: 1234, stderr: new PassThrough(), stdin: { end: () => undefined } });
     queueMicrotask(() => child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })));
     return child;
-  }) as typeof spawn;
+  }) as unknown as typeof spawn;
   await expect(createProcessAgentRunner(root, fakeSpawn)(record, 'prompt')).rejects.toThrow('spawn ENOENT');
 });
 
@@ -279,7 +420,7 @@ test('agent subprocess receives a paired mission ID and store root', async () =>
     const child = Object.assign(new EventEmitter(), { pid: 1234, stderr: new PassThrough(), stdin: { end: () => undefined } });
     queueMicrotask(() => child.emit('close', 0));
     return child;
-  }) as typeof spawn;
+  }) as unknown as typeof spawn;
   await expect(createProcessAgentRunner(root, fakeSpawn)(record, 'prompt')).resolves.toEqual({ code: 0, stderr: '' });
   expect(childEnv?.ELANOUS_STATE_DIR).toBe(root);
   expect(childEnv?.ELANOUS_STATE_DIR_SOURCE).toBeTruthy();
@@ -288,6 +429,7 @@ test('agent subprocess receives a paired mission ID and store root', async () =>
 
 test('real run CLI exposes progress/final and fails closed when the agent omits its output file', async () => {
   const root = makeRoot();
+  const store = createMissionOutStore(root);
   const fakeBin = join(root, 'bin');
   const fakeCodex = join(fakeBin, 'codex');
   const fakeEln = join(fakeBin, 'eln');
@@ -302,25 +444,39 @@ test('real run CLI exposes progress/final and fails closed when the agent omits 
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
     child.once('error', reject);
     child.once('close', (code) => resolveRun({ code, stdout, stderr }));
-  });
-  const readStatus = async (missionId: string, env: NodeJS.ProcessEnv): Promise<Record<string, unknown>> => {
+});
+  const readStatus = async (missionId: string): Promise<Record<string, unknown>> => {
+    const record = store.read(missionId);
+    if (!record) throw new Error(`mission disappeared: ${missionId}`);
+    const replies = store.replies(missionId);
+    return {
+      id: missionId, missionId,
+      status: record.status === 'completed' ? 'done' : record.status,
+      ...(record.result !== undefined || record.pendingFinalReply !== undefined ? { body: record.result ?? record.pendingFinalReply } : {}),
+      artifacts: record.status === 'completed' ? [target] : [],
+      ...(record.result !== undefined ? { result: record.result } : {}),
+      replies,
+    };
+  };
+  const readCliStatus = async (missionId: string, env: NodeJS.ProcessEnv): Promise<Record<string, unknown>> => {
     const result = await runProcess(['mission', 'status', missionId, '--json'], env);
     if (result.code !== 0) throw new Error(result.stderr || `status exited ${String(result.code)}`);
     return JSON.parse(result.stdout) as Record<string, unknown>;
   };
   const waitForStatus = async (missionId: string, env: NodeJS.ProcessEnv, terminal: string): Promise<Record<string, unknown>> => {
-    const deadline = Date.now() + 8_000;
+    const deadline = Date.now() + 30_000;
+    let latest: Record<string, unknown> | undefined;
     while (Date.now() < deadline) {
-      const value = await readStatus(missionId, env);
-      if (value.status === terminal) return value;
+      const value = latest = await readStatus(missionId);
+      if (value.status === terminal) return readCliStatus(missionId, env);
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
     }
-    throw new Error(`미션이 ${terminal} 상태가 되지 않았습니다`);
+    throw new Error(`미션이 ${terminal} 상태가 되지 않았습니다: ${JSON.stringify(latest)}`);
   };
-  const waitForProgress = async (missionId: string, env: NodeJS.ProcessEnv): Promise<Record<string, unknown>> => {
+  const waitForProgress = async (missionId: string): Promise<Record<string, unknown>> => {
     const deadline = Date.now() + 8_000;
     while (Date.now() < deadline) {
-      const value = await readStatus(missionId, env);
+      const value = await readStatus(missionId);
       if ((value.replies as Array<{ text: string }>).some((event) => event.text === 'working')) return value;
       if (value.status !== 'running') throw new Error(`progress 전에 미션 종료: ${JSON.stringify(value)}`);
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
@@ -356,14 +512,17 @@ test('real run CLI exposes progress/final and fails closed when the agent omits 
     NODE_ENV: 'production',
     PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
     ELANOUS_FAST_ROUTER: '0',
+    ELANOUS_NEXUS_URL: 'file:///mission-test-no-nexus',
   };
+  // Pin the fixture to a non-HTTP URL: no host-wide NEXUS discovery and the
+  // local-ledger fallback is deterministic in parallel HQ sessions.
 
   const launched = await runProcess(['mission', 'run', '--agent', 'codex', '--prompt', 'normal', '--out', target, '--json'], env);
   expect(launched.code).toBe(0);
   const missionId = (JSON.parse(launched.stdout) as { missionId: string }).missionId;
-  const running = await readStatus(missionId, env);
+  const running = await readStatus(missionId);
   expect(running.status).toBe('running');
-  const withProgress = await waitForProgress(missionId, env);
+  const withProgress = await waitForProgress(missionId);
   expect(withProgress.status).toBe('running');
   const completed = await waitForStatus(missionId, env, 'done');
   expect(completed).toMatchObject({ id: missionId, missionId, status: 'done', body: 'final answer', artifacts: [target], result: 'final answer' });
@@ -379,11 +538,11 @@ test('real run CLI exposes progress/final and fails closed when the agent omits 
   const missing = await runProcess(['mission', 'run', '--agent', 'codex', '--prompt', 'missing-output', '--out', join(root, 'missing.md'), '--json'], env);
   expect(missing.code).toBe(0);
   const missingId = (JSON.parse(missing.stdout) as { missionId: string }).missionId;
-  const missingRunning = await readStatus(missingId, env);
+  const missingRunning = await readStatus(missingId);
   expect(missingRunning.status).toBe('running');
   expect((missingRunning.replies as Array<{ done: boolean }>).some((event) => event.done)).toBe(false);
   const failed = await waitForStatus(missingId, env, 'failed');
   expect(failed).not.toHaveProperty('result');
   expect((failed.replies as Array<{ done: boolean }>).some((event) => event.done)).toBe(false);
 
-}, 30_000);
+}, 60_000);

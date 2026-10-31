@@ -7,6 +7,13 @@ const AUTOMATIC = new Set<DoctorFixItem['id']>(['private-files', 'key-cache-perm
 const DEFERRED = new Set<DoctorFixItem['id']>(['install-path', 'bun-tmpdir']);
 const LATER_LINE = '나중에: elanous doctor --fix (셸 시작 파일 수정)';
 
+export function safeDoctorReason(reason: string | undefined): string {
+  if (!reason) return '원인 불명';
+  return /(?:api[_-]?key|secret|token)\s*(?:=|:)?\s*\S+/i.test(reason)
+    ? '민감 정보가 포함된 오류'
+    : reason;
+}
+
 export interface FirstRunDoctorResult {
   fixed: string[];
   skipped: string[];
@@ -20,7 +27,7 @@ export function runFirstRunDoctor(deps: DoctorFixDeps): FirstRunDoctorResult {
   const result: FirstRunDoctorResult = { fixed: [], skipped: [], failed: [], later: [], lines: [] };
   const record = (id: string, outcome: 'fixed' | 'skipped' | 'failed', reason?: string) => {
     result[outcome].push(id);
-    if (outcome === 'failed') result.lines.push(`doctor: ${id} 수리 실패 — ${reason || '원인 불명'}`);
+    if (outcome === 'failed') result.lines.push(`doctor: ${id} 수리 실패 — ${safeDoctorReason(reason)}`);
     try { debug.log('doctor.first-run', outcome, { id }); } catch { /* 관측 실패가 첫 실행을 막지 않는다. */ }
   };
 

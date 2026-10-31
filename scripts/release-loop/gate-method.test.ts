@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readJunitFileSeconds } from './gate-method';
+import { readJunitFileSeconds, readReleaseGateRehearsal, readReleaseOpsPolicy, selectReleaseGateMethod } from './gate-method';
 import { readFileDurations } from './shard-plan';
 import { createGateRunner, graphGateResult, judgeGate, readBaselineFileCache, readIsolatedRun, shardFailureIds } from './gate-node';
 import { formatGateTiming, gateTiming } from './gate-timing';
@@ -15,6 +15,35 @@ afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: 
 test('reads outer file suite time instead of nested describe time, including self-closing file suites', () => {
   const xml = '<testsuites><testsuite file="src/a&amp;b.test.ts" time="8"><testsuite file="src/nested.test.ts" time="90"><testcase name="case" time="2"/></testsuite></testsuite><testsuite time="10"><testsuite file="src/hidden.test.ts" time="40"/></testsuite><testsuite file="src/empty.test.ts" time="0"/></testsuites>';
   expect([...readJunitFileSeconds(xml)]).toEqual([['src/a&b.test.ts', 8], ['src/empty.test.ts', 0]]);
+});
+
+test('release policy selects the configured Pod pool from a measured Pod rehearsal and keeps the cut commit image pin', () => {
+  const policy = readReleaseOpsPolicy();
+  const result = selectReleaseGateMethod({ policy, targetVersion: '0.2.41', configuredPool: 'release-pool',
+    rehearsal: { version: '0.2.40', outcome: 'ok', executor: 'pod', commit: 'a'.repeat(40) } });
+  expect(result).toMatchObject({ executor: 'pod', pool: 'release-pool', imagePin: 'cut-commit',
+    decision: 'measured-pod-rehearsal', expiredWorkarounds: ['manual-host-override-0.2.40'] });
+});
+
+test('release policy requires every recorded workaround to name a clear condition and expiry', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'release-policy-invalid-'));
+  scratch.push(dir);
+  const path = join(dir, 'policy.yaml');
+  writeFileSync(path, `schemaVersion: 1\ngate:\n  default: { executor: pod, poolSource: config.release.loop.gatePodPool, imagePin: cut-commit }\n  rehearsalDecisions: []\nknownInterferences:\n  - id: missing-expiry\n    observedVersion: 0.2.40\n    issue: historical\n    workaround: { executor: host }\n`);
+  expect(() => readReleaseOpsPolicy(path)).toThrow('workaround must declare expiresAfterVersion and clearCondition');
+});
+
+test('release policy rehearsal reader chooses the latest hard stamp and fails closed on ambiguous timestamps', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-policy-rehearsal-'));
+  scratch.push(root);
+  const dir = join(root, 'release', '0.2.40', 'rehearsal');
+  mkdirSync(dir, { recursive: true });
+  const base = { version: '0.2.40', outcome: 'ok', hardGate: { outcome: 'ok', commit: 'a'.repeat(40), executor: 'pod' } };
+  writeFileSync(join(dir, 'hard-5h.json'), JSON.stringify({ ...base, step: 'hard-5h', endedAt: '2026-10-27T10:00:00Z' }));
+  writeFileSync(join(dir, 'hard-mid.json'), JSON.stringify({ ...base, step: 'hard-mid', endedAt: '2026-10-27T12:00:00Z', hardGate: { ...base.hardGate, outcome: 'regression' } }));
+  expect(readReleaseGateRehearsal(root, '0.2.40')).toMatchObject({ outcome: 'regression', executor: 'pod' });
+  writeFileSync(join(dir, 'hard-5h.json'), JSON.stringify({ ...base, step: 'hard-5h', endedAt: '2026-10-27T12:00:00Z' }));
+  expect(readReleaseGateRehearsal(root, '0.2.40')).toBeUndefined();
 });
 
 test('ignores invalid, negative, and missing top-level times and keeps the largest duplicate', () => {
@@ -60,7 +89,9 @@ function gateFixture(cutRc: number, baseRc: number, cutRan = true) {
     if (cmd === 'rg') return { rc: 1, output: '' };
     return { rc: 0, output: '' };
   };
-  const podCommand: Parameters<typeof createGateRunner>[3] = async () => {
+  const podImageCommits: Array<string | null | undefined> = [];
+  const podCommand: Parameters<typeof createGateRunner>[3] = async (options) => {
+    podImageCommits.push(options.imageCommit);
     const dir = join(root, 'job');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'shard.log'), `${FILE}:\n(fail) A [1.00ms]\n2 pass\n1 fail\nRan 3 tests across 1 file.\n`);
@@ -77,7 +108,7 @@ function gateFixture(cutRc: number, baseRc: number, cutRan = true) {
   runner.snapshot = async () => {};
   runner.remove = async () => {};
   runner.removeSnapshot = async () => {};
-  return { root, runner, opts: { commit: CUT, version: '0.2.24', baselineVersion: '0.2.23', baselineCommit: BASE,
+  return { root, runner, podImageCommits, opts: { commit: CUT, version: '0.2.24', baselineVersion: '0.2.23', baselineCommit: BASE,
     repo, instanceRoot: root, ledgerRoot: root, pod: { pool: 'pool-test', shards: 1 } } };
 }
 
@@ -94,6 +125,13 @@ test('cut and baseline rc 1 with zero failures are preexisting, not a gate error
   expect(again.outcome).toBe('ok');
   expect(again.baselineCache?.hits).toBe(1);
   expect(again.rcNonzeroNoFailures[0]?.baseline).toBe('same');
+});
+
+test('cut-commit policy pins the gate Pod image to the checked-out cut SHA', async () => {
+  const { runner, opts, podImageCommits } = gateFixture(0, 0);
+  const result = await judgeGate({ ...opts, imagePin: 'cut-commit' }, runner);
+  expect(result.outcome).toBe('ok');
+  expect(podImageCommits).toContain(CUT);
 });
 
 test('baseline clean rc 0 leaves the cut rc-only failure introduced', async () => {

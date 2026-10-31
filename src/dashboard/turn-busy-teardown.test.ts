@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { createExternalInputQueue } from '../input/external-input-queue.js';
 import { logTurnThrew, runTurnTeardownStep, type TurnThrewLog } from './turn-busy-teardown.js';
 import { tuiSourceFileWith } from '../../test/helpers/dashboard-source.js';
+import { createTurnThrowSim } from '../ux-sim/turn-throw-sim.js';
 
 type Logged = { category: string; event: string; payload: Record<string, unknown>; level?: string };
 
@@ -88,6 +89,31 @@ describe('turn busy teardown (TUI-STALE-BUSY-MARKER)', () => {
     expect(threw.map((e) => e.payload.phase)).toEqual(['stream-keys-detach', 'esc-gate-dispose', 'settle-esc-lines']);
     expect(String(threw[0]!.payload.error)).toContain("line.startsWith");
     expect(threw.every((e) => e.level === 'warn')).toBe(true);
+  });
+
+  test('지연 throw 심 실행: turn-threw phase 기록 · idle 전이 · 대기 입력 1건 delivered', async () => {
+    const stage = 'loadAttachments';
+    const turn = createTurnHarness();
+    const { queue, submitted } = queueOn(turn.isTurnActive);
+    const cleanup = turn.attach();
+    const delayedThrow = createTurnThrowSim({ stage, delayMs: 1 });
+    queue.route('/help\r');
+    expect(queue.pump()).toBe(false);
+
+    try {
+      await delayedThrow(stage);
+    } catch (error) {
+      logTurnThrew(`turn:${stage}`, error, (category, event, payload, opts) => {
+        turn.events.push({ category, event, payload, level: opts?.level });
+      });
+    } finally {
+      cleanup();
+    }
+
+    expect(turn.events.filter((event) => event.category === 'tui.turn' && event.event === 'turn-threw').map((event) => event.payload.phase)).toEqual([`turn:${stage}`]);
+    expect(turn.reported).toEqual(['busy', 'idle']);
+    expect(queue.pump()).toBe(true);
+    expect(submitted).toEqual(['/help']);
   });
 
   test('정상 턴은 그대로 — 로그 0 · idle 1회', () => {

@@ -640,6 +640,61 @@ describe('OR-FALLBACK-TIER-1 — resolveRunFallback 이 config 의 openrouter �
   });
 });
 
+describe('LLM-PROVIDER-ANY-ONE — GLM 설정은 Z.ai 단독 fallback으로 해석한다', () => {
+  test('GLM 전용 설정에서 Codex/Grok 없이 Z.ai 키로 직접 전환한다', () => {
+    const root = isolatedRoot('glm-only-fallback-');
+    process.env.CODEX_HOME = join(root, 'codex-home');
+    _setRotationConfigReaderForTesting(() => ({ llm: { provider: 'glm' as const } }));
+    expect(resolveRunFallback(process.env, {
+      storePath: join(root, 'store.json'), grokAvailable: false, zaiAvailable: true,
+    })).toEqual({ action: 'switch-backend', backend: 'zai' });
+    expect(resolveRunFallback(process.env, {
+      storePath: join(root, 'store.json'), grokAvailable: false, zaiAvailable: false,
+    })).toEqual({ action: 'stay', why: 'zai-unavailable' });
+  });
+  test('OpenRouter 단독 설정은 llm.model을 fallback 모델로 쓴다', () => {
+    const root = isolatedRoot('openrouter-only-fallback-');
+    process.env.CODEX_HOME = join(root, 'codex-home');
+    _setRotationConfigReaderForTesting(() => ({ llm: { provider: 'openrouter' as const, model: 'openrouter/z-ai/glm-5.3' } }));
+    expect(resolveRunFallback(process.env, {
+      storePath: join(root, 'store.json'), grokAvailable: false, openrouterAvailable: true,
+    })).toEqual({ action: 'switch-backend', backend: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  });
+  test('API provider에 명시 체인이 있으면 within-quota가 외부 fallback을 계속 막는다', () => {
+    const root = isolatedRoot('api-explicit-chain-quota-');
+    const previous = process.env.ELANOUS_CODEX_QUOTA_POLICY;
+    process.env.ELANOUS_CODEX_QUOTA_POLICY = 'within-quota';
+    process.env.CODEX_HOME = join(root, 'codex-home');
+    _setRotationConfigReaderForTesting(() => ({ llm: {
+      provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', fallbackChain: ['codex-rotate', 'openrouter'],
+      codexQuotaPolicy: 'within-quota',
+    } }));
+    try {
+      expect(resolveRunFallback(process.env, {
+        storePath: join(root, 'store.json'), grokAvailable: false, openrouterAvailable: true,
+      })).not.toEqual(expect.objectContaining({ action: 'switch-backend', backend: 'openrouter' }));
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_CODEX_QUOTA_POLICY;
+      else process.env.ELANOUS_CODEX_QUOTA_POLICY = previous;
+    }
+  });
+  test('Grok 설정은 Codex within-quota 정책을 우회해 fallback 체인을 열지 않는다', () => {
+    const root = isolatedRoot('grok-default-chain-quota-');
+    const previous = process.env.ELANOUS_CODEX_QUOTA_POLICY;
+    process.env.ELANOUS_CODEX_QUOTA_POLICY = 'within-quota';
+    process.env.CODEX_HOME = join(root, 'codex-home');
+    _setRotationConfigReaderForTesting(() => ({ llm: { provider: 'grok', codexQuotaPolicy: 'within-quota' } }));
+    try {
+      expect(resolveRunFallback(process.env, {
+        storePath: join(root, 'store.json'), grokAvailable: true, grokQuota: 'usable',
+      })).toEqual({ action: 'stay', why: 'no-candidate' });
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_CODEX_QUOTA_POLICY;
+      else process.env.ELANOUS_CODEX_QUOTA_POLICY = previous;
+    }
+  });
+});
+
 describe('CLAUDE-FAILOVER-FU — resolveRunFallback 이 원장 성숙도를 판정 입력에 싣는다', () => {
   const NOW_MS = 1_800_000_000_000;
 

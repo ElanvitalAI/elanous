@@ -10,7 +10,7 @@ import { hostCredentials } from '../task-orchestrator/surfaces/self-implement-po
 import { _resetGrokRefreshCooldownForTesting, resolveGrokCredential } from '../grok/credential.js';
 import {
   judgeParentHostCredentials, PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript, shouldInstallRemoteCodexAccess,
-  installRemoteCodexAccess, installRemoteCodexAccessBatch, installRemoteGrokAccess, resolveOwnerGrokAccessMirror, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, rankParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, PARENT_HOST_ACTIVE_FILTER, PARENT_HOST_PROC_COUNT_SCRIPT, type ParentHostConfig, type SshRunner,
+  installRemoteCodexAccess, installRemoteCodexAccessBatch, installRemoteCodexCliMirror, REMOTE_CODEX_CLI_MIRROR_DIR, installRemoteGrokAccess, resolveOwnerGrokAccessMirror, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, rankParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, PARENT_HOST_ACTIVE_FILTER, PARENT_HOST_PROC_COUNT_SCRIPT, type ParentHostConfig, type SshRunner,
 } from './parent-host.js';
 import { handTask, shellQuote } from './task-hand.js';
 
@@ -966,6 +966,27 @@ function fakeHome(body: string): { home: string; cwd: string } {
 
 describe('원격 스크립트 — 실제 셸', () => {
   const env = { ELANOUS_RUN_ID: 'run-shell0001' };
+
+  test('direct CLI mirror reuses the access-only batch writer under cli-mirror and preserves ~/.codex', () => {
+    const { home } = fakeHome('true');
+    const cliAuth = join(home, '.codex', 'auth.json');
+    mkdirSync(join(home, '.codex'), { recursive: true });
+    writeFileSync(cliAuth, JSON.stringify({ sentinel: 'must-stay' }));
+    const credentials = {
+      account: 'default',
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { authMode: 'chatgpt', tokens: { accessToken: 'fixture-access', refreshToken: '', refresh_token: '' } } } }),
+      codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'fixture-access', refresh_token: '', refreshToken: '' } }),
+    };
+    try {
+      installRemoteCodexCliMirror({ host: 'h', cwd: '/repo' }, [credentials], localShell(home));
+      const dir = join(home, '.elanous', 'remote-parent-credentials', 'cli-mirror');
+      const store = JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'));
+      expect(store.providers['openai-codex'].tokens).toMatchObject({ accessToken: 'fixture-access', refreshToken: '', refresh_token: '' });
+      expect(readFileSync(cliAuth, 'utf8')).toBe(JSON.stringify({ sentinel: 'must-stay' }));
+      expect(statSync(join(dir, 'auth.json')).mode & 0o777).toBe(0o600);
+      expect(REMOTE_CODEX_CLI_MIRROR_DIR).toBe('$HOME/.elanous/remote-parent-credentials/cli-mirror');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
 
   test('HQ의 세 access 미러를 한 스냅샷으로 설치하고 원격에는 refresh 권한이 없다', () => {
     const { home } = fakeHome('true');

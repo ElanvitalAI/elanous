@@ -1,4 +1,5 @@
-catalogVersion: 1
+# Signed server catalogs must be at least this version; advance with catalog releases.
+catalogVersion: 2
 description: |
   RFC #2161 Phase 1 — Layer A static catalog (2-tier · builtin only at this
   Phase · global tier '~/.elanous/catalog/' overlay added by Phase 6 discovery).

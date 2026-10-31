@@ -1229,17 +1229,19 @@ describe('dashboard tool dispatch signal observation', () => {
     );
     expect(callSite).toContain('signal: turnSignal,');
     expect(callSite).toContain('signal: hasParentTurnAbortSignal ? turnSignal : undefined,');
+    expect(callSite).toContain('inheritGeneralPurposeToolCatalog: true,');
   });
 
   test('forwards the current turn signal into the nested tool runtime context', () => {
-    const dispatchClosure = dashboard.slice(
-      dashboard.indexOf('dispatchToolRuntime: (toolName, input, toolCallId) =>'),
-    ).slice(0, 1100);
+    const dispatchStart = dashboard.indexOf('dispatchToolRuntime: (toolName, input, toolCallId) =>');
+    const dispatchEnd = dashboard.indexOf('dispatchPluginTool:', dispatchStart);
+    const dispatchClosure = dashboard.slice(dispatchStart, dispatchEnd);
     expect(dispatchClosure).toContain('runtime.dispatchToolByName(toolName, input, {');
     expect(dispatchClosure).toContain("surface: 'tui'");
     expect(dispatchClosure).toContain('toolCallId,');
     expect(dispatchClosure).toContain('signal: hasParentTurnAbortSignal ? turnSignal : undefined');
     expect(dispatchClosure).toContain('agentHostTools: acpTurnToolSpecs');
+    expect(dispatchClosure).toContain('inheritGeneralPurposeToolCatalog: true,');
     expect(dispatchClosure).toContain('agentDispatchTool: (childName, childArgs) =>');
   });
 

@@ -12,13 +12,17 @@ const hooks = { log: () => {}, hudSet: () => {}, requestRender: () => {}, focusP
 const raw = { channels: [{ type: 'channel-test', target: 'demo' }, { type: 'telegram' }],
   routes: { alert: ['channel-test', 'telegram'] }, primary: { alert: 'channel-test' }, fallback: { alert: 'telegram' } };
 
-function plugin(root: string, id: string, connectors: string[]): void {
+function plugin(root: string, id: string, connectors: string[], capabilities = `
+      send: true, receive: false, thread: false, topic: false, persona: false,
+      channelLifecycle: false, permissions: false, commands: false, attachments: false,
+      buttons: false, choices: false, deliveryConfirmation: false, rateLimit: false,
+    `): void {
   const dir = join(root, id);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'plugin.json'), JSON.stringify({ id, contributes: { connectors: connectors.map(type => ({ id: type })) } }));
   writeFileSync(join(dir, 'plugin.ts'), `export default {
     name: '${id}', version: '1', initialState: () => ({}), panes: {},
-    channelAdapters: [{ type: 'channel-test', capabilities: { send: true },
+    channelAdapters: [{ type: 'channel-test', capabilities: { ${capabilities} },
       parseConfig: (raw) => raw.type === 'channel-test' && typeof raw.target === 'string'
         ? { type: 'channel-test', target: raw.target } : undefined,
       send: async () => ({ type: 'channel-test', ok: true }) }],
@@ -51,5 +55,16 @@ test('undeclared connector fails activation and leaves registry untouched', asyn
   const host = new PluginHost(hooks, null, { userDir: root, packsDir: join(root, 'packs') });
   await host.discover();
   expect(host.activate('undeclared-provider')).rejects.toThrow('must be declared');
+  expect(normalizeOutbound(raw)?.channels.map(ch => ch.type)).toEqual(['telegram']);
+});
+
+test('incomplete connector capabilities fail only that plugin activation and leave the registry untouched', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-channel-host-'));
+  roots.push(root);
+  plugin(root, 'partial-provider', ['channel-test'], 'send: true');
+  const host = new PluginHost(hooks, null, { userDir: root, packsDir: join(root, 'packs') });
+  await host.discover();
+  await expect(host.activate('partial-provider')).rejects.toThrow('invalid or duplicate outbound connector');
+  expect(host.active()).toBeNull();
   expect(normalizeOutbound(raw)?.channels.map(ch => ch.type)).toEqual(['telegram']);
 });

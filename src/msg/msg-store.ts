@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { debug } from '../debug/log.js';
 
 export interface MessageEnvelope {
   from: string;
@@ -37,13 +38,33 @@ export function canonicalSeatId(value: string): string {
   return Object.hasOwn(SEAT_ALIASES, seat) ? SEAT_ALIASES[seat]! : seat;
 }
 
+/** Normalize the public message address syntax while keeping seat IDs backward compatible. */
+export function canonicalMessageAddress(value: string): string {
+  if (typeof value !== 'string') throw new TypeError('message address must be a string');
+  const address = value.trim();
+  if (/^seat:/i.test(address)) return canonicalSeatId(address.slice(address.indexOf(':') + 1));
+  if (/^group:/i.test(address)) {
+    const name = address.slice(address.indexOf(':') + 1).trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(name)) throw new Error('invalid group name');
+    return name === 'all' ? 'ALL' : `group:${name}`;
+  }
+  return canonicalSeatId(address);
+}
+
+function canonicalGroupAddress(value: string): string {
+  const address = canonicalMessageAddress(/^group:/i.test(value.trim()) ? value : `group:${value}`);
+  if (!address.startsWith('group:')) throw new Error('group address must be group:<name>');
+  return address;
+}
+
 /** Check untrusted input before opening the DB or executing a write. */
 export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('message must be an object');
   const record = input as Record<string, unknown>;
-  const from = canonicalSeatId(record.from as string);
-  const to = canonicalSeatId(record.to as string);
+  const from = canonicalMessageAddress(record.from as string);
+  const to = canonicalMessageAddress(record.to as string);
   if (from === 'ALL') throw new Error('ALL cannot send messages');
+  if (from.startsWith('group:')) throw new Error('sender must be a seat');
   if (typeof record.body !== 'string' || !record.body.trim()) throw new Error('message body must be nonempty');
   if (record.kind !== undefined && (typeof record.kind !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(record.kind))) {
     throw new Error('invalid message kind');
@@ -65,20 +86,35 @@ function validCursor(cursor: number): number {
   return cursor;
 }
 
+function hasGroupMembershipTable(db: Database): boolean {
+  return (db.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'msg_group_memberships'")
+    .get() as { count: number }).count > 0;
+}
+
 /** Unread count ⊕ newest unread ID for one recipient (same predicate as `unreadCountOn`). */
 function unreadSummaryOn(db: Database, to: string): { count: number; maxId: number | null } {
+  const groupClause = hasGroupMembershipTable(db) ? ` OR EXISTS (
+        SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = ?
+          AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
+      )` : '';
+  const params = hasGroupMembershipTable(db) ? [to, to, to, to] : [to, to, to];
   const row = db.query(`SELECT COUNT(*) AS count, MAX(m.id) AS max_id FROM msg_messages m
     WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
-      AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?))`)
-    .get(to, to, to) as { count: number; max_id: number | null };
+      AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause})`)
+    .get(...params) as { count: number; max_id: number | null };
   return { count: row.count, maxId: row.max_id ?? null };
 }
 
 function unreadCountOn(db: Database, to: string): number {
+  const groupClause = hasGroupMembershipTable(db) ? ` OR EXISTS (
+        SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = ?
+          AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
+      )` : '';
+  const params = hasGroupMembershipTable(db) ? [to, to, to, to] : [to, to, to];
   return (db.query(`SELECT COUNT(*) AS count FROM msg_messages m
     WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
-      AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?))`)
-    .get(to, to, to) as { count: number }).count;
+      AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause})`)
+    .get(...params) as { count: number }).count;
 }
 
 interface MessageRow {
@@ -101,6 +137,7 @@ function fromRow(row: MessageRow): Message {
 /** SQLite owns both append order and per-recipient acknowledgement progress. */
 export class MsgStore {
   readonly db: Database;
+  private readonly clock: () => Date;
 
   // A read-only SSE connection may outlive another process's in-place migration.
   private get hasReplyTo(): boolean {
@@ -108,13 +145,19 @@ export class MsgStore {
       .get() as { count: number }).count > 0;
   }
 
-  private readWithSchema<T>(read: (hasReplyTo: boolean) => T): T {
-    // The schema projection and rows must share one SQLite snapshot. Otherwise a writer can
-    // migrate between them and a reader could advance past a reply with its link erased.
-    return this.db.transaction(() => read(this.hasReplyTo)).deferred();
+  private get hasGroupMemberships(): boolean {
+    return (this.db.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'msg_group_memberships'")
+      .get() as { count: number }).count > 0;
   }
 
-  constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean } = {}) {
+  private readWithSchema<T>(read: (hasReplyTo: boolean, hasGroupMemberships: boolean) => T): T {
+    // The schema projection and rows must share one SQLite snapshot. Otherwise a writer can
+    // migrate between them and a reader could advance past a reply with its link erased.
+    return this.db.transaction(() => read(this.hasReplyTo, this.hasGroupMemberships)).deferred();
+  }
+
+  constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date } = {}) {
+    this.clock = options.now ?? (() => new Date());
     if (options.readOnly && (path === ':memory:' || !existsSync(path))) throw new Error('message ledger unavailable for read-only SSE service');
     if (!options.readOnly && path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = options.readOnly ? new Database(path, { readonly: true }) : new Database(path);
@@ -142,9 +185,27 @@ export class MsgStore {
       request_id INTEGER PRIMARY KEY REFERENCES msg_messages(id),
       status TEXT NOT NULL CHECK(status IN ('pending', 'delivered'))
     );
-    CREATE TABLE IF NOT EXISTS msg_ta_claim (
+      CREATE TABLE IF NOT EXISTS msg_ta_claim (
       request_id INTEGER PRIMARY KEY REFERENCES msg_messages(id),
       token TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS msg_groups (
+      address TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS msg_group_memberships (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      address TEXT NOT NULL REFERENCES msg_groups(address),
+      seat TEXT NOT NULL,
+      joined_after_id INTEGER NOT NULL DEFAULT 0 CHECK(joined_after_id >= 0),
+      left_after_id INTEGER CHECK(left_after_id IS NULL OR left_after_id >= joined_after_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_msg_group_memberships_seat_interval ON msg_group_memberships(seat, joined_after_id, left_after_id);`);
+    if (!options.readOnly) this.db.exec(`CREATE TABLE IF NOT EXISTS msg_group_all_budget (
+      sender TEXT NOT NULL,
+      hour_start TEXT NOT NULL,
+      broadcast_count INTEGER NOT NULL CHECK(broadcast_count BETWEEN 1 AND 2),
+      summary_id INTEGER REFERENCES msg_messages(id),
+      PRIMARY KEY(sender, hour_start)
     );`);
     // Serialize the schema check and ALTER across processes opening an old ledger at once.
     if (!options.readOnly) this.db.transaction(() => {
@@ -155,9 +216,7 @@ export class MsgStore {
     }).immediate();
   }
 
-  append(input: MessageEnvelope): Message {
-    return this.insertMessage(input);
-  }
+  append(input: MessageEnvelope): Message { return this.post(input); }
 
   /** Append once for a coordination comment, task failure, or decided notification. */
   appendWithProvenance(input: MessageEnvelope, provenanceKey: string): Message {
@@ -171,9 +230,16 @@ export class MsgStore {
         FROM msg_provenance p JOIN msg_messages m ON m.id = p.message_id WHERE p.provenance_key = ?`)
         .get(provenanceKey) as MessageRow | null;
       if (existing) return fromRow(existing);
+      if (msg.to.startsWith('group:') && !this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(msg.to)) {
+        throw new Error(`group not found: ${msg.to}`);
+      }
       const message = this.insertMessage(msg);
       this.db.query('INSERT INTO msg_provenance(provenance_key, message_id) VALUES (?, ?)')
         .run(provenanceKey, message.id);
+      if (msg.to === 'ALL') {
+        try { debug.log('msg.broadcast-budget', 'provenance-exempt', { recipient: msg.to, count: 1, messageId: message.id, provenanceKey }); }
+        catch { /* observability is fail-open; preserve the idempotent event */ }
+      }
       return message;
     }).immediate();
   }
@@ -189,7 +255,85 @@ export class MsgStore {
     return { id: Number(result.lastInsertRowid), ...msg, createdAt };
   }
 
-  post(input: MessageEnvelope): Message { return this.append(input); }
+  post(input: MessageEnvelope): Message {
+    const message = validateMessageEnvelope(input);
+    if (message.to.startsWith('group:')) return this.db.transaction(() => {
+      if (!this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(message.to)) throw new Error(`group not found: ${message.to}`);
+      return this.insertMessage(message);
+    }).immediate();
+    if (message.to !== 'ALL') return this.insertMessage(message);
+    const now = this.clock();
+    const hourStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours())).toISOString();
+    return this.db.transaction(() => {
+      const row = this.db.query(`SELECT broadcast_count, summary_id FROM msg_group_all_budget
+        WHERE sender = ? AND hour_start = ?`).get(message.from, hourStart) as { broadcast_count: number; summary_id: number | null } | null;
+      if (row && row.broadcast_count >= 2) {
+        if (row.summary_id !== null) {
+          return this.getMessage(row.summary_id)!;
+        }
+        const summary = this.insertMessage({ from: message.from, to: 'ALL', kind: 'summary',
+          body: 'group:all 시간당 상한(2건)을 초과한 방송은 이 요약 한 건으로 접었습니다.' });
+        this.db.query('UPDATE msg_group_all_budget SET summary_id = ? WHERE sender = ? AND hour_start = ?')
+          .run(summary.id, message.from, hourStart);
+        return summary;
+      }
+      const posted = this.insertMessage(message);
+      this.db.query(`INSERT INTO msg_group_all_budget(sender, hour_start, broadcast_count, summary_id)
+        VALUES (?, ?, 1, NULL) ON CONFLICT(sender, hour_start)
+        DO UPDATE SET broadcast_count = msg_group_all_budget.broadcast_count + 1`)
+        .run(message.from, hourStart);
+      return posted;
+    }).immediate();
+  }
+
+  createGroup(name: string, owner: string): string {
+    const address = canonicalGroupAddress(name.startsWith('group:') ? name : `group:${name}`);
+    const seat = canonicalSeatId(owner);
+    return this.db.transaction(() => {
+      this.db.query('INSERT INTO msg_groups(address) VALUES (?)').run(address);
+      this.db.query('INSERT INTO msg_group_memberships(address, seat, joined_after_id) VALUES (?, ?, ?)')
+        .run(address, seat, this.latestId());
+      return address;
+    }).immediate();
+  }
+
+  joinGroup(group: string, member: string): boolean {
+    const address = canonicalGroupAddress(group);
+    const seat = canonicalSeatId(member);
+    return this.db.transaction(() => {
+      if (!this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(address)) throw new Error(`group not found: ${address}`);
+      const existing = this.db.query('SELECT 1 FROM msg_group_memberships WHERE address = ? AND seat = ? AND left_after_id IS NULL')
+        .get(address, seat);
+      if (existing) return false;
+      this.db.query('INSERT INTO msg_group_memberships(address, seat, joined_after_id) VALUES (?, ?, ?)')
+        .run(address, seat, this.latestId());
+      return true;
+    }).immediate();
+  }
+
+  leaveGroup(group: string, member: string): boolean {
+    const address = canonicalGroupAddress(group);
+    const seat = canonicalSeatId(member);
+    return this.db.transaction(() => {
+      const result = this.db.query(`UPDATE msg_group_memberships SET left_after_id = ?
+        WHERE id = (SELECT id FROM msg_group_memberships WHERE address = ? AND seat = ? AND left_after_id IS NULL ORDER BY id DESC LIMIT 1)`)
+        .run(this.latestId(), address, seat);
+      return result.changes > 0;
+    }).immediate();
+  }
+
+  listGroups(member: string): string[] {
+    const seat = canonicalSeatId(member);
+    return (this.db.query('SELECT DISTINCT address FROM msg_group_memberships WHERE seat = ? AND left_after_id IS NULL ORDER BY address')
+      .all(seat) as Array<{ address: string }>).map(row => row.address);
+  }
+
+  isGroupDelivery(message: Message, recipient: string): boolean {
+    const seat = canonicalSeatId(recipient);
+    return message.to.startsWith('group:') && Boolean(this.db.query(`SELECT 1 FROM msg_group_memberships
+      WHERE address = ? AND seat = ? AND ? > joined_after_id AND (left_after_id IS NULL OR ? <= left_after_id)`)
+      .get(message.to, seat, message.id, message.id));
+  }
 
   /** Delivery state is separate from the single linked reply; an uncertain send keeps its claim. */
   taDeliveryStatus(requestId: number): 'pending' | 'delivered' | null {
@@ -253,9 +397,16 @@ export class MsgStore {
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
-    return this.readWithSchema(hasReplyTo => (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
-      WHERE id > ? AND (recipient = ? OR (recipient = 'ALL' AND sender <> ?))
-      ORDER BY id ASC LIMIT ?`).all(after, to, to, limit) as MessageRow[]).map(fromRow));
+    return this.readWithSchema((hasReplyTo, hasGroupMemberships) => {
+      const groupClause = hasGroupMemberships ? ` OR EXISTS (
+        SELECT 1 FROM msg_group_memberships gm WHERE gm.address = msg_messages.recipient AND gm.seat = ?
+          AND msg_messages.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR msg_messages.id <= gm.left_after_id)
+      )` : '';
+      const params = hasGroupMemberships ? [after, to, to, to, limit] : [after, to, to, limit];
+      return (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+        WHERE id > ? AND (recipient = ? OR (recipient = 'ALL' AND sender <> ?)${groupClause}) ORDER BY id ASC LIMIT ?`)
+        .all(...params) as MessageRow[]).map(fromRow);
+    });
   }
 
   /** One message by durable ID, or null when absent. */
@@ -350,16 +501,23 @@ export class MsgStore {
   }
 
   unreadRecipients(): UnreadRecipient[] {
+    const hasGroups = this.hasGroupMemberships;
+    const membershipRecipients = hasGroups ? ' UNION SELECT seat FROM msg_group_memberships' : '';
+    const groupClause = hasGroups ? ` OR EXISTS (
+          SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = r.recipient
+            AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
+        )` : '';
     return this.db.query(`WITH recipients(recipient) AS (
         SELECT 'OP' UNION SELECT 'MK' UNION SELECT 'TC' UNION SELECT 'UX'
-        UNION SELECT recipient FROM msg_messages WHERE recipient <> 'ALL'
+        UNION SELECT recipient FROM msg_messages WHERE recipient <> 'ALL' AND recipient NOT LIKE 'group:%'
         UNION SELECT recipient FROM msg_cursors WHERE recipient <> 'ALL'
+        ${membershipRecipients}
       )
       SELECT r.recipient AS recipient, COUNT(m.id) AS count
       FROM recipients r
       LEFT JOIN msg_cursors c ON c.recipient = r.recipient
       JOIN msg_messages m ON m.id > COALESCE(c.last_id, 0)
-        AND (m.recipient = r.recipient OR (m.recipient = 'ALL' AND m.sender <> r.recipient))
+        AND (m.recipient = r.recipient OR (m.recipient = 'ALL' AND m.sender <> r.recipient)${groupClause})
       GROUP BY r.recipient ORDER BY r.recipient ASC`).all() as UnreadRecipient[];
   }
 

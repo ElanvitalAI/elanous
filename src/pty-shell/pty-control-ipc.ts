@@ -48,6 +48,8 @@ export type PtyControlPayload =
 export interface PtyControlRequestOptions {
   /** 요청자가 주장하는 쓰기 주체. `'agent'` 는 run-identity 일치를 요구한다(`resolveRemoteControlActor`). */
   readonly actor?: PtyWriteActor;
+  /** Bound child identity for an agent-originated control message (e.g. mission HandReply). */
+  readonly requesterRunId?: string;
   readonly timeoutMs?: number;
   /** 대상 PTY를 발견한 매니페스트 뿌리. 연합 조회는 이 DB에 제어 요청을 남겨 그 행의 owner가 처리하게 한다. */
   readonly manifestDbPath?: string;
@@ -467,7 +469,8 @@ export async function requestRemotePtyControl(id: string, action: PtyControlActi
     const now = Date.now();
     // ⭐ 요청자의 run anchor 를 요청에 실어 보낸다 — 인가는 **owner 가** 자기 PTY 의 run 과 대조해 내린다
     //    (요청자 자기 신고를 그대로 믿지 않는다는 뜻이 아니라, 판정 지점이 자원 소유자라는 뜻).
-    d.run(`INSERT INTO pty_control_requests (request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [requestId, targetId, action, payload ? JSON.stringify(payload) : null, actor, getHarnessRunId(process.env), ownerPid, 'pending', now, now]);
+  const requesterRunId = actor === 'agent' ? (options.requesterRunId?.trim() || getHarnessRunId(process.env)) : getHarnessRunId(process.env);
+  d.run(`INSERT INTO pty_control_requests (request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [requestId, targetId, action, payload ? JSON.stringify(payload) : null, actor, requesterRunId, ownerPid, 'pending', now, now]);
     // ⭐ 깊은 유휴 감속 중인 owner 를 즉시 깨운다 — 행을 넣은 «뒤» 표식을 남기므로 그 재읽기가 이 행을 본다.
     //    표식은 그 행의 `ownerPid` «별» 파일이다 — 같은 원장을 공유하는 다른 owner 가 가져가지 못한다.
     signalPtyControlWake(queuePath ?? ptyManifestDbPath(), ownerPid);

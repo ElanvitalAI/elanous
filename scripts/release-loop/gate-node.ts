@@ -52,7 +52,7 @@ import { markGateShardUnmeasured, nextGateShardAttempt, readGateShardManifest, r
 import { planGateShardDispatch, summarizeGateProgress, type GateProgressGroup, type GateShardReceipt } from './gate-shard-dispatch.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from './tui-node-checks.js';
-import { runWithReleaseGateTraffic } from './gate-traffic-mode.js';
+import { runWithReleaseGateTraffic, runWithReleasePwaTraffic } from './gate-traffic-mode.js';
 import { emitPodLifecycle, gatePodLifecycleEvent, gatePodOutcome } from '../../src/task-orchestrator/surfaces/pod-lifecycle-stages.js';
 import { gateHostReservationRoot, reserveReleaseGateHosts } from '../../src/release-loop/gate-host-reservation.js';
 import { normRoot } from '../../src/instance/resolve.js';
@@ -227,6 +227,10 @@ export function reconcileStaleGateShardBoard(input: {
 }
 export interface GateOptions {
   commit: string;
+  /** Explicit pre-cut warm↔fresh comparison, persisted before the ordinary gate reads warmHistory. */
+  warmPrecutCanary?: { file: string };
+  /** RELEASE-POLICY-PACK — the gate Pod image is tied to this resolved cut commit. */
+  imagePin?: 'cut-commit';
   /** The graph run that launched this gate; direct hard rehearsal instead pins source bytes explicitly. */
   graphRunId?: string;
   /** Only a direct hard rehearsal may pin graph bytes from its measured Git commit. */
@@ -250,6 +254,7 @@ export interface GateOptions {
   recheckFileLimit?: number;
   /** freshShards — GATE-SHARD-RESUME off: every shard starts a Pod even when this logDir already holds its result. */
   pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string; bunCache?: string; freshShards?: boolean;
+    imagePin?: 'cut-commit';
     /** One immutable container image identity for this gate graph run and all its resumes. */
     pinnedImageDigest?: string;
     pinnedRunId?: string;
@@ -409,29 +414,151 @@ const WARM_REPLAY_BUDGET = 3;
 interface WarmVerdictSample { version: string; commit: string; baselineCommit: string; warmShadow: WarmShadowObservation[] }
 const recordValue = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+function validWarmShadowObservation(value: unknown): value is WarmShadowObservation {
+  const row = recordValue(value);
+  if (!row || !Array.isArray(row.files) || row.files.length !== 1 || typeof row.files[0] !== 'string'
+    || !/^(?:[\w.-]+\/)*[\w.-]+\.test\.[cm]?[jt]sx?$/.test(row.files[0])
+    || row.files[0].split('/').some((part) => part === '.' || part === '..')
+    || typeof row.attemptId !== 'string' || !row.attemptId || typeof row.reason !== 'string'
+    || !['observed', 'fallback', 'unmeasured'].includes(String(row.status))
+    || !['yes', 'no', 'failed', 'unavailable'].includes(String(row.quarantined))) return false;
+  if (row.finalized !== undefined && typeof row.finalized !== 'boolean') return false;
+  if (row.cutSha !== undefined && typeof row.cutSha !== 'string') return false;
+  if (row.baselineSha !== undefined && typeof row.baselineSha !== 'string') return false;
+  if (row.workerKey !== undefined) {
+    const key = recordValue(row.workerKey);
+    if (!key || typeof key.context !== 'string' || !key.context || typeof key.imageDigest !== 'string' || !key.imageDigest
+      || typeof key.lockHash !== 'string' || !key.lockHash || typeof key.architecture !== 'string' || !key.architecture) return false;
+  }
+  return true;
+}
+function validWarmVerdictSample(value: unknown): value is WarmVerdictSample {
+  const row = recordValue(value);
+  return !!row && typeof row.version === 'string' && typeof row.commit === 'string'
+    && typeof row.baselineCommit === 'string' && Array.isArray(row.warmShadow)
+    && row.warmShadow.every(validWarmShadowObservation);
+}
 /** The verdict is atomically replaced; carry a bounded prior-verdict window in that same SSOT. */
 function readWarmVerdictHistory(path: string): WarmVerdictSample[] | undefined {
   if (!existsSync(path)) return [];
   try {
     const current = recordValue(JSON.parse(readFileSync(path, 'utf8')));
     if (!current || !Array.isArray(current.warmHistory)) return undefined;
-    const history = [...current.warmHistory, { version: current.version, commit: current.commit,
-      baselineCommit: current.baselineCommit, warmShadow: current.warmShadow }].slice(-WARM_VERDICT_HISTORY_LIMIT);
-    if (history.some((entry) => { const row = recordValue(entry);
-      return !row || typeof row.version !== 'string' || typeof row.commit !== 'string'
-        || typeof row.baselineCommit !== 'string' || !Array.isArray(row.warmShadow); })) return undefined;
-    return history as WarmVerdictSample[];
+    if (current.warmHistory.some((entry) => !validWarmVerdictSample(entry))) return undefined;
+    const hasCurrentSample = ['version', 'commit', 'baselineCommit', 'warmShadow'].some((key) => key in current);
+    const history = [...current.warmHistory];
+    if (current.warmHistoryOnly !== true || hasCurrentSample) {
+      const currentSample = { version: current.version, commit: current.commit,
+        baselineCommit: current.baselineCommit, warmShadow: current.warmShadow };
+      if (!validWarmVerdictSample(currentSample)) return undefined;
+      if (current.warmHistoryOnly !== true) history.push(currentSample);
+    }
+    return history.slice(-WARM_VERDICT_HISTORY_LIMIT) as WarmVerdictSample[];
   } catch { return undefined; }
+}
+
+/** Append one actual pre-cut replay observation to the gate verdict's bounded history, preserving its gate result. */
+function recordWarmPrecutCanarySample(path: string, sample: WarmVerdictSample): void {
+  if (!sample.version || !/^[0-9a-f]{7,40}$/i.test(sample.commit) || !/^[0-9a-f]{7,40}$/i.test(sample.baselineCommit)
+    || !Array.isArray(sample.warmShadow) || sample.warmShadow.length !== 1 || !sample.warmShadow.every(validWarmShadowObservation))
+    throw new Error('invalid pre-cut canary sample');
+  let current: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    let decoded: unknown;
+    try { decoded = JSON.parse(readFileSync(path, 'utf8')); }
+    catch (error) { throw new Error(`gate verdict JSON is malformed: ${String(error)}`); }
+    const parsed = recordValue(decoded);
+    if (!parsed) throw new Error('gate verdict is not an object');
+    current = parsed;
+    if (current.warmHistory !== undefined && !Array.isArray(current.warmHistory)) throw new Error('gate verdict warmHistory is invalid');
+  }
+  const storedHistory = Array.isArray(current.warmHistory) ? [...current.warmHistory] : [];
+  if (storedHistory.some((entry) => !validWarmVerdictSample(entry))) throw new Error('gate verdict warmHistory contains an invalid row');
+  const history = storedHistory;
+  const hasCurrentSample = ['version', 'commit', 'baselineCommit', 'warmShadow'].some((key) => key in current);
+  if (current.warmHistoryOnly === true && hasCurrentSample) {
+    const previous = { version: current.version, commit: current.commit, baselineCommit: current.baselineCommit, warmShadow: current.warmShadow };
+    if (!validWarmVerdictSample(previous)) throw new Error('gate verdict current warm sample is invalid');
+  } else if (current.warmHistoryOnly !== true) {
+    const previous = { version: current.version, commit: current.commit, baselineCommit: current.baselineCommit, warmShadow: current.warmShadow };
+    if (!validWarmVerdictSample(previous)) throw new Error('gate verdict current warm sample is invalid');
+    history.push(previous);
+  }
+  history.push(sample);
+  const body = JSON.stringify({ ...current, warmHistory: history.slice(-WARM_VERDICT_HISTORY_LIMIT), warmHistoryOnly: true }, null, 2) + '\n';
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = join(dirname(path), `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
+  try { writeFileSync(temp, body, { mode: 0o600, flag: 'wx' }); chmodSync(temp, 0o600); renameSync(temp, path); }
+  finally { if (existsSync(temp)) rmSync(temp); }
+}
+
+/** Run a bounded set of real fresh-Job ↔ warm-worker comparisons before the release gate. */
+export async function runWarmPrecutCanary(input: { opts: GateOptions; runner: GateRunner; file: string;
+  config: unknown; historyPath: string; timeoutMs?: number }): Promise<{ samples: WarmShadowObservation[]; decision: ReturnType<typeof decideWarmReuse> }> {
+  const { opts, runner } = input;
+  if (!opts.pod || !runner.recheckPod || !opts.baselineCommit || !opts.pod.warmReplay || !opts.pod.warmFinalize || !opts.pod.warmQuarantine)
+    throw new Error('pre-cut canary requires a Pod pool, baseline commit, and warm worker hooks');
+  if (!/^(?:[\w.-]+\/)*[\w.-]+\.test\.[cm]?[jt]sx?$/.test(input.file)
+    || input.file.split('/').some((part) => part === '.' || part === '..')) throw new Error('pre-cut canary requires one repository test file');
+  if (readWarmVerdictHistory(input.historyPath) === undefined)
+    throw new Error('gate verdict contains malformed warm history or current sample; refusing canary without writing');
+  const samples = 2;
+  if (samples > WARM_REPLAY_BUDGET) throw new Error(`pre-cut canary sample count exceeds replay budget (${WARM_REPLAY_BUDGET})`);
+  const lock = await runner.localCommand('git', ['show', `${opts.commit}:bun.lock`], opts.repo ?? process.cwd());
+  if (lock.rc !== 0 || !lock.output) throw new Error('pre-cut canary cut lock is unmeasured');
+  if (!/^[0-9a-f]{40}$/i.test(opts.baselineCommit)) throw new Error('pre-cut canary baseline commit is invalid');
+  const baseline = await runner.localCommand('git', ['cat-file', '-e', `${opts.baselineCommit}^{commit}`], opts.repo ?? process.cwd());
+  if (baseline.rc !== 0) throw new Error(`pre-cut canary baseline commit is absent: ${opts.baselineCommit.slice(0, 12)}`);
+  const trackedFile = await runner.localCommand('git', ['cat-file', '-e', `${opts.commit}:${input.file}`], opts.repo ?? process.cwd());
+  if (trackedFile.rc !== 0) throw new Error(`pre-cut canary test file is absent from cut ${opts.commit.slice(0, 12)}`);
+  const lockHash = createHash('sha256').update(lock.output).digest('hex');
+  const pod = { ...opts.pod, warmProducerEnabled: false, warmCutSha: opts.commit, warmBaselineSha: opts.baselineCommit,
+    warmEligible: true, warmReplayOwner: true, warmShadowScope: { requested: false, attempts: 0 } };
+  const observations: WarmShadowObservation[] = [];
+  const attemptIds = new Set<string>();
+  for (let index = 0; index < samples; index++) {
+    let observation: WarmShadowObservation;
+    let failure: Error | undefined;
+    try {
+      const result = await runner.recheckPod(input.file, opts.commit, pod, input.timeoutMs ?? GATE_ISOLATED_TIMEOUT_MS);
+      observation = result.warmShadow ?? { files: [input.file], attemptId: `precut-unmeasured-${index + 1}-${randomUUID()}`,
+        status: 'unmeasured', reason: result.rc === 0 ? 'warm-shadow-missing' : `fresh-job-rc-${result.rc}`, quarantined: 'no' };
+      if (result.rc !== 0) { observation = { ...observation, status: 'unmeasured', reason: `fresh-job-rc-${result.rc}` };
+        failure = new Error(`pre-cut fresh Job failed on attempt ${index + 1}: rc=${result.rc}`); }
+      else if (observation.status !== 'observed' || !observation.workerKey
+        || observation.files.length !== 1 || observation.files[0] !== input.file
+        || observation.cutSha !== opts.commit || observation.baselineSha !== opts.baselineCommit
+        || observation.workerKey.lockHash !== lockHash || !['match', 'result'].includes(observation.reason)
+        || attemptIds.has(observation.attemptId)
+        || (observation.reason === 'match' && (observation.finalized !== true || observation.quarantined !== 'no'))) {
+        failure = new Error(`pre-cut warm comparison was not measured on attempt ${index + 1}: ${observation.reason}`);
+      }
+    } catch (error) {
+      observation = { files: [input.file], attemptId: `precut-error-${index + 1}-${randomUUID()}`,
+        status: 'unmeasured', reason: String(error), quarantined: 'unavailable' };
+      failure = error instanceof Error ? error : new Error(String(error));
+    }
+    attemptIds.add(observation.attemptId);
+    observations.push(observation);
+    recordWarmPrecutCanarySample(input.historyPath, { version: opts.version, commit: opts.commit,
+      baselineCommit: opts.baselineCommit, warmShadow: [observation] });
+    if (failure) throw failure;
+  }
+  const history = readWarmVerdictHistory(input.historyPath);
+  const evidence = warmEvidenceFromVerdicts(history, opts.version, opts.commit, opts.baselineCommit, lockHash);
+  const warmReuseConfig = (input.config && typeof input.config === 'object' && 'pod' in input.config
+    && recordValue((input.config as Record<string, unknown>).pod)?.warmReuse) as WarmReuseSwitchConfig | undefined;
+  return { samples: observations, decision: decideWarmReuse('gate-recheck', warmReuseConfig,
+    evidence ? { 'gate-recheck': evidence } : undefined) };
 }
 /** Every counted match has a measured, finalized worker with this exact cut, baseline and lock. */
 export function warmEvidenceFromVerdicts(history: readonly WarmVerdictSample[] | undefined,
   version: string, head: string, baseline: string, lock: string): WarmReuseEvidence | undefined {
   if (!history?.length || !lock) return undefined;
-  const rows = history.flatMap((verdict) => {
-    if (verdict.version !== version || verdict.commit !== head || verdict.baselineCommit !== baseline
-      || !Array.isArray(verdict.warmShadow)) return [null];
-    return verdict.warmShadow.length ? verdict.warmShadow : [null];
-  });
+  const matchingHistory = history.filter((verdict) => verdict.version === version && verdict.commit === head
+    && verdict.baselineCommit === baseline);
+  const rows = matchingHistory.flatMap((verdict) => verdict.warmShadow.length ? verdict.warmShadow : [null]);
+  if (!rows.length) return undefined;
   const attempts = new Set<string>();
   const key = rows.at(-1)?.workerKey;
   if (rows.some((entry) => {
@@ -2227,7 +2354,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           pool: pod.pool, poolScheduler: trackedPool(shard, branch, jobName, resultFile, attemptId, (member) => {
             stamp('poolPlaced'); jobContext = member.context; jobContextForCapture = member.context; placedOn = member.context; placed();
             if (branch === '-tail') tailPlacedHost = member.context;
-          }, skipMembers, depth === 0 && branch === '' && hostRetries === 0 && !retriedNoOutput && !batchIsolation && skipMembers.size === 0), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
+          }, skipMembers, depth === 0 && branch === '' && hostRetries === 0 && !retriedNoOutput && !batchIsolation && skipMembers.size === 0), clone: true, source: { kind: 'commit', sha: commit },
+          ...(pod.imagePin === 'cut-commit' ? { imageCommit: commit } : {}), deadlineSeconds: shardDeadline,
           ...gateHostMirror(pod),
           ...(multiHost ? { statusUnreadableMs: memberUnreadableSeconds * 1000 } : {}),
           ...(bunCache ? { bunCache } : {}),
@@ -3266,11 +3394,11 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
   let cutSweepRc: number | null = null;
   let radiusShadow: GateRadiusShadowPlan | undefined;
   const trees: string[] = [];
+  const baselineVersion = opts.baselineVersion;
   try {
     if (!sha.test(opts.commit) || !versionPattern.test(opts.version)
       || (opts.baselineVersion && !versionPattern.test(opts.baselineVersion))
       || (opts.baselineCommit && !sha.test(opts.baselineCommit))) throw new Error('invalid commit or version');
-    const baselineVersion = opts.baselineVersion;
     if (!baselineVersion) throw new Error('previous release version required (--baseline-version)');
     if (opts.rehearsalBaseline && (opts.graphRunId || !opts.pod || !/-rc\.\d+$/.test(opts.version)))
       throw new Error('rehearsal baseline requires a direct Pod gate with an isolated rc version');
@@ -3506,7 +3634,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       try {
         const sweepResult = await runner.sweep(cutTree,
       join(root, 'release', opts.version, 'gate-logs', selected ? 'cut-partial' : 'cut'),
-      opts.pod ? { ...opts.pod, durationSource, ...(knownFailures.length ? { knownFailures } : {}), onSelectionTimed: ({ ms }) => { result.selectionMs = ms; },
+      opts.pod ? { ...opts.pod, ...(opts.imagePin ? { imagePin: opts.imagePin } : {}), durationSource, ...(knownFailures.length ? { knownFailures } : {}), onSelectionTimed: ({ ms }) => { result.selectionMs = ms; },
         // GATE-RISK-LANE — the watch list is read from this gate's own ledgers (the instance root ⊕ the machine ledger);
         // the cut sweep puts those files first, the baseline sweep keeps its plan.
         riskWatch: { instanceRoots: roots, ledgerRoots: roots },
@@ -3608,7 +3736,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           check(await runner.command('bun', ['install'], dir), `bun install ${dir}`);
         const rechecked = await runner.sweep(recheckTree,
           join(root, 'release', opts.version, 'gate-logs', 'baseline-attribution-recheck'),
-          opts.pod ? { ...opts.pod, durationSource } : undefined,
+          opts.pod ? { ...opts.pod, ...(opts.imagePin ? { imagePin: opts.imagePin } : {}), durationSource } : undefined,
           targetFiles);
         if (rechecked.timedOut || rechecked.abortedShards || rechecked.stalledEnv?.length) {
           attribution.baselineResult = 'timeout';
@@ -3723,7 +3851,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         // K9b — the baseline is swept on the same Pod pool as the cut, not on this host (0.2.6: an hour of local baseline
         // after a 23-minute Pod cut).
         const baseRun = await runner.sweep(baseTree!, join(root, 'release', opts.version, 'gate-logs', 'baseline'),
-          opts.pod ? { ...opts.pod, durationSource } : undefined,
+          opts.pod ? { ...opts.pod, ...(opts.imagePin ? { imagePin: opts.imagePin } : {}), durationSource } : undefined,
           present);
         baseline = await localStalled(baseRun, baseTree!, baseSha, 'baseline');
       } else baseline = { failures: [], errors: [] };
@@ -4174,6 +4302,14 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
   const fromGraph: Record<string, unknown> = context?.input ?? {};
   const graphCommit = context?.outputs['version-release']?.commit;
   if (typeof graphCommit === 'string') fromGraph.commit = graphCommit;
+  if (fromGraph.gateImagePin !== undefined && fromGraph.gateImagePin !== 'cut-commit') {
+    throw new Error(`unsupported gate image pin: ${String(fromGraph.gateImagePin)}`);
+  }
+  // Policy-selected Pod gates must pin their container to the resolved cut commit. Host sweeps do
+  // not consume a container image pin, and the legacy no-executor path retains its old behavior.
+  if (fromGraph.gateExecutor === 'pod' && fromGraph.gateImagePin !== 'cut-commit') {
+    throw new Error('gateImagePin cut-commit is required for a policy-selected release gate');
+  }
   const baselineCommit = context?.outputs.cutoff?.baseline as { sha?: unknown } | undefined;
   if (typeof baselineCommit?.sha === 'string') fromGraph.previousCommit = baselineCommit.sha;
   if (fromGraph.gateExecutor !== undefined && !isGateExecutor(fromGraph.gateExecutor)) throw new Error(`gateExecutor must be pod or host: ${String(fromGraph.gateExecutor)}`);
@@ -4186,6 +4322,7 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
       || !['darwin', 'linux'].includes((value as { os?: string }).os ?? ''))))
     throw new Error('gateShardCapabilities must map pod-N to {os: darwin|linux}');
   const opts: GateOptions = {
+    ...(fromGraph.gateImagePin === 'cut-commit' ? { imagePin: 'cut-commit' as const } : {}),
     rehearsalTui: fromGraph.rehearsalTui === true,
     recheckFileLimit: fromGraph.gateRecheckFileLimit !== undefined ? Number(fromGraph.gateRecheckFileLimit) : undefined,
     commit: typeof fromGraph.commit === 'string' ? fromGraph.commit : '',
@@ -4214,12 +4351,19 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
   };
   if (isGateExecutor(fromGraph.gateExecutor)) opts.executor = fromGraph.gateExecutor;
   let freshShards = false;
+  let warmPrecutCanaryFile: string | undefined;
   let rerouteShard: string | undefined;
   let shardHost: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--help') return 'help';
     if (arg === '--json') continue;
+    if (arg === '--precut-canary-file') {
+      const value = args[++i];
+      if (!value || value.startsWith('--')) throw new Error('--precut-canary-file requires one test file');
+      warmPrecutCanaryFile = value;
+      continue;
+    }
     if (arg === '--full') { opts.full = true; continue; }
     if (arg === '--rehearsal-baseline') { opts.rehearsalBaseline = true; continue; }
     // Applied after the loop and only to a Pod gate — on its own it must not turn a local gate into a Pod one (review r5).
@@ -4264,6 +4408,7 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
     else if (key === 'remoteMirror') opts.remoteMirror = value;
   }
   if (freshShards && opts.pod) opts.pod = { ...opts.pod, freshShards: true };
+  if (warmPrecutCanaryFile) opts.warmPrecutCanary = { file: warmPrecutCanaryFile };
   if ((rerouteShard || shardHost) && !opts.pod?.pool) throw new Error('shard reroute requires a Pod pool');
   if (shardHost && !rerouteShard) throw new Error('--shard-host requires --reroute-shard');
   if (opts.pod && rerouteShard) opts.pod = { ...opts.pod, rerouteShard, ...(shardHost ? { shardHost } : {}) };
@@ -4299,12 +4444,26 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
       catch (error) { debug.log('release-loop.gate', 'warm-profile-unavailable', { error: String(error) }); }
     }
     const opts = parsed === 'help' ? parsed : withWarmGateHooks(parsed, config, !!runner);
+    if (opts !== 'help' && opts.warmPrecutCanary) {
+      const canaryRunner = runner ?? createGateRunner(opts.repo ?? process.cwd(), opts.remote);
+      const warmPrecutTestSeam = (runner as (GateRunner & { warmPrecutCanaryTestSeam?: {
+        config: unknown; hooks: Pick<NonNullable<GateOptions['pod']>, 'warmReplay' | 'warmFinalize' | 'warmQuarantine' | 'warmReuseConfig'>;
+      } }) | undefined)?.warmPrecutCanaryTestSeam;
+      const canaryOpts = warmPrecutTestSeam && opts.pod ? { ...opts, pod: { ...opts.pod, ...warmPrecutTestSeam.hooks } } : opts;
+      const canary = await runWarmPrecutCanary({ opts: canaryOpts, runner: canaryRunner, file: opts.warmPrecutCanary.file,
+        config: warmPrecutTestSeam?.config ?? config,
+        historyPath: verdictFile(opts.ledgerRoot ?? releaseLedgerRoot(), opts.version) });
+      const output = { version: opts.version, commit: opts.commit, samples: canary.samples, decision: canary.decision };
+      console.log(JSON.stringify(output));
+      return 0;
+    }
     if (opts !== 'help') {
       placement = gateExecutorOf(opts);
-      debug.log('release-loop.gate', 'executor', { version: opts.version, ...placement, requested: opts.executor ?? null });
+      debug.log('release-loop.gate', 'executor', { version: opts.version, ...placement, requested: opts.executor ?? null,
+        imagePin: opts.imagePin ?? null, imageCommit: opts.imagePin === 'cut-commit' ? opts.commit : null });
     }
     if (opts === 'help') {
-      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--remote-mirror <path>] [--pod-pool <pool>] [--pod-shards <n>] [--pod-shard-timeout-seconds <n>] [--recheck-file-limit <n>] [--fresh-shards] [--reroute-shard <pod-N|auto>] [--shard-host <pool-context>] [--executor <pod|host>] [--rehearsal-baseline] [--full] [--json]\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.\n--executor host (input.gateExecutor) ignores every pod option and sweeps on --remote (input.gateRemote, required).\n--rehearsal-baseline pins source graph bytes only for a direct Pod gate on an isolated rc version.\n--full disables receipt and partial reuse and runs the complete test inventory.');
+      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--remote-mirror <path>] [--pod-pool <pool>] [--precut-canary-file <test-file>] [--pod-shards <n>] [--pod-shard-timeout-seconds <n>] [--recheck-file-limit <n>] [--fresh-shards] [--reroute-shard <pod-N|auto>] [--shard-host <pool-context>] [--executor <pod|host>] [--rehearsal-baseline] [--full] [--json]\n--precut-canary-file runs exactly two one-file warm↔fresh comparisons and stores them in this version\'s gate-verdict warmHistory before the standard gate consumes it; decideWarmReuse applies minMatchSamples.\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.\n--executor host (input.gateExecutor) ignores every pod option and sweeps on --remote (input.gateRemote, required).\n--rehearsal-baseline pins source graph bytes only for a direct Pod gate on an isolated rc version.\n--full disables receipt and partial reuse and runs the complete test inventory.');
       return 0;
     }
     version = opts.version;
@@ -4363,5 +4522,6 @@ if (import.meta.main) {
   // The graph spawns this file as its own process, which inherits no daemon sink — without this every
   // `release-loop.gate`/`release.gate`/`pod.pool` event stayed in the file trail and `elanous logs` read 0 rows.
   await registerStandaloneLogSink('release-loop');
-  process.exitCode = await runWithReleaseGateTraffic(process.env, () => runGateNode(process.argv.slice(2), process.env));
+  process.exitCode = await runWithReleaseGateTraffic(process.env,
+    () => runWithReleasePwaTraffic(process.env, () => runGateNode(process.argv.slice(2), process.env)));
 }

@@ -40,8 +40,7 @@ export function buildWebSearchTool(): LLMToolSpec {
   return {
     name: 'WebSearch',
     description:
-      'Search the public web via the daemon\'s configured provider (Grok / ' +
-      'Firecrawl / etc.). When no key is available, falls back to keyless DuckDuckGo. ' +
+      'Search the public web via Exa then Firecrawl; X/Twitter intent may use Grok. ' +
       'Returns a ranked list of URLs + titles + snippets. ' +
       'For fact questions, answer directly from the snippets and URLs; read the full body only when insufficient. ' +
       'Pair with a follow-up Read or external WebFetch when the model needs ' +

@@ -18,7 +18,7 @@ function helpNames(command: Command): string[] {
 const commands = program.commands;
 const grades = FEATURE_MATURITY.cliRoot;
 const names = commands.map(command => command.name());
-const system = ['repro', 'run-detached', 'dogfood', 'run'];
+const system = ['repro', 'run-detached', 'dogfood', 'run', 'tui'];
 // Private ledgers register only when their CLI module ships (release/public-export.yaml drops
 // src/cli/directives-cli.ts), so the public export keeps the grade without the command.
 const privateLedger = ['decisions', 'claims', 'lesson', 'directives'];

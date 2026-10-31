@@ -1,7 +1,7 @@
 // Coding-agent terminal preset.
 //
 // Thin wrapper over TerminalSessionRegistry that knows how to spawn
-// a "live agent host" session (claude-code / codex) with:
+// a "live agent host" session (claude-code / codex / grok) with:
 //
 //   • ELANOUS_SESSION_ID env so the child can self-identify in any
 //     scripts/hooks it runs
@@ -22,6 +22,8 @@ import type { ChromeControlResult } from '../ui/modal-adapter.js';
 export interface SpawnCodingAgentOpts {
   brand: CodingAgentBrand;
   cwd: string;
+  /** Optional stable UUID used to bind scoped mission-line authority to this PTY. */
+  id?: string;
   /** Extra CLI args to pass through after the binary name. */
   extraArgs?: string[];
   /** Override title. Defaults to `<brand> [<basename(cwd)>]`. */
@@ -74,8 +76,9 @@ export function spawnCodingAgent(
 
   const cwdName = basenameSafe(opts.cwd);
   const title = opts.title ?? `${opts.brand} [${cwdName}]`;
-  const rawCommand = opts.extraArgs && opts.extraArgs.length > 0
-    ? `${binary} ${opts.extraArgs.join(' ')}`
+  const extraArgs = opts.extraArgs ?? (opts.brand === 'grok' ? ['--always-approve'] : undefined);
+  const rawCommand = extraArgs && extraArgs.length > 0
+    ? `${binary} ${extraArgs.join(' ')}`
     : binary;
   // Only `claude` reads the macOS keychain — codex does not. Gate
   // the SSH unlock preamble on brand to avoid spawning a `sh -c`
@@ -92,8 +95,12 @@ export function spawnCodingAgent(
   // SSH keychain wrap and any other path-relative lookup. The
   // captured env mirrors what a fresh Terminal.app login would see
   // (see shell-env-bootstrap.ts), so it's the right baseline.
+  const callerEnv = { ...(opts.env ?? {}) };
+  const grokAuthEnvKeys = ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'] as const;
+  if (opts.brand === 'grok') for (const key of grokAuthEnvKeys) delete callerEnv[key];
   const env: Record<string, string> = buildPtyEnv({
-    ...(opts.env ?? {}),
+    ...callerEnv,
+    ...(opts.brand === 'grok' ? { GROK_DISABLE_API_KEY_AUTH: '1' } : {}),
     ELANOUS_AGENT_BRAND: opts.brand,
     // Session id is filled in below once we know it.
     TERM: 'xterm-ghostty',
@@ -104,10 +111,11 @@ export function spawnCodingAgent(
     COLORTERM: 'truecolor',
     CLICOLOR: '1',
     CLICOLOR_FORCE: '1',
-  });
+  }, process.env, { unset: opts.brand === 'grok' ? grokAuthEnvKeys : [] });
 
   const session = deps.registry.spawn(
     {
+      id: opts.id,
       title,
       cwd: opts.cwd,
       command,
@@ -138,6 +146,7 @@ function binaryForBrand(brand: CodingAgentBrand): string {
     case 'claude-code': return 'claude';
     case 'codex':       return 'codex';
     case 'gemini':      return 'gemini';
+    case 'grok':        return 'grok';
   }
 }
 

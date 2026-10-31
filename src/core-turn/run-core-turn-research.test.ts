@@ -4,7 +4,9 @@ import * as llmModule from '../llm.js';
 import { debug } from '../debug/log.js';
 import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
+const applyDeferredToolsActual = deferredModule.applyDeferredTools;
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
+import { isResearchToolAllowed, requestsResearchDocumentWrite, RESEARCH_TOOL_ALLOWLIST } from './research-policy.js';
 import { runCoreTurn } from './run-core-turn.js';
 
 const tool: LLMToolSpec = {
@@ -14,7 +16,40 @@ const skillExecTool: LLMToolSpec = {
   name: 'skill_exec', description: 'Execute a named installed skill',
   parameters: { type: 'object', properties: {} },
 };
+const webSearchTool: LLMToolSpec = {
+  name: 'WebSearch', description: 'Search the web', parameters: { type: 'object', properties: {} },
+};
+const omniSearchTool: LLMToolSpec = {
+  name: 'OmniSearch', description: 'Search multiple providers', parameters: { type: 'object', properties: {} },
+};
+const webFetchTool: LLMToolSpec = {
+  name: 'WebFetch', description: 'Fetch a URL', parameters: { type: 'object', properties: {} },
+};
 const signal = new AbortController().signal;
+
+function createManualTimers() {
+  const scheduled: Array<{ delayMs: number; callback: () => void; handle: ReturnType<typeof setTimeout>; cleared: boolean }> = [];
+  return {
+    scheduled,
+    timers: {
+      setTimeout(callback: () => void, delayMs: number) {
+        const entry = { delayMs, callback, handle: globalThis.setTimeout(() => {}, 60_000), cleared: false };
+        scheduled.push(entry);
+        return entry.handle;
+      },
+      clearTimeout(handle: ReturnType<typeof setTimeout>) {
+        const entry = scheduled.find(timer => timer.handle === handle);
+        if (entry) entry.cleared = true;
+        globalThis.clearTimeout(handle);
+      },
+    },
+    fire(delayMs: number) {
+      const entry = scheduled.find(timer => timer.delayMs === delayMs && !timer.cleared);
+      if (!entry) throw new Error(`no active timer for ${delayMs}ms`);
+      entry.callback();
+    },
+  };
+}
 
 beforeEach(() => {
   spyOn(llmModule, 'streamLLMWithTools').mockResolvedValue('done');
@@ -37,11 +72,13 @@ test('uses shared research-turn intent in chat surface and injects Bloom evidenc
   let calls = 0;
   let modelCalls = 0;
   let researchTurn: boolean | undefined;
+  let researchToolsSeen: string[] = [];
   let firstCallHadEvidence = true;
   let secondCallHadEvidence = false;
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, _handlers, options) => {
     modelCalls += 1;
     researchTurn = options?.researchTurn;
+    if (modelCalls === 2) researchToolsSeen = options?.tools?.map(spec => spec.name) ?? [];
     const message = messages.find((item) => item.role === 'system'
       && typeof item.content === 'string' && item.content.includes('<bloom-research>'));
     if (modelCalls === 1) firstCallHadEvidence = Boolean(message);
@@ -51,7 +88,8 @@ test('uses shared research-turn intent in chat surface and injects Bloom evidenc
   const result = await runCoreTurn({
     sessionId: 'research-chat-surface',
     messages: [{ role: 'user', content: request }],
-    tools: [tool], dispatchTool: async () => null, signal, userText: request,
+    tools: [tool, skillExecTool, webSearchTool, omniSearchTool, webFetchTool, { ...tool, name: 'ToolSearch' }],
+    dispatchTool: async () => null, signal, userText: request,
   }, { runResearch: async (text) => {
     calls += 1;
     expect(text).toBe(request);
@@ -63,7 +101,80 @@ test('uses shared research-turn intent in chat surface and injects Bloom evidenc
   expect(modelCalls).toBe(2);
   expect(firstCallHadEvidence).toBe(false);
   expect(secondCallHadEvidence).toBe(true);
+  expect(researchToolsSeen).toEqual(expect.arrayContaining(['Read', 'WebFetch']));
+  expect(researchToolsSeen).not.toEqual(expect.arrayContaining(['skill_exec', 'ToolSearch']));
   expect(result.finalText).toBe('evidence-reconciled answer');
+});
+
+test('deep non-research prompts get Bloom without skill or search tools', async () => {
+  const request = '채권 금리 앞으로 어떻게 봐야 하나';
+  expect(isResearchAgentIntent(request)).toBe(false);
+  let toolsSeen: string[] = [];
+  let researchTurn: boolean | undefined;
+  let bloomFrameSeen = false;
+  let researchCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, _handlers, options) => {
+    toolsSeen = options?.tools?.map(spec => spec.name) ?? [];
+    researchTurn = options?.researchTurn;
+    bloomFrameSeen = messages.some(message => message.role === 'system'
+      && typeof message.content === 'string' && message.content.includes('3–5 short questions'));
+    return 'analysis answer';
+  });
+  const result = await runCoreTurn({
+    sessionId: 'deep-non-research-no-search',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool, skillExecTool, webSearchTool, omniSearchTool, webFetchTool],
+    dispatchTool: async () => null, signal, userText: request,
+  }, { runResearch: async () => {
+    researchCalls += 1;
+    return { ok: true, output: 'unexpected research evidence' };
+  } });
+
+  expect(researchCalls).toBe(0);
+  expect(researchTurn).toBe(false);
+  expect(toolsSeen).toContain('Read');
+  expect(toolsSeen).not.toEqual(expect.arrayContaining(['skill_exec', 'WebSearch', 'OmniSearch', 'WebFetch', 'ToolSearch']));
+  expect(bloomFrameSeen).toBe(true);
+  expect(result.finalText).toBe('analysis answer');
+});
+
+test('deep non-research named-skill requests keep active skill_exec without research or ToolSearch', async () => {
+  const request = "Use the 'first-principles' skill to explain this clearly.";
+  expect(isResearchAgentIntent(request)).toBe(false);
+  let toolsSeen: string[] = [];
+  let researchCalls = 0;
+  let tierSplitEvent: unknown;
+  spyOn(deferredModule, 'applyDeferredTools').mockImplementation((messages, tools, options) =>
+    applyDeferredToolsActual(messages, tools, { ...options, enabled: true }));
+  spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'capability.resolve' && event === 'tool-tier-split') tierSplitEvent = data;
+  });
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, options) => {
+    toolsSeen = options?.tools?.map(spec => spec.name) ?? [];
+    return 'first-principles analysis';
+  });
+  const deferredTool: LLMToolSpec & { alwaysLoad: false; shouldDefer: true } = {
+    name: 'DeferredFixture', description: 'A deferred fixture tool',
+    parameters: { type: 'object', properties: {} },
+    alwaysLoad: false, shouldDefer: true,
+  };
+  const result = await runCoreTurn({
+    sessionId: 'deep-non-research-named-skill',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool, skillExecTool, webSearchTool, deferredTool],
+    dispatchTool: async () => null, signal, userText: request, reasoningEffort: 'high',
+  }, { runResearch: async () => {
+    researchCalls += 1;
+    return { ok: true, output: 'unexpected research evidence' };
+  } });
+
+  expect(researchCalls).toBe(0);
+  expect(toolsSeen).toContain('skill_exec');
+  expect(toolsSeen).not.toEqual(expect.arrayContaining(['WebSearch', 'ToolSearch']));
+  expect(tierSplitEvent).toMatchObject({
+    activeCount: 4, immediateCount: 2, deferredCount: 1, deferred: ['DeferredFixture'],
+  });
+  expect(result.finalText).toBe('first-principles analysis');
 });
 
 test('records first-token, research, provisional-answer, and synthesis timing on one research turn', async () => {
@@ -71,7 +182,9 @@ test('records first-token, research, provisional-answer, and synthesis timing on
   let finishResearch: ((value: { ok: boolean; output: string }) => void) | undefined;
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
   spyOn(debug, 'log').mockImplementation((category, event, data) => {
-    if (category === 'research.turn') events.push({ event, data });
+    if (category === 'research.turn' && data && typeof data === 'object' && !Array.isArray(data)) {
+      events.push({ event, data: data as Record<string, unknown> });
+    }
   });
   let modelCall = 0;
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
@@ -149,6 +262,223 @@ test('explicit named skill request skips the text-only research answer and invok
   expect(result.finalText).toBe('Invoked omni-crawl and found a practical source.');
 });
 
+test('headless research runs in core-turn keep the 20-call ceiling and shared allowlist', async () => {
+  const request = 'Research recent battery policy updates using current sources.';
+  const calledToolSets: string[][] = [];
+  let deniedDispatch: unknown;
+  let budgetDispatch: unknown;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
+    calledToolSets.push(options?.tools?.map((item) => item.name) ?? []);
+    expect(options?.maxTurns).toBe(20);
+    deniedDispatch = await handlers.dispatchTool('Bash', { command: 'echo should-not-run' });
+    for (let i = 0; i < 21; i += 1) {
+      const result = await handlers.dispatchTool('OmniSearch', { query: `research-${i}` });
+      if (i === 20) budgetDispatch = result;
+    }
+    return 'research complete';
+  });
+  let dispatches = 0;
+  let searchDispatches = 0;
+  await runCoreTurn({
+    sessionId: 'headless-research-policy',
+    messages: [{ role: 'user', content: request }],
+    tools: [
+      { name: 'OmniSearch', description: 'Search multiple sources', parameters: { type: 'object' } },
+      { name: 'WebFetch', description: 'Fetch a web page', parameters: { type: 'object' } },
+      { name: 'Agent', description: 'Delegate research', parameters: { type: 'object' } },
+      tool,
+      { name: 'WebSearch', description: 'Search the web', parameters: { type: 'object' } },
+      { name: 'Grep', description: 'Search files', parameters: { type: 'object' } },
+      { name: 'Bash', description: 'Run shell', parameters: { type: 'object' } },
+      skillExecTool,
+    ],
+    dispatchTool: async (name) => {
+      dispatches += 1;
+      if (name === 'OmniSearch') searchDispatches += 1;
+      return 'search result';
+    },
+    signal,
+    userText: request,
+  }, { runResearch: async (_request, _signal, admitToolCall) => {
+    for (let i = 0; i < 10; i += 1) expect(admitToolCall?.('OmniSearch')).toBe(true);
+    return { ok: false, output: '', error: 'no evidence in policy test' };
+  } });
+
+  expect(isResearchAgentIntent(request)).toBe(true);
+  expect(calledToolSets).toEqual([[], []]);
+  expect(RESEARCH_TOOL_ALLOWLIST).toEqual(['OmniSearch', 'WebFetch', 'Agent', 'Read', 'memory_recall', 'MsgList']);
+  expect(isResearchToolAllowed('memory_recall')).toBe(true);
+  expect(isResearchToolAllowed('MsgList')).toBe(true);
+  expect(isResearchToolAllowed('Bash')).toBe(false);
+  expect(isResearchToolAllowed('RunShell')).toBe(false);
+  expect(deniedDispatch).toEqual({ error: 'This research turn may only use the research tool allowlist.' });
+  expect(budgetDispatch).toEqual({ error: 'Research tool budget reached. Answer with the evidence collected so far.' });
+  expect(searchDispatches).toBe(10);
+  expect(dispatches).toBe(10);
+});
+
+test('research turns expose Edit/Write only for explicit document paths and still deny Bash', async () => {
+  expect(requestsResearchDocumentWrite('Research and write docs/research-report.md.')).toBe(true);
+  expect(requestsResearchDocumentWrite('Research and writing docs/research-report.md.')).toBe(true);
+  expect(requestsResearchDocumentWrite('Research docs/research-report.md.')).toBe(false);
+  expect(requestsResearchDocumentWrite("Research; don't write docs/research-report.md.")).toBe(false);
+  expect(requestsResearchDocumentWrite('Research; avoid writing docs/research-report.md.')).toBe(false);
+  expect(requestsResearchDocumentWrite('Research; never saving docs/research-report.md.')).toBe(false);
+  expect(requestsResearchDocumentWrite('Research; should not be writing docs/research-report.md.')).toBe(false);
+  expect(requestsResearchDocumentWrite('Research; docs/research-report.md 작성하지 마.')).toBe(false);
+  const request = 'Research these findings and write docs/research-report.md with the requested research report.';
+  let toolsSeen: string[] = [];
+  let bashResult: unknown;
+  const dispatched: string[] = [];
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
+    toolsSeen = options?.tools?.map(spec => spec.name) ?? [];
+    bashResult = await handlers.dispatchTool('Bash', { command: 'echo forbidden' });
+    await handlers.dispatchTool('Write', { file_path: 'docs/research-report.md', content: '# report' });
+    return 'Research report drafted.';
+  });
+  await runCoreTurn({
+    sessionId: 'research-document-output-policy',
+    messages: [{ role: 'user', content: request }],
+    tools: [
+      { name: 'Bash', description: 'Run shell', parameters: { type: 'object' } },
+      { name: 'Edit', description: 'Edit a file', parameters: { type: 'object' } },
+      { name: 'Write', description: 'Write a file', parameters: { type: 'object' } },
+      { name: 'Read', description: 'Read a file', parameters: { type: 'object' } },
+      { name: 'OmniSearch', description: 'Search sources', parameters: { type: 'object' } },
+    ],
+    dispatchTool: async name => { dispatched.push(name); return 'written'; },
+    signal,
+    userText: request,
+  }, { runResearch: async () => ({ ok: true, output: 'Research evidence.' }) });
+
+  expect(toolsSeen).toEqual(expect.arrayContaining(['Edit', 'Write', 'Read']));
+  expect(toolsSeen).not.toContain('Bash');
+  expect(bashResult).toEqual({ error: 'This research turn may use research tools and Edit/Write only for the explicitly requested document.' });
+  expect(dispatched.length).toBeGreaterThan(0);
+  expect(dispatched.every(name => name === 'Write')).toBe(true);
+});
+
+test('research Agent calls wait for results and narrow child tools to read-only fetch/read', async () => {
+  const dispatched: unknown[] = [];
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
+    modelCalls += 1;
+    if (modelCalls === 1) {
+      await handlers.dispatchTool('Agent', {
+        description: 'check source', prompt: 'read sources only', subagent_type: 'general-purpose',
+        run_in_background: true, wait_for_slot: true, max_turns: 99,
+        tool_filter: { allow: ['Bash'], deny: [] },
+      });
+      return 'Provisional answer';
+    }
+    return 'Final answer';
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  await runCoreTurn({
+    sessionId: 'research-agent-policy',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool, { name: 'WebFetch', description: 'fetch', parameters: { type: 'object' } }, { name: 'Agent', description: 'agent', parameters: { type: 'object' } }],
+    dispatchTool: async (_name, args) => { dispatched.push(args); return 'agent findings'; }, signal, userText: request,
+  }, { runResearch: async () => ({ ok: false, output: '', error: 'no evidence' }) });
+
+  expect(dispatched).toHaveLength(1);
+  expect(dispatched[0]).toMatchObject({
+    subagent_type: 'general-purpose', run_in_background: false, max_turns: 20,
+    tool_filter: { allow: ['Read', 'WebFetch'], deny: ['Bash', 'Edit', 'Grep'] },
+  });
+});
+
+test('a research turn emits a transparent first response at the 15-second limit', async () => {
+  const manual = createManualTimers();
+  const visible: string[] = [];
+  let startedResearch!: () => void;
+  let finishResearch!: (result: { ok: boolean; output: string }) => void;
+  const researchStarted = new Promise<void>(resolve => { startedResearch = resolve; });
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
+    modelCalls += 1;
+    if (modelCalls === 1) {
+      expect(options?.tools).toEqual([]);
+      return new Promise<string>(() => {});
+    }
+    expect(options?.tools?.map(item => item.name)).toEqual(['Read']);
+    handlers.onText?.('Grounded answer', 'Grounded answer');
+    handlers.onTurnComplete?.([{ role: 'assistant', content: 'Grounded answer', phase: 'final_answer' }]);
+    return 'Grounded answer';
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  const pending = runCoreTurn({
+    sessionId: 'research-first-reply-deadline',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool], dispatchTool: async () => null, signal, userText: request,
+    callbacks: { onText: (_delta, full) => visible.push(full) },
+  }, {
+    timers: manual.timers,
+    firstReplyBudgetMs: 15,
+    runResearch: () => { startedResearch(); return new Promise(resolve => { finishResearch = resolve; }); },
+  });
+  await researchStarted;
+  await Promise.resolve();
+  manual.fire(15);
+  await Promise.resolve();
+  finishResearch({ ok: true, output: 'A recent public source.' });
+  const result = await pending;
+
+  expect(modelCalls).toBe(2);
+  expect(visible[0]).toContain('질문을 확인하고 있습니다');
+  expect(result.finalText).toBe('Grounded answer');
+});
+
+test('the three-minute research deadline aborts tools and forces a no-tools synthesis from partial evidence', async () => {
+  const manual = createManualTimers();
+  const stopEvents: Array<Record<string, unknown>> = [];
+  spyOn(debug, 'log').mockImplementation((category, _event, data) => {
+    if (category === 'research.stop' && data && typeof data === 'object' && !Array.isArray(data)) {
+      stopEvents.push(data as Record<string, unknown>);
+    }
+  });
+  let startedResearch!: () => void;
+  const researchStarted = new Promise<void>(resolve => { startedResearch = resolve; });
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, handlers, options) => {
+    modelCalls += 1;
+    if (modelCalls === 1) {
+      handlers.onText?.('Provisional answer', 'Provisional answer');
+      handlers.onTurnComplete?.([{ role: 'assistant', content: 'Provisional answer', phase: 'final_answer' }]);
+      return 'Provisional answer';
+    }
+    expect(options?.tools).toEqual([]);
+    expect(messages.some(message => typeof message.content === 'string' && message.content.includes('partial source evidence'))).toBe(true);
+    handlers.onText?.('Forced synthesis', 'Forced synthesis');
+    handlers.onTurnComplete?.([{ role: 'assistant', content: 'Forced synthesis', phase: 'final_answer' }]);
+    return 'Forced synthesis';
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  const pending = runCoreTurn({
+    sessionId: 'research-wallclock-deadline',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool], dispatchTool: async () => null, signal, userText: request,
+  }, {
+    timers: manual.timers,
+    researchWallClockBudgetMs: 30,
+    runResearch: (_request, researchSignal) => {
+      startedResearch();
+      return new Promise(resolve => researchSignal.addEventListener('abort', () => resolve({
+        ok: false, output: 'partial source evidence', error: 'research stopped by its deadline',
+      }), { once: true }));
+    },
+  });
+  await researchStarted;
+  await Promise.resolve();
+  manual.fire(30);
+  const result = await pending;
+
+  expect(modelCalls).toBe(2);
+  expect(result.finalText).toBe('Forced synthesis');
+  expect(stopEvents.map(event => event.reason)).toContain('wall-clock-budget');
+  expect(stopEvents.map(event => event.reason)).toContain('forced-synthesis');
+});
+
 test('unnamed English and Korean skill mentions keep the research evidence prepass', async () => {
   const requests = [
     'Use a skill to research one practical source on fuzzy skill discovery.',
@@ -165,7 +495,7 @@ test('unnamed English and Korean skill mentions keep the research evidence prepa
         && typeof message.content === 'string' && /later evidence-reconciliation phase can use tools/i.test(message.content))).toBe(true);
       return 'provisional answer';
     }
-    expect(options?.tools?.map(spec => spec.name)).toContain('skill_exec');
+    expect(options?.tools?.map(spec => spec.name)).toEqual(['Read']);
     return 'evidence-reconciled answer';
   });
   let resultText = '';
@@ -220,7 +550,9 @@ test('streams the first answer before awaiting a pending research prepass', asyn
   await firstStreamStarted;
   expect(researchStarted).toBe(true);
   expect(modelCalls).toBe(1);
-  expect(statuses[0]).toContain('먼저 답변');
+  expect(statuses[0]).toContain('검색 도구로 요청한 주제의 근거를 찾습니다.');
+  expect(statuses[0]).toContain('질문 범위에 맞춰 결론과 근거를 정리합니다.');
+  expect(statuses).not.toContain('먼저 답변을 시작하고 근거를 확인합니다.');
   expect(visible).toContain('first answer');
 
   resolveResearch({ ok: true, output: 'counterevidence' });
@@ -293,7 +625,7 @@ test('aborting while research is pending returns the provisional turn and signal
   await firstStreamStarted;
   controller.abort();
   const result = await pendingTurn;
-  expect(researchSignal).toBe(controller.signal);
+  expect(researchSignal?.aborted).toBe(true);
   expect(result).toMatchObject({ stopReason: 'aborted', finalText: 'provisional answer' });
   expect(completions).toHaveLength(1);
   expect(completions[0]).toEqual([{ role: 'assistant', content: 'provisional answer', phase: 'final_answer' }]);

@@ -89,6 +89,8 @@ export interface AcpChatHandlers {
   /** Append streamed assistant text. Caller accumulates + redraws.
    *  Receives each chunk exactly as the ACP agent emits it. */
   appendChunk: (delta: string) => void;
+  /** Replace the current streamed assistant answer with its authoritative final text. */
+  replaceText?: (fullText: string) => void;
   /** A goal iteration ended; fold only that interim reply in the visible pane. */
   foldGoalInterim?: (text: string) => void;
   /** Called once per tool_call event with a rendered label like
@@ -441,6 +443,14 @@ export class DashboardAcpChat {
         }
         const c = update.content;
         if (c.type === 'text') {
+          const meta = (update as typeof update & { _meta?: { elanous?: { textOperation?: unknown } } })._meta;
+          if (meta?.elanous?.textOperation === 'replace') {
+            this.closeStreamBuffer(sess, 'flush');
+            if (handlers.replaceText) handlers.replaceText(c.text);
+            else handlers.appendChunk(c.text);
+            handlers.redraw?.();
+            return;
+          }
           this.routeText(sess, c.text, handlers);
         }
         return;

@@ -7,6 +7,7 @@ import { HookQueue, type QueuedHook } from './queue.js';
 import { recordGithubShadow, type ShadowReviewResult } from './github-shadow.js';
 import { toExternalTask, verifyWebhook, type HookProvider } from './providers.js';
 import { drainReports, handleReportPost, ReportLimiter, ReportQueue, type ReceivedReport } from './error-report.js';
+import { createCloudErrorReportPublisher } from './error-report-cloud.js';
 import { ConsultLimiter, ConsultQueue, drainConsults, handleConsultPost, type QueuedConsult } from './consult-intake.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 
@@ -28,6 +29,9 @@ export interface HookReceiverOptions {
   wakeSeat?: HookWake;
   /** ER2 — forward one queued error report to the Primary; default = POST /v1/reports/ingest over the tailnet. */
   forwardReport?: (item: ReceivedReport) => Promise<boolean>;
+  /** ER3 — persist and fan out through GCS + Pub/Sub before using the legacy Primary path. */
+  publishCloudReport?: (item: ReceivedReport) => Promise<void>;
+  cloudReportsEnabled?: boolean;
   /** CS1 — forward a queued consultation to the Primary's consult ledger. */
   forwardConsult?: (item: QueuedConsult) => Promise<boolean>;
   /** CS1 — the public consult route is a write path from the open internet, so it stays closed (404) until
@@ -99,6 +103,9 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
   const reportQueue = new ReportQueue(options.root ?? effectiveInstanceRoot(), (event, data) => debug.log('hooks.reports', event, data));
   const reportLimiter = new ReportLimiter(options.now ?? Date.now);
   const forwardReport = options.forwardReport ?? forwardReportToPrimary;
+  const publishCloudReport = options.publishCloudReport ?? createCloudErrorReportPublisher();
+  const cloudReportsEnabled = options.cloudReportsEnabled ?? process.env.ELANOUS_ERROR_REPORT_CLOUD_ENABLED === 'true';
+  debug.log('error-collect', cloudReportsEnabled ? 'cloud-enabled' : 'cloud-disabled', {});
   const consultEnabled = options.consultEnabled ?? consultRouteEnabled();
   debug.log('hooks.consult', consultEnabled ? 'route-open' : 'route-closed', {});
   const consultQueue = new ConsultQueue(options.root ?? effectiveInstanceRoot(), (_event, data) =>
@@ -128,8 +135,28 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
     if (stopped || reportsDraining || Date.now() < reportNextAt) return;
     reportsDraining = true;
     try {
-      const result = await drainReports(reportQueue, forwardReport, (options.now ?? Date.now)());
-      if (result.delivered) debug.log('hooks.reports', 'forwarded', { delivered: result.delivered });
+      let cloudDelivered = 0;
+      let primaryFallbackDelivered = 0;
+      const deliver = async (item: ReceivedReport): Promise<boolean> => {
+        if (cloudReportsEnabled) {
+          try {
+            await publishCloudReport(item);
+            cloudDelivered++;
+            debug.log('error-collect', 'published', { reportId: item.reportId });
+            return true;
+          } catch (error) {
+            const stage = error && typeof error === 'object' && 'stage' in error
+              && (error.stage === 'store' || error.stage === 'publish') ? error.stage : 'unknown';
+            debug.log('error-collect', 'publish-failed', { reportId: item.reportId, stage });
+          }
+        }
+        const delivered = await forwardReport(item);
+        if (delivered) primaryFallbackDelivered++;
+        return delivered;
+      };
+      const result = await drainReports(reportQueue, deliver, (options.now ?? Date.now)());
+      if (primaryFallbackDelivered) debug.log('hooks.reports', 'forwarded', { delivered: primaryFallbackDelivered });
+      if (cloudDelivered) debug.log('error-collect', 'drained', { delivered: cloudDelivered });
       if (result.failed) {
         reportFailures++;
         reportNextAt = Date.now() + Math.min(300_000, Math.max(1, options.retryBaseMs ?? 1000) * 2 ** Math.min(reportFailures - 1, 20));

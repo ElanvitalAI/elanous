@@ -16,7 +16,7 @@ const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': {
 const CODEX_AUTH = JSON.stringify({ tokens: { access_token: 'access', refresh_token: 'refresh' } });
 const config = (provider?: string, fastPath = true) => ({ llm: { provider }, chat: { fastPath } }) as UserConfig;
 
-type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[]; firstRunTopics?: boolean };
+type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; gitAvailable?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[]; firstRunTopics?: boolean };
 
 async function runSetup(state: SetupState = {}) {
   const output: string[] = [];
@@ -49,7 +49,10 @@ async function runSetup(state: SetupState = {}) {
       return {
         ok: true,
         credentials: [],
-        externalCommands: [{ name: 'codex', tier: 'required', status: state.externalReady === false ? 'missing' : 'found', breaks: 'Codex app-server integration' }],
+        externalCommands: [
+          { name: 'codex', tier: 'required', status: state.externalReady === false ? 'missing' : 'found', breaks: 'Codex app-server integration' },
+          { name: 'git', tier: 'capability', status: state.gitAvailable === false ? 'missing' : 'found', breaks: 'repository and worktree operations' },
+        ],
       };
     },
     prompt: async (message) => { prompts.push(message); return message.startsWith('추천대로') ? state.recommendationAnswer : state.answer; },
@@ -500,6 +503,16 @@ describe('setup CLI', () => {
     expect(missingUnavailable).toContain('- External command-dependent integrations');
   });
 
+  test('missing Git reports unavailable integrations while keeping core Elanous sessions available', async () => {
+    const result = await runSetup({ elanous: true, provider: 'openai-codex', codex: true, gitAvailable: false });
+    const available = section(result.text, 'Available now:', 'Unavailable until');
+    const unavailable = section(result.text, 'Unavailable until');
+    expect(available).toContain('- OpenAI Codex-backed elanous sessions');
+    expect(unavailable).toContain('- Codex app-server integration');
+    expect(unavailable).toContain('- External command-dependent integrations');
+    expect(result.exitCodes).toEqual([0]);
+  });
+
   test('refuses a non-TTY stdin before asking, with a non-zero exit and the existing onboarding sentence plus the named non-interactive path', async () => {
     const result = await runSetup({ nonInteractive: false, stdinTty: false });
     expect(result.prompts).toEqual([]);
@@ -598,5 +611,85 @@ describe('setup CLI', () => {
     expect(result.writes).toEqual([]);
     expect(result.prompts).toEqual(['추천대로 켤까요? [Y/n] ']);
     expect(result.output.at(-1)).toContain('chat.fastPath');
+  });
+
+  test('DEMO1104-ONE-SHOT-KEY-SETUP: eln setup service-keys imports hidden .env keys, probes status only, and never renders their values', async () => {
+    const output: string[] = [];
+    const stored = new Map<string, string>();
+    const secret = 'mock-secret-must-not-appear';
+    let exitCode: number | undefined;
+    const program = new Command();
+    registerSetupCommand(program, {
+      getUserConfig: () => config('auto') as UserConfig,
+      isStdinTty: () => true,
+      prompt: async () => { throw new Error('ordinary prompt must not collect API keys'); },
+      promptSecret: async (message) => message.includes('.env') ? `OPENAI_API_KEY=${secret}\nANTHROPIC_API_KEY=${secret}` : '',
+      getSecretAsync: async (id) => stored.get(id),
+      setSecretAsync: async (id, value) => { stored.set(id, value); },
+      probeKey: async () => ({ success: false, durationMs: 0, model: 'mock' }),
+      out: { log: (line) => output.push(line) },
+      setExitCode: (code) => { exitCode = code; },
+    } as SetupCliDeps);
+    await program.parseAsync(['node', 'elanous', 'setup', 'service-keys']);
+    const text = output.join('\n');
+    expect(stored).toEqual(new Map([['OPENAI_API_KEY', secret], ['ANTHROPIC_API_KEY', secret]]));
+    expect(text).toContain('OpenAI');
+    expect(text).toContain('Anthropic');
+    expect(text).toContain('❌');
+    expect(text).toContain('건너뜀');
+    expect(text).toContain('https://t.me/BotFather');
+    expect(text).not.toContain(secret);
+    expect(exitCode).toBe(1);
+  }, 5_000);
+
+  test('setup service-keys catches secret-store errors without showing their details', async () => {
+    const output: string[] = [];
+    let exitCode: number | undefined;
+    const program = new Command();
+    registerSetupCommand(program, {
+      getUserConfig: () => config('auto') as UserConfig,
+      isStdinTty: () => true,
+      promptSecret: async (message) => message.includes('.env')
+        ? 'OPENAI_API_KEY=secret-value'
+        : message.includes('OPENAI_API_KEY') ? 'secret-value' : '',
+      getSecretAsync: async () => undefined,
+      setSecretAsync: async () => { throw new Error('backend secret-value failure'); },
+      out: { log: (line) => output.push(line), error: (line) => output.push(line) },
+      setExitCode: (code) => { exitCode = code; },
+    } as SetupCliDeps);
+    await program.parseAsync(['node', 'elanous', 'setup', 'service-keys']);
+    expect(exitCode).toBe(1);
+    expect(output.join('\n')).toContain('키 설정을 완료하지 못했습니다.');
+    expect(output.join('\n')).not.toContain('secret-value');
+    expect(output.join('\n')).not.toContain('backend');
+  }, 5_000);
+
+  test('setup keys --status prints presence metadata without credential values', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'setup-keys-status-'));
+    const cacheDir = join(root, 'key-cache');
+    const previousCacheDir = process.env.ELANOUS_KEY_CACHE_DIR;
+    process.env.ELANOUS_KEY_CACHE_DIR = cacheDir;
+    const output: string[] = [];
+    const errors: string[] = [];
+    const exitCodes: number[] = [];
+    const program = new Command();
+    const configPath = join(root, 'config.json');
+    try {
+      registerSetupCommand(program, {
+        getUserConfig: () => buildUserConfig(configPath),
+        isStdinTty: () => false,
+        out: { log: value => output.push(value), error: value => errors.push(value) },
+        setExitCode: code => exitCodes.push(code),
+      });
+      await program.parseAsync(['setup', 'keys', '--status'], { from: 'user' });
+      expect(output.join('\n')).toContain('OpenAI API: 키 필요 (OPENAI_API_KEY)');
+      expect(output.join('\n')).not.toMatch(/sentinel|secret-value/i);
+      expect(errors).toEqual([]);
+      expect(exitCodes).toEqual([0]);
+    } finally {
+      if (previousCacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR;
+      else process.env.ELANOUS_KEY_CACHE_DIR = previousCacheDir;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

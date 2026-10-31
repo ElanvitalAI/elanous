@@ -28,6 +28,7 @@ export interface ConnectorCliDeps {
   log?: typeof debug.log;
   bearerToken?: string;
   readKey?: () => Promise<string>;
+  stateDir?: string;
 }
 
 async function setLinearSecret(id: string, deps: ConnectorCliDeps): Promise<number> {
@@ -201,4 +202,19 @@ export async function runLinearSync(opts: ConnectorSyncOptions, deps: ConnectorC
   }
   const events = await fetchLinearIssues({ apiKey: key, teamKey: opts.team, labelOrPrefix: opts.prefix, fetch: deps.fetch ?? fetch, ledger: deps.ledger });
   return applyLinearEvents(events, opts, deps);
+}
+
+export async function runLinearDailyProgress(opts: { send?: boolean; json?: boolean; version?: string }, deps: ConnectorCliDeps = {}): Promise<number> {
+  const { syncLinearDailyProgress } = await import('../connectors/linear-daily-progress.js');
+  const result = await syncLinearDailyProgress({
+    dryRun: !opts.send,
+    ...(opts.version ? { version: opts.version } : {}),
+    ...(deps.stateDir ? { stateDir: deps.stateDir } : {}),
+    ...(deps.getSecret ? { getSecret: deps.getSecret } : {}),
+    ...(deps.fetch ? { fetch: deps.fetch } : {}),
+    ...(deps.log ? { log: deps.log } : {}),
+  });
+  (deps.output ?? console.log)(opts.json ? JSON.stringify(result) :
+    `connector linear daily-summary: ${result.dryRun ? 'dry-run' : 'send'} · planned ${result.plan.length} · posted ${result.posted} · duplicate ${result.skipped} · failed ${result.failed}`);
+  return result.failed ? 1 : 0;
 }

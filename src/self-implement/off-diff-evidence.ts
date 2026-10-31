@@ -2,10 +2,19 @@
 
 import { requirePosixShellCommand } from '../platform/default-shell.js';
 import { spawnSync } from 'node:child_process';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve, sep } from 'node:path';
+import { linkWorktreeDependencies } from '../git-fs/worktree.js';
+import { runGitCommand } from '../git-fs/runner.js';
+import { parseSafeDecisionSignalCommand } from './decision-signal-press.js';
 import { debug } from '../debug/log.js';
 import { narrowerEvidenceCommand } from './evidence-command-budget.js';
 import { resolveRunIdentity } from '../harness/harness-space.js';
 import { authoredSignalCommandFromGoal } from './goal-doc/section.js';
+import { TDD_GREEN_TAG, TDD_RED_TAG, type TddRecordTag } from './tdd-evidence-tags.js';
+export { TDD_GREEN_TAG, TDD_RED_TAG } from './tdd-evidence-tags.js';
+export type { TddRecordTag } from './tdd-evidence-tags.js';
 //
 // ⛔ **왜 필요한가** — 리뷰어의 증거 채널은 워크트리 diff 하나다(`seams.ts` 의 `reviewDiff`).
 // 그래서 자식이 **diff 로 드러나지 않는 이행**(명령을 돌려 확인한 결과·라이브 관측)을 했을 때
@@ -257,9 +266,18 @@ export function buildImplementReport(
   meta: { bootReason?: string; changed: boolean; toolCalls: number; reached: boolean; timedOut: boolean; ptyId?: string },
 ): { summary: string; evidenceTranscript: string } {
   const tail = `[변경: ${meta.changed ? 'yes' : 'none'} · 툴콜 ${meta.toolCalls} · 완료 ${meta.reached} · 타임아웃 ${meta.timedOut}${meta.ptyId ? ` · PTY ${meta.ptyId}` : ''}]`;
+  const evidence = harvestEvidenceLines(transcript);
+  const observedTests = observedBunTestCommands(transcript);
+  const testOutput = observedTests
+    .map(({ command, result }) => `[child-test-output] command=${command}\n[child-test-result] ${result}`);
+  debug.log('self-implement.tdd-evidence', 'child-output-harvest', {
+    testOutputs: testOutput.length,
+    commands: observedTests.map(({ command }) => command),
+    evidenceGreenTags: (evidence.match(/\[tdd-green\]/gu) ?? []).length,
+  });
   return {
     summary: `${meta.bootReason ? `[부팅 실패] ${meta.bootReason}\n\n` : ''}${tailWithOmissionMarker(transcript, 2000)}\n\n${tail}`,
-    evidenceTranscript: harvestEvidenceLines(transcript),
+    evidenceTranscript: [evidence, ...testOutput].filter(Boolean).join('\n'),
   };
 }
 
@@ -575,10 +593,6 @@ export function coverRequiredEvidence(
 //   `EVIDENCE: [tdd-green] … || <같은 명령>` ⊕ `RESULT: <통과>` 를 남긴다.
 
 /** 자식이 남겨야 하는 TDD 증거 태그. ⛔ 판정은 **태그 동등**이다(해석 금지). */
-export const TDD_RED_TAG = 'tdd-red';
-export const TDD_GREEN_TAG = 'tdd-green';
-export type TddRecordTag = typeof TDD_RED_TAG | typeof TDD_GREEN_TAG;
-
 /** 골 문서의 «검증 계획(TDD)» 절 형식(완료 경계 증거 명령이 골 문서가 아니라 조각 계획에 박혀 있다). */
 const TDD_PLAN_HEADING = /^#{2,3}\s*검증\s*계획\s*\(TDD\)\s*$/iu;
 const TDD_RED_PLAN_PREFIX = /^[-*]\s*③\s*먼저\s*쓸\s*시험\(RED\)\s*:\s*/u;
@@ -686,4 +700,234 @@ export function judgeTddEvidence(goal: string, evidence: OffDiffEvidenceParse): 
     missing,
     needsRepair: plan.planned && missing.length > 0,
   };
+}
+
+/** Tagged evidence와 별도로 수신할 수 있는 실제 child test 결과의 형식. */
+export interface ObservedBunTestCommand {
+  readonly command: string;
+  /** 제한된 원문 판정 요약(도구 블록 안의 pass/fail 수). */
+  readonly result: string;
+  readonly passed: boolean;
+  readonly source: 'child' | 'harness-base' | 'harness-head';
+}
+
+/** 도구 출력과 바로 붙은 Bun 시험 명령·결과만 받아 적는다. 산문·다른 도구 결과는 근거가 아니다. */
+export function observedBunTestCommands(transcript: string): ObservedBunTestCommand[] {
+  const harvested: ObservedBunTestCommand[] = [];
+  const harvestedRecords = transcript.split(/\r?\n/);
+  for (let i = 0; i < harvestedRecords.length; i += 1) {
+    const output = harvestedRecords[i]?.match(/^\[(child|harness-base|harness-head)-test-output\] command=(.+)$/u);
+    const command = output?.[2]?.trim();
+    const result = harvestedRecords[i + 1]?.match(/^\[(?:child|harness-base|harness-head)-test-result\] (.+)$/u)?.[1]?.trim();
+    if (command && result && /^bun\s+test(?:\s|$)/u.test(command)) {
+      const counts = testCounts(result);
+      if (counts) harvested.push({ command, result: `${counts.pass} pass · ${counts.fail} fail`, passed: counts.pass > 0 && counts.fail === 0,
+        source: output?.[1] === 'harness-base' ? 'harness-base' : output?.[1] === 'harness-head' ? 'harness-head' : 'child' });
+    }
+  }
+  const normalized = transcript
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\"/g, '"');
+  const blocks = normalized.split(/(?=⏺\s+Bash\()/u);
+  for (const block of blocks) {
+    const command = block.match(/⏺\s+Bash\(\s*\{\s*"command"\s*:\s*"([^"\n]+)"/u)?.[1]?.trim();
+    if (!command || !/^bun\s+test(?:\s|$)/u.test(command)) continue;
+    const resultStart = block.indexOf('↳');
+    if (resultStart < 0) continue;
+    const nextToolStart = block.indexOf('\n⏺ ', resultStart);
+    const result = block.slice(resultStart, nextToolStart < 0 ? undefined : nextToolStart);
+    const counts = testCounts(result);
+    if (counts) {
+      harvested.push({ command, result: `${counts.pass} pass · ${counts.fail} fail`, passed: counts.pass > 0 && counts.fail === 0, source: 'child' });
+    }
+  }
+  return harvested;
+}
+
+function testCounts(result: string): { pass: number; fail: number } | undefined {
+  const pass = result.match(/\b(\d+)\s+pass\b/iu)?.[1];
+  const fail = result.match(/\b(\d+)\s+fail\b/iu)?.[1];
+  return pass !== undefined && fail !== undefined ? { pass: Number(pass), fail: Number(fail) } : undefined;
+}
+
+export interface TddBaseHeadTestResult {
+  readonly accepted: boolean;
+  readonly reason: string;
+  readonly command: string;
+  readonly baseResult?: string;
+  readonly headResult?: string;
+  readonly transcript?: string;
+}
+
+/** Accepts RED only when the exact changed test fails on base and passes on the implemented head. */
+export function assessTddBaseHeadTest(input: {
+  readonly command: string;
+  readonly baseExitCode: number;
+  readonly baseOutput: string;
+  readonly headExitCode: number;
+  readonly headOutput: string;
+}): TddBaseHeadTestResult {
+  const base = testCounts(input.baseOutput);
+  if (input.baseExitCode === 0 || !base || base.fail === 0) {
+    return { accepted: false, reason: 'base-test-did-not-prove-red', command: input.command,
+      ...(base ? { baseResult: `${base.pass} pass · ${base.fail} fail` } : {}) };
+  }
+  const head = testCounts(input.headOutput);
+  if (input.headExitCode !== 0 || !head || head.pass === 0 || head.fail !== 0) {
+    return { accepted: false, reason: 'head-test-did-not-pass', command: input.command,
+      baseResult: `${base.pass} pass · ${base.fail} fail`, ...(head ? { headResult: `${head.pass} pass · ${head.fail} fail` } : {}) };
+  }
+  const baseResult = `${base.pass} pass · ${base.fail} fail`;
+  const headResult = `${head.pass} pass · ${head.fail} fail`;
+  return {
+    accepted: true, reason: 'base-red-head-green', command: input.command, baseResult, headResult,
+    transcript: [
+      `[harness-base-test-output] command=${input.command}`,
+      `[harness-base-test-result] ${baseResult}`,
+      `[harness-head-test-output] command=${input.command}`,
+      `[harness-head-test-result] ${headResult}`,
+    ].join('\n'),
+  };
+}
+
+const TDD_TEST_PATH = /(?:^|\/)\S+\.(?:test|spec)\.[cm]?[jt]sx?$/u;
+const TDD_BASE_TEST_TIMEOUT_MS = 180_000;
+
+/** Runs the goal's planned Bun test twice: overlay the changed test on its exact base, then run on head. */
+export function runTddBaseHeadTest(input: { readonly cwd: string; readonly baseSha: string; readonly goal: string }): TddBaseHeadTestResult {
+  const command = tddPlanFromGoal(input.goal).greenCommand;
+  if (!command) return { accepted: false, reason: 'planned-test-command-missing', command: '' };
+  const safe = parseSafeDecisionSignalCommand(command);
+  if (!safe || 'reason' in safe || safe.executable !== 'bun' || safe.args[0] !== 'test') {
+    return { accepted: false, reason: 'planned-command-not-safe-bun-test', command };
+  }
+  const targetArgs = safe.args.slice(1).filter((arg) => !arg.startsWith('-') && arg !== '--');
+  if (!targetArgs.length || targetArgs.some((arg) => arg === '.' || arg === './')) {
+    return { accepted: false, reason: 'planned-command-not-targeted', command };
+  }
+  const diff = runGitCommand(input.cwd, ['diff', '--name-only', '-z', input.baseSha, '--'], { encoding: 'utf8', timeout: 20_000 });
+  const untracked = runGitCommand(input.cwd, ['ls-files', '--others', '--exclude-standard', '-z'], { encoding: 'utf8', timeout: 20_000 });
+  if (diff.status !== 0 || untracked.status !== 0) return { accepted: false, reason: 'changed-test-files-unmeasured', command };
+  const changedPaths = [...new Set([...(diff.stdout ?? '').split('\0'), ...(untracked.stdout ?? '').split('\0')].filter(Boolean))];
+  const targetTests = changedPaths.filter((path) => TDD_TEST_PATH.test(path) && targetArgs.some((arg) => {
+    const normalized = arg.replace(/^\.\//u, '');
+    return path === normalized || path.startsWith(`${normalized.replace(/\/$/u, '')}/`);
+  }));
+  if (!targetTests.length) return { accepted: false, reason: 'no-changed-test-file-matches-planned-command', command };
+  const root = resolve(input.cwd);
+  for (const path of targetTests) {
+    const source = resolve(root, path);
+    if (!source.startsWith(`${root}${sep}`) || !existsSync(source) || !lstatSync(source).isFile()) {
+      return { accepted: false, reason: 'changed-test-file-unavailable', command };
+    }
+  }
+  for (const path of ['bun.lock', 'package.json']) {
+    const baseFile = runGitCommand(input.cwd, ['show', `${input.baseSha}:${path}`], { encoding: 'utf8', timeout: 20_000 });
+    const headFile = existsSync(join(root, path)) ? readFileSync(join(root, path), 'utf8') : undefined;
+    if (baseFile.status !== 0 || headFile === undefined || baseFile.stdout !== headFile) {
+      return { accepted: false, reason: `dependency-input-changed:${path}`, command };
+    }
+  }
+  const baselineDir = mkdtempSync(join(tmpdir(), 'elanous-tdd-base-'));
+  let attached = false;
+  try {
+    const add = runGitCommand(input.cwd, ['worktree', 'add', '--detach', baselineDir, input.baseSha], { encoding: 'utf8', timeout: 60_000 });
+    if (add.status !== 0) return { accepted: false, reason: 'base-worktree-unavailable', command };
+    attached = true;
+    linkWorktreeDependencies(input.cwd, baselineDir, ['node_modules']);
+    if (!existsSync(join(baselineDir, 'node_modules'))) return { accepted: false, reason: 'base-dependencies-unavailable', command };
+    for (const path of targetTests) {
+      const target = resolve(baselineDir, path);
+      if (!target.startsWith(`${resolve(baselineDir)}${sep}`)) return { accepted: false, reason: 'changed-test-path-unsafe', command };
+      mkdirSync(dirname(target), { recursive: true });
+      copyFileSync(resolve(root, path), target);
+    }
+    const run = (cwd: string) => {
+      const result = spawnSync(safe.executable, [...safe.args], {
+        cwd, encoding: 'utf8', timeout: TDD_BASE_TEST_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
+      });
+      if (result.error || result.status === null) return { status: 1, output: '' };
+      return { status: result.status, output: `${result.stdout ?? ''}\n${result.stderr ?? ''}` };
+    };
+    const baseRun = run(baselineDir);
+    const baseCounts = testCounts(baseRun.output);
+    if (baseRun.status === 0 || !baseCounts || baseCounts.fail === 0) {
+      return { accepted: false, reason: 'base-test-did-not-prove-red', command,
+        ...(baseCounts ? { baseResult: `${baseCounts.pass} pass · ${baseCounts.fail} fail` } : {}) };
+    }
+    const headRun = run(root);
+    return assessTddBaseHeadTest({ command, baseExitCode: baseRun.status, baseOutput: baseRun.output,
+      headExitCode: headRun.status, headOutput: headRun.output });
+  } catch (error) {
+    return { accepted: false, reason: `base-test-unmeasured:${error instanceof Error ? error.message : String(error)}`,
+      command };
+  } finally {
+    if (attached) runGitCommand(input.cwd, ['worktree', 'remove', '--force', baselineDir], { encoding: 'utf8', timeout: 60_000 });
+    rmSync(baselineDir, { recursive: true, force: true });
+  }
+}
+
+function normalizeTddTestCommand(command: string): string {
+  return command.trim().replace(/\\"/g, '"').replace(/["']/g, '').replace(/\s+/g, ' ')
+    .replace(/\bbun\s+test\s+--\s+/u, 'bun test ');
+}
+
+/** 실제 같은 시험의 fail→pass 도구 출력을 RED 원장 기록으로 수확한다. 산문 요약은 받지 않는다. */
+export function receiveObservedTddRed(input: {
+  readonly goal: string;
+  readonly judgment: TddEvidenceJudgment;
+  readonly transcript: string;
+  readonly resultParsed: boolean;
+}): { readonly transcript: string; readonly accepted: boolean; readonly reason: string; readonly command?: string; readonly result?: string; readonly source?: ObservedBunTestCommand['source'] } {
+  const { judgment } = input;
+  if (!input.resultParsed) return { transcript: input.transcript, accepted: false, reason: 'child-result-unparsed' };
+  if (!judgment.planned) return { transcript: input.transcript, accepted: false, reason: 'tdd-plan-missing' };
+  if (judgment.red.observed) return { transcript: input.transcript, accepted: false, reason: 'red-already-recorded' };
+  const planned = tddPlanFromGoal(input.goal).greenCommand;
+  if (!planned) return { transcript: input.transcript, accepted: false, reason: 'planned-test-command-missing' };
+  const expected = normalizeTddTestCommand(planned);
+  const observed = observedBunTestCommands(input.transcript)
+    .filter(({ command }) => normalizeTddTestCommand(command) === expected);
+  const failedIndex = observed.findIndex(({ passed }) => !passed);
+  if (failedIndex < 0) return { transcript: input.transcript, accepted: false, reason: 'no-matching-failing-test-output' };
+  // RED is only accepted as the earlier half of a same-command fail→pass sequence.
+  const passedAfter = observed.slice(failedIndex + 1).find(({ passed }) => passed);
+  if (!passedAfter) return { transcript: input.transcript, accepted: false, reason: 'no-later-matching-passing-test-output' };
+  const matching = observed[failedIndex]!;
+  const claim = matching.source === 'harness-base' ? 'planned test failed on base before implementation' : 'observed planned test failure before later pass';
+  const record = `EVIDENCE: [tdd-red] ${claim} || ${planned}\nRESULT: ${matching.result}`;
+  return { transcript: `${input.transcript.trimEnd()}\n${record}`, accepted: true,
+    reason: 'matching-test-failure-recorded', command: matching.command, result: matching.result, source: matching.source };
+}
+
+/** 실제 자식 도구 결과를 계획된 동일 TDD 명령과 대조해 green 원장 레코드로 수신한다. */
+export function receiveObservedTddGreen(input: {
+  readonly goal: string;
+  readonly judgment: TddEvidenceJudgment;
+  readonly transcript: string;
+  readonly resultParsed: boolean;
+}): { readonly transcript: string; readonly accepted: boolean; readonly reason: string; readonly command?: string; readonly result?: string; readonly source?: ObservedBunTestCommand['source'] } {
+  const { judgment } = input;
+  if (!input.resultParsed) return { transcript: input.transcript, accepted: false, reason: 'child-result-unparsed' };
+  if (!judgment.planned || !judgment.red.observed || !judgment.red.verify) {
+    return { transcript: input.transcript, accepted: false, reason: 'red-or-plan-missing' };
+  }
+  if (judgment.green.observed && judgment.sameCommand) {
+    return { transcript: input.transcript, accepted: false, reason: 'green-already-recorded' };
+  }
+  const expected = normalizeTddTestCommand(judgment.red.verify);
+  const planned = tddPlanFromGoal(input.goal).greenCommand;
+  const observed = observedBunTestCommands(input.transcript);
+  const matching = observed.filter(({ command }) => normalizeTddTestCommand(command) === expected
+    && (!planned || normalizeTddTestCommand(command) === normalizeTddTestCommand(planned))).at(-1);
+  if (!matching || !matching.passed) return {
+    transcript: input.transcript, accepted: false,
+    reason: matching ? 'latest-matching-test-failed' : observed.length ? 'passing-test-command-mismatch' : 'no-adjacent-passing-bun-test',
+    ...(observed[observed.length - 1] ? { command: observed[observed.length - 1]?.command, result: observed[observed.length - 1]?.result } : {}),
+  };
+  const claim = matching.source === 'harness-head' ? 'planned test passed on implemented head' : 'observed planned test passed';
+  const record = `EVIDENCE: [tdd-green] ${claim} || ${judgment.red.verify}\nRESULT: ${matching.result}`;
+  return { transcript: `${input.transcript.trimEnd()}\n${record}`, accepted: true, reason: 'matching-test-output-recorded',
+    command: matching.command, result: matching.result, source: matching.source };
 }

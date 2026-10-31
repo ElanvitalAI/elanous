@@ -79,6 +79,24 @@ describe('research axis fanout', () => {
     }
   });
 
+  it('bridge axis invocation forwards shared tool admission to production fanout', async () => {
+    const admitted: string[] = [];
+    const searched: string[] = [];
+    const result = await invokeResearchAxes(axes, {
+      search: async query => { searched.push(query); return []; },
+      admitToolCall: toolName => {
+        admitted.push(toolName);
+        return admitted.length === 1;
+      },
+    });
+
+    expect(admitted).toEqual(['OmniSearch', 'OmniSearch', 'OmniSearch']);
+    expect(searched).toEqual([axes[0]!.searchTerms[0]]);
+    expect(result.axes[0]!.evidence[0]!.outcome).toBe('partial');
+    expect(result.axes[1]!.evidence[0]!.content).toContain('research tool budget reached');
+    expect(result.axes[2]!.evidence[0]!.content).toContain('research tool budget reached');
+  });
+
   it('검색 제공자와 원문 URL을 보존하되 없는 관측일·수치 단위는 만들지 않는다', async () => {
     const result = await fanOutAxisEvidence([axes[0]!], { search: async () => [{
       url: 'https://example.org/?a=1&amp;b=2', title: 'yield data', snippet: 'change in percent', engine: 'firecrawl',
@@ -130,7 +148,7 @@ describe('research axis fanout', () => {
     expect(result.axes[0]!.error).toContain('firecrawl: timeout');
   });
 
-  it('연구 fanout은 Grok/Firecrawl만 선택하고 무료 엔진을 호출하지 않는다', async () => {
+  it('일반 다축 검색은 Grok을 생략하고 Firecrawl만 호출한다', async () => {
     const calls: string[] = [];
     const provider = (id: string): WebSearchProvider => ({
       id, displayName: id, available: () => true,
@@ -141,9 +159,30 @@ describe('research axis fanout', () => {
     });
     const search = createResearchAxisSearcher([provider('grok'), provider('firecrawl'), provider('ddg-free')]);
     const results = await Promise.all([search('first axis'), search('second axis')]);
-    expect(calls.map(call => call.split(':')[0]).sort()).toEqual(['firecrawl', 'firecrawl', 'grok', 'grok']);
+    expect(calls.map(call => call.split(':')[0]).sort()).toEqual(['firecrawl', 'firecrawl']);
     expect(results.flatMap(result => Array.isArray(result) ? result : result.hits).map(hit => hit.engine).sort())
-      .toEqual(['firecrawl', 'firecrawl', 'grok', 'grok']);
+      .toEqual(['firecrawl', 'firecrawl']);
+  });
+
+  it('최신·여론 질문도 Grok 없이 Exa/Firecrawl만 호출한다', async () => {
+    const calls: string[] = [];
+    const provider = (id: string): WebSearchProvider => ({
+      id, displayName: id, available: () => true,
+      search: async ({ query }) => {
+        calls.push(`${id}:${query}`);
+        return { providerName: id, durationMs: 1, hits: [{ url: `https://${id}.example`, title: id, snippet: query }] };
+      },
+    });
+    const search = createResearchAxisSearcher([provider('grok'), provider('firecrawl'), provider('exa')]);
+    const questions = [
+      { id: 'stable', level: 1, prompt: 'What is the background?', searchTerms: ['company background'] },
+      { id: 'current-opinion', level: 1, prompt: 'What is the latest public opinion?', requestedWindow: 'today', searchTerms: ['brand sentiment'] },
+      { id: 'second-current', level: 2, prompt: 'What are recent reactions?', searchTerms: ['recent reactions'] },
+    ] as BloomResearchQuestion[];
+    await fanOutAxisEvidence(questions, { search });
+    expect(calls.some(call => call.startsWith('grok:'))).toBe(false);
+    expect(calls.filter(call => call.startsWith('exa:'))).toHaveLength(3);
+    expect(calls.filter(call => call.startsWith('firecrawl:'))).toHaveLength(0);
   });
 
   it('research abort signal reaches each queued axis search', async () => {
@@ -161,10 +200,24 @@ describe('research axis fanout', () => {
     expect(received).toBe(controller.signal);
   });
 
-  it('기본 axis 경로는 등록 provider 중 Grok 한 경로와 Firecrawl만 검색한다', async () => {
+  it('shared tool admission caps dispatched OmniSearch calls and retains denied axes as failure evidence', async () => {
+    let admitted = 0;
+    let searched = 0;
+    const result = await fanOutAxisEvidence(axes, {
+      admitToolCall: name => { expect(name).toBe('OmniSearch'); if (admitted >= 2) return false; admitted += 1; return true; },
+      search: async query => { searched += 1; return [{ title: query, url: `https://example.org/${query}`, snippet: 'evidence' }]; },
+    });
+
+    expect(admitted).toBe(2);
+    expect(searched).toBe(2);
+    expect(result.plan).toHaveLength(3);
+    expect(result.axes.flatMap(axis => axis.evidence).some(item => item.content.includes('research tool budget reached'))).toBe(true);
+  });
+
+  it('일반 금리 축은 Exa 성공 뒤 다른 공급자를 호출하지 않는다', async () => {
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
-    for (const id of ['grok', 'grok-api', 'firecrawl', 'tavily', 'ddg']) {
+    for (const id of ['grok', 'grok-api', 'exa', 'firecrawl', 'tavily', 'ddg']) {
       addWebSearchProvider({
         id, displayName: id, available: () => true,
         search: async () => {
@@ -175,14 +228,62 @@ describe('research axis fanout', () => {
     }
     try {
       const result = await fanOutAxisEvidence([axes[0]!]);
-      expect(calls.sort()).toEqual(['firecrawl', 'grok']);
-      expect(result.axes[0]!.evidence.map(item => item.sourceKind).sort()).toEqual(['web-search:firecrawl', 'web-search:grok']);
+      expect(calls).toEqual(['exa']);
+      expect(result.axes[0]!.evidence.map(item => item.sourceKind)).toEqual(['web-search:exa']);
     } finally {
       _resetWebSearchProvidersForTests();
     }
   });
 
-  it('첫 timeout에서 해당 엔진 breaker를 열되 다른 엔진의 queued 축 검색은 보존한다', async () => {
+  it('Exa 성공 시 웹 폴백은 즉시 멈춰 뒤 공급자를 호출하지 않는다', async () => {
+    const calls: string[] = [];
+    const provider = (id: string, search: WebSearchProvider['search']): WebSearchProvider => ({
+      id, displayName: id, available: () => true, search,
+    });
+    const search = createResearchAxisSearcher([
+      provider('exa', async () => {
+        calls.push('exa');
+        return { providerName: 'exa', durationMs: 1, hits: [{ url: 'https://exa.example', title: 'Exa', snippet: 'primary' }] };
+      }),
+      provider('firecrawl', async () => {
+        calls.push('firecrawl');
+        return { providerName: 'firecrawl', durationMs: 1, hits: [] };
+      }),
+    ]);
+
+    const result = await search('latest public opinion topic');
+
+    expect(calls).toEqual(['exa']);
+    expect(Array.isArray(result) ? result : result.hits).toMatchObject([
+      { url: 'https://exa.example', engine: 'exa' },
+    ]);
+  });
+
+  it('Exa 실패 뒤 Firecrawl만 폴백하며 Grok과 DDG는 호출하지 않는다', async () => {
+    const calls: string[] = [];
+    const provider = (id: string, search: WebSearchProvider['search']): WebSearchProvider => ({
+      id, displayName: id, available: () => true, search,
+    });
+    const search = createResearchAxisSearcher([
+      provider('grok', async () => { calls.push('grok'); return { providerName: 'grok', durationMs: 1, hits: [] }; }),
+      provider('exa', async () => {
+        calls.push('exa');
+        throw new Error('Exa unavailable');
+      }),
+      provider('firecrawl', async () => {
+        calls.push('firecrawl');
+        throw new Error('Firecrawl unavailable');
+      }),
+      provider('ddg-free', async () => { calls.push('ddg-free'); return { providerName: 'ddg-free', durationMs: 1, hits: [] }; }),
+    ]);
+
+    const result = await search('latest public opinion topic');
+
+    expect(calls).toEqual(['exa', 'firecrawl']);
+    expect(Array.isArray(result) ? [] : result.hits).toEqual([]);
+  });
+
+  it('Grok timeout은 research axis 경로에서 발생하지 않는다', async () => {
     let grokCalls = 0;
     let firecrawlCalls = 0;
     const grok: WebSearchProvider = {
@@ -197,12 +298,36 @@ describe('research axis fanout', () => {
           hits: [{ url: 'https://example.org/source', title: query, snippet: 'evidence' }] };
       },
     };
-    const search = createResearchAxisSearcher([grok, firecrawl]);
-    const [first, second] = await Promise.all([search('first axis'), search('queued axis')]);
-    expect(grokCalls).toBe(1);
-    expect(firecrawlCalls).toBe(2);
-    expect(Array.isArray(first) ? [] : first.errors).toContain('grok: timed out');
-    expect(Array.isArray(second) ? [] : second.errors).toEqual([]);
-    expect((Array.isArray(second) ? second : second.hits).map(hit => hit.engine)).toEqual(['firecrawl']);
+    const exa: WebSearchProvider = { id: 'exa', displayName: 'Exa', available: () => true,
+      search: async () => ({ providerName: 'exa', durationMs: 1, hits: [{ url: 'https://example.org/exa', title: 'exa', snippet: 'ok' }] }) };
+    const search = createResearchAxisSearcher([grok, firecrawl, exa]);
+    const result = await search('latest public opinion');
+    expect(grokCalls).toBe(0);
+    expect(firecrawlCalls).toBe(0);
+    expect((Array.isArray(result) ? result : result.hits).map(hit => hit.engine)).toEqual(['exa']);
+  });
+
+  it('Exa가 멈춰도 14.5초 예산 안에서 Firecrawl에 남은 시간이 전달된다', async () => {
+    const calls: string[] = [];
+    const exa: WebSearchProvider = {
+      id: 'exa', displayName: 'Exa', available: () => true,
+      search: async (_query, signal) => new Promise(resolve => {
+        signal?.addEventListener('abort', () => resolve({ providerName: 'exa', durationMs: 4_500, hits: [] }), { once: true });
+      }),
+    };
+    const firecrawl: WebSearchProvider = {
+      id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async (_query, signal) => {
+        calls.push('firecrawl');
+        expect(signal).toBeInstanceOf(AbortSignal);
+        return { providerName: 'firecrawl', durationMs: 1, hits: [{ url: 'https://firecrawl.example', title: 'fallback', snippet: 'ok' }] };
+      },
+    };
+    const search = createResearchAxisSearcher([exa, firecrawl]);
+    const started = Date.now();
+    const result = await search('topic');
+    expect(Date.now() - started).toBeLessThan(RESEARCH_SEARCH_BUDGET_MS);
+    expect(calls).toEqual(['firecrawl']);
+    expect(Array.isArray(result) ? result : result.hits).toMatchObject([{ engine: 'firecrawl' }]);
   });
 });

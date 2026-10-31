@@ -13,6 +13,7 @@ import { resolveHarnessTarget } from '../self-implement/harness-target-options.j
 import { loadRunLedger, runLedgerDir, appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 import { readRunStopRecord } from '../self-implement/run-stop.js';
 import { debug } from '../debug/log.js';
+import { DISPATCH_SHADOW_COMPARE_ENV } from './dispatch-shadow-compare.js';
 import { addHarnessQueue, listHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
 import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
@@ -330,6 +331,35 @@ describe('harness CLI command', () => {
       setUserConfigOverlay(null);
       if (previous === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
       else process.env.ELANOUS_HARNESS_SEAT = previous;
+    }
+  });
+
+  test('harness say records one joined dispatcher and loop-shadow decision at product entry', async () => {
+    const previous = process.env[DISPATCH_SHADOW_COMPARE_ENV];
+    const context = {
+      requestId: 'request-42', cellId: 'CELL-42', tickId: 'tick-42', snapshotHash: 'b'.repeat(64),
+      dispatcherAction: 'launch', dispatcherReason: 'eligible and highest priority',
+      loopShadowAction: 'launch', loopShadowReason: 'capacity available',
+      policyVersion: 'entrance-shadow-v1', runId: 'run-42',
+    };
+    process.env[DISPATCH_SHADOW_COMPARE_ENV] = JSON.stringify(context);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const { program } = install(async () => {}, async () => {});
+    try {
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'shadow probe', '--seat', 'UX', '--no-queue']);
+      const rows = log.mock.calls.filter(([category, event]) => category === 'harness' && event === 'dispatch.shadow.compare');
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.[2]).toEqual({
+        ...context,
+        entrance: 'cli-harness-say',
+        productEntryAction: 'launch-gate',
+        productEntryReason: 'graph-intake-launch-gate',
+        agreement: true,
+      });
+    } finally {
+      log.mockRestore();
+      if (previous === undefined) delete process.env[DISPATCH_SHADOW_COMPARE_ENV];
+      else process.env[DISPATCH_SHADOW_COMPARE_ENV] = previous;
     }
   });
 

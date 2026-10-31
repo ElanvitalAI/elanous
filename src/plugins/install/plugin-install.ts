@@ -18,6 +18,65 @@ const VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?$/;
 const SHA = /^[a-fA-F0-9]{40}$/;
 const HASH = /^[a-fA-F0-9]{64}$/;
 
+/** Curated scene packages offered by the default install group. Service-key
+ *  declarations live in each package manifest and use the shared key catalog. */
+export const DEFAULT_PLUGIN_GROUP = [
+  { id: 'demo-research', label: '리서치', requiredServiceKeys: [], optionalServiceKeys: ['exa', 'firecrawl', 'xai', 'tavily'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
+  { id: 'demo-linear-secretary', label: '리니어 비서', requiredServiceKeys: ['linear'], optionalServiceKeys: ['telegram', 'telegram-chat'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
+  { id: 'demo-absorption-briefing', label: '흡수 브리핑', requiredServiceKeys: [], optionalServiceKeys: ['exa', 'firecrawl', 'xai', 'telegram', 'telegram-chat', 'linear'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
+  { id: 'demo-browser-hand', label: '브라우저 손', requiredServiceKeys: [], optionalServiceKeys: ['linear'], requiredPrerequisites: ['llm-provider', 'aside'], optionalPrerequisites: [] },
+  { id: 'demo-video-briefing', label: '영상 브리핑', requiredServiceKeys: [], optionalServiceKeys: ['elevenlabs', 'telegram', 'telegram-chat'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
+  { id: 'demo-plugin-wizard', label: '플러그인 마법사', requiredServiceKeys: [], optionalServiceKeys: [], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: ['claude-cli', 'github-cli'] },
+] as const;
+
+export type DefaultPluginStatus = {
+  id: typeof DEFAULT_PLUGIN_GROUP[number]['id'];
+  label: string;
+  status: 'ready' | 'key-needed';
+  missingRequiredKeys: string[];
+  missingPrerequisites: string[];
+  optionalKeysMissing: string[];
+  optionalPrerequisitesMissing: string[];
+};
+
+/** Public readiness identifiers only; callers must never pass secret values. */
+export function defaultPluginStatuses(input: {
+  readyServiceKeyIds?: readonly string[];
+  satisfiedPrerequisites?: readonly string[];
+} = {}): DefaultPluginStatus[] {
+  const readyKeys = new Set(input.readyServiceKeyIds ?? []);
+  const satisfied = new Set(input.satisfiedPrerequisites ?? []);
+  return DEFAULT_PLUGIN_GROUP.map(plugin => {
+    const missingRequiredKeys = plugin.requiredServiceKeys.filter(id => !readyKeys.has(id));
+    const missingPrerequisites = plugin.requiredPrerequisites.filter(id => !satisfied.has(id));
+    return {
+      id: plugin.id,
+      label: plugin.label,
+      status: missingRequiredKeys.length || missingPrerequisites.length ? 'key-needed' : 'ready',
+      missingRequiredKeys,
+      missingPrerequisites,
+      optionalKeysMissing: plugin.optionalServiceKeys.filter(id => !readyKeys.has(id)),
+      optionalPrerequisitesMissing: plugin.optionalPrerequisites.filter(id => !satisfied.has(id)),
+    };
+  });
+}
+
+const DEFAULT_PLUGIN_ROOT = resolve(import.meta.dir, '../../../plugins');
+
+/** Install the curated default group from this distribution's packaged plugin assets. */
+export async function installDefaultPluginGroup(opts: InstallOptions = {}): Promise<InstalledPlugin[]> {
+  const root = resolve(opts.root ?? elanousStateRoot());
+  const installed: InstalledPlugin[] = [];
+  for (const plugin of DEFAULT_PLUGIN_GROUP) {
+    const packageRoot = join(DEFAULT_PLUGIN_ROOT, plugin.id);
+    const manifest = loadPluginManifestFromDir(packageRoot, { id: plugin.id }).manifest;
+    const existing = listInstalledPlugins(root).find(item =>
+      item.market === 'local' && item.name === manifest.id && item.version === manifest.version);
+    installed.push(existing ?? await installPlugin(packageRoot, { ...opts, root }));
+  }
+  return installed;
+}
+
 export type InstallEvent =
   | { event: 'resolve'; plugin: string; version: string; sha256: string | null }
   | { event: 'verify'; signature: 'ok' | 'missing' | 'bad'; scan: 'safe' | 'caution' | 'dangerous' }

@@ -29,13 +29,14 @@ import { codexPolicyAllowsCredits, codexPolicyAllowsFallback, resolveCodexQuotaP
 import { emitDecision } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
 import {
-  decideFallback, normalizeFallbackChain, grokQuotaFromUsageSnapshot,
+  decideFallback, fallbackChainForProvider, normalizeFallbackChain, grokQuotaFromUsageSnapshot,
   type FallbackDecision, type FallbackInput, type FallbackStep, type RotationOutcome,
 } from './fallback-chain.js';
 import { collectClaudePtyMaturitySample, judgeClaudePtyMaturity, type ClaudePtyMaturity } from './claude-pty-maturity.js';
 import type { UsageOutcomesDeps } from '../budget/usage-outcomes.js';
 import { resolveGrokCredential } from '../grok/credential.js';
 import { getOpenRouterApiKey } from '../config.js';
+import { zaiCodingPlanAvailable } from '../llm/zai-coding-plan.js';
 import { lookupOpenRouterModelSpec } from '../model-tier/llm-tier-map.js';
 import { sendOutbound } from '../domains/outbound-alert.js';
 
@@ -55,7 +56,7 @@ export function _setCodexAccountOutboundSenderForTesting(sender: CodexAccountOut
 /** ⛔⭐ 정적 import 로 읽는다 — 종전 `require()` 는 ESM 에서 «정의되지 않을 수 있고», 그러면
  *  fail-soft 가 삼켜 ***config false 가 영영 무시된다***(리뷰 should-fix: 노브가 no-op 이 된다).
  *  ⚠️ 순환 없음을 확인했다 — user-config 는 oauth 를 안 끌어온다. */
-type RotationConfig = { llm?: { codexCreditReserve?: unknown; codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexCreditsAllowed?: boolean; codexResetAutoConsumePerDay?: number; codexQuotaPolicy?: unknown; fallbackChain?: unknown; openrouter?: { fallbackModel?: unknown } } };
+type RotationConfig = { llm?: { provider?: string; model?: string; codexCreditReserve?: unknown; codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexCreditsAllowed?: boolean; codexResetAutoConsumePerDay?: number; codexQuotaPolicy?: unknown; fallbackChain?: unknown; openrouter?: { fallbackModel?: unknown } } };
 
 function readUserConfig(): RotationConfig {
   return getUserConfig();
@@ -312,7 +313,8 @@ function rotationCreditsGrant(candidates: readonly RotationCandidate[]): Rotatio
   if (codexPolicyAllowsCredits(policy)) return { allowed: true, via: 'policy' };
   if (!codexPolicyAllowsFallback(policy)) return { allowed: false, via: 'none' };
   try {
-    const { chain } = normalizeFallbackChain(configReader().llm?.fallbackChain);
+    const llm = configReader().llm;
+    const { chain } = normalizeFallbackChain(llm?.fallbackChain, llm?.provider);
     if (!chain.includes('codex-credits')) return { allowed: false, via: 'none' };
     const creditAccountCount = codexCreditAccountNames(candidates, codexCreditReserveFromConfig()).length;
     const fallbackModel = configReader().llm?.openrouter?.fallbackModel;
@@ -1121,6 +1123,8 @@ export function resolveRunFallback(
     readonly grokQuota?: 'usable' | 'exhausted' | 'unknown';
     /** OpenRouter 키 «존재» seam(테스트 격리) — 안 주면 `getOpenRouterApiKey()` 로 잰다. 키 값은 기록하지 않는다. */
     readonly openrouterAvailable?: boolean;
+    /** Z.ai 키 «존재» seam(테스트 격리) — 안 주면 키 존재만 잰다. */
+    readonly zaiAvailable?: boolean;
     /** codex 크레딧 잔액 «확인» seam — 안 주면 회전 후보의 크레딧 신호(잔액 > 0 · 보유 ≠ false)로 잰다. */
     readonly codexCreditsAvailable?: boolean;
     /** ⛔ 런 원장 «읽기» seam — 체인에 `claude-pty` 가 있을 때만 쓴다. 안 주면 실제 런 원장을 읽는다. */
@@ -1150,11 +1154,18 @@ export function resolveRunFallback(
       rotation = { reason: 'no-candidate' };
     }
 
-    const normalized = normalizeFallbackChain(configReader().llm?.fallbackChain);
+    const llm = configReader().llm;
+    const normalized = normalizeFallbackChain(llm?.fallbackChain, llm?.provider);
     const { dropped, usedDefault } = normalized;
     // 대표 정책 `within-quota` — codex 밖으로 폴백하지 않는다(회전만). 전부 차면 멈춘다.
     const quotaPolicy = codexQuotaPolicyFromConfig();
-    const chain = codexPolicyAllowsFallback(quotaPolicy)
+    // A non-Codex primary has no Codex quota to enforce. Only its implicit
+    // provider default bypasses the Codex fallback policy; an explicit chain
+    // continues to obey the existing within-quota contract.
+    const nonCodexProviderDefault = usedDefault
+      && (llm?.provider === 'glm' || llm?.provider === 'zai' || llm?.provider === 'openrouter')
+      && fallbackChainForProvider(llm?.provider) !== undefined;
+    const chain = codexPolicyAllowsFallback(quotaPolicy) || nonCodexProviderDefault
       ? normalized.chain
       : normalized.chain.filter((step) => step === 'codex-rotate');
     // ⛔ grok 가용성은 «호출자가 확정»해서 줄 수 있다(테스트 격리). 안 주면 여기서 잰다.
@@ -1164,7 +1175,8 @@ export function resolveRunFallback(
     // ⛔ 「지금 쓸 수 있나」는 «자격과 다른 축»이다. 안 주면 'unknown' — 그리고 unknown 은 «통과»다.
     //   ⇒ 「모르고 갔다」와 「알고 갔다」가 관측에서 갈린다(아래 grokQuota).
     const grokQuota = deps.grokQuota ?? readCachedGrokQuota();
-    const fallbackModel = configReader().llm?.openrouter?.fallbackModel;
+    const fallbackModel = llm?.openrouter?.fallbackModel
+      ?? (llm?.provider === 'openrouter' ? llm.model : undefined);
     // SUBSCRIPTION-EXHAUST-REROUTE — 크레딧 예비분에 닿은 «넘김»은 OpenRouter 가 먼저다(대표 OP 10-11: grok 이 아니다).
     //   운영 체인 `['codex-rotate','grok']` 에는 openrouter 칸이 없다 ⇒ 이 경로에만 codex 바로 뒤에 openrouter 를 끼운다
     //   (나머지 칸은 그 뒤 · 키가 없으면 종전 체인으로). 모델은 `llm.openrouter.fallbackModel`, 없으면 «중» 기본 glm-5.3.
@@ -1179,6 +1191,7 @@ export function resolveRunFallback(
       : reserveReroute ? CREDIT_RESERVE_OPENROUTER_MODEL : undefined;
     const openrouterAvailable = effectiveChain.includes('openrouter')
       && (deps.openrouterAvailable ?? Boolean(getOpenRouterApiKey()?.trim()));
+    const zaiAvailable = effectiveChain.includes('zai') && (deps.zaiAvailable ?? zaiCodingPlanAvailable());
     // CODEX-CREDITS-STEP — 체인에 그 칸이 있을 때만 잰다(없으면 판정이 안 읽는다). 잔액을 «모르면» 없다고 본다(돈 · fail-closed).
     //   ⛔ 사람이 계정을 «명시»했으면 그 계정의 잔액만 본다 — 다른 계정 잔액으로 칸을 열고 명시 계정으로 쏘면 fail-closed 가 깨진다.
     const explicitAccount = snapshot.reason === 'explicit';
@@ -1191,7 +1204,7 @@ export function resolveRunFallback(
     //   ⛔ 없으면 `undefined` 이고 판정은 종전 그대로다(수집 0회 · 판정식 무변경).
     const claudePtyMaturity = claudePtyMaturityForChain(effectiveChain, deps.claudePtyLedger);
     const fallbackBase = {
-      rotation, chain: effectiveChain, grokAvailable, grokQuota, openrouterFallbackModel, openrouterAvailable, codexCreditsAvailable,
+      rotation, chain: effectiveChain, grokAvailable, grokQuota, openrouterFallbackModel, openrouterAvailable, zaiAvailable, codexCreditsAvailable,
       ...(claudePtyMaturity ? { claudePtyMaturity } : {}),
     };
     const fallbackInput: FallbackInput = deps.currentCredentialRateLimited === true && deps.currentStep

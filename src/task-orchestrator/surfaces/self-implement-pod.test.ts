@@ -17,6 +17,7 @@ import * as childProcess from 'node:child_process';
 import type { SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import { parsePodArtifactChunks } from './pod-artifact-return.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { SUPPLY_AXES } from '../../live-supply/snapshot.js';
 import { enableLandingFreeze } from '../../release-loop/landing-freeze.js';
 import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
@@ -284,6 +285,69 @@ test('Pod Job records the supplied commit when the selected image is the local i
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('task failure evidence joins only the failed sibling with its own task, attempt, child, and termination facts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-task-failure-join-'));
+  const parentRunId = 'run-task-failure-join-fixture';
+  const secret = 'sk-proj-ABCDEFGHIJKLMNOP1234';
+  try {
+    const failed = fakeKubectl(['Failed'], `${JSON.stringify({ stage: 'error', ok: false, error: `child failed\twith\n${secret}` })}\n`, 1);
+    const succeeded = fakeKubectl(['Complete'], '{"stage":"complete","ok":true}\n', 0);
+    await podSelfImplementSpawn({ kubectl: failed.k, sleep: async () => {}, credentials: CREDS,
+      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })({
+      feature: 'failed slice', spaceId: 'space-failed-slice', taskId: 'task-failed-slice',
+    }).done;
+    await podSelfImplementSpawn({ kubectl: succeeded.k, sleep: async () => {}, credentials: CREDS,
+      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })({
+      feature: 'successful sibling', spaceId: 'space-success-sibling', taskId: 'task-success-sibling',
+    }).done;
+
+    const failures = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? [])
+      .filter((entry) => entry.event === 'pod-task-failure');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.data).toMatchObject({
+      spaceId: 'space-failed-slice', taskId: 'task-failed-slice', job: podJobName('space-failed-slice'),
+      attempt: 1, childRunId: expect.any(String), childStage: 'error',
+      podTermination: expect.any(Object),
+    });
+    const childError = String(failures[0]?.data.childError);
+    expect(childError).toContain('child failed with');
+    expect(childError).not.toContain(secret);
+    expect(childError.length).toBeLessThanOrEqual(500);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('task failure evidence is written for a failed Job apply with no child facts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-task-apply-failure-'));
+  const parentRunId = 'run-task-apply-failure-fixture';
+  const base = fakeKubectl(['Complete'], '', 0);
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('apply') && input && JSON.parse(input).kind === 'Job') {
+      return { status: 1, stdout: '', stderr: 'job apply denied' };
+    }
+    return base.k(args, input);
+  };
+  try {
+    appendRunLedgerEntry({ runId: parentRunId, event: 'pod-child-run', data: {
+      job: podJobName('space-apply-failure'), childRunId: 'old-child-run', attempt: 2,
+    } }, runLedgerDir(root));
+    appendRunLedgerEntry({ runId: parentRunId, event: 'pod-child-evidence', data: {
+      job: podJobName('space-apply-failure'), childRunId: 'old-child-run', podTermination: { exitCode: 99 },
+    } }, runLedgerDir(root));
+    const result = await podSelfImplementSpawn({ kubectl, sleep: async () => {}, credentials: CREDS,
+      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })({
+      feature: 'apply failure', spaceId: 'space-apply-failure', taskId: 'task-apply-failure',
+    }).done;
+    expect(result.error?.code).toBe('pod-apply');
+    const failures = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? [])
+      .filter((entry) => entry.event === 'pod-task-failure');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.data).toMatchObject({
+      spaceId: 'space-apply-failure', taskId: 'task-apply-failure', job: podJobName('space-apply-failure'),
+      attempt: 1, childRunId: null, childStage: 'unknown', childError: 'job apply denied', podTermination: null,
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('Pod slot wait records one correlated request, queue, and admission observation', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pod-slot-observation-'));
   const parentRunId = 'run-pod-slot-observation';
@@ -385,6 +449,7 @@ test('aborted Pod slot wait retains the first reasonCode on its no-launch result
     expect(incidents[0]?.data).toMatchObject({ observationKey: rows.at(-1)?.data.observationKey, runId: rows.at(-1)?.data.runId,
       host: rows.at(-1)?.data.host, requestedAt: rows.at(-1)?.data.requestedAt, waitedMs: rows.at(-1)?.data.waitedMs,
       queued: false, poolCapacity: 2, reasonCode: 'no-free-slot', parentId: parentRunId, outcome: 'rejected' });
+    expect((loadRunLedger(parentRunId, runLedgerDir(root)) ?? []).filter((entry) => entry.event === 'pod-task-failure')).toHaveLength(0);
     expect(reasonEvents).toBe(3);
   } finally { debugSpy.mockRestore(); rmSync(root, { recursive: true, force: true }); }
 });
@@ -764,9 +829,9 @@ describe('pod source delivery', () => {
   test('records source IO marker as one debug event and warns on malformed marker', () => {
     const rows: Array<{ category: string; event: string; data: Record<string, unknown>; options?: { level?: string } }> = [];
     const log = (category: string, event: string, data: Record<string, unknown>, options?: { level?: string }) => rows.push({ category, event, data, options });
-    recordPodSourceIoSummary('noise\nELANOUS_POD_SOURCE_IO {"originCalls":2,"checkoutFiles":17,"sourceVia":"github","sourceSeconds":3,"sourceStatus":"complete","pushCalls":null,"installRan":null,"installSeconds":null}\n', 'job-1', 'run-1', 'pod-launch-child-run-id', log, 1);
+    recordPodSourceIoSummary('noise\nELANOUS_POD_SOURCE_IO {"originCalls":2,"baseShaOriginFallback":true,"checkoutFiles":17,"sourceVia":"github","sourceSeconds":3,"sourceStatus":"complete","pushCalls":null,"installRan":null,"installSeconds":null}\n', 'job-1', 'run-1', 'pod-launch-child-run-id', log, 1);
     expect(rows).toEqual([{ category: 'pod.source', event: 'io-summary', data: {
-      job: 'job-1', runId: 'run-1', runIdSource: 'pod-launch-child-run-id', hostOriginCalls: 1, originCalls: 2, checkoutFiles: 17, sourceVia: 'github', sourceSeconds: 3,
+      job: 'job-1', runId: 'run-1', runIdSource: 'pod-launch-child-run-id', hostOriginCalls: 1, originCalls: 2, baseShaOriginFallback: true, checkoutFiles: 17, sourceVia: 'github', sourceSeconds: 3,
       sourceStatus: 'complete', pushCalls: null, installRan: null, installSeconds: null,
     }, options: undefined }]);
     rows.length = 0;
@@ -3275,6 +3340,35 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(finished[0]).toMatchObject({ state: 'failed', childError: 'no-result-line' });
       expect(finished[0]).not.toHaveProperty('childStage');
     } finally { off(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('terminal result observation distinguishes same provider signature with and without a result row', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-terminal-observation-'));
+    const providerError = 'Grok unavailable: run `grok login` (subscription unavailable)';
+    const successRun = 'run-terminal-observation-success';
+    const missingRun = 'run-terminal-observation-missing';
+    try {
+      const success = fakeKubectl(['Complete'], `${providerError}\n${JSON.stringify({ stage: 'complete', ok: true, outcome: 'completed' })}\n`, 0);
+      await podSelfImplementSpawn({ kubectl: success.k, credentials: CREDS,
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: successRun } })({ feature: 'terminal observation success', spaceId: 'terminal-observation-success' }).done;
+      const successObservation = (loadRunLedger(successRun, runLedgerDir(root)) ?? [])
+        .find((entry) => entry.event === 'pod-child-terminal-result-observation')?.data;
+
+      const missing = fakeKubectl(['Failed'], `${providerError}\n`, 2);
+      await podSelfImplementSpawn({ kubectl: missing.k, credentials: CREDS,
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: missingRun } })({ feature: 'terminal observation missing', spaceId: 'terminal-observation-missing' }).done;
+      const missingObservation = (loadRunLedger(missingRun, runLedgerDir(root)) ?? [])
+        .find((entry) => entry.event === 'pod-child-terminal-result-observation')?.data;
+
+      expect(successObservation).toMatchObject({
+        terminalResultObserved: true, terminalStage: 'complete', terminalOk: true, terminalOutcome: 'completed',
+        providerSignature: { grokUnavailableCount: 1 },
+      });
+      expect(missingObservation).toMatchObject({
+        terminalResultObserved: false, terminalStage: null, terminalOk: null, terminalOutcome: null,
+        providerSignature: { grokUnavailableCount: 1 },
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('a known child ledger stage also preserves the failed Pod log tail', async () => {
@@ -5803,7 +5897,10 @@ describe('pod remote continuity', () => {
         const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: { ELANOUS_RUN_ID: 'run-parent-1', ELANOUS_STATE_DIR: root } })({ spaceId: 'reattach-missing', feature: 'x' }).done;
         expect(result.error?.code).toBe('pod-child-run-id');
         expect(calls.some((c) => c.includes('exec') || c.includes('logs') || c.includes('apply') || c.includes('delete'))).toBe(false);
-        expect(existsSync(runLedgerDir(root))).toBe(false);
+        const parentLedger = loadRunLedger('run-parent-1', runLedgerDir(root)) ?? [];
+        expect(parentLedger).toHaveLength(1);
+        expect(parentLedger[0]).toMatchObject({ event: 'pod-task-failure', data: { childRunId: null } });
+        expect(parentLedger.some((entry) => entry.event === 'pod-child-run' || entry.event === 'pod-child-evidence')).toBe(false);
       } finally { rmSync(root, { recursive: true, force: true }); }
     }
   });
@@ -7296,6 +7393,40 @@ describe('pod git push guard', () => {
 describe('BUDGET-SNAPSHOT-TO-POD — the host budget snapshot rides the Job env', () => {
   const snapshotEnv = (job: { spec: { template: { spec: { containers: Array<{ env: Array<{ name: string; value?: string }> }> } } } }) =>
     job.spec.template.spec.containers[0]!.env.filter((entry) => entry.name === 'ELANOUS_BUDGET_SNAPSHOT');
+
+  test('fresh supply narrows the real Pod host budget decision before Job creation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-live-supply-'));
+    const previous = getElanousConfigDirOverride();
+    try {
+      setElanousConfigDir(root);
+      mkdirSync(join(root, 'live-supply'), { recursive: true });
+      const at = new Date().toISOString();
+      writeFileSync(join(root, 'live-supply', 'latest.json'), JSON.stringify({
+        version: 1, sequence: 9, observedAt: at, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        sources: Object.fromEntries(SUPPLY_AXES.map(axis => [axis, {
+          status: axis === 'codex' ? 'measured' : 'unknown', observedAt: axis === 'codex' ? at : null, reason: null,
+        }])),
+        values: { codex: { accounts: [{ name: 'team', usedPercent: 99, signalAt: at, available: false }] } },
+      }));
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const result = await realPodSelfImplementSpawn({
+        kubectl: k, credentials: CREDS, env: {}, pollMs: 1,
+        budgetInputDeps: {
+          config: { tools: { selfImplement: { childLlm: { mode: 'auto', chain: [{ provider: 'openai-codex' }, { provider: 'grok' }] } } }, llm: {} } as never,
+          inspectCodex: (() => ({ candidates: [{ name: 'team', usedPercent: 10 }] })) as never,
+          grokSnapshot: () => undefined,
+          readLiveGrok: async () => 7,
+        },
+      })({ feature: 'fix it', spaceId: 'budget-live-supply' }).done;
+      expect(result.exitCode).toBe(0);
+      const job = calls.filter(call => call.args.endsWith('apply -f -')).map(call => JSON.parse(call.input!)).find(item => item.kind === 'Job');
+      const carried = JSON.parse(snapshotEnv(job)[0]!.value!);
+      expect(carried.decision).toMatchObject({ action: 'next-provider', provider: 'grok' });
+    } finally {
+      if (previous) setElanousConfigDir(previous); else resetElanousConfigDir();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   test('the default host measurement reaches Job and Pod even with an injected kubectl adapter', async () => {
     const { k, calls } = fakeKubectl(['Complete'], '');

@@ -582,6 +582,16 @@ export function installRemoteCodexAccessBatch(target: ParentHostConfig, mirrors:
   if (result.status !== 0) throw new Error(`remote Codex access mirror batch failed (ssh rc=${result.status ?? 'unknown'})`);
 }
 
+/** Install the same refresh-free snapshot for direct CLI use, outside per-launch parent credentials. */
+export const REMOTE_CODEX_CLI_MIRROR_DIR = '$HOME/.elanous/remote-parent-credentials/cli-mirror';
+export function installRemoteCodexCliMirror(
+  target: ParentHostConfig,
+  mirrors: readonly { elanousAuth: string; codexAuth: string; account: string }[],
+  ssh: SshRunner = defaultSshRunner,
+): void {
+  installRemoteCodexAccessBatch({ ...target, configDir: REMOTE_CODEX_CLI_MIRROR_DIR }, mirrors, ssh);
+}
+
 // ── 관측: 원격 런 원장 거울 ─────────────────────────────────────────────────────────────
 
 const RUN_ID_RE = /^run-[A-Za-z0-9_-]{4,64}$/;

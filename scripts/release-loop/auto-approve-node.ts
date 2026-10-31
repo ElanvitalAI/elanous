@@ -86,7 +86,7 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   writeFileSync(report, lines.join('\n'));
   const tuiSubcheck = { runId: context.runId ?? null, level: regressStatus.level,
     fail: failedCheckIds?.length ?? null, failedCheckIds, approvalRequired: regressNeedsApproval };
-  debug.log('release-loop.approve', 'auto-decision', { version, outcome, metrics, tuiSubcheck });
+  debug.log('release-loop.approve', 'auto-decision', { version, outcome, metrics, runId: context.runId ?? null, tuiSubcheck });
   return { outcome, verdict: outcome === 'ok' ? 'pass' as const : 'fail' as const,
     summary: `auto approval ${outcome}: ${metrics.filter((metric) => !WARNING_ONLY.has(metric.name) && metric.verdict === 'pass').length}/8${regressNeedsApproval ? ` · tui-regress ${regressStatus.level} failed ${failedLabel} → HITL` : ''}`,
     runId: context.runId ?? null, tuiSubcheck, ...(outcome === 'ok' ? { decidedBy: 'release-loop metrics' as const } : {}), metrics, report };

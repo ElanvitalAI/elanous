@@ -32,6 +32,27 @@ describe('⑴ resolveDefaultBackend — 체인이 실행 경로에 «있다»', 
     expect(resolveDefaultBackend({ decide: () => ({ action: 'stay' }) })).toBe(codexBackend);
   });
 
+  it('API-only OpenRouter/GLM 설정에서 Codex CLI 기능은 명시적으로 요구한다', () => {
+    for (const configuredProvider of ['openrouter', 'glm']) {
+      expect(() => resolveDefaultBackend({ configuredProvider })).toThrow(/Codex required/);
+    }
+    expect(() => resolveDefaultBackend({ configuredProvider: 'openai-codex',
+      decide: () => ({ action: 'switch-backend', backend: 'zai' }) })).toThrow(/Codex required/);
+  });
+
+  it('Grok 주 설정은 PTY 가능한 사용자 선택을 유지한다', () => {
+    expect(resolveDefaultBackend({
+      configuredProvider: 'grok',
+      decide: () => { throw new Error('Codex fallback must not override a pinned Grok provider'); },
+    })).toBe(grokBackend);
+  });
+
+  it('Codex PTY 재시도 중 API-only 전환은 런타임 예외 대신 안전하게 멈춘다', () => {
+    const state = { attemptedSteps: new Set<FallbackStep>(['codex-rotate']), descents: 0, maxDescents: 1 };
+    expect(decideRuntimeFallback(new Error('429 rate limit'), 'codex-rotate', state,
+      () => ({ action: 'switch-backend', backend: 'zai' }))).toBeNull();
+  });
+
   it('codex-rotate 는 «백엔드»를 안 바꾼다 — 계정 축이지 백엔드 축이 아니다', () => {
     expect(resolveDefaultBackend({ decide: () => ({ action: 'codex-rotate' }) })).toBe(codexBackend);
   });

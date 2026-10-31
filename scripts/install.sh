@@ -154,7 +154,6 @@ missing_prerequisites() {
     command -v curl >/dev/null 2>&1 || MISSING+=(curl)
     command -v unzip >/dev/null 2>&1 || MISSING+=(unzip)   # bun 공식 설치기가 쓴다
   fi
-  command -v git >/dev/null 2>&1 || MISSING+=(git)
 }
 missing_prerequisites
 INSTALLED_DEPS=''
@@ -192,8 +191,9 @@ if ! command -v bun >/dev/null 2>&1 && [ "$BOOTSTRAP_BUN" -eq 1 ]; then
   fi
 fi
 
-# Keep this explicit set aligned with catalog/external-commands.yaml required entries.
-REQUIRED_COMMANDS=(git bun)
+# Git enables repository/worktree features but is not needed to boot the installed TUI.
+# Keep this set aligned with the runtime-required entries in catalog/external-commands.yaml.
+REQUIRED_COMMANDS=(bun)
 HARNESS_COMMANDS=(gh rg codex)
 for command in "${REQUIRED_COMMANDS[@]}"; do
   if ! command -v "$command" >/dev/null 2>&1; then
@@ -379,27 +379,23 @@ if [ ! -f "$VERSION_DIR/package.json" ]; then
 fi
 # 🩸 2026-09-24 빈 GCP VM 실측: `--offline` 만 쓰면 bun 캐시가 빈 새 기계에서 의존성이 «전부» failed to resolve — 어떤
 #    새 기계에서도 설치가 안 됐다(이 맥은 캐시가 차 있어 가려졌다). ⇒ 캐시로 먼저(빠르고 네트워크 없음) ⊕ 실패하면 레지스트리.
-# 🩸 2026-09-24 빈 VM 실측: apt `nodejs npm` 이 있으면 PATH 의 node(v18)·node-gyp(9.3.0)가 node-pty 를 빌드해
-#    bun 이 불러오는 순간 panic(uv_version_string)으로 죽었다. ⇒ 빌드 동안만 node=bun · node-gyp=최신 심을 PATH 앞에
-#    (src/native/native-build-env.ts 와 같은 심).
-NATIVE_SHIM="$(mktemp -d "${TMPDIR:-/tmp}/elanous-native-build.XXXXXX")"
-ln -s "$BUN_EXEC" "$NATIVE_SHIM/node"
-printf '#!/bin/sh\nexec "%s" x node-gyp@latest "$@"\n' "$BUN_EXEC" > "$NATIVE_SHIM/node-gyp"
-chmod +x "$NATIVE_SHIM/node-gyp"
-if ! (cd "$VERSION_DIR" && PATH="$NATIVE_SHIM:$PATH" bun add --no-save --offline "$INSTALL_TARBALL" >/dev/null 2>&1); then
+# Bun is the only runtime prerequisite. Skip lifecycle scripts: Bun otherwise runs optional
+# utf-8-validate native builds on bare Ubuntu and fails without Python/compiler. Optional prebuilt
+# packages (for example sharp) remain in the dependency graph.
+if ! (cd "$VERSION_DIR" && bun add --no-save --ignore-scripts --offline "$INSTALL_TARBALL" >/dev/null 2>&1); then
   echo "dependencies not in the local bun cache — fetching them from the npm registry" >&2
   # bun prints «Blocked N postinstalls» and progress noise here — keep it out of the screen unless this step fails.
   ADD_LOG="$(mktemp "${TMPDIR:-/tmp}/elanous-bun-add.XXXXXX")"
   ADD_RC=0
-  (cd "$VERSION_DIR" && PATH="$NATIVE_SHIM:$PATH" bun add --no-save "$INSTALL_TARBALL") >"$ADD_LOG" 2>&1 || ADD_RC=$?
+  (cd "$VERSION_DIR" && bun add --no-save --ignore-scripts "$INSTALL_TARBALL") >"$ADD_LOG" 2>&1 || ADD_RC=$?
   if [ "$ADD_RC" -ne 0 ]; then
     tail -n 20 "$ADD_LOG" >&2
-    rm -f "$ADD_LOG"; rm -rf "$NATIVE_SHIM"
+    rm -f "$ADD_LOG"
     exit "$ADD_RC"
   fi
   rm -f "$ADD_LOG"
 fi
-rm -rf "$NATIVE_SHIM"
+echo "If an optional native feature is unavailable, run 'elanous doctor --fix --yes' for repair guidance. The Bun TUI needs no system Node.js, Python, or compiler." >&2
 ln -sfn "versions/$VERSION_NAME" "$PREFIX/current"
 mkdir -p "$PREFIX/bin"
 # 절대 bun 경로를 설치 때 박고 엔트리는 current 를 거친다 — cron/systemd 의 짧은 PATH 와 판 전환 모두 지원.
@@ -478,30 +474,6 @@ if [ "$START_SETUP" -eq 0 ]; then
 fi
 # 🆕 2026-09-24 빈 VM 실측: 하니스(codex 백엔드)는 Codex CLI 를 자식으로 띄우는데 빈 기계엔 codex·node 가 «둘 다» 없었다.
 #    ⚠️ 아래 설치 줄은 빈 기계에서 아직 «안 쟀다» — `elanous doctor` 의 codex 줄이 판정한다.
-# C++20 toolchain must precede node-pty's rebuild; only suggest missing prerequisites.
-if ! command -v make >/dev/null 2>&1 || ! command -v c++ >/dev/null 2>&1; then
-  case "$(uname -s)" in
-    Darwin) BUILD_HINT='xcode-select --install' ;;
-    Linux)
-      OS_ID='' OS_LIKE=''
-      if [ -r "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}" ]; then
-        while IFS='=' read -r key value; do
-          value="${value#\"}"; value="${value%\"}"
-          case "$key" in ID) OS_ID="$value" ;; ID_LIKE) OS_LIKE="$value" ;; esac
-        done < "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}"
-      fi
-      BUILD_HINT=''
-      case " $OS_ID $OS_LIKE " in
-        *' debian '*|*' ubuntu '*) BUILD_HINT='sudo apt-get install -y build-essential' ;;
-        *' fedora '*) BUILD_HINT='sudo dnf groupinstall -y "Development Tools"' ;;
-      esac ;;
-    *) BUILD_HINT='' ;;
-  esac
-  if [ -n "$BUILD_HINT" ]; then
-    echo "  $STEP) $BUILD_HINT"; STEP=$((STEP + 1))
-  fi
-  echo "  $STEP) elanous doctor --fix --yes       # $(t 'rebuild node-pty after installing build tools' '빌드 도구를 깐 뒤 node-pty 다시 빌드')"; STEP=$((STEP + 1))
-fi
 if ! command -v rg >/dev/null 2>&1; then
   if [ -z "${OS_ID:-}" ] && [ -r "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}" ]; then
     while IFS='=' read -r key value; do

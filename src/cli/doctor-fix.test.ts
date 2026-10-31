@@ -785,7 +785,7 @@ describe('doctor --fix — node-pty rebuild (RFC #20265 P2)', () => {
     readiness: { installPrefix: '/i/elanous', nodePty: 'missing' as const, buildToolchain: { make: true, cxx20: true }, distro },
     realpath: (path: string) => path === '/i/elanous/current' ? '/i/elanous/versions/1.0.0-abc' : path,
     readFile: (path: string) => {
-      if (path === '/i/elanous/versions/1.0.0-abc/node_modules/elanous/package.json') return JSON.stringify({ optionalDependencies: { 'node-pty': '^1.1.0' } });
+      if (path === '/i/elanous/versions/1.0.0-abc/node_modules/elanous/package.json') return JSON.stringify({ elanousOptionalIntegrations: { 'node-pty': '^1.1.0' } });
       throw new Error('missing');
     },
   });
@@ -903,7 +903,7 @@ describe('node-pty rebuild uses the native build shim', () => {
       keyNames: [],
       readiness: { installPrefix: '/opt/elanous', nodePty: 'missing', buildToolchain: { make: true, cxx20: true }, distro: 'debian' },
       realpath: () => '/opt/elanous/versions/1.0.0',
-      readFile: () => JSON.stringify({ optionalDependencies: { 'node-pty': '^1.1.0' } }),
+      readFile: () => JSON.stringify({ elanousOptionalIntegrations: { 'node-pty': '^1.1.0' } }),
       exists: () => false,
       shimDir: () => '/tmp/shim-x',
       removeTree: (p) => { removed.push(p); },

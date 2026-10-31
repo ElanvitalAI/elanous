@@ -25,6 +25,14 @@ test('exit 1 without a terminal line retains last ledger stage, round and verbat
     .toBe('child terminal result missing; last ledger stage=pr-opening; round=3; mustFix=1 ["MF-1"]');
 });
 
+test('route evidence after a failed child does not replace the last execution stage', () => {
+  const ledger = [
+    JSON.stringify({ event: 'implemented', data: { round: 2 } }),
+    JSON.stringify({ event: 'path-signature', data: { pathSignature: 'abc123' } }),
+  ].join('\n');
+  expect(podNoResultDiagnostic(ledger)).toBe('child terminal result missing; last ledger stage=implemented; round=2; mustFix=unknown');
+});
+
 test('failed Pod exit without a result classifies from the returned ledger instead of a silent error', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pod-terminal-diagnostic-'));
   let childRunId = '';

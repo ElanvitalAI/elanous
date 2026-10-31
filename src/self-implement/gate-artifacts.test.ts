@@ -32,9 +32,9 @@ const sharded: ShardRunResult = {
     { id: 'shard-2', files: ['src/m.test.ts'], plannedRssMb: 10, plannedSeconds: 1 },
   ],
   attempts: [
-    { shardId: 'shard-1', attempt: 1, currentJUnit: '<testsuite name="cur-1"/>', baselineJUnit: '<testsuite name="base-1"/>',
+    { shardId: 'shard-1', attempt: 1, elapsedMs: 125, currentJUnit: '<testsuite name="cur-1"/>', baselineJUnit: '<testsuite name="base-1"/>',
       currentExitCode: 0, baselineExitCode: 0, baselineFiles: ['src/z.test.ts'] },
-    { shardId: 'shard-2', attempt: 1, baselineJUnit: '<testsuite name="base-2"/>', currentExitCode: 2, baselineExitCode: 0,
+    { shardId: 'shard-2', attempt: 1, elapsedMs: 180, baselineJUnit: '<testsuite name="base-2"/>', currentExitCode: 2, baselineExitCode: 0,
       currentDiagnostic: 'stderr: bootstrap error' },
   ],
   aggregate: { status: 'unmeasured', retryShardIds: ['shard-2'] },
@@ -156,8 +156,10 @@ describe('self gate --artifact-dir (R2 입력 재료)', () => {
     });
     expect(summary.artifactsUnavailable).toBeUndefined();
     const [s1, s2] = summary.shardsDetail;
+    expect(s1.elapsedMs).toBe(125);
+    expect(s2.elapsedMs).toBe(180);
     expect(s1).toEqual({
-      shardId: 'shard-1', attempt: 1, files: ['src/a.test.ts', 'src/z.test.ts'],
+      shardId: 'shard-1', attempt: 1, elapsedMs: 125, files: ['src/a.test.ts', 'src/z.test.ts'],
       current: { runId: 'shard-1-1-current', head40: HEAD, envKey: ENV, cohort: ['src/a.test.ts', 'src/z.test.ts'], rc: 0, signal: null,
         resultPath: join(dir, 'shard-1-1-current.result.json'), junitPath: join(dir, 'shard-1-1-current.xml') },
       baseline: { runId: 'shard-1-1-baseline', head40: BASE, envKey: ENV, cohort: ['src/z.test.ts'], rc: 0, signal: null,

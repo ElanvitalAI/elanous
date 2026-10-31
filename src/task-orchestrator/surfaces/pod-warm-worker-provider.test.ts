@@ -12,7 +12,8 @@ import { ensureControlTokens, startControlServer } from '../../control-plane/ser
 import { issueMemberToken } from '../../control-plane/member-tokens.js';
 import { createFakeKubectl } from '../../ux-sim/fake-kubectl.js';
 import { loadSiWarmPodProvider, SiWarmPodProvider } from './pod-si-warm-provider.js';
-import { assembleWarmPoolProviderConfig, writeWarmPoolProviderConfig } from '../../../scripts/warm-pool-provider-config.js';
+import { assembleWarmPoolProviderConfig, selectSingleWarmPoolCandidate, writeWarmPoolProviderConfig,
+  type WarmPoolProviderConfig } from '../../../scripts/warm-pool-provider-config.js';
 
 const warmPoolAssemblerInput = () => {
   const host = 'node-c';
@@ -116,6 +117,11 @@ test('named slots are independently reconciled and bounded by the measured host 
         const selector = args.find(arg => arg.startsWith('--field-selector=metadata.name='));
         const rows = selector ? [...pods.values()].filter(pod => pod.metadata.name === selector.split('=').at(-1))
           : [...pods.values()].filter(pod => pod.metadata.labels?.['elanous.kind'] === 'warm-worker');
+        if (args.includes('-l')) {
+          expect(args).toContain('--chunk-size=50');
+          expect(Buffer.byteLength(JSON.stringify({ kind: 'PodList', metadata: { continue: '' }, items: rows })))
+            .toBeLessThan(2 * 1024 * 1024);
+        }
         return result({ kind: 'PodList', metadata: { continue: '' }, items: rows });
       }
       if (args[4] === 'create') {
@@ -151,10 +157,13 @@ test('named slots are independently reconciled and bounded by the measured host 
   filler.metadata.annotations.payload += 'x'.repeat(3_174_232 - currentBytes);
   expect(namespaceRows).toHaveLength(57);
   expect(Buffer.byteLength(JSON.stringify(namespaceRows))).toBe(3_174_232);
+  expect(Buffer.byteLength(JSON.stringify({ kind: 'PodList', metadata: { continue: '' }, items: namespaceRows })))
+    .toBeGreaterThan(2 * 1024 * 1024);
+  expect(await provider.reconcilePool()).toMatchObject({ target: 2, ready: 2, failed: [] });
   expect([...pods.values()].filter(pod => pod.metadata.labels?.['elanous.kind'] === 'warm-worker').length).toBe(2);
   expect(listQueries.some(args => args.some(arg => arg.startsWith('--field-selector=metadata.name=')))).toBe(true);
   expect(listQueries.some(args => args.includes('-l') && args.includes('elanous.kind=warm-worker'))).toBe(true);
-  expect(listQueries.some(args => args.includes('--limit=10'))).toBe(true);
+  expect(listQueries.some(args => args.includes('--chunk-size=50'))).toBe(true);
   let attemptedCreates = 0;
   const incompleteProvider = new WarmPodProvider({ candidates: [candidates[0]!],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
@@ -170,13 +179,63 @@ test('named slots are independently reconciled and bounded by the measured host 
       return { status: 1, stdout: '', stderr: 'unexpected kubectl' };
     },
   });
-  expect(await incompleteProvider.reconcilePool()).toMatchObject({ target: 1, ready: 0, failed: [candidates[0]!.spec.workerId] });
+  const incompleteEvents: Array<{ event: string; data: unknown }> = [];
+  const incompleteLog = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && event === 'warm-pod-list-skipped') incompleteEvents.push({ event, data });
+  }) as typeof debug.log);
+  try {
+    expect(await incompleteProvider.reconcilePool()).toMatchObject({ target: 1, ready: 0,
+      failed: [candidates[0]!.spec.workerId] });
+    expect(incompleteEvents).toEqual([{ event: 'warm-pod-list-skipped', data: { reason: 'kubectl-failed' } }]);
+  } finally { incompleteLog.mockRestore(); }
   expect(attemptedCreates).toBe(0);
   expect(() => new WarmPodProvider({ candidates: [candidates[0]!, candidates[0]!],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) })).toThrow();
   expect(() => new WarmPodProvider({ candidates: Array.from({ length: 5 }, (_, index) => ({
     ...candidate, spec: { ...second, name: 'warm-node-c-' + (index + 1), workerId: 'node-c-uid-' + (index + 1) },
   })), controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) })).toThrow('quota');
+});
+
+test('warm Pod discovery failures emit one redacted reason and never create a Pod', async () => {
+  const failureCandidate = { ...candidate, spec: { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' } };
+  const ok = () => ({ status: 0, stdout: JSON.stringify({ kind: 'PodList', metadata: {}, items: [] }), stderr: '' });
+  const enobufs = () => Object.assign(new Error('secret-token'), { code: 'ENOBUFS' });
+  const cases: Array<{ stage: 'named' | 'list'; reason: string; response: () => any }> = [
+    { stage: 'named', reason: 'kubectl-failed', response: () => ({ status: 1, stdout: '', stderr: 'secret-token' }) },
+    { stage: 'named', reason: 'malformed-output', response: () => ({ status: 0, stdout: '{bad json', stderr: '' }) },
+    { stage: 'list', reason: 'kubectl-failed', response: () => ({ status: 1, stdout: '', stderr: 'secret-token' }) },
+    { stage: 'list', reason: 'malformed-output', response: () => ({ status: 0, stdout: '{bad json', stderr: '' }) },
+    { stage: 'list', reason: 'output-too-large', response: () => { throw enobufs(); } },
+    { stage: 'list', reason: 'output-too-large', response: () => ({ status: null, stdout: '', stderr: '', error: enobufs() }) },
+  ];
+  const events: Array<{ event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm') events.push({ event, data });
+  }) as typeof debug.log);
+  try {
+    for (const scenario of cases) {
+      events.length = 0;
+      let creates = 0;
+      const provider = new WarmPodProvider({ candidates: [failureCandidate],
+        controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+        machineTokens: { [failureCandidate.host]: '2'.repeat(64) },
+        kubectl: args => {
+          const isNamed = args[4] === 'get' && args.some(arg => arg.startsWith('--field-selector=metadata.name='));
+          const isList = args[4] === 'get' && args.includes('-l') && args.includes('elanous.kind=warm-worker');
+          if ((scenario.stage === 'named' && isNamed) || (scenario.stage === 'list' && isList))
+            return scenario.response();
+          if (isNamed || isList) return ok();
+          if (args[4] === 'create') creates++;
+          return { status: 1, stdout: '', stderr: '' };
+        },
+        fetch: async () => { throw new Error('discovery failure must stop before ledger access'); },
+      });
+      expect(await provider.ensureStandingWorker(failureCandidate)).toBe(false);
+      expect(creates).toBe(0);
+      expect(events).toEqual([{ event: 'warm-pod-list-skipped', data: { reason: scenario.reason } }]);
+      expect(JSON.stringify(events)).not.toContain('secret-token');
+    }
+  } finally { log.mockRestore(); }
 });
 
 test('a pinned template expands to every measured profile slot with separate Pod and worker identities', async () => {
@@ -1877,6 +1936,26 @@ test('WARM-POOL-PROVIDER-DEPLOY: assembles deterministic private templates, reje
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('WARM-POOL-PROVIDER-DEPLOY: single-candidate config does not expand the host quota', () => {
+  const assembled = assembleWarmPoolProviderConfig(warmPoolAssemblerInput());
+  const single: WarmPoolProviderConfig = selectSingleWarmPoolCandidate(assembled, 'node-c/standard');
+  expect(single.poolTemplates).toEqual([]);
+  expect(single.candidates).toHaveLength(1);
+  expect(single.candidates[0]).toMatchObject({ host: 'node-c', tier: 'standard', spec: {
+    name: 'warm-node-c-standard-1', workerId: 'warm-node-c-aaaaaaaaaaaa-standard-1',
+    memoryLimit: '16Gi', nodeName: 'pool-node-c-server-0',
+  } });
+  expect(() => selectSingleWarmPoolCandidate(assembled, 'node-b/standard')).toThrow('warm pool template not found: node-b/standard');
+  expect(() => selectSingleWarmPoolCandidate(assembled, 'node-c/unknown')).toThrow('--single-candidate must be HOST/lite or HOST/standard');
+  const root = mkdtempSync(join(tmpdir(), 'warm-pool-single-candidate-'));
+  try {
+    const file = join(root, 'provider.json');
+    writeWarmPoolProviderConfig(file, single);
+    expect(loadWarmPodProvider(file)).toBeInstanceOf(WarmPodProvider);
+    expect(loadSiWarmPodProvider(file)).toBeInstanceOf(SiWarmPodProvider);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('WARM-POOL-PROVIDER-DEPLOY: production CLIs redact tokens, reconcile with fake kubectl, and stop --serve child', async () => {
   const root = mkdtempSync(join(tmpdir(), 'warm-pool-assembler-cli-'));
   const controlRoot = join(root, 'control');
@@ -1911,6 +1990,13 @@ test('WARM-POOL-PROVIDER-DEPLOY: production CLIs redact tokens, reconcile with f
     const dry = spawnSync(process.execPath, [...assemblerArgs, dryOutput, '--dry-run'], { encoding: 'utf8' });
     expect(dry.status).toBe(0); expect(dry.stdout).toContain('"memberToken":"[redacted]"');
     expect(dry.stdout).not.toContain(memberValue); expect(dry.stdout).not.toContain(machineValue);
+    expect(existsSync(dryOutput)).toBe(false);
+    const singleDry = spawnSync(process.execPath,
+      [...assemblerArgs, dryOutput, '--single-candidate', 'node-c/standard', '--dry-run'], { encoding: 'utf8' });
+    expect(singleDry.status).toBe(0);
+    expect(JSON.parse(singleDry.stdout)).toMatchObject({ config: { candidates: [{ host: 'node-c', tier: 'standard',
+      spec: { name: 'warm-node-c-standard-1', workerId: 'warm-node-c-aaaaaaaaaaaa-standard-1' } }], poolTemplates: [] } });
+    expect(singleDry.stdout).not.toContain(memberValue); expect(singleDry.stdout).not.toContain(machineValue);
     expect(existsSync(dryOutput)).toBe(false);
     const assembled = spawnSync(process.execPath, [...assemblerArgs, output], { encoding: 'utf8' });
     expect(assembled.status).toBe(0);

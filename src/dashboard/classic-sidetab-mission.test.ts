@@ -1,7 +1,8 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { dispatchSessionRuntimeTool } from '../session-runtime/index.js';
 import { streamLLMWithTools, type LLMProvider } from '../llm.js';
-import { CLASSIC_SIDETAB_MISSION_CANCEL_TOOL_NAME, CLASSIC_SIDETAB_MISSION_TOOL_NAME } from './classic-sidetab-mission.js';
+import { CLASSIC_SIDETAB_HAND_REPLY_TOOL_NAME, CLASSIC_SIDETAB_MISSION_CANCEL_TOOL_NAME, CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionTool } from './classic-sidetab-mission.js';
 import { createDashboardClassicSidetabMissionCallbacks } from './index.js';
 import { startClassicMissionCli } from './mission-cli-consumer.js';
 
@@ -82,6 +83,67 @@ test('classic chat exposes and dispatches a sidetab mission without leaking its 
   expect(resultWasFedBack).toBe(true);
   expect(answer).toContain('The requested change is complete. [internal result]');
   expect(JSON.stringify(toolResults)).not.toContain('/private/state');
+});
+
+test('linear mission binding stays single-only while pairs skip sync with a warning and continue', async () => {
+  const seen: Array<string | undefined> = [];
+  const pairContexts: Array<unknown> = [];
+  const events: Array<{ category: string; event: string; data: unknown; level?: string }> = [];
+  const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown, options?: { level?: string }) => {
+    events.push({ category, event, data, ...(options?.level ? { level: options.level } : {}) });
+  }) as typeof debug.log);
+  const tool = createClassicSidetabMissionTool(async (_agent, _mission, context) => {
+    seen.push(context?.linearIssueId);
+    return { ok: true, status: 'running', interactionId: '123e4567-e89b-42d3-a456-426614174000' };
+  }, async (_agent, _mission, _parallelMission, context) => {
+    pairContexts.push(context);
+    return ({
+    pairId: 'pair',
+    codex: { ok: true, status: 'running', interactionId: '123e4567-e89b-42d3-a456-426614174000' },
+    claude: { ok: true, status: 'running', interactionId: '123e4567-e89b-42d3-a456-426614174001' },
+    });
+  });
+  try {
+    expect((await tool.dispatch({ agent: 'codex', mission: 'work', linearIssueId: 'DEMO-42' })).status).toBe('running');
+    expect(seen).toEqual(['DEMO-42']);
+    expect((await tool.dispatch(
+      { agent: 'codex', mission: 'work', linearIssueId: 'DEMO-42', parallelMission: 'other' },
+      { callId: 'pair-call', parentSessionId: 'parent-session', linearIssueId: 'DEMO-42' },
+    )).status).toBe('running');
+    expect(seen).toEqual(['DEMO-42']);
+    expect(pairContexts).toEqual([{ callId: 'pair-call', parentSessionId: 'parent-session' }]);
+    expect(events).toContainEqual({
+      category: 'agent-mission.sidetab',
+      event: 'linear-sync-skipped-for-parallel',
+      data: {
+        source: 'tool-input+dispatch-context',
+        reason: 'Linear progress sync is only supported for a single sidetab mission',
+      },
+      level: 'warn',
+    });
+  } finally {
+    logSpy.mockRestore();
+  }
+});
+
+test('HandReply tool is present only with its runtime seam and validates correction identity inputs', async () => {
+  const called: unknown[] = [];
+  const mission = createDashboardClassicSidetabMissionCallbacks(
+    async () => ({ ok: false, status: 'failed', error: 'unused' }),
+    undefined,
+    undefined,
+    async (input) => { called.push(input); return { ok: true, body: 'delivered' }; },
+  );
+  const handReplySpec = mission.getTools([]).find((tool) => tool.name === CLASSIC_SIDETAB_HAND_REPLY_TOOL_NAME);
+  expect(handReplySpec?.parameters).toMatchObject({ required: ['missionId', 'kind', 'text', 'actor', 'replyTo'] });
+  await expect(mission.dispatchTool(CLASSIC_SIDETAB_HAND_REPLY_TOOL_NAME, {
+    missionId: '123e4567-e89b-42d3-a456-426614174000', kind: 'correct', text: 'Narrow the next step.', actor: 'agent', replyTo: 3,
+    runId: 'run-1', scope: 'src/agent-mission', stop: true, priority: 'P0',
+  })).resolves.toMatchObject({ status: 'done', body: 'delivered' });
+  expect(called).toEqual([{
+    missionId: '123e4567-e89b-42d3-a456-426614174000', kind: 'correct', text: 'Narrow the next step.', actor: 'agent', replyTo: 3,
+    runId: 'run-1', scope: 'src/agent-mission', stop: true, priority: 'P0',
+  }]);
 });
 
 test('classic sidetab mission returns the running interaction ID without waiting for job completion', async () => {

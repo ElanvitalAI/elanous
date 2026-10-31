@@ -6,7 +6,8 @@
 
 import { readFileSync } from 'node:fs';
 import type { AgentBackend, AgentMissionResult, EvidenceMode } from './driver.js';
-import type { AgentCliDetection } from './tool-install.js';
+import { runAgentMissionDuo, type DuoDeps, type DuoResult } from './duo.js';
+import type { AgentCli, AgentCliDetection, AgentCliPreparation } from './tool-install.js';
 import { buildAgentMissionDevSpec, executeAgentMissionReroute, type runDevPipeline } from '../self-dev/dev-pipeline.js';
 import { parsePositiveInt } from '../self-dev/dev-cli.js';
 import { parsePluginRef } from './in-agent-plugin.js';
@@ -17,7 +18,9 @@ export interface MissionCliOpts {
   base?: string;
   backend?: string;
   chain?: string;
+  duo?: boolean;
   headless?: boolean;
+  followUp?: string;
   plugin?: string;
   resources?: 'on' | 'off';
   evidence?: string; // 'doc' | 'tsc' | 'test'
@@ -35,15 +38,17 @@ export interface MissionCliOpts {
 export interface MissionCliDeps {
   resolveBackend: (name?: string) => AgentBackend;
   detectAgentCli?: (agent: 'claude' | 'codex') => AgentCliDetection;
+  prepareAgentCli?: (agent: AgentCli) => Promise<AgentCliPreparation>;
   onStatus?: (line: string) => void;
   signal?: AbortSignal;
   readFile?: (path: string) => string;
   runDevPipeline?: typeof runDevPipeline;
+  duoDeps?: DuoDeps;
 }
 
 export type MissionCliOutcome =
   | { ok: false; message: string; exitCode: number }
-  | { ok: true; result: AgentMissionResult; exitCode: number };
+  | { ok: true; result: AgentMissionResult; duo?: DuoResult; exitCode: number };
 
 /** mission CLI 글루 — 검증/구성/실행. process.exit·console 없음(호출부가 I/O). */
 export async function runAgentMissionCliCommand(
@@ -53,8 +58,11 @@ export async function runAgentMissionCliCommand(
 ): Promise<MissionCliOutcome> {
   // ── backend 검증(fail-fast·단일 resolve) ──
   const chain = opts.chain?.split(',').map((item) => item.trim());
-  if (chain && (opts.commit === false || !['codex,claude,elanous', 'codex,claude,codex,elanous'].includes(chain.join(',')) || (opts.backend && opts.backend !== 'codex') || opts.headless)) {
-    return { ok: false, message: '--chain 은 codex,claude[,codex],elanous 형식이며 --backend 는 첫 backend 와 같아야 하고 --headless/--no-commit 은 함께 쓸 수 없습니다', exitCode: 1 };
+  if (chain && (opts.commit === false || !['codex,claude,elanous', 'codex,claude,codex,elanous'].includes(chain.join(',')) || (opts.backend && opts.backend !== 'codex') || opts.headless || opts.followUp !== undefined)) {
+    return { ok: false, message: '--chain 은 codex,claude[,codex],elanous 형식이며 --backend 는 첫 backend 와 같아야 하고 --headless/--follow-up/--no-commit 은 함께 쓸 수 없습니다', exitCode: 1 };
+  }
+  if (opts.duo && (chain || opts.backend || opts.headless || opts.followUp !== undefined || opts.plugin || opts.enhance === false)) {
+    return { ok: false, message: '--duo 는 Codex·Claude 병렬 기본값만 지원하며 --chain/--backend/--headless/--follow-up/--plugin/--no-enhance 와 함께 쓸 수 없습니다', exitCode: 1 };
   }
   let agentBackend: AgentBackend;
   try { agentBackend = deps.resolveBackend(chain?.[0] ?? opts.backend); }
@@ -62,8 +70,14 @@ export async function runAgentMissionCliCommand(
   if (opts.headless && agentBackend.name !== 'claude') {
     return { ok: false, message: '--headless 는 --backend claude 전용입니다', exitCode: 1 };
   }
+  if (opts.followUp !== undefined && !opts.followUp.trim()) {
+    return { ok: false, message: '--follow-up 은 비어 있지 않은 후속 프롬프트가 필요합니다', exitCode: 1 };
+  }
+  if (opts.followUp !== undefined && !['claude', 'codex'].includes(agentBackend.name)) {
+    return { ok: false, message: '--follow-up 은 Claude 또는 Codex backend 전용입니다', exitCode: 1 };
+  }
   const plugin = opts.plugin ? parsePluginRef(opts.plugin) : null;
-  if (opts.plugin !== undefined && (!plugin || !['codex', 'claude'].includes(agentBackend.name) || opts.headless)) {
+  if (opts.plugin !== undefined && (!plugin || !['codex', 'claude'].includes(agentBackend.name) || opts.headless || opts.followUp !== undefined)) {
     return { ok: false, message: '--plugin 은 codex/claude 대화형 backend 에서 <name>@<market> 형식이어야 합니다', exitCode: 1 };
   }
   if (opts.resources !== undefined && opts.resources !== 'on' && opts.resources !== 'off') {
@@ -108,6 +122,7 @@ export async function runAgentMissionCliCommand(
     resources: opts.resources ?? 'on',
     ...(opts.backend ? { backendExplicit: opts.backend } : {}),
     ...(opts.headless ? { headless: true } : {}),
+    ...(opts.followUp !== undefined ? { followUp: opts.followUp } : {}),
     branch: opts.branch,
     ...(opts.base ? { base: opts.base } : {}),
     ...(opts.enhance === false ? { enhanceOff: true } : {}),
@@ -119,24 +134,44 @@ export async function runAgentMissionCliCommand(
   });
   // The production CLI injects the host probe; injected tests can assert this preflight
   // without spawning an agent CLI. For a chain, inspect each external CLI before any launch.
-  const externalAgents = [...new Set((chain ?? [agentBackend.name]).filter(
+  const externalAgents: Array<'claude' | 'codex'> = opts.duo ? ['codex', 'claude'] : [...new Set((chain ?? [agentBackend.name]).filter(
     (name): name is 'claude' | 'codex' => name === 'claude' || name === 'codex',
   ))];
-  const detections = deps.detectAgentCli ? externalAgents.map((agent) => deps.detectAgentCli!(agent)) : [];
-  const statusLine = detections.map(({ message }) => message).join(' · ');
-  if (statusLine) deps.onStatus?.(statusLine);
-  const notReady = detections.find(({ installed, login }) => installed !== true || login !== 'ready');
-  if (notReady) {
-    const message = notReady.installed === false
-      ? `${notReady.message}; 공식 설치 후 다시 실행`
-      : notReady.installed === null
-        ? `${notReady.message}; 설치 상태를 확인한 뒤 다시 실행`
-        : notReady.login === 'api-key'
-          ? `${notReady.message}; API 키 요금 고지와 동의 화면이 아직 없어 미션을 시작하지 않습니다 — Codex 구독 로그인(codex login) 후 다시 실행`
-        : notReady.login === 'needed'
-          ? `${notReady.message}; ${notReady.agent} login 후 다시 실행`
-          : `${notReady.message}; 로그인 상태를 확인한 뒤 다시 실행`;
-    return { ok: false, message, exitCode: 1 };
+  if (deps.prepareAgentCli) {
+    for (const agent of externalAgents) {
+      const prepared = await deps.prepareAgentCli(agent);
+      if (!prepared.ready) return { ok: false, message: prepared.message, exitCode: 1 };
+    }
+  } else {
+    const detections = deps.detectAgentCli ? externalAgents.map((agent) => deps.detectAgentCli!(agent)) : [];
+    const statusLine = detections.map(({ message }) => message).join(' · ');
+    if (statusLine) deps.onStatus?.(statusLine);
+    const notReady = detections.find(({ installed, login }) => installed !== true || login !== 'ready');
+    if (notReady) {
+      const message = notReady.installed === false
+        ? `${notReady.message}; 공식 설치 후 다시 실행`
+        : notReady.installed === null
+          ? `${notReady.message}; 설치 상태를 확인한 뒤 다시 실행`
+          : notReady.login === 'api-key'
+            ? `${notReady.message}; API 키 요금 고지와 동의 화면이 아직 없어 미션을 시작하지 않습니다 — Codex 구독 로그인(codex login) 후 다시 실행`
+            : notReady.login === 'needed'
+              ? `${notReady.message}; ${notReady.agent} login 후 다시 실행`
+              : `${notReady.message}; 로그인 상태를 확인한 뒤 다시 실행`;
+      return { ok: false, message, exitCode: 1 };
+    }
+  }
+  if (opts.duo) {
+    const duo = await runAgentMissionDuo([mission], {
+      left: 'codex', right: 'claude', branch: opts.branch, ...(opts.base ? { base: opts.base } : {}),
+      evidence: opts.evidence, ...(opts.docDir ? { docDir: opts.docDir } : {}), ...(opts.docGlob ? { docGlob: opts.docGlob } : {}),
+      ...(opts.testPath ? { testPath: opts.testPath } : {}), ...(opts.file ? { file: opts.file } : {}),
+      maxRounds: opts.maxRounds, commit: opts.commit,
+    }, { ...deps.duoDeps, resolveBackend: deps.duoDeps?.resolveBackend ?? deps.resolveBackend });
+    const result = duo.sides.find((side) => side.result)?.result ?? {
+      ok: false, worktree: '', branch: null, rounds: 0, evidencePath: null, committed: false,
+      usedOmniCrawl: false, detail: duo.lines.join('\n'),
+    };
+    return { ok: true, result, duo, exitCode: duo.exitCode };
   }
   const { result, exitCode } = await executeAgentMissionReroute(
     spec, agentBackend,

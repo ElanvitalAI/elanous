@@ -18,37 +18,37 @@ describe('Grok subscription search default', () => {
   test('API key presence alone cannot register metered providers', () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['grok', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'grok', 'ddg-free']);
   });
 
   test('metered providers require explicit opt-in', () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: { grokApi: { enabled: true }, firecrawl: { enabled: true } } }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['grok', 'grok-api', 'firecrawl', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'firecrawl', 'grok', 'grok-api', 'ddg-free']);
   });
 
-  test('subscription quota exhaustion falls through to free search without invoking metered search', async () => {
+  test('X intent falls through to Firecrawl after subscription quota exhaustion', async () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['grok', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'grok', 'ddg-free']);
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
     addWebSearchProvider({ id: 'grok', displayName: 'subscription', available: () => true, search: async () => {
       calls.push('grok');
       throw new Error('429 usage_limit_reached');
     } });
-    addWebSearchProvider({ id: 'ddg-free', displayName: 'free', available: () => true, search: async () => {
-      calls.push('ddg-free');
-      return { providerName: 'ddg-free', durationMs: 0, hits: [{ url: 'https://example.org', title: 'Source', snippet: '' }] };
+    addWebSearchProvider({ id: 'firecrawl', displayName: 'firecrawl', available: () => true, search: async () => {
+      calls.push('firecrawl');
+      return { providerName: 'firecrawl', durationMs: 0, hits: [{ url: 'https://example.org', title: 'Source', snippet: '' }] };
     } });
-    expect((await searchWeb({ query: 'example' })).providerName).toBe('ddg-free');
-    expect(calls).toEqual(['grok', 'ddg-free']);
+    expect((await searchWeb({ query: 'X에서 example 찾기' })).providerName).toBe('firecrawl');
+    expect(calls).toEqual(['grok', 'firecrawl']);
   });
 
   test('subscription quota exhaustion may use metered fallback after explicit opt-in', async () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: { grokApi: { enabled: true } } }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['grok', 'grok-api', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'grok', 'grok-api', 'ddg-free']);
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
     addWebSearchProvider({ id: 'grok', displayName: 'subscription', available: () => true, search: async () => {
@@ -59,7 +59,7 @@ describe('Grok subscription search default', () => {
       calls.push('grok-api');
       return { providerName: 'grok-api', durationMs: 0, hits: [{ url: 'https://example.org', title: 'Source', snippet: '' }] };
     } });
-    expect((await searchWeb({ query: 'example' })).providerName).toBe('grok-api');
+    expect((await searchWeb({ query: 'X에서 example 찾기' })).providerName).toBe('grok-api');
     expect(calls).toEqual(['grok', 'grok-api']);
   });
 
@@ -110,14 +110,14 @@ describe('Grok subscription search default', () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
     const logSpy = spyOn(debug, 'log');
     let captured: { url: string; init?: RequestInit } | undefined;
-    globalThis.fetch = async (url, init) => {
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
       captured = { url: String(url), init };
       return new Response(JSON.stringify({ output: [] }), { status: 200 });
-    };
+    }) as unknown as typeof fetch;
     try {
       const credentialEnv = { ...process.env, XAI_API_KEY: 'api-key-test-value' } as NodeJS.ProcessEnv;
       expect(resolveGrokCredential({ home, env: credentialEnv, model: 'grok-4.6' })?.kind).toBe('subscription');
-      expect(resolveGrokCredential({ home, env: credentialEnv, model: 'grok-4.6', prefer: 'api_key' })?.kind).toBe('api_key');
+      expect(resolveGrokCredential({ home, env: credentialEnv, model: 'grok-4.6', skipSubscription: true })?.kind).toBe('api_key');
       const result = await searchWeb({ query: 'latest release' }, { providerId: 'grok' });
       expect(result.providerName).toBe('grok');
       expect(captured?.url).toBe('https://api.x.ai/v1/responses');

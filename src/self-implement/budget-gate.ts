@@ -71,6 +71,7 @@ function budgetCreditReserve(config: ChildLlmPreferenceInput): number {
 }
 
 const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+const UNMEASURED_API_KEY_PROVIDERS = new Set(['glm', 'openrouter']);
 
 function capFor(maxUsedPercent: BudgetGateMaxUsedPercent, provider: string): number | undefined {
   if (!Object.prototype.hasOwnProperty.call(maxUsedPercent, provider)) {
@@ -178,6 +179,12 @@ function slotUsable(
       reason: formatGrokReason(input.grokUsedPercent, cap),
       ...(unmeasured ? { unmeasured: true } : {}),
     };
+  }
+  // The launch gate has no usage meter for API-key providers such as GLM/OpenRouter.
+  // A provider explicitly selected in the resolved child chain may launch, with the
+  // missing measurement surfaced; ordinary budget decisions remain fail-closed.
+  if (allowUnmeasured && UNMEASURED_API_KEY_PROVIDERS.has(provider)) {
+    return { usable: true, reason: `${provider}: 예산 미측정`, unmeasured: true };
   }
   return { usable: false, reason: `${provider}: 예산 판정 없음` };
 }

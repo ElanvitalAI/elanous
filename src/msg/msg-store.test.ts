@@ -45,9 +45,62 @@ describe('message identity and envelope', () => {
         .toEqual({ from: 'OP', to: 'MK', body: '  hi  ', kind: 'memo' });
     } finally { store.close(); }
   });
+
+  test('message addresses normalize seats and groups, including the group:all broadcast alias', () => {
+    expect(validateMessageEnvelope({ from: 'seat:op', to: 'seat:cmo', body: 'hi' }))
+      .toEqual({ from: 'OP', to: 'MK', body: 'hi' });
+    expect(validateMessageEnvelope({ from: 'MK', to: 'group:Release-Window', body: 'hi' }).to)
+      .toBe('group:release-window');
+    expect(validateMessageEnvelope({ from: 'MK', to: 'group:all', body: 'hi' }).to).toBe('ALL');
+    expect(() => validateMessageEnvelope({ from: 'MK', to: 'group:../private', body: 'hi' })).toThrow();
+  });
 });
 
 describe('durable message log and cursor', () => {
+  test('MSG-CHANNELS: create, join, leave and group membership gate delivery on each seat cursor', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const owner = store.createGroup('Release-Window', 'OP');
+      expect(owner).toBe('group:release-window');
+      const beforeJoin = store.post({ from: 'OP', to: owner, body: 'before join' });
+      expect(store.joinGroup(owner, 'TC')).toBe(true);
+      const afterJoin = store.post({ from: 'OP', to: owner, body: 'subscribers only' });
+      expect(store.list('OP').map(row => row.body)).toEqual(['before join', 'subscribers only']);
+      expect(store.list('TC').map(row => row.body)).toEqual(['subscribers only']);
+      expect(store.list('MK')).toEqual([]);
+      expect(store.listGroups('tc')).toEqual([owner]);
+      expect(store.leaveGroup(owner, 'TC')).toBe(true);
+      store.post({ from: 'OP', to: owner, body: 'after leave' });
+      expect(store.list('TC', afterJoin.id).map(row => row.body)).toEqual([]);
+      expect(store.list('TC').map(row => row.body)).toEqual(['subscribers only']);
+      store.ack('TC', afterJoin.id);
+      expect(store.joinGroup(owner, 'TC')).toBe(true);
+      store.post({ from: 'OP', to: owner, body: 'after rejoin' });
+      expect(store.list('TC', store.getCursor('TC')).map(row => row.body)).toEqual(['after rejoin']);
+      expect(beforeJoin.id).toBeLessThan(afterJoin.id);
+    } finally { store.close(); }
+  });
+
+  test('MSG-CHANNELS: group:all enforces two posts per sender per UTC hour and folds overflow into one summary', () => {
+    let now = new Date('2026-10-29T12:00:00.000Z');
+    const store = new MsgStore(':memory:', { now: () => now });
+    try {
+      store.post({ from: 'OP', to: 'group:all', body: 'one' });
+      store.append({ from: 'OP', to: 'ALL', body: 'two' });
+      const event = store.appendWithProvenance({ from: 'OP', to: 'ALL', body: 'provenance event' }, 'coord:group-all-test:ALL');
+      expect(store.appendWithProvenance({ from: 'OP', to: 'ALL', body: 'different retry text' }, 'coord:group-all-test:ALL').id)
+        .toBe(event.id);
+      const summary = store.post({ from: 'OP', to: 'group:all', body: 'three' });
+      const folded = store.post({ from: 'OP', to: 'ALL', body: 'four' });
+      expect(folded.id).toBe(summary.id);
+      expect(store.list('MK').map(row => row.body)).toEqual(['one', 'two', 'provenance event', expect.stringContaining('시간당 상한')]);
+      expect(store.list('OP')).toEqual([]);
+      now = new Date('2026-10-29T13:00:00.000Z');
+      store.post({ from: 'OP', to: 'group:all', body: 'new hour' });
+      expect(store.list('MK').map(row => row.body).at(-1)).toBe('new hour');
+    } finally { store.close(); }
+  });
+
   test('TA delivery claim serializes two senders and rejects a stale failure after success', () => {
     const path = diskPath();
     const first = new MsgStore(path);
@@ -389,6 +442,28 @@ describe('durable message log and cursor', () => {
       expect(reopened.getMessage(2)).toEqual(oldAnswer);
       expect(reopened.listReplies(1).map(message => [message.id, message.replyTo])).toEqual([[3, 1]]);
     } finally { reopened.close(); }
+  });
+
+  test('read-only pre-group ledger lists DM/unread without attempting group schema writes', () => {
+    const path = diskPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const legacy = new Database(path);
+    try {
+      legacy.exec(`CREATE TABLE msg_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+        body TEXT NOT NULL, kind TEXT, created_at TEXT NOT NULL
+      );
+      CREATE TABLE msg_cursors (recipient TEXT PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0);`);
+      legacy.query('INSERT INTO msg_messages(sender, recipient, body, created_at) VALUES (?, ?, ?, ?)')
+        .run('OP', 'TC', 'legacy direct', '2026-10-01T00:00:00.000Z');
+    } finally { legacy.close(); }
+    const readOnly = new MsgStore(path, { readOnly: true });
+    try {
+      expect(readOnly.list('TC').map(row => row.body)).toEqual(['legacy direct']);
+      expect(readOnly.unread()).toEqual([{ recipient: 'TC', count: 1 }]);
+      expect(readOnly.db.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'msg_groups'").get())
+        .toEqual({ count: 0 });
+    } finally { readOnly.close(); }
   });
 
   test('two processes can open the same pre-threading ledger during migration', async () => {

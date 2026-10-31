@@ -107,6 +107,22 @@ export function collectSlotLoads(lines: readonly string[]): readonly SlotLoad[] 
   return out;
 }
 
+/** §6 머리말이 선언한 「사람 몫」 — 매뉴얼이 canonical 이므로 «수»를 이 파일에 박지 않는다.
+ *  🩸 계기(2026-10-31): `«여섯»` 이 여기 박혀 있었고 매뉴얼 §6 이 `«둘»` 로 바뀐 뒤에도 그 수를 계속 찍었다. */
+const HUMAN_SLOT_DECLARATION = /사람\s*(?:몫|칸)\s*«([^»]+)»/u;
+
+export function declaredHumanSlots(lines: readonly string[]): string | null {
+  const start = lines.findIndex(l => /^##\s*6\./u.test(l));
+  if (start < 0) return null;
+  const rel = lines.slice(start + 1).findIndex(l => /^##\s/u.test(l));
+  const end = rel < 0 ? lines.length : start + 1 + rel;
+  for (const line of lines.slice(start, end)) {
+    const match = HUMAN_SLOT_DECLARATION.exec(line);
+    if (match) return match[1]!;
+  }
+  return null;
+}
+
 export interface NarrativeCount { readonly name: string; readonly lines: number }
 
 /** 머리말이 「여기 없다」고 선언한 것들이 실제로 몇 줄인가. */
@@ -135,7 +151,7 @@ function report(path = MANUAL): number {
   console.log('');
   const slots = collectSlotLoads(lines);
   const mapped = new Set(slots.flatMap(s => s.clauses));
-  console.log(`축② 사람 칸 — §6 선언 «여섯» ↔ 조항 ${clauses.length} · 칸에 «걸린» 조항 ${mapped.size}`);
+  console.log(`축② 사람 칸 — §6 선언 «${declaredHumanSlots(lines) ?? '없음'}» ↔ 조항 ${clauses.length} · 칸에 «걸린» 조항 ${mapped.size}`);
   for (const { slot, clauses: c } of slots) {
     console.log(`   ${slot.padEnd(3)} ${String(c.length).padStart(2)}개  ${c.join(' ')}`);
   }

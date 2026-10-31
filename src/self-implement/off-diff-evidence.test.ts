@@ -389,6 +389,14 @@ describe('buildImplementReport — 두 갈래가 같은 조립기를 쓴다', ()
     expect(r.summary).toContain('[변경: yes · 툴콜 3');
   });
 
+  test('시험 실행 출력은 요약 꼬리 밖에서도 command/result 원문으로 evidenceTranscript에 들어간다', () => {
+    const toolOutput = `⏺ Bash({"command":"bun test -- 'src/feature.test.ts'"})\\n ↳ bun test v1.4.2\\n ↳ 3 pass 0 fail`;
+    const r = buildImplementReport(`${'x'.repeat(2600)}\\n${toolOutput}`, { changed: true, toolCalls: 1, reached: true, timedOut: false });
+    expect(r.summary).toContain('[상한 2000자 — 앞부분');
+    expect(r.evidenceTranscript).toContain('[child-test-output] command=bun test --');
+    expect(r.evidenceTranscript).toContain('[child-test-result] 3 pass · 0 fail');
+  });
+
   test('⭐ 보고문이 2000자를 넘으면 앞부분 결손을 표시한다', () => {
     const r = buildImplementReport(`CHILD-REPORT-FIRST-${'x'.repeat(2500)}-CHILD-REPORT-LAST`, { changed: true, toolCalls: 1, reached: true, timedOut: false });
     expect(r.summary).toContain('[상한 2000자 — 앞부분');

@@ -779,8 +779,11 @@ export function getEscAbortRunningCount(
 export function createDashboardClassicSidetabMissionCallbacks(
   runMission: (agent: 'codex' | 'claude', mission: string, context?: ClassicSidetabMissionDispatchContext) => Promise<ClassicSidetabMissionResult>,
   cancelMission?: (interactionId: string) => Promise<boolean>,
+  runMissionPair?: (agent: 'codex' | 'claude', mission: string, parallelMission: string, context?: ClassicSidetabMissionDispatchContext) => Promise<ClassicSidetabMissionPairResult>,
+  handReply?: (input: ClassicSidetabHandReplyInput) => Promise<{ ok: boolean; body: string }>,
+  runMissionTrio?: (mission: string, context?: ClassicSidetabMissionDispatchContext) => Promise<ClassicSidetabMissionTrioResult>,
 ): ClassicSidetabMissionIntegration {
-  return createClassicSidetabMissionIntegration(runMission, cancelMission);
+  return createClassicSidetabMissionIntegration(runMission, cancelMission, runMissionPair, handReply, runMissionTrio);
 }
 
 /** Bind the classic sidetab runtime to the ACP tool callbacks used by the dashboard. */
@@ -970,9 +973,14 @@ import {
 } from './context-menu-action-runtime.js';
 import { createDashboardTerminalPopupRuntime } from './terminal-popup-runtime.js';
 import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAgentMission } from './sidetab-runtime.js';
-import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
+import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, createClassicSidetabMissionPairSessionRegistry, type ClassicSidetabHandReplyInput, type ClassicSidetabMissionAgent, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionPairResult, type ClassicSidetabMissionResult, type ClassicSidetabMissionTrioResult } from './classic-sidetab-mission.js';
 import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
 import { enqueueClassicSidetabMissionCompletion } from './classic-sidetab-mission-job.js';
+import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
+import { startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
+import { createDashboardPluginWizardRuntime } from './plugin-wizard-runtime.js';
+import { TUI_PLUGIN_WIZARD_TOOL_NAME } from './plugin-wizard-tool.js';
+import { probeGrokLogin } from '../agent-mission/grok-auth-status.js';
 import { loadSidetabRows } from '../sidetab-core/model.js';
 import { toggleDashboardAssistantRenderState } from './assistant-render-state-runtime.js';
 import { bootDashboardAcpBgSweep } from './acp-bg-sweep-boot.js';
@@ -1112,8 +1120,10 @@ import {
 import { initElementObservability } from '../element-registry/index.js';
 import {
   createSearchPlannerState,
+  buildSubagentSessionRuntimeToolSpecs,
   buildSessionRuntimeToolSpecs,
   buildSessionDashboardStatusLines,
+  resolveDynamicSessionNativeToolSpecs,
   consumeSessionQuickControl,
   createSessionPostureState,
   enterSessionControlMode,
@@ -13570,7 +13580,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // single line.
     type TerminalPopupRequest =
       | { kind: 'shell'; cwd: string; command?: string; env?: Record<string, string> }
-      | { kind: 'coding-agent'; brand: 'claude-code' | 'codex' | 'gemini'; cwd: string; extraArgs?: readonly string[] };
+      | { kind: 'coding-agent'; brand: 'claude-code' | 'codex' | 'gemini' | 'grok'; cwd: string; extraArgs?: readonly string[]; env?: Record<string, string>; id?: string };
 
     const openInteractiveTerminalPopup = (req: TerminalPopupRequest): TerminalSession | null => {
       const { cols: tc, rows: tr } = termSize();
@@ -13686,7 +13696,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             {
               brand: req.brand,
               cwd: req.cwd,
+              id: req.id,
               extraArgs: req.extraArgs ? [...req.extraArgs] : undefined,
+              env: req.env,
               onExit: handleExit,
               onTitleAction: handleTitleAction,
             },
@@ -13699,6 +13711,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const installLabel =
             req.brand === 'claude-code' ? 'Claude Code'
             : req.brand === 'gemini' ? 'Gemini CLI (@google/gemini-cli)'
+            : req.brand === 'grok' ? 'Grok CLI'
             : 'Codex CLI';
           chatLines.push(C.muted(
             `  Install ${installLabel} first, then try again.`,
@@ -13816,9 +13829,38 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       },
       spawnShell: () => { spawnGlobalTerminalModal(); },
       spawnAgent: (agent) => {
-        TerminalPopup.agent(agent === 'claude' ? 'claude-code' : 'codex').cwd(workingDir.cwd).open();
+        void (async () => {
+          try {
+            const prepared = await prepareClassicSidetabAgentCli(agent);
+            if (!prepared.ready) {
+              chatLines.push(C.warning(`  ${prepared.message}`));
+              chatScrollOffset = -1;
+              draw();
+              return;
+            }
+            TerminalPopup.agent(agent === 'claude' ? 'claude-code' : 'codex').cwd(workingDir.cwd).open();
+          } catch {
+            chatLines.push(C.warning(`  ${agent}: 설치·로그인 상태를 확인하지 못했습니다`));
+            chatScrollOffset = -1;
+            draw();
+          }
+        })();
       },
       runMission: async (agent, mission, requestedOutputPath) => {
+        try {
+          const prepared = await prepareClassicSidetabAgentCli(agent);
+          if (!prepared.ready) return {
+            ok: false, path: requestedOutputPath ?? '', promptReady: false,
+            missionVisible: false, promptReturned: false, completionMarker: false,
+            error: prepared.message,
+          };
+        } catch {
+          return {
+            ok: false, path: requestedOutputPath ?? '', promptReady: false,
+            missionVisible: false, promptReturned: false, completionMarker: false,
+            error: `${agent}: 설치·로그인 상태를 확인하지 못했습니다`,
+          };
+        }
         return runDashboardAgentMission({
           agent,
           requestedOutputPath,
@@ -13885,15 +13927,45 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       },
     });
     closeClassicSidetabRuntime = () => classicSidetabRuntime.close();
+    const classicMissionPairSessions = createClassicSidetabMissionPairSessionRegistry();
+    const cancelClassicSidetabMission = async (interactionId: string): Promise<boolean> => {
+      const paired = classicMissionPairSessions.cancel(
+        interactionId,
+        (sessionId) => Boolean(sessionRegistry.get(sessionId)),
+        (sessionId) => sessionRegistry.kill(sessionId),
+      );
+      return paired ?? cancelClassicMissionCli(interactionId);
+    };
+    const handReplyTargets = new Map<string, { missionId: string; attemptId: string; agent: 'codex' | 'claude'; token: string; nexusUrl: string; ptyId: string; runId: string }>();
+    const prepareClassicSidetabAgentCli = async (agent: 'codex' | 'claude') => {
+      const [{ prepareAgentCli }, { requestConfirmation }] = await Promise.all([
+        import('../agent-mission/tool-install.js'), import('../hitl/confirm.js'),
+      ]);
+      return prepareAgentCli(agent, {
+        onStatus: (line) => {
+          chatLines.push(C.muted(`  ${line}`));
+          chatScrollOffset = -1;
+          draw();
+        },
+        confirmInstall: async (prompt) => (await requestConfirmation({
+          prompt,
+          detail: '확인하면 공식 npm 설치 명령을 실행한 뒤 설치 버전과 로그인을 다시 확인합니다.',
+          agentKind: 'agent-cli',
+          onTimeout: () => false,
+        })).answer,
+      });
+    };
+    const pluginWizardPairCompletions = new Map<string, Promise<import('./classic-sidetab-mission-job.js').ClassicSidetabMissionPairCompletionResult>>();
     const classicSidetabMission = createDashboardClassicSidetabMissionCallbacks(async (agent, mission, context) => {
       const started = await startClassicMissionCli({
         agent,
         prompt: mission,
+        ...(context?.linearIssueId ? { linearIssueId: context.linearIssueId } : {}),
         onInteractionId: (interactionId) => debug.log('classic-sidetab.mission', 'started', {
           interactionId,
           toolCallId: context?.callId ?? null,
         }),
-      });
+      }, { prepareAgentCli: prepareClassicSidetabAgentCli });
       if (!('completion' in started)) return started;
       const job = started;
       enqueueClassicSidetabMissionCompletion(job, agent, (notification) => globalTaskNotificationQueue.enqueue(notification));
@@ -13904,7 +13976,221 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         path: job.path,
         content: 'Independent sidetab job started; this conversation can continue.',
       };
-    }, cancelClassicMissionCli);
+    }, cancelClassicSidetabMission, async (agent, mission, parallelMission, context) => {
+      for (const member of ['codex', 'claude'] as const) {
+        const prepared = await prepareClassicSidetabAgentCli(member);
+        if (!prepared.ready) {
+          const failed = (error: string) => ({ ok: false, status: 'failed' as const, error });
+          return {
+            pairId: 'agent-cli-not-ready',
+            codex: member === 'codex' ? failed(prepared.message) : failed('Pair 실행을 시작하지 않았습니다'),
+            claude: member === 'claude' ? failed(prepared.message) : failed('Pair 실행을 시작하지 않았습니다'),
+          };
+        }
+      }
+      const [{ createMissionLineStore }, { missionChildEnv, renderMissionAgentInstructions, createMissionOutStore }, { effectiveInstanceRoot }, { resolveDaemonEndpoint }] = await Promise.all([
+        import('../agent-mission/mission-line.js'), import('../agent-mission/mission-out.js'),
+        import('../instance/resolve.js'), import('../nexus/daemon-endpoint.js'),
+      ]);
+      const stateRoot = effectiveInstanceRoot();
+      const missionStore = createMissionOutStore(stateRoot);
+      const endpoint = (process.env.ELANOUS_NEXUS_URL?.trim() || resolveDaemonEndpoint()?.baseUrl || '').replace(/\/$/, '');
+      const handLines = new Map<string, { attemptId: string; handLine?: ReturnType<ReturnType<typeof createMissionLineStore>['issue']> }>();
+      const spawnVisible = (member: 'codex' | 'claude', missionId: string, attemptId: string) => {
+        const ptyId = crypto.randomUUID();
+        const handLine = endpoint ? createMissionLineStore(stateRoot).issue({
+          missionId, attemptId, agent: member,
+          who: member === 'claude' ? 'Claude' : 'Codex', what: mission.replace(/\s+/g, ' ').trim().slice(0, 180) || 'sidetab mission',
+          runId: ptyId, ptyId,
+        }) : undefined;
+        handLines.set(missionId, { attemptId, handLine });
+        try {
+          const env = handLine && endpoint
+            ? Object.fromEntries(Object.entries(missionChildEnv(stateRoot, missionId, process.env, { ...handLine, agent: member, nexusUrl: endpoint, runId: ptyId, ptyId })).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+            : undefined;
+          const session = TerminalPopup.agent(member === 'claude' ? 'claude-code' : 'codex').cwd(workingDir.cwd).id(ptyId).env(env ?? {}).open();
+          if (session && terminalModalRouter.current()?.id === session.id) terminalModalRouter.close();
+          if (session) debug.log('classic-sidetab.mission-pair', 'started', { pairMember: member, interactionId: session.id, toolCallId: context?.callId ?? null });
+          return session;
+        } catch {
+          return null;
+        }
+      };
+      const runVisible = async (member: 'codex' | 'claude', prompt: string, session: TerminalSession | null, missionId?: string): Promise<ClassicSidetabMissionResult> => {
+        const outputPath = session
+          ? join(session.cwd, '.elanous', 'mission-results', `classic-pair-${session.id}-${Date.now()}.md.tmp`)
+          : '';
+        if (!session) return { ok: false, status: 'failed', path: outputPath, error: `${member} sidetab PTY could not start` };
+        let missionFinished = false;
+        let askMonitor: Promise<void> | undefined;
+        try {
+          const [{ runVisibleAgentMission }, { codexBackend, claudeBackend }] = await Promise.all([
+            import('../sidetab-core/visible-agent-mission.js'),
+            import('../agent-mission/driver.js'),
+          ]);
+          const targetOutputPath = outputPath.slice(0, -4);
+          missionStore.create({ missionId: missionId!, agent: member, prompt, cwd: session.cwd, outputPath, targetOutputPath });
+          const lineIdentity = handLines.get(missionId!);
+          if (lineIdentity?.handLine && endpoint) handReplyTargets.set(missionId!, {
+            missionId: missionId!, attemptId: lineIdentity.attemptId, agent: member,
+            token: lineIdentity.handLine.token, nexusUrl: endpoint, ptyId: session.id, runId: session.id,
+          });
+          const backend = member === 'codex' ? codexBackend : claudeBackend;
+          askMonitor = (async () => {
+            const seen = new Set<number>();
+            while (!missionFinished) {
+              for (const event of missionStore.replies(missionId!).filter((reply) => reply.kind === 'ask' && !seen.has(reply.sequence))) {
+                seen.add(event.sequence);
+                try {
+                  globalTaskNotificationQueue.enqueue({
+                    taskId: `${missionId}:ask:${event.sequence}`,
+                    ...(context?.parentSessionId ? { parentSessionId: context.parentSessionId } : {}),
+                    agentName: member === 'claude' ? 'Claude Code' : 'Codex',
+                    label: 'sidetab mission ask', state: 'done', truncated: false,
+                    output: JSON.stringify({
+                      missionId, sequence: event.sequence, runId: session.id, ptyId: session.id,
+                      actor: member, question: event.text, options: null,
+                      defaults: event.defaults ?? '', deadline: event.deadline ?? null,
+                      instruction: 'Call HandReply with missionId, replyTo=sequence, actor=agent, runId, kind=answer/correct, and text; correct also needs scope/stop/priority. After the deadline the child uses its default.',
+                    }),
+                    durationMs: 0, finishedAt: Date.now(),
+                  });
+                } catch { /* notification delivery cannot interrupt the PTY mission */ }
+              }
+              await new Promise((resolve) => setTimeout(resolve, 400));
+            }
+          })();
+          const resultPromise = Promise.resolve().then(() => runVisibleAgentMission({
+            pty: {
+              snapshot: () => session.preview.renderForLLM(),
+              write: (bytes) => session.preview.write(bytes),
+              isAlive: () => session.preview.isAlive,
+            },
+            mission: `${renderMissionAgentInstructions(missionId!, stateRoot)}\n\nTask:\n${prompt}`,
+            outputPath,
+            handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
+          }));
+          const result = await resultPromise.finally(() => { missionFinished = true; });
+          await askMonitor;
+          handReplyTargets.delete(missionId!);
+          if (result.ok) await missionStore.complete(missionId!);
+          else await missionStore.finish(missionId!, { status: 'failed', error: result.error ?? 'visible mission failed' });
+          return { ...result, status: result.ok ? 'completed' as const : 'failed' as const, interactionId: missionId };
+        } catch (error) {
+          missionFinished = true;
+          await askMonitor?.catch(() => undefined);
+          if (missionId) handReplyTargets.delete(missionId);
+          if (missionId && missionStore.read(missionId)?.status === 'running') {
+            await missionStore.finish(missionId, { status: 'failed', error: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
+          }
+          return { ok: false, status: 'failed' as const, interactionId: missionId, path: outputPath, error: error instanceof Error ? error.message : String(error) };
+        }
+      };
+      const started = startClassicSidetabMissionPair({
+        agent,
+        mission,
+        parallelMission,
+        context,
+        spawnVisible,
+        runVisible,
+        registry: classicMissionPairSessions,
+        hasSession: (sessionId) => Boolean(sessionRegistry.get(sessionId)),
+        killSession: (sessionId) => sessionRegistry.kill(sessionId),
+        enqueue: (notification) => globalTaskNotificationQueue.enqueue(notification),
+      });
+      if (context?.callId?.startsWith('plugin-wizard:')) {
+        pluginWizardPairCompletions.set(context.callId, started.completion);
+      }
+      void started.completion;
+      return started.result;
+    }, async (input) => {
+      const target = handReplyTargets.get(input.missionId);
+      if (!target) {
+        const [{ effectiveInstanceRoot }, { createMissionOutStore }, { recordHeadlessMissionHandReply }] = await Promise.all([
+          import('../instance/resolve.js'), import('../agent-mission/mission-out.js'), import('../agent-mission/mission-hand-reply.js'),
+        ]);
+        const store = createMissionOutStore(effectiveInstanceRoot());
+        const result = await recordHeadlessMissionHandReply(input, store);
+        return { ok: result.ok, body: result.ok ? `Recorded ${input.kind} on headless mission line (record-only; no PTY input).` : result.reason };
+      }
+      const { recordAndDeliverMissionHandReply } = await import('../agent-mission/mission-hand-reply.js');
+      const result = await recordAndDeliverMissionHandReply({ target, ...input });
+        const delivery = result.ok ? result.delivery === 'ask-ledger' ? 'recorded in the mission ledger for a matching ask waiter' : 'delivered through PTY arbiter' : '';
+        return { ok: result.ok, body: result.ok ? `Recorded ${input.kind} and ${delivery} (line ${result.lineId}).` : `${result.reason}; recorded=${result.recorded}, delivered=${result.delivered}${result.lineId ? ` (line ${result.lineId})` : ''}.` };
+    }, async (mission, context) => {
+      const { codexBackend, claudeBackend, grokBackend } = await import('../agent-mission/driver.js');
+      const spawnVisible = (member: ClassicSidetabMissionAgent, missionId: string) => {
+        try {
+          const brand = member === 'claude' ? 'claude-code' : member;
+          const backend = member === 'codex' ? codexBackend : member === 'claude' ? claudeBackend : grokBackend;
+          const session = TerminalPopup.agent(brand).cwd(workingDir.cwd).id(missionId).args(backend.args).open();
+          if (session && terminalModalRouter.current()?.id === session.id) terminalModalRouter.close();
+          if (session) debug.log('classic-sidetab.mission-trio', 'started', { member, interactionId: session.id, toolCallId: context?.callId ?? null });
+          return session;
+        } catch (error) {
+          debug.log('classic-sidetab.mission-trio', 'spawn-failed', { member, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+          return null;
+        }
+      };
+      const runVisible = async (member: ClassicSidetabMissionAgent, prompt: string, session: TerminalSession | null, missionId?: string): Promise<ClassicSidetabMissionResult> => {
+        const outputPath = session ? join(session.cwd, '.elanous', 'mission-results', `classic-trio-${member}-${session.id}-${Date.now()}.md.tmp`) : '';
+        if (!session) return { ok: false, status: 'failed', path: outputPath, error: `${member} sidetab PTY could not start` };
+        try {
+          const { runVisibleAgentMission } = await import('../sidetab-core/visible-agent-mission.js');
+          const backend = member === 'codex' ? codexBackend : member === 'claude' ? claudeBackend : grokBackend;
+          const result = await runVisibleAgentMission({
+            pty: { snapshot: () => session.preview.renderForLLM(), write: (bytes) => session.preview.write(bytes), isAlive: () => session.preview.isAlive },
+            mission: prompt,
+            outputPath,
+            handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
+          });
+          return { ...result, status: result.ok ? 'completed' : 'failed', interactionId: missionId, finalScreen: session.preview.renderForLLM() };
+        } catch (error) {
+          return {
+            ok: false,
+            status: 'failed',
+            path: outputPath,
+            interactionId: missionId,
+            error: error instanceof Error ? error.message : String(error),
+            finalScreen: session.preview.renderForLLM(),
+          };
+        }
+      };
+      const started = await startClassicSidetabMissionTrio({
+        mission,
+        context,
+        checkGrokAuth: probeGrokLogin,
+        spawnVisible: (member, missionId) => spawnVisible(member, missionId),
+        runVisible,
+        registry: classicMissionPairSessions,
+        hasSession: (sessionId) => Boolean(sessionRegistry.get(sessionId)),
+        killSession: (sessionId) => sessionRegistry.kill(sessionId),
+        enqueue: (notification) => globalTaskNotificationQueue.enqueue(notification),
+      });
+      void started.completion;
+      return started.result;
+    });
+    const tuiPluginWizard = createDashboardPluginWizardRuntime({
+      getWorkspace: () => getSessionCwd(),
+      runMissionPair: async ({ runId, prompt, context }) => {
+          const pairCallId = `plugin-wizard:${runId}`;
+          const started = await classicSidetabMission.dispatchTool('RunSidetabMission', {
+            agent: 'codex', mission: prompt, parallelMission: prompt,
+          }, { callId: pairCallId, ...(context?.parentSessionId ? { parentSessionId: context.parentSessionId } : {}) });
+          const completion = pluginWizardPairCompletions.get(pairCallId);
+          if (!completion || started?.status === 'error') {
+            pluginWizardPairCompletions.delete(pairCallId);
+            throw new Error(started?.body ?? 'Codex/Claude pair did not start');
+          }
+          try {
+            const result = await completion;
+            return {
+              codex: { ok: result.codex.ok, ...(result.codex.content ? { content: result.codex.content } : {}), ...(result.codex.error ? { error: result.codex.error } : {}) },
+              claude: { ok: result.claude.ok, ...(result.claude.content ? { content: result.claude.content } : {}), ...(result.claude.error ? { error: result.claude.error } : {}) },
+            };
+          } finally { pluginWizardPairCompletions.delete(pairCallId); }
+      },
+    });
     disposeClassicSigquit = registerClassicSigquitHandler(() => {
       classicSidetabRuntime.beginPrefix();
     });
@@ -15417,7 +15703,19 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 surface: acpTurnRef.turnProfile?.surface,
               })
             : [];
-          const classicTools = runtime ? classicSidetabMission.getTools(tools) : tools;
+          const surface = acpTurnRef.turnProfile?.surface;
+          const researchDefaults = surface?.id === 'research/agent'
+            ? resolveDynamicSessionNativeToolSpecs({
+                userText,
+                defaultFamilyIds: surface.defaultNativeFamilyIds,
+                surfaceId: surface.id,
+              }).filter(tool => ['WebSearch', 'OmniSearch', 'WebFetch'].includes(tool.name))
+            : [];
+          const withSurfaceDefaults = [...new Map(
+            [...researchDefaults, ...tools].map(tool => [tool.name, tool] as const),
+          ).values()];
+          const classicTools = runtime ? classicSidetabMission.getTools(withSurfaceDefaults) : withSurfaceDefaults;
+          const tuiTools = tuiPluginWizard.getTools(classicTools);
           return [
             ...tuiChatPersonaMessages(currentChatPersonaSessionId(), chatPersonaSelection),
             ...buildDashboardTurnPreamble({
@@ -15433,14 +15731,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               // codex-only behavioral addendum (fix L-1) inside the
               // universal preamble.
               modelFamily: getModelFamily(activeModel),
-              enabledTools: classicTools.map(t => t.name),
+              enabledTools: tuiTools.map(t => t.name),
               seatBoot: true,
             }),
           ];
         },
         getTools: ({ userText }) => {
           const runtime = acpToolRuntime;
-          if (!runtime) return [];
+          if (!runtime) return tuiPluginWizard.getTools([]);
           const tools = buildSessionRuntimeToolSpecs({
             userText,
             hostTools: pluginHost.hostLLMTools(),
@@ -15448,7 +15746,19 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             optionalTools: acpTurnRef.optionalSpecs,
             surface: acpTurnRef.turnProfile?.surface,
           });
-          const classicTools = classicSidetabMission.getTools(tools);
+          const surface = acpTurnRef.turnProfile?.surface;
+          const researchDefaults = surface?.id === 'research/agent'
+            ? resolveDynamicSessionNativeToolSpecs({
+                userText,
+                defaultFamilyIds: surface.defaultNativeFamilyIds,
+                surfaceId: surface.id,
+              }).filter(tool => ['WebSearch', 'OmniSearch', 'WebFetch'].includes(tool.name))
+            : [];
+          const withSurfaceDefaults = [...new Map(
+            [...researchDefaults, ...tools].map(tool => [tool.name, tool] as const),
+          ).values()];
+          const classicTools = classicSidetabMission.getTools(withSurfaceDefaults);
+          const tuiTools = tuiPluginWizard.getTools(classicTools);
           // ⭐ Remember this turn's catalog so a spawned sub-agent can inherit it.
           //
           //  `dispatchAgent` computes `childTools = (hostTools ?? []).filter(...)`,
@@ -15456,8 +15766,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           //  or edit anything, which is the whole point of delegating code work.
           //  Exposing `Agent` without this wiring is worse than not exposing it:
           //  the model picks a delegate that provably cannot act.
-          acpTurnToolSpecs = classicTools.filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME);
-          return classicTools;
+          acpTurnToolSpecs = tuiTools.filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME && tool.name !== TUI_PLUGIN_WIZARD_TOOL_NAME);
+          return tuiTools;
         },
         // R2 essential TUI execution boundary: ACP receives the same
         // Codex-first decision as every other surface. The core bridge now
@@ -15473,8 +15783,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // Count at the server-side boundary, before any tool effect and
           // before the ACP notification can reach the TUI client.
           acpToolDispatchCount++;
+          const pluginWizardResult = tuiPluginWizard.dispatchTool(name, args, {
+            callId: ctx?.callId,
+            parentSessionId: ctx?.sessionId,
+          });
+          if (pluginWizardResult) return await pluginWizardResult;
           const classicMissionResult = classicSidetabMission.dispatchTool(name, args, {
             callId: ctx?.callId,
+            parentSessionId: ctx?.sessionId,
           });
           if (classicMissionResult) return classicMissionResult;
           // For Agent with no `hand` or `hand: internal`, the sidetab
@@ -15507,6 +15823,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             draw,
             signal: turnSignal,
             toolCallId: ctx?.callId,
+            inheritGeneralPurposeToolCatalog: true,
             // ⛔⭐ 폴백은 `''` 가 아니라 `undefined` 다 — 「안 넘김」과 「말했는데 어휘가 없음」은 «다른 값»이다.
             //   harnessMentionState(session-runtime 소비처)는 `undefined → 'absent'` · `'' → 'not-matched'` 로
             //   가른다. `?? ''` 로 접으면 그 둘이 같은 값이 되고, 그것이 2026-08-06 에 「TUI 가 하니스에게
@@ -15534,12 +15851,39 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 parentSessionId: ctx?.sessionId,
                 toolCallId,
                 signal: hasParentTurnAbortSignal ? turnSignal : undefined,
+                inheritGeneralPurposeToolCatalog: true,
                 // ⭐ Agent-family context. Without these two the sub-agent runs
                 //  text-only (see getTools above). `agentDispatchTool` routes the
                 //  child's calls back through THIS dispatcher so the child gets the
                 //  same policy/truncation treatment as the parent — not a second,
                 //  laxer path.
                 agentHostTools: acpTurnToolSpecs,
+                // Agent children inherit the full TUI-visible tool catalog,
+                // not only this turn's surface/tier-selected model catalog.
+                // Calls still route through this parent dispatcher, preserving
+                // availability and dangerous-tool policy checks.
+                buildChildToolCatalog: (childCwd) => {
+                  const childCatalog = buildSubagentSessionRuntimeToolSpecs({
+                    hostTools: pluginHost.hostLLMTools(),
+                    // Runtime can disappear between the parent turn and a child
+                    // spawn. In that case keep the captured TUI host catalog below.
+                    runtimeTools: runtime?.listToolRuntimes('tui') ?? [],
+                    optionalTools: acpTurnRef.optionalSpecs,
+                  });
+                  const specs = [...new Map(
+                    [...acpTurnToolSpecs, ...childCatalog]
+                      .filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME && tool.name !== TUI_PLUGIN_WIZARD_TOOL_NAME)
+                      .map(tool => [tool.name, tool] as const),
+                  ).values()];
+                  return {
+                    specs,
+                    dispatch: (childName: string, childArgs: Record<string, unknown>) =>
+                      acpDispatchToolSelf
+                        ? acpDispatchToolSelf(childName, childArgs, ctx)
+                        : Promise.resolve({ error: 'parent dispatcher unavailable' }),
+                    workingDirectory: childCwd,
+                  };
+                },
                 // ⛔ Forward the parent's `ctx` — without it `turnIndex` is lost and
                 //    the child's output is attributed to the wrong turn by the
                 //    truncation/persist path (and the search planner loses its
@@ -17774,11 +18118,32 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
               agentLauncher: {
                 open: (brand, agentArgs) => {
-                  TerminalPopup
+                  const launch = () => TerminalPopup
                     .agent(brand)
                     .cwd(getSessionCwd())
                     .args([...agentArgs])
                     .open();
+                  if (brand === 'gemini') {
+                    launch();
+                    return;
+                  }
+                  const agent = brand === 'claude-code' ? 'claude' : 'codex';
+                  void (async () => {
+                    try {
+                      const prepared = await prepareClassicSidetabAgentCli(agent);
+                      if (!prepared.ready) {
+                        chatLines.push(C.warning(`  ${prepared.message}`));
+                        chatScrollOffset = -1;
+                        draw();
+                        return;
+                      }
+                      launch();
+                    } catch {
+                      chatLines.push(C.warning(`  ${agent}: 설치·로그인 상태를 확인하지 못했습니다`));
+                      chatScrollOffset = -1;
+                      draw();
+                    }
+                  })();
                 },
               },
               theme: {

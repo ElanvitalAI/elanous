@@ -36,16 +36,23 @@ function operationsBotToken(cfg: UserConfig): string | undefined {
   const tradingTokens = new Set(channels.filter(c => c.roles.includes('report')).map(c => c.botToken));
   // The report (trading) bot is never the operations bot — with or without a channels table (review must-fix · OUT1).
   if (cfg.telegram.reportChannel?.botToken) tradingTokens.add(cfg.telegram.reportChannel.botToken);
+  // An explicit operational channel is authoritative even when env/tokenRef/legacy botToken
+  // resolves first; those older sources can point at a different (or trading) bot.
+  const operationalChannels = channels.filter(c => (c.name === 'ops' && c.roles.includes('system'))
+    || (c.name === 'main' && c.roles.some(r => r === 'system' || r === 'qa' || r === 'default')));
+  if (operationalChannels.length > 0) {
+    const tokens = new Set(operationalChannels.filter(c => !tradingTokens.has(c.botToken)).map(c => c.botToken));
+    if (tokens.size !== 1) return undefined;
+    const explicitToken = tokens.values().next().value;
+    // The explicitly named operational channel outranks the generic tab's tokenRef;
+    // legacy/env conflicts without a trading identity remain ambiguous and fail closed.
+    if (main.source !== 'channels.main' && main.source !== 'tokenRef'
+      && main.token && main.token !== explicitToken && !tradingTokens.has(main.token)) return undefined;
+    return explicitToken;
+  }
+
   if (main.source !== 'channels.main') return main.token && !tradingTokens.has(main.token) ? main.token : undefined;
-  // channels.main may mean "first channel", which can be the trading bot.
-  // Only a named operations channel (or the named main channel) with an
-  // operational role establishes identity; array order and role alone do not.
-  const tokens = new Set(channels
-    .filter(c => (c.name === 'ops' && c.roles.includes('system'))
-      || (c.name === 'main' && c.roles.some(r => r === 'system' || r === 'qa' || r === 'default')))
-    .filter(c => !tradingTokens.has(c.botToken))
-    .map(c => c.botToken));
-  return tokens.size === 1 ? tokens.values().next().value : undefined;
+  return undefined;
 }
 
 function isAllowedBot(cfg: UserConfig, kind: string | undefined, token: string): boolean {

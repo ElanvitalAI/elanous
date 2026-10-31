@@ -252,7 +252,7 @@ import type { HealthProbeBackend } from './supervisor/health.js';
 import { gracefulExit, cleanExit } from './supervisor/graceful-exit.js';
 import { restoreFromPending } from './supervisor/restore-state.js';
 import { resolveHeadlessMode } from './headless-mode.js';
-import { checkSetupStatus, readNexusSetupMode, renderSetupStatus, setupBootMode, setupModeBootPlan } from './setup-status.js';
+import { checkSetupStatus, readNexusSetupMode, renderSetupStatus, setupBootMode, setupModeBootPlan, shouldCheckHeadlessSetup } from './setup-status.js';
 import { probeTailscale } from './onboarding/tailscale-probe.js';
 import {
   runPwaSharePrompt,
@@ -859,7 +859,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   }
 
   const headless = resolveHeadlessMode({ ...(opts.headless !== undefined ? { headless: opts.headless } : {}) });
-  if (headless && !opts.detachForTesting && !opts.skipHeadlessSetupCheckForTesting) {
+  if (shouldCheckHeadlessSetup({
+    headless,
+    detachedForTesting: opts.detachForTesting === true,
+    skipForTesting: opts.skipHeadlessSetupCheckForTesting === true,
+    testInstance: resolveCurrentInstance().kind === 'test',
+  })) {
     const setup = checkSetupStatus({ argvBin: process.argv[1] ?? '' });
     const boot = setupBootMode(setup);
     if (boot.mode === 'refuse') {

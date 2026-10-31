@@ -1,0 +1,26 @@
+schemaVersion: 1
+
+gate:
+  default:
+    executor: pod
+    poolSource: config.release.loop.gatePodPool
+    imagePin: cut-commit
+  rehearsalDecisions:
+    - id: measured-pod-rehearsal
+      when:
+        outcome: ok
+        executor: pod
+      executor: pod
+      poolSource: config.release.loop.gatePodPool
+      imagePin: cut-commit
+
+knownInterferences:
+  - id: manual-host-override-0.2.40
+    observedVersion: 0.2.40
+    issue: >-
+      A hand host-executor override ignored the configured Pod warm pool, shard plan, and pinned image path.
+    workaround:
+      executor: host
+      expiresAfterVersion: 0.2.40
+      clearCondition: >-
+        The release ops pack selects the measured Pod method and the host override is no longer allowed as an implicit default.

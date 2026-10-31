@@ -30,7 +30,7 @@ import { debug } from '../../debug/log.js';
 import { globalAgentRegistry, type AgentRegistry } from '../../agent/registry.js';
 import type { TaskNotificationQueue } from '../../agent/task-notification.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { writeAuthoredGoal } from '../../self-implement/goal-author.js';
+import { resolveGoalAuthorReviewerPrecheckEnabled, writeAuthoredGoal } from '../../self-implement/goal-author.js';
 import { selfAnswerOrAssumeGoalDocumentClarifications, type GoalClarificationSelfResolver } from '../../self-implement/goal-author-clarification.js';
 import { writeGoalDocumentAtomic } from '../../self-implement/goal-document-write.js';
 import { DecisionLedger } from '../../decisions/decision-ledger.js';
@@ -220,6 +220,7 @@ type SelfImplementGoalAuthor = (ask: string, cwd: string, deps?: {
   goalTitle?: string;
   decomposeSteps?: (objective: string, opts?: { context?: string }) => Promise<readonly string[]>;
   onProgress?: (phase: import('../../self-implement/goal-author.js').GoalAuthorPhase, event: 'start' | 'end') => void;
+  reviewerPrecheckEnabled?: boolean;
 }) => Promise<{ path: string }>;
 
 const GOAL_ORIGINAL_TEXT_LIMIT = null;
@@ -328,6 +329,7 @@ export async function dispatchSelfImplement(
     const recentStepCounts = readRecentStepCountsFailOpen(recentStepCountReader);
     goalFile = (await authorGoal(goalSourceText, ctx.cwd, {
       goalTitle: feature,
+      reviewerPrecheckEnabled: resolveGoalAuthorReviewerPrecheckEnabled(),
       decomposeSteps: createDecomposeSteps(ctx.signal, {
         repositoryRoot: ctx.cwd,
         ...(adversarialReview !== undefined ? { adversarialReview } : {}),

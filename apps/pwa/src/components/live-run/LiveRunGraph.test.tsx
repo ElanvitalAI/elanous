@@ -178,6 +178,28 @@ describe('LiveRunGraph — 390px', () => {
     expect(renderedEdge.props.children[0].props['data-testid']).toBe(`edge-token-intake-${longName}`);
   });
 
+  test('traversal graphEvents를 같은 순서로 적용해 runtime 노드와 적응 간선을 재생한다', async () => {
+    const withRuntimeGraph = {
+      ...TRAVERSAL,
+      graphEvents: [
+        { seq: 4, ts: '2026-10-29T00:00:00.000Z', type: 'node-added' as const, node: 'source-audit', kind: 'judge', decider: 'runtime-overlay', reason: 'need source' },
+        { seq: 5, ts: '2026-10-29T00:00:01.000Z', type: 'edge-rerouted' as const, from: 'audit', outcome: '$default', was: 'ship', to: 'source-audit', decider: 'runtime-overlay', reason: 'need source' },
+        { seq: 6, ts: '2026-10-29T00:00:02.000Z', type: 'edge-rerouted' as const, from: 'source-audit', outcome: '$default', was: '$absent', to: 'ship', decider: 'runtime-overlay', reason: 'need source' },
+      ],
+    };
+    root = await mount(1024, [], withRuntimeGraph);
+    const flow = root.root.findByType(ReactFlow);
+    expect(flow.props.nodes.some((node: { id: string }) => node.id === 'source-audit')).toBe(true);
+    const addedNode = root.root.findByProps({ 'data-testid': 'live-node-source-audit' });
+    expect(addedNode.props['data-adaptive-event']).toBe('경로 수리');
+    expect(root.root.findByProps({ 'data-testid': 'adaptive-event-source-audit' }).children).toEqual(['경로 수리']);
+    expect(addedNode.props.className).toContain('animate-pulse');
+    expect(flow.props.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: 'audit', target: 'source-audit' }),
+      expect.objectContaining({ source: 'source-audit', target: 'ship' }),
+    ]));
+  });
+
   test('넓은 화면(≥700px) 배치는 그대로 — 좁은 화면 수리가 넓은 골을 침범하지 않는다', async () => {
     (g.window as { innerWidth: number }).innerWidth = 1024;
     root = await mount(1024);

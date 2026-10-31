@@ -1,7 +1,7 @@
 {
   "name": "elanous",
   "mcpName": "io.github.ElanvitalAI/elanous",
-  "version": "0.2.42",
+  "version": "0.2.43",
   "description": "Self-healing coding harness where eyes, hands, and memory all turn on one sentence — it authors its own goals, implements them in isolated worktrees, and reviews its own work.",
   "license": "Apache-2.0",
   "author": "Elanvital AI",
@@ -60,6 +60,7 @@
     "prepack": "bun -e \"import { writePackagedRevision } from './src/version/code-revision.ts'; writePackagedRevision()\"",
     "postpack": "bun -e \"import { rmSync } from 'node:fs'; rmSync('src/version/packed-revision.json', { force: true })\"",
     "dev": "bun run src/index.ts",
+    "catalog:build": "bun run scripts/build-signed-catalog.ts",
     "build": "bun build src/index.ts --outdir dist --target bun",
     "sync": "bun run src/index.ts sync",
     "status": "bun run src/index.ts status",
@@ -104,6 +105,7 @@
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "diff": "^9.0.0",
+    "google-auth-library": "^10.6.2",
     "libsodium-wrappers": "^0.8.4",
     "mammoth": "^1.12.0",
     "mermaidtui": "^0.0.5",
@@ -125,8 +127,10 @@
     "yaml": "^2.8.3"
   },
   "optionalDependencies": {
-    "node-pty": "^1.1.0",
     "telegram": "^2.26.22"
+  },
+  "elanousOptionalIntegrations": {
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@copilotkit/aimock": "1.45.1",

@@ -1820,23 +1820,21 @@ export class TelegramBot {
     if (!fromVoice && ctx.text && !ctx.text.startsWith('/')) {
       try {
         const ambientMode = this.slashContext?.userConfig.intake.telegram.ambientCapture ?? 'off';
-        if (ambientMode !== 'off') {
-          const { maybeHandleTelegramAmbientMessage } = await import('./intake-plane/adapters/telegram-ambient.js');
-          const ambientReply = await maybeHandleTelegramAmbientMessage({
-            text: ctx.text,
-            chatId: ctx.chatId,
-            userId: ctx.userId,
-            ...(ctx.userName ? { userName: ctx.userName } : {}),
-            ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}),
-            ambientCapture: ambientMode,
+        const { maybeHandleTelegramAmbientMessage } = await import('./intake-plane/adapters/telegram-ambient.js');
+        const ambientReply = await maybeHandleTelegramAmbientMessage({
+          text: ctx.text,
+          chatId: ctx.chatId,
+          userId: ctx.userId,
+          ...(ctx.userName ? { userName: ctx.userName } : {}),
+          ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}),
+          ambientCapture: ambientMode,
+        });
+        if (ambientReply) {
+          await this.sendMessage(ctx.chatId, ambientReply, {
+            replyTo: ctx.messageId,
+            threadId: ctx.threadId,
           });
-          if (ambientReply) {
-            await this.sendMessage(ctx.chatId, ambientReply, {
-              replyTo: ctx.messageId,
-              threadId: ctx.threadId,
-            });
-            return;
-          }
+          return;
         }
       } catch (err) {
         this.log(`telegram ambient-intake failed: ${err instanceof Error ? err.message : String(err)}`);

@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventLedger } from './event-ledger.js';
-import { fetchLinearIssues, fetchLinearProjectIssues, parseLinearWebhook, toTaskRequest, verifyLinearWebhook } from './linear.js';
+import { createLinearAttachment, createLinearIssue, createLinearTeamIssue, fetchLinearIssueStateType, fetchLinearIssues, fetchLinearProjectIssues, moveLinearIssueToStateType, parseLinearWebhook, toTaskRequest, uploadLinearFile, verifyLinearWebhook } from './linear.js';
 
 const now = Date.now();
 const issue = (priority: number, n: number) => ({ id: `id-${n}`, identifier: `ELA-${n}`, title: `Issue ${n}`, description: 'What is done?', url: `https://linear.app/issue/ELA-${n}`, priority, updatedAt: new Date(now).toISOString() });
@@ -200,6 +200,117 @@ test('project issue fetch caps at 250 while walking pages', async () => {
   expect(requests).toBe(3);
 });
 
+test('createLinearIssue carries parent, assignee and due date into the Linear mutation', async () => {
+  const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(init!.body as string) as { query: string; variables: Record<string, unknown> };
+    calls.push(body);
+    return Response.json({ data: body.query.includes('DecisionProjectTeam')
+      ? { project: { teams: { nodes: [{ id: 'team-1', states: { nodes: [{ id: 'state-started', type: 'started' }] } }] } } }
+      : { issueCreate: { success: true, issue: { id: 'issue-child' } } } });
+  }) as typeof fetch;
+  await expect(createLinearIssue({ apiKey: 'key', projectId: 'project-1', title: 'child', description: 'desc',
+    parentId: 'issue-parent', assigneeId: 'user-1', dueDate: '2026-11-04', stateType: 'started', fetch: fakeFetch })).resolves.toBe('issue-child');
+  expect(calls).toHaveLength(2);
+  expect(calls[1]!.variables.input).toEqual({ teamId: 'team-1', projectId: 'project-1', title: 'child', description: 'desc',
+    parentId: 'issue-parent', assigneeId: 'user-1', dueDate: '2026-11-04', stateId: 'state-started' });
+});
+
+test('createLinearIssue uses a team workflow for projectless parent and child issues', async () => {
+  const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const request = JSON.parse(init!.body as string) as { query: string; variables: Record<string, unknown> };
+    calls.push(request);
+    if (request.query.includes('LinearTeamByKey')) return Response.json({ data: { teams: { nodes: [{ id: 'team-1', states: { nodes: [{ id: 'started', type: 'started' }] } }] } } });
+    return Response.json({ data: { issueCreate: { success: true, issue: { id: 'issue-1' } } } });
+  }) as typeof fetch;
+  await expect(createLinearIssue({ apiKey: 'key', teamKey: 'DEMO', title: 'parent', description: 'grounded', dueDate: '2026-11-05', stateType: 'started', fetch: fakeFetch }))
+    .resolves.toBe('issue-1');
+  expect(calls[1]!.variables).toEqual({ input: { teamId: 'team-1', title: 'parent', description: 'grounded', dueDate: '2026-11-05', stateId: 'started' } });
+  expect(calls[1]!.variables.input).not.toHaveProperty('projectId');
+});
+
+test('projectless team issue resolves a unique team key and omits projectId from issueCreate', async () => {
+  const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+    calls.push(request);
+    return request.query.includes('LinearTeamByKey')
+      ? Response.json({ data: { teams: { nodes: [{ id: 'team-id' }] } } })
+      : Response.json({ data: { issueCreate: { success: true, issue: { id: 'issue-id' } } } });
+  }) as typeof fetch;
+  await expect(createLinearTeamIssue({ apiKey: 'key', teamKey: ' DEMO ', title: ' test ', description: ' details ', fetch: fakeFetch }))
+    .resolves.toBe('issue-id');
+  expect(calls[0]!.variables).toEqual({ key: 'DEMO' });
+  expect(calls[1]!.variables).toEqual({ input: { teamId: 'team-id', title: 'test', description: 'details' } });
+  expect(calls[1]!.variables.input).not.toHaveProperty('projectId');
+});
+
+test('projectless team issue fails closed for a missing or ambiguous team key', async () => {
+  const fakeFetch = (async () => Response.json({ data: { teams: { nodes: [{ id: 'one' }, { id: 'two' }] } } })) as unknown as typeof fetch;
+  await expect(createLinearTeamIssue({ apiKey: 'key', teamKey: 'DEMO', title: 'test', fetch: fakeFetch })).rejects.toThrow('ambiguous');
+});
+
+test('projectless team issue refuses a requested workflow state that the team does not have', async () => {
+  const calls: string[] = [];
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const query = JSON.parse(String(init?.body)).query as string;
+    calls.push(query);
+    return Response.json({ data: { teams: { nodes: [{ id: 'team-id', states: { nodes: [] } }] } } });
+  }) as typeof fetch;
+  await expect(createLinearTeamIssue({ apiKey: 'key', teamKey: 'DEMO', title: 'test', stateType: 'started', fetch: fakeFetch }))
+    .rejects.toThrow('workflow state not found');
+  expect(calls).toEqual([expect.stringContaining('LinearTeamByKey')]);
+});
+
+test('Linear attachmentCreate accepts HTTPS image URLs and rejects insecure URLs', async () => {
+  let variables: Record<string, unknown> | undefined;
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    variables = JSON.parse(init!.body as string).variables;
+    return Response.json({ data: { attachmentCreate: { success: true, attachment: { id: 'attachment-1' } } } });
+  }) as typeof fetch;
+  await expect(createLinearAttachment({ apiKey: 'key', issueId: 'issue-1', title: '진행 캡처', url: 'https://example.test/capture.png', fetch: fakeFetch })).resolves.toBe('attachment-1');
+  expect(variables?.input).toEqual({ issueId: 'issue-1', title: '진행 캡처', url: 'https://example.test/capture.png' });
+  await expect(createLinearAttachment({ apiKey: 'key', issueId: 'issue-1', title: 'bad', url: 'file:///capture.png', fetch: fakeFetch })).rejects.toThrow('HTTPS');
+  await expect(createLinearAttachment({ apiKey: 'key', issueId: 'issue-1', title: 'bad', url: 'http://example.test/capture.png', fetch: fakeFetch })).rejects.toThrow('HTTPS');
+});
+
+test('Linear fileUpload requests a signed URL, copies required headers, and PUTs bytes server-side', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init! });
+    if (String(url) === 'https://api.linear.app/graphql') return Response.json({ data: { fileUpload: { success: true, uploadFile: {
+      uploadUrl: 'https://uploads.linear.app/signed', assetUrl: 'https://asset.linear.app/capture.png', headers: [{ key: 'x-storage-token', value: 'signed' }],
+    } } } });
+    return new Response(null, { status: 200 });
+  }) as typeof fetch;
+  const bytes = Buffer.from([137, 80, 78, 71]);
+  await expect(uploadLinearFile({ apiKey: 'key', filename: 'capture.png', contentType: 'image/png', body: bytes, fetch: fakeFetch }))
+    .resolves.toBe('https://asset.linear.app/capture.png');
+  const graphql = JSON.parse(calls[0]!.init.body as string) as { query: string; variables: Record<string, unknown> };
+  expect(graphql.query).toContain('fileUpload(contentType: $contentType, filename: $filename, size: $size)');
+  expect(graphql.variables).toEqual({ contentType: 'image/png', filename: 'capture.png', size: 4 });
+  expect(calls[1]!.url).toBe('https://uploads.linear.app/signed');
+  expect(calls[1]!.init.method).toBe('PUT');
+  expect(calls[1]!.init.body).toEqual(new Uint8Array(bytes));
+  expect(new Headers(calls[1]!.init.headers).get('x-storage-token')).toBe('signed');
+});
+
+test('Linear state helper supports the Todo, In Progress and Done state types', async () => {
+  const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(init!.body as string);
+    calls.push(body);
+    return Response.json({ data: body.query.includes('IssueStates')
+      ? { issue: { team: { states: { nodes: [{ id: 'todo', type: 'unstarted' }, { id: 'doing', type: 'started' }, { id: 'done', type: 'completed' }] } } } }
+      : { issueUpdate: { success: true } } });
+  }) as typeof fetch;
+  await moveLinearIssueToStateType({ apiKey: 'key', issueId: 'issue-1', type: 'unstarted', fetch: fakeFetch });
+  await moveLinearIssueToStateType({ apiKey: 'key', issueId: 'issue-1', type: 'started', fetch: fakeFetch });
+  await moveLinearIssueToStateType({ apiKey: 'key', issueId: 'issue-1', type: 'completed', fetch: fakeFetch });
+  expect(calls.filter(call => call.query.includes('DecisionIssueClose')).map(call => (call.variables.input as { stateId: string }).stateId)).toEqual(['todo', 'doing', 'done']);
+});
+
 test('project query filters done before the 250-item cap so later open issues remain visible', async () => {
   const completed = Array.from({ length: 250 }, (_, i) => ({ identifier: `DONE-${i}`, state: { name: '완료', type: 'completed' } }));
   const open = { identifier: 'OPEN-251', title: '남은 일', url: 'https://linear.app/issue/OPEN-251', state: { name: '진행', type: 'started' }, dueDate: null, priority: 1, assignee: null, updatedAt: '2026-10-02T00:00:00Z' };
@@ -223,4 +334,19 @@ test('GraphQL rejects a repeated pagination cursor rather than fetching forever'
   const fakeFetch = async () => Response.json({ data: { issues: { nodes: [], pageInfo: { hasNextPage: true, endCursor: 'same' } } } });
   await expect(fetchLinearIssues({ apiKey: 'key', teamKey: 'ELA', fetch: fakeFetch as unknown as typeof fetch }))
     .rejects.toThrow('pagination cursor missing or repeated');
+});
+
+test('issue briefing can detect Done and move the issue back to an active state', async () => {
+  const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+  const fetchFn = async (_url: string, init: RequestInit) => {
+    const request = JSON.parse(String(init.body)) as { query: string; variables: Record<string, unknown> };
+    calls.push(request);
+    if (request.query.includes('LinearIssueStatus')) return Response.json({ data: { issue: { state: { type: 'completed' } } } });
+    if (request.query.includes('DecisionIssueStates')) return Response.json({ data: { issue: { team: { states: { nodes: [{ id: 'started-id', type: 'started' }] } } } } });
+    return Response.json({ data: { issueUpdate: { success: true } } });
+  };
+  expect(await fetchLinearIssueStateType({ apiKey: 'test', issueId: linearIssueId, fetch: fetchFn as typeof fetch })).toBe('completed');
+  await moveLinearIssueToStateType({ apiKey: 'test', issueId: linearIssueId, type: 'started', fetch: fetchFn as typeof fetch });
+  expect(calls[2]?.variables).toEqual({ id: linearIssueId, input: { stateId: 'started-id' } });
 });

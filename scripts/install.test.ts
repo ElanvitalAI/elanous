@@ -42,6 +42,20 @@ function hostPathWithoutEln(path = process.env.PATH ?? ''): string {
   return [shim, ...path.split(':').filter((dir) => dir && !existsSync(join(dir, 'eln')))].join(':');
 }
 
+function pathWithoutCommand(command: string, path = hostPathWithoutEln()): string {
+  const filteredDirs = path.split(':').filter(Boolean).map((dir) => {
+    if (!existsSync(join(dir, command))) return dir;
+    const filtered = mkdtempSync(join(tmpdir(), `elanous-path-without-${command}-`));
+    fixtures.push(filtered);
+    for (const name of readdirSync(dir)) {
+      if (name === command) continue;
+      try { symlinkSync(join(dir, name), join(filtered, name)); } catch { /* first path entry wins */ }
+    }
+    return filtered;
+  });
+  return filteredDirs.join(':');
+}
+
 function run(args: string[], env: ReturnType<typeof setup> = setup(), path = hostPathWithoutEln(), cwd = repoRoot, extra: Record<string, string> = {}) {
   const result = spawnSync('/bin/bash', [installer, ...args], {
     cwd,
@@ -294,15 +308,9 @@ describe('scripts/install.sh', () => {
 
   test('missing required commands give distro-specific install hints and retain rc 127', () => {
     const cases = [
-      { release: 'ID=amzn\nVERSION_ID=2\n', platform: 'Linux', missing: 'git', expected: 'sudo yum install -y git' },
-      { release: 'ID="amzn"\nVERSION_ID="2"\n', platform: 'Linux', missing: 'git', expected: 'sudo yum install -y git' },
-      { release: 'ID=amzn\nVERSION_ID=2023\n', platform: 'Linux', missing: 'git', expected: 'sudo dnf install -y git' },
       { release: 'ID=ubuntu\n', platform: 'Linux', missing: 'bun', expected: 'curl -fsSL https://bun.sh/install | bash' },
       { release: 'ID=amzn\nVERSION_ID=2\n', platform: 'Linux', missing: 'bun', expected: 'curl -fsSL https://bun.sh/install | bash' },
       { release: 'ID=alpine\n', platform: 'Linux', missing: 'bun', expected: "(install the 'bun' package with your package manager)" },
-      { release: 'ID=linuxmint\nID_LIKE="ubuntu debian"\n', platform: 'Linux', missing: 'git', expected: 'sudo apt-get install -y git' },
-      { release: 'ID=alpine\n', platform: 'Linux', missing: 'git', expected: "(install the 'git' package with your package manager)" },
-      { release: 'ID=amzn\nVERSION_ID=2\n', platform: 'Darwin', missing: 'git', expected: 'brew install git' },
     ];
     for (const { release, platform, missing, expected } of cases) {
       const env = setup();
@@ -312,7 +320,7 @@ describe('scripts/install.sh', () => {
       writeFileSync(osRelease, release);
       for (const [name, body] of [
         ['uname', `#!/bin/sh\nprintf '%s\\n' '${platform}'\n`],
-        [missing === 'git' ? 'bun' : 'git', '#!/bin/sh\nexit 0\n'],
+        ['git', '#!/bin/sh\nexit 0\n'],
       ]) {
         const file = join(path, name);
         writeFileSync(file, body);
@@ -330,13 +338,13 @@ describe('scripts/install.sh', () => {
   });
 
   // 📏 09-25 베어 ubuntu:24.04(root · sudo 없음): unzip → 깔고 다시 → git 으로 또 멈췄고(세 판), 안내 줄마다 sudo 가 붙어 그대로 치면 실패했다.
-  test('a bare machine gets every missing prerequisite in one line, and root gets no sudo', () => {
+  test('Ubuntu 24.04 bare machine gets every missing prerequisite in one line, and root gets no sudo', () => {
     for (const root of [false, true]) {
       const env = setup();
       const path = join(env.dir, 'path');
       mkdirSync(path);
       const osRelease = join(env.dir, 'os-release');
-      writeFileSync(osRelease, 'ID=ubuntu\n');
+      writeFileSync(osRelease, 'ID=ubuntu\nVERSION_ID="24.04"\n');
       const stubs: Array<[string, string]> = [['uname', "#!/bin/sh\nprintf 'Linux\\n'\n"]];
       if (root) stubs.push(['id', '#!/bin/sh\necho 0\n']);
       for (const [name, body] of stubs) {
@@ -344,16 +352,60 @@ describe('scripts/install.sh', () => {
         writeFileSync(file, body);
         chmodSync(file, 0o755);
       }
-      // bun·curl·unzip·git 이 전부 없다 — bun 은 설치기가 깔 것이므로 세지 않고, 그 설치에 드는 curl·unzip 을 센다.
+      // bun·curl·unzip·git 이 전부 없다 — Bun bootstrap needs curl+unzip; Git does not block core install.
       const { result } = run(['--no-modify-path'], env, path, repoRoot,
         { BUN_INSTALL: join(env.home, '.bun'), ELANOUS_INSTALL_OS_RELEASE_FILE: osRelease });
       expect(result.status, result.stderr).toBe(127);
-      expect(result.stderr).toContain('required command missing: curl unzip git');
-      expect(result.stderr).toContain(`   ${root ? '' : 'sudo '}apt-get install -y curl unzip git`);
+      expect(result.stderr).toContain('required command missing: curl unzip');
+      expect(result.stderr).toContain(`   ${root ? '' : 'sudo '}apt-get install -y curl unzip`);
       expect(result.stderr.match(/required command missing/g)?.length).toBe(1);
       if (root) expect(result.stderr).not.toContain('sudo ');
     }
   });
+
+  test('npm-pack installer succeeds when Git is removed from its PATH, then non-interactive setup works', () => {
+    const packed = pack(fixture());
+    const env = setup();
+    const path = pathWithoutCommand('git');
+    const installed = run(['--source', packed, '--no-modify-path', '--no-setup'], env, path, repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0' });
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    expect(installed.result.stdout).toContain('Installed elanous');
+    expect(installed.result.stderr).not.toContain('required command missing: git');
+    // node-pty can arrive transitively through the required Gemini CLI package; Git absence must not block core setup.
+
+    const setupReport = spawnSync(join(env.prefix, 'bin', 'elanous'), ['setup', '--non-interactive'], {
+      encoding: 'utf8', env: { ...process.env, HOME: env.home, PATH: path, ELANOUS_CONFIG_DIR: join(env.home, '.elanous'), ELANOUS_STATE_DIR: join(env.home, '.elanous') },
+    });
+    expect(setupReport.status, setupReport.stderr).toBe(0);
+    expect(setupReport.stdout).toContain('Setup: external command check');
+  }, 180_000);
+
+  test('Bun global install of an npm-pack tarball starts the core setup', () => {
+    const packed = pack(fixture());
+    const env = setup();
+    const bunInstall = join(env.home, '.bun');
+    const path = pathWithoutCommand('git');
+    const added = spawnSync('bun', ['add', '--global', '--ignore-scripts', packed], {
+      cwd: env.dir, encoding: 'utf8', timeout: 180_000,
+      env: { ...process.env, HOME: env.home, BUN_INSTALL: bunInstall, PATH: path },
+    });
+    expect(added.status, added.stderr).toBe(0);
+    const globalModules = join(bunInstall, 'install', 'global', 'node_modules');
+    expect(existsSync(join(globalModules, 'elanous'))).toBe(true);
+    const elanous = join(bunInstall, 'bin', 'elanous');
+    const sharpCheck = spawnSync('bun', ['-e', "import sharp from 'sharp'; const png = await sharp({ create: { width: 1, height: 1, channels: 3, background: '#fff' } }).png().toBuffer(); console.log(png.length > 0 ? 'sharp-prebuilt-ok' : 'sharp-prebuilt-missing')"], {
+      cwd: join(globalModules, 'elanous'), encoding: 'utf8', env: { ...process.env, HOME: env.home, BUN_INSTALL: bunInstall, PATH: path },
+    });
+    expect(sharpCheck.status, sharpCheck.stderr).toBe(0);
+    expect(sharpCheck.stdout).toContain('sharp-prebuilt-ok');
+    const version = spawnSync(elanous, ['--version'], { encoding: 'utf8', env: { ...process.env, HOME: env.home, PATH: path } });
+    expect(version.status, version.stderr).toBe(0);
+    const setupReport = spawnSync(elanous, ['setup', '--non-interactive'], {
+      encoding: 'utf8', env: { ...process.env, HOME: env.home, PATH: path, ELANOUS_CONFIG_DIR: join(env.home, '.elanous'), ELANOUS_STATE_DIR: join(env.home, '.elanous') },
+    });
+    expect(setupReport.status, setupReport.stderr).toBe(0);
+    expect(setupReport.stdout).toContain('Setup: external command check');
+  }, 240_000);
 
   // The fake PATH contains no host apt/curl/unzip/git: only the stub can make prerequisites appear.
   function aptPrerequisiteFixture(uid: number, release = 'ID=ubuntu\n', fail = false) {
@@ -376,22 +428,22 @@ describe('scripts/install.sh', () => {
     return { env, path, calls, extra };
   }
 
-  test('root Debian apt installs the missing set once, rechecks it, and advances past the prerequisite gate', () => {
-    const { env, path, calls, extra } = aptPrerequisiteFixture(0);
+  test('Ubuntu 24.04 root apt installs the missing set once, rechecks it, and advances past the prerequisite gate', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(0, 'ID=ubuntu\nVERSION_ID="24.04"\n');
     const { result } = run(['--no-modify-path'], env, path, repoRoot, extra);
     // Fresh images have empty package lists: one update, then one non-interactive install.
-    expect(readFileSync(calls, 'utf8')).toBe('update -qq\ninstall -y -qq curl unzip git\n');
-    expect(result.stderr).toContain('installed: curl unzip git');
-    // Past the prerequisite gate: later steps may still stop (the fake PATH has no real bun/bash), but never on curl/unzip/git.
-    expect(result.stderr).not.toMatch(/required command missing: [^\n]*\b(?:curl|unzip|git)\b/);
+    expect(readFileSync(calls, 'utf8')).toBe('update -qq\ninstall -y -qq curl unzip\n');
+    expect(result.stderr).toContain('installed: curl unzip');
+    // Past the prerequisite gate: later steps may still stop (the fake PATH has no real bun/bash).
+    expect(result.stderr).not.toMatch(/required command missing: [^\n]*\b(?:curl|unzip)\b/);
   });
 
-  test('a non-root user never invokes apt even when it is present', () => {
-    const { env, path, calls, extra } = aptPrerequisiteFixture(1000);
+  test('Ubuntu 24.04 non-root gets the exact prerequisite command without invoking apt', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(1000, 'ID=ubuntu\nVERSION_ID="24.04"\n');
     const { result } = run([], env, path, repoRoot, extra);
     expect(existsSync(calls)).toBe(false);
     expect(result.status).toBe(127);
-    expect(result.stderr).toContain('   sudo apt-get install -y curl unzip git');
+    expect(result.stderr).toContain('   sudo apt-get install -y curl unzip');
   });
 
   test('--no-install-deps disables apt for root without changing the existing hint', () => {
@@ -399,7 +451,7 @@ describe('scripts/install.sh', () => {
     const { result } = run(['--no-install-deps'], env, path, repoRoot, extra);
     expect(existsSync(calls)).toBe(false);
     expect(result.status).toBe(127);
-    expect(result.stderr).toContain('   apt-get install -y curl unzip git');
+    expect(result.stderr).toContain('   apt-get install -y curl unzip');
   });
 
   test('root with all prerequisites present does not invoke apt', () => {
@@ -415,17 +467,17 @@ describe('scripts/install.sh', () => {
     const { result } = run([], env, path, repoRoot, extra);
     expect(existsSync(calls)).toBe(false);
     expect(result.status).toBe(127);
-    expect(result.stderr).toContain("(install the 'curl unzip git' package with your package manager)");
+    expect(result.stderr).toContain("(install the 'curl unzip' package with your package manager)");
   });
 
-  test('apt failure stays rc 127 and names manual recovery with the existing hint', () => {
-    const { env, path, calls, extra } = aptPrerequisiteFixture(0, 'ID=ubuntu\n', true);
+  test('Ubuntu 24.04 apt failure stays rc 127 and names manual recovery with the existing hint', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(0, 'ID=ubuntu\nVERSION_ID="24.04"\n', true);
     const { result } = run([], env, path, repoRoot, extra);
     // The failing stub fails at update, so install is never attempted.
     expect(readFileSync(calls, 'utf8')).toBe('update -qq\n');
     expect(result.status).toBe(127);
     expect(result.stderr).toContain('자동 설치 실패 — 아래를 직접 실행하라');
-    expect(result.stderr).toContain('   apt-get install -y curl unzip git');
+    expect(result.stderr).toContain('   apt-get install -y curl unzip');
   });
 
   test('bun bootstrap is pinned to the repository bun version (.bun-version)', () => {
@@ -469,10 +521,16 @@ describe('scripts/install.sh', () => {
     expect(portable('#!/bin/sh\nmktemp -t elanous\n')).toBe(false);
   });
 
-  test('the required command set exactly matches the catalog and remains two entries', () => {
+  test('the installer command set exactly matches the catalog runtime-required entries', () => {
     const installerRequired = readFileSync(installer, 'utf8').match(/REQUIRED_COMMANDS=\(([^)]*)\)/)?.[1].trim().split(/\s+/).sort();
     expect(installerRequired).toEqual(requiredFromCatalog('required'));
-    expect(installerRequired).toEqual(['bun', 'git']);
+    expect(installerRequired).toEqual(['bun']);
+    const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string>; elanousOptionalIntegrations?: Record<string, string> };
+    expect(manifest.optionalDependencies).not.toHaveProperty('node-pty');
+    expect(manifest.peerDependencies).not.toHaveProperty('node-pty');
+    expect(manifest.peerDependencies).not.toHaveProperty('telegram');
+    expect(manifest.optionalDependencies).toMatchObject({ telegram: '^2.26.22' });
+    expect(manifest.elanousOptionalIntegrations).toMatchObject({ 'node-pty': '^1.1.0' });
   });
 
   test('--source reads version from the installed tarball and JSON-encodes a quoted source path', () => {
@@ -546,7 +604,7 @@ describe('scripts/install.sh', () => {
     expect(next).not.toContain('llm.provider');   // auto 는 로그인만 있으면 런타임이 codex 로 고른다(#19950)
   }, 180_000);
 
-  test('Next suggests build tools then node-pty rebuild and ripgrep only when missing on Debian PATH', () => {
+  test('Next does not require native build tools and still suggests ripgrep only when missing', () => {
     const packed = pack(fixture());
     const env = setup();
     const pathDir = join(env.dir, 'path');
@@ -579,9 +637,8 @@ describe('scripts/install.sh', () => {
     const missing = install(`${missingDir}:${hidden}`);
     expect(missing.result.status, missing.result.stderr).toBe(0);
     const next = missing.result.stdout.slice(missing.result.stdout.indexOf('Next:'));
-    expect(next).toContain('sudo apt-get install -y build-essential');
-    expect(next).toContain('elanous doctor --fix --yes');
-    expect(next.indexOf('build-essential')).toBeLessThan(next.indexOf('doctor --fix --yes'));
+    expect(next).not.toContain('build-essential');
+    expect(next).not.toContain('rebuild node-pty');
     expect(next).toContain('sudo apt-get install -y ripgrep');
     for (const name of ['make', 'c++', 'rg']) writeFileSync(join(missingDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const present = install(`${missingDir}:${hidden}`);
@@ -741,22 +798,22 @@ describe('scripts/install.sh', () => {
     expect(readlinkSync(join(realpathSync(env.prefix), 'current'))).toBe(`versions/${packageJson.version}-${sha.slice(0, 12)}-dirty`);
   }, 120_000);
 
-  test('--source URL downloads the tarball and records the URL as source', () => {
+  test('--source URL downloads the tarball and records the URL as source', async () => {
     const env = setup();
     const served = fixture();
     const tgz = pack(served);
-    const server = Bun.spawn(['python3', '-m', 'http.server', '0', '--bind', '127.0.0.1', '--directory', served], { stdout: 'pipe', stderr: 'pipe' });
+    const server = Bun.spawn([process.execPath, '-e', [
+      `const file = ${JSON.stringify(tgz)};`,
+      'const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(Bun.file(file)) });',
+      'console.log(server.port);',
+    ].join('\n')], { stdout: 'pipe', stderr: 'pipe' });
     try {
-      const port = (() => {
-        const deadline = Date.now() + 10_000;
-        while (Date.now() < deadline) {
-          const probe = spawnSync('lsof', ['-a', '-p', String(server.pid), '-iTCP', '-sTCP:LISTEN', '-Fn'], { encoding: 'utf8' });
-          const m = probe.stdout.match(/:(\d+)\s*$/m);
-          if (m) return m[1];
-          spawnSync('sleep', ['0.2']);
-        }
-        throw new Error('http.server did not listen');
-      })();
+      const ready = await Promise.race([
+        server.stdout.getReader().read(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('local HTTP fixture did not start')), 5_000)),
+      ]);
+      const port = Number(new TextDecoder().decode(ready.value).trim());
+      expect(Number.isInteger(port) && port > 0).toBe(true);
       const url = `http://127.0.0.1:${port}/${basename(tgz)}`;
       const installed = run(['--no-modify-path', '--source', url], env);
       expect(installed.result.status, installed.result.stderr).toBe(0);
@@ -930,11 +987,15 @@ describe('INST2 — finish in the same window', () => {
     const shim = join(env.dir, 'shim');
     mkdirSync(shim);
     // offline add fails (cache miss) · registry add prints the noise and then really installs.
-    writeFileSync(join(shim, 'bun'), `#!/bin/sh\ncase "$*" in\n  *"add --no-save --offline"*) exit 1 ;;\n  *"add --no-save"*) echo "Blocked 3 postinstalls. Run \\\`bun pm untrusted\\\` for details."; exec '${realBun}' "$@" --offline ;;\nesac\nexec '${realBun}' "$@"\n`, { mode: 0o755 });
+    const calls = join(env.dir, 'bun-add-calls');
+    writeFileSync(join(shim, 'bun'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\ncase "$*" in\n  *"add --no-save --ignore-scripts --offline"*) exit 1 ;;\n  *"add --no-save --ignore-scripts "*) echo "Blocked 3 postinstalls. Run \\\`bun pm untrusted\\\` for details."; exec '${realBun}' "$@" --offline ;;\nesac\nexec '${realBun}' "$@"\n`, { mode: 0o755 });
     const { result } = run(['--no-modify-path', '--no-setup'], env, `${shim}:${process.env.PATH ?? ''}`, repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0' });
     expect(result.status, result.stderr).toBe(0);
     expect(`${result.stdout}${result.stderr}`).toContain('fetching them from the npm registry');
     expect(`${result.stdout}${result.stderr}`).not.toContain('Blocked 3 postinstalls');
+    const addCalls = readFileSync(calls, 'utf8');
+    expect(addCalls).toContain('add --no-save --ignore-scripts --offline');
+    expect(addCalls).toContain('add --no-save --ignore-scripts ');
   }, 180_000);
 });
 

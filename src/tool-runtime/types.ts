@@ -66,6 +66,9 @@ export interface ToolRuntimeContext {
     dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
     workingDirectory: string;
   };
+  /** TUI-only opt-in for inheriting the parent's policy-filtered catalog when
+   *  the general-purpose agent definition omits its own tool allowlist. */
+  inheritGeneralPurposeToolCatalog?: boolean;
   /** M5 (PLAN-rich-dev-feedback-multi-surface · 2026-05-13) —
    *  optional progress emitter. Runtimes that produce streaming
    *  side effects (bash stdout tail, search hit streaming, edit

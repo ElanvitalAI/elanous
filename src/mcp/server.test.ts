@@ -67,6 +67,7 @@ describe('MCP native runtime exposure', () => {
       'elanous_asana_workspaces', 'elanous_asana_list_tasks', 'elanous_asana_create_task',
       'elanous_asana_comment', 'elanous_asana_complete',
     ]);
+    expect(names).toContain('elanous_linear_secretary');
     expect(names).toEqual(expect.arrayContaining([
       'self_recall',
       'logs_query',

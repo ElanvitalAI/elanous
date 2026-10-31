@@ -2,20 +2,27 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import cron from 'node-cron';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { findTrack } from '../autopilot/mission-phase-track.js';
 import { appendGithubStarSnapshots, collectGithubStars, ghApiSearchRepos, type SearchGithubRepos } from './collect-github.js';
 import { ingestIntakeItems, parseRawIntakeJsonl, type IntakeSource, type RegisteredIntakeSourceKind, type RawIntakeItem } from './items.js';
 
-export type SourceKind = 'github-query' | 'rss' | 'command';
+export type SourceKind = 'github-query' | 'rss' | 'command' | 'topic-search';
 export interface RegisteredIntakeSource {
   id: string;
   seat: string;
   kind: SourceKind;
   spec: string;
   every: string;
+  /** Per-topic recurring fire time, interpreted by the existing schedule registry/daemon path. */
+  scheduleCron?: string;
   until?: string;
   why?: string;
+  /** Existing Linear secretary issue identifier; absent for ordinary sources. */
+  issueRef?: string;
+  /** Parent Linear issue UUID; never replace with the display identifier. */
+  linearIssueId?: string;
   lastRunAt?: string;
 }
 
@@ -88,11 +95,19 @@ function commandArgv(spec: string): string[] {
 
 export function addSource(input: RegisteredIntakeSource, stateDir = effectiveInstanceRoot()): RegisteredIntakeSource {
   const seat = canonicalSeat(input.seat);
-  if (!['github-query', 'rss', 'command'].includes(input.kind)) throw new Error(`알 수 없는 원천 종류: ${input.kind}`);
+  if (!['github-query', 'rss', 'command', 'topic-search'].includes(input.kind)) throw new Error(`알 수 없는 원천 종류: ${input.kind}`);
   cadenceMs(input.every);
   if (input.until !== undefined) untilMs(input.until);
   if (!input.id?.trim() || !/^[\w.-]+$/.test(input.id)) throw new Error('원천 id 는 영문·숫자·_·-·. 만 허용한다');
   if (!input.spec?.trim()) throw new Error('원천 spec 이 비었다');
+  if (input.linearIssueId !== undefined && (input.kind !== 'topic-search'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.linearIssueId))) {
+    throw new Error('topic-search linearIssueId 는 부모 Linear issue UUID여야 한다');
+  }
+  if (input.kind === 'topic-search' && (!input.linearIssueId || !input.scheduleCron || !cron.validate(input.scheduleCron))) {
+    throw new Error('topic-search 는 부모 Linear UUID와 유효한 개별 schedule cron 이 필요하다');
+  }
+  if (input.kind !== 'topic-search' && input.scheduleCron !== undefined) throw new Error('scheduleCron 은 topic-search 원천만 가질 수 있다');
   if (input.kind === 'rss') {
     let protocol = '';
     try { protocol = new URL(input.spec).protocol; } catch { /* validation below */ }
@@ -118,8 +133,11 @@ export function removeSource(id: string, stateDir = effectiveInstanceRoot()): bo
   return true;
 }
 
-export function dueSources(now: Date = new Date(), stateDir = effectiveInstanceRoot()): RegisteredIntakeSource[] {
-  return listSources({}, stateDir).filter((source) => sourceIsDue(source, now));
+export function dueSources(now: Date = new Date(), stateDir = effectiveInstanceRoot(), sourceId?: string): RegisteredIntakeSource[] {
+  return listSources({}, stateDir).filter((source) => (sourceId === undefined || source.id === sourceId)
+    && (sourceId !== undefined && source.kind === 'topic-search'
+      ? !expiredSource(source, now)
+      : sourceIsDue(source, now)));
 }
 
 export interface RunDueDeps {
@@ -127,7 +145,39 @@ export interface RunDueDeps {
   searchGithub?: SearchGithubRepos;
   fetchFeed?: (url: string) => Promise<string>;
   runCommand?: (command: string) => Promise<string>;
+  searchTopic?: (topic: string) => Promise<RawIntakeItem[]>;
+  addBriefItem?: (input: import('../briefing/brief-items.js').AddBriefItem) => unknown;
+  projectTopicBriefing?: (source: RegisteredIntakeSource, items: import('../briefing/brief-items.js').BriefItem[], stateDir?: string) => Promise<void>;
   ingest?: typeof ingestIntakeItems;
+  onCollected?: (source: RegisteredIntakeSource, raws: RawIntakeItem[], now: Date) => Promise<void> | void;
+}
+
+async function searchTopicWithResearchBridge(topic: string): Promise<RawIntakeItem[]> {
+  const { invokeResearchAxes } = await import('../research-bridge/index.js');
+  const fanout = await invokeResearchAxes([{ id: 'intake-topic', prompt: topic, level: 3, searchTerms: [topic] }]);
+  const evidence = fanout.axes.find((axis) => axis.questionId === 'intake-topic')?.evidence ?? [];
+  return evidence.filter((entry) => entry.outcome !== 'failed' && /^https?:\/\//i.test(entry.source))
+    .map((entry) => {
+      const [title, ...summary] = entry.content.split(' — ');
+      return { url: entry.source, title, text: summary.join(' — ') || entry.content, kind: 'article' };
+    });
+}
+
+async function addTopicBriefItems(stateDir: string, source: RegisteredIntakeSource, items: readonly RawIntakeItem[], createdAt: string,
+  addBriefItem?: RunDueDeps['addBriefItem']): Promise<void> {
+  const ledger = addBriefItem ? null : new (await import('../briefing/brief-items.js')).BriefItemsLedger({ stateDir });
+  for (const item of items) {
+    if (!item.url) continue;
+    const text = `새 토픽 자료: ${(item.title ?? item.text ?? item.url).replace(/[\r\n]+/g, ' ').trim()}`;
+    const input = {
+      text, domain: '흡수' as const, priority: 'P1' as const, source: `intake.topic-search:${source.id}`,
+      evidence: item.url, createdAt,
+      ...(source.linearIssueId ? { linearIssueId: source.linearIssueId } : {}),
+      dedupeKey: `${source.linearIssueId ?? source.id}:${item.url}`, dedupeWithinMs: Math.max(86_400_000, cadenceMs(source.every)),
+    };
+    if (addBriefItem) addBriefItem(input);
+    else ledger!.add(input);
+  }
 }
 
 function xmlText(value: string): string {
@@ -150,11 +200,13 @@ export function parseFeed(xml: string): RawIntakeItem[] {
   }).filter((entry) => !!entry.url);
 }
 
-export async function runDue({ now = new Date(), seat, deps = {} }: { now?: Date; seat?: string; deps?: RunDueDeps } = {}): Promise<{ ran: Array<{ id: string; items: number; error?: string }> }> {
+export async function runDue({ now = new Date(), seat, sourceId, deps = {} }: { now?: Date; seat?: string; sourceId?: string; deps?: RunDueDeps } = {}): Promise<{ ran: Array<{ id: string; items: number; error?: string }> }> {
   const stateDir = deps.stateDir ?? effectiveInstanceRoot();
   const selectedSeat = seat === undefined ? undefined : canonicalSeat(seat);
   const ran: Array<{ id: string; items: number; error?: string }> = [];
-  for (const source of dueSources(now, stateDir).filter((source) => selectedSeat === undefined || source.seat === selectedSeat)) {
+  for (const source of dueSources(now, stateDir, sourceId).filter((source) =>
+    (selectedSeat === undefined || source.seat === selectedSeat)
+      && (source.kind !== 'topic-search' || !!deps.projectTopicBriefing))) {
     try {
       let raws: RawIntakeItem[];
       let githubSnapshots: { day: string; repo: string; stars: number }[] | undefined;
@@ -176,6 +228,9 @@ export async function runDue({ now = new Date(), seat, deps = {} }: { now?: Date
         }))(source.spec);
         raws = parseFeed(feed);
         intakeSource = 'rss';
+      } else if (source.kind === 'topic-search') {
+        raws = await (deps.searchTopic ?? searchTopicWithResearchBridge)(source.spec);
+        intakeSource = 'topic-search';
       } else {
         const argv = commandArgv(source.spec);
         const stdout = await (deps.runCommand ?? (async () => execFileSync(argv[0]!, argv.slice(1), { encoding: 'utf8', timeout: 600_000, maxBuffer: 16 * 1024 * 1024 })))(source.spec);
@@ -188,9 +243,24 @@ export async function runDue({ now = new Date(), seat, deps = {} }: { now?: Date
         raws = parsed.raws;
         intakeSource = 'command';
       }
-      const items = (deps.ingest ?? ingestIntakeItems)(stateDir, intakeSource, raws.map((raw) => ({ ...raw, seat: source.seat })), now.toISOString()).shaped;
+      raws = raws.map((raw) => ({ ...raw, seat: source.seat,
+        ...(source.kind === 'topic-search' && source.linearIssueId ? { linearIssueId: source.linearIssueId } : {}) }));
+      const items = (deps.ingest ?? ingestIntakeItems)(stateDir, intakeSource, raws, now.toISOString()).shaped;
+      if (source.kind === 'topic-search') await addTopicBriefItems(stateDir, source, raws, now.toISOString(), deps.addBriefItem);
+      await deps.onCollected?.(source, raws, now);
       if (githubSnapshots) appendGithubStarSnapshots(stateDir, githubSnapshots);
-      // Re-read after each run so one failure cannot overwrite another source's successful timestamp.
+      if (source.kind === 'topic-search' && source.linearIssueId && deps.projectTopicBriefing) {
+        const { BriefItemsLedger } = await import('../briefing/brief-items.js');
+        const ledger = new BriefItemsLedger({ stateDir });
+        const pending = ledger.list().filter(item => item.source === `intake.topic-search:${source.id}`
+          && item.linearIssueId?.toLowerCase() === source.linearIssueId!.toLowerCase() && item.sent_at === null);
+        if (pending.length) {
+          await deps.projectTopicBriefing(source, pending, stateDir);
+          // This dedicated issue card/comment is the delivery for these brief items.
+          ledger.markSent(pending.map(item => item.id), 'realtime');
+        }
+      }
+      // A projection failure must remain retryable; advance cadence only after delivery succeeds.
       const current = readSources(stateDir);
       const found = current.find((entry) => entry.id === source.id);
       if (found) saveSources(stateDir, current.map((entry) => entry.id === source.id ? { ...entry, lastRunAt: now.toISOString() } : entry));

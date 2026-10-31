@@ -68,18 +68,37 @@ test('tasks repair-outcomes reads repair-result in the card ledger, not rejudge 
   const dir = mkdtempSync(join(tmpdir(), 'ta-repair-outcomes-'));
   try {
     const statePath = join(dir, 'cards.json');
-    const card: TaskCard = { id: 'ta-repair-1', text: 'fix', createdAt: '2026-10-20T00:00:00Z', status: 'launched',
+    const card: TaskCard = { id: 'ta-repair-1', text: 'fix', createdAt: '2026-10-20T00:00:00Z', status: 'launched', tier: '특',
+      repairs: [{ pr: 30001, head: 'a'.repeat(40), branch: 'repair', at: '2026-10-21T13:10:00Z', move: 'narrow-relaunch',
+        runId: 'repair-run-1', resultPath: '/tmp/repair-result.json', fromModel: 'glm/glm-5.3',
+        toModel: 'openai-codex/gpt-6-sol', status: 'applied' }],
       history: [
         { at: '2026-10-21T13:10:00Z', event: 'rejudge-on-head', effect: 'repair-applied' },
+        { at: '2026-10-21T13:10:30Z', event: 'harness.role-llm', runId: 'repair-run-1', detail: 'repair child model openai-codex/gpt-6-sol' },
         { at: '2026-10-21T13:11:00Z', event: 'repair-result', pr: 30001, head: 'a'.repeat(40), runId: 'repair-run-1', effect: 'applied' },
       ] };
     writeTaskCards(statePath, [card]);
+    const before = readFileSync(statePath, 'utf8');
     const result = await run(['tasks', 'repair-outcomes', '--since', '2026-10-21T13:00:00Z', '--until', '2026-10-21T14:00:00Z', '--json'], { taskStatePath: statePath });
     expect(result.code ?? 0).toBe(0);
-    expect(JSON.parse(result.lines[0]!)).toEqual({ applied: 1, failed: 0, unconfirmed: 0, results: 1, cards: 1, missingRunId: 0, unknownEffect: 0 });
+    const report = JSON.parse(result.lines[0]!);
+    expect(report).toMatchObject({ applied: 1, failed: 0, unconfirmed: 0, results: 1, cards: 1, missingRunId: 0, unknownEffect: 0,
+      window: { since: '2026-10-21T13:00:00.000Z', until: '2026-10-21T14:00:00.000Z' },
+      tierModel: { samples: 1, measured: true, unmeasuredReason: null,
+        solCalls: [{ card: 'ta-repair-1', runId: 'repair-run-1', at: '2026-10-21T13:10:00Z', tier: '특', model: 'openai-codex/gpt-6-sol', status: 'applied' }],
+        solCallUnmeasured: [], invalidTimestamp: 0, missingRunId: 0 } });
+    expect(report.tierModel.byTierModel).toHaveLength(4);
+    expect(report.tierModel.byTierModel).toContainEqual({ tier: '특', model: 'openai-codex/gpt-6-sol', n: 1, measured: true, observedN: 1 });
+    expect(report.tierModel.byTierModel).toContainEqual({ tier: '하', model: 'openai-codex/gpt-6-sol', n: null, measured: false, observedN: 0 });
     const invalid = await run(['tasks', 'repair-outcomes', '--since', '2026-10-21T14:00:00Z', '--until', '2026-10-21T13:00:00Z'], { taskStatePath: statePath });
     expect(invalid.code).toBe(1);
     expect(invalid.lines[0]).toContain('순서가 맞는 ISO');
+    const empty = await run(['tasks', 'repair-outcomes', '--since', '2026-10-21T14:00:00Z', '--until', '2026-10-21T15:00:00Z', '--json'], { taskStatePath: statePath });
+    const emptyBreakdown = JSON.parse(empty.lines[0]!).tierModel;
+    expect(emptyBreakdown).toMatchObject({ samples: 0, measured: false, solCalls: [], solCallUnmeasured: [] });
+    expect(emptyBreakdown.byTierModel).toHaveLength(4);
+    expect(emptyBreakdown.byTierModel.every((row: { n: unknown; measured: boolean }) => row.n === null && !row.measured)).toBe(true);
+    expect(readFileSync(statePath, 'utf8')).toBe(before);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 const withDoneBoundary = (text: string): string => `${text}\n완료 경계 코드: src/cli/tasks-cli.ts 의 카드 발사\n완료 경계 실물: 지정한 체크리스트 칸이 한 번 발사된다\n완료 경계 증거 명령: bun test src/cli/tasks-cli.test.ts`;
@@ -1306,7 +1325,7 @@ test('task hand rejects missing, directory, unreadable and empty goal files with
 test('task hand --checklist uses the unchanged cell title when text is omitted and rejects non-path text before launch', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-checklist-hand-'));
   const releaseBoard: BoardNode[] = [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
-    { id: 'cell-1', level: 'task', title: withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'), status: 'open' },
+    { id: 'CELL-1', level: 'task', title: withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'), status: 'open' },
   ] }];
   const launcherCalls: string[][] = [];
   const deps: TasksCliDeps = {
@@ -1314,18 +1333,18 @@ test('task hand --checklist uses the unchanged cell title when text is omitted a
     taskLauncher: (args) => { launcherCalls.push(args); },
   };
 
-  const omitted = await run(['tasks', 'hand', '--checklist', 'cell-1', '--live', '--json'], deps);
+  const omitted = await run(['tasks', 'hand', '--checklist', 'CELL-1', '--live', '--json'], deps);
   expect(omitted.code ?? 0).toBe(0);
   expect(JSON.parse(omitted.lines[0]!).move.command.at(-1)).toBe(withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'));
   expect(launcherCalls).toHaveLength(1);
   expect(launcherCalls[0]!.at(-1)).toBe(withDoneBoundary('대상 경로: src/thing.ts\n구현 계약 그대로'));
 
-  const valid = await run(['tasks', 'hand', withDoneBoundary('대상 경로: src/supplied.ts\n세부'), '--checklist', 'cell-1', '--live', '--json'], deps);
+  const valid = await run(['tasks', 'hand', withDoneBoundary('대상 경로: src/supplied.ts\n세부'), '--checklist', 'CELL-1', '--live', '--json'], deps);
   expect(valid.code ?? 0).toBe(0);
   expect(JSON.parse(valid.lines[0]!).move.command.at(-1)).toBe(withDoneBoundary('대상 경로: src/supplied.ts\n세부'));
   expect(launcherCalls[1]!.at(-1)).toBe(withDoneBoundary('대상 경로: src/supplied.ts\n세부'));
 
-  const invalid = await run(['tasks', 'hand', '임의의 문면', '--checklist', 'cell-1', '--live'], deps);
+  const invalid = await run(['tasks', 'hand', '임의의 문면', '--checklist', 'CELL-1', '--live'], deps);
   expect(invalid.code).toBe(1);
   expect(invalid.lines).toEqual(['칸 문면을 쓰려면 문면 인자를 빼라']);
   expect(launcherCalls).toHaveLength(2);
@@ -1350,6 +1369,10 @@ test('tasks hand reuses one OPEN PR for its release cell and fails closed on an 
   let launched = 0;
   const censusArgs: string[][] = [];
   const row = (number: number) => ({ number, body: `칸: ${cell}` });
+  const sixHundredSearchRows = Array.from({ length: 600 }, (_, index) => ({
+    number: index === 599 ? 30262 : index + 1,
+    body: index === 599 ? `칸: ${cell}` : `칸: UNRELATED-${index}\n본문 언급: ${cell}`,
+  }));
   const base: TasksCliDeps = {
     taskStatePath: statePath, registerSink: async () => true,
     releaseBoard: () => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
@@ -1364,7 +1387,7 @@ test('tasks hand reuses one OPEN PR for its release cell and fails closed on an 
     for (const result of [
       { status: 1, stdout: '' },
       { status: 0, stdout: JSON.stringify([row(30262), row(30263)]) },
-      { status: 0, stdout: JSON.stringify(Array.from({ length: 500 }, (_, n) => row(n + 1))) },
+      { status: 0, stdout: JSON.stringify(Array.from({ length: 1000 }, (_, n) => row(n + 1))) },
     ]) {
       const denied = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live', '--json'],
         { ...base, handOpenPrRun: (_command, args) => { censusArgs.push(args); return result; } });
@@ -1389,12 +1412,15 @@ test('tasks hand reuses one OPEN PR for its release cell and fails closed on an 
     expect(existsSync(statePath)).toBe(false);
     expect(launched).toBe(0);
     const adopted = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live', '--json'],
-      { ...base, handOpenPrRun: (_command, args) => { censusArgs.push(args); return { status: 0, stdout: JSON.stringify([row(30262)]) }; } });
+      { ...base, handOpenPrRun: (_command, args) => { censusArgs.push(args); return { status: 0, stdout: JSON.stringify(sixHundredSearchRows) }; } });
+    expect(sixHundredSearchRows).toHaveLength(600);
     expect(adopted.code ?? 0).toBe(0);
     const response = JSON.parse(adopted.lines[0]!);
     expect(response).toMatchObject({ pr: 30262, head: 'a'.repeat(40), launched: false });
     expect(readTaskCard(response.card, statePath)?.pr).toEqual({ number: 30262, url: 'https://github.com/ElanvitalAI/elanous/pull/30262' });
     expect(censusArgs.every((args) => args.includes('--repo') && args[args.indexOf('--repo') + 1] === 'ElanvitalAI/elanous')).toBe(true);
+    expect(censusArgs.every((args) => args.includes('--search') && args[args.indexOf('--search') + 1] === `in:body "${cell}"`
+      && args.includes('--limit') && args[args.indexOf('--limit') + 1] === '1000')).toBe(true);
     expect(launched).toBe(0);
     const alreadyBound = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live', '--json'],
       { ...base, handOpenPrRun: () => ({ status: 0, stdout: JSON.stringify([row(30262)]) }) });
@@ -1548,10 +1574,10 @@ test('task hand --checklist passes a non-path cell title unchanged when text is 
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-non-path-title-'));
   const title = withDoneBoundary('기존 칸 문면\n둘째 줄 그대로');
   const launcherCalls: string[][] = [];
-  const result = await run(['tasks', 'hand', '--checklist', 'cell-no-path', '--live', '--json'], {
+  const result = await run(['tasks', 'hand', '--checklist', 'CELL-NO-PATH', '--live', '--json'], {
     taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
     releaseBoard: () => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
-      { id: 'cell-no-path', level: 'task', title, status: 'open' },
+      { id: 'CELL-NO-PATH', level: 'task', title, status: 'open' },
     ] }],
     taskLauncher: (args) => { launcherCalls.push(args); },
   });
@@ -1917,6 +1943,24 @@ test('STOP-RECORD launch-failed: through task hand --live the card is launch-fai
   expect(cards[0]!.history[0]!.detail).toContain('child rc=2: error: bad argv');
   expect(written).toHaveLength(1);
   expect(written[0]!.data).toMatchObject({ class: 'launch-failed' });
+});
+
+test('TASK-HAND-RETRY: live launch refusal prints its reason instead of the shadow hint', async () => {
+  const taskStatePath = join(mkdtempSync(join(tmpdir(), 'tasks-cli-hand-refusal-')), 'cards.json');
+  let launches = 0;
+  const result = await run(['tasks', 'hand', '대상 경로: src/task-agent/task-hand.ts\n재시도 카드', '--live'], {
+    taskStatePath,
+    taskLauncher: () => { launches += 1; },
+    taskLaunchRequestDoor: {
+      requestId: () => 'request-test-card-attempt',
+      consume: () => ({ status: 'refused', requestId: 'request-test-card-attempt', receiptId: 'receipt-old', receiptAt: '2026-10-30T00:00:00.000Z', reason: '이미 소비된 카드 넘김 시도' }),
+      fail: () => {},
+      rows: () => [],
+    },
+  });
+  expect(launches).toBe(0);
+  expect(result.lines.join('\n')).toContain('launch-refused-duplicate: 이미 소비된 카드 넘김 시도');
+  expect(result.lines.join('\n')).not.toContain('shadow — 띄우지 않았다');
 });
 
 test('tasks adopt-runs backfills uncarded registry runs into the injected state file only', async () => {

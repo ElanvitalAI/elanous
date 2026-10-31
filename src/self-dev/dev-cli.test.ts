@@ -27,6 +27,7 @@ import { buildUserConfig, parseChildLlmPreference, resetUserConfig, setUserConfi
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { readHarnessScreen } from '../harness/harness-screen.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
+import { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } from '../self-implement/elanous-tui-spawn.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -449,7 +450,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
 
   it('self + --elanous → 격리 TUI namespace로 매핑하고 completion을 주입하지 않는다', () => {
     const spec = buildDevCliSpec(IN, SELF, { elanous: true, goal: 'child goal', maxSteps: '4', pollMs: '0', model: 'brain', isolatedRoot: '/iso', cwd: '/work', readyTimeoutMs: '180000' });
-    expect(spec.elanous).toEqual({ goal: 'child goal', maxSteps: 4, pollMs: 0, model: 'brain', isolatedRoot: '/iso', cwd: '/work', readyTimeoutMs: 180000 });
+    expect(spec.elanous).toEqual({ goal: 'child goal', maxSteps: 4, pollMs: 0, model: 'brain', isolatedRoot: '/iso', cwd: '/work', readyTimeoutMs: 180_000 });
     expect(spec.completion).toBeUndefined();
     expect(planDevPipeline(spec).dispatch).toBe('elanous-tui');
   });
@@ -3551,8 +3552,12 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
   });
 
   it('--hold는 --elanous 전용이고 goal 없는 held TUI spec으로 전달하며 goal과의 충돌은 거부한다', () => {
-    expect(buildDevCliSpec(IN, SELF, { elanous: true, hold: true }).elanous).toEqual({ hold: true });
-    expect(buildDevCliSpec(IN, SELF, { elanous: true, hold: true, json: true }).elanous).toEqual({ hold: true, json: true });
+    expect(buildDevCliSpec(IN, SELF, { elanous: true, hold: true }).elanous).toEqual({ hold: true, readyTimeoutMs: DEFAULT_TUI_TEST_READY_TIMEOUT_MS });
+    expect(buildDevCliSpec(IN, SELF, { elanous: true, hold: true, json: true }).elanous).toEqual({ hold: true, readyTimeoutMs: DEFAULT_TUI_TEST_READY_TIMEOUT_MS, json: true });
+    expect(buildDevCliSpec(IN, SELF, { elanous: true, hold: true, readyTimeoutMs: '180000' }, ['elanous', 'hold', 'readyTimeoutMs']).elanous)
+      .toEqual({ hold: true, readyTimeoutMs: 180_000 });
+    expect(buildDevCliSpec(IN, SELF, { elanous: true, goal: 'g', readyTimeoutMs: '180000' }, ['elanous', 'goal', 'readyTimeoutMs']).elanous)
+      .toEqual({ goal: 'g', readyTimeoutMs: 180_000 });
     expect(() => buildDevCliSpec(IN, SELF, { hold: true })).toThrow(/--hold 는 --elanous/);
     expect(() => buildDevCliSpec(IN, SELF, { elanous: true, hold: true, goal: 'x' })).toThrow(/--hold 와 --goal/);
     // ⛔ 경계값 — `trim()` 기준이면 `--goal ''`/공백이 거부를 통과하고 조립부가 falsy 로 버려

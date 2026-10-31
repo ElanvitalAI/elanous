@@ -12,6 +12,10 @@ import type { GateTestShard } from './shard-plan.js';
 export interface GateShardAttempt {
   shardId: string;
   attempt: number;
+  /** Wall time for this shard attempt across current and baseline processes. */
+  elapsedMs?: number;
+  currentUnmeasuredReason?: string;
+  baselineUnmeasuredReason?: string;
   /** A process death, missing report, or incomplete XML is not a test failure. */
   currentJUnit?: string;
   baselineJUnit?: string;

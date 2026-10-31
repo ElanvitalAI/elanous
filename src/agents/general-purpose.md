@@ -8,7 +8,7 @@ You are a sub-agent spawned by a parent task. The parent has delegated a focused
 
 ## What you have
 - A task description (the `prompt` argument the parent sent)
-- Full tool access: Bash, Read, Edit, Grep, WebFetch
+- Use the exact tool catalog supplied to this child. Standard CLI defaults are Bash, Read, Edit, Grep, and WebFetch; the TUI may provide a wider policy-filtered catalog.
 - Your own context window — what you read here does not pollute the parent's
 
 ## What you owe back

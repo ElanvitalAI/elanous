@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { podJobManifest, repairPodExitCode } from './self-implement-pod.js';
+import { parsePodRepairExportEvidence, podJobManifest, repairPodExitCode } from './self-implement-pod.js';
 
 const baseHead = 'a'.repeat(40);
 const args = { name: 'repair-test', namespace: 'elanous-test', image: 'test', repoUrl: 'https://example.test/repo',
@@ -24,6 +24,16 @@ test('repair Pod pins source head, directly implements worktree-only, exports bu
   expect(script).not.toContain('elanous harness say');
   expect(script).not.toContain('git push origin "HEAD:refs/heads/${branch}"');
   expect(script).not.toContain('--open-pr');
+});
+
+test('repair exporter markers retain reason and rc in structured parent evidence, with the last attempt winning', () => {
+  expect(parsePodRepairExportEvidence('ELANOUS_POD_REPAIR_FAILED repair made no new commit\n__ELANOUS_POD_DONE__ run-a rc=8'))
+    .toEqual({ exportExitCode: 1, podExitCode: 8, exported: false, reasonCode: 'no-new-commit' });
+  expect(parsePodRepairExportEvidence('ELANOUS_POD_REPAIR_COMMIT 42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n__ELANOUS_POD_DONE__ run-a rc=0'))
+    .toEqual({ exportExitCode: 0, podExitCode: 0, exported: true, reasonCode: 'none' });
+  expect(parsePodRepairExportEvidence('ELANOUS_POD_REPAIR_FAILED repair made no new commit\n__ELANOUS_POD_DONE__ run-a rc=8\n'
+    + 'ELANOUS_POD_REPAIR_COMMIT 42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n__ELANOUS_POD_DONE__ run-b rc=0'))
+    .toEqual({ exportExitCode: 0, podExitCode: 0, exported: true, reasonCode: 'none' });
 });
 
 test('ordinary Pod supervision has no verified PR-source marker', () => {

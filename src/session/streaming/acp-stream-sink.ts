@@ -36,7 +36,8 @@ export function createAcpStreamSink(broadcast: AcpBroadcast): StreamingSurfaceSi
       if (!sessionId) return;
       if (ev.delta) {
         // push(chunk) 등가 — agent_message_chunk(byte-identical).
-        void broadcast(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ev.delta } });
+        void broadcast(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ev.delta },
+          ...(ev.textOperation === 'replace' ? { _meta: { elanous: { textOperation: 'replace' } } } : {}) });
       }
       if (ev.reasoning) {
         // 🧠 추론 — agent_thought_chunk(ACP 의 thought 채널).

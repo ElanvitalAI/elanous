@@ -32,6 +32,8 @@ import {
   type AcceptanceReport,
 } from './acceptance.js';
 import { recordOpsEventSafe, type OpsEventInput } from '../domains/ops-log.js';
+import { getHarnessRunId } from '../harness/harness-space.js';
+import { collectLinearCaptureArtifacts } from './linear-capture-events.js';
 import { defaultAnomalyCluster, extractContainerExit, type AnomalyCluster } from '../loops/orchestrator/anomaly-cluster.js';
 
 // ───────────────────────── Concurrency caps ────────────────────────
@@ -309,7 +311,18 @@ export class TaskDispatcher {
     const kind = task.surface.kind;
     let savedExecution = false;
     try {
-      const exec = { ...await res.promise, id: res.executionId };
+      const completedExecution = { ...await res.promise, id: res.executionId };
+      // The run identity is taken from this dispatcher process, never from child-reported execution output.
+      const runId = getHarnessRunId();
+      let captureArtifacts: TaskExecution['captureArtifacts'] = [];
+      if (runId) {
+        try {
+          captureArtifacts = collectLinearCaptureArtifacts({ runId, startedAt: completedExecution.startedAt,
+            endedAt: completedExecution.endedAt ?? this.now() });
+        } catch { /* Capture observation is optional; an unavailable log store must not block task completion. */ }
+      }
+      const exec: TaskExecution = { ...completedExecution, runId: runId || undefined,
+        captureArtifacts: captureArtifacts.length ? captureArtifacts : undefined };
       // Keep the task row and execution in the same store read by GET /v1/tasks/:id.
       this.opts.store?.saveTask(this.opts.graph.getTask(task.id)!);
       this.opts.store?.saveExecution(exec);

@@ -13,7 +13,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runSelfImplement } from './orchestrator.js';
 import { seams } from './test-seams.js';
-import { appendRunLedgerEntry, loadRunLedger, type RunLedgerEntry } from './run-ledger.js';
+import { appendRunLedgerEntries, appendRunLedgerEntry, loadRunLedger, type RunLedgerEntry } from './run-ledger.js';
+import { projectRunLedgerSteps } from './run-step-projection.js';
 import { GRAPH_SPECS, GRAPH_TEMPLATES } from './graph-templates.js';
 import type { GraphOverlaySpec } from './graph-overlay-yaml.js';
 import { RUN_STOP_CLASSES } from './run-stop.js';
@@ -323,6 +324,72 @@ test('runtime branch is applied by runSelfImplement, while unknown STOP-RECORD a
     expect(reviewedIds.length).toBe(4);
     expect(reviewedIds.every((ids, index) => index === 0 || ids.every(id => !reviewedIds[index - 1]!.includes(id)))).toBe(true);
     expect(repeated!.data.selections).toEqual(expect.arrayContaining([expect.objectContaining({ overlayId: 'review-repeat', verdict: 'applies' })]));
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test('DEMO-GRAPH-EVENT-STREAM: runSelfImplement records accepted runtime structural changes through the production ledger seam', async () => {
+  const entries: RunLedgerEntry[] = [];
+  const overlay: GraphOverlaySpec = {
+    overlayId: 'runtime-structural-fixture', target: 'self-implement', stage: 'runtime', appliesWhen: 'attempts >= 0',
+    patch: [
+      { op: 'add', path: '/nodes/-', value: {
+        nodeId: 'source-audit', kind: 'judge', recipe: 'observe-only', maxVisits: 1,
+        contract: { inputs: ['worktree'], tools: 'read-only', outputs: ['findings'] },
+      } },
+      { op: 'add', path: '/edges/-', value: { from: 'review', on: 'outcome', map: { source_missing: 'source-audit' } } },
+      { op: 'add', path: '/edges/-', value: { from: 'source-audit', to: 'merge' } },
+    ],
+  };
+  const result = await runSelfImplement({
+    feature: 'runtime structural overlay fixture', memory: false, completion: 'worktree-only', graphOverlays: [overlay],
+    seams: seams({ writeRunLedger: (entry) => { entries.push(entry); } }),
+  });
+
+  expect(result.ok).toBe(true);
+  expect(entries.filter((entry) => entry.event === 'node-added').map((entry) => entry.data)).toEqual([
+    expect.objectContaining({ node: 'source-audit', kind: 'judge', decider: 'runtime-overlay' }),
+  ]);
+  expect(entries.filter((entry) => entry.event === 'edge-rerouted').map((entry) => entry.data)).toEqual(expect.arrayContaining([
+    expect.objectContaining({ from: 'source-audit', to: 'merge', was: '$absent', decider: 'runtime-overlay' }),
+  ]));
+}, 30_000);
+
+test('runSelfImplement sends one accepted runtime structural batch through the batch ledger seam', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'overlay-structural-batch-'));
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  const runId = 'run-33333333-3333-4333-8333-333333333333';
+  try {
+    const base = GRAPH_SPECS['self-implement']!;
+    const gateFailEdge = base.edges.findIndex(edge => edge.from === 'gate' && edge.map?.fail === 'rework');
+    expect(gateFailEdge).toBeGreaterThanOrEqual(0);
+    const overlay: GraphOverlaySpec = {
+      overlayId: 'runtime-structural-batch-fixture', target: 'self-implement', stage: 'runtime', appliesWhen: 'attempts >= 0',
+      patch: [
+        { op: 'add', path: '/nodes/-', value: { nodeId: 'runtime-probe', kind: 'judge', recipe: 'observe-only', maxVisits: 1,
+          contract: { inputs: ['worktree'], tools: 'read-only', outputs: ['findings'] } } },
+        { op: 'replace', path: `/edges/${gateFailEdge}/map/fail`, value: 'runtime-probe' },
+        { op: 'add', path: '/edges/-', value: { from: 'runtime-probe', to: 'rework' } },
+      ],
+    };
+    const batches: RunLedgerEntry[][] = [];
+    const result = await runSelfImplement({
+      runId, goalId: '3344556677889900', feature: 'runtime structural batch fixture',
+      memory: false, completion: 'worktree-only', graphOverlays: [overlay],
+      seams: seams({ writeRunLedgerBatch: entries => { batches.push([...entries]); appendRunLedgerEntries(entries); } }),
+    });
+    expect(result.ok).toBe(true);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.map(entry => entry.event)).toEqual(['node-added', 'edge-rerouted', 'edge-rerouted']);
+    const persisted = loadRunLedger(runId) ?? [];
+    expect(persisted.filter(entry => ['node-added', 'edge-rerouted'].includes(entry.event)).map(entry => entry.seq))
+      .toEqual([expect.any(Number), expect.any(Number), expect.any(Number)]);
+    expect(projectRunLedgerSteps(runId, persisted).steps.map(step => step.type))
+      .toEqual(['node-added', 'edge-rerouted', 'edge-rerouted']);
   } finally {
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previous;

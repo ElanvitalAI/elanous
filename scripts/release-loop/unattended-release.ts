@@ -15,6 +15,7 @@ import { releaseRunUniverse } from './release-universe.js';
 import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKind } from './release-version.js';
 import { publishAtError } from './publish-at.js';
 import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
+import { readReleaseGateRehearsal, readReleaseOpsPolicy, selectReleaseGateMethod } from './gate-method.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -55,6 +56,8 @@ export interface ReleaseRunInput extends ReleaseLoopConfig {
   gatePodPool?: string;
   /** GATE-HOST-EXECUTOR — absent = pod (today's input, byte-identical); `host` sweeps on `gateRemote`. */
   gateExecutor?: GateExecutor;
+  /** RELEASE-POLICY-PACK — gate source/image identity follows the selected cut commit. */
+  gateImagePin?: 'cut-commit';
   forceFreeze?: boolean;
   publishAt?: string;
   /** RELEASE-BRANCH: version-release cuts release/<v> from main HEAD and bumps only the branch. */
@@ -65,6 +68,7 @@ export interface UnattendedReleaseDeps {
   ledgerRoot?: string;
   config?: ReleaseLoopConfig;
   configPath?: string;
+  policyPath?: string;
   graph?: (path: string, options: { input: ReleaseRunInput; pinChildUniverse?: boolean; deps?: { root?: string } }) => Promise<GraphRunState>;
   checklist?: (version: string) => Pick<ReturnType<typeof cutChecklistGate>, 'ok' | 'red' | 'undecided' | 'blocked'>;
   freezeRoot?: string;
@@ -125,20 +129,27 @@ export interface GateExecutorRequest { executor?: string; host?: string }
 export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDeps = {}, cutCommit?: string, gate: GateExecutorRequest = {}): ReleaseRunInput {
   const config = deps.config ?? releaseLoopConfig(deps.configPath);
   if (gate.executor === undefined && gate.host !== undefined) throw new Error('--gate-host requires --gate-executor host');
-  const choice = gate.executor === undefined ? undefined
-    : checkGateExecutorChoice(gate.executor, gate.executor === 'host' ? gate.host ?? config.gateRemote : gate.host);
-  const pool = config.gatePodPool;
-  const hasPool = typeof pool === 'string' && !!pool.trim();
-  // The pod executor (the default) stays fail-closed on a missing pool; an explicit host executor does not need one.
-  if (choice?.executor !== 'host' && !hasPool) throw new Error('release.loop.gatePodPool is required before graph execution');
   const previousVersion = latestPublishedPreviousVersion(baseVersion(version), deps.ledgerRoot);
+  const rehearsal = readReleaseGateRehearsal(deps.ledgerRoot ?? releaseLedgerRoot(), previousVersion);
+  const method = selectReleaseGateMethod({ policy: readReleaseOpsPolicy(deps.policyPath), targetVersion: baseVersion(version),
+    configuredPool: config.gatePodPool, rehearsal });
+  debug.log('release.run', 'gate-method-selected', { version, previousVersion, ...method });
+  const requested = gate.executor === undefined ? undefined
+    : checkGateExecutorChoice(gate.executor, gate.executor === 'host' ? gate.host ?? config.gateRemote : gate.host);
+  if (requested && requested.executor !== method.executor) {
+    debug.log('release.run', 'gate-method-override-rejected', { version, requested: requested.executor, selected: method.executor, decision: method.decision });
+    throw new Error(`gate executor ${requested.executor} conflicts with release policy ${method.executor}`);
+  }
+  if (method.executor === 'pod' && !method.pool) throw new Error('release.loop.gatePodPool is required by release ops policy');
   return {
     ...config,
     version, previousVersion,
     ...(cutCommit !== undefined ? { cutCommit } : {}),
-    ...(hasPool ? { gatePodPool: pool.trim() } : {}),
-    ...(choice ? { gateExecutor: choice.executor } : {}),
-    ...(choice?.host ? { gateRemote: choice.host } : {}),
+    ...(method.executor === 'pod' ? { gatePodPool: method.pool } : {}),
+    gateExecutor: method.executor,
+    gateImagePin: method.imagePin,
+    // A future policy may select host; only then can its validated host request reach this input.
+    ...(requested?.host ? { gateRemote: requested.host } : {}),
   };
 }
 

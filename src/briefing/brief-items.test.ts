@@ -1,14 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BRIEF_DOMAINS, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, composeBriefPage, normalizeClaim, orderBriefDomains, pendingRealtime, type BriefItem, type BriefWeeklyActions } from './brief-items.js';
+import { BRIEF_DOMAINS, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, composeBriefMarkdown, composeBriefPage, composeIntakeDailyBrief, normalizeClaim, orderBriefDomains, pendingRealtime, type BriefItem, type BriefWeeklyActions } from './brief-items.js';
 import { runRequirementFunnel, type RequirementFunnelResult } from '../intake-plane/requirement-funnel.js';
 import { briefFeedbackButtons, recordBriefTelegramUpdate, registerBriefCommands } from '../cli/brief-cli.js';
 import { Command } from 'commander';
 import { TelegramBot } from '../telegram.js';
 import type { DirectiveRow } from '../intake-plane/requirement-funnel.js';
+import { runIntakeIssueBriefing } from '../intake-plane/actions.js';
 
 const NOW = new Date('2026-10-05T00:00:00Z'); // 09:00 KST — after 08:30, before 22:00
 
@@ -183,7 +184,8 @@ test('append-only items keep the claim verbatim under briefing/items.sqlite', ()
     expect(existsSync(store.path)).toBe(true);
     expect(first).toEqual({
       id: 1, text, domain: '흡수', priority: 'P1', deadline: '2026-10-06',
-      evidence: 'https://example.test/1', source: '흡수', created_at: '2026-10-05T00:00:00.000Z', sent_at: null,
+      evidence: 'https://example.test/1', source: '흡수', linearIssueId: null,
+      created_at: '2026-10-05T00:00:00.000Z', sent_at: null,
     });
     expect(second.deadline).toBeNull();
     expect(second.evidence).toBeNull();
@@ -1018,6 +1020,51 @@ test('pendingRealtime is pure and selects unsent P0 or KST-today deadlines, rega
   expect(BRIEF_SLOTS).toEqual(['08:30', 'after-release', '22:00']);
 });
 
+test('DEMO1104-ABSORB-BRIEFING: issue-scoped items keep the existing Linear issue key and render a related-issue card', () => {
+  const { root, store } = fixture();
+  try {
+    const item = store.add({
+      text: '흡수한 변화가 기존 판단을 흔든다', domain: '흡수', priority: 'P0',
+      source: 'intake-daily', evidence: 'https://example.com/brief', issueRef: 'ELN-1104',
+      createdAt: '2026-10-04T23:00:00Z',
+    });
+    expect(item.issue_ref).toBe('ELN-1104');
+    expect(store.compose('08:30')).toContain('관련 이슈: ELN-1104');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DEMO1104-ABSORB-BRIEFING 2/2: the intake-daily action keeps an issue watch, briefs open issues, comments, and reopens a done issue on a material event', async () => {
+  const { root, store } = fixture();
+  const registrations: Array<{ id: string; issueRef?: string }> = [];
+  const comments: Array<{ issueRef: string; body: string }> = [];
+  const reopened: string[] = [];
+  let collections = 0;
+  const deps = {
+    stateDir: root,
+    ledger: store,
+    registerSource: (source: { id: string; issueRef?: string }) => { registrations.push(source); },
+    runSources: async () => { collections++; return { ran: [{ id: 'watch-ELN-1104', items: 5 }] }; },
+    commentIssue: async (issueRef: string, body: string) => { comments.push({ issueRef, body }); },
+    reopenIssue: async (issueRef: string) => { reopened.push(issueRef); },
+  };
+  try {
+    await runIntakeIssueBriefing({ issueRef: 'ELN-1104', topic: 'agent harness', state: 'open',
+      evidence: [{ title: '새 수집 결과', url: 'https://example.com/1', summary: '판단을 바꿀 변화' }] }, deps);
+    expect(registrations).toMatchObject([{ id: 'watch-ELN-1104', issueRef: 'ELN-1104', spec: 'agent harness', every: '1d' }]);
+    expect(collections).toBe(1);
+    expect(store.list()).toMatchObject([{ issue_ref: 'ELN-1104', evidence: 'https://example.com/1' }]);
+    expect(store.compose('22:00')).toContain('관련 이슈: ELN-1104');
+    expect(comments).toEqual([{ issueRef: 'ELN-1104', body: expect.stringContaining('https://example.com/1') }]);
+
+    await runIntakeIssueBriefing({ issueRef: 'ELN-1104', topic: 'agent harness', state: 'done',
+      evidence: [{ title: '결정을 흔드는 사건', url: 'https://example.com/2', summary: '재검토가 필요하다', reopensIssue: true }] }, deps);
+    expect(registrations).toHaveLength(2);
+    expect(collections).toBe(2);
+    expect(reopened).toEqual(['ELN-1104']);
+    expect(store.list().filter(item => item.issue_ref === 'ELN-1104')).toHaveLength(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('invalid item and slot inputs do not add rows', () => {
   const { root, store } = fixture();
   try {
@@ -1031,6 +1078,19 @@ test('invalid item and slot inputs do not add rows', () => {
     expect(() => store.compose('realtime')).toThrow('invalid slot');
     expect(store.list()).toEqual([]);
     expect(store.list({ domain: '운영' })).toEqual([]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('brief items retain parent Linear issue UUID and reject display identifiers', () => {
+  const { root, store } = fixture();
+  try {
+    const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+    const item = store.add({ text: 'demo evidence', domain: '흡수', priority: 'P1', source: 'intake.topic-search',
+      evidence: 'https://example.test/evidence', linearIssueId });
+    expect(item.linearIssueId).toBe(linearIssueId);
+    expect(new BriefItemsLedger({ stateDir: root }).list()[0]?.linearIssueId).toBe(linearIssueId);
+    expect(() => store.add({ text: 'bad id', domain: '흡수', priority: 'P1', source: 'test', linearIssueId: 'ENG-123' }))
+      .toThrow('invalid Linear issue UUID');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -1054,6 +1114,31 @@ test('08:30 compose reaches requirement funnel and shows P0 oldest directive; ot
     expect(ledger.list()).toEqual([]);
     expect(ledger.compose('22:00')).not.toContain('대표 지시 중 아직 칸 없는 것');
     expect(calls).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DEMO1104-ABSORB-BRIEFING: intake-daily 그래프 브리핑 단계가 requirement-funnel의 briefItems를 08:30 구성 경로로 전달한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'brief-intake-daily-'));
+  const graph = readFileSync('graphs/intake/intake-daily.yaml', 'utf8');
+  const funnelItem = { text: '일일 흡수 브리핑', domain: '흡수' as const, priority: 'P1' as const, source: 'intake-daily' };
+  let receivedAt: Date | undefined;
+  const brief = composeIntakeDailyBrief({
+    stateDir: root,
+    now: () => NOW,
+    log: () => {},
+    requirementFunnel: now => {
+      receivedAt = now;
+      return { ...emptyFunnel(), briefItems: [funnelItem] };
+    },
+  });
+  try {
+    expect(graph).toContain('node_id: briefing-0830');
+    expect(graph).toContain('recipe: cmd:brief-compose-0830');
+    expect(graph).toContain('entrypoint: src/briefing/brief-items.ts#composeIntakeDailyBrief');
+    expect(graph).toContain('orchestration_id: orchestrationId()');
+    expect(brief.orchestrationId).not.toBe('');
+    expect(brief.markdown).toContain('[P1] 일일 흡수 브리핑');
+    expect(receivedAt?.toISOString()).toBe('2026-10-04T23:29:59.999Z');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

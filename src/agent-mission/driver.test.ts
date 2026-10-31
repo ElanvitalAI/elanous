@@ -86,6 +86,75 @@ describe('pre-mission resource ladder on PTY dispatch', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
 
+  test('Claude --follow-up dispatches the second turn to the first turn session', async () => {
+    const calls: Array<Parameters<NonNullable<AgentMissionDeps['runClaudeHeadless']>>[0]> = [];
+    const runClaudeHeadless: NonNullable<AgentMissionDeps['runClaudeHeadless']> = async (options) => {
+      calls.push(options);
+      return {
+        ok: true, reason: 'success', exitCode: 0, result: 'done', subtype: 'success', sessionId: 'claude-session-1',
+        isError: false, numTurns: 1, durationMs: 1, durationApiMs: 1, totalCostUsd: 0, usage: null, toolEvents: 0, malformedLines: 0,
+      };
+    };
+    const { result } = await launch({ agent: claudeBackend, followUp: 'Revise the result', resources: 'off' }, {
+      checkClaudeSubscription: () => ({ ok: true, authMethod: 'claude.ai', apiProvider: 'firstParty', reason: 'subscription' }),
+      runClaudeHeadless,
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.prompt).toBe('List skills');
+    expect(calls[0]?.resumeSessionId).toBeUndefined();
+    expect(calls[1]).toMatchObject({ prompt: 'Revise the result', resumeSessionId: 'claude-session-1' });
+    expect(result.rounds).toBe(2);
+  });
+
+  test('Codex --follow-up dispatches the second turn to the first turn thread', async () => {
+    const calls: Array<Parameters<NonNullable<AgentMissionDeps['runCodexExec']>>[0]> = [];
+    const runCodexExec: NonNullable<AgentMissionDeps['runCodexExec']> = async (options) => {
+      calls.push(options);
+      return {
+        ok: true, reason: 'success', exitCode: 0, sessionId: 'codex-thread-1',
+        result: 'done', numTurns: 1, malformedLines: 0,
+      };
+    };
+    const { result } = await launch({ agent: codexBackend, followUp: 'Revise the result', resources: 'off' }, { runCodexExec });
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.prompt).toBe('List skills');
+    expect(calls[0]?.resumeSessionId).toBeUndefined();
+    expect(calls[1]).toMatchObject({ prompt: 'Revise the result', resumeSessionId: 'codex-thread-1' });
+    expect(result.rounds).toBe(2);
+  });
+
+  test('Codex --follow-up fails closed if resume returns a different thread id', async () => {
+    let calls = 0;
+    const runCodexExec: NonNullable<AgentMissionDeps['runCodexExec']> = async (options) => {
+      calls++;
+      return {
+        ok: true, reason: 'success', exitCode: 0,
+        sessionId: options.resumeSessionId ? 'different-thread' : 'codex-thread-1',
+        result: 'done', numTurns: 1, malformedLines: 0,
+      };
+    };
+    const { result } = await launch({ agent: codexBackend, followUp: 'Revise the result', resources: 'off' }, { runCodexExec });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('session-mismatch');
+    expect(calls).toBe(2);
+  });
+
+  test('Codex --follow-up fails closed if resume completes without a thread id', async () => {
+    let calls = 0;
+    const runCodexExec: NonNullable<AgentMissionDeps['runCodexExec']> = async () => {
+      calls++;
+      return calls === 1
+        ? { ok: true, reason: 'success', exitCode: 0, sessionId: 'codex-thread-1', result: 'first', numTurns: 1, malformedLines: 0 }
+        : { ok: false, reason: 'no-session', exitCode: 0, sessionId: null, result: 'follow-up', numTurns: 1, malformedLines: 0 };
+    };
+    const { result } = await launch({ agent: codexBackend, followUp: 'Revise the result', resources: 'off' }, { runCodexExec });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('session-mismatch');
+    expect(calls).toBe(2);
+  });
+
   test('codex PTY start and finish are in coord events without the mission prompt', async () => {
     const since = new Date().toISOString();
     const { result } = await launch({ mission: 'PRIVATE MISSION PROMPT', resources: 'off' });
@@ -1147,4 +1216,35 @@ describe('claude input: text and Enter go as separate writes (09-29 실물: Ente
     expect(inject('text\r')).toBe(false);
     expect(later).toEqual([]);
   });
+});
+
+test('research graph hand returns a bounded report as the next graph node input', async () => {
+  const { createResearchGraphHandNodeHandler } = await import('./driver.js');
+  const root = mkdtempSync(join(tmpdir(), 'research-graph-hand-driver-'));
+  const worktree = join(root, 'codex-worktree');
+  const reportPath = join(worktree, '.elanous', 'mission-results', 'hand-result.md');
+  let mission = '';
+  try {
+    mkdirSync(join(worktree, '.elanous', 'mission-results'), { recursive: true });
+    writeFileSync(reportPath, 'Codex found two independent sources.');
+    const handler = createResearchGraphHandNodeHandler({ agent: 'codex' }, {
+      resolveBackend: (name) => ({ name: name as 'codex' | 'claude', cmd: 'fake', args: [] }),
+      runMission: async (spec) => {
+        mission = spec.mission;
+        return {
+          ok: true, worktree, branch: spec.branch ?? null, rounds: 1,
+          evidencePath: reportPath, evidenceSatisfied: true, committed: true,
+          usedOmniCrawl: false, detail: '완료(증거 충족)',
+        };
+      },
+    });
+    const result = await handler({
+      graphId: 'research-demo', runId: 'run-1', nodeId: 'codex-hand',
+      input: { question: 'HBM4 2027 전망' }, outputs: {},
+    });
+    expect(mission).toContain('연구 질문: HBM4 2027 전망');
+    expect(result).toMatchObject({ ok: true, outcome: 'ok', evidence: {
+      hand: 'codex', reportPath, report: 'Codex found two independent sources.', status: 'completed',
+    } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

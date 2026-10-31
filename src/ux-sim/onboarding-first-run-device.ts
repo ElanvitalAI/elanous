@@ -1,14 +1,13 @@
-// ux-sim device: the PRODUCTION first-run menu, driven under a real util-linux PTY.
+// ux-sim device: the PRODUCTION fresh-install setup menu, driven under a real util-linux PTY.
 //
-// Why this exists: the menu re-ask loop of `src/onboarding/first-run.ts`
-// (`promptProviderMenu` → `parseMenuAnswer`) is only reachable when
+// Why this exists: the fresh-install setup menu is only reachable when
 // `process.stdin.isTTY` is true. A plain pipe makes the CLI take the non-TTY
 // `needs-llm` shortcut instead, so the board (how many times the menu comes
 // back, which phrase ends the run, whether `onboarding.ready` is written) is
 // unmeasurable without a TTY. This device allocates one the same way the live
 // seat does — util-linux `script -q -e -c` — so the production entrypoint
 // `bin/elanous.mjs --test` runs its real `src/index.ts` → `runFirstRun` →
-// `promptProviderMenu` path.
+// `runFirstRunProviderSetup` path.
 //
 // Isolation (K-MK-03): HOME/XDG/claude dirs are a fresh temp tree and the CLI
 // is spawned with `--test --config-dir <temp>`, so the run cannot touch a real
@@ -19,26 +18,30 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { formatProviderMenu, orderProviderChoices } from '../onboarding/first-run.js';
+import { FIRST_RUN_PROVIDER_MENU_PROMPT, formatProviderMenu, orderProviderChoices } from '../onboarding/first-run.js';
+import {
+  FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES,
+  FIRST_RUN_PROVIDER_SETUP_MENU_HEADING,
+  FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES,
+} from '../cli/setup-keys.js';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { createFakeBins, utilLinuxScript, type FakeBinCall } from './fake-bin.js';
-/**
- * Text `promptProviderMenu` prints before every re-ask — one occurrence per render.
- * Every assertion on the re-ask count uses this marker, so it has one source.
- */
-export const FIRST_RUN_MENU_MARKER = 'Choose LLM';
-/**
- * Fixed choice line of the first-run menu, taken from the production renderer
- * itself (`formatProviderMenu` over the default choice order) rather than retyped.
- * Every assertion that the menu printed the expected wording — here and in
- * `src/onboarding/first-run.test.ts` — reads this, so production wording drift
- * turns into a failure instead of a stale expectation.
- */
+/** English provider chooser and Korean fresh-install chooser headings. */
+export const FIRST_RUN_MENU_MARKERS = [FIRST_RUN_PROVIDER_MENU_PROMPT, FIRST_RUN_PROVIDER_SETUP_MENU_HEADING] as const;
+
+/** Count menu renders independently of the selected user-facing locale. */
+export function countFirstRunMenuRenders(output: string): number {
+  const markerCounts = FIRST_RUN_MENU_MARKERS.map((marker) => output.split(marker).length - 1);
+  // A process keeps one locale; max also avoids counting one bilingual render twice.
+  return Math.max(...markerCounts);
+}
+/** Fixed provider-chooser choice line, taken from the production renderer. */
 export const FIRST_RUN_MENU_CHOICES = formatProviderMenu(orderProviderChoices());
+export const FIRST_RUN_MENU_CHOICE_MARKERS = [FIRST_RUN_MENU_CHOICES, FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES] as const;
 /** Line `runFirstRun` prints before a fresh install has to pick a provider. */
 export const FIRST_RUN_SETUP_HINT = 'eln setup llm 으로 고르세요';
-/** Misses the parser must reject and re-ask: out of range, exponent, full-width, then 1. */
-export const FIRST_RUN_MENU_ANSWERS = ['4', '1e0', '１', '1'] as const;
+/** Misses the parser must reject: out of range, exponent, and full-width digits. */
+export const FIRST_RUN_MENU_ANSWERS = ['4', '1e0', '１'] as const;
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const cliEntry = join(repoRoot, 'bin', 'elanous.mjs');
@@ -196,6 +199,7 @@ export async function driveFirstRunMenu(
     let stdout = '';
     let stderr = '';
     let seen = 0;
+    let keyPasteAnswered = false;
     const answersSent: string[] = [];
     let closed = false;
     let timedOut = false;
@@ -209,11 +213,17 @@ export async function driveFirstRunMenu(
 
     child.stdout.on('data', (chunk: Buffer) => {
       stdout += chunk.toString('utf8');
-      const count = stdout.split(FIRST_RUN_MENU_MARKER).length - 1;
+      const count = countFirstRunMenuRenders(stdout);
       while (seen < count) {
         seen += 1;
         setTimeout(() => {
           if (!closed) writeNext();
+        }, answerDelayMs);
+      }
+      if (!keyPasteAnswered && stdout.includes('.env 형식 키를 붙여 넣고 빈 줄로 끝내세요')) {
+        keyPasteAnswered = true;
+        setTimeout(() => {
+          if (!closed) child.stdin.write('\n');
         }, answerDelayMs);
       }
     });
@@ -253,7 +263,7 @@ export async function driveFirstRunMenu(
       stderr,
       status,
       timedOut,
-      menuRenderCount: Math.min(seen, stdout.split(FIRST_RUN_MENU_MARKER).length - 1),
+      menuRenderCount: Math.min(seen, countFirstRunMenuRenders(stdout)),
       answersSent,
       finalPhrase: stdout.includes(FIRST_RUN_SETUP_HINT) ? FIRST_RUN_SETUP_HINT : null,
       readyRecorded,

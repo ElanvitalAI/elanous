@@ -1,0 +1,16 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "demo-research",
+  "version": "0.1.0",
+  "description": "Research scene package: Exa and Firecrawl search, Grok coverage, research turn guidance, and Bloom defaults.",
+  "extensions": {
+    "ai.elanous": {
+      "connectors": [
+        { "id": "exa", "required": false, "fields": [{ "name": "apiKey", "secret": true, "env": "EXA_API_KEY" }] },
+        { "id": "firecrawl", "required": false, "fields": [{ "name": "apiKey", "secret": true, "env": "FIRECRAWL_API_KEY" }] },
+        { "id": "xai", "required": false, "fields": [{ "name": "apiKey", "secret": true, "env": "XAI_API_KEY" }] },
+        { "id": "tavily", "required": false, "fields": [{ "name": "apiKey", "secret": true, "env": "TAVILY_API_KEY" }] }
+      ]
+    }
+  }
+}

@@ -3,8 +3,15 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runPodCommand, type RunPodCommandOptions, type PodCommandResult } from '../task-orchestrator/surfaces/pod-command-job.js';
 import { redactSecretText } from '../debug/log.js';
+import { getUserConfig } from '../user-config.js';
 import type { RootPlanSummary } from './pr-land-heavy-remote.js';
-import type { WarmReuseEvidence, WarmReuseEvidenceByConsumer } from '../task-orchestrator/surfaces/pod-warm-switch.js';
+import type { WarmReuseEvidence, WarmReuseEvidenceByConsumer, WarmReuseSwitchConfig } from '../task-orchestrator/surfaces/pod-warm-switch.js';
+import { requestWarmPodReplay, finalizeWarmPodReplay, quarantineWarmPodReplay } from '../task-orchestrator/surfaces/pod-warm-worker-provider.js';
+import { assessWarmWorkerShadow, type WarmWorkerFileResult } from '../task-orchestrator/surfaces/pod-warm-worker-protocol.js';
+import { writeWarmJobManifest, warmReferenceFromJobArtifacts } from '../../scripts/release-loop/gate-warm-artifacts.js';
+import type { ActualWarmLeaseEvidence } from '../task-orchestrator/surfaces/warm-reuse-evidence.js';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const MARKER = 'ELANOUS_PRLAND_SHADOW';
@@ -12,7 +19,7 @@ const MARKER = 'ELANOUS_PRLAND_SHADOW';
 export const LANDING_POD_SHADOW_HOST_TIMEOUT_MS = 10 * 60_000;
 export const LANDING_POD_SHADOW_STATUS_UNREADABLE_MS = 60_000;
 
-export interface LandingPodShadowInput { head: string; main: string }
+export interface LandingPodShadowInput { pr?: number; repo?: string; host?: string; head: string; main: string }
 export interface LandingPodShadowVerdict {
   measured: boolean;
   ok: boolean;
@@ -21,9 +28,26 @@ export interface LandingPodShadowVerdict {
   gateRc?: number;
   reason?: string;
   job?: string;
+  /** Warm evidence only exists after a real worker lease and exact per-file comparison. */
+  warmEvidence?: ActualWarmLeaseEvidence;
+  warmReason?: string;
+  warmTestFiles?: string[];
 }
 
-export function landingPodShadowScript(head: string, main: string): string {
+const LAND_TEST_PATH = /^(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.test\.tsx?$/;
+export const LAND_WARM_CANARY_TIMEOUT_MS = 5 * 60_000;
+
+/** Changed test files are the bounded canary scope; no test file means no warm evidence. */
+export function changedLandWarmTestFiles(repo: string, head: string, main: string): string[] {
+  if (!SHA.test(head) || !SHA.test(main)) return [];
+  const result = spawnSync('git', ['-C', repo, 'diff', '--name-only', '--diff-filter=ACMR', `${main}...${head}`], {
+    encoding: 'utf8', timeout: 15_000, maxBuffer: 2 * 1024 * 1024,
+  });
+  if (result.status !== 0) return [];
+  return [...new Set(result.stdout.split(/\r?\n/).filter((path) => LAND_TEST_PATH.test(path)))].sort();
+}
+
+export function landingPodShadowScript(head: string, main: string, afterGate = ''): string {
   if (!SHA.test(head) || !SHA.test(main)) throw new Error('pod shadow: invalid head/main');
   return [
     'set -u',
@@ -39,8 +63,96 @@ export function landingPodShadowScript(head: string, main: string): string {
     `printf '${MARKER}_TSC_PLAN %s\\n' "$(grep '^\\[tsc-gate\\] root-plan ' /tmp/prland-shadow-tsc.log | tail -n 1 | sed 's/^\\[tsc-gate\\] root-plan //')"`,
     "tail -n 8 /tmp/prland-shadow-tsc.log; tail -n 8 /tmp/prland-shadow-gate.log",
     `printf '${MARKER} head=%s main=%s tsc=%s gate=%s\\n' '${head}' '${main}' "$tsc_rc" "$gate_rc"`,
+    ...(afterGate ? [afterGate] : []),
     'exit 0',
   ].join('\n');
+}
+
+function landWarmColdTestScript(files: readonly string[], head: string, attemptId: string): string {
+  if (files.some((file) => !LAND_TEST_PATH.test(file)) || !SHA.test(head) || !/^[0-9a-f-]{36}$/i.test(attemptId))
+    throw new Error('pod shadow: invalid warm test scope');
+  return files.map((file, index) => {
+    const prefix = `"$HOME/outbox/pr-land-warm/${index}"`;
+    const quotedFile = `'${file}'`;
+    return [
+      `mkdir -p "$HOME/outbox/pr-land-warm"`,
+      `bun test --reporter=junit --reporter-outfile=${prefix}.junit.xml ${quotedFile} >${prefix}.log 2>&1`,
+      'test_rc=$?',
+      `printf '%s' "$test_rc" >${prefix}.rc`,
+      `printf '{"commit":"${head}","attemptId":"${attemptId}","files":["${file}"],"rc":%s,"jobFailed":false,"jobExitCode":0}\n' "$test_rc" >${prefix}.json`,
+      `printf '[warm-worker] file=%s\\n[warm-worker] cut=%s attempt=%s\\n' '${file}' '${head}' '${attemptId}' >${prefix}.log.stamped`,
+      `cat ${prefix}.log >>${prefix}.log.stamped`,
+      `printf '\\n[warm-worker] junit-sha256=%s\\n' "$(sha256sum ${prefix}.junit.xml 2>/dev/null | cut -d' ' -f1)" >>${prefix}.log.stamped`,
+      `mv ${prefix}.log.stamped ${prefix}.log`,
+    ].join('\n');
+  }).join('\n');
+}
+
+async function runWarmLandCanary(input: {
+  pr: number; head: string; main: string; host: string; repo: string;
+  job: PodCommandResult; files: readonly string[]; attemptId: string; coldGatePassed: boolean;
+  timeoutMs?: number;
+  readReference?: typeof warmReferenceFromJobArtifacts;
+  requestWarm?: typeof requestWarmPodReplay;
+  finalizeWarm?: typeof finalizeWarmPodReplay;
+  quarantineWarm?: typeof quarantineWarmPodReplay;
+  warmConfig?: () => WarmReuseSwitchConfig | undefined;
+}): Promise<{ warmEvidence?: ActualWarmLeaseEvidence; reason: string }> {
+  let config: WarmReuseSwitchConfig | undefined;
+  try { config = input.warmConfig ? input.warmConfig() : getUserConfig().pod?.warmReuse; }
+  catch { return { reason: 'warm-config-unavailable' }; }
+  if (input.host !== 'node-b') return { reason: 'canary-host-mismatch' };
+  if (config?.land !== true) return { reason: 'land-canary-flag-off' };
+  if (!input.files.length) return { reason: 'changed-test-files-unmeasured' };
+  const coldFiles = input.files.map((file, index) => {
+    const prefix = join(input.job.artifactsDir, 'outbox', 'pr-land-warm', String(index));
+    const writeManifest = writeWarmJobManifest(prefix, file, input.head, input.attemptId);
+    return writeManifest ? (input.readReference ?? warmReferenceFromJobArtifacts)(prefix, file,
+      { cutSha: input.head, attemptId: input.attemptId }) : null;
+  });
+  if (coldFiles.some((row) => row === null)) return { reason: 'cold-reference-unmeasured' };
+  const requestWarm = input.requestWarm ?? requestWarmPodReplay;
+  let replay;
+  const timeoutMs = input.timeoutMs ?? LAND_WARM_CANARY_TIMEOUT_MS;
+  const request = requestWarm({ protocol: 1, runId: `land-${input.pr}-${input.head.slice(0, 8)}`,
+      attemptId: input.attemptId, cutSha: input.head, baselineSha: input.main,
+      deadlineAt: Date.now() + timeoutMs, files: [...input.files], envProfile: 'gate-v1' });
+  const timedOut = Symbol('warm-canary-timeout');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const raced = await Promise.race([request, new Promise<typeof timedOut>((resolve) => {
+      timer = setTimeout(() => resolve(timedOut), timeoutMs);
+    })]);
+    if (raced === timedOut) {
+      // The provider API has no AbortSignal yet. Fence any late lease as soon as it arrives.
+      void request.then(async (late) => {
+        if (late.command) await (input.quarantineWarm ?? quarantineWarmPodReplay)(late.command, 'land-shadow-late-after-timeout');
+      }).catch(() => {});
+      return { reason: 'warm-request-timeout' };
+    }
+    replay = raced;
+  } catch (error) { return { reason: `warm-request-failed:${error instanceof Error ? error.name : 'unknown'}` }; }
+  finally { if (timer) clearTimeout(timer); }
+  const command = replay.command;
+  if (!command) return { reason: replay.transport.reason ?? 'warm-lease-unmeasured' };
+  const decision = assessWarmWorkerShadow(command, coldFiles as WarmWorkerFileResult[], replay.transport.reply);
+  const matched = decision.reason === 'match';
+  let leaseValid = replay.transport.status === 'observed' && replay.transport.reason === 'complete';
+  try {
+    if (matched) await (input.finalizeWarm ?? finalizeWarmPodReplay)(command);
+    else { leaseValid = false; await (input.quarantineWarm ?? quarantineWarmPodReplay)(command, `land-shadow-${decision.reason}`); }
+  } catch { leaseValid = false; }
+  // The reply is the worker-side observation. Falling back to the host's requested key
+  // would turn a missing worker identity into a false positive comparison.
+  const workerLockHash = replay.transport.reply?.key?.lockHash;
+  if (!command.leaseId || !Number.isSafeInteger(command.generation) || command.generation < 1
+    || !command.key.lockHash || !workerLockHash) return { reason: 'warm-lease-identity-unmeasured' };
+  return { reason: decision.reason, warmEvidence: {
+    workerId: command.workerId,
+    leaseId: command.leaseId, generation: command.generation,
+    expectedLockHash: command.key.lockHash, workerLockHash,
+    leaseValid, canaryPassed: matched && leaseValid && input.coldGatePassed, agree: matched,
+  } };
 }
 
 export async function runLandingPodShadowJob(input: LandingPodShadowInput, deps: {
@@ -48,8 +160,20 @@ export async function runLandingPodShadowJob(input: LandingPodShadowInput, deps:
   readLog?: (path: string) => string;
   /** Deterministic timer seam for the host deadline. */
   armTimeout?: (onTimeout: () => void, ms: number) => () => void;
+  testFiles?: readonly string[];
+  warmReplay?: typeof requestWarmPodReplay;
+  finalizeWarm?: typeof finalizeWarmPodReplay;
+  quarantineWarm?: typeof quarantineWarmPodReplay;
+  readReference?: typeof warmReferenceFromJobArtifacts;
+  warmConfig?: () => WarmReuseSwitchConfig | undefined;
+  warmTimeoutMs?: number;
 } = {}): Promise<LandingPodShadowVerdict> {
-  const script = landingPodShadowScript(input.head, input.main);
+  let warmConfig: WarmReuseSwitchConfig | undefined;
+  try { warmConfig = deps.warmConfig ? deps.warmConfig() : getUserConfig().pod?.warmReuse; } catch { /* no warm launch without readable config */ }
+  const canaryEnabled = input.host === 'node-b' && warmConfig?.land === true;
+  const files = canaryEnabled ? deps.testFiles ?? (input.repo ? changedLandWarmTestFiles(input.repo, input.head, input.main) : []) : [];
+  const attemptId = randomUUID();
+  const script = landingPodShadowScript(input.head, input.main, landWarmColdTestScript(files, input.head, attemptId));
   const controller = new AbortController();
   const armTimeout = deps.armTimeout ?? ((onTimeout: () => void, ms: number) => {
     const timer = setTimeout(onTimeout, ms);
@@ -106,7 +230,21 @@ export async function runLandingPodShadowJob(input: LandingPodShadowInput, deps:
   if (!rootPlan) return { measured: false, ok: false, rootPlan: null, reason: 'root-plan-missing', job: job.job };
   const tscRc = Number(match[1]);
   const gateRc = Number(match[2]);
-  return { measured: true, ok: tscRc === 0 && gateRc === 0, rootPlan, tscRc, gateRc, job: job.job };
+  const verdict: LandingPodShadowVerdict = { measured: true, ok: tscRc === 0 && gateRc === 0, rootPlan, tscRc, gateRc, job: job.job,
+    ...(files.length ? { warmTestFiles: [...files] } : {}) };
+  if (input.pr && input.repo && input.host) {
+    const warm = await runWarmLandCanary({ pr: input.pr, head: input.head, main: input.main, host: input.host,
+      repo: input.repo, job, files, attemptId, coldGatePassed: verdict.ok,
+      ...(deps.warmTimeoutMs !== undefined ? { timeoutMs: deps.warmTimeoutMs } : {}),
+      ...(deps.readReference ? { readReference: deps.readReference } : {}),
+      ...(deps.warmReplay ? { requestWarm: deps.warmReplay } : {}),
+      ...(deps.finalizeWarm ? { finalizeWarm: deps.finalizeWarm } : {}),
+      ...(deps.quarantineWarm ? { quarantineWarm: deps.quarantineWarm } : {}),
+      warmConfig: () => warmConfig });
+    verdict.warmReason = warm.reason;
+    if (warm.warmEvidence) verdict.warmEvidence = warm.warmEvidence;
+  }
+  return verdict;
 }
 
 /** WARM-REUSE-LAND-CONSUMER-WIRE — land shadow Job 결과 표본(착지쌍·lock·lease·카나리아·그림자 일치). */

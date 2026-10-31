@@ -1,4 +1,5 @@
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
@@ -32,9 +33,15 @@ export interface RunLedgerEntry {
   shardIdentityReadFailure?: RunShardIdentityReadFailure;
 }
 
+/** Stable signature for an ordered observed route; callers record the evidence basis separately. */
+export function pathSignatureOf(steps: readonly { readonly from: string; readonly to: string; readonly skipped?: readonly string[] }[]): string {
+  return createHash('sha256').update(JSON.stringify(steps.map(step => [step.from, step.to, step.skipped ?? []]))).digest('hex').slice(0, 12);
+}
+
 const RUN_GRAPH_STEP_EVENTS = new Set([
   'node-enter', 'node-exit', 'edge-taken', 'node-skipped', 'node-added', 'edge-rerouted',
   'unit-expanded', 'unit-collapsed', 'pipeline-node-entry', 'pipeline-node-exit', 'graph-edge-taken',
+  'graph.path',
 ]);
 
 function isRunGraphStepEvent(entry: RunLedgerEntry): boolean {
@@ -192,6 +199,7 @@ export interface RunOriginData extends Record<string, unknown> {
 }
 
 export type RunLedgerWriter = (entry: RunLedgerEntry) => void;
+export type RunLedgerBatchWriter = (entries: readonly RunLedgerEntry[]) => void;
 export type RunLedgerReader = (path: string, encoding?: 'utf8') => string | Buffer;
 
 /** A live PTY lacks its producer correlation id, or that id lacks an observable JSONL ledger. */
@@ -817,6 +825,48 @@ export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()
     recordRunRequestVsEffectiveFromLedger(entry.runId, dir, entry);
   } catch {
     // The comparison is observation: it must never fail a producer write that already landed.
+  }
+}
+
+/** Append one run's structural graph events as a rollback-protected ledger batch. */
+export function appendRunLedgerEntries(entries: readonly RunLedgerEntry[], dir = runLedgerDir()): void {
+  if (entries.length === 0) return;
+  const runId = entries[0]!.runId;
+  if (!runId || entries.some((entry) => entry.runId !== runId)) throw new Error('run ledger batch must have one runId');
+  if (entries.some((entry) => !isRunGraphStepEvent(entry))) throw new Error('run ledger batch accepts graph-step events only');
+  if (refuseProductionLedgerWriteInTest(dir, 'run-ledger')) return;
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const live = runLedgerPath(runId, dir);
+  const devProject = process.env.ELANOUS_DEV_PROJECT;
+  withRunLedgerLock(dir, runId, () => {
+    restoreArchivedRunLedger(dir, runId);
+    let lastSequence = lastRunGraphEventSequence(runId, dir);
+    const rows = entries.map((entry) => {
+      const sequenced = sequenceRunGraphEvent(entry, lastSequence);
+      lastSequence = sequenced.seq ?? (typeof sequenced.data.seq === 'number' ? sequenced.data.seq : lastSequence);
+      return sequenced.devProject === undefined && typeof devProject === 'string' && devProject.startsWith('prj-')
+        ? { ...sequenced, devProject }
+        : sequenced;
+    });
+    const lines = rows.map((row) => `${JSON.stringify(row)}\n`).join('');
+    const appendLine = separateAppendedLedgerLine(live, lines);
+    const existed = existsSync(live);
+    const sizeBefore = existed ? statSync(live).size : 0;
+    try {
+      appendFileSync(live, appendLine, 'utf8');
+    } catch (error) {
+      try {
+        if (existed) truncateSync(live, sizeBefore);
+        else if (existsSync(live)) unlinkSync(live);
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], `run ledger batch append and rollback failed: ${runId}`);
+      }
+      throw error;
+    }
+  });
+  for (const entry of entries) {
+    try { recordRunRequestVsEffectiveFromLedger(runId, dir, entry); }
+    catch { /* This comparison is observation and cannot fail a committed batch. */ }
   }
 }
 

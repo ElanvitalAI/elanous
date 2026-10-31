@@ -55,7 +55,7 @@ export type LiveProbeInputs = {
 
 export type LiveProbeLine = LiveProbeInputs & (
   | { readonly action: 'stay'; readonly why: StayReason; readonly backend?: never; readonly to?: never }
-  | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' | 'openrouter'; readonly model?: string; readonly why?: never; readonly to?: never }
+  | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' | 'openrouter' | 'zai'; readonly model?: string; readonly why?: never; readonly to?: never }
   | { readonly action: 'codex-rotate'; readonly to: string; readonly why?: never; readonly backend?: never }
   | { readonly action: 'codex-credits'; readonly to?: string; readonly why?: never; readonly backend?: never }
 ) & { readonly inputKind: 'live' };

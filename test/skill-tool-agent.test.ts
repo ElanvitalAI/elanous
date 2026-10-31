@@ -184,7 +184,7 @@ describe('dispatchAgent — agent resolution', () => {
     const hostTools: LLMToolSpec[] = [
       { name: 'Bash', description: 'b', parameters: { type: 'object' } },
     ];
-    await dispatchAgent(
+    const result = await dispatchAgent(
       { description: 'd', prompt: 'p', model: 'gpt-special' } as any,
       {
         provider,
@@ -218,7 +218,7 @@ describe('dispatchAgent — Agent tool stripped from child', () => {
     ];
     // Allowlist all so filterAgentTools doesn't drop everything.
     const def: AgentDefinition = { ...stubDef, tools: ['Bash', 'Read', 'Agent'] };
-    await dispatchAgent(
+    const result = await dispatchAgent(
       { description: 'd', prompt: 'p' },
       { provider, hostTools, resolveAgentDef: () => def },
     );
@@ -401,6 +401,97 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     expect(cap.names()).toContain('Bash');
     expect(cap.names()).toContain('Read');
     expect(cap.names()).not.toContain('Agent');
+  });
+
+  test('child research tool is explicit: parent grounding does not auto-repeat the same crawl', async () => {
+    let toolNames: string[] = [];
+    let childSkillDispatches = 0;
+    const provider: LLMProvider = {
+      name: 'capture',
+      defaultModel: 'd',
+      available: () => true,
+      async *streamChat(_messages, opts) {
+        toolNames = (opts?.tools ?? []).map(tool => tool.name);
+        yield { type: 'text', delta: 'done' };
+      },
+      async *chat() {},
+    };
+    const parentCatalog: LLMToolSpec[] = [
+      ...['Read'].map(name => ({
+        name, description: '', parameters: { type: 'object' as const },
+      })),
+    ];
+    const result = await dispatchAgent(
+      { description: 'verify inherited tools', prompt: 'use research tools' },
+      {
+        provider,
+        hostTools: parentCatalog,
+        cwd: '/tmp',
+        inheritGeneralPurposeToolCatalog: true,
+        resolveAgentDef: () => ({
+          name: 'general-purpose', systemPrompt: 'default', source: 'builtin',
+          tools: ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch'],
+        }),
+        buildChildToolCatalog: cwd => ({
+          specs: ['Agent', 'OmniSearch', 'WebFetch', 'skill_exec'].map(name => ({
+            name, description: '', parameters: { type: 'object' as const },
+          })),
+          dispatch: async name => { if (name === 'skill_exec') childSkillDispatches++; return 'unused'; },
+          workingDirectory: cwd,
+        }),
+      },
+    );
+    if (toolNames.length === 0) throw new Error(result.output);
+    expect(toolNames).toContain('OmniSearch');
+    expect(toolNames).toContain('WebFetch');
+    expect(toolNames).toContain('skill_exec');
+    expect(toolNames).not.toContain('Read');
+    expect(toolNames).not.toContain('Agent');
+    // Parent seam output is grounding; inheriting this tool does not trigger a
+    // second same-query crawl unless the child explicitly calls skill_exec.
+    expect(childSkillDispatches).toBe(0);
+  });
+
+  test('empty child catalog gives general-purpose an explicit text-only prompt', async () => {
+    let toolNames: string[] = [];
+    let prompt = '';
+    const provider: LLMProvider = {
+      name: 'capture',
+      defaultModel: 'd',
+      available: () => true,
+      async *streamChat(messages, opts) {
+        toolNames = (opts?.tools ?? []).map(tool => tool.name);
+        prompt = messages.map(message => typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content)).join('\n');
+        yield { type: 'text', delta: 'done' };
+      },
+      async *chat() {},
+    };
+
+    const result = await dispatchAgent(
+      { description: 'text-only fallback', prompt: 'Summarize the task.' },
+      {
+        provider,
+        hostTools: [{ name: 'Read', description: '', parameters: { type: 'object' as const } }],
+        cwd: '/tmp',
+        inheritGeneralPurposeToolCatalog: true,
+        resolveAgentDef: () => ({
+          name: 'general-purpose', systemPrompt: 'default', source: 'builtin',
+          tools: ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch'],
+        }),
+        buildChildToolCatalog: cwd => ({
+          specs: [],
+          dispatch: async () => 'unused',
+          workingDirectory: cwd,
+        }),
+      },
+    );
+
+    expect(result.output).toBe('done');
+    expect(toolNames).toEqual([]);
+    expect(prompt).toContain('No tools are available');
+    expect(prompt).toContain('report that as unavailable rather than guessing');
   });
 
   test('malformed tool_filter (non-object) is ignored — graceful', async () => {

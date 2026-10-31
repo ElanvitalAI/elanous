@@ -42,7 +42,7 @@ export interface AcpSessionUpdate {
   title?: string;
   toolCallId?: string;
   status?: string;
-  _meta?: { reasoning?: unknown };
+  _meta?: { reasoning?: unknown; elanous?: { textOperation?: unknown } };
   /** Plan event 가 ref 를 직접 들고 오는 경우 (현재 ACP spec 에 없으면
    *  router 가 turn-기반 fallback ref 사용). */
   planId?: string;
@@ -100,6 +100,9 @@ interface SessionState {
    *  body.text 를 update 로 누적. */
   activeAssistantBlockId: string | null;
   activeAssistantText: string;
+  /** Last assistant block for this turn, retained across thought/tool delimiters
+   *  so an authoritative synthesis can replace a provisional answer. */
+  replaceableAssistantBlockId: string | null;
   /** Same shape for thought chunks. */
   activeThoughtBlockId: string | null;
   activeThoughtText: string;
@@ -112,6 +115,7 @@ function freshSessionState(): SessionState {
     sysSeq: 0,
     activeAssistantBlockId: null,
     activeAssistantText: '',
+    replaceableAssistantBlockId: null,
     activeThoughtBlockId: null,
     activeThoughtText: '',
   };
@@ -168,6 +172,7 @@ export function createAcpEventRouter(): AcpEventRouter {
       flushActiveThought(state);
       state.turnSeq += 1;
       state.blockSeq = 0;
+      state.replaceableAssistantBlockId = null;
       const id = makeUserTurnBlockId(sessionId, state.turnSeq, state.blockSeq);
       const block: MessageBlock = {
         id,
@@ -199,6 +204,19 @@ export function createAcpEventRouter(): AcpEventRouter {
         case 'agent_message_chunk': {
           const c = u.content;
           if (c?.type !== 'text' || typeof c.text !== 'string') return;
+          const isReplace = u._meta?.elanous?.textOperation === 'replace';
+          const replaceTargetId = state.activeAssistantBlockId ?? state.replaceableAssistantBlockId;
+          if (isReplace && replaceTargetId !== null) {
+            flushActiveThought(state);
+            state.activeAssistantText = c.text;
+            const id = replaceTargetId;
+            stream.update(id, (cur) => ({
+              ...cur,
+              body: { ...cur.body, text: c.text } as MessageBlock['body'],
+            }));
+            state.activeAssistantBlockId = id;
+            return;
+          }
           if (state.activeAssistantBlockId === null) {
             // New assistant block — close any active thought first so
             // append/update events stay temporally ordered for
@@ -211,6 +229,7 @@ export function createAcpEventRouter(): AcpEventRouter {
               state.blockSeq,
             );
             state.activeAssistantBlockId = id;
+            state.replaceableAssistantBlockId = id;
             state.activeAssistantText = c.text;
             stream.push({
               id,

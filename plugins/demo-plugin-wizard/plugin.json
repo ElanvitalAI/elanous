@@ -1,0 +1,11 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "demo-plugin-wizard",
+  "version": "0.1.0",
+  "description": "Plugin wizard scene package: search a marketplace, install packages, develop with Claude or Codex, and use the result.",
+  "extensions": {
+    "ai.elanous": {
+      "connectors": []
+    }
+  }
+}

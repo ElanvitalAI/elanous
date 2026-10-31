@@ -23,6 +23,11 @@ function preferenceConfig(patch: {
 }
 
 describe('resolveChildLlmPreference', () => {
+  it('명시된 GLM·OpenRouter 공급자를 기본 자식 체인으로 쓴다', () => {
+    const base = { tools: { selfImplement: { childLlm: undefined } }, llm: { provider: 'openrouter' as const } };
+    expect(resolveChildLlmPreference(base as never).chain).toEqual([{ provider: 'openrouter' }]);
+    expect(resolveChildLlmPreference({ ...base, llm: { provider: 'glm' } } as never).chain).toEqual([{ provider: 'glm' }]);
+  });
   const warnings: string[] = [];
   const write = spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
     warnings.push(String(chunk));

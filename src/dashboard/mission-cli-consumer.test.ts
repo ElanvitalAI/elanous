@@ -135,6 +135,61 @@ test('classic sidetab consumes the final mission result for the same mission id'
   expect(result.path).toBe(outputPath);
 });
 
+test('classic sidetab prepares the selected agent before running its mission', async () => {
+  const order: string[] = [];
+  const started = await startClassicMissionCli({ agent: 'codex', prompt: 'preflight first' }, {
+    prepareAgentCli: async (agent) => {
+      order.push(`prepare:${agent}`);
+      return {
+        ready: true,
+        detection: { agent, installed: true, version: '1.2.3', executable: 'present', login: 'ready', message: 'codex ready' },
+        installation: 'not-needed', message: 'codex ready',
+      };
+    },
+    runCli: async (args) => {
+      order.push(`run:${args[1]}`);
+      if (args[1] === 'run') return { code: 0, stdout: JSON.stringify({ missionId: MISSION_ID, status: 'running' }), stderr: '' };
+      if (args[1] === 'status') return { code: 0, stdout: JSON.stringify({ missionId: MISSION_ID, status: 'done', result: 'finished' }), stderr: '' };
+      throw new Error('unexpected CLI call');
+    },
+    now: () => 1,
+  });
+  expect(order.slice(0, 2)).toEqual(['prepare:codex', 'run:run']);
+  if ('completion' in started) await started.completion;
+});
+
+test('classic sidetab does not launch when agent preparation is declined or blocked', async () => {
+  let launched = false;
+  const started = await startClassicMissionCli({ agent: 'codex', prompt: 'must not launch' }, {
+    prepareAgentCli: async (agent) => ({
+      ready: false,
+      detection: { agent, installed: false, executable: 'missing', login: 'unknown', message: 'codex missing' },
+      installation: 'declined', message: '설치를 건너뛰었습니다',
+    }),
+    runCli: async () => { launched = true; return { code: 0, stdout: '{}', stderr: '' }; },
+  });
+  expect(started).toMatchObject({ ok: false, status: 'failed', error: '설치를 건너뛰었습니다' });
+  expect(launched).toBe(false);
+});
+
+test('classic sidetab forwards the optional Linear child issue binding to mission run', async () => {
+  const commands: string[][] = [];
+  const started = await startClassicMissionCli({ agent: 'codex', prompt: 'Implement the linked task.', linearIssueId: 'DEMO-42' }, {
+    now: () => 1,
+    delay: async () => {},
+    runCli: async args => {
+      commands.push(args);
+      if (args[1] === 'run') return { code: 0, stdout: JSON.stringify({ missionId: MISSION_ID, status: 'running' }), stderr: '' };
+      if (args[1] === 'status') return { code: 0, stdout: JSON.stringify({ missionId: MISSION_ID, status: 'completed', result: 'done' }), stderr: '' };
+      throw new Error(`unexpected command: ${args.join(' ')}`);
+    },
+  });
+  expect('completion' in started).toBe(true);
+  if ('completion' in started) await expect(started.completion).resolves.toMatchObject({ ok: true, status: 'completed' });
+  expect(commands[0]).toContain('--linear-issue-id');
+  expect(commands[0]).toContain('DEMO-42');
+});
+
 test('explicit mission cancellation reaches the parent once through the job completion notification', async () => {
   const queue = new TaskNotificationQueue();
   let cancelled = false;

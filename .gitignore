@@ -160,6 +160,8 @@ id_dsa
 acp-token
 .elanous/auth.json
 *.pem
+# Ed25519 catalog verification key — public material included by public export.
+!catalog/signing/catalog-signing-public.pem
 *.key
 *.p12
 *.pfx

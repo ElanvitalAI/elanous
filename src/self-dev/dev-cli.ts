@@ -67,6 +67,7 @@ import { BEDROCK_DEFAULT_MODEL, BEDROCK_MODELS, findBedrockModel, resolveBedrock
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_CODING_MODELS } from '../llm/zai-coding-plan.js';
 import { isVerifiedOpenGatewayModel, OPENGATEWAY_DEFAULT_MODEL, OPENGATEWAY_VERIFIED_MODELS } from '../llm/opengateway-models.js';
 import { DEV_PLAN_REPLACEMENT } from './cli-help-text.js';
+import { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } from '../self-implement/elanous-tui-spawn.js';
 export { DEV_PLAN_REPLACEMENT, formatDevPlanOptionHelp } from './cli-help-text.js';
 
 /** dev CLI 옵션(commander) — `--no-*` 는 false 로 도착. input/executor 는 액션이 빌드해 별도 전달. */
@@ -2187,7 +2188,9 @@ export function buildDevCliSpec(
       ...spec,
       elanous: {
         ...(opts.hold ? { hold: true } : {}),
-        ...(opts.readyTimeoutMs !== undefined ? { readyTimeoutMs: parsePositiveInt(opts.readyTimeoutMs, '--ready-timeout-ms') } : {}),
+        ...(opts.readyTimeoutMs !== undefined
+          ? { readyTimeoutMs: parsePositiveInt(opts.readyTimeoutMs, '--ready-timeout-ms') }
+          : opts.hold ? { readyTimeoutMs: DEFAULT_TUI_TEST_READY_TIMEOUT_MS } : {}),
         ...(opts.json ? { json: true } : {}),
         ...(opts.goal !== undefined ? { goal: opts.goal } : {}),
         ...(opts.maxSteps !== undefined ? { maxSteps: parsePositiveInt(opts.maxSteps, '--max-steps') } : {}),

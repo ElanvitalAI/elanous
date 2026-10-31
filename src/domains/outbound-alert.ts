@@ -119,10 +119,42 @@ export function kstMinutes(now: Date = new Date()): number {
   return ((h ?? 0) % 24) * 60 + (m ?? 0);
 }
 
-/** 야간 무음 창(00:00 ≤ t < 06:30 KST). 아침리포트(06:25)는 별도 경로라 비대상. */
+export const OUTBOUND_QUIET_HOURS_ENV = 'ELANOUS_OUTBOUND_QUIET_HOURS';
+const DEFAULT_QUIET_HOURS = '00:00-06:30';
+type QuietHours = 'off' | { start: number; end: number; label: string };
+
+/** `off` 또는 HH:MM-HH:MM 을 분 범위로 해석한다. 잘못된 설정은 기본값에 맡긴다. */
+function parseQuietHours(value: unknown): QuietHours | null {
+  if (value === 'off') return 'off';
+  if (typeof value !== 'string') return null;
+  const match = /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const [, sh, sm, eh, em] = match;
+  const startHour = Number(sh), startMinute = Number(sm), endHour = Number(eh), endMinute = Number(em);
+  if (startHour > 23 || endHour > 23 || startMinute > 59 || endMinute > 59) return null;
+  const start = startHour * 60 + startMinute, end = endHour * 60 + endMinute;
+  if (start === end) return null;
+  return { start, end, label: `${sh}:${sm}-${eh}:${em}` };
+}
+
+/** config.outbound.quietHours > ELANOUS_OUTBOUND_QUIET_HOURS > 기존 기본 창. */
+function configuredQuietHours(): QuietHours {
+  try {
+    const configValue = parseQuietHours(getUserConfig().outbound?.quietHours);
+    if (configValue) return configValue;
+  } catch { /* use env/default */ }
+  const envValue = parseQuietHours(process.env[OUTBOUND_QUIET_HOURS_ENV]?.trim());
+  return envValue ?? parseQuietHours(DEFAULT_QUIET_HOURS)!;
+}
+
+/** 야간 무음 창. 기본은 기존 00:00 ≤ t < 06:30 KST. */
 export function inQuietHours(now: Date = new Date()): boolean {
-  const m = kstMinutes(now);
-  return m >= 0 && m < 390;
+  const quiet = configuredQuietHours();
+  if (quiet === 'off') return false;
+  const minute = kstMinutes(now);
+  return quiet.start < quiet.end
+    ? minute >= quiet.start && minute < quiet.end
+    : minute >= quiet.start || minute < quiet.end;
 }
 
 /** 최근 사용자 활동 우회 창(분) — 이 시간 내 genuine 사용자 인텐트가 있으면 무음이어도 즉시 발송. */
@@ -465,11 +497,14 @@ export function flushDeferred(path = DEFERRED_PATH, deps: FlushDeferredDeps = {}
 
 /** TEST-PROD-LEAK — a test process may not reach a real bot or the ops daemon. `external` = a third-party bot API
  *  (refused unless curl is a test double replacing the real one); the local daemon is refused only when ops-routed. */
-function assertTestSendFaked(what: string, external = true): void {
+function assertTestSendFaked(what: string, external = true, injectedTransport?: unknown): void {
   let roots: string[] = [];
   try { roots = [getElanousConfigDir(), dirname(ACP_TOKEN_PATH), effectiveInstanceRoot(), conatusDataDir(), dirname(DEFERRED_PATH)]; }
   catch { roots = [dirname(ACP_TOKEN_PATH), dirname(DEFERRED_PATH)]; }
-  assertNoRealSendFromTest(what, { transportFaked: isTestDouble(childProcess.execFileSync, REAL_EXEC_FILE_SYNC), routingRoots: roots, external });
+  const transportFaked = injectedTransport === undefined
+    ? isTestDouble(childProcess.execFileSync, REAL_EXEC_FILE_SYNC)
+    : isTestDouble(injectedTransport);
+  assertNoRealSendFromTest(what, { transportFaked, routingRoots: roots, external });
 }
 
 /** 동기 curl(POST). body 는 stdin. 파싱 실패/에러 → null. `what` names the send for the test guard (never the URL — it carries the token). */
@@ -509,25 +544,28 @@ export function sendOutbound(text: string, kind = 'alert', origin?: (MissionOrig
     : 'unknown');
   ensureOutboundLogSink();
   let bot = origin?.channel === 'discord' ? 'discord:configured' : 'unknown';
+  const quietConfig = configuredQuietHours();
+  const quietMode = quietConfig === 'off' ? 'off' : `window:${quietConfig.label}`;
   const logOutcome = (event: 'sent' | 'deferred' | 'failed', path?: string): void => {
-    try { debug.log('outbound.send', event, { kind: safeObservationLabel(kind), source: safeObservationLabel(source), chars: text.length, bot, ...(path ? { path } : {}) }); } catch { /* fail-open */ }
+    try { debug.log('outbound.send', event, { kind: safeObservationLabel(kind), source: safeObservationLabel(source), chars: text.length, bot, quietMode, ...(path ? { path } : {}) }); } catch { /* fail-open */ }
   };
   // ★ 무음 우회(대표 2026-07-14) — 사용자가 최근(기본 30분) genuine 인텐트(타이핑/버튼탭)를 냈으면
   //   깨어있으므로 야간 무음이어도 즉시 발송(사용자 발원 흐름의 결과물이 아침까지 묶이지 않게).
   //   우회 시 flushDeferred 로 그간 보류분도 함께 전달(사용자가 지금 볼 수 있음).
-  if (inQuietHours() && !userRecentlyActive()) {
+  const quietNow = inQuietHours();
+  if (quietNow && !userRecentlyActive()) {
     const queued = deferOutbound(text, kind, origin);
     if (queued) recordOutbound(text, kind); // 성공한 보류만 회상 대상
     logOutcome(queued ? 'deferred' : 'failed', queued ? 'deferred' : 'queue-failed');
     return queued; // 적재가 성공했을 때만 보류 수락
   }
-  const bypass = inQuietHours();
+  const bypass = quietNow;
   if (bypass) console.error('[outbound] 야간 무음 우회 — 최근 사용자 활동(깨어있음) → 즉시 발송 + 보류분 flush');
   try { flushDeferred(); } catch { /* fail-soft */ }
   // ★ 발송 관측(대표 지시) — 발송 시각·mode·밀림(burst) 판정을 logs.db 에. burst=최근 2분 5건+
   //   (몰려 나가는 중 = 밀림 의심). `elanous logs --category outbound.send` 로 실시간/밀림 구분.
   const { recentCount, burst } = recentSendBurst();
-  logSend(bypass ? 'quiet-bypass' : 'realtime', kind, { burst, recentCount, ...(burst ? { backlog: true } : {}) });
+  logSend(bypass ? 'quiet-bypass' : 'realtime', kind, { burst, recentCount, quietMode, ...(burst ? { backlog: true } : {}) });
   // ★ origin 되돌림(무음 밖) — 발신 채널로 직접 발송. 성공 시 종료, 실패면 report 폴백.
   if (origin && deliverToOrigin(origin, text, (label) => { bot = label; })) {
     recordOutbound(text, kind);
@@ -706,8 +744,8 @@ export function sendTelegramDirect(
   onBot?: (bot: string) => void,
 ): boolean {
   const sendRaw = (token: string, chatId: string | number, body: string): boolean => {
-    // The transport is checked only after a route is eligible; a test double cannot target the ops universe.
-    assertTestSendFaked('send a real Telegram message', !deps.sendRaw);
+    // The transport is checked only after a route is eligible; injected transports must themselves be test doubles.
+    assertTestSendFaked('send a real Telegram message', true, deps.sendRaw);
     return (deps.sendRaw ?? sendTelegramRaw)(token, chatId, body);
   };
   let cfg: UserConfig | undefined;

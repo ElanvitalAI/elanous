@@ -19,6 +19,38 @@ import { PIPELINE_EDGES_BY_NODE, TERMINAL_STAGES_BY_NODE } from './pipeline-shap
 const GRAPHS_DIR = join(import.meta.dir, '../../graphs');
 
 describe('RFC §5 0단계 — YAML 파서', () => {
+  test('ARG L graph/node allowance is parsed and malformed declarations are rejected', () => {
+    const valid = parseGraphTemplateYaml(`
+graph_id: allowance
+version: 1
+entry_node: invoke
+terminal_nodes: [done]
+allowance: { inner_steps: 12 }
+nodes:
+  - { node_id: invoke, kind: subgraph, recipe: none, max_visits: 1, call: worker@1,
+      budget: { inner_steps: 8 }, allowance: { inner_steps: 6 }, contract: { inputs: [], tools: read-only, outputs: [] } }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+edges: [{ from: invoke, to: done }]
+`);
+    expect(valid.errors).toEqual([]);
+    expect(valid.template?.allowance).toEqual({ innerSteps: 12 });
+    expect(valid.template?.nodes[0]?.budget).toEqual({ innerSteps: 8 });
+    expect(valid.template?.nodes[0]?.allowance).toEqual({ innerSteps: 6 });
+    const invalid = parseGraphTemplateYaml(`
+graph_id: allowance
+version: 1
+entry_node: invoke
+terminal_nodes: [done]
+nodes:
+  - { node_id: invoke, kind: subgraph, recipe: none, max_visits: 1, call: worker@1,
+      budget: { inner_steps: 8 }, allowance: { inner_steps: 0 }, contract: { inputs: [], tools: read-only, outputs: [] } }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+edges: [{ from: invoke, to: done }]
+`);
+    expect(invalid.template).toBeUndefined();
+    expect(invalid.errors.some(issue => issue.path.endsWith('/allowance/inner_steps'))).toBe(true);
+  });
+
   test('ARG L1 when/skip_when은 오버레이 조건 문법으로 읽고 필수 노드 건너뛰기는 거절한다', () => {
     const source = `graph_id: t
 version: 1

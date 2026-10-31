@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { runGraph, validateUnitCalls, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
 import type { GraphWizardDeps } from '../graph-wizard/generate.js';
+import type { PluginWizardDeps, PluginWizardInput } from '../graph-wizard/mission-compose.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
 import { getUserConfig } from '../user-config.js';
@@ -192,15 +193,19 @@ export const COMPOSITION_ROOT = join(dirname(fileURLToPath(import.meta.url)), '.
 export function selectTaskComposition(completion: CompletionKind, root?: string): CompositionSelection;
 export function selectTaskComposition(completion: CompletionKind, root: string, mission: {
   text: string; ledgerPath: string; cardId: string; callLLM?: GraphWizardDeps['callLLM']; onPersist?: (persist: () => void) => void;
+  pluginWizard?: PluginWizardInput; pluginWizardDeps?: PluginWizardDeps;
 }): Promise<CompositionSelection>;
 export function selectTaskComposition(completion: CompletionKind, root = COMPOSITION_ROOT, mission?: {
   text: string; ledgerPath: string; cardId: string; callLLM?: GraphWizardDeps['callLLM']; onPersist?: (persist: () => void) => void;
+  pluginWizard?: PluginWizardInput; pluginWizardDeps?: PluginWizardDeps;
 }): CompositionSelection | Promise<CompositionSelection> {
   if (mission) {
     const standard = selectTaskComposition(completion, root);
     return import('../graph-wizard/mission-compose.js').then(async ({ composeMissionGraph }) => {
       const result = await composeMissionGraph({ text: mission.text, completion, root, ledgerPath: mission.ledgerPath,
-        cardId: mission.cardId, standard }, { callLLM: mission.callLLM, deferPersistence: mission.onPersist !== undefined });
+        cardId: mission.cardId, standard, ...(mission.pluginWizard ? { pluginWizard: mission.pluginWizard } : {}) },
+      { callLLM: mission.callLLM, deferPersistence: mission.onPersist !== undefined,
+        ...(mission.pluginWizardDeps ? { pluginWizard: mission.pluginWizardDeps } : {}) });
       mission.onPersist?.(result.persist);
       return result.selection;
     });
@@ -1135,6 +1140,10 @@ export interface HandTaskOptions {
   composeGraph?: boolean;
   /** Injectable LLM boundary for isolated composition tests. */
   composeCallLLM?: GraphWizardDeps['callLLM'];
+  /** Explicit missing-tool handoff from the active assistant; keeps the wizard opt-in and uses the same task graph path. */
+  pluginWizard?: Omit<PluginWizardInput, 'mission' | 'root'> & { root?: string };
+  /** Host surfaces for Telegram, side-tab agents, trial/use, and progress reporting. */
+  pluginWizardDeps?: PluginWizardDeps;
   /** `--live` 일 때만 불린다. */
   launcher?: TaskLauncher;
   /**
@@ -1189,7 +1198,7 @@ export class TaskLaunchError extends Error {
   }
 }
 
-export interface HandTaskResult { card: TaskCard; move: TaskCardMove; mode: 'shadow' | 'live'; launched: boolean; cwd?: string }
+export interface HandTaskResult { card: TaskCard; move: TaskCardMove; mode: 'shadow' | 'live'; launched: boolean; reason?: string; cwd?: string }
 
 /** Dispatch evidence for a handed deliverable card; unlike handTask, this never launches work. */
 export function dispatchDeliverableCompletion(id: string, input: { ref: string; receipt?: boolean }, path: string, now: () => Date = () => new Date()): boolean {
@@ -1335,9 +1344,12 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     })
     : undefined;
   let persistComposition: (() => void) | undefined;
-  const selected = (opts.composeGraph ?? (process.env.ELANOUS_MISSION_GRAPH_COMPOSE === '1'))
+  const pluginWizard = opts.pluginWizard ? { ...opts.pluginWizard, mission: text,
+    root: opts.pluginWizard.root ?? opts.compositionRoot ?? COMPOSITION_ROOT } : undefined;
+  const selected = (pluginWizard !== undefined || (opts.composeGraph ?? (process.env.ELANOUS_MISSION_GRAPH_COMPOSE === '1')))
     ? await selectTaskComposition(completion, opts.compositionRoot ?? COMPOSITION_ROOT,
       { text, ledgerPath: path, cardId: id, callLLM: opts.composeCallLLM,
+        ...(pluginWizard ? { pluginWizard, pluginWizardDeps: opts.pluginWizardDeps } : {}),
         onPersist: persist => { persistComposition = persist; } })
     : selectTaskComposition(completion, opts.compositionRoot);
   // 2판 — launcher 'graph-run' 조합(단위 해석까지 완료)은 실제 graph run 으로 발사한다. 더 이상 거부하지 않는다.
@@ -1604,11 +1616,12 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       reason: knowhow.reason, repoPath: knowhowRepo, repoRevision,
       repoSource: project ? 'project' : configuredRepo ? 'harness.defaultRepo' : 'package' }); } catch { /* fail-soft */ }
   }
-  // LAUNCH-SINGLE-DOOR-1C — 발사 직전 단일문: 모든 요청(중복 포함)은 원장에 append 되고, 소비 영수증은
-  // requestId 단위로 최초 1회만 발급된다. 주입된 문이 없으면 생산 우주의 기본 문을 쓴다(시험 환경은 건너뛴다).
+  // LAUNCH-SINGLE-DOOR — hand 재시도는 새 카드/시도이므로 문면만으로 만든 영구 requestId 를 재사용하지 않는다.
+  // 실제 실행 중인 같은 골은 자식 harness 의 active-run gate 가 막는다. 부모 영수증은 그 자식에 한 번 상속한다.
   const launchDoor = opts.launchRequestDoor
     ?? (process.env.NODE_ENV === 'test' ? undefined : openLaunchRequestDoor({ source: 'hand' }));
-  const launchDoorRequestId = launchDoor?.requestId(card.text);
+  const launchAttemptKey = `${card.id}\n${card.createdAt}\n${randomBytes(12).toString('hex')}\n${card.text}`;
+  const launchDoorRequestId = launchDoor?.requestId(launchAttemptKey);
   let inheritedLaunchDoorReceipt: string | undefined;
   if (launchDoor !== undefined && launchDoorRequestId !== undefined) {
     const doorConsumption = launchDoor.consume(launchDoorRequestId);
@@ -1617,7 +1630,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       const refused: TaskCard = { ...card, history: [...card.history, { at, event: LAUNCH_REFUSED_DUPLICATE_EVENT, detail: doorConsumption.reason }] };
       writeCard(path, refused);
       try { debug.log('task-agent', 'launch-refused-duplicate', { taskId: id, requestId: launchDoorRequestId, reason: doorConsumption.reason }); } catch { /* fail-soft */ }
-      return { card: refused, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
+      return { card: refused, move, mode, launched: false, reason: `${LAUNCH_REFUSED_DUPLICATE_EVENT}: ${doorConsumption.reason}`, ...(project ? { cwd: project.target } : {}) };
     }
     // 소비 영수증을 자식 say 에 물려줘 그 문을 다시 두드리지 않게 한다(한 번만 상속).
     inheritedLaunchDoorReceipt = doorConsumption.status === 'consumed' ? launchDoorRequestId : undefined;

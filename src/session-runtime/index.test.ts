@@ -3,14 +3,17 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { ToolRuntime } from '../tool-runtime/types.js';
 import * as llmModule from '../llm.js';
 import * as deferredModule from './tier-flip.js';
 import { buildDashboardTurnPreamble } from '../dashboard/turn-preamble.js';
 import { getUserConfig } from '../user-config.js';
 import {
+  buildSubagentSessionRuntimeToolSpecs,
   buildSessionRuntimeTurnSystemMessages,
   createSessionPostureState,
   resolveSessionSurfaceProfile,
+  resolveDynamicSessionNativeToolSpecs,
   resolveSessionTurnProfileWithHistory,
 } from './index.js';
 import { runCoreTurn } from '../core-turn/run-core-turn.js';
@@ -44,6 +47,50 @@ function guidanceFor(surfaceId: 'research/turn' | 'research/agent'): string {
 }
 
 afterEach(() => mock.restore());
+
+test('Agent child catalog keeps research tools and skill execution beyond the parent surface catalog', () => {
+  const skillRuntime: ToolRuntime = {
+    id: 'skill_exec',
+    spec: { name: 'skill_exec', description: 'Run an installed skill', parameters: { type: 'object', properties: {} } },
+    run: async () => ({ output: 'ok' }),
+    surfaces: ['tui'],
+  };
+  const specs = buildSubagentSessionRuntimeToolSpecs({
+    hostTools: [],
+    runtimeTools: [skillRuntime],
+    optionalTools: [],
+    toolAvailability: { OmniSearch: true, WebFetch: true, skill_exec: true },
+  });
+  const names = specs.map(spec => spec.name);
+  expect(names).toContain('OmniSearch');
+  expect(names).toContain('WebFetch');
+  expect(names).toContain('skill_exec');
+
+  const researchSurface = resolveSessionSurfaceProfile({ preferredSurfaceId: 'research/agent' });
+  const researchParentNames = resolveDynamicSessionNativeToolSpecs({
+    userText: '',
+    defaultFamilyIds: researchSurface.defaultNativeFamilyIds,
+    surfaceId: researchSurface.id,
+    toolAvailability: { WebSearch: true, OmniSearch: true, WebFetch: true },
+  }).map(spec => spec.name);
+  expect(researchParentNames).toContain('OmniSearch');
+  expect(researchParentNames).toContain('WebFetch');
+});
+
+test('Agent child catalog falls back to the captured parent host tools when runtime tools are absent', () => {
+  const parentHostTool = {
+    name: 'ParentHostFallback',
+    description: 'Captured TUI host tool',
+    parameters: { type: 'object', properties: {} },
+    handler: async () => 'ok',
+  };
+  const specs = buildSubagentSessionRuntimeToolSpecs({
+    hostTools: [parentHostTool],
+    runtimeTools: [],
+    optionalTools: [],
+  });
+  expect(specs.map(spec => spec.name)).toContain('ParentHostFallback');
+});
 
 test('research turn and agent prompts require same-turn task reconciliation in prose', () => {
   for (const surfaceId of ['research/turn', 'research/agent'] as const) {

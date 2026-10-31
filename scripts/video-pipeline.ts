@@ -1092,7 +1092,15 @@ async function plan() {
         ovSelections = sel.selections.map((x) => ({ overlayId: x.overlayId, verdict: x.verdict, detail: x.detail }));
         if (sel.applied.length > 0) {
           const applied = applyGraphOverlays(decl.template, sel.applied);
-          if (applied.ok) ovPatches = applied.patches.map((x) => ({ overlayId: x.overlayId, node: x.node, field: x.field, before: (x as { before: unknown }).before, after: (x as { after: unknown }).after }));
+          if (applied.ok) ovPatches = applied.patches.map((x) => {
+            if (x.field === 'edge-rerouted') return {
+              overlayId: x.overlayId, node: x.from, field: x.field, before: x.was, after: x.to,
+            };
+            if (x.field === 'node-added') return {
+              overlayId: x.overlayId, node: x.node, field: x.field, before: null, after: x.kind,
+            };
+            return { overlayId: x.overlayId, node: x.node, field: x.field, before: x.before, after: x.after };
+          });
           else ovError = `얹다가 거절됐다 — ${applied.rejections.map((r) => r.kind).join(', ')}`;
         }
       }

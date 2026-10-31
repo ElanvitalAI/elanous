@@ -78,4 +78,16 @@ describe('harness launch budget — empty chain (L6b2 incident 10-03)', () => {
     expect(decision.action).toBe('stop');
     expect(warning).toBeUndefined();
   });
+
+  test('configured API-key provider reaches launch unmeasured without Codex/Grok fallback', () => {
+    const { decision, unmeasuredProvider } = harnessLaunchBudgetDecision(inputs([{ provider: 'openrouter' }]));
+    expect(decision.action).toBe('proceed');
+    expect(decision.provider).toBe('openrouter');
+    expect(unmeasuredProvider).toBe('openrouter');
+  });
+
+  test('launch-only unmeasured exception does not admit an unknown provider', () => {
+    const { decision } = harnessLaunchBudgetDecision(inputs([{ provider: 'unknown-api-provider' }]));
+    expect(decision.action).toBe('stop');
+  });
 });

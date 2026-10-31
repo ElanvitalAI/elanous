@@ -442,8 +442,8 @@ export function nodePtyRebuildPlan(deps: DoctorFixDeps): { versionDir: string; p
   try {
     const versionDir = (deps.realpath ?? realpathSync)(join(readiness.installPrefix, 'current'));
     const packageDir = join(versionDir, 'node_modules', 'elanous');
-    const pkg = JSON.parse((deps.readFile ?? ((path: string) => readFileSync(path, 'utf8')))(join(packageDir, 'package.json'))) as { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string> };
-    const version = pkg.optionalDependencies?.['node-pty'] ?? pkg.dependencies?.['node-pty'];
+    const pkg = JSON.parse((deps.readFile ?? ((path: string) => readFileSync(path, 'utf8')))(join(packageDir, 'package.json'))) as { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string>; elanousOptionalIntegrations?: Record<string, string> };
+    const version = pkg.elanousOptionalIntegrations?.['node-pty'] ?? pkg.optionalDependencies?.['node-pty'] ?? pkg.dependencies?.['node-pty'] ?? pkg.peerDependencies?.['node-pty'];
     if (!version) return undefined;
     // RFC #20265 A2 amzn2: node-pty 는 C++20(gcc10) · node-gyp 는 Python 3.8+ 를 요구한다.
     const env: Record<string, string> = readiness.distro === 'amzn2' ? { CC: 'gcc10-gcc', CXX: 'gcc10-g++', PYTHON: 'python3.8' } : {};

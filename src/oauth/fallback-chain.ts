@@ -44,6 +44,22 @@ export type FallbackStep = (typeof FALLBACK_STEPS)[number];
  *  «머문다». 즉 기본에 두는 비용은 0 이고 얻는 것은 「죽지 않음」이다. */
 export const DEFAULT_FALLBACK_CHAIN: readonly FallbackStep[] = ['codex-rotate', 'grok'];
 
+/** Build a one-provider default when the user has explicitly selected a provider.
+ *
+ * Keep this mapping here so chat retry, account rotation, child defaults and launch
+ * budgeting do not each invent their own provider priority. `auto` keeps the
+ * historical default chain; explicit provider selection must never add Codex/Grok.
+ */
+export function fallbackChainForProvider(provider: unknown): readonly FallbackStep[] | undefined {
+  if (typeof provider !== 'string') return undefined;
+  switch (provider.trim().toLowerCase()) {
+    case 'glm':
+    case 'zai': return ['zai'];
+    case 'openrouter': return ['openrouter'];
+    default: return undefined;
+  }
+}
+
 export function isFallbackStep(value: unknown): value is FallbackStep {
   return typeof value === 'string' && (FALLBACK_STEPS as readonly string[]).includes(value);
 }
@@ -54,9 +70,11 @@ export function isFallbackStep(value: unknown): value is FallbackStep {
  *  ⛔ 비었거나 전부 무효면 기본 체인으로 — 「설정이 있다」와 「설정이 유효하다」는 다르다. */
 export function normalizeFallbackChain(
   value: unknown,
+  configuredProvider?: unknown,
 ): { chain: readonly FallbackStep[]; dropped: readonly string[]; usedDefault: boolean } {
+  const configuredDefault = fallbackChainForProvider(configuredProvider);
   if (!Array.isArray(value)) {
-    return { chain: DEFAULT_FALLBACK_CHAIN, dropped: [], usedDefault: true };
+    return { chain: configuredDefault ?? DEFAULT_FALLBACK_CHAIN, dropped: [], usedDefault: true };
   }
   const chain: FallbackStep[] = [];
   const dropped: string[] = [];
@@ -68,7 +86,7 @@ export function normalizeFallbackChain(
     }
   }
   if (chain.length === 0) {
-    return { chain: DEFAULT_FALLBACK_CHAIN, dropped, usedDefault: true };
+    return { chain: configuredDefault ?? DEFAULT_FALLBACK_CHAIN, dropped, usedDefault: true };
   }
   return { chain, dropped, usedDefault: false };
 }
@@ -83,7 +101,7 @@ export type FallbackDecision =
   /** codex 계정을 갈아탄다(종전 동작). */
   | { readonly action: 'codex-rotate'; readonly to: RotationCandidate }
   /** 백엔드를 통째로 바꾼다. */
-  | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' }
+  | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' | 'zai' }
   /** 명시한 유료 OpenRouter 모델로 전환한다. 호출부가 모델을 바꾸지 못하면 실행하지 않는다. */
   | { readonly action: 'switch-backend'; readonly backend: 'openrouter'; readonly model: string }
   /** codex 로 «돌아와» 선불 크레딧으로 계속한다 — 체인의 `codex-credits` 칸(마지막 수단 · 유료).
@@ -116,6 +134,7 @@ export type StayReason =
   | 'grok-exhausted'
   /** 유료 OpenRouter 모델 또는 키가 없다. */
   | 'openrouter-unavailable'
+  | 'zai-unavailable'
   /** claude PTY 의 최근 표본이 성숙 관문을 통과하지 못했거나 읽히지 않는다. */
   | 'claude-pty-immature'
   /** 체인에 `codex-credits` 가 있는데 크레딧 잔액이 «확인된» codex 계정이 없다(모름 포함 — 돈이라 fail-closed). */
@@ -137,6 +156,8 @@ export type FallbackInput = {
   readonly openrouterFallbackModel?: string;
   /** OpenRouter 키 존재 여부(키 값 자체는 판정·관측에 넣지 않는다). */
   readonly openrouterAvailable?: boolean;
+  /** Direct Z.ai coding-plan credential is available (key presence only). */
+  readonly zaiAvailable?: boolean;
   /**
    * grok 이 «지금 쓸 수 있나» — ⛔ 자격(`grokAvailable`)과 «다른 축»이다.
    *   'usable'    쓸 수 있다(잔량 있음 · 무제한 · 임계 미만)
@@ -183,13 +204,13 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
   const {
     rotation, chain, currentStep, currentCredentialRateLimited = false,
     grokAvailable, grokQuota = 'unknown', claudePtyMaturity, stayOnResetCreditAvailable = false,
-    openrouterFallbackModel, openrouterAvailable = false, codexCreditsAvailable = false,
+    openrouterFallbackModel, openrouterAvailable = false, zaiAvailable = false, codexCreditsAvailable = false,
   } = input;
-  const openrouter = { model: openrouterFallbackModel, available: openrouterAvailable, codexCreditsAvailable };
+  const providerExtras = { openrouterModel: openrouterFallbackModel, openrouterAvailable, zaiAvailable, codexCreditsAvailable };
 
   if (currentCredentialRateLimited) {
     if (currentStep === undefined) return { action: 'stay', why: 'chain-exhausted' };
-    return stepAfter(chain, currentStep, grokAvailable, grokQuota, claudePtyMaturity, openrouter, 'chain-exhausted');
+    return stepAfter(chain, currentStep, grokAvailable, grokQuota, claudePtyMaturity, providerExtras, 'chain-exhausted');
   }
   if (rotation.reason === 'explicit') return { action: 'stay', why: 'explicit' };
   if (rotation.reason === 'not-reached' || (rotation.reason === 'credit-pace' && !('to' in rotation))) {
@@ -203,13 +224,13 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
     // 회전이 답을 냈는데 체인이 codex-rotate 를 «빼» 놨다면 그 뜻을 존중하고
     // 다음 칸으로 간다(회전을 원치 않는 구성).
     if (chain.includes('codex-rotate')) return { action: 'codex-rotate', to: rotation.to };
-    return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, openrouter, 'chain-exhausted');
+    return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, providerExtras, 'chain-exhausted');
   }
 
   // no-candidate | disabled | reset-credit-available(기본) — codex 축이 끝났다. 다음 칸을 본다.
   // ⛔ 다음 칸이 «없을 때»의 이름만 고른다. 진행(stepAfterCodex)은 그대로다.
   const fallbackWhy = stayReasonWhenCodexAxisEnds(rotation.reason === 'credit-pace' ? 'no-candidate' : rotation.reason);
-  return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, openrouter, fallbackWhy);
+  return stepAfterCodex(chain, grokAvailable, grokQuota, claudePtyMaturity, providerExtras, fallbackWhy);
 }
 
 /** codex 축이 끝났는데 체인 다음 칸도 없을 때 머무는 이유.
@@ -223,18 +244,23 @@ export function stayReasonWhenCodexAxisEnds(
   return 'chain-exhausted';
 }
 
-/** 칸 판정에 필요한 «나머지» 재료 — OpenRouter 모델·키, codex 크레딧 잔액 확인. */
-type StepExtras = { readonly model?: string; readonly available: boolean; readonly codexCreditsAvailable?: boolean };
+/** Per-provider evidence consumed by backend steps. */
+type StepExtras = {
+  readonly openrouterModel?: string;
+  readonly openrouterAvailable?: boolean;
+  readonly zaiAvailable?: boolean;
+  readonly codexCreditsAvailable?: boolean;
+};
 
 function stepAfterCodex(
   chain: readonly FallbackStep[],
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
   claudePtyMaturity: ClaudePtyMaturity | undefined,
-  openrouter: StepExtras,
+  providerExtras: StepExtras,
   whyIfNone: StayReason,
 ): FallbackDecision {
-  return stepAfter(chain, 'codex-rotate', grokAvailable, grokQuota, claudePtyMaturity, openrouter, whyIfNone);
+  return stepAfter(chain, 'codex-rotate', grokAvailable, grokQuota, claudePtyMaturity, providerExtras, whyIfNone);
 }
 
 function stepAfter(
@@ -243,7 +269,7 @@ function stepAfter(
   grokAvailable: boolean,
   grokQuota: 'usable' | 'exhausted' | 'unknown',
   claudePtyMaturity: ClaudePtyMaturity | undefined,
-  openrouter: StepExtras,
+  providerExtras: StepExtras,
   whyIfNone: StayReason,
 ): FallbackDecision {
   const idx = currentStep === undefined ? -1 : chain.indexOf(currentStep);
@@ -255,12 +281,16 @@ function stepAfter(
   for (const step of rest) {
     if (step === 'codex-credits') {
       // ⛔ 크레딧은 돈이다 — 잔액이 «확인된» 계정이 없으면 건너뛴다(「모른다」는 통과가 «아니다»).
-      if (openrouter.codexCreditsAvailable !== true) { skip(step, 'codex-credits-unavailable'); continue; }
+      if (providerExtras.codexCreditsAvailable !== true) { skip(step, 'codex-credits-unavailable'); continue; }
       return { action: 'codex-credits', skipped };
     }
+    if (step === 'zai') {
+      if (!providerExtras.zaiAvailable) { skip(step, 'zai-unavailable'); continue; }
+      return { action: 'switch-backend', backend: 'zai' };
+    }
     if (step === 'openrouter') {
-      const model = openrouter.model?.trim();
-      if (!openrouter.available || !model || !/^openrouter\/[^/\s]+\/[^\s]+$/.test(model)) {
+      const model = providerExtras.openrouterModel?.trim();
+      if (!providerExtras.openrouterAvailable || !model || !/^openrouter\/[^/\s]+\/[^\s]+$/.test(model)) {
         skip(step, 'openrouter-unavailable');
         continue;
       }
@@ -290,7 +320,7 @@ export function describeFallback(decision: FallbackDecision): string {
     case 'switch-backend':
       return decision.backend === 'openrouter'
         ? `백엔드 전환 → openrouter (${decision.model} · API 과금)`
-        : `백엔드 전환 → ${decision.backend} (구독)`;
+        : decision.backend === 'zai' ? '백엔드 전환 → Z.ai GLM' : `백엔드 전환 → ${decision.backend} (구독)`;
     case 'codex-credits':
       return `codex 크레딧으로 계속 (마지막 칸 · 선불 크레딧 과금${decision.skipped.length ? ` · 건너뜀 ${decision.skipped.map((s) => `${s.step}:${s.why}`).join(', ')}` : ''})`;
     case 'stay':

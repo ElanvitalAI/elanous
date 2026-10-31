@@ -74,7 +74,11 @@ describe('CLI overlap evidence path', () => {
       const reviewDir = join(cwd, '.state', 'review-results');
       mkdirSync(reviewDir, { recursive: true });
       const reviewResult = join(reviewDir, `card-28865-${head.slice(0, 12)}.json`);
-      writeFileSync(reviewResult, JSON.stringify({ pr: 28865, headCommit: head, reviewed: true, verdict: 'pass', mustFix: [] }));
+      // PRLAND-ACP-CLAUDE-ALLOW — the production `pr land --expected-head` path must accept a
+      // same-head review that ran on acp:claude, and must still refuse an invalid one below.
+      writeFileSync(reviewResult, JSON.stringify({
+        pr: 28865, headCommit: head, reviewed: true, verdict: 'pass', mustFix: [], model: 'acp:claude', reviewRoute: 'acp',
+      }));
       writeFileSync(join(cwd, '.state', 'overlap.json'), JSON.stringify({ pr: 28865, head, reviewResult }));
 
       const run: CmdRunner = (command, args, options) => {
@@ -96,6 +100,17 @@ describe('CLI overlap evidence path', () => {
       expect(code).toBe(0);
       expect(messages.some((line) => line.includes('overlap-evidence: already-ancestor'))).toBe(true);
       expect(messages.some((line) => line.includes('[dry-run] ✓ overlap: evidence accepted'))).toBe(true);
+
+      writeFileSync(reviewResult, JSON.stringify({
+        pr: 28865, headCommit: head, reviewed: true, verdict: 'fail', mustFix: ['ACP finding'], model: 'acp:claude', reviewRoute: 'acp',
+      }));
+      const refusals: string[] = [];
+      const refused = await runPrLand({ pr: '28865', expectedHead: head, dryRun: true, overlapEvidence: '.state/overlap.json', cwd }, {
+        run, resolveBase: () => 'origin/main', currentBranch: () => 'feature', reviewResultsDir: reviewDir,
+        out: { log: (line) => refusals.push(line), error: (line) => refusals.push(line) },
+      });
+      expect(refused).not.toBe(0);
+      expect(refusals.some((line) => line.includes('review-verdict-fail'))).toBe(true);
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   }, 30_000);
 });
@@ -275,17 +290,123 @@ describe('review provider evidence', () => {
     } finally { console.warn = old; }
   });
 
-  test('forbidden acp:claude is never landing evidence, including automatic lookup', () => {
+  test('acp:claude pass on the same head is landing evidence on both landing paths', () => {
+    const old = console.warn;
+    console.warn = () => undefined;
+    try {
+      for (const body of [
+        { model: 'acp:claude', reviewRoute: 'acp' },
+        { model: 'acp:claude/opus', reviewRoute: 'acp' },
+        { actualBackend: 'acp:claude/opus', reviewRoute: 'acp' },
+        { requestedModel: 'openrouter/z-ai/glm-5.3', actualBackend: 'acp:claude', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'acp-fallback' },
+        { reviewRoute: 'acp-fallback', fallbackBackend: 'claude' },
+      ]) {
+        expect(inspect(body)).toEqual({ ok: true, mode: 'already-ancestor', reviewResult: path });
+        expect(inspect(body, true)).toEqual({ ok: true, mode: 'already-ancestor-auto', reviewResult: path });
+      }
+    } finally { console.warn = old; }
+  });
+
+  test('an acp:claude review that breaks the landing contract stays rejected', () => {
     for (const body of [
-      { model: 'acp:claude', reviewRoute: 'acp' },
-      { model: 'acp:claude/opus', reviewRoute: 'acp' },
-      { actualBackend: 'acp:claude/opus', reviewRoute: 'acp' },
-      { requestedModel: 'openrouter/z-ai/glm-5.3', actualBackend: 'acp:claude', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'acp-fallback' },
-      { reviewRoute: 'acp-fallback', fallbackBackend: 'claude' },
+      { model: 'acp:claude', reviewRoute: 'acp', verdict: 'fail', mustFix: ['ACP finding'] },
+      { model: 'acp:claude', reviewRoute: 'acp', verdict: 'warn', mustFix: ['one finding'] },
+      { model: 'acp:claude', reviewRoute: 'acp', reviewed: false, verdict: null },
+      { model: 'acp:claude/opus', reviewRoute: 'acp', headCommit: 'f'.repeat(40) },
     ]) {
-      expect(inspect(body)).toEqual({ ok: false, reason: 'review-forbidden-acp-claude' });
-      expect(inspect(body, true)).toEqual({ ok: false, reason: 'review-forbidden-acp-claude' });
+      expect(inspect(body).ok).toBe(false);
+      expect(inspect(body, true).ok).toBe(false);
     }
+    expect(inspect({ model: 'acp:claude', reviewRoute: 'acp', headCommit: 'f'.repeat(40) }))
+      .toEqual({ ok: false, reason: 'review-head-mismatch' });
+  });
+});
+
+describe('PRLAND-ACP-CLAUDE-ALLOW: same-head acp:claude evidence and superseded exclusion', () => {
+  const dir = STD_DIR;
+  const claudeFail = `card-R3-${PR}-${HEAD.slice(0, 12)}.json`;
+  const glmPass = `card-R4-${PR}-${HEAD.slice(0, 12)}.json`;
+  const claudePass = `card-R5-${PR}-${HEAD.slice(0, 12)}.json`;
+  const staleHead = 'a'.repeat(40);
+  const staleName = `card-R6-${PR}-${staleHead.slice(0, 12)}.json`;
+  const invalidName = `card-R7-${PR}-${HEAD.slice(0, 12)}.json`;
+  const unreviewedName = `card-R8-${PR}-${HEAD.slice(0, 12)}.json`;
+  const body = (extra: Record<string, unknown>) => JSON.stringify({
+    pr: PR, headCommit: HEAD, reviewed: true, verdict: 'pass', mustFix: [], ...extra,
+  });
+  const bodies: Record<string, string> = {
+    [claudeFail]: body({ verdict: 'fail', mustFix: ['ACP finding'], model: 'acp:claude', reviewRoute: 'acp' }),
+    [glmPass]: body({ requestedModel: 'openrouter/z-ai/glm-5.3', model: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api' }),
+    [claudePass]: body({ actualBackend: 'acp:claude', model: 'acp:claude/opus', reviewRoute: 'acp' }),
+    [staleName]: JSON.stringify({ pr: PR, headCommit: staleHead, reviewed: true, verdict: 'pass', mustFix: [], model: 'acp:claude', reviewRoute: 'acp' }),
+    [invalidName]: body({ verdict: 'fail', mustFix: ['ACP finding'], model: 'acp:claude', reviewRoute: 'acp' }),
+    [unreviewedName]: body({ reviewed: false, verdict: null, model: 'acp:claude', reviewRoute: 'acp' }),
+  };
+  /** Production entry path ① — the explicit `--overlap-evidence` selector. */
+  const explicit = (options: {
+    reviewResult: string;
+    names?: readonly string[];
+    supersedes?: unknown;
+    followupPr?: unknown;
+    mtimes?: Record<string, number>;
+  }) => verifyOverlapEvidence({
+    evidencePath: '/evidence.json', pr: PR, expectedHead: HEAD, remote: 'origin', branch: 'main', cwd: '/repo',
+    run: (command, args) => command === 'gh' && args[0] === 'pr' && args[1] === 'view'
+      ? { ok: true, out: JSON.stringify({ state: 'OPEN' }), err: '' }
+      : { ok: true, out: '', err: '' },
+    reviewResultsDir: dir,
+    listDir: () => [...(options.names ?? [options.reviewResult])],
+    reviewMtime: (path) => options.mtimes?.[basename(path)] ?? 20,
+    reviewRealPath: (path) => path,
+    readFile: (path) => path === '/evidence.json'
+      ? JSON.stringify({
+        pr: PR, head: HEAD, reviewResult: `${dir}/${options.reviewResult}`,
+        supersedes: options.supersedes, followupPr: options.followupPr,
+      })
+      : bodies[basename(path)] ?? body({}),
+    overlappingLandings: ['abcdef1234567'],
+  });
+  /** Production entry path ② — the automatic same-head lookup when no evidence file exists. */
+  const automatic = (names: readonly string[]) => verifyAncestorAutoPass({
+    pr: PR, expectedHead: HEAD, cwd: '/repo', reviewResultsDir: dir,
+    overlappingLandings: ['abcdef1234567'],
+    run: () => ({ ok: true, out: '', err: '' }),
+    listDir: () => [...names],
+    readFile: (path) => bodies[basename(path)] ?? body({}),
+  });
+
+  test('(a) the same-head forbidden FAIL is excluded as superseded and the later GLM pass lands', () => {
+    expect(explicit({
+      reviewResult: glmPass, names: [glmPass, claudeFail],
+      mtimes: { [glmPass]: 20, [claudeFail]: 10 },
+      supersedes: [{ reviewResult: `${dir}/${claudeFail}`, reason: 'review-verdict-fail' }],
+      followupPr: PR + 1,
+    })).toEqual({ ok: true, mode: 'already-ancestor', reviewResult: `${dir}/${glmPass}` });
+    expect(explicit({ reviewResult: glmPass, names: [glmPass, claudeFail], mtimes: { [glmPass]: 20, [claudeFail]: 10 } }))
+      .toEqual({ ok: false, reason: `review-attempt-not-superseded: ${claudeFail} (review-verdict-fail)` });
+  });
+
+  test('(b) a same-head acp:claude PASS lands on both production entry paths', () => {
+    expect(explicit({ reviewResult: claudePass, names: [claudePass] }))
+      .toEqual({ ok: true, mode: 'already-ancestor', reviewResult: `${dir}/${claudePass}` });
+    expect(explicit({ reviewResult: glmPass, names: [claudePass, glmPass] }))
+      .toEqual({ ok: true, mode: 'already-ancestor', reviewResult: `${dir}/${glmPass}` });
+    expect(automatic([claudePass])).toEqual({ ok: true, mode: 'already-ancestor-auto', reviewResult: `${dir}/${claudePass}` });
+  });
+
+  test('(c) a stale-head review is refused on both production entry paths', () => {
+    expect(explicit({ reviewResult: staleName, names: [staleName] }))
+      .toEqual({ ok: false, reason: 'review-path-not-for-this-pr-head' });
+    expect(automatic([staleName])).toEqual({ ok: false, reason: 'review-missing' });
+  });
+
+  test('(d) fail-closed stays when no valid same-head review exists', () => {
+    expect(explicit({ reviewResult: invalidName, names: [invalidName] }))
+      .toEqual({ ok: false, reason: 'review-verdict-fail' });
+    expect(explicit({ reviewResult: unreviewedName, names: [unreviewedName] }))
+      .toEqual({ ok: false, reason: 'review-not-reviewed' });
+    expect(automatic([])).toEqual({ ok: false, reason: 'review-missing' });
+    expect(automatic([invalidName])).toEqual({ ok: false, reason: 'review-verdict-fail' });
   });
 });
 
@@ -623,9 +744,11 @@ describe('rebased overlap evidence (① re-base · ② re-gate · ③ review)', 
     expect(verify({ review: review('f'.repeat(40)) })).toEqual({ ok: false, reason: 'review-head-mismatch' });
   });
 
-  test('keeps provider evidence binding on the gated path', () => {
+  test('accepts a same-head acp:claude pass on the gated path and still refuses an invalid one', () => {
     expect(verify({ review: JSON.stringify({ pr: PR, headCommit: HEAD, reviewed: true, verdict: 'pass', mustFix: [], model: 'acp:claude', reviewRoute: 'acp' }) }))
-      .toEqual({ ok: false, reason: 'review-forbidden-acp-claude' });
+      .toEqual({ ok: true, mode: 'rebased', baseTip: BASE_TIP, reviewResult: selectedPath });
+    expect(verify({ review: JSON.stringify({ pr: PR, headCommit: HEAD, reviewed: true, verdict: 'fail', mustFix: ['ACP finding'], model: 'acp:claude', reviewRoute: 'acp' }) }))
+      .toEqual({ ok: false, reason: 'review-verdict-fail' });
   });
 
   test('only accepts a reviewed pass|warn whose counted must-fix is zero', () => {
@@ -703,8 +826,12 @@ describe('all same-head reviews decide together (already-ancestor-auto)', () => 
       .toEqual({ ok: false, reason: 'review-head-mismatch' });
     expect(decide([first, second], (name) => (name === second ? passBody({ pr: PR + 1 }) : passBody())))
       .toEqual({ ok: false, reason: 'review-pr-mismatch' });
+    expect(decide([first, second], (name) => (name === second
+      ? JSON.stringify({ pr: PR, headCommit: HEAD, reviewed: true, verdict: 'fail', mustFix: [], model: 'acp:claude', reviewRoute: 'acp' })
+      : passBody())))
+      .toEqual({ ok: false, reason: 'review-verdict-fail' });
     expect(decide([first, second], (name) => (name === second ? passBody({ model: 'acp:claude', reviewRoute: 'acp' }) : passBody())))
-      .toEqual({ ok: false, reason: 'review-forbidden-acp-claude' });
+      .toEqual({ ok: true, reviewResult: `${STD_DIR}/${second}` });
   });
 });
 
@@ -741,8 +868,10 @@ describe('virtual rebase evidence (verifyOverlapEvidenceVirtualRebase)', () => {
       .toEqual({ ok: false, reason: 'review-path-not-for-this-pr-head', baseTip: BASE_TIP });
     expect(verifyVirtual({ review: review('f'.repeat(40)) })).toEqual({ ok: false, reason: 'review-head-mismatch', baseTip: BASE_TIP });
     expect(verifyVirtual({ review: review(HEAD, PR + 1) })).toEqual({ ok: false, reason: 'review-pr-mismatch', baseTip: BASE_TIP });
+    expect(verifyVirtual({ review: JSON.stringify({ pr: PR, headCommit: HEAD, reviewed: true, verdict: 'fail', mustFix: ['ACP finding'], model: 'acp:claude', reviewRoute: 'acp' }) }))
+      .toEqual({ ok: false, reason: 'review-verdict-fail', baseTip: BASE_TIP });
     expect(verifyVirtual({ review: JSON.stringify({ pr: PR, headCommit: HEAD, reviewed: true, verdict: 'pass', mustFix: [], model: 'acp:claude', reviewRoute: 'acp' }) }))
-      .toEqual({ ok: false, reason: 'review-forbidden-acp-claude', baseTip: BASE_TIP });
+      .not.toEqual({ ok: false, reason: 'review-forbidden-acp-claude', baseTip: BASE_TIP });
   });
 
   test('refuses a base tip that advanced again or a stale local tracking ref', () => {

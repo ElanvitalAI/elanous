@@ -23,6 +23,17 @@ export interface MockScenarioEntry {
   expected: string;
 }
 
+export interface MockScenarioCandidate {
+  path: string;
+  disposition: 'device' | 'scenario' | 'already-indexed' | 'excluded';
+  entryCommand: string;
+  logsRecorded: 'yes' | 'no' | 'conditional' | 'runner-dependent';
+  logsDetail: string;
+  deviceId?: string;
+  scenarioIds?: string[];
+  excludeReason?: string;
+}
+
 export interface MockScenarioCatalog {
   version: 1;
   runEvidence: {
@@ -34,6 +45,15 @@ export interface MockScenarioCatalog {
   };
   devices: MockScenarioDevice[];
   scenarios: MockScenarioEntry[];
+  candidateAudit: {
+    source: string;
+    baseCommit: string;
+    sourceRows: number;
+    existingPaths: number;
+    excludedPaths: number;
+    sourceExclusions: Array<{ path: string; reason: string }>;
+    candidates: MockScenarioCandidate[];
+  };
   discovery: { trackedRoot: string; candidateRoots: string[]; limits: string };
 }
 
@@ -99,15 +119,112 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
       expected: requireString(row.expected, `scenarios[${index}].expected`),
     };
   });
-  if (!isRecord(value.runEvidence) || !isRecord(value.runEvidence.event)) throw new Error('runEvidence and runEvidence.event are required');
-  if (!isRecord(value.discovery)) throw new Error('discovery is required');
+  if (!isRecord(value.candidateAudit) || !Array.isArray(value.candidateAudit.candidates) || !Array.isArray(value.candidateAudit.sourceExclusions)) {
+    throw new Error('candidateAudit and candidateAudit.candidates are required');
+  }
+  const knownScenarioIds = new Set(scenarios.map((scenario) => scenario.id));
+  const scenarioById = new Map(scenarios.map((scenario) => [scenario.id, scenario]));
+  const deviceById = new Map(devices.map((device) => [device.id, device]));
+  const candidatePaths = new Set<string>();
+  const sourceExclusions = value.candidateAudit.sourceExclusions.map((row, index) => {
+    if (!isRecord(row)) throw new Error(`candidateAudit.sourceExclusions[${index}] must be an object`);
+    const path = requireString(row.path, `candidateAudit.sourceExclusions[${index}].path`);
+    if (candidatePaths.has(path)) throw new Error(`candidateAudit.sourceExclusions contains duplicate path: ${path}`);
+    candidatePaths.add(path);
+    return { path, reason: requireString(row.reason, `candidateAudit.sourceExclusions[${index}].reason`) };
+  });
+  const candidates = value.candidateAudit.candidates.map((row, index): MockScenarioCandidate => {
+    if (!isRecord(row)) throw new Error(`candidateAudit.candidates[${index}] must be an object`);
+    const path = requireString(row.path, `candidateAudit.candidates[${index}].path`);
+    if (candidatePaths.has(path)) throw new Error(`candidateAudit.candidates contains duplicate path: ${path}`);
+    candidatePaths.add(path);
+    const disposition = requireString(row.disposition, `candidateAudit.candidates[${index}].disposition`);
+    if (!['device', 'scenario', 'already-indexed', 'excluded'].includes(disposition)) {
+      throw new Error(`candidateAudit.candidates[${index}].disposition is unknown: ${disposition}`);
+    }
+    const logsRecorded = requireString(row.logsRecorded, `candidateAudit.candidates[${index}].logsRecorded`);
+    if (!['yes', 'no', 'conditional', 'runner-dependent'].includes(logsRecorded)) {
+      throw new Error(`candidateAudit.candidates[${index}].logsRecorded is unknown: ${logsRecorded}`);
+    }
+    const deviceId = row.deviceId === undefined ? undefined : requireString(row.deviceId, `candidateAudit.candidates[${index}].deviceId`);
+    if (deviceId && !deviceIds.has(deviceId)) throw new Error(`candidateAudit.candidates[${index}] references unknown device: ${deviceId}`);
+    const scenarioIds = row.scenarioIds === undefined ? undefined : requireStringArray(row.scenarioIds, `candidateAudit.candidates[${index}].scenarioIds`);
+    for (const scenarioId of scenarioIds ?? []) {
+      if (!knownScenarioIds.has(scenarioId)) throw new Error(`candidateAudit.candidates[${index}] references unknown scenario: ${scenarioId}`);
+    }
+    const excludeReason = row.excludeReason === undefined ? undefined : requireString(row.excludeReason, `candidateAudit.candidates[${index}].excludeReason`);
+    if (disposition === 'excluded' && !excludeReason) throw new Error(`candidateAudit.candidates[${index}] excluded entries require excludeReason`);
+    if (disposition === 'excluded' && (deviceId || scenarioIds?.length)) {
+      throw new Error(`candidateAudit.candidates[${index}] excluded entries cannot have catalog links`);
+    }
+    if (disposition === 'device' && (!deviceId || !scenarioIds?.length)) {
+      throw new Error(`candidateAudit.candidates[${index}] device entries require deviceId and scenarioIds`);
+    }
+    if (disposition === 'scenario' && (!deviceId || !scenarioIds?.length)) {
+      throw new Error(`candidateAudit.candidates[${index}] scenario entries require deviceId and scenarioIds`);
+    }
+    if (disposition === 'already-indexed' && !deviceId && !scenarioIds?.length) {
+      throw new Error(`candidateAudit.candidates[${index}] already-indexed entries require a catalog link`);
+    }
+    if (scenarioIds?.length && !deviceId) {
+      throw new Error(`candidateAudit.candidates[${index}] scenarioIds require a deviceId`);
+    }
+    if (deviceId) {
+      const device = deviceById.get(deviceId)!;
+      if (![...device.implementation, ...device.tests].includes(path)) {
+        throw new Error(`candidateAudit.candidates[${index}] path is not registered by device ${deviceId}: ${path}`);
+      }
+    }
+    for (const scenarioId of scenarioIds ?? []) {
+      const scenario = scenarioById.get(scenarioId)!;
+      if (scenario.device !== deviceId) {
+        throw new Error(`candidateAudit.candidates[${index}] deviceId does not own scenario ${scenarioId}`);
+      }
+      if (![...scenario.implementation, ...scenario.tests].includes(path)) {
+        throw new Error(`candidateAudit.candidates[${index}] path is not registered by scenario ${scenarioId}: ${path}`);
+      }
+    }
+    return {
+      path,
+      disposition: disposition as MockScenarioCandidate['disposition'],
+      entryCommand: requireString(row.entryCommand, `candidateAudit.candidates[${index}].entryCommand`),
+      logsRecorded: logsRecorded as MockScenarioCandidate['logsRecorded'],
+      logsDetail: requireString(row.logsDetail, `candidateAudit.candidates[${index}].logsDetail`),
+      ...(deviceId ? { deviceId } : {}),
+      ...(scenarioIds ? { scenarioIds } : {}),
+      ...(excludeReason ? { excludeReason } : {}),
+    };
+  });
+  const candidateAudit = value.candidateAudit;
+  const sourceRows = candidateAudit.sourceRows;
+  const baseCommit = candidateAudit.baseCommit;
+  const existingPaths = candidateAudit.existingPaths;
+  const excludedPaths = candidateAudit.excludedPaths;
+  if (![sourceRows, existingPaths, excludedPaths].every((n) => Number.isInteger(n) && Number(n) >= 0)) {
+    throw new Error('candidateAudit counts must be non-negative integers');
+  }
+  if (sourceRows !== candidates.length + sourceExclusions.length || excludedPaths !== candidates.filter((candidate) => candidate.disposition === 'excluded').length) {
+    throw new Error('candidateAudit counts do not match the candidate rows');
+  }
+  if (Number(existingPaths) !== candidates.length) throw new Error('candidateAudit.existingPaths must equal the current candidate count');
   const runEvidence = value.runEvidence;
+  if (!isRecord(runEvidence) || !isRecord(runEvidence.event)) throw new Error('runEvidence and runEvidence.event are required');
+  if (!isRecord(value.discovery)) throw new Error('discovery is required');
   const event = runEvidence.event;
   const discovery = value.discovery;
   return {
     version: 1,
     devices,
     scenarios,
+    candidateAudit: {
+      source: requireString(candidateAudit.source, 'candidateAudit.source'),
+      baseCommit: requireString(baseCommit, 'candidateAudit.baseCommit'),
+      sourceRows: Number(sourceRows),
+      existingPaths: Number(existingPaths),
+      excludedPaths: Number(excludedPaths),
+      sourceExclusions,
+      candidates,
+    },
     runEvidence: {
       scope: requireString(runEvidence.scope, 'runEvidence.scope'),
       runId: requireString(runEvidence.runId, 'runEvidence.runId'),
@@ -133,6 +250,7 @@ export function renderMockScenarioList(catalog: MockScenarioCatalog): string[] {
     'Mock scenario catalog · reusable devices and scenario references',
     ...catalog.scenarios.map((scenario) => `${scenario.id}\t${scenario.kind}\t${scenario.name}`),
     `장치 ${catalog.devices.length} · 시나리오 ${catalog.scenarios.length} · 자세히: bun scripts/ux-sim.ts show <MS-id>`,
+    `후보 감사 ${catalog.candidateAudit.existingPaths}/${catalog.candidateAudit.sourceRows} 경로 확인 · 제외 ${catalog.candidateAudit.excludedPaths} · entry/logs 근거는 mock-scenario-catalog.json`,
   ];
 }
 

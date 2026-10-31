@@ -1,5 +1,6 @@
 import { setDefaultTimeout, afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
+import { spawnSync } from 'node:child_process';
 import { registerOpsCommands } from './cli/ops-cli.js';
 import { setUserConfigOverlay } from './user-config.js';
 import * as podDispatch from './harness/harness-pod-dispatch.js';
@@ -681,6 +682,9 @@ describe('agent-mission backend help', () => {
     const agentMission = program.commands.find((command) => command.name() === 'agent-mission')!;
     const mission = agentMission.commands.find((command) => command.name() === 'mission')!;
     const backendOption = mission.options.find((option) => option.long === '--backend')!;
+    const codexMirror = agentMission.commands.find((command) => command.name() === 'mirror')!;
+    expect(codexMirror.commands.map((command) => command.name())).toEqual(['push']);
+    expect(codexMirror.commands[0]!.helpInformation()).toContain('<host>');
 
     for (const backend of agentBackendNames()) {
       expect(agentMission.description()).toContain(backend);
@@ -714,8 +718,8 @@ describe('agent-mission backend help', () => {
       await program.parseAsync(['node', 'elanous', 'agent-mission', 'mission', '--branch', 'wt/test', '--backend', 'codex', 'do work']);
 
       expect(order[0]).toBe('log-sink:agent-mission');
-      expect(order[1]).toBe('stderr:[agent-mission] codex: 설치됨, 로그인 확인됨');
-      expect(order.indexOf('pipeline')).toBeGreaterThan(order.indexOf('stderr:[agent-mission] codex: 설치됨, 로그인 확인됨'));
+      expect(order[1]).toBe('stderr:[agent-mission] codex: 설치됨 v1.2.3 · 로그인 확인됨');
+      expect(order.indexOf('pipeline')).toBeGreaterThan(order.indexOf('stderr:[agent-mission] codex: 설치됨 v1.2.3 · 로그인 확인됨'));
       expect(order.at(-1)).toBe('exit:0');
 
       order.length = 0;
@@ -5896,4 +5900,112 @@ describe('GATE-REMOTE-SHARD-PLAN — self gate 원격 명령에 조각 인자가
       process.exitCode = previousExitCode ?? 0;
     }
   }, 60_000);
+});
+
+describe('ASK-HEADLESS-RESEARCH-PATH', () => {
+  test('headless ask research intent reaches the session turn with the ask surface', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'elanous-ask-research-path-'));
+    const stateDir = join(home, 'state');
+    const capturePath = join(home, 'turn.json');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      onboarding: { completed: true },
+      llm: { provider: 'auto', model: '', memoryJudge: { enabled: false } },
+    }));
+    const request = '이번 주 한국 시장과 업계 변화를 조사해 비교해줘';
+    const script = `
+      process.argv = ['bun', 'elanous', 'ask', '--json', ${JSON.stringify(request)}];
+      const { writeFileSync } = await import('node:fs');
+      const { setCliRunTurnForTesting } = await import(${JSON.stringify(new URL('./cli/agent-cli.ts', import.meta.url).href)});
+      setCliRunTurnForTesting(async (turn) => {
+        writeFileSync(process.env.TEST_CAPTURE_PATH, JSON.stringify({ utteranceSurface: turn.utteranceSurface }));
+        return { text: 'research reply', provider: 'test', model: 'test',
+          meta: { id: turn.sessionId }, usedTokens: 0, droppedMessages: 0, memoryIds: [] };
+      });
+      const { program } = await import(${JSON.stringify(new URL('./index.ts', import.meta.url).href)});
+      await program.parseAsync(process.argv);
+    `;
+    try {
+      const result = spawnSync(process.execPath, ['-e', script], {
+        cwd: REPO_CWD,
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: { ...process.env, HOME: home, ELANOUS_CONFIG_DIR: stateDir,
+          ELANOUS_STATE_DIR: stateDir, NODE_ENV: 'test', TEST_CAPTURE_PATH: capturePath },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(capturePath, 'utf8'))).toEqual({ utteranceSurface: 'ask' });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+// LIFE-KINDS(0.2.43) — 생산 진입점 `eln life` 를 «실물 bin/elanous.mjs» 로 지나간다.
+// 격리 무대: `--test=<stateDir>` 우주 ⊕ 임시 HOME ⊕ 임시 시리즈 파일(가짜 시계 대신 실제 시각).
+describe.concurrent('LIFE-KINDS: 생산 진입점', () => {
+  test('LIFE-KINDS: 보존 계약불변식: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같다', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'elanous-life-kinds-'));
+    const stateDir = join(root, 'state');
+    const seriesFile = join(root, 'series', 'dev.json');
+    const env = { ...process.env, ELANOUS_STATE_DIR: stateDir, HOME: join(root, 'home'), ELANOUS_SUPPRESS_XDG_WARNING: '1' };
+    const run = (...args: string[]) => spawnRealCliBytes([process.execPath, ELANOUS_BIN, `--test=${stateDir}`, ...args], { cwd: root, env, timeoutMs: 120_000 });
+    const stdoutOf = (result: RealCliSpawnBytesResult) => new TextDecoder().decode(result.stdout);
+    try {
+      const kinds = await run('life', 'kinds', '--json');
+      expect(kinds.exitCode).toBe(0);
+      expect(JSON.parse(stdoutOf(kinds))).toEqual([
+        { kind: 'dev', label: '개발', endsWith: ['pr'] },
+        { kind: 'run', label: '실행 산출', endsWith: ['artifact'] },
+        { kind: 'ops', label: '운영 조치', endsWith: ['state-measurement'] },
+        { kind: 'admin', label: '행정', endsWith: ['proof'] },
+      ]);
+
+      const unmet = await run('life', 'check', 'admin', '--evidence', 'pr:1', '--json');
+      expect(unmet.exitCode).toBe(1);
+      expect(JSON.parse(stdoutOf(unmet))).toMatchObject({ kind: 'admin', required: ['proof'], missing: ['proof'], satisfied: false });
+      const met = await run('life', 'check', 'dev', '--evidence', 'pr:26146', '--json');
+      expect(met.exitCode).toBe(0);
+      expect(JSON.parse(stdoutOf(met))).toMatchObject({ kind: 'dev', satisfied: true });
+
+      const first = await run('life', 'series', 'dev', '--add', '첫 조각', '--file', seriesFile, '--json');
+      expect(first.exitCode).toBe(0);
+      const second = await run('life', 'series', 'dev', '--add', '둘째', '--evidence', 'pr:26146', '--file', seriesFile, '--json');
+      expect(second.exitCode).toBe(0);
+      const stored = JSON.parse(readFileSync(seriesFile, 'utf8')) as Array<Record<string, unknown>>;
+      expect(stored.map((entry) => entry.seq)).toEqual([1, 2]);
+      expect(Object.keys(stored[1] ?? {}).sort()).toEqual(['at', 'evidence', 'kind', 'note', 'satisfied', 'seq']);
+      expect(stored[1]).toMatchObject({ kind: 'dev', note: '둘째', satisfied: true, evidence: [{ kind: 'pr', ref: '26146' }] });
+      const lookup = await run('life', 'series', 'dev', '--seq', '1', '--file', seriesFile, '--json');
+      expect(JSON.parse(stdoutOf(lookup))).toMatchObject([{ seq: 1, note: '첫 조각', satisfied: false }]);
+
+      // Corrupt persisted data must not silently reuse a sequence number.
+      writeFileSync(seriesFile, JSON.stringify([
+        { seq: 2, kind: 'dev', at: '2026-10-30T00:00:00.000Z', evidence: [], satisfied: false },
+        { seq: 2, kind: 'dev', at: '2026-10-30T00:01:00.000Z', evidence: [], satisfied: false },
+      ]));
+      const duplicateSeq = await run('life', 'series', 'dev', '--add', '세 번째', '--file', seriesFile, '--json');
+      expect(duplicateSeq.exitCode).toBe(1);
+      expect(new TextDecoder().decode(duplicateSeq.stderr)).toContain('중복 seq');
+
+      // 보존 — 기존 명령의 화면(도움말)은 한 글자도 바뀌지 않는다.
+      const knowHelp = await run('know', '--help');
+      expect(knowHelp.exitCode).toBe(0);
+      expect(stdoutOf(knowHelp)).toBe([
+        'Usage: elanous know [options] <words...>',
+        '',
+        '대표 지시 · 결정 · 판 칸 · 교훈을 한 질문으로 검색',
+        '',
+        'Options:',
+        '  --json       JSON 출력',
+        '  --limit <N>  최대 결과 수 (default: "20")',
+        '  -h, --help   display help for command',
+        '',
+      ].join('\n'));
+      // 보존 — 기존 런 원장 형식의 자리(run-ledger)는 이 명령이 건드리지 않는다.
+      expect(existsSync(join(stateDir, 'run-ledger'))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, REAL_CLI_TEST_TIMEOUT_MS);
 });

@@ -89,12 +89,12 @@ describe('keyless DuckDuckGo provider', () => {
     expect(JSON.stringify(debug.events().slice(-2))).not.toContain(query.query);
   });
 
-  test('registry puts builtin ddg-free last and cascades from unavailable providers to injected fetch', async () => {
+  test('DDG stays available for explicit selection but is excluded from default general routing', async () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: { tavily: { enabled: false }, grokApi: { enabled: false }, firecrawl: { enabled: false } } }));
     _resetWebSearchProvidersForTests();
     const builtins = listWebSearchProviders();
     expect(builtins.at(-1)).toMatchObject({ id: 'ddg-free', available: true });
-    expect(builtins.slice(0, -1).map(p => p.id)).toEqual(['grok']);
+    expect(builtins.slice(0, -1).map(p => p.id)).toEqual(['exa', 'grok']);
 
     _resetWebSearchProvidersForTests(false);
     for (const id of ['tavily', 'grok', 'firecrawl']) {
@@ -102,7 +102,7 @@ describe('keyless DuckDuckGo provider', () => {
     }
     addWebSearchProvider(buildFreeWebSearchProvider({ fetch: fakeFetch(html) }));
     expect(listWebSearchProviders().at(-1)).toMatchObject({ id: 'ddg-free', available: true });
-    const result = await searchWeb(query);
+    const result = await searchWeb(query, { providerId: 'ddg-free' });
     expect(result.providerName).toBe('ddg-free');
     expect(result.hits).toHaveLength(3);
   });
@@ -113,7 +113,7 @@ describe('keyless DuckDuckGo provider', () => {
       providerName: 'grok', hits: [{ url: 'https://grok.example/', title: 'Grok', snippet: '' }], durationMs: 0,
     }) });
     addWebSearchProvider(buildFreeWebSearchProvider({ fetch: (async () => { throw new Error('DDG should not run'); }) as unknown as typeof fetch }));
-    expect((await searchWeb(query)).providerName).toBe('grok');
+    expect((await searchWeb({ query: 'X에서 private search terms' })).providerName).toBe('grok');
   });
 
   test('registry exhausts with WebSearchUnavailableError on DDG HTTP 503', async () => {
@@ -123,17 +123,12 @@ describe('keyless DuckDuckGo provider', () => {
     await expect(searchWeb(query)).rejects.toBeInstanceOf(WebSearchUnavailableError);
   });
 
-  test('daemon dispatch uses the same keyless registry and keeps its result shape and unavailable mapping', async () => {
+  test('daemon dispatch does not use DDG as an implicit general-search fallback', async () => {
     _resetWebSearchProvidersForTests(false);
     addWebSearchProvider({ id: 'grok', displayName: 'grok', available: () => false, search: async () => { throw new Error('should not run'); } });
     addWebSearchProvider(buildFreeWebSearchProvider({ fetch: fakeFetch(html) }));
     const ctx = { cwd: process.cwd(), signal: new AbortController().signal };
-    expect(await dispatchWebSearch({ query: query.query, limit: 2 }, ctx)).toEqual({
-      query: query.query, providerName: 'ddg-free', numHits: 2, hits: [
-        { url: 'https://example.com/first?a=1&b=2', title: 'First & best', snippet: 'Snippet one' },
-        { url: 'https://example.org/second', title: 'Second', snippet: 'Snippet two' },
-      ],
-    });
+    await expect(dispatchWebSearch({ query: query.query, limit: 2 }, ctx)).rejects.toBeInstanceOf(ToolSafetyError);
     _resetWebSearchProvidersForTests(false);
     addWebSearchProvider(buildFreeWebSearchProvider({ fetch: fakeFetch('unavailable', 503) }));
     await expect(dispatchWebSearch({ query: query.query }, ctx)).rejects.toMatchObject({
@@ -141,10 +136,10 @@ describe('keyless DuckDuckGo provider', () => {
     });
   });
 
-  test('both model-facing descriptions advertise keyless DuckDuckGo fallback', () => {
-    expect(buildWebSearchTool().description).toContain('keyless DuckDuckGo');
+  test('both model-facing descriptions advertise Exa/Firecrawl general search routing', () => {
+    expect(buildWebSearchTool().description).toContain('Exa then Firecrawl');
     const entry = nativeToolCatalog.find(tool => tool.id === 'web_search');
-    expect(entry?.description).toContain('keyless DuckDuckGo');
-    expect(entry?.promptSummary).toContain('keyless DuckDuckGo');
+    expect(entry?.description).toContain('Exa then Firecrawl');
+    expect(entry?.promptSummary).toContain('Exa then Firecrawl');
   });
 });

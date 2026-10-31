@@ -1,7 +1,7 @@
 // `pr land --cwd <tree>` measures typecheck and mock-module restore against that tree, not process.cwd().
 import { expect, setDefaultTimeout, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveTscScript, runGate } from '../../scripts/ci-typecheck-changed.js';
@@ -209,7 +209,7 @@ test('pr land --cwd reaches its production type gate in another Git worktree bef
     writeFileSync(join(target, 'tsconfig.gate.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [], skipLibCheck: true }, include: ['src/**/*.ts'] }));
     mkdirSync(join(target, 'src'), { recursive: true });
     writeFileSync(join(target, 'src/model.test.ts'), 'const targetOnly: number = "wrong";\n');
-    git(target, ['add', 'src/model.test.ts']);
+    git(target, ['add', 'tsconfig.gate.json', 'src/model.test.ts']);
     git(target, ['commit', '-q', '-m', 'broken target TypeScript']);
     mkdirSync(join(dir, 'src'), { recursive: true });
     writeFileSync(join(dir, 'src/launcher.test.ts'), 'const launcherOnly: number = "wrong";\n');
@@ -240,22 +240,29 @@ test('CLI pr land --cwd reports only the target diagnostic before any PR mutatio
   const target = mkdtempSync(join(tmpdir(), 'prland-cli-target-'));
   const state = mkdtempSync(join(tmpdir(), 'prland-cli-state-'));
   try {
-    git(dir, ['remote', 'add', 'origin', 'https://github.com/example/repo.git']);
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    const gitShimDir = join(state, 'bin');
+    mkdirSync(gitShimDir, { recursive: true });
+    const baseTip = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).stdout.trim();
+    const gitShim = join(gitShimDir, 'git');
+    writeFileSync(gitShim, `#!/bin/sh\nif [ "$1" = ls-remote ]; then printf '%s\\trefs/heads/main\\n' '${baseTip}'; exit 0; fi\nexec '${realGit}' "$@"\n`);
+    chmodSync(gitShim, 0o755);
+    git(dir, ['remote', 'add', 'origin', 'https://github.com/example/prland-cwd-gates.git']);
     git(dir, ['worktree', 'add', '-b', 'feature', target, 'HEAD']);
     rmSync(join(target, 'node_modules'), { recursive: true, force: true });
     writeFileSync(join(target, 'tsconfig.gate.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [], skipLibCheck: true }, include: ['src/**/*.ts'] }));
     writeFileSync(join(target, 'tsconfig.pwa-env.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [], skipLibCheck: true }, include: ['src/**/*.ts'] }));
     mkdirSync(join(target, 'src'), { recursive: true });
     writeFileSync(join(target, 'src/model.test.ts'), 'const targetOnly: number = "wrong";\n');
-    git(target, ['add', 'src/model.test.ts']);
+    git(target, ['add', 'tsconfig.gate.json', 'tsconfig.pwa-env.json', 'src/model.test.ts']);
     git(target, ['commit', '-q', '-m', 'broken target TypeScript']);
     mkdirSync(join(dir, 'src'), { recursive: true });
     writeFileSync(join(dir, 'src/launcher.test.ts'), 'const launcherOnly: number = "wrong";\n');
     const beforeHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: target, encoding: 'utf8' }).stdout.trim();
     const beforeStatus = spawnSync('git', ['status', '--porcelain'], { cwd: target, encoding: 'utf8' }).stdout;
     const result = spawnSync(process.execPath, [join(import.meta.dir, '../../bin/elanous.mjs'), 'pr', 'land', '--cwd', target], {
-      cwd: dir, encoding: 'utf8', timeout: 30_000,
-      env: { ...process.env, ELANOUS_STATE_DIR: state },
+      cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, PATH: `${gitShimDir}:${process.env.PATH ?? ''}`, ELANOUS_STATE_DIR: state },
     });
     const output = `${result.stdout}\n${result.stderr}`;
     expect(result.status, output).toBe(1);

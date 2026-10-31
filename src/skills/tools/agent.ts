@@ -245,8 +245,9 @@ const FALLBACK_GENERAL_PURPOSE: AgentDefinition = {
   systemPrompt:
     'You are a sub-agent spawned by a parent task. Run the work in the prompt to ' +
     'completion using the tools you have, then return ONE final message containing ' +
-    'the deliverable. Be terse — your output goes back into the parent\'s context.',
-  tools: ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch'],
+    'the deliverable. The parent provides the available tool catalog; Agent recursion is removed ' +
+    'and all calls still pass through the parent dispatcher and its policy checks. ' +
+    'Be terse — your output goes back into the parent\'s context.',
 };
 
 export interface AgentToolArgs {
@@ -355,7 +356,7 @@ export function buildAgentTool(): LLMToolSpec {
       'and finish after the results arrive.\n' +
       'For parallel research, prefer completion_delivery="supplement" and budget_minutes=8: ask each child for its best verified evidence within the budget; late results appear as one chat line without reopening a TUI turn.\n' +
       '\n' +
-      'The sub-agent gets its own tools (Bash/Read/Edit/Grep/WebFetch by default) and its own ' +
+      'The sub-agent inherits the parent-provided tool catalog by default (Agent recursion is removed) and its own ' +
       'turn budget (default 20). It returns ONE final message which becomes your tool_result. ' +
       'Pass everything the worker needs (data, persona, framing) inside `prompt` — the worker ' +
       'starts with no memory of your conversation.',
@@ -457,6 +458,10 @@ export interface DispatchAgentOpts {
     dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
     workingDirectory: string;
   };
+  /** Allow the default general-purpose worker to inherit this host's catalog.
+   *  Opt-in for the TUI's policy-filtered catalog; CLI and MCP keep their
+   *  agent-definition allowlists unless they explicitly request inheritance. */
+  inheritGeneralPurposeToolCatalog?: boolean;
   /** Provider override (test stubs). When omitted, runner picks via
    *  agent definition's `model` field or parent default. */
   provider?: LLMProvider;
@@ -500,6 +505,8 @@ export interface DispatchAgentOpts {
     promptChars: number;
   }) => void;
 }
+
+const BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS = ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch'] as const;
 
 export async function dispatchAgent(
   args: Record<string, unknown>,
@@ -965,9 +972,21 @@ export async function dispatchAgent(
     noTools: hasNoTools,
   });
 
+  // The built-in general-purpose definition's standard CLI allowlist is
+  // replaced only for TUI callers that explicitly opt into the already
+  // policy-filtered TUI catalog. MCP/CLI and user/project definitions keep
+  // their own allowlists.
+  const isBuiltinGeneralPurposeDefault = definition.name === 'general-purpose'
+    && definition.source === 'builtin'
+    && definition.tools?.length === BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS.length
+    && BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS.every((name, index) => definition.tools?.[index] === name);
+  const spawnDefinition = opts.inheritGeneralPurposeToolCatalog === true && isBuiltinGeneralPurposeDefault
+    ? { ...definition, tools: childTools.map(tool => tool.name) }
+    : definition;
+
   const startedAt = Date.now();
   const handle = globalAgentRegistry.spawn({
-    definition,
+    definition: spawnDefinition,
     prompt: childPrompt,
     ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
     label: spawnName ?? description,   // PFC-S1 P1: explicit `name`

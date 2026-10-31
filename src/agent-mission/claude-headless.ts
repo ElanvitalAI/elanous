@@ -30,10 +30,11 @@ const string = (value: unknown): string | null => typeof value === 'string' ? va
 const number = (value: unknown): number | null => typeof value === 'number' && Number.isFinite(value) ? value : null;
 
 /** Run the non-interactive Claude CLI with a pipe, never passing the prompt as an argv value. */
-export async function runClaudeHeadless({ cwd, prompt, env, spawn = nodeSpawn, timeoutMs = 1_800_000, maxTurns, onSpawn }: {
+export async function runClaudeHeadless({ cwd, prompt, env, resumeSessionId, spawn = nodeSpawn, timeoutMs = 1_800_000, maxTurns, onSpawn }: {
   cwd: string;
   prompt: string;
   env: NodeJS.ProcessEnv;
+  resumeSessionId?: string;
   spawn?: Spawn;
   timeoutMs?: number;
   maxTurns?: number;
@@ -42,6 +43,7 @@ export async function runClaudeHeadless({ cwd, prompt, env, spawn = nodeSpawn, t
   if (maxTurns !== undefined && (!Number.isSafeInteger(maxTurns) || maxTurns < 1)) {
     throw new Error('Claude headless maxTurns must be a positive integer');
   }
+  if (resumeSessionId !== undefined && !resumeSessionId.trim()) throw new Error('Claude resume session id must not be empty');
   let child: ChildProcessWithoutNullStreams;
   const base: ClaudeHeadlessResult = {
     ok: false, reason: 'no-result', exitCode: null, result: null, subtype: null,
@@ -51,6 +53,7 @@ export async function runClaudeHeadless({ cwd, prompt, env, spawn = nodeSpawn, t
   try {
     child = spawn('claude', [
       '-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions',
+      ...(resumeSessionId === undefined ? [] : ['--resume', resumeSessionId]),
       ...(maxTurns === undefined ? [] : ['--max-turns', String(maxTurns)]),
     ], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
   } catch {

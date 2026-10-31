@@ -63,6 +63,7 @@ describe('release checklist ledger', () => {
     const pinSha = 'b'.repeat(40);
     const runId = 'run-12345678-1234-1234-1234-123456789abc';
     const calls: string[] = [];
+    let logArgs: string[] = [];
     const runner: ChecklistEvidenceCommandRunner = (command, args) => {
       calls.push(`${command} ${args.join(' ')}`);
       if (command === 'eln' && args[0] === 'gh') return { status: 0, stdout: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: mergeSha } }), stderr: '' };
@@ -71,14 +72,21 @@ describe('release checklist ledger', () => {
       if (command === 'git' && args[0] === 'remote') return { status: 0, stdout: 'git@github.com:ElanvitalAI/elanous.git\n', stderr: '' };
       if (command === 'git' && args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
       if (command === 'git' && args[0] === 'merge-base') return { status: 0, stdout: '', stderr: '' };
-      if (command === 'eln' && args[0] === 'logs') return { status: 0, stdout: `${JSON.stringify({ _meta: { count: 1 } })}\n${JSON.stringify({ event: 'complete', data: JSON.stringify({ runId }) })}\n`, stderr: '' };
+      if (command === 'eln' && args[0] === 'logs') { logArgs = args; return { status: 0, stdout: `${JSON.stringify({ _meta: { count: 1 } })}\n${JSON.stringify({ event: 'complete', data: JSON.stringify({ runId }) })}\n`, stderr: '' }; }
       throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
     };
-    const item = { id: 'CHAIN', title: '완료 경계 실물: CLI 결과\n완료 경계 증거 명령: bun test src/a.test.ts', evidence: `PR #42 merge ${mergeSha}\nrunId ${runId} event=complete` } as ReturnType<typeof listChecklist>['items'][number];
+    const item = { id: 'CHAIN', title: '완료 경계 실물: CLI 결과\n완료 경계 증거 명령: bun test src/a.test.ts', evidence: `PR #42 merge ${mergeSha}\nrunId ${runId} at=2026-10-25T10:00:00.000Z event=complete` } as ReturnType<typeof listChecklist>['items'][number];
     const stages = collectChecklistEvidenceStages(item, runner);
     expect(stages.map(({ id, state }) => [id, state])).toEqual([['E1', 'observed'], ['E3', 'observed'], ['E4', 'observed'], ['E5', 'missing']]);
     expect(calls.some((call) => call.includes('git merge-base --is-ancestor'))).toBe(true);
     expect(calls.some((call) => call.includes('git cat-file -e'))).toBe(true);
+    expect(logArgs).toContain('--event');
+    expect(logArgs).toContain('complete');
+    expect(logArgs).toContain('--since');
+    expect(logArgs).toContain('2026-10-25T09:30:00.000Z');
+    expect(logArgs).toContain('--until');
+    expect(logArgs).toContain('2026-10-25T10:30:00.000Z');
+    expect(logArgs).not.toContain('--grep');
   });
 
   test('CHECKLIST-EVIDENCE-CHAIN: E3 accepts the product repository origin alias', () => {
@@ -104,17 +112,29 @@ describe('release checklist ledger', () => {
       let payloadKey: string = expectedField === 'missionId' ? 'taskId' : 'missionId';
       const runner: ChecklistEvidenceCommandRunner = (command, args) => {
         if (command === 'eln' && args[0] === 'logs') {
-          queried = args[2] ?? '';
+          queried = args.join(' ');
           return { status: 0, stdout: `${JSON.stringify({ event: 'complete', data: JSON.stringify({ [payloadKey]: id }) })}\n`, stderr: '' };
         }
         throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
       };
-      const item = { id: 'CHAIN', title: '- 완료 경계 증거 명령: bun test src/a.test.ts', evidence: `${label}=${id} event=complete` } as ReturnType<typeof listChecklist>['items'][number];
+      const item = { id: 'CHAIN', title: '- 완료 경계 증거 명령: bun test src/a.test.ts', evidence: `${label}=${id} at=2026-10-25T10:00:00.000Z event=complete` } as ReturnType<typeof listChecklist>['items'][number];
       expect(collectChecklistEvidenceStages(item, runner).find(({ id }) => id === 'E4')).toMatchObject({ state: 'missing' });
       payloadKey = expectedField;
       expect(collectChecklistEvidenceStages(item, runner).find(({ id }) => id === 'E4')).toMatchObject({ state: 'observed' });
-      expect(queried).toBe(id);
+      expect(queried).toContain('--event complete');
+      expect(queried).not.toContain('--grep');
     }
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: E4 is unmeasurable without a timestamp instead of scanning broad logs', () => {
+    let logCalls = 0;
+    const runner: ChecklistEvidenceCommandRunner = (command, args) => {
+      if (command === 'eln' && args[0] === 'logs') { logCalls += 1; return { status: 0, stdout: '', stderr: '' }; }
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    };
+    const item = { id: 'CHAIN', title: '- 완료 경계 증거 명령: bun test src/a.test.ts', evidence: 'PR mergedAt=2026-10-25T10:00:00.000Z\nrunId=run-12345678-1234-1234-1234-123456789abc event=complete' } as ReturnType<typeof listChecklist>['items'][number];
+    expect(collectChecklistEvidenceStages(item, runner).find(({ id }) => id === 'E4')).toMatchObject({ id: 'E4', state: 'unmeasurable', reason: expect.stringContaining('ISO 시각') });
+    expect(logCalls).toBe(0);
   });
 
   test('CHECKLIST-EVIDENCE-CHAIN: E5 accepts a boundary line without a markdown bullet', () => {

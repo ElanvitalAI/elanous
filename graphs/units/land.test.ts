@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveUnit, runGraph } from '../../src/graph-runner/runner';
 import { parseGraphTemplateYaml } from '../../src/self-implement/graph-yaml';
-import { runLandEnqueue } from '../../scripts/graph-units/land-enqueue';
+import { observeLandPolicyDrift, runLandEnqueue, type LandTrainObservation } from '../../scripts/graph-units/land-enqueue';
 
 const unitPath = join(import.meta.dir, 'land', 'land.yaml');
 const head = 'a'.repeat(40);
@@ -33,6 +33,65 @@ test('policy block validates batch bounds and non-empty directive text', () => {
   const invalidBounds = parseGraphTemplateYaml(source.replace('    min: 2', '    min: 1'), unitPath);
   expect(invalidBounds.template).toBeUndefined();
   expect(invalidBounds.errors.some((issue) => issue.path.endsWith('/policy/batch/min'))).toBe(true);
+});
+
+test('train policy observer emits land.policy-drift only for measured policy mismatches', () => {
+  const source = readFileSync(unitPath, 'utf8');
+  const policy = parseGraphTemplateYaml(source, unitPath).template?.policy;
+  expect(policy).toBeDefined();
+  if (!policy) throw new Error('land train policy did not parse');
+  const observed: LandTrainObservation = {
+    express: false,
+    waitedForBatch: true,
+    batchSize: 3,
+    groupBy: ['cellPrefix', 'area'],
+    waitMinutes: 12,
+    scenarioSource: 'fake-harness',
+    mockUsed: true,
+    gateRuns: 1,
+    land: { perPr: 'squash', pinnedHead: true, ejectOnFail: true, integrationPr: false },
+  };
+  const events: Array<{ event: string; payload: unknown }> = [];
+  expect(observeLandPolicyDrift(policy, observed, (event, payload) => events.push({ event, payload }))).toEqual([]);
+  expect(events).toEqual([]);
+  expect(observeLandPolicyDrift(policy, { ...observed, express: true, waitedForBatch: false, batchSize: 1 },
+    (event, payload) => events.push({ event, payload }))).toEqual([]);
+  expect(events).toEqual([]);
+
+  const drift = observeLandPolicyDrift(policy, {
+    ...observed,
+    batchSize: 1,
+    scenarioSource: 'live-llm',
+    mockUsed: false,
+    gateRuns: 2,
+    land: { ...observed.land, pinnedHead: false },
+  }, (event, payload) => events.push({ event, payload }));
+  expect(drift.map((entry) => entry.field)).toEqual([
+    '/batch/size', '/scenarioPrebuild/source', '/scenarioPrebuild/mock', '/gate/runs', '/land/pinnedHead',
+  ]);
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({ event: 'land.policy-drift', payload: { drift } });
+});
+
+test('land enqueue runtime consumes an optional train observation before its side effect', () => {
+  const root = mkdtempSync(join(tmpdir(), 'land-policy-observation-'));
+  try {
+    const review = join(root, 'review.json');
+    const command = join(root, 'enqueue');
+    writeFileSync(review, '{}');
+    writeFileSync(command, '#!/bin/sh\n');
+    const events: string[] = [];
+    const accept = (() => ({ status: 0, stdout: 'ENQUEUED', stderr: '' })) as unknown as typeof spawnSync;
+    const result = runLandEnqueue({ context: {
+      pr: 29155, expectedHead: head, review, owner: 'train:TC', landTrainObservation: {
+        express: false, waitedForBatch: true, batchSize: 1, groupBy: ['area'], waitMinutes: 31,
+        scenarioSource: 'live-llm', mockUsed: false, gateRuns: 2,
+        land: { perPr: 'merge', pinnedHead: false, ejectOnFail: false, integrationPr: true },
+      },
+    } }, command, accept, (event) => events.push(event));
+    expect(result).toMatchObject({ outcome: 'done', result: 'train-enqueued' });
+    expect(events).toEqual(['land.policy-drift']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('land@1 requires pinned review and enqueue command before any side effect', () => {

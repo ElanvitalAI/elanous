@@ -20,6 +20,7 @@ import { debug } from '../../debug/log.js';
  *  shadow 시엔 'acp' 구독자 부재 → tg/dc/pwa 미러만. reasoning 채널 추가 지원. */
 export interface AcpChunkProducer {
   delta: (text: string) => void;
+  replaceText: (text: string) => void;
   /** ⭐ `result` 는 «결과 단계»에서만 뜻이 있고, 주면 ACP `rawOutput` 으로 실려 나간다.
    *
    *  ⛔⭐⭐ **「안 줬다」의 «사유»를 여기서 만들지 않는다.**
@@ -51,6 +52,11 @@ export function makeAcpChunkProducer(sessionId: string, opts: { streamId?: strin
       if (!text) return;
       accum += text;
       fo({ streamId, seq: seq++, delta: text });
+      deltas++;
+    },
+    replaceText(text: string): void {
+      accum = text;
+      fo({ streamId, seq: seq++, delta: text, textOperation: 'replace' });
       deltas++;
     },
     tool(id, name, phase, ok, result): void {

@@ -56,7 +56,7 @@ test('release.loop config builds the full graph input with ledger previousVersio
   const loop = { gatePodPool: 'gate-pool', gatePodBunCache: '/var/cache/elanous-bun', gatePodShards: 4, gatePodShardTimeoutSeconds: 240,
     gateRemote: 'node-b', gateRemoteMirror: '/mirror/repo.git', opsHosts: ['local', 'node-b'], internalDist: '~/dist', opsRestart: true };
   writeFileSync(configPath, JSON.stringify({ release: { loop } }));
-  expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', ...loop });
+  expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gateExecutor: 'pod', gateImagePin: 'cut-commit', ...loop });
 }));
 
 test('freeze stops gate and publish graph; force-freeze records bypass and off resumes', async () => {
@@ -78,6 +78,18 @@ test('freeze stops gate and publish graph; force-freeze records bypass and off r
     expect([gates, published]).toEqual([2, 2]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('RELEASE-POLICY-PACK: production run input selects the measured Pod method and rejects a hand host override', () => fixture((root) => {
+  record(root, '0.2.40', { version: '0.2.40', publishedAt: 'now' });
+  const rehearsalDir = join(root, 'release', '0.2.40', 'rehearsal');
+  mkdirSync(rehearsalDir, { recursive: true });
+  writeFileSync(join(rehearsalDir, 'hard-5h.json'), JSON.stringify({ version: '0.2.40', step: 'hard-5h', endedAt: '2026-10-27T12:00:00Z', outcome: 'ok',
+    hardGate: { outcome: 'ok', commit: 'a'.repeat(40), executor: 'pod', introduced: [], preexisting: 0 } }));
+  const base = buildReleaseRunInput('0.2.41', { ledgerRoot: root, config: { gatePodPool: 'release-pool' } });
+  expect(base).toMatchObject({ version: '0.2.41', previousVersion: '0.2.40', gateExecutor: 'pod', gatePodPool: 'release-pool', gateImagePin: 'cut-commit' });
+  expect(() => buildReleaseRunInput('0.2.41', { ledgerRoot: root, config: { gatePodPool: 'release-pool' } }, undefined,
+    { executor: 'host', host: 'node-b' })).toThrow('gate executor host conflicts with release policy pod');
+}));
 
 test('dry run reports input but never invokes the checklist or graph; execution enforces both', async () => {
   const root = mkdtempSync(join(tmpdir(), 'unattended-release-'));
@@ -119,9 +131,9 @@ test('RELEASE-BRANCH: the default run cuts a release branch; --cut-commit and --
     await runUnattendedRelease({ version: '0.2.4', cutCommit: 'abc1234' }, deps);
     await runUnattendedRelease({ version: '0.2.4', mainCut: true }, deps);
     expect(inputs).toEqual([
-      { gatePodPool: 'pool', version: '0.2.4', previousVersion: '0.2.3', branchCut: true },
-      { gatePodPool: 'pool', version: '0.2.4', previousVersion: '0.2.3', cutCommit: 'abc1234' },
-      { gatePodPool: 'pool', version: '0.2.4', previousVersion: '0.2.3' },
+      { gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', branchCut: true },
+      { gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', cutCommit: 'abc1234' },
+      { gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3' },
     ]);
     enableLandingFreeze({ reason: 'emergency', by: 'OP' }, root);
     await expect(runUnattendedRelease({ version: '0.2.4' }, deps)).rejects.toThrow('동결 중 · emergency');
@@ -142,7 +154,7 @@ test('RELEASE-REHEARSAL-RC: --prerelease rc numbers the next free rc, skips the 
       checklist: () => { checklists++; return { ok: false, red: ['K1'], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
       graph: async (_p: string, o: { input: unknown }) => { inputs.push(o.input as Record<string, unknown>); return { status: 'done' } as never; } };
     const preview = await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc', dryRun: true }, deps);
-    expect(preview.input).toEqual({ gatePodPool: 'pool', version: '0.2.18-rc.2', previousVersion: '0.2.17', branchCut: true });
+    expect(preview.input).toEqual({ gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.18-rc.2', previousVersion: '0.2.17', branchCut: true });
     await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc' }, deps);
     expect(inputs[0]!.version).toBe('0.2.18-rc.2');
     expect(checklists).toBe(0);

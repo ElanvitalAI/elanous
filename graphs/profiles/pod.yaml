@@ -1,0 +1,4 @@
+profile_id: pod
+applies_when: substrate == pod
+state: { substrate: pod }
+overlays: []

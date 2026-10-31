@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { podTerminalRow } from './pod-failure-reason.js';
 
 /** Capture a failed Job against its recorded placement, never the caller's current kubectl context. */
 export function captureFailedPodJobs(input: {
@@ -39,10 +40,14 @@ export function captureFailedPodJobs(input: {
     finish('failed', 'placement-conflict'); return;
   }
   const location = { host: first.host, context: first.context, namespace: first.namespace, childRunId: first.childRunId, jobUid: first.jobUid };
+  const childRows = rows.filter(row => row.event === 'pod-child-run' && row.data?.job === job
+    && row.data.childRunId === first.childRunId && Number.isSafeInteger(row.data.attempt)
+    && (row.data.attempt as number) > 0);
+  const attempt = childRows.length ? childRows[childRows.length - 1]!.data!.attempt as number : undefined;
   const evidenceDir = join(artifactDir, 'pod-failure-capture', runId, job, first.childRunId as string);
   // A failed kubectl/SSH read is itself the missing diagnostic. Keep its stderr in
   // the private artifact directory and put only the path and exit status in the ledger.
-  const readFailure = (reason: string, result: { status: number | null; stderr: string }, extra: Record<string, unknown> = {}): void => {
+  const captureStderr = (reason: string, result: { status: number | null; stderr: string }): Record<string, unknown> => {
     let stderrEvidence: string | null = null;
     let stderrCaptureStatus: 'saved' | 'redacted' | 'empty' | 'write-failed' = result.stderr ? 'saved' : 'empty';
     if (result.stderr) {
@@ -61,19 +66,40 @@ export function captureFailedPodJobs(input: {
         }
       } catch { stderrEvidence = null; stderrCaptureStatus = 'write-failed'; }
     }
-    finish('failed', reason, { ...location, ...extra, kubectlStatus: result.status, stderrEvidence, stderrCaptureStatus });
+    return { kubectlStatus: result.status, stderrEvidence, stderrCaptureStatus };
+  };
+  const readFailure = (reason: string, result: { status: number | null; stderr: string }, extra: Record<string, unknown> = {}): void => {
+    finish('failed', reason, { ...location, ...extra, ...captureStderr(reason, result) });
   };
   const previous = rows.find(row => row.event === 'pod-failure-capture' && row.data?.job === job && row.data?.outcome === 'collected'
     && row.data.childRunId === first.childRunId && row.data.jobUid === first.jobUid
     && row.data.host === first.host && row.data.context === first.context && row.data.namespace === first.namespace);
+  const priorLogEvidence = previous?.data?.logEvidence;
+  const priorPreviousLogEvidence = previous?.data?.previousLogEvidence;
+  const priorCurrentReadStatus = previous?.data?.currentLogReadStatus;
+  const priorPreviousReadStatus = previous?.data?.previousLogReadStatus;
   // A ledger row describes a prior collection; it does not guarantee that its files survived.
-  // Check all three expected paths before treating it as complete, then recapture any missing evidence.
-  if (previous && ([['jobEvidence', 'job.json'], ['podEvidence', 'pods.json'], ['logEvidence', 'child.log']] as const)
+  // Validate the required artifacts and every log artifact claimed by the prior row before deduping.
+  // Unknown restart count is terminal for this Job snapshot: another identical Pod read cannot recover it.
+  const previousReadComplete = priorCurrentReadStatus === 'captured'
+    ? ['captured', 'empty', 'not-needed', 'unknown'].includes(String(priorPreviousReadStatus))
+    : priorCurrentReadStatus === 'empty' && priorPreviousReadStatus === 'captured';
+  const currentLogEvidencePresent = priorCurrentReadStatus === 'captured'
+    && priorLogEvidence === join(evidenceDir, 'child.log')
+    && (() => { try { return statSync(priorLogEvidence).isFile(); } catch { return false; } })();
+  const previousLogEvidencePresent = priorPreviousReadStatus === 'captured'
+    && priorPreviousLogEvidence === join(evidenceDir, 'child.previous.log')
+    && (() => { try { return statSync(priorPreviousLogEvidence).isFile(); } catch { return false; } })();
+  const logEvidenceComplete = currentLogEvidencePresent
+    ? priorPreviousReadStatus !== 'captured' || previousLogEvidencePresent
+    : priorCurrentReadStatus === 'empty' && previousLogEvidencePresent;
+  if (previous && previousReadComplete && ([['jobEvidence', 'job.json'], ['podEvidence', 'pods.json']] as const)
     .every(([field, filename]) => {
       const path = join(evidenceDir, filename);
       if (previous.data?.[field] !== path) return false;
       try { return statSync(path).isFile(); } catch { return false; }
-    })) return;
+    })
+    && logEvidenceComplete) return;
   const args = ['--context', first.context as string, '-n', first.namespace as string] as const;
   try {
     const jobResult = kubectl(first.host as string, [...args, 'get', 'job', job, '-o', 'json']);
@@ -103,21 +129,86 @@ export function captureFailedPodJobs(input: {
     });
     const podResult = kubectl(first.host as string, [...args, 'get', 'pods', '-l', `job-name=${job}`, '-o', 'json']);
     if (podResult.status !== 0) { readFailure('pods-read-failed', podResult, { jobEvidence }); return; }
-    const pods = JSON.parse(podResult.stdout) as { items?: Array<{ metadata?: { name?: string; ownerReferences?: Array<{ uid?: string }> } }> };
+    const pods = JSON.parse(podResult.stdout) as { items?: Array<{
+      metadata?: { name?: string; uid?: string; ownerReferences?: Array<{ uid?: string }> };
+      status?: { phase?: string; containerStatuses?: Array<{ name?: string; restartCount?: number;
+        state?: { terminated?: { reason?: string; exitCode?: number; finishedAt?: string } } }> };
+    }> };
     if (!pods.items?.length || pods.items.some(p => !p.metadata?.ownerReferences?.some(owner => owner.uid === jobBody.metadata?.uid))) {
       finish('failed', 'pod-owner-mismatch', { ...location, jobEvidence }); return;
     }
     const podEvidence = save('pods.json', podResult.stdout);
-    const podName = pods.items[0]?.metadata?.name;
+    const pod = pods.items[0]!;
+    const podName = pod.metadata?.name;
     if (pods.items.length !== 1 || !podName || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(podName)) {
       finish('failed', 'pod-ambiguous', { ...location, jobEvidence, podEvidence }); return;
     }
+    const childStatus = pod.status?.containerStatuses?.find(status => status.name === 'child');
+    const terminated = childStatus?.state?.terminated;
+    const shortCode = (value: unknown): string | undefined => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(value) && !SECRET_VALUE.test(value) ? value : undefined;
+    const numeric = (value: unknown): number | undefined => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+    const exitCode = (value: unknown): number | undefined => typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
+    const restartCount = numeric(childStatus?.restartCount);
+    const podSummary: Record<string, unknown> = {
+      ...location,
+      ...(attempt !== undefined ? { attempt } : {}), podName,
+      ...(shortCode(pod.metadata?.uid) ? { podUid: shortCode(pod.metadata?.uid) } : {}),
+      ...(shortCode(pod.status?.phase) ? { podPhase: shortCode(pod.status?.phase) } : {}),
+      ...(shortCode(terminated?.reason) ? { containerReason: shortCode(terminated?.reason) } : {}),
+      ...(exitCode(terminated?.exitCode) !== undefined ? { containerExitCode: exitCode(terminated?.exitCode) } : {}),
+      ...(typeof terminated?.finishedAt === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(terminated.finishedAt) ? { containerFinishedAt: terminated.finishedAt } : {}),
+      ...(restartCount !== undefined ? { containerRestartCount: restartCount } : {}),
+    };
     const logs = kubectl(first.host as string, [...args, 'logs', `pod/${podName}`, '-c', 'child']);
-    if (logs.status !== 0) { readFailure('logs-read-failed', logs, { jobEvidence, podEvidence }); return; }
-    if (!logs.stdout.trim()) { finish('failed', 'logs-empty', { ...location, jobEvidence, podEvidence }); return; }
-    const logEvidence = save('child.log', logs.stdout);
-    finish('collected', 'job-failed', { ...location, jobEvidence, podEvidence, logEvidence });
+    const currentLogReadStatus = logs.status === 0 ? (logs.stdout.trim() ? 'captured' : 'empty') : 'failed';
+    const currentLogBytes = logs.status === 0 ? Buffer.byteLength(logs.stdout) : 0;
+    let logEvidence: string | undefined;
+    let previousLogEvidence: string | undefined;
+    let previousLogReadStatus = restartCount === undefined || restartCount > 0 ? 'unknown' : 'not-needed';
+    let previousLogBytes: number | undefined;
+    let previousLogFailure: Record<string, unknown> = {};
+    let resultMarkerPresent = false;
+    if (logs.status === 0 && logs.stdout.trim()) {
+      logEvidence = save('child.log', logs.stdout);
+      resultMarkerPresent = hasTerminalMarker(logs.stdout);
+    }
+    if (restartCount !== undefined && restartCount > 0) {
+      const previousLogs = kubectl(first.host as string, [...args, 'logs', `pod/${podName}`, '-c', 'child', '--previous']);
+      previousLogReadStatus = previousLogs.status === 0 ? (previousLogs.stdout.trim() ? 'captured' : 'empty') : 'failed';
+      previousLogBytes = previousLogs.status === 0 ? Buffer.byteLength(previousLogs.stdout) : 0;
+      if (previousLogs.status !== 0) {
+        const failure = captureStderr('previous-logs-read-failed', previousLogs);
+        previousLogFailure = {
+          previousLogKubectlStatus: failure.kubectlStatus,
+          previousLogStderrEvidence: failure.stderrEvidence,
+          previousLogStderrCaptureStatus: failure.stderrCaptureStatus,
+        };
+      }
+      if (previousLogs.status === 0 && previousLogs.stdout.trim()) {
+        previousLogEvidence = save('child.previous.log', previousLogs.stdout);
+        resultMarkerPresent ||= hasTerminalMarker(previousLogs.stdout);
+      }
+    }
+    const summary = { ...podSummary, jobEvidence, podEvidence, currentLogReadStatus, currentLogBytes,
+      previousLogReadStatus, ...(previousLogBytes !== undefined ? { previousLogBytes } : {}), ...previousLogFailure, resultMarkerPresent,
+      ...(logEvidence ? { logEvidence } : {}), ...(previousLogEvidence ? { previousLogEvidence } : {}) };
+    if (currentLogReadStatus !== 'captured' && previousLogReadStatus !== 'captured') {
+      if (logs.status !== 0) { readFailure('logs-read-failed', logs, summary); return; }
+      finish('failed', 'logs-empty', summary); return;
+    }
+    if (logs.status !== 0) finish('collected', 'job-failed', { ...summary, ...captureStderr('logs-read-failed', logs) });
+    else finish('collected', 'job-failed', summary);
   } catch { finish('failed', 'capture-error', location); }
+}
+
+function hasTerminalMarker(logs: string): boolean {
+  for (const line of logs.split(/\r?\n/)) {
+    try {
+      const row: unknown = JSON.parse(line);
+      if (row && typeof row === 'object' && !Array.isArray(row) && podTerminalRow(row as Record<string, unknown>)) return true;
+    } catch { /* ordinary child output is not a terminal result marker */ }
+  }
+  return false;
 }
 
 const SECRET_FIELD = /token|secret|password|authorization|key/i;
@@ -127,8 +218,12 @@ const MAX_FIELDS = 32;
 // Review R2: only lifecycle events the host needs to see, and no free text. Event names must start with a known
 // lifecycle prefix; string fields survive only when they are short code-like values in a fixed set of keys.
 const EVENT_ALLOWED = /^(?:gate|gated|review|reviewed|repair|repaired|rework|merge|merged|pr|land|landed|stage|round|supervisor|child|plan|planned|decompose|decomposed|shard|stall|harvest|decision|run|pipeline|progress|human|start|started|finish|finished|done|implement|implemented|commit|test|typecheck)(?:-(?:started|finished|round|opened|closed|failed|passed|blocked|done|entry|node|outcome|delivery|decision|stop|merged|ready|requested|resolved|result|fix|must-fix|verdict|skipped|origin|cleared))*$/;
-const CODE_FIELDS = new Set(['stage', 'outcome', 'verdict', 'status', 'kind', 'phase', 'role', 'result']);
+const CODE_FIELDS = new Set(['stage', 'outcome', 'verdict', 'status', 'kind', 'phase', 'role', 'result', 'containerReason',
+  'podPhase', 'currentLogReadStatus', 'previousLogReadStatus', 'previousLogStderrCaptureStatus', 'stderrCaptureStatus']);
 const CODE_VALUE = /^[a-z0-9_.:-]{1,40}$/i;
+const IDENTITY_FIELDS = new Set(['job', 'jobUid', 'childRunId', 'host', 'context', 'namespace', 'podName', 'podUid']);
+const SAFE_ID_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SAFE_ISO_TIMESTAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/;
 
 function secretValues(root: Record<string, unknown>): string[] {
   const secrets: string[] = [];
@@ -163,7 +258,8 @@ export function ledgerLineToLogEvent(line: string, runId: string): {
   const sources = [entry, details].filter((source): source is Record<string, unknown> => source !== undefined);
   const knownSecrets = secretValues(entry);
   const containsCredential = (value: string) => SECRET_VALUE.test(value) || knownSecrets.some((secret) => value.includes(secret));
-  if (containsCredential(entry.event) || (!EVENT_ALLOWED.test(entry.event) && entry.event !== 'ask-auto-target-candidates' && entry.event !== 'ask-auto-reauthor')) return undefined;
+  if (containsCredential(entry.event) || (!EVENT_ALLOWED.test(entry.event) && entry.event !== 'pod-failure-capture'
+    && entry.event !== 'ask-auto-target-candidates' && entry.event !== 'ask-auto-reauthor')) return undefined;
 
   const data: Record<string, unknown> = { runId };
   let fields = 0;
@@ -176,7 +272,10 @@ export function ledgerLineToLogEvent(line: string, runId: string): {
       if (!SAFE_FIELD.test(outputName) || SECRET_FIELD.test(outputName) || Object.hasOwn(data, outputName)) continue;
       if (typeof value === 'string') {
         // Free text (reasons, messages, patches) never leaves the pod ledger; only short code values in known keys.
-        if (!CODE_FIELDS.has(name) || !CODE_VALUE.test(value) || containsCredential(value)) continue;
+        const acceptedCode = CODE_FIELDS.has(name) && CODE_VALUE.test(value);
+        const acceptedIdentity = IDENTITY_FIELDS.has(name) && SAFE_ID_VALUE.test(value);
+        const acceptedTimestamp = name === 'containerFinishedAt' && SAFE_ISO_TIMESTAMP.test(value);
+        if ((!acceptedCode && !acceptedIdentity && !acceptedTimestamp) || containsCredential(value)) continue;
         data[name] = value;
       } else if (typeof value === 'number' && Number.isFinite(value) || typeof value === 'boolean' || value === null) {
         data[name] = value;

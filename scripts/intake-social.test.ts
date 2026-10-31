@@ -160,11 +160,12 @@ test('INTAKE-SOCIAL: 하루 상한(8점)을 넘는 동향은 상한까지만 쓴
   }
 });
 
-test('INTAKE-SOCIAL: daily graph 는 news → social → ingest 로 배선하고 등록된 명령을 쓴다', () => {
+test('INTAKE-SOCIAL: daily graph 는 news → social → registered sources → ingest 로 배선하고 등록된 명령을 쓴다', () => {
   const graph = parseYaml(readFileSync(join(import.meta.dir, '../graphs/intake/intake-daily.yaml'), 'utf8'));
   const recipes = parseYaml(readFileSync(join(import.meta.dir, '../graphs/intake/recipes.yaml'), 'utf8'));
   expect(graph.nodes.find((node: { node_id: string }) => node.node_id === 'social').recipe).toBe('cmd:intake-social');
   expect(graph.edges.find((edge: { from: string }) => edge.from === 'news').map).toEqual({ ok: 'social', fail: 'social' });
-  expect(graph.edges.find((edge: { from: string }) => edge.from === 'social').map).toEqual({ ok: 'ingest', fail: 'ingest' });
+  expect(graph.edges.find((edge: { from: string }) => edge.from === 'social').map).toEqual({ ok: 'registered-sources', fail: 'registered-sources' });
+  expect(graph.edges.find((edge: { from: string }) => edge.from === 'registered-sources').map).toEqual({ ok: 'ingest', fail: 'ingest' });
   expect(recipes['intake-social'].command).toContain('scripts/intake-social.ts');
 });

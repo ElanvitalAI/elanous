@@ -1,0 +1,5 @@
+profile_id: local
+applies_when: substrate == local
+state:
+  substrate: local
+overlays: []

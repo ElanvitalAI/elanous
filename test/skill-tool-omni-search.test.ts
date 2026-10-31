@@ -50,8 +50,8 @@ describe('omniSearchAvailable', () => {
   });
 
   test('true when ≥ 2 providers available', () => {
-    addWebSearchProvider(fakeProvider('one', []));
-    addWebSearchProvider(fakeProvider('two', []));
+    addWebSearchProvider(fakeProvider('exa', []));
+    addWebSearchProvider(fakeProvider('firecrawl', []));
     expect(omniSearchAvailable()).toBe(true);
   });
 });
@@ -66,11 +66,11 @@ describe('dispatchOmniSearch — empty providers', () => {
 
 describe('dispatchOmniSearch — happy path', () => {
   beforeEach(() => {
-    addWebSearchProvider(fakeProvider('alpha', [
+    addWebSearchProvider(fakeProvider('exa', [
       { url: 'https://a.com/1', title: 'A1', snippet: 'aaa' },
       { url: 'https://a.com/2', title: 'A2', snippet: 'bbb' },
     ]));
-    addWebSearchProvider(fakeProvider('beta', [
+    addWebSearchProvider(fakeProvider('firecrawl', [
       { url: 'https://b.com/1', title: 'B1', snippet: 'ccc' },
     ]));
   });
@@ -79,8 +79,8 @@ describe('dispatchOmniSearch — happy path', () => {
     const r = await dispatchOmniSearch({ query: 'whatever' });
     expect(r.metadata.totalHits).toBe(3);
     expect(r.metadata.merge).toBe('interleave');
-    expect(r.metadata.perEngine.alpha.hits).toBe(2);
-    expect(r.metadata.perEngine.beta.hits).toBe(1);
+    expect(r.metadata.perEngine.exa.hits).toBe(2);
+    expect(r.metadata.perEngine.firecrawl.hits).toBe(1);
     // Output contains hits from both providers.
     expect(r.output).toContain('A1');
     expect(r.output).toContain('B1');
@@ -88,14 +88,14 @@ describe('dispatchOmniSearch — happy path', () => {
 
   test('merge="by-engine" groups under headings', async () => {
     const r = await dispatchOmniSearch({ query: 'q', merge: 'by-engine' });
-    expect(r.output).toContain('## alpha');
-    expect(r.output).toContain('## beta');
+    expect(r.output).toContain('## exa');
+    expect(r.output).toContain('## firecrawl');
   });
 
   test('engines filter restricts to named providers', async () => {
-    const r = await dispatchOmniSearch({ query: 'q', engines: ['alpha'] });
-    expect(r.metadata.perEngine.alpha).toBeDefined();
-    expect(r.metadata.perEngine.beta).toBeUndefined();
+    const r = await dispatchOmniSearch({ query: 'q', engines: ['exa'] });
+    expect(r.metadata.perEngine.exa).toBeDefined();
+    expect(r.metadata.perEngine.firecrawl).toBeUndefined();
   });
 });
 
@@ -106,31 +106,31 @@ describe('dispatchOmniSearch — onEngine', () => {
       const searched: string[] = [];
       const events: Array<{ engine: string; phase: string; hits?: number; durationMs?: number; error?: string }> = [];
       addWebSearchProvider({
-        ...fakeProvider('first', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]),
+        ...fakeProvider('exa', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]),
         async search(q) {
-          searched.push(`first:${q.query}:${q.limit}`);
-          return { hits: [{ url: 'https://a.test', title: 'A', snippet: 'a' }], providerName: 'first', durationMs: 0 };
+          searched.push(`exa:${q.query}:${q.limit}`);
+          return { hits: [{ url: 'https://a.test', title: 'A', snippet: 'a' }], providerName: 'exa', durationMs: 0 };
         },
       });
       addWebSearchProvider({
-        ...fakeProvider('second', []),
+        ...fakeProvider('firecrawl', []),
         async search(q) {
-          searched.push(`second:${q.query}:${q.limit}`);
+          searched.push(`firecrawl:${q.query}:${q.limit}`);
           throw new Error('offline failure');
         },
       });
-      const args = { query: 'offline', engines: ['first', 'second'], limit: 3, merge: 'by-engine' as const };
+      const args = { query: 'offline', engines: ['exa', 'firecrawl'], limit: 3, merge: 'by-engine' as const };
       const without = await dispatchOmniSearch(args);
-      expect(searched).toEqual(['first:offline:3', 'second:offline:3']);
+      expect(searched).toEqual(['exa:offline:3', 'firecrawl:offline:3']);
       searched.length = 0;
       const withCallback = await dispatchOmniSearch(args, { onEngine: event => events.push(event) });
-      expect(searched).toEqual(['first:offline:3', 'second:offline:3']);
+      expect(searched).toEqual(['exa:offline:3', 'firecrawl:offline:3']);
       expect(withCallback).toEqual(without);
       expect(events).toEqual([
-        { engine: 'first', phase: 'start' },
-        { engine: 'second', phase: 'start' },
-        { engine: 'first', phase: 'complete', hits: 1, durationMs: 0 },
-        { engine: 'second', phase: 'complete', hits: 0, durationMs: 0, error: 'offline failure' },
+        { engine: 'exa', phase: 'start' },
+        { engine: 'firecrawl', phase: 'start' },
+        { engine: 'exa', phase: 'complete', hits: 1, durationMs: 0 },
+        { engine: 'firecrawl', phase: 'complete', hits: 0, durationMs: 0, error: 'offline failure' },
       ]);
     } finally {
       clock.mockRestore();
@@ -138,8 +138,8 @@ describe('dispatchOmniSearch — onEngine', () => {
   });
 
   test('observer exceptions do not turn successful searches into failures', async () => {
-    addWebSearchProvider(fakeProvider('local', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]));
-    const args = { query: 'offline', engines: ['local'] };
+    addWebSearchProvider(fakeProvider('exa', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]));
+    const args = { query: 'offline', engines: ['exa'] };
     const baseline = await dispatchOmniSearch(args);
     const phases: string[] = [];
     const result = await dispatchOmniSearch(args, { onEngine: event => {
@@ -149,14 +149,14 @@ describe('dispatchOmniSearch — onEngine', () => {
     expect(phases).toEqual(['start', 'complete']);
     expect(result.output.replace(/in \d+ms/g, 'in <ms>')).toBe(baseline.output.replace(/in \d+ms/g, 'in <ms>'));
     expect(result.metadata.totalHits).toBe(baseline.metadata.totalHits);
-    expect(result.metadata.perEngine.local.error).toBeUndefined();
+    expect(result.metadata.perEngine.exa.error).toBeUndefined();
   });
 
   test('async observer rejections at start and completion leave the result unchanged', async () => {
     const clock = spyOn(Date, 'now').mockReturnValue(100);
     try {
-      addWebSearchProvider(fakeProvider('local', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]));
-      const args = { query: 'offline', engines: ['local'] };
+      addWebSearchProvider(fakeProvider('exa', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]));
+      const args = { query: 'offline', engines: ['exa'] };
       const baseline = await dispatchOmniSearch(args);
       const phases: string[] = [];
       const result = await dispatchOmniSearch(args, { onEngine: async event => {
@@ -185,19 +185,19 @@ describe('dispatchOmniSearch — onEngine', () => {
 
 describe('dispatchOmniSearch — source observer', () => {
   test('emits provider-tagged hits without changing the original output or swallowing provider results', async () => {
-    addWebSearchProvider(fakeProvider('first', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]));
+    addWebSearchProvider(fakeProvider('exa', [{ url: 'https://a.test', title: 'A', snippet: 'a' }]));
     const clock = spyOn(Date, 'now').mockReturnValue(100);
     try {
       const args = { query: 'q' };
       const baseline = await dispatchOmniSearch(args);
       const hits: string[] = [];
       const actual = await dispatchOmniSearch(args, { onSource: hit => {
-        hits.push(`${hit.engine}:${hit.url}`);
+      hits.push(`${hit.engine}:${hit.url}`);
         throw new Error('observer failed');
       } });
-      expect(hits).toEqual(['first:https://a.test']);
+    expect(hits).toEqual(['exa:https://a.test']);
       expect(actual).toEqual(baseline);
-      expect(actual.metadata.perEngine.first.error).toBeUndefined();
+      expect(actual.metadata.perEngine.exa.error).toBeUndefined();
     } finally {
       clock.mockRestore();
     }
@@ -206,14 +206,14 @@ describe('dispatchOmniSearch — source observer', () => {
 
 describe('dispatchOmniSearch — provider error tolerance', () => {
   test('one failing provider does not break the call', async () => {
-    addWebSearchProvider(fakeProvider('good', [
+    addWebSearchProvider(fakeProvider('exa', [
       { url: 'https://x.com', title: 'X', snippet: 's' },
     ]));
-    addWebSearchProvider(fakeProvider('bad', [], { throwError: 'simulated 500' }));
-    const r = await dispatchOmniSearch({ query: 'q' });
+    addWebSearchProvider(fakeProvider('firecrawl', [], { throwError: 'simulated 500' }));
+    const r = await dispatchOmniSearch({ query: 'q', engines: ['exa', 'firecrawl'] });
     expect(r.metadata.totalHits).toBe(1);
-    expect(r.metadata.perEngine.bad.error).toContain('simulated 500');
-    expect(r.metadata.perEngine.good.hits).toBe(1);
+    expect(r.metadata.perEngine.firecrawl.error).toContain('simulated 500');
+    expect(r.metadata.perEngine.exa.hits).toBe(1);
   });
 });
 

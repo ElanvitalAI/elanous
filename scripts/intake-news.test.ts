@@ -95,15 +95,18 @@ test('network failure emits 못 모음 and does not block next source', async ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('daily graph wires trend → news → social → ingest, including fail continuation and registered command', () => {
+test('daily graph wires trend → news → social → registered sources → ingest, including fail continuation and registered command', () => {
   const graph = parseYaml(readFileSync(join(import.meta.dir, '../graphs/intake/intake-daily.yaml'), 'utf8'));
   const recipes = parseYaml(readFileSync(join(import.meta.dir, '../graphs/intake/recipes.yaml'), 'utf8'));
   expect(graph.loop.trigger.cron).toBe('0 7 * * *');
   expect(graph.nodes.find((node: { node_id: string }) => node.node_id === 'news').recipe).toBe('cmd:intake-news');
   expect(graph.edges.find((edge: { from: string }) => edge.from === 'trend').map).toEqual({ ok: 'news', fail: 'news' });
   expect(graph.edges.find((edge: { from: string }) => edge.from === 'news').map).toEqual({ ok: 'social', fail: 'social' });
-  expect(graph.edges.find((edge: { from: string }) => edge.from === 'social').map).toEqual({ ok: 'ingest', fail: 'ingest' });
+  expect(graph.nodes.find((node: { node_id: string }) => node.node_id === 'registered-sources').recipe).toBe('cmd:intake-source-run-due');
+  expect(graph.edges.find((edge: { from: string }) => edge.from === 'social').map).toEqual({ ok: 'registered-sources', fail: 'registered-sources' });
+  expect(graph.edges.find((edge: { from: string }) => edge.from === 'registered-sources').map).toEqual({ ok: 'ingest', fail: 'ingest' });
   expect(recipes['intake-news'].command).toContain('scripts/intake-news.ts');
+  expect(recipes['intake-source-run-due'].command).toContain('intake source run-due');
   expect(parseYaml(readFileSync(join(import.meta.dir, '../graphs/intake/news-sources.yaml'), 'utf8')).sources).toEqual(sources);
 });
 
@@ -112,7 +115,7 @@ test('the existing graph CLI accepts the daily graph and resolves the registered
     cwd: join(import.meta.dir, '..'), encoding: 'utf8', timeout: 30_000,
   });
   expect(result.status).toBe(0);
-  expect(result.stdout).toContain('trend → news → social → ingest');
+  expect(result.stdout).toContain('trend → news → social → registered-sources → ingest');
 });
 
 test('NEWS-INTAKE: one article is checked as up to three facts (title ⊕ two summary lines)', async () => {

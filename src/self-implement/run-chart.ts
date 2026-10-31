@@ -55,8 +55,11 @@ export function readRunChart(runId: string, device: RunChartDevice, dir: string)
 export function runChartMetrics(entries: readonly RunLedgerEntry[]): { emptyHandoffs: number; unreadHandoffs: number; conflictingVerdicts: number } {
   const cells = entries.filter((e) => e.event === 'run-chart-cell');
   const emptyHandoffs = cells.filter((e) => !String(e.data.handoff ?? '').trim()).length;
-  const unreadHandoffs = cells.filter((e) => Boolean(e.data.handoff)
-    && !cells.some((next) => next.data.readStopKeys instanceof Array && next.data.readStopKeys.includes(String(e.data.stopKey)))).length;
+  const unreadHandoffs = cells.filter((e) => {
+    const handoff = String(e.data.handoff ?? '').trim().toLowerCase();
+    return handoff !== '' && handoff !== 'none'
+      && !cells.some((next) => next.data.readStopKeys instanceof Array && next.data.readStopKeys.includes(String(e.data.stopKey)));
+  }).length;
   const verdicts = new Map<string, Set<string>>();
   for (const cell of cells) {
     const key = `${String(cell.data.device)}\0${String(cell.data.stopKey)}`;
@@ -90,7 +93,7 @@ export function recordRunChartDecision(input: RunChartDecision): RunChartWriteRe
     }
     append.push({ timestamp: new Date().toISOString(), runId: input.runId, event: 'run-chart-cell', data: {
       device: input.device, stopKey: input.stopKey, observed: input.observed.slice(0, 240), verdict: input.verdict,
-      action: input.action, handoff: input.handoff, why: input.why.slice(0, 240), readStopKeys: input.readStopKeys.slice(-RUN_CHART_READ_CELLS),
+      action: input.action, handoff: input.handoff ?? 'none', why: input.why.slice(0, 240), readStopKeys: input.readStopKeys.slice(-RUN_CHART_READ_CELLS),
       ...(input.waitCount === undefined ? {} : { waitCount: input.waitCount }),
       ...(input.failureClass === undefined ? {} : { failureClass: input.failureClass }),
     } });

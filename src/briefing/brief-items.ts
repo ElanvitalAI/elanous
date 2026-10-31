@@ -32,6 +32,10 @@ export interface BriefItem {
   deadline: string | null;
   evidence: string | null;
   source: string;
+  /** Existing Linear issue identifier; this is the secretary contract key. */
+  issue_ref?: string | null;
+  /** Parent Linear issue UUID used by the Linear comment projector. */
+  linearIssueId?: string | null;
   created_at: string;
   sent_at: string | null;
 }
@@ -43,6 +47,9 @@ export interface AddBriefItem {
   deadline?: string | null;
   evidence?: string | null;
   source: string;
+  /** Reuses the Linear secretary issue identifier; no intake-specific key is created. */
+  issueRef?: string | null;
+  linearIssueId?: string;
   createdAt?: string;
   /** Optional normalized claim identity and time window for repeat observations. */
   dedupeKey?: string;
@@ -185,6 +192,7 @@ function itemLine(item: BriefItem): string {
   const extra = [
     item.deadline ? `마감: ${item.deadline}` : '',
     item.evidence ? `근거: ${item.evidence}` : '',
+    item.issue_ref ? `관련 이슈: ${item.issue_ref}` : '',
     `출처: ${item.source}`,
   ].filter(Boolean).join(' · ');
   return `- [${item.priority}] ${item.text} (${extra})`;
@@ -207,6 +215,7 @@ function migrateLegacyItems(db: Database, log: (category: string, event: string,
       deadline TEXT,
       evidence TEXT,
       source TEXT NOT NULL,
+      linear_issue_id TEXT,
       created_at TEXT NOT NULL,
       sent_at TEXT
     )`);
@@ -220,6 +229,12 @@ function migrateLegacyItems(db: Database, log: (category: string, event: string,
         created_at, NULL FROM items_v1`);
   })();
   log('briefing.items', 'migrated-legacy', { rows: (db.query('SELECT COUNT(*) AS n FROM items_v1').get() as { n: number }).n });
+}
+
+function briefItem(row: BriefItem): BriefItem {
+  if (row.issue_ref != null) return row;
+  const { issue_ref: _issueRef, ...legacy } = row;
+  return legacy;
 }
 
 /** Append-only briefing item ledger at `<state>/briefing/items.sqlite`. */
@@ -251,6 +266,8 @@ export class BriefItemsLedger {
         deadline TEXT,
         evidence TEXT,
         source TEXT NOT NULL,
+        issue_ref TEXT,
+        linear_issue_id TEXT,
         created_at TEXT NOT NULL,
         sent_at TEXT
       );
@@ -284,8 +301,11 @@ export class BriefItemsLedger {
         update_id TEXT NOT NULL,
         PRIMARY KEY (bot_id, chat_id, update_id)
       );`);
-      if (!(db.query("SELECT name FROM pragma_table_info('items')").all() as { name: string }[]).some(column => column.name === 'dedupe_key')) {
-        db.exec('ALTER TABLE items ADD COLUMN dedupe_key TEXT');
+      const columns = db.query("SELECT name FROM pragma_table_info('items')").all() as { name: string }[];
+      if (!columns.some(column => column.name === 'dedupe_key')) db.exec('ALTER TABLE items ADD COLUMN dedupe_key TEXT');
+      if (!columns.some(column => column.name === 'issue_ref')) db.exec('ALTER TABLE items ADD COLUMN issue_ref TEXT');
+      if (!columns.some(column => column.name === 'linear_issue_id')) {
+        db.exec('ALTER TABLE items ADD COLUMN linear_issue_id TEXT');
       }
       db.exec('CREATE INDEX IF NOT EXISTS items_dedupe ON items(source, dedupe_key, created_at)');
       return work(db);
@@ -301,6 +321,9 @@ export class BriefItemsLedger {
     if (!(BRIEF_DOMAINS as readonly string[]).includes(input.domain)) throw new BriefItemsInputError('invalid domain');
     if (!(BRIEF_PRIORITIES as readonly string[]).includes(input.priority)) throw new BriefItemsInputError('invalid priority');
     const source = required(input.source, 'source');
+    if (input.linearIssueId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.linearIssueId)) {
+      throw new BriefItemsInputError('invalid Linear issue UUID');
+    }
     const deadline = optional(input.deadline, 'deadline');
     // Every field that reaches the composed Markdown is one line, so no stored item can forge a heading or entry (ACP must-fix).
     for (const [field, value] of [['source', source], ['evidence', input.evidence ?? null], ['deadline', deadline]] as const) {
@@ -311,6 +334,8 @@ export class BriefItemsLedger {
       if (!format.test(deadline) || !Number.isFinite(Date.parse(deadline))) throw new BriefItemsInputError('invalid deadline');
     }
     const evidence = optional(input.evidence, 'evidence');
+    const issueRef = optional(input.issueRef, 'issueRef');
+    if (issueRef !== null && /[\r\n]/.test(issueRef)) throw new BriefItemsInputError('issueRef must be a single line');
     const createdAt = input.createdAt ?? this.now().toISOString();
     if (!Number.isFinite(Date.parse(createdAt))) throw new BriefItemsInputError('invalid createdAt');
     const dedupeKey = input.dedupeKey === undefined ? null : normalizeClaim(required(input.dedupeKey, 'dedupeKey'));
@@ -319,7 +344,7 @@ export class BriefItemsLedger {
       throw new BriefItemsInputError('invalid dedupe window');
     }
     const selected = this.using(db => {
-      const select = 'SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items WHERE id = ?';
+      const select = 'SELECT id, text, domain, priority, deadline, evidence, source, issue_ref, linear_issue_id AS linearIssueId, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items WHERE id = ?';
       db.exec('BEGIN IMMEDIATE');
       try {
         if (dedupeKey !== null && windowMs !== undefined) {
@@ -329,15 +354,15 @@ export class BriefItemsLedger {
             AND julianday(created_at) <= julianday(?) ORDER BY id DESC LIMIT 1`)
             .get(source, dedupeKey, createdAt, windowMs, createdAt) as { id: number } | null;
           if (existing) {
-            const item = db.query(select).get(existing.id) as BriefItem;
+            const item = briefItem(db.query(select).get(existing.id) as BriefItem);
             db.exec('COMMIT');
             return { item, added: false };
           }
         }
         const result = db.query(
-          'INSERT INTO items (text, domain, priority, deadline, evidence, source, created_at, sent_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)',
-        ).run(text, input.domain, input.priority, deadline, evidence, source, createdAt, dedupeKey);
-        const item = db.query(select).get(result.lastInsertRowid) as BriefItem;
+          'INSERT INTO items (text, domain, priority, deadline, evidence, source, issue_ref, linear_issue_id, created_at, sent_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)',
+        ).run(text, input.domain, input.priority, deadline, evidence, source, issueRef, input.linearIssueId ?? null, createdAt, dedupeKey);
+        const item = briefItem(db.query(select).get(result.lastInsertRowid) as BriefItem);
         db.exec('COMMIT');
         return { item, added: true };
       } catch (cause) {
@@ -434,9 +459,13 @@ export class BriefItemsLedger {
 
   /** Insertion order. Optional domain filter. Item text is the stored original. */
   list(filters: { domain?: BriefDomain } = {}): BriefItem[] {
-    return this.using(db => (filters.domain === undefined
-      ? db.query('SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items ORDER BY id').all()
-      : db.query('SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items WHERE domain = ? ORDER BY id').all(filters.domain)) as BriefItem[]);
+    const rows = this.using(db => {
+      const select = 'SELECT id, text, domain, priority, deadline, evidence, source, issue_ref, linear_issue_id AS linearIssueId, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items';
+      return filters.domain === undefined
+        ? db.query(`${select} ORDER BY id`).all()
+        : db.query(`${select} WHERE domain = ? ORDER BY id`).all(filters.domain);
+    }) as BriefItem[];
+    return rows.map(briefItem);
   }
 
   /**
@@ -450,7 +479,7 @@ export class BriefItemsLedger {
   }
 
   private itemsFromDb(db: Database): BriefItem[] {
-    return db.query('SELECT id, text, domain, priority, deadline, evidence, source, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items ORDER BY id').all() as BriefItem[];
+    return (db.query('SELECT id, text, domain, priority, deadline, evidence, source, issue_ref, linear_issue_id AS linearIssueId, created_at, (SELECT MIN(sent_at) FROM sends WHERE sends.item_id = items.id) AS sent_at FROM items ORDER BY id').all() as BriefItem[]).map(briefItem);
   }
 
   private pageFromDb(db: Database, slot: BriefSendSlot): { markdown: string; ids: number[] } {
@@ -561,4 +590,19 @@ export class BriefItemsLedger {
     if (slot !== 'realtime' && !(BRIEF_SLOTS as readonly string[]).includes(slot)) throw new BriefItemsInputError('invalid slot');
     return this.using(db => db.transaction(() => this.markSentInDb(db, ids, slot))());
   }
+}
+
+export interface IntakeDailyBrief {
+  orchestrationId: string;
+  markdown: string;
+}
+
+function orchestrationId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `intake-brief-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** Graph entrypoint for the daily 08:30 briefing; requirement-funnel items stay ephemeral. */
+export function composeIntakeDailyBrief(options: BriefItemsOptions = {}): IntakeDailyBrief {
+  const ledger = new BriefItemsLedger(options);
+  return { orchestrationId: orchestrationId(), markdown: ledger.compose('08:30') };
 }

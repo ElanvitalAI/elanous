@@ -8,7 +8,7 @@ import { findTrack } from '../autopilot/mission-phase-track.js';
 import { wasIntakeEventScheduled } from './route.js';
 
 export const INTAKE_SOURCES = ['x', 'youtube', 'github', 'telegram-saved', 'telegram-bot', 'memo', 'pwa'] as const;
-export type RegisteredIntakeSourceKind = 'rss' | 'command';
+export type RegisteredIntakeSourceKind = 'rss' | 'command' | 'topic-search';
 export type IntakeSource = typeof INTAKE_SOURCES[number];
 export type IntakeKind = 'video' | 'repo' | 'post' | 'article' | 'note' | 'rss';
 export type IntakePrivacy = 'public' | 'user-private';
@@ -21,6 +21,8 @@ export interface IntakeItem {
   /** 같은 항목이 다른 입력원에서도 왔으면 여기 모인다 — «두 입력원에서 동시에 뜬 것»이 신호다. */
   sources: (IntakeSource | RegisteredIntakeSourceKind)[];
   seat?: string;
+  /** Parent Linear issue UUID, kept separate from its human-readable identifier. */
+  linearIssueId?: string;
   url?: string;
   kind: IntakeKind;
   title?: string;
@@ -39,6 +41,7 @@ export interface IntakeItem {
 /** 수집기가 내는 한 줄 — 모양 맞추기 전. */
 export interface RawIntakeItem {
   seat?: string;
+  linearIssueId?: string;
   url?: string;
   title?: string;
   text?: string;
@@ -90,10 +93,12 @@ function normalizedSeat(seat: unknown): string | undefined {
   return track.id;
 }
 
-export function intakeItemId(source: IntakeSource | RegisteredIntakeSourceKind, raw: Pick<RawIntakeItem, 'url' | 'text'> & { seat?: string }): string {
+export function intakeItemId(source: IntakeSource | RegisteredIntakeSourceKind,
+  raw: Pick<RawIntakeItem, 'url' | 'text' | 'linearIssueId'> & { seat?: string }): string {
   const seat = normalizedSeat(raw.seat);
   const url = raw.url ? canonicalUrl(raw.url) : undefined;
-  const basis = url ?? `${source}:${(raw.text ?? '').trim().slice(0, 200)}`;
+  const itemKey = url ?? `${source}:${(raw.text ?? '').trim().slice(0, 200)}`;
+  const basis = raw.linearIssueId ? JSON.stringify(['linear-issue', raw.linearIssueId.toLowerCase(), itemKey]) : itemKey;
   // Unassigned items retain their original IDs; assigned items have an independent lifecycle per seat.
   return createHash('sha256').update(seat ? JSON.stringify([seat, basis]) : basis).digest('hex').slice(0, 16);
 }
@@ -114,6 +119,9 @@ export function privacyFor(source: IntakeSource | RegisteredIntakeSourceKind): I
 /** ① 모양 맞추기 — 수집기 한 줄 → IntakeItem. 비어 있으면(URL·본문 둘 다 없음) null. */
 export function shapeIntakeItem(source: IntakeSource | RegisteredIntakeSourceKind, raw: RawIntakeItem, now: string): IntakeItem | null {
   const seat = normalizedSeat(raw.seat);
+  if (raw.linearIssueId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw.linearIssueId)) {
+    throw new Error('invalid Linear issue UUID');
+  }
   const url = raw.url ? canonicalUrl(raw.url) : undefined;
   const text = raw.text?.trim() || undefined;
   if (!url && !text) return null;
@@ -121,10 +129,11 @@ export function shapeIntakeItem(source: IntakeSource | RegisteredIntakeSourceKin
   const signals: Record<string, number> = {};
   for (const [k, v] of Object.entries(raw.signals ?? {})) if (Number.isFinite(v)) signals[`${source}.${k}`] = v;
   return {
-    id: intakeItemId(source, { url, text, seat }),
+    id: intakeItemId(source, { url, text, seat, linearIssueId: raw.linearIssueId }),
     source,
     sources: [source],
     ...(seat ? { seat } : {}),
+    ...(raw.linearIssueId ? { linearIssueId: raw.linearIssueId } : {}),
     ...(url ? { url } : {}),
     kind: raw.kind ?? kindFor(source, url),
     ...(raw.title?.trim() ? { title: raw.title.trim().slice(0, 300) } : {}),
@@ -191,6 +200,7 @@ export function ingestIntakeItems(instanceRoot: string, source: IntakeSource | R
       signals: { ...prev.signals, ...shaped.signals },
       title: prev.title ?? shaped.title,
       text: prev.text ?? shaped.text,
+      linearIssueId: prev.linearIssueId ?? shaped.linearIssueId,
       axis: shaped.axis ?? prev.axis,
       judgement: shaped.judgement ?? prev.judgement,
       // 한 번이라도 개인 입력원에서 왔으면 개인으로 남긴다(공개로 풀지 않는다).

@@ -57,6 +57,8 @@ import { isFactQuestion } from './fact-question.js';
 import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import { classifyTuiChatIntent, formatTuiRouteLine, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
+import { RESEARCH_TOOL_ALLOWLIST, RESEARCH_TURN_MAX_TOOL_TURNS } from '../core-turn/research-policy.js';
+import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { createReasoningThoughtBuffer } from './reasoning-thought-buffer.js';
 import {
   REQUEST_SIZE_MAX_CHARS,
@@ -78,7 +80,7 @@ const QUICK_TOOLS: Record<QuickTuiRoute, readonly string[]> = {
   '조회': ['decisions_pending', 'ops_seats', 'ops_status', 'release_status', 'logs_query', 'context_now', 'memory_recall', 'Read'],
   '설정 변경': ['DashboardConfigGet', 'DashboardConfigSet', 'LlmListAvailableModels', 'prompt_getRuntimeConfig', 'prompt_setRuntimeConfig', 'view_getConfig', 'view_applyRuntimeConfig', 'view_saveConfig', 'memory_recall'],
   // MsgList is a read-only ledger listing (never acks); MsgPost · MsgAck · RunShell · Bash stay out (TUI-QUICK-ROUTE-EXPLICIT-CMD).
-  '조사': ['WebSearch', 'OmniSearch', 'Grep', 'Glob', 'Read', 'fact_check', 'memory_recall', 'MsgList', 'Agent'],
+  '조사': RESEARCH_TOOL_ALLOWLIST,
   // ScheduleWakeup (H5) wakes this TUI in-process; schedule_manage is OS cron — both belong to «상시 일».
   '상시 일': ['schedule_manage', 'schedule_list', 'schedule_create', 'schedule_update', 'ScheduleWakeup', 'session_manage', 'ops_status', 'memory_recall'],
 };
@@ -329,6 +331,7 @@ export function bridgeCoreTurnToAcp(
       // (10-14 13:48 운영 TUI OP: route short-question·goalLoop ⊕ factQuestion → 소진 뒤 헛호출 7회).
       const surfaceProfile = resolveSessionSurfaceProfile({ userText: turnCtx.userText });
       const factShaped = isFactQuestion(turnCtx.userText);
+      const researchTurn = isResearchAgentIntent(turnCtx.userText);
       // A quick research/turn lookup still keeps the fact budget. Only the
       // multi-source research/agent route needs enough rounds to compare axes.
       const factQuestion = factShaped && !armGoalLoop && surfaceProfile.id !== 'research/agent';
@@ -337,7 +340,12 @@ export function bridgeCoreTurnToAcp(
         catch { /* observation cannot interrupt a turn */ }
       }
       const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
-      const maxToolTurns = explicitMaxToolTurns ?? (factQuestion ? getUserConfig().chat.factQuestion.maxToolTurns : undefined);
+      const resolvedMaxToolTurns = explicitMaxToolTurns ?? (factQuestion
+        ? getUserConfig().chat.factQuestion.maxToolTurns
+        : researchTurn ? RESEARCH_TURN_MAX_TOOL_TURNS : undefined);
+      const maxToolTurns = researchTurn && resolvedMaxToolTurns !== undefined
+        ? Math.min(resolvedMaxToolTurns, RESEARCH_TURN_MAX_TOOL_TURNS)
+        : resolvedMaxToolTurns;
       const withFactInstruction = (seed: LLMMessage[]): LLMMessage[] => factQuestion
         ? [{ role: 'system', content: FACT_QUESTION_INSTRUCTION }, ...seed]
         : seed;
@@ -552,9 +560,7 @@ export function bridgeCoreTurnToAcp(
           onReplaceText: (full) => {
             reasoningThoughts.flush();
             streamedTextSum = full;
-            // Match the existing ACP clear/replace convention used for final synthesis.
-            void turnCtx.push('');
-            void turnCtx.push(full);
+            void turnCtx.pushWithMeta(full, { elanous: { textOperation: 'replace' } });
           },
           // P2-bridge-ext — forward tool + usage events as ACP
           // sessionUpdate notifications so extension-aware clients
@@ -725,14 +731,13 @@ export function bridgeCoreTurnToAcp(
               }
             } else if (originalFinalStreamed) {
               void turnCtx.push(followupSuffix);
+            } else if (needsReSurface && needsFollowup) {
+              // A budget follow-up is an explicit replacement of the last assistant answer,
+              // not the legacy forced-synthesis boundary used by ordinary final answers.
+              void turnCtx.pushWithMeta(visibleFinalText!, { elanous: { textOperation: 'replace' } });
             } else if (needsReSurface) {
-              // Emit a clear-then-replace pair so clients that follow
-              // the empty-chunk-as-clear convention (dashboard plain
-              // chat) reset their per-round buffer before receiving
-              // the substantive answer. The empty signal does nothing
-              // for clients that just append (web / iphone — they
-              // would only have the new finalAssistantText delta to
-              // work with anyway).
+              // Forced synthesis without a validation supplement retains the legacy clear+final
+              // boundary. Clients that treat an empty chunk as a round reset rely on this pair.
               void turnCtx.push('');
               void turnCtx.push(visibleFinalText!);
             }

@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { basename, dirname, join } from 'node:path';
 import { findGitDir } from '../git-fs/locate.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { PR_LABELS, PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { appendRunLedgerEntry, listRunLedgers, loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
@@ -161,9 +161,42 @@ const GH_MAX_BUFFER = 64 * 1024 * 1024;
  *  several times larger than this projection, so the listing asks gh to project each page down to these fields. */
 const OPEN_DRAFT_FIELDS = '[.[] | {number, title, headRefName: .head.ref, createdAt: .created_at, body, labels: [.labels[] | {name}], draft}]';
 
+interface GhFailureEvidence {
+  args: readonly string[];
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  errorCode?: string;
+  stderr: string;
+  capturedStderrBytes: number;
+  stdoutBytes: number;
+}
+
+class GhCommandError extends Error {
+  constructor(message: string, readonly evidence: GhFailureEvidence) {
+    super(message);
+    this.name = 'GhCommandError';
+  }
+}
+
+function executionSha(): string | undefined {
+  const sha = process.env.ELANOUS_EXECUTION_SHA?.trim();
+  return sha && /^[a-f0-9]{40}$/i.test(sha) ? sha : undefined;
+}
+
 function gh(args: string[]): string {
-  const result = spawnSync('gh', args, { cwd: findGitDir(process.cwd())?.root ?? process.cwd(), encoding: 'utf8', timeout: 60_000, maxBuffer: GH_MAX_BUFFER });
-  if (result.status !== 0) throw new Error((result.stderr || result.error?.message || `gh exited ${result.status}`).trim().slice(0, 200));
+  const cwd = findGitDir(process.cwd())?.root ?? process.cwd();
+  const result = spawnSync('gh', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: GH_MAX_BUFFER });
+  if (result.status !== 0) {
+    const spawnError = result.error as NodeJS.ErrnoException | undefined;
+    const stderr = result.stderr ?? '';
+    const reason = (stderr || spawnError?.message || `gh exited ${result.status}`).trim().slice(0, 200);
+    throw new GhCommandError(reason, {
+      args: [...args], status: result.status, signal: result.signal,
+      ...(spawnError?.code ? { errorCode: spawnError.code } : {}),
+      stderr: redactSecretText(stderr).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 4_000), capturedStderrBytes: Buffer.byteLength(stderr),
+      stdoutBytes: Buffer.byteLength(result.stdout ?? ''),
+    });
+  }
   return result.stdout.trim();
 }
 function ghPr(row: { number: number; title: string; headRefName: string; headRefOid?: string; isDraft?: boolean; createdAt: string; body: string; labels: Array<{ name: string }>; comments?: Array<{ body: string }>; state?: string }): ResiduePr {
@@ -233,8 +266,9 @@ export function defaultAdapters(sources: ResidueRunStatusSources = defaultRunSta
     },
     listOpenDrafts: (repository) => {
       const rows: ResiduePr[] = [];
+      let page = 0;
       try {
-        for (let page = 1; page <= 100; page++) {
+        for (page = 1; page <= 100; page++) {
           const result = JSON.parse(gh(['api', `repos/${repository}/pulls?state=open&per_page=100&page=${page}`, '--jq', OPEN_DRAFT_FIELDS])) as Array<{
             number: number; title: string; headRefName: string; createdAt: string; body: string;
             labels: Array<{ name: string }>; draft: boolean;
@@ -246,7 +280,32 @@ export function defaultAdapters(sources: ResidueRunStatusSources = defaultRunSta
         throw new Error('Open PR inventory exceeded pagination limit');
       } catch (error) {
         // «못 셌음»: a failed (or truncated) listing is unmeasurable — it must never surface as a counted zero.
-        debug.log('draft.residue', 'list-open-drafts-unobserved', { repository, reason: error instanceof Error ? error.message : String(error) });
+        const ghEvidence = error instanceof GhCommandError ? error.evidence : undefined;
+        const reason = error instanceof Error ? error.message : String(error);
+        const isEnobufs = ghEvidence?.errorCode === 'ENOBUFS' || /ENOBUFS/.test(reason);
+        const runSha = executionSha();
+        const responseBytes = !ghEvidence
+          ? { status: 'unmeasured', complete: false,
+            reason: /pagination limit/.test(reason) ? 'pagination limit reached; aggregate page response bytes were not retained'
+              : 'the failed inventory response byte count was not retained' }
+          : isEnobufs || ghEvidence.errorCode || ghEvidence.status === null || ghEvidence.signal !== null
+            ? { status: 'unmeasured', capturedBytes: ghEvidence.stdoutBytes, complete: false,
+              reason: isEnobufs ? 'spawnSync ENOBUFS truncates child output before the complete REST response length is known'
+                : ghEvidence.signal ? `child process was terminated by ${ghEvidence.signal}`
+                  : ghEvidence.status === null ? 'child exit status is unavailable, so response completeness is unknown'
+                    : 'the child process ended with an error before response completeness could be established' }
+            : { status: 'measured', bytes: ghEvidence.stdoutBytes, complete: true };
+        debug.log('draft.residue', 'list-open-drafts-unobserved', {
+          repository, reason: redactSecretText(reason), requestedPage: page <= 100 ? page : null,
+          paginationLimitExceeded: page > 100, request: ghEvidence?.args ?? null,
+          exitStatus: ghEvidence?.status ?? null, signal: ghEvidence?.signal ?? null,
+          errorCode: ghEvidence?.errorCode ?? null,
+          stderr: ghEvidence?.stderr ?? null, capturedStderrBytes: ghEvidence?.capturedStderrBytes ?? null,
+          responseBytes,
+          executionSha: runSha ? { status: 'measured', value: runSha } : {
+            status: 'unmeasured', reason: 'ELANOUS_EXECUTION_SHA is absent or invalid for this process invocation',
+          },
+        });
         return undefined;
       }
     },

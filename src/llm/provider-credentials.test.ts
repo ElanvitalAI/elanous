@@ -199,6 +199,11 @@ describe('resolveProviderCredential — 우선순위 rotation → env → (미�
       expect(ok.source).toBe('env');
     }
   });
+
+  test('runtime detector의 Grok primary alias XAI_API_KEY도 resolver가 읽는다', () => {
+    const resolved = resolveProviderCredential({ provider: 'grok', env: { XAI_API_KEY: 'xai-primary' } });
+    expect(resolved).toMatchObject({ apiKey: 'xai-primary', source: 'env', envKey: 'XAI_API_KEY' });
+  });
 });
 
 // BACKLOG B13 — 런 단위 LOCAL_LLM_URL 이 config rotation 의 local 주소를 이긴다.

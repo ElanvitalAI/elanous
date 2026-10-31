@@ -4,7 +4,7 @@ import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../../self-im
 import { podJobName, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { captureFailedPodJobs } from './pod-ledger-events.js';
+import { captureFailedPodJobs, ledgerLineToLogEvent } from './pod-ledger-events.js';
 
 const placement = { host: 'node-b', context: 'k3d-elanous-pool', namespace: 'elanous-test' };
 const jobs = ['si-incident', 'si-pool-node-b'];
@@ -31,6 +31,28 @@ function stage(rows: Array<{ event: string; data: Record<string, unknown> }>) {
 const entered = (job: string, extra: Record<string, unknown> = {}) => ({ event: 'pod-job-applied', data: { job, childRunId: `run-${job}`, jobUid: `uid-${job}`, ...placement, ...extra } });
 
 describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
+  test('pod failure 요약은 허용된 로그 projection에 실리고 credential·본문·artifact path는 제외된다', () => {
+    const event = ledgerLineToLogEvent(JSON.stringify({ runId: 'incident', event: 'pod-failure-capture', data: {
+      job: 'si-incident', jobUid: 'uid-si-incident', childRunId: 'run-si-incident', host: 'node-b', context: 'k3d-elanous-pool',
+      namespace: 'elanous-test', attempt: 2, podName: 'si-incident-pod', podUid: 'pod-si-incident', podPhase: 'Failed',
+      containerReason: 'Error', containerExitCode: -1, containerFinishedAt: '2026-10-31T01:00:00Z', containerRestartCount: 1,
+      currentLogReadStatus: 'empty', currentLogBytes: 0, previousLogReadStatus: 'captured', previousLogBytes: 82,
+      previousLogStderrCaptureStatus: 'saved', resultMarkerPresent: true, outcome: 'collected',
+      previousLogEvidence: '/private/pod-artifacts/child.previous.log', token: 'ghp_syntheticcredential12345', message: 'private terminal payload',
+    } }), 'incident');
+    expect(event?.event).toBe('pod-failure-capture');
+    expect(event?.data).toMatchObject({ runId: 'incident', job: 'si-incident', jobUid: 'uid-si-incident', childRunId: 'run-si-incident',
+      host: 'node-b', podName: 'si-incident-pod', podUid: 'pod-si-incident', podPhase: 'Failed', containerReason: 'Error',
+      containerExitCode: -1, containerFinishedAt: '2026-10-31T01:00:00Z', containerRestartCount: 1,
+      currentLogReadStatus: 'empty', currentLogBytes: 0, previousLogReadStatus: 'captured', previousLogBytes: 82,
+      previousLogStderrCaptureStatus: 'saved', resultMarkerPresent: true, outcome: 'collected' });
+    expect(event?.data.token).toBeUndefined();
+    expect(event?.data.message).toBeUndefined();
+    expect(event?.data.previousLogEvidence).toBeUndefined();
+    expect(JSON.stringify(event)).not.toContain('ghp_syntheticcredential12345');
+    expect(JSON.stringify(event)).not.toContain('private terminal payload');
+  });
+
   test('mbp incident와 pool-node-b 두 Job을 ledger placement에서 수집하고 기존 증거를 보존한다', () => {
     const s = stage([{ event: 'incident', data: { host: 'mbp' } }, ...jobs.map(job => entered(job))]);
     expect(s.rows()[0]?.data).toMatchObject({ host: 'mbp' });
@@ -125,6 +147,162 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
     expect(results.map(row => row.data.childRunId)).toEqual([`run-${job}`, 'retry-run']);
     expect(results[0]?.data.jobEvidence).not.toBe(results[1]?.data.jobEvidence);
     expect(s.calls).toHaveLength(6);
+  });
+
+  test('빈 current log 뒤 previous 로그의 터미널 요약을 attempt와 함께 기록하고 비밀·본문은 원장에 넣지 않는다', () => {
+    const job = jobs[0]!;
+    const s = stage([{ event: 'pod-child-run', data: { job, childRunId: `run-${job}`, attempt: 2 } }, entered(job)]);
+    const previous = '{"kind":"self","ok":false,"result":{"stage":"implement","ok":false,"error":"synthetic-secret ghp_syntheticcredential12345"}}\n';
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { phase: 'Failed', containerStatuses: [{ name: 'child', restartCount: 1,
+          state: { terminated: { reason: 'Error', exitCode: -1, finishedAt: '2026-10-31T01:00:00Z' } } }] },
+      }] }), stderr: '' };
+      if (args[4] === 'logs' && !args.includes('--previous')) return { status: 0, stdout: '', stderr: '' };
+      if (args[4] === 'logs' && args.includes('--previous')) return { status: 0, stdout: previous, stderr: '' };
+      return s.kubectl(host, args);
+    };
+
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record });
+    const row = s.rows().at(-1)?.data;
+    expect(row).toMatchObject({ attempt: 2, jobUid: `uid-${job}`, podName: `${job}-pod`, podUid: `pod-${job}`,
+      podPhase: 'Failed', containerReason: 'Error', containerExitCode: -1, containerFinishedAt: '2026-10-31T01:00:00Z',
+      containerRestartCount: 1, currentLogReadStatus: 'empty', currentLogBytes: 0,
+      previousLogReadStatus: 'captured', previousLogBytes: Buffer.byteLength(previous), resultMarkerPresent: true });
+    expect(readFileSync(String(row?.previousLogEvidence), 'utf8')).toBe(previous);
+    expect(JSON.stringify(row)).not.toContain('synthetic-secret');
+    expect(JSON.stringify(row)).not.toContain('ghp_syntheticcredential12345');
+    expect(s.calls.some(call => call.args[4] === 'logs' && call.args.includes('--previous'))).toBe(true);
+  });
+
+  test('빈 current·previous log와 조회 실패도 상태·바이트 0·result marker 부재로 구분한다', () => {
+    const job = jobs[0]!;
+    const s = stage([{ event: 'pod-child-run', data: { job, childRunId: `run-${job}`, attempt: 1 } }, entered(job)]);
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { phase: 'Failed', containerStatuses: [{ name: 'child', restartCount: 1,
+          state: { terminated: { reason: 'Error', exitCode: 1, finishedAt: '2026-10-31T01:00:00Z' } } }] },
+      }] }), stderr: '' };
+      if (args[4] === 'logs' && !args.includes('--previous')) return { status: 0, stdout: '', stderr: '' };
+      if (args[4] === 'logs' && args.includes('--previous')) return { status: 1, stdout: '', stderr: 'previous container logs unavailable' };
+      return s.kubectl(host, args);
+    };
+
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record });
+    expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'failed', reason: 'logs-empty', attempt: 1,
+      currentLogReadStatus: 'empty', currentLogBytes: 0, previousLogReadStatus: 'failed', previousLogBytes: 0,
+      resultMarkerPresent: false });
+    const row = s.rows().at(-1)?.data;
+    expect(JSON.stringify(row)).not.toContain('previous container logs unavailable');
+    expect(readFileSync(String(row?.previousLogStderrEvidence), 'utf8')).toBe('previous container logs unavailable');
+  });
+
+  test('previous 조회가 성공해 빈 로그면 empty로 기록하고, current 조회 실패면 previous 미측정은 unknown이다', () => {
+    const job = jobs[0]!;
+    const previousEmpty = stage([{ event: 'pod-child-run', data: { job, childRunId: `run-${job}`, attempt: 2 } }, entered(job)]);
+    const withRestart = (host: string, args: readonly string[]) => {
+      previousEmpty.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { containerStatuses: [{ name: 'child', restartCount: 1 }] },
+      }] }), stderr: '' };
+      if (args[4] === 'logs' && args.includes('--previous')) return { status: 0, stdout: ' \n', stderr: '' };
+      if (args[4] === 'logs') return { status: 0, stdout: '', stderr: '' };
+      return previousEmpty.kubectl(host, args);
+    };
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: previousEmpty.ledger, artifactDir: previousEmpty.dir, kubectl: withRestart, record: previousEmpty.record });
+    expect(previousEmpty.rows().at(-1)?.data).toMatchObject({ outcome: 'failed', reason: 'logs-empty', currentLogReadStatus: 'empty',
+      currentLogBytes: 0, previousLogReadStatus: 'empty', previousLogBytes: 2, resultMarkerPresent: false });
+
+    const currentFailed = stage([entered(job)]);
+    const failingLogs = (host: string, args: readonly string[]) => args[4] === 'logs'
+      ? { status: 1, stdout: '', stderr: 'current logs unavailable' } : currentFailed.kubectl(host, args);
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: currentFailed.ledger, artifactDir: currentFailed.dir, kubectl: failingLogs, record: currentFailed.record });
+    const failure = currentFailed.rows().at(-1)?.data;
+    expect(failure).toMatchObject({ outcome: 'failed', reason: 'logs-read-failed', currentLogReadStatus: 'failed',
+      currentLogBytes: 0, previousLogReadStatus: 'unknown', resultMarkerPresent: false, stderrCaptureStatus: 'saved' });
+    expect(failure?.previousLogBytes).toBeUndefined();
+    expect(readFileSync(String(failure?.stderrEvidence), 'utf8')).toContain('current logs unavailable');
+    expect(JSON.stringify(currentFailed.rows().at(-1)?.data)).not.toContain('current logs unavailable');
+  });
+
+  test('current 로그가 있어도 restart된 이전 로그를 읽어 marker를 포착하고 logEvidence는 current를 가리킨다', () => {
+    const job = jobs[0]!;
+    const s = stage([{ event: 'pod-child-run', data: { job, childRunId: `run-${job}`, attempt: 2 } }, entered(job)]);
+    const previous = '{"kind":"self","ok":true,"result":{"stage":"complete","ok":true}}\n';
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { containerStatuses: [{ name: 'child', restartCount: 1 }] },
+      }] }), stderr: '' };
+      if (args[4] === 'logs' && args.includes('--previous')) return { status: 0, stdout: previous, stderr: '' };
+      if (args[4] === 'logs') return { status: 0, stdout: 'current container restarted\n', stderr: '' };
+      return s.kubectl(host, args);
+    };
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record });
+    const row = s.rows().at(-1)?.data;
+    expect(row).toMatchObject({ outcome: 'collected', currentLogReadStatus: 'captured', previousLogReadStatus: 'captured', resultMarkerPresent: true });
+    expect(readFileSync(String(row?.logEvidence), 'utf8')).toBe('current container restarted\n');
+    expect(readFileSync(String(row?.previousLogEvidence), 'utf8')).toBe(previous);
+    rmSync(String(row?.logEvidence));
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record });
+    const recaptured = s.rows().at(-1)?.data;
+    expect(recaptured?.outcome).toBe('collected');
+    expect(readFileSync(String(recaptured?.logEvidence), 'utf8')).toBe('current container restarted\n');
+    expect(s.calls).toHaveLength(10);
+  });
+
+  test('current 조회 실패와 previous 캡처가 함께 있으면 current stderr를 보존하고 재시도 때 재조회한다', () => {
+    const job = jobs[0]!;
+    const s = stage([{ event: 'pod-child-run', data: { job, childRunId: `run-${job}`, attempt: 2 } }, entered(job)]);
+    const previous = 'prior container details\n';
+    let currentReadCount = 0;
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { containerStatuses: [{ name: 'child', restartCount: 1 }] },
+      }] }), stderr: '' };
+      if (args[4] === 'logs' && args.includes('--previous')) return { status: 0, stdout: previous, stderr: '' };
+      if (args[4] === 'logs') { currentReadCount += 1; return { status: 1, stdout: '', stderr: `current read ${currentReadCount} unavailable` }; }
+      return s.kubectl(host, args);
+    };
+    const input = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record };
+    captureFailedPodJobs(input);
+    const first = s.rows().at(-1)?.data;
+    expect(first).toMatchObject({ outcome: 'collected', currentLogReadStatus: 'failed', previousLogReadStatus: 'captured' });
+    expect(readFileSync(String(first?.stderrEvidence), 'utf8')).toContain('current read 1 unavailable');
+    captureFailedPodJobs(input);
+    expect(currentReadCount).toBe(2);
+  });
+
+  test('current capture 뒤 previous 조회 실패는 다음 호출에서 previous 읽기를 재시도한다', () => {
+    const job = jobs[0]!;
+    const s = stage([{ event: 'pod-child-run', data: { job, childRunId: `run-${job}`, attempt: 2 } }, entered(job)]);
+    let previousReadCount = 0;
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { containerStatuses: [{ name: 'child', restartCount: 1 }] },
+      }] }), stderr: '' };
+      if (args[4] === 'logs' && args.includes('--previous')) {
+        previousReadCount += 1;
+        return { status: 1, stdout: '', stderr: `previous read ${previousReadCount} unavailable` };
+      }
+      if (args[4] === 'logs') return { status: 0, stdout: 'current log captured\n', stderr: '' };
+      return s.kubectl(host, args);
+    };
+    const input = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record };
+    captureFailedPodJobs(input);
+    expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'collected', currentLogReadStatus: 'captured', previousLogReadStatus: 'failed' });
+    captureFailedPodJobs(input);
+    expect(previousReadCount).toBe(2);
   });
 
   test('이미 수집된 증거는 다른 bytes로 덮지 않고 실패를 기록한다', () => {

@@ -3,8 +3,12 @@
  *  Unlike `dispatchHeavyCheck` it never falls back to a local run: a busy host or an infra failure is «unmeasured».
  *  The only local commands are git (cat-file · rev-parse · push · diff). */
 import { debug } from '../debug/log.js';
+import { spawnSync } from 'node:child_process';
 import { parseGateScenario, readGateScenarioFile } from './gate-scenario.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
+import { join } from 'node:path';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
+import { saveGateReceipt, type GateReceipt } from './gate-receipt-registry.js';
 import {
   gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote,
   type GateRemoteRunner, type GateRemoteSettings, type RemoteRunOutcome,
@@ -30,6 +34,51 @@ export interface TrainGateInput {
 
 export interface TrainGateResult { outcome: TrainGateOutcome; host: string; ms?: number; rc?: number; reason?: string }
 
+const GATE_RECEIPTS_MARKER = String.fromCharCode(10) + '__GATE_RECEIPTS__';
+
+function sharedGateReceiptPath(repo: string, runner: GateRemoteRunner): string | undefined {
+  try {
+    const result = runner.local('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], repo);
+    const commonDir = result.stdout.trim();
+    return result.rc === 0 && commonDir ? join(commonDir, 'elanous-host-regate', 'gate-receipts.json') : undefined;
+  } catch { return undefined; }
+}
+
+/** The exact persistent registry used by local train receipt merging. */
+export function gateReceiptRegistryPathForRepo(repo: string): string | undefined {
+  const result = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+    cwd: repo, encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
+  const commonDir = (result.stdout ?? '').trim();
+  return result.status === 0 && commonDir ? join(commonDir, 'elanous-host-regate', 'gate-receipts.json') : undefined;
+}
+
+/** Merge the existing remote-writer marker into the local common-dir registry. Invalid rows fail closed. */
+export function mergeGateReceiptRegistryPayload(payload: string, path: string): number {
+  let saved = 0;
+  try {
+    const rows = JSON.parse(Buffer.from(payload, 'base64').toString('utf8')) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(rows)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const receipt = value as GateReceipt;
+      if (receipt.key !== key) continue;
+      try { saveGateReceipt(path, receipt); saved++; }
+      catch { /* Invalid remote records are discarded; local gates remain fail-open. */ }
+    }
+  } catch { /* A malformed response never changes the measured gate verdict. */ }
+  return saved;
+}
+
+function mergeReturnedReceipts(outcome: RemoteRunOutcome, path: string | undefined): RemoteRunOutcome {
+  if (outcome.kind !== 'ran' || outcome.rc !== 0 || !path) return outcome;
+  const stdout = outcome.stdout.toString('utf8');
+  const marker = stdout.lastIndexOf(GATE_RECEIPTS_MARKER);
+  if (marker < 0) return outcome;
+  const payload = stdout.slice(marker + GATE_RECEIPTS_MARKER.length).trim();
+  mergeGateReceiptRegistryPayload(payload, path);
+  return { ...outcome, stdout: Buffer.from(stdout.slice(0, marker)) };
+}
+
 export interface TrainGateObservation {
   host: string; commit: string; baseSha: string; outcome: TrainGateOutcome;
   rc?: number; ms?: number; reason?: string; changedFiles: number;
@@ -40,22 +89,6 @@ export interface TrainGateDeps {
   now?: () => number;
   /** Observation sink (default: category `merge-queue` in the log store, so a standalone CLI records it too). */
   observe?: (entry: TrainGateObservation) => void;
-}
-
-const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
-const TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
-
-/** The host-side shell body: each step runs only if the one before it passed. Exported for tests. */
-export function trainGateScript(baseSha: string, changedFiles: readonly string[], deleted: ReadonlySet<string> = new Set(), scenarioTests: readonly string[] = []): string {
-  // A deleted test file is a changed path (tsc/PWA reach) but not something to run.
-  const changedTests = changedFiles.filter((file) => TEST_FILE.test(file) && !deleted.has(file));
-  const tests = scenarioTests.length ? [...new Set([...changedTests, ...scenarioTests])] : changedTests;
-  const steps = [
-    `TSC_BASE_REF=${quote(baseSha)} bun scripts/ci-typecheck-changed.ts --local`,
-    ...(tests.length ? [`bun run test:deterministic ${tests.map(quote).join(' ')}`] : []),
-    `bun scripts/ci-pwa-build-gate.ts --changed-files ${changedFiles.map(quote).join(' ')}`,
-  ];
-  return steps.join(' && ');
 }
 
 async function loadSettings(): Promise<GateRemoteSettings> {
@@ -76,6 +109,10 @@ export const TRAIN_GATE_HOST = 'node-b';
 
 export async function runTrainGateOnHost(input: TrainGateInput, runner: GateRemoteRunner = realGateRemoteRunner, deps: TrainGateDeps = {}): Promise<TrainGateResult> {
   const settings = input.settings ?? await loadSettings();
+  const receiptPath = sharedGateReceiptPath(input.repo, runner);
+  // Each remote full gate writes into a fresh scratch registry; returned rows merge into the local shared registry.
+  // No existing registry contents are needed for receipt registration.
+  const payloadFiles = receiptPath ? [{ env: 'ELANOUS_GATE_RECEIPT_REGISTRY_PATH', content: '{}' }] : undefined;
   const host = settings.host;
   const hostCap = gateRemoteHostCap(settings, host);
   let scenarioTests: string[] = [];
@@ -110,14 +147,21 @@ export async function runTrainGateOnHost(input: TrainGateInput, runner: GateRemo
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now;
   const deadline = now() + settings.slotWaitSeconds * 1000;
-  const script = trainGateScript(input.baseSha, input.changedFiles, new Set(input.deletedFiles ?? []), scenarioTests);
   let outcome: RemoteRunOutcome;
   for (;;) {
     try {
       outcome = runOnRemote({
         repo: input.repo, host, mirror: settings.mirror, commit: input.commit, refs: [input.baseSha],
-        argv: ['sh', '-c', script], installPwa: true, hostCap,
+        argv: ['bun', 'src/self-implement/train-gate-receipt.ts', JSON.stringify({
+          repo: input.repo,
+          commit: input.commit,
+          baseSha: input.baseSha,
+          changedFiles: input.changedFiles,
+          deletedFiles: input.deletedFiles ?? [],
+          scenarioTests,
+        })], installPwa: true, hostCap, ...(payloadFiles ? { payloadFiles } : {}),
       }, runner);
+      outcome = mergeReturnedReceipts(outcome, receiptPath);
     } catch (error) {
       outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
     }

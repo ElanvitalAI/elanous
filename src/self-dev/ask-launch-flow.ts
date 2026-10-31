@@ -29,8 +29,10 @@ import {
   renderConcurrentAuthoringNotice,
   renderLaunchPreflight,
   renderRepeatedBlockNotice,
+  renderSiblingContextLines,
   siblingTestPath,
   type AskPreflightDeps,
+  type SiblingContextCard,
   type LaunchPreflightResult,
   type PriorBlockSample,
   type RecentAuthoringSample,
@@ -245,6 +247,8 @@ export interface AskLaunchFlowInput {
   readonly goalType?: import('../self-implement/goal-author.js').GoalType;
   /** 런 식별자가 이미 있으면 앞단 관측을 그 키로 잇는다. 없으면 관측은 runId 없이 남는다. */
   readonly runId?: string;
+  /** CARD-TARGET-PATHS가 제공한 같은-경로 카드 관측. 발사 판정에는 쓰지 않는다. */
+  readonly cardsTouchingPaths?: readonly SiblingContextCard[];
   /** Explicit harness choice; false is distinct from omission. */
   readonly selfResolveClarifications?: boolean;
 }
@@ -257,6 +261,18 @@ export type AskLaunchFlowResult =
   | { readonly kind: 'stopped-by-preflight'; readonly goalFile: string; readonly blockers: LaunchPreflightResult['blockers'] }
   /** ⑴ 저작에서 접지 예산(AUTHOR-TIMEBOX)을 넘겨 NOT-GROUNDED 로 끝났다 — 발사하지 «않는다». */
   | { readonly kind: 'stopped-by-timebox'; readonly goalFile: string };
+
+/**
+ * A harness entry can be named inside a request whose operative instruction is
+ * explicitly read-only. Require both a read-only marker and a no-write marker;
+ * either alone is too broad (for example, implementing a read-only feature).
+ */
+function isExplicitReadOnlyNoWriteRequest(text: string): boolean {
+  const normalized = text.normalize('NFKC').toLowerCase();
+  const readOnly = /(?:read[\s-]*only|readonly|읽기\s*전용|읽기만|파일\s*존재\s*여부만|상태만\s*확인)/u.test(normalized);
+  const noWrite = /(?:수정하지\s*마|변경하지\s*마|변경\s*금지|파일을?\s*만들지\s*마|쓰지\s*마|편집하지\s*마|no\s+(?:file\s+)?changes?|do\s+not\s+(?:edit|modify|write|create)|don't\s+(?:edit|modify|write|create)|without\s+(?:editing|modifying|writing)|\bcommit\b.{0,24}(?:하지\s*마|금지)|\bpush\b.{0,24}(?:하지\s*마|금지)|\bpr\b.{0,24}(?:하지\s*마|금지))/u.test(normalized);
+  return readOnly && noWrite;
+}
 
 /** ⑴ AUTHOR-TIMEBOX NOT-GROUNDED — 결과 줄을 쓰고 흐름을 끊는 값. */
 export type AskLaunchFlowTimeboxStop = Extract<AskLaunchFlowResult, { kind: 'stopped-by-timebox' }>;
@@ -858,8 +874,22 @@ export async function runAskLaunchFlow(
     // ⛔ 이 목록은 «광고»다 — 실제 단계와 어긋나면 조회하는 사람이 없는 단계를 찾거나 있는 단계를 안 찾는다.
     // ⛔ 분해 단계는 «두 이름 중 하나»로 난다 — 켜졌으면 `…-decomposition`, 꺼졌으면 `…-decomposition-skipped`.
     //   ⭐ 뒤엣것을 빼 두면 조회하는 사람이 「분해 관측이 0건이다」를 보고 «없어졌다»로 읽는다(실은 꺼진 것이다).
-    steps: ['ask-start', 'ask-pre-preflight', 'ask-authored', 'ask-launching-tree', 'ask-preflight', 'ask-launch-decomposition', 'ask-launch-decomposition-skipped', 'ask-launch'],
+    steps: ['ask-start', 'ask-readonly-no-launch', 'ask-pre-preflight', 'ask-authored', 'ask-launching-tree', 'ask-preflight', 'ask-launch-decomposition', 'ask-launch-decomposition-skipped', 'ask-launch'],
   }, 'info');
+
+  if (isExplicitReadOnlyNoWriteRequest(input.askText)) {
+    deps.log('ask-readonly-no-launch', {
+      entrance: entrance.id,
+      surface: entrance.surface,
+      inputSource: input.inputSource,
+      runId: input.runId ?? process.env.ELANOUS_RUN_ID ?? null,
+      authoringSkipped: true,
+      launchSkipped: true,
+      completionModeSelected: false,
+    }, 'info');
+    deps.print('[ask] 읽기 전용·변경 금지 요청으로 판정해 구현·자동 병합을 시작하지 않았습니다. TUI 읽기 도구로 결과만 확인하세요.');
+    return { kind: 'stopped-before-authoring' };
+  }
 
   const launchPreflight = await runPrePreflight(input, deps);
   if (launchPreflight === false) return { kind: 'stopped-before-authoring' };
@@ -1036,6 +1066,47 @@ export async function runAskLaunchFlow(
     const preflight = decision.result;
     deps.print(renderLaunchPreflight(preflight, input.forceRequested && decision.shouldLaunch && preflight.blockers.length > 0, 'before-launch'));
     observeLaunchPreflight(deps, 'before-launch', decision);
+    let siblingCards = input.cardsTouchingPaths;
+    let siblingCardsUnmeasured = false;
+    if (siblingCards === undefined && preflight.paths.length > 0) {
+      try {
+        // CARD-TARGET-PATHS is a read-only signal: production entrances use the shared task-card store when
+        // no caller supplied a precomputed snapshot. The launch decision never depends on these matches.
+        const taskHand = await import('../task-agent/task-hand.js');
+        const state = taskHand.readTaskAgentState<{ tasks?: Record<string, import('../task-agent/task-hand.js').TaskCard> }>(taskHand.taskAgentStatePath());
+        siblingCards = taskHand.cardsTouchingPaths(Object.values(state.tasks ?? {}), preflight.paths)
+          .map(({ card, runId, paths }) => ({ cardId: card.id, ...(runId ? { runId } : {}), overlapPaths: paths }));
+      } catch (error) {
+        siblingCardsUnmeasured = true;
+        try { debug.log('self-dev.ask', 'sibling-context-cards-unmeasured', { reason: error instanceof Error ? error.message : String(error) }); }
+        catch { /* supplemental card context remains fail-soft */ }
+        siblingCards = [];
+      }
+    }
+    const siblingContextLines = renderSiblingContextLines(preflight, siblingCards);
+    const recentLanded = preflight.warnings.filter((warning) => warning.kind === 'recent-change' && preflight.paths.includes(warning.name)).length;
+    const siblingContextObservation = {
+      liveRuns: preflight.warnings.filter((warning) => warning.kind === 'live-run').length,
+      openPrs: preflight.warnings.filter((warning) => warning.kind === 'open-pr' || warning.kind === 'sibling-pr').length,
+      recentLanded,
+      unmeasured: siblingCardsUnmeasured || preflight.liveRuns.state === 'unknown' || preflight.openPrs.state === 'unknown' || preflight.recentChanges.state === 'unknown' || preflight.unreadableRuns > 0,
+    };
+    try { debug.log('self-dev.ask', 'sibling-context', siblingContextObservation); }
+    catch { /* sibling context observation must not change launch */ }
+    if (!sanitizeFailed && existsSync(goalFile)) {
+      try {
+        const document = deps.readFile(goalFile);
+        const firstSection = document.search(/^## /mu);
+        const header = siblingContextLines.join('\n');
+        const beforeFirstSection = firstSection < 0 ? document : document.slice(0, firstSection).trimEnd();
+        const contextualized = firstSection < 0
+          ? `${header}\n\n${document}`
+          : `${beforeFirstSection ? `${beforeFirstSection}\n` : ''}${header}\n형제가 같은 파일을 고친다 — 국소 변경만 · 무관 포맷 금지 · 자기 의도를 시험으로 고정\n\n${document.slice(firstSection)}`;
+        (deps.writeGoalDocument ?? deps.writeFile)(goalFile, contextualized);
+      } catch (error) {
+        deps.print(`[ask] 형제 맥락 기록 못 남김 (${error instanceof Error ? error.message : String(error)})`);
+      }
+    }
     // ⛔ 자식 격리 worktree를 만들기 전, 이 흐름을 호출한 작업 트리에서만 센다.
     //    이 관측은 발사 판정의 입력이 아니다 — 의도적으로 옛 판에서 쏘는 경우도 있다.
     const invokerBehindDefaultBranch = deps.measureInvokerBehindDefaultBranch?.()

@@ -1,12 +1,13 @@
 // Research-only native fanout. The caller supplies Bloom's question ladder;
 // each axis gets its own direct tool call and evidence stays attributed to it.
 import type { BloomResearchQuestion, ResearchEvidenceEnvelope } from '../auto-research/question-ladder-contract.js';
-import { getAvailableWebSearchProviders } from '../web-search/index.js';
+import { getAvailableResearchWebSearchProviders } from '../web-search/index.js';
 import type { WebSearchHit, WebSearchProvider } from '../web-search/provider.js';
 import { debug } from '../debug/log.js';
 
-const RESEARCH_SEARCH_ENGINES = ['grok', 'grok-api', 'firecrawl'] as const;
-const RESEARCH_GROK_TIMEOUT_MS = 8_000;
+const RESEARCH_SEARCH_ENGINES = ['exa', 'firecrawl'] as const;
+const RESEARCH_WEB_FALLBACK_IDS = ['exa', 'firecrawl'] as const;
+const RESEARCH_EXA_TIMEOUT_MS = 4_500;
 // Leave scheduler/logging headroom under the user-visible 15s aggregate cap.
 export const RESEARCH_SEARCH_BUDGET_MS = 14_500;
 const ENGINE_BREAKER_FAILURE_LIMIT = 2;
@@ -33,11 +34,16 @@ export interface AxisSearchResult {
   hits: AxisSearchHit[];
   errors: string[];
 }
-export type AxisSearch = (query: string, signal?: AbortSignal) => Promise<AxisSearchHit[] | AxisSearchResult>;
+export interface AxisSearchContext {
+  questionPrompt?: string;
+  requestedWindow?: string;
+}
+export type AxisSearch = (query: string, signal?: AbortSignal, context?: AxisSearchContext) => Promise<AxisSearchHit[] | AxisSearchResult>;
 
 export interface AxisFanoutDeps {
   search?: AxisSearch;
   signal?: AbortSignal;
+  admitToolCall?: (toolName: 'OmniSearch') => boolean;
 }
 
 interface ProviderHealth {
@@ -45,20 +51,16 @@ interface ProviderHealth {
   open: boolean;
 }
 
-/** Build one bounded searcher per research prepass. Free/DDG is deliberately
- * excluded: it is not a safe fallback for stock research and can consume a
- * full 15s timeout for every query. Per-engine serialization lets the first
- * timeout open that engine's breaker before queued Bloom axes start. */
+/** Build one bounded searcher per research prepass. Research uses only the
+ * sequential Exa → Firecrawl fallback; Grok is reserved for explicit X intent.
+ * Per-engine serialization lets a timeout open that engine's
+ * breaker before queued Bloom axes start. */
 export function createResearchAxisSearcher(
-  availableProviders: readonly WebSearchProvider[] = getAvailableWebSearchProviders(),
+  availableProviders: readonly WebSearchProvider[] = getAvailableResearchWebSearchProviders(),
   now: () => number = Date.now,
 ): AxisSearch {
-  const grok = availableProviders.find(provider => provider.id === 'grok')
-    ?? availableProviders.find(provider => provider.id === 'grok-api');
-  const allowed = [
-    ...(grok ? [grok] : []),
-    ...availableProviders.filter(provider => provider.id === 'firecrawl'),
-  ];
+  const webFallback = RESEARCH_WEB_FALLBACK_IDS.flatMap(id => availableProviders.filter(provider => provider.id === id));
+  const allowed = [...webFallback];
   const health = new Map(allowed.map(provider => [provider.id, { failures: 0, open: false }]));
   const deadline = now() + RESEARCH_SEARCH_BUDGET_MS;
   const tails = new Map<string, Promise<void>>();
@@ -81,23 +83,18 @@ export function createResearchAxisSearcher(
   return async (query, signal) => {
     const hits: AxisSearchHit[] = [];
     const errors: string[] = [];
-    const selected = allowed.filter(provider => !health.get(provider.id)?.open);
-    if (selected.length === 0) return { hits, errors: ['no healthy Grok/Firecrawl research provider'] };
-
-    await Promise.all(selected.map(provider => enqueue(provider.id, async () => {
+    const execute = async (provider: WebSearchProvider): Promise<boolean> => enqueue(provider.id, async () => {
       const state = health.get(provider.id)!;
-      if (state.open) return;
+      if (state.open) return false;
       const remainingMs = deadline - now();
       if (remainingMs <= 0) {
         state.open = true;
         errors.push(`${provider.id}: research search budget exhausted`);
-        return;
+        return false;
       }
-      const activeCount = Math.max(1, allowed.filter(candidate => !health.get(candidate.id)?.open).length);
-      const isGrok = provider.id === 'grok' || provider.id === 'grok-api';
-      const timeoutMs = isGrok
-        ? Math.min(RESEARCH_GROK_TIMEOUT_MS, remainingMs)
-        : Math.max(1, Math.floor(remainingMs / activeCount));
+      const timeoutMs = provider.id === 'exa'
+        ? Math.min(RESEARCH_EXA_TIMEOUT_MS, remainingMs)
+        : remainingMs;
       const startedAt = now();
       try {
         const controller = new AbortController();
@@ -131,6 +128,7 @@ export function createResearchAxisSearcher(
           provider: provider.id, queryLength: query.length, hits: result.hits.length,
           durationMs: now() - startedAt, breakerOpen: state.open,
         });
+        return result.hits.length > 0;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const timeout = error instanceof Error && /timeout|timed out|abort/i.test(`${error.name} ${error.message}`);
@@ -142,8 +140,16 @@ export function createResearchAxisSearcher(
           provider: provider.id, queryLength: query.length, durationMs: now() - startedAt,
           timeout, quota, failures: state.failures, breakerOpen: state.open,
         }, { level: 'warn' });
+        return false;
       }
-    })));
+    });
+    const runWebFallback = async (): Promise<void> => {
+      for (const provider of webFallback) {
+        if (!health.get(provider.id)?.open && await execute(provider)) return;
+      }
+    };
+    await runWebFallback();
+    if (hits.length === 0 && errors.length === 0) errors.push('no healthy Exa/Firecrawl research provider');
     return { hits, errors };
   };
 }
@@ -195,7 +201,16 @@ export async function fanOutAxisEvidence(
     throw new Error('research axis question IDs must be unique');
   }
   const search = deps.search ?? createResearchAxisSearcher();
-  const settled = await Promise.allSettled(plan.map(call => search(call.query, deps.signal)));
+  const settled = await Promise.allSettled(plan.map(call => {
+    if (deps.admitToolCall && !deps.admitToolCall('OmniSearch')) {
+      return Promise.resolve({ hits: [], errors: ['research tool budget reached'] } satisfies AxisSearchResult);
+    }
+    const question = questions.find(candidate => candidate.id === call.questionId)!;
+    return search(call.query, deps.signal, {
+      questionPrompt: question.prompt,
+      requestedWindow: question.requestedWindow,
+    });
+  }));
   const axes: AxisEvidenceGroup[] = questions.map(question => ({ questionId: question.id, evidence: [] }));
   const groups = new Map(axes.map(axis => [axis.questionId, axis]));
   const byQuestion = new Map(questions.map(question => [question.id, question]));

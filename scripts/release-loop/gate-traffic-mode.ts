@@ -1,11 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 
-type TrafficBoard = Record<string, unknown> & { global: string };
+type TrafficBoard = Record<string, unknown> & { global: string; seats?: Record<string, Record<string, unknown>> };
 type PatchResult = { changed: true; previous: string; warning?: string } | { changed: false; current: string };
+type PwaSnapshot = { reason: unknown; hadReason: boolean; updatedAt: unknown; hadUpdatedAt: boolean; activeUpdatedAt: string;
+  heavyLocalBan: unknown; hadHeavyLocalBan: boolean;
+  perCycle: Record<string, { value: unknown; hadValue: boolean }> };
+type PwaPatchResult = { changed: true; previous: PwaSnapshot; warning?: string };
+const RELEASE_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
+const PWA_PER_CYCLE = 3;
+const MAX_PWA_TRAFFIC_BACKUPS_PER_KIND = 10;
 
 const defaultTrafficPath = () => join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'traffic.json');
 const trafficPath = (env: NodeJS.ProcessEnv) => env.ELANOUS_TRAFFIC_SIGNAL || defaultTrafficPath();
@@ -16,6 +23,17 @@ function releaseGateContext(env: NodeJS.ProcessEnv): boolean {
   try {
     const raw = JSON.parse(source.trimStart().startsWith('{') ? source : readFileSync(source, 'utf8')) as Record<string, unknown>;
     return raw.graphId === 'release-loop' && raw.nodeId === 'gate';
+  } catch {
+    return false;
+  }
+}
+
+function releasePwaContext(env: NodeJS.ProcessEnv): boolean {
+  const source = env.ELANOUS_GRAPH_CONTEXT;
+  if (!source) return false;
+  try {
+    const raw = JSON.parse(source.trimStart().startsWith('{') ? source : readFileSync(source, 'utf8')) as Record<string, unknown>;
+    return raw.graphId === 'release-loop' && raw.nodeId === 'pwa';
   } catch {
     return false;
   }
@@ -84,6 +102,136 @@ function patchGlobal(path: string, next: string, reason: string, onlyIf?: string
     }
     return { changed: true, previous: board.global };
   });
+}
+
+function writeTrafficBoard(path: string, after: TrafficBoard, suffix: string): void {
+  const at = new Date();
+  const stamp = [at.getMonth() + 1, at.getDate(), at.getHours(), at.getMinutes(), at.getSeconds()].map(value => String(value).padStart(2, '0')).join('');
+  writeFileSync(`${path}.bak-${stamp}-${randomUUID().slice(0, 8)}-${suffix}`, readFileSync(path));
+  const temp = `${path}.tmp.${process.pid}.${randomUUID()}`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(after, null, 2)}\n`, { mode: statSync(path).mode & 0o777 });
+    renameSync(temp, path);
+  } finally { rmSync(temp, { force: true }); }
+  // Re-read after the atomic rename so a malformed write is visible to the caller.
+  JSON.parse(readFileSync(path, 'utf8')) as TrafficBoard;
+  if (suffix.startsWith('release-pwa-')) {
+    try { pruneTrafficBackups(path, suffix); }
+    catch (error) { debug.log('release-loop.pwa', 'traffic backup pruning failed', { path, suffix, error: String(error) }, { level: 'warn' }); }
+  }
+}
+
+function pruneTrafficBackups(path: string, suffix: string): void {
+  const directory = dirname(path);
+  const prefix = `${basename(path)}.bak-`;
+  const backups = readdirSync(directory)
+    .filter(name => name.startsWith(prefix) && name.endsWith(`-${suffix}`))
+    .map(name => ({ path: join(directory, name), modifiedAt: statSync(join(directory, name)).mtimeMs }))
+    .sort((a, b) => a.modifiedAt - b.modifiedAt);
+  for (const backup of backups.slice(0, Math.max(0, backups.length - MAX_PWA_TRAFFIC_BACKUPS_PER_KIND))) {
+    rmSync(backup.path, { force: true });
+  }
+}
+
+function patchPwaTraffic(path: string): PwaPatchResult {
+  return withTrafficLock(path, () => {
+    if (!existsSync(path)) throw new Error(`traffic board missing: ${path}`);
+    const board = JSON.parse(readFileSync(path, 'utf8')) as TrafficBoard;
+    if (!board || typeof board !== 'object' || Array.isArray(board) || typeof board.global !== 'string'
+      || !board.seats || typeof board.seats !== 'object' || Array.isArray(board.seats)
+      || !RELEASE_SEATS.every(seat => board.seats![seat] && typeof board.seats![seat] === 'object' && !Array.isArray(board.seats![seat]))) {
+      throw new Error(`invalid traffic board for PWA policy: ${path}`);
+    }
+    const activeUpdatedAt = new Date().toISOString();
+    const previous: PwaSnapshot = {
+      hadReason: Object.hasOwn(board, 'reason'), reason: board.reason,
+      hadUpdatedAt: Object.hasOwn(board, 'updatedAt'), updatedAt: board.updatedAt, activeUpdatedAt,
+      hadHeavyLocalBan: Object.hasOwn(board, 'heavyLocalBan'), heavyLocalBan: board.heavyLocalBan,
+      perCycle: Object.fromEntries(RELEASE_SEATS.map(seat => [seat, {
+        hadValue: Object.hasOwn(board.seats![seat]!, 'perCycle'), value: board.seats![seat]!.perCycle,
+      }])),
+    };
+    const updated: TrafficBoard = {
+      ...board,
+      ...(board.heavyLocalBan === true ? {} : { reason: 'release PWA node running (heavy-local banned)' }),
+      heavyLocalBan: true,
+      seats: Object.fromEntries(Object.entries(board.seats).map(([seat, value]) => [seat,
+        RELEASE_SEATS.includes(seat as typeof RELEASE_SEATS[number]) ? { ...value, perCycle: PWA_PER_CYCLE } : value])),
+      updatedAt: activeUpdatedAt,
+    };
+    writeTrafficBoard(path, updated, 'release-pwa-policy');
+    return { changed: true, previous };
+  });
+}
+
+function restorePwaTraffic(path: string, previous: PwaSnapshot): { restored: boolean; reason?: string } {
+  return withTrafficLock(path, () => {
+    const board = JSON.parse(readFileSync(path, 'utf8')) as TrafficBoard;
+    if (!board || typeof board !== 'object' || Array.isArray(board) || !board.seats || typeof board.seats !== 'object') {
+      throw new Error(`invalid traffic board while restoring PWA policy: ${path}`);
+    }
+    // If another writer removed/replaced our marker, that writer owns the current policy.
+    if (board.heavyLocalBan !== true) return { restored: false, reason: 'heavyLocalBan-changed' };
+    const seats = { ...board.seats };
+    for (const seat of RELEASE_SEATS) {
+      const current = seats[seat];
+      const snapshot = previous.perCycle[seat];
+      if (!current || current.perCycle !== PWA_PER_CYCLE) continue;
+      const restored = { ...current };
+      if (snapshot?.hadValue) restored.perCycle = snapshot.value;
+      else delete restored.perCycle;
+      seats[seat] = restored;
+    }
+    const updated: TrafficBoard = { ...board, seats };
+    if (previous.hadHeavyLocalBan) updated.heavyLocalBan = previous.heavyLocalBan;
+    else delete updated.heavyLocalBan;
+    if (updated.reason === 'release PWA node running (heavy-local banned)') {
+      if (previous.hadReason) updated.reason = previous.reason;
+      else delete updated.reason;
+    }
+    if (board.updatedAt === previous.activeUpdatedAt) {
+      if (previous.hadUpdatedAt) updated.updatedAt = previous.updatedAt;
+      else delete updated.updatedAt;
+    }
+    writeTrafficBoard(path, updated, 'release-pwa-restore');
+    return { restored: true };
+  });
+}
+
+/** Apply the release PWA node's temporary half-traffic and heavy-local marker, restoring on every exit. */
+export async function runWithReleasePwaTraffic<T>(env: NodeJS.ProcessEnv, run: () => Promise<T>): Promise<T> {
+  if (!releasePwaContext(env)) return run();
+  const path = trafficPath(env);
+  let started: PwaPatchResult;
+  try { started = patchPwaTraffic(path); }
+  catch (error) {
+    debug.log('release-loop.pwa', 'traffic policy set failed', { path, error: String(error) }, { level: 'warn' });
+    throw new Error(`release PWA traffic policy could not be applied: ${String(error)}`, { cause: error });
+  }
+  if (started.warning) debug.log('release-loop.pwa', 'traffic policy verification failed', { path, error: started.warning }, { level: 'warn' });
+  let restoreResult: Promise<void> | undefined;
+  const restoreOnce = () => restoreResult ??= Promise.resolve().then(() => {
+    try {
+      const restored = restorePwaTraffic(path, started.previous);
+      if (!restored.restored) debug.log('release-loop.pwa', 'traffic policy restore skipped', { path, reason: restored.reason }, { level: 'warn' });
+    } catch (error) { debug.log('release-loop.pwa', 'traffic policy restore failed', { path, error: String(error) }, { level: 'warn' }); }
+  });
+  const interrupt = (signal: NodeJS.Signals) => {
+    void restoreOnce().finally(() => {
+      process.removeListener(signal, signal === 'SIGINT' ? onSigint : onSigterm);
+      process.kill(process.pid, signal);
+    });
+  };
+  const onSigint = () => interrupt('SIGINT');
+  const onSigterm = () => interrupt('SIGTERM');
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
+  try { return await run(); }
+  finally {
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
+    await restoreOnce();
+  }
 }
 
 /** Hold dispatcher traffic at gate only for the release-loop's gate node, then restore conditionally. */

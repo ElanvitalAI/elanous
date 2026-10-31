@@ -9,6 +9,7 @@ export interface ResearchCliDeps {
   readonly availableEngines?: () => string[];
   readonly maxDetailOn?: (runId?: string) => boolean;
   readonly log?: typeof debug.log;
+  readonly registerLogSink?: (surface: string) => Promise<unknown>;
 }
 
 export function registerResearchCommand(program: Command, deps: ResearchCliDeps = {}): void {
@@ -30,6 +31,14 @@ export function registerResearchCommand(program: Command, deps: ResearchCliDeps 
         process.exitCode = 2;
         return;
       }
+
+      // 독립 CLI 프로세스는 데몬의 StoreSink 를 상속하지 않는다. Sink 등록이 없으면
+      // debug.log 이벤트가 파일 trail 에만 남아 `eln logs` 에서 관측되지 않는다.
+      try {
+        const register = deps.registerLogSink
+          ?? (async (surface: string) => (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink(surface));
+        await register('research');
+      } catch { /* fail-open: logging must not prevent research */ }
 
       const log = deps.log ?? ((category: string, event: string, data?: unknown) => debug.log(category, event, data));
       const maxDetailOn = deps.maxDetailOn ?? isLiveDetailOn;

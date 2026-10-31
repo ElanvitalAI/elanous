@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addItem, listChecklist, setItem } from '../../src/release-loop/checklist.js';
@@ -9,7 +9,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-co
 import { setSchedule } from '../../src/release-loop/release-schedule.js';
 import { releaseReadiness } from './release-readiness.js';
 import { cutChecklistGate } from '../../src/release-loop/checklist.js';
-import { cadencePublishAt, formatPreflight, isPostPublishCell, releaseGateMeasure, releasePreflight, type PreflightDeps } from './preflight.js';
+import { cadencePublishAt, formatCountdown, formatPreflight, formatReleaseCountdown, isPostPublishCell, releaseCountdown as scheduleReleaseCountdown, releaseGateMeasure, releasePreflight, runReleaseCountdown, type PreflightDeps } from './preflight.js';
 
 async function isolated(fn: (root: string) => Promise<void>): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-'));
@@ -38,6 +38,23 @@ function fakeRun(runs: string, runId: string, version: string, startedAt: string
 }
 
 const NOW = new Date('2026-10-06T20:30:00.000Z');
+
+test('release countdown lays out T−120/T−60/T−30/T0 and never claims that a step ran', () => {
+  const cutAt = '2026-10-07T06:00:00.000Z';
+  const steps = scheduleReleaseCountdown(cutAt);
+  expect(steps.map(({ id, offsetMinutes, at, observation }) => ({ id, offsetMinutes, at, observation }))).toEqual([
+    { id: 'notes-and-readiness', offsetMinutes: -120, at: '2026-10-07T04:00:00.000Z', observation: 'not-observed-by-countdown' },
+    { id: 'pinned-main-preflight', offsetMinutes: -60, at: '2026-10-07T05:00:00.000Z', observation: 'not-observed-by-countdown' },
+    { id: 'gate-window', offsetMinutes: -30, at: '2026-10-07T05:30:00.000Z', observation: 'not-observed-by-countdown' },
+    { id: 'cut', offsetMinutes: 0, at: cutAt, observation: 'not-observed-by-countdown' },
+  ]);
+  const lines = formatReleaseCountdown(cutAt, new Date('2026-10-07T04:00:00.000Z'));
+  expect(lines).toHaveLength(5);
+  expect(lines[1]).toContain('시각 도달 · 완료 미관측');
+  expect(lines[2]).toContain('예정');
+  expect(lines[0]).toContain('단계 완료를 관측하거나 실행하지 않는다');
+});
+
 function deps(root: string, extra: Partial<PreflightDeps> = {}): PreflightDeps {
   return {
     now: NOW,
@@ -45,11 +62,45 @@ function deps(root: string, extra: Partial<PreflightDeps> = {}): PreflightDeps {
     schedule: () => ({ version: '0.2.18', cutAt: '2026-10-06T21:00:00.000Z', landBy: '2026-10-06T20:30:00.000Z', updatedAt: NOW.toISOString(), updatedBy: 'test' }),
     graphRunsRoot: join(root, 'graph-runs', 'release-loop'),
     exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 0 }),
+    releaseNotesCheck: async () => 1,
     releaseRunDeps: { freezeRoot: root },
     publishAt: '2026-10-06T23:30:00.000Z',
     ...extra,
   };
 }
+
+test('T−120 countdown readiness summarizes pinned release notes, public export and checklist without claiming execution', () => isolated(async (root) => {
+  const result = await releasePreflight('0.2.18', deps(root, { countdown: true, releaseNotesCheck: async () => 2 }));
+  expect(result.countdownReadiness).toEqual({
+    status: 'green',
+    notes: { status: 'green', addedLines: 2 },
+    export: { status: 'green', leaks: 0 },
+    checklist: { status: 'green' },
+  });
+  const lines = formatReleaseCountdown(result.schedule!.cutAt, new Date('2026-10-06T20:00:00.000Z'), result.countdownReadiness);
+  expect(lines[1]).toContain('read-only 판정 green');
+  expect(lines[1]).toContain('notes +2');
+  expect(lines[0]).toContain('단계 완료를 관측하거나 실행하지 않는다');
+}));
+
+test('T−120 readiness is red on missing release notes or public export leaks', () => isolated(async (root) => {
+  const notesMissing = await releasePreflight('0.2.18', deps(root, { countdown: true, releaseNotesCheck: async () => 0 }));
+  expect(notesMissing.countdownReadiness).toMatchObject({ status: 'red', notes: { status: 'red', addedLines: 0 } });
+  const leaks = await releasePreflight('0.2.18', deps(root, {
+    countdown: true,
+    releaseNotesCheck: async () => 1,
+    exportCheck: async () => ({ mainSha: 'b'.repeat(40), files: 123, leaks: 2, codeLiterals: 0 }),
+  }));
+  expect(leaks.countdownReadiness).toMatchObject({ status: 'red', export: { status: 'red', leaks: 2 } });
+}));
+
+test('ordinary preflight does not run or block on the T−120 release notes check', () => isolated(async (root) => {
+  const result = await releasePreflight('0.2.18', deps(root, {
+    releaseNotesCheck: async () => { throw new Error('countdown-only check should not run'); },
+  }));
+  expect(result.findings.some((finding) => finding.check === 'release-notes')).toBe(false);
+  expect(result.countdownReadiness.status).toBe('unmeasured');
+}));
 
 test('F9 export preflight records one main head, separates code literals, and names the cut-minus-60 manual check time', () => isolated(async (root) => {
   const result = await releasePreflight('0.2.18', deps(root, { now: new Date('2026-10-06T20:00:00.000Z'), exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 2 }) }));
@@ -196,7 +247,8 @@ test('post-publish detection reads the id or a title that starts with the marker
 test('real CLI: without release.loop.gatePodPool, preflight surfaces the actual release run --dry-run error and exits 1', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-cli-'));
   const root = join(home, '.elanous');
-  mkdirSync(root);
+  mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
+  writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
   writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: {} } }));
   try {
     const repo = join(import.meta.dir, '../..');
@@ -303,7 +355,7 @@ test('real preflight CLI scans the pinned origin/main tree and blocks its export
   mkdirSync(join(repo, 'src'), { recursive: true });
   writeFileSync(join(repo, 'src/.gitignore'), 'ignored.ts\n');
   writeFileSync(join(repo, 'release/public-export.yaml'), 'include: ["src/**"]\nexclude: []\nreplace: {}\n');
-  writeFileSync(join(repo, 'src/leak.ts'), `// ${privateMarker} private marker\nexport const safe = true;\n`);
+  writeFileSync(join(repo, 'src/leak.ts'), `// ${privateMarker} private marker\nexport const safe = true;\nexport const marker = '${privateMarker}';\n`);
   writeFileSync(join(repo, 'src/ignored.ts'), 'export const ignored = true;\n');
   const git = (args: string[]) => {
     const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
@@ -317,15 +369,172 @@ test('real preflight CLI scans the pinned origin/main tree and blocks its export
     git(['-c', 'user.name=Preflight test', '-c', 'user.email=preflight@example.invalid', 'commit', '-qm', 'fixture main']);
     git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const mainSha = git(['rev-parse', 'HEAD']);
-    // A second marker exists only in the working tree; preflight must still report the pinned main result (two hits).
-    writeFileSync(join(repo, 'src/leak.ts'), `// ${privateMarker} private marker\n// ${privateMarker} working-tree-only marker\nexport const safe = true;\n`);
+    // A second marker exists only in the working tree; preflight must still report the pinned main result.
+    const workingTreeContent = `// ${privateMarker} working-tree-only marker\nexport const safe = true;\nexport const marker = '${privateMarker}';\n`;
+    writeFileSync(join(repo, 'src/leak.ts'), workingTreeContent);
+    const mainStatus = git(['status', '--porcelain']);
     const sourceRepo = join(import.meta.dir, '../..');
     const result = spawnSync('bun', [join(sourceRepo, 'bin/elanous.mjs'), '--config-dir', config, 'release', 'preflight', '--version', '0.2.18', '--json'], {
       cwd: repo, encoding: 'utf8', env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: config, ELANOUS_EXPORT_REDACTIONS: redactions },
     });
-    const output = JSON.parse(result.stdout.trim().split('\n').at(-1)!) as { exportCheck: { mainSha: string; leaks: number }; findings: Array<{ check: string; level: string }> };
-    expect(output.exportCheck).toMatchObject({ mainSha, leaks: 2 });
-    expect(output.findings).toContainEqual(expect.objectContaining({ check: 'export', level: 'block' }));
+    const output = JSON.parse(result.stdout.trim().split('\n').at(-1)!) as { exportCheck: { mainSha: string; leaks: number; codeLiterals: number }; findings: Array<{ check: string; level: string; message?: string }> };
+    expect(output.exportCheck).toMatchObject({ mainSha, leaks: 1, codeLiterals: 1 });
+    expect(output.findings).toContainEqual(expect.objectContaining({ check: 'export', level: 'block', message: expect.stringContaining('공개 export 누수 1건') }));
+    expect(output.findings).toContainEqual(expect.objectContaining({ check: 'export', level: 'warn', message: expect.stringContaining('코드 리터럴 표지 1건') }));
+    expect(git(['rev-parse', 'origin/main'])).toBe(mainSha);
+    expect(git(['status', '--porcelain'])).toBe(mainStatus);
+    expect(readFileSync(join(repo, 'src/leak.ts'), 'utf8')).toBe(workingTreeContent);
     expect(result.status).toBe(1);
   } finally { rmSync(home, { recursive: true, force: true }); }
 }, 60_000);
+
+// ── RELEASE-COUNTDOWN-SEQUENCE (0.2.42) — T−120 → T0 발사 시퀀스 ────────────────────────────────
+// 무대: mock 시나리오(가짜 시계 deps.now ⊕ 주입 export 검사 ⊕ 주입 컷 manifest/node-b 게이트 자리) · L2 통합 층.
+// 판정선: 단계별 녹색/빨강 한 화면 · 빨강이면 이후 단계 자동 중지 ⊕ 담당 자리 우편 ⊕ «부적합 보고» 원장 자동 추가.
+
+const CUT_MANIFEST = { cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 0, byNextMd: 2, unlinked: 0, unknown: 0 }, escalate: [] as Array<{ kind: string }> };
+const SLOT_OK = { dispatcherPaused: true, podTargetFrom: 6, podTargetTo: 2 };
+
+test('RELEASE-COUNTDOWN-SEQUENCE: T−120→T0 단계를 녹색 한 화면으로 내보내고 전부 녹색이면 통과', () => isolated(async (root) => {
+  addItem('0.2.18', { id: 'A1', title: 'cell A1', owner: 'TC' });
+  setItem('0.2.18', 'A1', { status: 'green' }, 'TC');
+  const runs = join(root, 'graph-runs', 'release-loop');
+  fakeRun(runs, 'r1', '0.2.17', '2026-10-06T09:00:00.000Z', 600);
+  const ledger = join(root, 'release', 'nonconformance.jsonl');
+  const result = await runReleaseCountdown('0.2.18', deps(root, {
+    manifest: () => CUT_MANIFEST,
+    gateSlot: () => SLOT_OK,
+    nonconformanceLog: ledger,
+  }));
+  expect(result.steps.map((step) => step.stage)).toEqual(['T-120', 'T-60', 'T-30', 'T0']);
+  expect(result.steps.map((step) => step.level)).toEqual(['ok', 'ok', 'ok', 'ok']);
+  expect(result.steps.every((step) => !step.skipped)).toBe(true);
+  expect(result.haltedAt).toBeNull();
+  expect(result.verdict).toBe('ok');
+  expect(result.mail).toBeNull();
+  expect(result.nonconformance).toEqual([]);
+  expect(existsSync(ledger)).toBe(false);
+  expect(result.steps.map((step) => step.at)).toEqual([
+    '2026-10-06T19:00:00.000Z', '2026-10-06T20:00:00.000Z', '2026-10-06T20:30:00.000Z', '2026-10-06T21:00:00.000Z',
+  ]);
+  expect(result.manualCancel).toMatchObject({
+    totalResponsibleSeconds: 8, ldSeconds: 5,
+    windowStartAt: '2026-10-06T20:59:47.000Z', windowEndAt: '2026-10-06T21:00:00.000Z',
+  });
+  const lines = formatCountdown(result);
+  expect(lines[0]).toStartWith('release countdown 0.2.18');
+  expect(lines.some((line) => line.startsWith('✅ T-120'))).toBe(true);
+  expect(lines.some((line) => line.startsWith('✅ T-60'))).toBe(true);
+  expect(lines.some((line) => line.startsWith('✅ T-30'))).toBe(true);
+  expect(lines.some((line) => line.startsWith('✅ T0'))).toBe(true);
+  expect(lines.some((line) => line.includes('최후 수동 취소 구간') && line.includes('총책임자 8초') && line.includes('LD 5초'))).toBe(true);
+  expect(lines.at(-1)).toStartWith('✅ 판정:');
+}));
+
+test('RELEASE-COUNTDOWN-SEQUENCE: 빨강 기본 dry-run은 우편·부적합 원장을 쓰지 않고 계획만 보인다', () => isolated(async (root) => {
+  const ledger = join(root, 'release', 'nonconformance.jsonl');
+  const mailed: Array<{ from: string; to: string; subject: string; body: string }> = [];
+  const result = await runReleaseCountdown('0.2.18', deps(root, {
+    exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 12, leaks: 3, codeLiterals: 0 }),
+    releaseNotesCheck: async () => 1,
+    manifest: () => CUT_MANIFEST,
+    gateSlot: () => SLOT_OK,
+    nonconformanceLog: ledger,
+    postMail: (mail) => { mailed.push(mail); },
+  }));
+  expect(result.haltedAt).toBe('T-120');
+  expect(result.sideEffectsEnabled).toBe(false);
+  expect(result.mail?.to).toBe('TC');
+  expect(mailed).toEqual([]);
+  expect(existsSync(ledger)).toBe(false);
+  expect(formatCountdown(result).some((line) => line.startsWith('📮 담당 자리 우편 계획(미발송 · 기본 dry-run)'))).toBe(true);
+}));
+
+test('RELEASE-COUNTDOWN-SEQUENCE: 빨강이면 이후 단계 자동 중지 ⊕ 담당 자리 우편 ⊕ «부적합 보고» 원장 자동 추가', () => isolated(async (root) => {
+  const ledger = join(root, 'release', 'nonconformance.jsonl');
+  const mailed: Array<{ from: string; to: string; subject: string; body: string }> = [];
+  const result = await runReleaseCountdown('0.2.18', deps(root, {
+    exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 12, leaks: 3, codeLiterals: 0 }),
+    manifest: () => CUT_MANIFEST,
+    gateSlot: () => SLOT_OK,
+    nonconformanceLog: ledger,
+    postMail: (mail) => { mailed.push(mail); },
+    allowSideEffects: true,
+  }));
+  expect(result.haltedAt).toBe('T-120');
+  expect(result.verdict).toBe('block');
+  expect(result.steps.map((step) => step.skipped)).toEqual([false, true, true, true]);
+  expect(result.steps.slice(1).every((step) => step.findings.length === 0)).toBe(true);
+  expect(result.steps[0]!.findings).toContainEqual(expect.objectContaining({ check: 'export', level: 'block' }));
+  expect(result.mail).toMatchObject({ from: 'OP', to: 'TC' });
+  expect(result.mail?.subject).toBe('RELEASE-COUNTDOWN 0.2.18 T-120');
+  expect(mailed).toEqual([result.mail!]);
+  const entry = result.nonconformance.find((row) => row.stage === 'T-120' && row.cause.includes('공개 export 누수'))!;
+  expect(entry).toMatchObject({ version: '0.2.18', stage: 'T-120', nextRelease: '0.2.19' });
+  expect(entry.repair.length).toBeGreaterThan(0);
+  expect(result.nonconformanceLedger).toBe(ledger);
+  const written = readFileSync(ledger, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  expect(written).toContainEqual(entry);
+  const lines = formatCountdown(result);
+  expect(lines.some((line) => line.startsWith('⏸ T-60') && line.includes('미진행(T-120 빨강 — 자동 중지)'))).toBe(true);
+  expect(lines.some((line) => line.startsWith('📮 담당 자리 우편 → TC'))).toBe(true);
+  expect(lines.at(-1)).toStartWith('⛔ 판정: 평가 중지 — T-120 빨강');
+}));
+
+test('RELEASE-COUNTDOWN-SEQUENCE: T−120 노트 0줄은 ⛔ notes-empty, T−60 node-b 게이트 자리 미확보는 ⛔ 디스패처·podTarget', () => isolated(async (root) => {
+  const ledger = join(root, 'release', 'nonconformance.jsonl');
+  const notesRed = await runReleaseCountdown('0.2.18', deps(root, {
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 0, byNextMd: 0, unlinked: 0, unknown: 0 }, escalate: [{ kind: 'notes-empty' }] }),
+    gateSlot: () => SLOT_OK,
+    nonconformanceLog: ledger,
+  }));
+  expect(notesRed.haltedAt).toBe('T-120');
+  const notes = notesRed.steps[0]!.findings.find((finding) => finding.check === 'notes')!;
+  expect(notes).toMatchObject({ level: 'block' });
+  expect(notes.message).toContain('notes-empty');
+
+  rmSync(ledger, { force: true });
+  const slotRed = await runReleaseCountdown('0.2.18', deps(root, {
+    manifest: () => CUT_MANIFEST,
+    gateSlot: () => ({ dispatcherPaused: false, podTargetFrom: 6, podTargetTo: 6 }),
+    nonconformanceLog: ledger,
+  }));
+  expect(slotRed.steps[0]!.level).toBe('ok');
+  expect(slotRed.haltedAt).toBe('T-60');
+  const slot = slotRed.steps[1]!.findings.filter((finding) => finding.check === 'gate-slot');
+  expect(slot.every((finding) => finding.level === 'block')).toBe(true);
+  expect(slot.some((finding) => finding.message.includes('디스패처'))).toBe(true);
+  expect(slot.some((finding) => finding.message.includes('podTarget'))).toBe(true);
+  expect(slotRed.mail?.to).toBe('OP');
+  expect(slotRed.steps.slice(2).every((step) => step.skipped)).toBe(true);
+  expect(formatCountdown(slotRed).at(-1)).toStartWith('⛔ 판정: 평가 중지 — T-60 빨강');
+}));
+
+test('real CLI: release preflight --countdown 은 생산 진입점에서 T−120→T0 단계와 판정 한 줄을 낸다', () => {
+  const home = mkdtempSync(join(tmpdir(), 'release-countdown-cli-'));
+  const root = join(home, '.elanous');
+  mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
+  mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'pool-cli-test' } } }));
+  writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
+  writeFileSync(join(root, 'release', '0.2.18', 'manifest.json'), JSON.stringify({ version: '0.2.18', baseline: { ref: 'v0.2.17', sha: 'a'.repeat(40) }, cutoff: { sha: 'b'.repeat(40) }, in: [], deferred: [], escalate: [], fragments: { byPr: 0, byNextMd: 2, unlinked: 0, unknown: 0 } }));
+  writeFileSync(join(root, 'release', '0.2.18', 'gate-slot.json'), JSON.stringify(SLOT_OK));
+  setElanousConfigDir(root);
+  setSchedule('0.2.18', { cutAt: '2026-10-07T06:00:00+09:00', landBy: '2026-10-07T05:30:00+09:00' }, 'test');
+  resetElanousConfigDir();
+  try {
+    const repo = join(import.meta.dir, '../..');
+    const run = spawnSync('bun', [join(repo, 'bin/elanous.mjs'), '--config-dir', root, 'release', 'preflight', '--version', '0.2.18', '--countdown', '--json'], {
+      cwd: repo, encoding: 'utf8', timeout: 180_000, env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: root },
+    });
+    const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as {
+      steps: Array<{ stage: string; level: string; skipped: boolean }>; verdict: string; nonconformance: unknown[]; manualCancel: { totalResponsibleSeconds: number };
+    };
+    expect(result.steps.map((step) => step.stage)).toEqual(['T-120', 'T-60', 'T-30', 'T0']);
+    expect(result.manualCancel).toMatchObject({
+      totalResponsibleSeconds: 8, ldSeconds: 5,
+      windowEndAt: '2026-10-06T21:00:00.000Z', windowStartAt: '2026-10-06T20:59:47.000Z',
+    });
+    expect(run.status).toBe(result.verdict === 'block' ? 1 : 0);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}, 240_000);

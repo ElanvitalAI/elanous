@@ -168,6 +168,9 @@ export const AUXILIARY_AI_ENV_VARS: readonly AuxiliaryAiEnvVar[] = [
   { name: 'UPSTAGE_API_KEY',    usedBy: 'document parse' },
 ] as const;
 
+export { SERVICE_KEY_CATALOG, renderServiceKeyCatalogMarkdown } from './service-key-catalog.js';
+export type { ServiceKeyCatalogEntry } from './service-key-catalog.js';
+
 export function summarizeAuxiliaryAiEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): AuxiliaryAiEnvVar[] {

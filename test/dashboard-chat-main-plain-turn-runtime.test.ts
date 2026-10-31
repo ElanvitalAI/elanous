@@ -13,6 +13,8 @@ import { promptForPhase } from '../src/impl-discipline/index.js';
 import { buildDashboardTurnPreamble } from '../src/dashboard/turn-preamble.js';
 import { getUserConfig } from '../src/user-config.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
+import { createTurnThrowSim } from '../src/ux-sim/turn-throw-sim.js';
+import { createExternalInputQueue } from '../src/input/external-input-queue.js';
 import { saveTokens } from '../src/oauth/store.js';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -384,6 +386,43 @@ describe('runDashboardChatMainPlainTurn', () => {
     expect(ctx.calls).toContain('apply-action-block');
     expect(ctx.calls).toContain('run-action-effects');
     expect(ctx.actionEffects).toEqual([{ ok: true }]);
+  });
+
+  it('runs delayed throw simulation through the production plain-turn catch and delivers queued input after idle', async () => {
+    const ctx = buildDeps({
+      turnThrowSim: createTurnThrowSim({ stage: 'streaming-keys-attached', delayMs: 1 }),
+    });
+    let turnActive = false;
+    const delivered: string[] = [];
+    const queue = createExternalInputQueue({ schedule: () => () => {}, log: () => {} });
+    queue.register({
+      isTurnActive: () => turnActive,
+      composerText: () => '',
+      hasPendingKeys: () => false,
+      submit: (text) => { delivered.push(text); return true; },
+    });
+    ctx.deps.attachChatStreamingKeys = () => {
+      turnActive = true;
+      expect(queue.route('/queued\r')).toBe('queued');
+      return () => { turnActive = false; ctx.calls.push('cleanup-streaming-keys'); };
+    };
+    ctx.deps.finalizeTurn = (status, error) => {
+      ctx.finalizeCalls.push({ status, error });
+      queue.pump();
+    };
+
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(ctx.debugEvents).toContainEqual(expect.objectContaining({
+      category: 'tui.turn',
+      event: 'turn-threw',
+      payload: expect.objectContaining({ phase: 'turn:streaming-keys-attached' }),
+      level: 'warn',
+    }));
+    expect(ctx.errorLines).toContain('simulated turn body failure at streaming-keys-attached');
+    expect(ctx.finalizeCalls).toEqual([{ status: 'failed', error: 'simulated turn body failure at streaming-keys-attached' }]);
+    expect(turnActive).toBe(false);
+    expect(delivered).toEqual(['/queued']);
   });
 
   it('pushes an error line and finalizes failed when the stream send throws', async () => {

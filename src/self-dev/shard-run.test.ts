@@ -215,7 +215,8 @@ test('self gate separates real spawn files under the same shard budget and retai
   expect(result.shards.every((shard) => shard.files.every(isGateSpawnLaneFile)
     || shard.files.every((file) => !isGateSpawnLaneFile(file)))).toBe(true);
   expect(calls.filter(([cwd]) => cwd === '/head')).toHaveLength(files.length + result.shards.length);
-  expect(selfGateShardTimeoutMs(['test/plain-a.test.ts'])).toBe(300_000);
+  expect(selfGateShardTimeoutMs(['test/plain-a.test.ts'])).toBe(900_000);
+  expect(selfGateShardTimeoutMs(['test/plain-a.test.ts'], { ELANOUS_SELF_GATE_SHARD_TIMEOUT_MS: '300000' })).toBe(300_000);
   expect(selfGateShardTimeoutMs(['test/preview-terminal.test.ts'])).toBe(120_000);
   expect(() => selfGateShardTimeoutMs(['test/plain-a.test.ts', 'test/preview-terminal.test.ts'])).toThrow('mixed');
   const expanded = runShardedGateTests('/head', files, 'HEAD', 1, run,
@@ -594,7 +595,7 @@ test('real async Bun child stops waiting when a grandchild inherits its output p
   }
 });
 
-test('Bun child launch gets 120s for real spawn files and retains 300s for regular tests', () => {
+test('Bun child launch gets 120s for real spawn files and defaults regular tests to 900s', () => {
   const launched: Array<{ command: readonly string[]; timeout: number | undefined }> = [];
   const spawn = ((command: string[], options: { timeout?: number }) => {
     launched.push({ command, timeout: options.timeout });
@@ -608,7 +609,31 @@ test('Bun child launch gets 120s for real spawn files and retains 300s for regul
     expect(launched[0]?.command).toContain('--timeout=120000');
     expect(launched[0]?.timeout).toBe(120_000);
     expect(launched[1]?.command).not.toContain('--timeout=120000');
-    expect(launched[1]?.timeout).toBe(300_000);
+    expect(launched[1]?.timeout).toBe(900_000);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('configured timeout is reported as timeout reason, distinct from SIGKILL, with shard elapsedMs', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-timeout-test-'));
+  const env = { ELANOUS_SELF_GATE_SHARD_TIMEOUT_MS: '300000' };
+  const spawn = (() => ({
+    exitCode: 137, signalCode: 9, stdout: new Uint8Array(), stderr: new Uint8Array(),
+    resourceUsage: { maxRSS: 1024 * 1024 }, error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }),
+  })) as unknown as typeof Bun.spawnSync;
+  const baseline = ((_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base')) as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree;
+  try {
+    const timedOut = runBunShardWithSpawn(cwd, ['test/slow.test.ts'], spawn, env);
+    expect(timedOut).toMatchObject({ exitCode: 137, unmeasuredReason: 'timeout 300s 초과' });
+    expect(timedOut.signal).toBeUndefined();
+    expect(timedOut.elapsedMs).toBeGreaterThanOrEqual(0);
+    const result = runShardedGateTests('/head', ['test/slow.test.ts'], 'HEAD', 1,
+      (location) => location === '/head' ? timedOut : { exitCode: 0, junit: xml(['test/slow.test.ts'], []) },
+      baseline, undefined, { fixedDistribution: true });
+    expect(result.aggregate.status).toBe('unmeasured');
+    expect(result.unmeasuredByShard?.['shard-1']).toBe('current: timeout 300s 초과 · baseline: exit 0, signal none, JUnit present · aggregate rejected (incomplete, malformed JUnit, or exit/JUnit mismatch)');
+    expect(result.attempts[0]?.elapsedMs).toBeGreaterThanOrEqual(0);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { isReleaseVersion } from './release-version.js';
 import { readFileSync } from 'node:fs';
 import { debug } from '../../src/debug/log.js';
+import { runWithReleasePwaTraffic } from './gate-traffic-mode.js';
 
 export type NodeOutcome = 'ok' | 'fail' | 'error';
 export type NodeVerdict = 'pass' | 'flaky' | 'fail';
@@ -86,30 +87,42 @@ export function pwaNodeArgs(commit: string, input: Record<string, unknown>): str
 }
 
 // Existing cutoff/PWA/TUI programs have different output conventions; normalize them at the graph boundary.
-if (import.meta.main) {
-  const node = process.argv[2];
+export async function runNodeVerdict(argv: string[], env: NodeJS.ProcessEnv = process.env,
+  runner: CommandRunner = runCommand): Promise<number> {
+  const node = argv[0];
   let version = '';
-  let result: Record<string, unknown> & { outcome: NodeOutcome; verdict: NodeVerdict; summary: string };
-  try {
-    const context = readGraphContext();
-    version = context.input.version;
-    const commit = nodeOutput(context, 'version-release', 'commit');
-    const predecessor = node === 'pwa' ? 'gate' : node === 'tui' ? 'upgrade' : 'version-release';
-    if (context.outputs[predecessor]?.outcome !== 'ok') throw new Error(`${predecessor} did not pass`);
-    const args = node === 'cutoff' ? ['scripts/release-loop/cutoff.ts', '--version', version, '--cutoff', commit, '--baseline', `v${context.input.previousVersion}`, '--json']
-      : node === 'pwa' ? pwaNodeArgs(commit, context.input)
-      : node === 'tui' ? ['scripts/release-loop/tui-sim-node.ts', '--commit', commit, '--json'] : (() => { throw new Error(`unknown node: ${node}`); })();
-    const run = runCommand('bun', args);
-    if (run.stderr) process.stderr.write(run.stderr);
-    const data = lastResult(run);
-    const verdict = data?.verdict;
-    const baseline = data?.baseline as { sha?: string } | undefined;
-    const outcome: NodeOutcome = node === 'cutoff' ? run.status === 0 && data?.version === version && (data?.cutoff as { sha?: string } | undefined)?.sha === commit && typeof baseline?.sha === 'string' ? 'ok' : 'error'
-      : run.status === 0 && (verdict === 'pass' || verdict === 'flaky') ? 'ok' : run.status === 1 ? 'fail' : 'error';
-    if (node === 'cutoff' && outcome === 'ok' && cutoffNotesEmpty(data)) {
-      result = { ...data, outcome: 'fail', verdict: 'fail', summary: 'cutoff notes-empty — 사용자에게 보일 변경 줄이 0이다(release/next.md 와 PR 노트 조각을 확인하라)' };
-    } else result = { ...data, outcome, verdict: outcome === 'ok' ? verdict === 'flaky' ? 'flaky' : 'pass' : 'fail',
-      summary: outcome === 'ok' ? `${node} ${verdict === 'flaky' ? 'flaky' : 'pass'}` : `${node} ${data?.error || run.stderr.trim() || data?.verdict || 'failed'} (rc=${run.status})` };
-  } catch (error) { result = errorResult(error); }
-  process.exitCode = finishNode(node ?? 'unknown', version, result);
+  const execute = async (): Promise<number> => {
+    let result: Record<string, unknown> & { outcome: NodeOutcome; verdict: NodeVerdict; summary: string };
+    try {
+      const context = readGraphContext(env);
+      version = context.input.version;
+      const commit = nodeOutput(context, 'version-release', 'commit');
+      const predecessor = node === 'pwa' ? 'gate' : node === 'tui' ? 'upgrade' : 'version-release';
+      if (context.outputs[predecessor]?.outcome !== 'ok') throw new Error(`${predecessor} did not pass`);
+      const args = node === 'cutoff' ? ['scripts/release-loop/cutoff.ts', '--version', version, '--cutoff', commit, '--baseline', `v${context.input.previousVersion}`, '--json']
+        : node === 'pwa' ? pwaNodeArgs(commit, context.input)
+        : node === 'tui' ? ['scripts/release-loop/tui-sim-node.ts', '--commit', commit, '--json'] : (() => { throw new Error(`unknown node: ${node}`); })();
+      const run = runner('bun', args);
+      if (run.stderr) process.stderr.write(run.stderr);
+      const data = lastResult(run);
+      const verdict = data?.verdict;
+      const baseline = data?.baseline as { sha?: string } | undefined;
+      const outcome: NodeOutcome = node === 'cutoff' ? run.status === 0 && data?.version === version && (data?.cutoff as { sha?: string } | undefined)?.sha === commit && typeof baseline?.sha === 'string' ? 'ok' : 'error'
+        : run.status === 0 && (verdict === 'pass' || verdict === 'flaky') ? 'ok' : run.status === 1 ? 'fail' : 'error';
+      if (node === 'cutoff' && outcome === 'ok' && cutoffNotesEmpty(data)) {
+        result = { ...data, outcome: 'fail', verdict: 'fail', summary: 'cutoff notes-empty — 사용자에게 보일 변경 줄이 0이다(release/next.md 와 PR 노트 조각을 확인하라)' };
+      } else result = { ...data, outcome, verdict: outcome === 'ok' ? verdict === 'flaky' ? 'flaky' : 'pass' : 'fail',
+        summary: outcome === 'ok' ? `${node} ${verdict === 'flaky' ? 'flaky' : 'pass'}` : `${node} ${data?.error || run.stderr.trim() || data?.verdict || 'failed'} (rc=${run.status})` };
+    } catch (error) { result = errorResult(error); }
+    return finishNode(node ?? 'unknown', version, result);
+  };
+
+  if (node !== 'pwa') return execute();
+  try { return await runWithReleasePwaTraffic(env, execute); }
+  catch (error) {
+    try { version = readGraphContext(env).input.version; } catch { /* preserve empty version when context itself is invalid */ }
+    return finishNode(node, version, errorResult(error));
+  }
 }
+
+if (import.meta.main) process.exitCode = await runNodeVerdict(process.argv.slice(2), process.env);

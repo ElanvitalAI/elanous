@@ -85,6 +85,8 @@ export function warmReuseFlagOn(config: unknown, consumer: WarmReuseConsumer): b
 
 function evidenceReason(evidence: WarmReuseEvidence | undefined, minSamples: number): string | null {
   if (!evidence) return 'evidence-unmeasured';
+  // A measured mismatch is the most actionable reason even when it also makes the latest canary fail.
+  if (typeof evidence.recentMismatchCount === 'number' && evidence.recentMismatchCount > 0) return 'recent-mismatch';
   if (evidence.leaseValid !== true) return evidence.leaseValid === false ? 'lease-invalid' : 'lease-unmeasured';
   if (evidence.canaryPassed !== true) return evidence.canaryPassed === false ? 'canary-failed' : 'canary-unmeasured';
   for (const field of IDENTITY_FIELDS) {

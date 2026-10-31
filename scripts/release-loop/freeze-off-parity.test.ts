@@ -8,16 +8,23 @@ import * as publishNode from './publish-node.js';
 import * as unattendedNode from './unattended-release.js';
 
 // FREEZE1 off-state parity (OP 10-04 19:39 condition ①): with no landing-freeze file, gate · publish · unattended
-// produce the same result, calls and graph input as before the switch existed.
+// retain their pre-freeze behavior, with the explicit release-policy gate selection added to the graph input.
 // An independent checkout of the pre-FREEZE1 base (parent of the first commit that brought the freeze in — or HEAD
 // before the change is committed: its own scripts and src, only node_modules shared) and this checkout run the same
-// isolated scenario; both must match the GOLDEN captured from main before FREEZE1.
+// isolated scenario; the historical capture must match GOLDEN, while current behavior may add the policy selection.
 // This is a deliberate pin: a later change that alters these nodes' off-state output must update this test.
 // GOLDEN (the same capture taken from main before FREEZE1) is used only without git history (not a work tree,
 // or a shallow clone).
 // GOLDEN provenance: captured 2026-10-04 from origin/main d958ff5b (pre-FREEZE1) by running this file's `capture` against
 // that checkout's three nodes; with git history, the test re-derives the same value from the pre-freeze base each run.
 const GOLDEN = {"gate": {"outcome": "regression", "commit": "cccccccccccccccccccccccccccccccccccccccc", "introduced": ["src/b.test.ts > B"], "preexisting": 1, "fixed": 1, "knownEnv": 0, "knownEnvCleared": [], "stalledEnv": [], "baselineSource": "instance"}, "gateCalls": ["add cccccccccccccccccccccccccccccccccccccccc @<tmp>/cut", "bun install @<tmp>/cut", "bun install @<tmp>/cut/apps/pwa", "sweep @<tmp>/cut", "bun run test:deterministic ./src/b.test.ts @<tmp>/cut", "snapshot bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb @<tmp>/baseline", "bun install @<tmp>/baseline", "bun install @<tmp>/baseline/apps/pwa", "bun run test:deterministic ./src/b.test.ts @<tmp>/baseline", "bun run test:deterministic ./src/c.test.ts @<tmp>/cut", "removeSnapshot @<tmp>/baseline", "remove @<tmp>/cut"], "publish": {"outcome": "ok", "verdict": "pass", "summary": "published v0.2.4 · 0 assets downloadable", "tag": "v0.2.4"}, "publishCalls": [["git", "show", "release-docs/0.2.4:release/public/docs/releases/0.2.4.md"], ["git", "show", "release-docs/0.2.4:website/pages.json"], ["bun", "bin/elanous.mjs", "release", "publish", "--dir", "dist", "--notes-file", "<notes>", "--yes", "--json"]], "unattended": {"input": {"gatePodPool": "pool", "version": "0.2.4", "previousVersion": "0.2.3"}, "dryRun": false, "state": {"status": "done"}}, "graphInput": {"gatePodPool": "pool", "version": "0.2.4", "previousVersion": "0.2.3"}};
+
+function expectedCurrentWithPolicy() {
+  const expected = structuredClone(GOLDEN);
+  Object.assign(expected.unattended.input, { gateExecutor: 'pod', gateImagePin: 'cut-commit' });
+  Object.assign(expected.graphInput, { gateExecutor: 'pod', gateImagePin: 'cut-commit' });
+  return expected;
+}
 const NODES = ['scripts/release-loop/gate-node.ts', 'scripts/release-loop/publish-node.ts', 'scripts/release-loop/unattended-release.ts'];
 const REPO = resolve(import.meta.dir, '../..');
 type Mods = { judgeGate: typeof gateNode.judgeGate; runPublish: typeof publishNode.runPublish; runUnattendedRelease: typeof unattendedNode.runUnattendedRelease };
@@ -129,11 +136,11 @@ function treeAt(rev: string, expectFreeze: boolean): { dir: string; base: string
   return { dir, base: base.stdout.trim() };
 }
 
-test('freeze switch off: gate, publish and unattended release are byte-identical to pre-freeze behavior', async () => {
+test('freeze switch off preserves historical behavior plus explicit release-policy selection', async () => {
   if (!historyAvailable()) {
     const current = await capture({ judgeGate: gateNode.judgeGate, runPublish: publishNode.runPublish, runUnattendedRelease: unattendedNode.runUnattendedRelease }, true);
     console.warn('freeze-off-parity: no git history (not a work tree or shallow clone) — compared with the recorded pre-FREEZE1 GOLDEN only');
-    expect(current).toBe(JSON.stringify(GOLDEN));
+    expect(JSON.parse(current)).toEqual(expectedCurrentWithPolicy());
     return;
   }
   const current = await capture({ judgeGate: gateNode.judgeGate, runPublish: publishNode.runPublish, runUnattendedRelease: unattendedNode.runUnattendedRelease }, true);
@@ -148,7 +155,7 @@ test('freeze switch off: gate, publish and unattended release are byte-identical
     });
     expect(old).not.toContain('forceFreeze');
     expect(old).toBe(JSON.stringify(GOLDEN));
-    expect(current).toBe(old);
-    expect(current).toBe(JSON.stringify(GOLDEN));
+    expect(old).toBe(JSON.stringify(GOLDEN));
+    expect(JSON.parse(current)).toEqual(expectedCurrentWithPolicy());
   } finally { rmSync(before.dir, { recursive: true, force: true }); }
 }, 120_000);

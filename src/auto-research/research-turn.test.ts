@@ -77,6 +77,47 @@ test('a research turn sends all six Bloom axes to native search and attaches sou
   expect(result.output).toContain('Evidence');
 });
 
+test('a research wall-clock stop preserves collected axis evidence and skips output skills', async () => {
+  const controller = new AbortController();
+  let outputSkillCalls = 0;
+  let generateCalls = 0;
+  const result = await runResearchQuestionLadder('Why are bond yields rising?', {
+    signal: controller.signal,
+    allowPartialOnAbort: true,
+    allowOutputSkill: false,
+    generateContract,
+    generate: async (_prompt, signal) => {
+      generateCalls += 1;
+      if (signal?.aborted) throw signal.reason;
+      return JSON.stringify({ questions });
+    },
+    invokeAxes: async (axes) => {
+      const partial = {
+        plan: [],
+        axes: axes.map((axis, index) => ({ questionId: axis.id, evidence: index === 0 ? [{
+          questionId: axis.id, sourceKind: 'web-search:test', source: 'https://example.org/partial',
+          content: 'Partial deadline evidence', outcome: 'complete' as const, truncated: false,
+        }] : [] })),
+      };
+      controller.abort(new Error('budget reached'));
+      return partial;
+    },
+    routeOutput: () => ({
+      weight: 'heavy', weightSource: 'estimated', format: 'diagram',
+      skillCallPlan: { skill: 'research-diagram', args: 'format evidence' },
+      observation: { resultChars: 1, axisCount: 1, estimatedWeight: 'heavy', selectedSkill: 'research-diagram' },
+    } as ResearchOutputRouteDecision),
+    invokeOutputSkill: async () => { outputSkillCalls += 1; return { ok: true, output: 'should not run' }; },
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain('Partial deadline evidence');
+  expect(result.ladder.evidence.filter(item => item.outcome === 'complete')).toHaveLength(1);
+  expect(result.error).toBe('research stopped by its deadline');
+  expect(generateCalls).toBe(1);
+  expect(outputSkillCalls).toBe(0);
+});
+
 test('a configured complete pro bank injects finance Bloom 4/5 examples into a bond-rate ladder prompt', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'research-turn-bloom-pack-'));
   const packPath = join(directory, 'bloom-exemplars.json');

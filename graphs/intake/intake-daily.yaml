@@ -24,6 +24,10 @@ nodes:
     kind: agent
     recipe: cmd:intake-social
     max_visits: 1
+  - node_id: registered-sources
+    kind: agent
+    recipe: cmd:intake-source-run-due
+    max_visits: 1
   - node_id: ingest
     kind: agent
     recipe: cmd:intake-ingest
@@ -40,6 +44,12 @@ nodes:
     kind: agent
     recipe: cmd:intake-absorb
     max_visits: 1
+  - node_id: briefing-0830
+    kind: agent
+    recipe: cmd:brief-compose-0830
+    entrypoint: src/briefing/brief-items.ts#composeIntakeDailyBrief
+    orchestration_id: orchestrationId()
+    max_visits: 1
   - node_id: done
     kind: gate
     max_visits: 1
@@ -55,6 +65,9 @@ edges:
     map: { ok: social, fail: social }
   - from: social
     on: outcome
+    map: { ok: registered-sources, fail: registered-sources }
+  - from: registered-sources
+    on: outcome
     map: { ok: ingest, fail: ingest }
   - from: ingest
     on: outcome
@@ -66,5 +79,8 @@ edges:
     on: outcome
     map: { ok: absorb, fail: absorb }
   - from: absorb
+    on: outcome
+    map: { ok: briefing-0830, fail: failed }
+  - from: briefing-0830
     on: outcome
     map: { ok: done, fail: failed }

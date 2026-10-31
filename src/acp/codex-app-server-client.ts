@@ -7,15 +7,14 @@
 //   - server-originated request handling (server → client with id)
 //   - lifecycle (close · exit)
 //
-// Deliberately NOT wired into agent-manager yet — 3.B.2 is the arc
-// that connects this client to `EmbodiedAgentSession` and flips the
-// CodexApprovalAdapter from logOnly to real approval routing.
-//
 // The stream interface is abstract so tests can drive the client with
 // synthetic Duplex streams. `spawnCodexAppServer()` is the production
-// factory that shells out to `codex app-server`.
+// factory that shells out to `codex app-server`; an explicit remoteSocketPath
+// opts the ACP agent into the shadow side-tab socket without changing stdio defaults.
 
-import { spawn as spawnChild, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn as spawnChild, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { createConnection } from 'node:net';
+import { PassThrough } from 'node:stream';
 import { resolvePreferredCodexBinary } from './codex-auth.js';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
@@ -444,6 +443,16 @@ export class CodexAppServerClient {
     }
     this.closed = true;
   }
+
+  /** Reject only requests sent over a disconnected transport; the socket
+   *  factory may reconnect, so the client itself remains usable. */
+  _markDisconnected(error: Error): void {
+    for (const entry of this.pending.values()) {
+      if (entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
+      entry.reject(error);
+    }
+    this.pending.clear();
+  }
 }
 
 // ─── Factory · spawn real codex binary ──────────────────────────────
@@ -453,6 +462,8 @@ export interface SpawnCodexAppServerOpts {
   codexBinary?: string;
   /** Subcommand args · default `['app-server']`. */
   codexArgs?: readonly string[];
+  /** Explicit opt-in endpoint for Codex remote side-tab mode. */
+  remoteSocketPath?: string;
   /** Env vars merged onto current env · e.g. `CODEX_API_KEY`.
    *  ⛔⭐ 계약: 넘긴 값이 «이기고» 나머지 부모 env 는 «보존»된다. 그리고 이 병합은
    *  `process.env` 를 «안 바꾼다» — 계정별 쿼터 측정(`usage --account`)이 여기에 걸려 있다. */
@@ -469,6 +480,80 @@ export interface SpawnedCodexAppServer {
   readonly client: CodexAppServerClient;
   readonly child: ChildProcessWithoutNullStreams;
 }
+
+function createUnixSocketStreams(socketPath: string, onDisconnect: (error: Error) => void): {
+  stdin: PassThrough;
+  stdout: PassThrough;
+} {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  let closed = false;
+  let activeSocket: ReturnType<typeof createConnection> | undefined;
+  let activeSocketError: ((error: Error) => void) | undefined;
+  let activeSocketClose: (() => void) | undefined;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let connect: () => void = () => {};
+  const scheduleReconnect = (): void => {
+    if (closed || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      connect();
+    }, 100);
+    reconnectTimer.unref();
+  };
+  const retireSocket = (
+    socket: ReturnType<typeof createConnection>,
+    error: Error | undefined,
+    notifyClient: boolean,
+  ): void => {
+    if (activeSocket !== socket) return;
+    activeSocket = undefined;
+    // A destroyed destination stays registered with PassThrough.pipe unless
+    // explicitly detached. Leaving it there makes the next request write to
+    // the dead socket as well as the replacement socket.
+    stdin.unpipe(socket);
+    socket.unpipe(stdout);
+    if (activeSocketError) socket.removeListener('error', activeSocketError);
+    if (activeSocketClose) socket.removeListener('close', activeSocketClose);
+    activeSocketError = undefined;
+    activeSocketClose = undefined;
+    socket.destroy();
+    if (notifyClient) onDisconnect(error ?? new Error('codex app-server socket disconnected'));
+    else scheduleReconnect(); // Initial late startup retries; reconnect after a live transport is deferred.
+  };
+  connect = (): void => {
+    if (closed) return;
+    const socket = createConnection(socketPath);
+    let didConnect = false;
+    activeSocket = socket;
+    const onSocketError = (error: Error): void => retireSocket(socket, error, didConnect);
+    const onSocketClose = (): void => retireSocket(socket, undefined, didConnect);
+    activeSocketError = onSocketError;
+    activeSocketClose = onSocketClose;
+    socket.on('error', onSocketError);
+    socket.once('close', onSocketClose);
+    socket.once('connect', () => {
+      if (closed || activeSocket !== socket) {
+        socket.destroy();
+        return;
+      }
+      didConnect = true;
+      stdin.pipe(socket);
+      // Keep the client-facing readable open across reconnects.
+      socket.pipe(stdout, { end: false });
+    });
+  };
+  stdin.once('close', () => {
+    closed = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+    if (activeSocket) retireSocket(activeSocket, undefined, false);
+    stdout.end();
+  });
+  connect();
+  return { stdin, stdout };
+}
+
 
 /** Build the argv for `codex app-server`, always FORCING codex's
  *  `code_mode_host` feature OFF.
@@ -493,11 +578,53 @@ export function buildCodexAppServerArgs(codexArgs?: readonly string[]): string[]
   return args;
 }
 
-/** Spawn the `codex app-server` binary and wrap its stdio in a client.
- *
- *  3.B.1 ships this as a plain factory · no agent-manager integration.
- *  3.B.2 will wrap it behind `EmbodiedAgentSession` and flip the
- *  backend-registry `codex-app-server` transport on. */
+/** Build both command lines for the opt-in Codex remote shadow surface.
+ *  The default app-server factory remains stdio-backed; callers must
+ *  explicitly select these arguments to expose a Unix-domain endpoint. */
+export function buildCodexRemoteSideTabArgs(socketPath: string): {
+  appServerArgs: string[];
+  remoteTuiArgs: string[];
+} {
+  if (!socketPath.trim()) throw new Error('socket path is required');
+  const endpoint = `unix://${socketPath}`;
+  return {
+    appServerArgs: ['app-server', '--listen', endpoint, '-c', 'features.code_mode_host=false'],
+    remoteTuiArgs: ['--remote', endpoint],
+  };
+}
+
+/** Spawn options for the shadow mode; absent socketPath preserves stdio. */
+export function buildCodexAppServerSpawnArgs(opts: {
+  codexArgs?: readonly string[];
+  remoteSocketPath?: string;
+}): string[] {
+  const args = buildCodexAppServerArgs(opts.codexArgs);
+  if (!opts.remoteSocketPath) return args;
+  if (args.some((arg) => arg === '--listen' || arg.startsWith('--listen='))) {
+    throw new Error('remote socket path conflicts with codexArgs --listen');
+  }
+  const endpoint = `unix://${opts.remoteSocketPath}`;
+  return [...args.slice(0, -2), '--listen', endpoint, ...args.slice(-2)];
+}
+
+export function spawnCodexRemoteTui(opts: {
+  codexBinary: string;
+  socketPath: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  spawnImpl?: typeof spawnChild;
+}): ChildProcess {
+  const spawnFn = opts.spawnImpl ?? spawnChild;
+  return spawnFn(opts.codexBinary, buildCodexRemoteSideTabArgs(opts.socketPath).remoteTuiArgs, {
+    cwd: opts.cwd,
+    env: { ...process.env, ...(opts.env ?? {}) },
+    stdio: 'inherit',
+  });
+}
+
+/** Spawn the `codex app-server` binary and wrap its stdio or explicit
+ *  Unix-socket connection in a client. The ACP agent manager selects the
+ *  socket form only when the Codex remote side-tab opt-in is configured. */
 export function spawnCodexAppServer(
   opts: SpawnCodexAppServerOpts = {},
 ): SpawnedCodexAppServer {
@@ -507,7 +634,10 @@ export function spawnCodexAppServer(
   // models ("requires a newer version of Codex"). See
   // resolvePreferredCodexBinary.
   const binary = opts.codexBinary ?? resolvePreferredCodexBinary();
-  const args = buildCodexAppServerArgs(opts.codexArgs);
+  const args = buildCodexAppServerSpawnArgs({
+    codexArgs: opts.codexArgs,
+    remoteSocketPath: opts.remoteSocketPath,
+  });
   // ⛔⭐ 테스트 심 — env 병합 «계약»(넘긴 값이 이기고 나머지 부모 env 는 보존)을 무는 유일한 방법이다.
   //   계정별 쿼터 측정이 이 병합에 걸려 있고, 여기가 틀리면 「B 를 재려다 A 를 잰다」가 된다.
   const spawnFn = opts.spawnImpl ?? spawnChild;
@@ -516,9 +646,16 @@ export function spawnCodexAppServer(
     env: { ...process.env, ...(opts.env ?? {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-  const client = new CodexAppServerClient({
-    stdin: child.stdin,
-    stdout: child.stdout,
+  // Remote mode speaks over the Unix socket, leaving the app-server child's
+  // stdout disconnected. Drain it so a verbose child cannot fill the pipe.
+  if (opts.remoteSocketPath) child.stdout.resume();
+  let client: CodexAppServerClient | undefined;
+  const socketStreams = opts.remoteSocketPath
+    ? createUnixSocketStreams(opts.remoteSocketPath, (error) => client?._markDisconnected(error))
+    : undefined;
+  client = new CodexAppServerClient({
+    stdin: socketStreams?.stdin ?? child.stdin,
+    stdout: socketStreams?.stdout ?? child.stdout,
     stderr: child.stderr,
     requestTimeoutMs: opts.requestTimeoutMs,
   });
@@ -537,5 +674,5 @@ export function spawnCodexAppServer(
       }
     }
   });
-  return { client, child };
+  return { client: client!, child };
 }

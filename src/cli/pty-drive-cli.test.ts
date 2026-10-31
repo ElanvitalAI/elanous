@@ -11,6 +11,7 @@ const { runPtyDrive, runDriveCliCommand, runPtyAttachDrive, registerPtyAttachDri
 const { controlDepsForRemoteRef } = await import('../autopilot/pty-control-loop.js');
 const { registerPtyTakeoverCommands } = await import('./pty-takeover-cli.js');
 const { buildDevCliSpec } = await import('../self-dev/dev-cli.js');
+const { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } = await import('../self-implement/elanous-tui-spawn.js');
 const { planDevPipeline } = await import('../self-dev/dev-pipeline.js');
 const { debug } = await import('../debug/log.js');
 const { KNOWN_LOG_EVENT_NAMES } = await import('./log-event-names.js');
@@ -226,6 +227,11 @@ describe('runPtyDrive (elanous drive 핸들러)', () => {
     const plan = planDevPipeline(spec);
     expect(plan.dispatch).toBe('elanous-tui');
     expect(plan.elanous).toEqual({ hold: true, readyTimeoutMs: 180000 });
+  });
+
+  test('dev --elanous --hold defaults to the measured cold test-universe readiness budget', () => {
+    const plan = planDevPipeline(buildDevCliSpec({ text: '' }, { kind: 'self' }, { elanous: true, hold: true }));
+    expect(plan.elanous).toEqual({ hold: true, readyTimeoutMs: DEFAULT_TUI_TEST_READY_TIMEOUT_MS });
   });
 
   test('dev --elanous --hold rejects non-positive and nonnumeric --ready-timeout-ms values by name', () => {

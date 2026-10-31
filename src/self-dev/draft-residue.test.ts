@@ -1657,6 +1657,41 @@ describe('Pod terminal residue', () => {
       expect(events).toHaveLength(1);
       expect(events[0]?.data).toMatchObject({ repository: 'ElanvitalAI/elanous' });
       expect(String(events[0]?.data.reason)).toContain('gh: API rate limit exceeded');
+      expect(events[0]?.data.requestedPage).toBe(1);
+      expect(events[0]?.data.paginationLimitExceeded).toBe(false);
+      expect(events[0]?.data.request).toEqual([
+        'api', 'repos/ElanvitalAI/elanous/pulls?state=open&per_page=100&page=1', '--jq',
+        '[.[] | {number, title, headRefName: .head.ref, createdAt: .created_at, body, labels: [.labels[] | {name}], draft}]',
+      ]);
+      expect(events[0]?.data.stderr).toContain('gh: API rate limit exceeded');
+      expect(events[0]?.data.capturedStderrBytes).toBeGreaterThan(0);
+      expect(events[0]?.data.exitStatus).toBe(1);
+      expect(events[0]?.data.errorCode).toBeNull();
+      expect(events[0]?.data.responseBytes).toMatchObject({ status: 'measured', bytes: 0, complete: true });
+      expect(events[0]?.data.executionSha).toMatchObject({ status: 'unmeasured' });
+    } finally {
+      off();
+      process.env.PATH = previousPath;
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  test('a signal-terminated open-draft listing keeps the response length unmeasured', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'draft-residue-gh-signal-'));
+    writeFileSync(join(binDir, 'gh'), `#!${process.execPath}\nprocess.kill(process.pid, 'SIGKILL');\n`);
+    chmodSync(join(binDir, 'gh'), 0o755);
+    const events: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'draft-residue-signal-test', emit: (row) => {
+      if (row.category === 'draft.residue' && row.event === 'list-open-drafts-unobserved') events.push(row.data as Record<string, unknown>);
+    } });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}${previousPath ? `:${previousPath}` : ''}`;
+    try {
+      expect(await defaultAdapters().listOpenDrafts('ElanvitalAI/elanous')).toBeUndefined();
+      expect(events).toHaveLength(1);
+      expect(events[0]?.exitStatus).toBeNull();
+      expect(events[0]?.signal).toBe('SIGKILL');
+      expect(events[0]?.responseBytes).toMatchObject({ status: 'unmeasured', complete: false, capturedBytes: 0 });
     } finally {
       off();
       process.env.PATH = previousPath;

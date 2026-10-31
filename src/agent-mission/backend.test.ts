@@ -60,6 +60,12 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
     expect(codexBackend.scrubEnv).toContain('OPENAI_API_KEY');
   });
 
+  it('claude child disables its automatic updater without changing login selection', () => {
+    const spawn = resolveBackendSpawn(claudeBackend, { PATH: '/usr/bin', DISABLE_AUTOUPDATER: '0' });
+    expect(spawn.env.DISABLE_AUTOUPDATER).toBe('1');
+    expect(spawn.args).toEqual(['--dangerously-skip-permissions']);
+  });
+
   it('codex spawn 인자에 자식 깊이 표지가 실린다 (inherit=core 가 env 를 버려도 argv 로 간다)', () => {
     const prev = process.env.ELANOUS_NEST_DEPTH;
     delete process.env.ELANOUS_NEST_DEPTH;
@@ -142,6 +148,15 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
     expect(grokBackend.scrubEnv).toEqual(expect.arrayContaining(['XAI_API_KEY', 'GROK_API_KEY']));
   });
 
+  it('Grok first-run data-use dialog is handled by selecting Opt out', () => {
+    let sent = '';
+    const screen = 'Help improve Grok\n[Opt out] [Opt in]\nOpt-in allows retention of coding data for training and debugging.';
+    expect(grokBackend.handleTrust?.(screen, bytes => { sent += bytes; })).toBe(true);
+    expect(sent).toBe('\u001b[D\r');
+    expect(grokBackend.handleTrust?.('Grok Build 1.0.70 [stable]', () => { sent += 'unexpected'; })).toBe(false);
+    expect(sent).toBe('\u001b[D\r');
+  });
+
   it('Aside browser backend = aside exec·low effort·계정 인증은 CLI 플래그로 제어', () => {
     expect(asideBackend.name).toBe('aside');
     expect(asideBackend.cmd).toBe('aside');
@@ -163,6 +178,21 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
     const handled = codexBackend.handleTrust?.('그냥 작업 중 화면', (s) => { sent += s; });
     expect(handled).toBe(false);
     expect(sent).toBe('');
+  });
+
+  it('handleTrust preserves the Codex update skip for legacy callers', () => {
+    let sent = '';
+    const screen = [
+      'Update available · 0.165.0 → 0.166.0',
+      'Release notes: https://github.com/openai/codex/releases/latest',
+      '› 1. Update now (runs `brew upgrade --cask codex`)',
+      '  2. Skip',
+      '  3. Skip until next version',
+      '  enter continue · esc skip',
+    ].join('\n');
+    const handled = codexBackend.handleTrust?.(screen, (bytes) => { sent += bytes; });
+    expect(handled).toBe(true);
+    expect(sent).toBe('\u001b');
   });
 
   it('resolveBackend — 미지정 → 디폴트 codex, codex 명시 → codex', () => {

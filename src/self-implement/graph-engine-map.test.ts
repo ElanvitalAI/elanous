@@ -106,6 +106,16 @@ describe('GRAPH-ENGINE-MAP', () => {
     expect(rangeContains(budgetCitation, observerLine)).toBe(true);
   });
 
+  test('gate 인용 범위가 gating entry부터 gated 및 gate-failed 판정까지 덮는다', () => {
+    const gateCitation = mapRows.get('gate')![2]!;
+    const gateEntry = sourceLine(/onNodeEntry\(node\('gate'\)/, 'gate entry');
+    const gated = sourceLine(/observe\('gated',/, 'gated observation');
+    const gateFailed = sourceLine(/progress\('gate-failed',/, 'gate-failed disposition');
+    expect(rangeContains(gateCitation, gateEntry)).toBe(true);
+    expect(rangeContains(gateCitation, gated)).toBe(true);
+    expect(rangeContains(gateCitation, gateFailed)).toBe(true);
+  });
+
   test('주요 실행 단계 인용이 현재 orchestrator 경계들을 덮는다', () => {
     const currentMarkers: Array<[string, RegExp, string]> = [
       ['dispatch', /^async function runSelfImplementInner\(/, 'runSelfImplementInner entry'],

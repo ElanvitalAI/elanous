@@ -174,7 +174,7 @@ import { ZAI_POD_EGRESS_LABEL, checkZaiPodSecret, countActiveZaiJobs, decideZaiP
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_OPENROUTER_FALLBACK_MODEL, zaiSettingsFromConfig, type ZaiCodingPlanSettings } from '../../llm/zai-coding-plan.js';
 import { normalizePlanningFallbackReason, selectEnhanceLlm } from '../../prompt-enhance/enhance.js';
 import { inferProviderFromModel } from '../../llm.js';
-import { classifyPodExit, extractPodFailureReason, podChildEvidenceLedgerRow, podChildFailureAttribution, podDeadlineResultMarker, podJobConditionReason, podTerminalRow, POD_TERMINATION_JOB_JSONPATH, POD_TERMINATION_PODS_JSONPATH, readPodTermination, type PodExitClass, type PodTermination } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, podChildEvidenceLedgerRow, podChildFailureAttribution, podChildProviderFailureFact, podDeadlineResultMarker, podJobConditionReason, podTerminalRow, POD_TERMINATION_JOB_JSONPATH, POD_TERMINATION_PODS_JSONPATH, readPodTermination, type PodExitClass, type PodTermination } from './pod-failure-reason.js';
 import { kubectlTransientReason, retryKubectlTransient } from './kubectl-transient-retry.js';
 import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
 import { resolveDefaultSourceHead, seedMirrorOnce, type MirrorSeedResult } from './pod-mirror-seed.js';
@@ -409,7 +409,8 @@ async function measureHostBudgetSnapshot(childLlm: PodBudgetChildLlm, env: NodeJ
   const host = resolveHostId(env);
   const measuredAt = Date.now();
   const { readBudgetInputsLive, CODEX_PROVIDER, GROK_PROVIDER } = await import('../../self-implement/budget-gate.js');
-  const inputs = await readBudgetInputsLive(inputDeps);
+  const { budgetInputsWithLiveSupply } = await import('../../live-supply/budget-consumer.js');
+  const inputs = budgetInputsWithLiveSupply(await readBudgetInputsLive(inputDeps));
   const { decision } = harnessLaunchBudgetDecision(inputs, { ...(childLlm.provider ? { childLlmProvider: childLlm.provider } : {}), ...(childLlm.model ? { childLlmModel: childLlm.model } : {}) });
   const provider = decision.provider ?? childLlm.provider ?? 'chain';
   const used = provider === GROK_PROVIDER
@@ -1618,6 +1619,22 @@ export function repairPodExitCode(input: { state: string; repairCommitOnly: bool
   return input.disposition?.stage !== 'host-regate-failed' && input.disposition?.ok !== false ? 0 : 1;
 }
 
+export function parsePodRepairExportEvidence(output: string): { exportExitCode: number | null; podExitCode: number | null; exported: boolean;
+  reasonCode: 'none' | 'no-new-commit' | 'source-head-mismatch' | 'export-failed' } | null {
+  const outcomes = [
+    ...[...output.matchAll(/^ELANOUS_POD_REPAIR_FAILED ([^\r\n]+)$/gm)].map((match) => ({ index: match.index!, failure: match[1]! })),
+    ...[...output.matchAll(/^ELANOUS_POD_REPAIR_COMMIT ([1-9]\d*) ([0-9a-f]{40}) ([0-9a-f]{40})$/gm)].map((match) => ({ index: match.index!, failure: null })),
+  ].sort((a, b) => a.index - b.index);
+  const outcome = outcomes.at(-1);
+  if (!outcome) return null;
+  const podRc = [...output.matchAll(/__ELANOUS_POD_DONE__[^\r\n]*\brc=(\d+)/g)].at(-1)?.[1];
+  const reasonCode = outcome.failure === null ? 'none' : outcome.failure === 'repair made no new commit' ? 'no-new-commit'
+    : outcome.failure === 'source-head-mismatch' ? 'source-head-mismatch' : 'export-failed';
+  const exported = outcome.failure === null;
+  return { exportExitCode: exported ? 0 : reasonCode === 'source-head-mismatch' ? null : 1,
+    podExitCode: podRc === undefined ? null : Number(podRc), exported, reasonCode };
+}
+
 export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplementJobSpawn {
   if (options.repairCommitOnly && (options.source?.kind !== 'pr' || options.source.number !== options.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(options.repairCommitOnly.baseHead))) {
     throw new Error('repair commit-only requires a matching PR source and exact head');
@@ -1635,6 +1652,46 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
   const resultMarkerOn = options.resultMarker ?? !options.kubectl;
   const writeWarmLedger = options.siWarmLedger
     ?? ((entry: RunLedgerEntry) => appendRunLedgerEntry(entry, runLedgerDir(env.ELANOUS_STATE_DIR)));
+  const recordFinalTaskFailure = (input: Parameters<SelfImplementJobSpawn>[0], result: SelfImplementJobDone,
+    ledgerStartIndex: number): SelfImplementJobDone => {
+    // Match createSelfImplementAdapter: a nonzero process exit is failed even if it also emitted an ok disposition.
+    if (result.error?.code === 'aborted' || (result.exitCode === 0 && result.disposition?.ok !== false)) return result;
+    const ledgerRunId = env.ELANOUS_RUN_ID ?? input.spaceId;
+    const ledgerDir = runLedgerDir(env.ELANOUS_STATE_DIR);
+    const job = podJobName(input.spaceId);
+    try {
+      const entries = loadRunLedger(ledgerRunId, ledgerDir) ?? [];
+      const currentEntries = entries.slice(ledgerStartIndex);
+      const childStart = currentEntries.slice().reverse().find((entry) => entry.event === 'pod-child-run' && entry.data?.job === job);
+      const childRunId = typeof childStart?.data?.childRunId === 'string' ? childStart.data.childRunId : null;
+      const attemptValue = childStart?.data?.attempt;
+      const attempt = typeof attemptValue === 'number' && Number.isSafeInteger(attemptValue) && attemptValue > 0 ? attemptValue : 1;
+      const evidence = childRunId ? currentEntries.slice().reverse().find((entry) => entry.event === 'pod-child-evidence'
+        && entry.data?.job === job && entry.data?.childRunId === childRunId) : undefined;
+      const childResult = evidence?.data?.childResult && typeof evidence.data.childResult === 'object'
+        ? evidence.data.childResult as Record<string, unknown> : undefined;
+      const rawError = typeof result.disposition?.error === 'string' && result.disposition.error.trim() ? result.disposition.error
+        : typeof childResult?.error === 'string' && childResult.error.trim() ? childResult.error
+          : result.error?.message ?? result.output;
+      const podTermination = evidence?.data?.podTermination && typeof evidence.data.podTermination === 'object'
+        ? evidence.data.podTermination : null;
+      appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-task-failure', data: {
+        spaceId: input.spaceId,
+        taskId: input.taskId ?? null,
+        job,
+        attempt,
+        childRunId,
+        childStage: typeof result.disposition?.stage === 'string' ? result.disposition.stage
+          : typeof childResult?.stage === 'string' ? childResult.stage : 'unknown',
+        childError: redactSecretText(rawError).replace(/\s+/gu, ' ').trim().slice(0, 500) || 'unknown',
+        podTermination,
+      } }, ledgerDir);
+    } catch (error) {
+      debug.log('self-implement.pod', 'task-failure-write-failed', { job, childRunId: null,
+        reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+    }
+    return result;
+  };
   return (input) => {
     if (options.repairCommitOnly && (input.autoMerge || input.openPr || input.base !== `pr-${options.repairCommitOnly.pr}`)) {
       throw new Error('repair commit-only refuses auto merge, new PR, or a different base');
@@ -1642,6 +1699,19 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
     if (options.siWarmAttempt && !options.siWarmHostPostprocess) {
       throw new Error('si-v1 warm execution requires cold-path host postprocess parity');
     }
+    const taskLedgerDir = runLedgerDir(env.ELANOUS_STATE_DIR);
+    let taskLedgerStartIndex = Number.MAX_SAFE_INTEGER;
+    try { taskLedgerStartIndex = (loadRunLedger(env.ELANOUS_RUN_ID ?? input.spaceId, taskLedgerDir) ?? []).length; }
+    catch (error) { debug.log('self-implement.pod', 'task-failure-baseline-unavailable', {
+      spaceId: input.spaceId, reason: error instanceof Error ? error.message : String(error),
+    }, { level: 'warn' }); }
+    const recordFailure = (result: SelfImplementJobDone) => recordFinalTaskFailure(input, result, taskLedgerStartIndex);
+    const recordRejectedFailure = (error: unknown): never => {
+      if (!input.signal?.aborted && !(error instanceof Error && error.name === 'AbortError')) {
+        recordFailure({ exitCode: 1, output: '', error: { code: 'pod-promise-rejected', message: error instanceof Error ? error.message : String(error) } });
+      }
+      throw error;
+    };
     let siWarmEnabled = true;
     const taskCard = env.ELANOUS_POD_TASK_CARD ?? env.ELANOUS_TASK_CARD_ID;
     if (taskCard) {
@@ -1956,7 +2026,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           return { exitCode: 1, output: log.slice(-4096), disposition: hostDisposition,
             error: { code: 'si-warm-host-postprocess-failed', message } };
         }
-      })();
+      })().then(recordFailure, recordRejectedFailure);
       return { address: `self-impl:${input.spaceId}`, done };
     }
     const name = podJobName(input.spaceId);
@@ -2122,6 +2192,23 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const detail = unfit.map((u) => `${u.context} ${Math.round(u.allocatableMemoryBytes / 2 ** 30 * 10) / 10}GiB`).join(' · ');
         return { exitCode: 1, output: '', error: { code: 'pod-pool-unfit', message: `모든 풀 멤버의 할당 가능 메모리가 이 Job 의 한도 ${memoryLimit} 보다 작다 — 영원히 배치될 수 없다(${detail}) · --pod-memory 를 낮추거나 다른 풀로` } };
       };
+      // PRLAND-OOM-RETRY-POOL-FIT: whether the NEXT memory limit can ever be placed decides the retry before
+      // anything is written or deleted. Read-only — an all-unfit pool ends the run here, so no retry intent
+      // is journaled, the OOM Job stays, and no second Job is applied. A fit member leaves the single retry intact.
+      const retryPoolFit = async (nextLimit: string, from: string): Promise<SelfImplementJobDone | null> => {
+        const pool = options.pool as { unfitMembers?: (b: number) => Promise<Array<{ context: string; allocatableMemoryBytes: number }>>; members?: readonly PodPoolMember[] } | undefined;
+        if (!pool || typeof pool.unfitMembers !== 'function' || !Array.isArray(pool.members) || !pool.members.length) return null;
+        const limitBytes = memoryQuantityBytes(nextLimit);
+        if (limitBytes === null) return null;
+        const unfit = await pool.unfitMembers(limitBytes);
+        const unfitContextsForRetry = new Set(unfit.map((u) => u.context));
+        const fit = pool.members.filter((m) => !unfitContextsForRetry.has(m.context)).map((m) => m.context);
+        debug.log('self-implement.pod', 'oom-retry-pool-fit', { job: name, from, to: nextLimit, fit, unfit: unfit.map((u) => u.context) }, { level: fit.length ? 'info' : 'warn' });
+        if (fit.length) return null;
+        const detail = unfit.map((u) => `${u.context} ${Math.round(u.allocatableMemoryBytes / 2 ** 30 * 10) / 10}GiB`).join(' · ');
+        const poolLimit = `${Math.round(Math.max(...unfit.map((u) => u.allocatableMemoryBytes)) / 2 ** 30 * 10) / 10}GiB`;
+        return { exitCode: 1, output: '', error: { code: 'pod-pool-unfit', message: `Job ${name} 이 OOMKilled(137) 로 ${from} 에서 죽었고 다음 한도는 ${nextLimit} 이지만 어느 풀 멤버도 그 한도를 받을 수 없다 — 재시도 Job 을 만들 수 없다(필요 ${nextLimit} · 풀 한계 ${poolLimit} · ${detail}) · --pod-memory 를 낮추거나 다른 풀로` } };
+      };
       const acquireSlot = async (): Promise<PodPoolMember | null> => {
         if (!options.pool) return null;
         // Each actual acquisition is a separate observation, including the OOM retry in this
@@ -2184,8 +2271,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       if (unfitDone) return unfitDone;
       // HARNESS-FULL-GRAPH — Pod 입장(입장 관문 ⊕ 멤버 슬롯)은 그래프 노드 pool-admit 이다.
       // 2판: decompose →(substrate=pod) pool-admit 간선은 «여기»(Pod 입장 직전 · 실제 단계 경계)에서 남긴다.
-      if (options.repairCommitOnly) routeJourneyEdge('dispatch', 'pr-source', { source: 'pr', substrate: 'pod' });
-      else routeJourneyEdge('decompose', 'pod', { substrate: 'pod' });
+      const journeyRunId = parentRunId ?? childRunId;
+      if (options.repairCommitOnly) routeJourneyEdge('dispatch', 'pr-source', { source: 'pr', substrate: 'pod' }, { runId: journeyRunId });
+      else routeJourneyEdge('decompose', 'pod', { substrate: 'pod' }, { runId: journeyRunId });
       enterJourneyNode('pool-admit', { provenance: 'self-implement-pod', data: { spaceId: input.spaceId } });
       // ⛔ 감싸는 함수(async 래퍼)를 쓰지 않는다 — 마이크로태스크가 늘면 Job apply 순서가 밀린다(시험이 잡았다). 같은 자리 try/catch 로.
       const podAdmitError = (error: unknown): void => {
@@ -2300,6 +2388,11 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           collectPodArtifacts(full.stdout, { dir: join(effectiveInstanceRoot(), 'pod-artifacts'), job: name, log: record });
         }
         catch (error) { record('self-implement.pod', 'artifact-collect-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
+        const repairExportEvidence = options.repairCommitOnly ? parsePodRepairExportEvidence(full.stdout) : null;
+        if (repairExportEvidence) {
+          try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-repair-export', data: { job: name, ...repairExportEvidence } }, ledgerDir); }
+          catch (error) { record('self-implement.pod', 'repair-export-ledger-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
+        }
         for (const line of full.stdout.split(/\r?\n/)) {
           const bundle = /^ELANOUS_POD_SALVAGE_BUNDLE (pod-salvage\/[a-zA-Z0-9._-]+\.bundle) ([0-9]+) ([0-9]+)(?: ([0-9a-f]{40,64}))?$/.exec(line);
           if (bundle) {
@@ -3413,6 +3506,32 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         for (const row of usagePlan.rows) debug.log(row.category, row.event, row.data);
         const parsed = parseSelfImplementJson(logs);
         const terminal = parseSelfImplementJson(logs.trimEnd().split('\n').at(-1) ?? '');
+        const terminalObservation = podChildTerminalResultObservation(logs);
+        const providerSignature = {
+          grokUnavailableCount: logs.match(/Grok unavailable:\s*run `grok login`/gu)?.length ?? 0,
+          structuredProviderErrors: terminal?.providerErrors ?? parsed?.providerErrors ?? null,
+        };
+        const childResultObservation = {
+          job: name,
+          childRunId: liveChildRunId,
+          jobState: state,
+          containerExitCode: containerExitCode ?? null,
+          ledgerCompleteness,
+          terminalResultObserved: terminalObservation.observed,
+          terminalStage: terminalObservation.stage,
+          terminalOk: terminalObservation.ok,
+          terminalOutcome: terminalObservation.outcome,
+          terminalFailureClassification: terminalObservation.failureClassification,
+          providerSignature,
+        };
+        debug.log('self-implement.pod', 'child-terminal-result-observed', childResultObservation);
+        try {
+          appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-terminal-result-observation', data: childResultObservation }, ledgerDir);
+        } catch (error) {
+          debug.log('self-implement.pod', 'child-terminal-result-observation-write-failed', {
+            job: name, childRunId: liveChildRunId, reason: error instanceof Error ? error.message : String(error),
+          }, { level: 'warn' });
+        }
         const nextAccount = codexAccounts?.find((candidate) => candidate !== account);
         if (state === 'failed' && containerExitCode === 7 && !input.signal?.aborted) {
           debug.log('self-implement.pod', 'gh-login-failed', { job: name, attempt: ghLoginRetried ? 2 : 1, tokenExpiresInSec: ghTokenExpiresAt === null ? null : Math.floor((ghTokenExpiresAt - now()) / 1000) });
@@ -3751,6 +3870,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           if (actual < (memoryGi(nextLimit) ?? actual)) {
             const from = reattachedMemoryLimit ?? memoryLimit;
+            // A retry nobody can place is not a retry: decide pool fitness for the next limit first.
+            const retryUnfit = await retryPoolFit(nextLimit, from);
+            if (retryUnfit) return retryUnfit;
             appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry-intent', data: { attempt: 2, from, to: nextLimit, tier: nextTier, reason: 'OOMKilled', job: name, executionKey, fromChildRunId: liveChildRunId } }, ledgerDir);
             debug.log('self-implement.pod', 'oom-retry', { from, to: nextLimit, tier: nextTier, reason: 'OOMKilled', job: name });
             const deleted = kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=true']);
@@ -3798,6 +3920,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         // The host still has the complete Pod log here. The CLI only retains a short stdout tail,
         // so preserve the parsed child facts in the parent ledger before that tail is returned.
+        // OBS-GAP-BATCH-1030 — 자식 LLM 실패의 공급자·HTTP status 를 부모 원장 행에 붙인다.
+        // 줄이 공급자를 이름하지 않으면 이 Pod 의 자식 provider(Pod 옵션 ⊕ 위임 플래그)를 정규 id 로만 쓴다.
+        // ⛔ 본문·자격증명은 담지 않는다 — 귀속은 두 스칼라뿐이다.
+        const childProviderFailure = podChildProviderFailureFact(logs, {
+          providerHint: options.provider ?? podChildProviderOf(podDelegatedChildLlm(jobArgs)?.provider),
+        });
         const childEvidenceRow = podChildEvidenceLedgerRow({
           job: name,
           childRunId: liveChildRunId,
@@ -3806,6 +3934,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           noResultDiagnostic,
           noResultLogEvidence,
           podTermination,
+          providerFailure: childProviderFailure,
         });
         if (childEvidenceRow) {
           // Every terminal attempt writes a marker, including one with no parseable child facts.
@@ -3927,7 +4056,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       } finally {
         releaseAdmission?.();
       }
-    })();
+    })().then(recordFailure, recordRejectedFailure);
     return { address, done };
   };
 }
@@ -4093,6 +4222,43 @@ export function readPodNoResultLogTail(args: {
   } catch (error) {
     return { unavailable: boundedPodLogText(error instanceof Error ? error.message : String(error), POD_NO_RESULT_LOG_REASON_MAX_CHARS) || 'unknown error' };
   }
+}
+
+/** Keep the terminal result row separate from provider-error text in the same child log. */
+function podChildTerminalResultObservation(logs: string): {
+  observed: boolean;
+  stage: string | null;
+  ok: boolean | null;
+  outcome: string | null;
+  failureClassification: string | null;
+} {
+  const lines = logs.split(/\r\n|\n|\r/u);
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!.trim();
+    if (!line.startsWith('{')) continue;
+    let value: unknown;
+    try { value = JSON.parse(line); } catch { continue; }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    const terminal = podTerminalRow(row);
+    if (!terminal) continue;
+    const nested = (row.kind === 'self' || row.kind === 'external')
+      && row.result && typeof row.result === 'object' && !Array.isArray(row.result)
+      ? row.result as Record<string, unknown> : row;
+    const abandoned = nested.abandonedClassification && typeof nested.abandonedClassification === 'object'
+      && !Array.isArray(nested.abandonedClassification) ? nested.abandonedClassification as Record<string, unknown> : null;
+    return {
+      observed: true,
+      stage: terminal.stage,
+      ok: terminal.ok,
+      outcome: typeof nested.outcome === 'string' ? nested.outcome
+        : typeof nested.completionDisposition === 'string' ? nested.completionDisposition
+          : typeof nested.terminationReason === 'string' ? nested.terminationReason : null,
+      failureClassification: typeof nested.failureClassification === 'string' ? nested.failureClassification
+        : typeof abandoned?.classification === 'string' ? abandoned.classification : null,
+    };
+  }
+  return { observed: false, stage: null, ok: null, outcome: null, failureClassification: null };
 }
 
 /** 사람용 런 결과 한 줄 — 수확 브랜치가 있으면 «수확할 브랜치: …» 를 붙인다. */

@@ -4577,7 +4577,8 @@ function configuredFallbackChainSteps(): readonly string[] {
   try {
     const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
     const { normalizeFallbackChain } = require('./oauth/fallback-chain.js') as typeof import('./oauth/fallback-chain.js');
-    return normalizeFallbackChain(getUserConfig().llm.fallbackChain).chain;
+    const llm = getUserConfig().llm;
+    return normalizeFallbackChain(llm.fallbackChain, llm.provider).chain;
   } catch (err) {
     // ⛔ 조용히 삼키면 「설정을 못 읽었다」가 「폴백 후보가 없다」로 «둔갑»한다 —
     //   호출자는 그것을 `fallback candidates exhausted` 로 보고 사람에게 그렇게 말한다.

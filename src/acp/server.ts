@@ -1679,6 +1679,12 @@ function wireAcpConnection(
           content: { type: 'text', text: chunk },
         };
         if (_meta) update._meta = _meta;
+        const elanousMeta = _meta?.elanous;
+        if (elanousMeta && typeof elanousMeta === 'object' && !Array.isArray(elanousMeta)
+          && (elanousMeta as Record<string, unknown>).textOperation === 'replace') {
+          aggregatorAgentText = chunk;
+          try { c5dProducer?.replaceText(chunk); } catch { /* fail-soft */ }
+        }
         await broadcast(
           req.sessionId,
           update as Parameters<typeof broadcast>[1],

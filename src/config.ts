@@ -7,6 +7,7 @@ import { listSshHosts } from './ssh/ssh-hosts.js';
 import { isInstalledPackagePath } from './instance/installed-package.js';
 import { defaultObsidianVault } from './obsidian/default-vault.js';
 import { OPENGATEWAY_DEFAULT_MODEL } from './llm/opengateway-models.js';
+import { SERVICE_KEY_CATALOG } from './setup/service-key-catalog.js';
 
 // ── User config ──
 export const REMOTE_HOME = homedir();
@@ -191,10 +192,11 @@ export function refreshKeyFromCache(envName: string): boolean {
  * (음성 STT/TTS 등) plist 에서 키만 빼면 조용히 죽는다 ⇒ 부팅 한 곳에서 캐시를 env 에 싣는다(규약 = 캐시 우선 · ⓐⓑ 동일).
  * 자식 프로세스도 이 env 를 물려받는다. 반환 = 캐시로 채운 이름(값은 절대 안 싣는다).
  */
-export const DAEMON_KEY_ENV_NAMES = [
+export const DAEMON_KEY_ENV_NAMES = [...new Set([
   'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'XAI_API_KEY', 'OPENROUTER_API_KEY', 'OPENGATEWAY_API_KEY',
   'ELANOUS_OPENAI_RELAY_SHARED_SECRET',
-] as const;
+  ...SERVICE_KEY_CATALOG.flatMap(item => item.envNames),
+])];
 
 export function hydrateEnvFromKeyCache(names: readonly string[] = DAEMON_KEY_ENV_NAMES, env: NodeJS.ProcessEnv = process.env): string[] {
   const filled: string[] = [];

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { withFakeBins } from '../ux-sim/fake-bin.js';
 import { CensusDiffCache, resetCensusDiffCache, sharedCensusDiffCache, cardIdFromBody, censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, sliceMarkerFromBody, spawnParallelCommands,
-  type PrToolCall, type PrToolCommand, type PrToolCommandResult, type PrToolParallelCommand } from './census.js';
+  observePrLineage, type PrToolCall, type PrToolCommand, type PrToolCommandResult, type PrToolParallelCommand } from './census.js';
 
 const pr = (number: number, files: string[], extra: Record<string, unknown> = {}) => ({
   number, title: `PR ${number}`, state: 'open', draft: false, updated_at: '2026-10-16T00:00:00Z',
@@ -50,6 +50,48 @@ test('inventory traverses every page and all PR file pages; later-page file over
   expect(verdict.status).toBe('allow');
   expect(verdict.warnings).toContainEqual(expect.objectContaining({ code: 'file-overlap', prs: [3] }));
   expect(f.calls.some(endpoint => endpoint.includes('/pulls/3/files?'))).toBe(true);
+});
+
+test('PR lineage reads explicit head and Supersedes facts while leaving close criteria unknown', () => {
+  const calls: string[][] = [];
+  const writes: string[][] = [];
+  const observedAt = new Date('2026-10-30T03:00:00.000Z');
+  const result = observePrLineage({
+    pr: 42,
+    now: () => observedAt,
+    run: (command, args) => {
+      expect(command).toBe('gh');
+      calls.push([...args]);
+      if (args[0] === 'pr' && ['close', 'edit', 'merge'].includes(args[1] ?? '')) writes.push([...args]);
+      return { ok: true, out: JSON.stringify({ number: 42, headRefOid: 'a'.repeat(40), body: 'summary\nSupersedes: #7\n' }) };
+    },
+  });
+  expect(result).toMatchObject({
+    status: 'observed', pr: 42, observedAt: observedAt.toISOString(), closeEligible: false,
+    currentHead: { status: 'observed', value: 'a'.repeat(40) },
+    supersedes: { status: 'observed', value: 7 },
+    sourceCard: { status: 'unknown', value: null },
+    olderScopeCarriedForward: { status: 'unknown', value: null },
+    newerProtected: { status: 'unknown', value: null },
+    cellStatus: { status: 'unknown', value: null },
+    owner: { status: 'unknown', value: null },
+    mergeSubstitution: { status: 'unknown', value: null },
+  });
+  expect(result.currentHead.evidence).toContain('headRefOid');
+  expect(result.supersedes.evidence).toContain('Supersedes: #7');
+  expect(calls).toEqual([['pr', 'view', '42', '--json', 'number,headRefOid,body']]);
+  expect(writes).toEqual([]);
+});
+
+test('PR lineage fails closed for ambiguous Supersedes or an unreadable PR', () => {
+  const ambiguous = observePrLineage({ pr: 42, run: () => ({ ok: true, out: JSON.stringify({
+    number: 42, headRefOid: 'b'.repeat(40), body: 'Supersedes: #7\nSupersedes: #8',
+  }) }) });
+  expect(ambiguous).toMatchObject({ status: 'unknown', closeEligible: false,
+    supersedes: { status: 'unknown', value: null, reason: expect.stringContaining('둘 이상') } });
+  const failed = observePrLineage({ pr: 42, run: () => ({ ok: false, out: '', err: 'offline' }) });
+  expect(failed).toMatchObject({ status: 'unknown', closeEligible: false, reason: expect.stringContaining('offline'),
+    currentHead: { status: 'unknown' }, supersedes: { status: 'unknown' } });
 });
 
 test('inventory failure and GitHub file cap stay unknown, never become no-overlap', () => {

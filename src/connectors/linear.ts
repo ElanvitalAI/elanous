@@ -180,6 +180,12 @@ export async function resolveLinearProjectId({ apiKey, project, fetch: fetchFn =
   return projectId;
 }
 
+export async function resolveLinearViewerId({ apiKey, fetch: fetchFn = fetch }: LinearRequestOptions): Promise<string> {
+  const data = await linearRequest<{ viewer?: { id?: string } }>({ apiKey, fetch: fetchFn }, 'query LinearSecretaryViewer { viewer { id } }', {});
+  if (!data.viewer?.id) throw new Error('Linear viewer id could not be resolved');
+  return data.viewer.id;
+}
+
 /** Read-only project lookup. A name is resolved uniquely before querying its issues. */
 export async function fetchLinearProjectIssues({ apiKey, project, includeDone = false, fetch: fetchFn = fetch }: {
   apiKey: string; project: string; includeDone?: boolean; fetch?: typeof fetch;
@@ -234,17 +240,47 @@ export async function findLinearDecisionIssue({ apiKey, projectId, decisionId, f
   return match;
 }
 
-/** Create in the COO project; Linear requires a team from that project for issueCreate. */
-export async function createLinearIssue({ apiKey, projectId, title, description, dueDate, fetch: fetchFn = fetch }: LinearRequestOptions & {
-  projectId: string; title: string; description: string; dueDate?: string;
+/** Create in a project or directly in an explicitly selected team. */
+export async function createLinearIssue({ apiKey, projectId, teamKey, title, description, dueDate, parentId, assigneeId, stateType, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  projectId?: string; teamKey?: string; title: string; description: string; dueDate?: string; parentId?: string; assigneeId?: string;
+  stateType?: 'started' | 'unstarted' | 'completed' | 'canceled';
 }): Promise<string> {
-  const data = await linearRequest<{ project?: { teams?: { nodes?: Array<{ id: string }> } } }>({ apiKey, fetch: fetchFn },
-    'query DecisionProjectTeam($id: String!) { project(id: $id) { teams { nodes { id } } } }', { id: projectId });
+  if (!apiKey.trim() || (!projectId?.trim() && !teamKey?.trim())) throw new Error('Linear project or team and API key are required');
+  if (!projectId?.trim()) return createLinearTeamIssue({ apiKey, teamKey: teamKey!.trim(), title, description, dueDate, parentId, assigneeId, stateType, fetch: fetchFn });
+  type Team = { id: string; states?: { nodes?: Array<{ id: string; type: string }> } };
+  const data = await linearRequest<{ project?: { teams?: { nodes?: Team[] } } }>({ apiKey, fetch: fetchFn },
+    'query DecisionProjectTeam($id: String!) { project(id: $id) { teams { nodes { id states { nodes { id type } } } } } }', { id: projectId });
   const teams = data.project?.teams?.nodes;
   if (!teams?.[0]?.id) throw new Error('Linear project has no team');
+  const stateId = stateType ? teams[0].states?.nodes?.find(state => state.type === stateType)?.id : undefined;
+  if (stateType && !stateId) throw new Error(`Linear team workflow state not found: ${stateType}`);
   const created = await linearRequest<{ issueCreate?: { success?: boolean; issue?: { id?: string } } }>({ apiKey, fetch: fetchFn },
     'mutation DecisionIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id } } }',
-    { input: { teamId: teams[0].id, projectId, title, description, ...(dueDate ? { dueDate } : {}) } });
+    { input: {
+      teamId: teams[0].id, projectId, title, description,
+      ...(dueDate ? { dueDate } : {}), ...(parentId ? { parentId } : {}), ...(assigneeId ? { assigneeId } : {}), ...(stateId ? { stateId } : {}),
+    } });
+  const id = created.issueCreate?.issue?.id;
+  if (!created.issueCreate?.success || !id) throw new Error('Linear issueCreate did not return an issue id');
+  return id;
+}
+
+/** Create an issue directly in a team, without requiring a project. */
+export async function createLinearTeamIssue({ apiKey, teamKey, title, description, dueDate, parentId, assigneeId, stateType, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  teamKey: string; title: string; description?: string; dueDate?: string; parentId?: string; assigneeId?: string;
+  stateType?: 'started' | 'unstarted' | 'completed' | 'canceled';
+}): Promise<string> {
+  if (!apiKey.trim() || !teamKey.trim() || !title.trim()) throw new Error('Linear team, title and API key are required');
+  const data = await linearRequest<{ teams?: { nodes?: Array<{ id?: string; states?: { nodes?: Array<{ id: string; type: string }> } }> } }>({ apiKey, fetch: fetchFn },
+    'query LinearTeamByKey($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id states { nodes { id type } } } } }', { key: teamKey.trim() });
+  const teams = data.teams?.nodes ?? [];
+  if (teams.length !== 1 || !teams[0]?.id) throw new Error(teams.length ? 'Linear team key is ambiguous' : 'Linear team key was not found');
+  const stateId = stateType ? teams[0].states?.nodes?.find(state => state.type === stateType)?.id : undefined;
+  if (stateType && !stateId) throw new Error(`Linear team workflow state not found: ${stateType}`);
+  const created = await linearRequest<{ issueCreate?: { success?: boolean; issue?: { id?: string } } }>({ apiKey, fetch: fetchFn },
+    'mutation LinearTeamIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id } } }',
+    { input: { teamId: teams[0].id, title: title.trim(), ...(description?.trim() ? { description: description.trim() } : {}),
+      ...(dueDate ? { dueDate } : {}), ...(parentId ? { parentId } : {}), ...(assigneeId ? { assigneeId } : {}), ...(stateId ? { stateId } : {}) } });
   const id = created.issueCreate?.issue?.id;
   if (!created.issueCreate?.success || !id) throw new Error('Linear issueCreate did not return an issue id');
   return id;
@@ -257,8 +293,74 @@ export async function commentLinearIssue({ apiKey, issueId, body, fetch: fetchFn
   if (!data.commentCreate?.success || !data.commentCreate.comment?.id) throw new Error('Linear commentCreate failed');
 }
 
+export async function createLinearAttachment({ apiKey, issueId, title, url, subtitle, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  issueId: string; title: string; url: string; subtitle?: string;
+}): Promise<string> {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:') throw new Error('Linear attachment URL must use HTTPS');
+  const data = await linearRequest<{ attachmentCreate?: { success?: boolean; attachment?: { id?: string } } }>({ apiKey, fetch: fetchFn },
+    'mutation LinearAttachmentCreate($input: AttachmentCreateInput!) { attachmentCreate(input: $input) { success attachment { id } } }',
+    { input: { issueId, title, url: parsed.toString(), ...(subtitle ? { subtitle } : {}) } });
+  const id = data.attachmentCreate?.attachment?.id;
+  if (!data.attachmentCreate?.success || !id) throw new Error('Linear attachmentCreate did not return an attachment id');
+  return id;
+}
+
+/** Request a signed Linear upload URL and stream a generated artifact from the server. */
+export async function uploadLinearFile({ apiKey, filename, contentType, body, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  filename: string; contentType: string; body: Buffer;
+}): Promise<string> {
+  const data = await linearRequest<{ fileUpload?: { success?: boolean; uploadFile?: {
+    uploadUrl?: string; assetUrl?: string; headers?: Array<{ key: string; value: string }>;
+  } } }>({ apiKey, fetch: fetchFn },
+    `mutation LinearFileUpload($contentType: String!, $filename: String!, $size: Int!) {
+      fileUpload(contentType: $contentType, filename: $filename, size: $size) {
+        success uploadFile { uploadUrl assetUrl headers { key value } }
+      }
+    }`,
+    { contentType, filename, size: body.byteLength });
+  const upload = data.fileUpload?.uploadFile;
+  if (!data.fileUpload?.success || !upload?.uploadUrl || !upload.assetUrl || !Array.isArray(upload.headers)) {
+    throw new Error('Linear fileUpload did not return an upload URL');
+  }
+  const uploadUrl = new URL(upload.uploadUrl);
+  const assetUrl = new URL(upload.assetUrl);
+  if (uploadUrl.protocol !== 'https:' || assetUrl.protocol !== 'https:') throw new Error('Linear file upload URLs must use HTTPS');
+  const headers = new Headers({ 'Content-Type': contentType, 'Cache-Control': 'public, max-age=31536000' });
+  for (const header of upload.headers) {
+    if (!header || typeof header.key !== 'string' || typeof header.value !== 'string') throw new Error('Linear fileUpload returned invalid headers');
+    headers.set(header.key, header.value);
+  }
+  let response: Response;
+  try {
+    const uploadBody = new Uint8Array(body.byteLength);
+    uploadBody.set(body);
+    response = await fetchFn(uploadUrl, { method: 'PUT', headers, body: uploadBody, redirect: 'error' });
+  } catch {
+    throw new Error('Linear file upload PUT failed');
+  }
+  if (!response.ok) throw new Error(`Linear file upload PUT HTTP ${response.status}`);
+  return assetUrl.toString();
+}
+
+export async function updateLinearIssueDescription({ apiKey, issueId, description, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  issueId: string; description: string;
+}): Promise<void> {
+  const data = await linearRequest<{ issueUpdate?: { success?: boolean } }>({ apiKey, fetch: fetchFn },
+    'mutation LinearIssueDescriptionUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',
+    { id: issueId, input: { description } });
+  if (!data.issueUpdate?.success) throw new Error('Linear issue description update failed');
+}
+
+export async function fetchLinearIssueDescription({ apiKey, issueId, fetch: fetchFn = fetch }: LinearRequestOptions & { issueId: string }): Promise<string> {
+  const data = await linearRequest<{ issue?: { description?: string | null } }>({ apiKey, fetch: fetchFn },
+    'query LinearIssueDescription($id: String!) { issue(id: $id) { description } }', { id: issueId });
+  if (typeof data.issue?.description !== 'string') throw new Error('Linear issue description is missing');
+  return data.issue.description;
+}
+
 export async function moveLinearIssueToStateType({ apiKey, issueId, type, fetch: fetchFn = fetch }: LinearRequestOptions & {
-  issueId: string; type: 'completed' | 'canceled';
+  issueId: string; type: 'unstarted' | 'started' | 'completed' | 'canceled';
 }): Promise<void> {
   const data = await linearRequest<{ issue?: { team?: { states?: { nodes?: Array<{ id: string; type: string }> } } } }>({ apiKey, fetch: fetchFn },
     'query DecisionIssueStates($id: String!) { issue(id: $id) { team { states { nodes { id type } } } } }', { id: issueId });
@@ -268,6 +370,48 @@ export async function moveLinearIssueToStateType({ apiKey, issueId, type, fetch:
     'mutation DecisionIssueClose($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',
     { id: issueId, input: { stateId: state.id } });
   if (!updated.issueUpdate?.success) throw new Error('Linear issueUpdate failed');
+}
+
+/** Check the issue's current workflow state and transition in one fresh read/write operation. */
+export async function transitionLinearIssueStateType({ apiKey, issueId, type, fromTypes, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  issueId: string; type: 'unstarted' | 'started' | 'completed' | 'canceled'; fromTypes?: readonly string[];
+}): Promise<boolean> {
+  const data = await linearRequest<{ issue?: { state?: { type?: string } | null; team?: { states?: { nodes?: Array<{ id: string; type: string }> } } } }>({ apiKey, fetch: fetchFn },
+    'query LinearIssueTransitionGuard($id: String!) { issue(id: $id) { state { type } team { states { nodes { id type } } } } }', { id: issueId });
+  const currentType = data.issue?.state?.type;
+  if (!currentType || currentType === 'completed' || currentType === 'canceled' || (fromTypes && !fromTypes.includes(currentType))) return false;
+  const state = data.issue?.team?.states?.nodes?.find(node => node.type === type);
+  if (!state?.id) throw new Error(`Linear team workflow state not found: ${type}`);
+  const updated = await linearRequest<{ issueUpdate?: { success?: boolean } }>({ apiKey, fetch: fetchFn },
+    'mutation LinearIssueTransition($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',
+    { id: issueId, input: { stateId: state.id } });
+  if (!updated.issueUpdate?.success) throw new Error('Linear issueUpdate failed');
+  return true;
+}
+
+export async function fetchLinearIssueStateType({ apiKey, issueId, fetch: fetchFn = fetch }: LinearRequestOptions & { issueId: string }): Promise<string> {
+  const data = await linearRequest<{ issue?: { state?: { type?: string } | null } }>({ apiKey, fetch: fetchFn },
+    'query LinearIssueStatus($id: String!) { issue(id: $id) { state { type } } }', { id: issueId });
+  const type = data.issue?.state?.type;
+  if (!type) throw new Error('Linear issue state type is missing');
+  return type;
+}
+
+/** Read the immutable identity needed to bind a demo mission to a real child issue. */
+export async function fetchLinearMissionIssueIdentity({ apiKey, issueId, fetch: fetchFn = fetch }: LinearRequestOptions & { issueId: string }): Promise<{ id: string; teamKey: string; parentId: string | null }> {
+  const data = await linearRequest<{ issue?: { id?: string; team?: { key?: string } | null; parent?: { id?: string } | null } }>({ apiKey, fetch: fetchFn },
+    'query LinearMissionIssueIdentity($id: String!) { issue(id: $id) { id team { key } parent { id } } }', { id: issueId });
+  const issue = data.issue;
+  if (!issue?.id || !issue.team?.key) throw new Error('Linear issue identity is incomplete');
+  return { id: issue.id, teamKey: issue.team.key, parentId: issue.parent?.id ?? null };
+}
+
+export async function fetchLinearIssueUpdatedAt({ apiKey, issueId, fetch: fetchFn = fetch }: LinearRequestOptions & { issueId: string }): Promise<string> {
+  const data = await linearRequest<{ issue?: { updatedAt?: string } }>({ apiKey, fetch: fetchFn },
+    'query LinearIssueUpdatedAt($id: String!) { issue(id: $id) { updatedAt } }', { id: issueId });
+  const updatedAt = data.issue?.updatedAt;
+  if (!updatedAt || !Number.isFinite(Date.parse(updatedAt))) throw new Error('Linear issue updatedAt is missing');
+  return updatedAt;
 }
 
 export function toTaskRequest(event: ExternalTaskEvent): {

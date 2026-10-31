@@ -21,7 +21,7 @@ import { createWorktree, resolveMainRepoRoot, type CreateWorktreeOpts } from '..
 import { configuredWorktreeRoot, getUserConfig } from '../user-config.js';
 import { worktreeHasChanges, commitWorktree, changedFiles } from '../self-implement/seams.js';
 import { streamLLM, type LLMMessage } from '../llm.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { emitPtyDecision, type DecisionInput } from './pty-decision.js';
 import { observeExternalEvent } from '../context-bus/external-events.js';
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
@@ -42,8 +42,10 @@ import { checkClaudeSubscription } from './claude-subscription.js';
 import { handoffMission, waitForHumanLogin, type HandoffOperations } from './handoff.js';
 import { dispatchOpenPullRequest } from '../tool-runtime/git-pr-runtime.js';
 import { runClaudeHeadless } from './claude-headless.js';
+import { runCodexExec } from './codex-exec.js';
 import { installPluginInsideAgent, type PluginRequest, type PluginDeps } from './in-agent-plugin.js';
 import { planMissionResources, type ResourceLadderDeps, type ResourcePlan } from './resource-ladder.js';
+import type { InProcessHandler, InProcessHandlerContext } from '../graph-runner/in-process-registry.js';
 import { ensureRunId } from '../harness/harness-space.js';
 import { recordHarnessWorktreeProvenance } from '../harness/harness-worktree-add.js';
 import { resolveInstanceName } from '../instance-identity.js';
@@ -190,6 +192,9 @@ export const codexBackend: AgentBackend = {
   args: ['--yolo', '-c', 'check_for_update_on_startup=false'],
   scrubEnv: ['OPENAI_API_KEY'],
   handleTrust: (screen, write) => {
+    // Compatibility for non-sidetab callers; runVisibleAgentMission handles
+    // this screen with a one-shot Escape when agent='codex' is supplied.
+    if (/update available/i.test(screen) && /\besc(?:ape)?\s+(?:to\s+)?skip\b/i.test(screen)) { write('\u001b'); return true; }
     if (screenNeedsTrust(screen)) { write('1\r'); return true; }
     return false;
   },
@@ -217,6 +222,7 @@ export const claudeBackend: AgentBackend = {
   name: 'claude',
   cmd: 'claude',
   args: ['--dangerously-skip-permissions'],
+  env: { DISABLE_AUTOUPDATER: '1' },
   // CLAUDE_CODE_OAUTH_TOKEN: a launching Claude Code session exports its own token; the child must use the
   //   machine's stored login, never the parent session's (09-29 🅞: status read `oauth_token` → «api-key» · 대표 R2).
   scrubEnv: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'],
@@ -298,6 +304,13 @@ export const grokBackend: AgentBackend = {
   cmd: 'grok',
   args: ['--always-approve'],
   scrubEnv: ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'],
+  // Grok Build's first-run data-use dialog can cover its composer. Keep the
+  // product's default privacy setting: move to Opt out, then confirm.
+  handleTrust: (screen, write) => {
+    if (!/Help improve Grok/i.test(screen) || !/\[?Opt out\]?/i.test(screen) || !/\[?Opt in\]?/i.test(screen)) return false;
+    write('\u001b[D\r');
+    return true;
+  },
 };
 
 /** Aside Browser agent backend — `aside exec --help` confirms `--effort low`; `ultrabrowse` enables the highest thinking level and proactive mode. */
@@ -452,9 +465,18 @@ export function agentBackendNames(): string[] {
  */
 export function resolveDefaultBackend(
   /** ⛔ 테스트 심 — 실 스토어·실 자격 없이 판정을 주입한다. */
-  deps: { readonly decide?: () => { action: string; backend?: string } } = {},
+  deps: { readonly decide?: () => { action: string; backend?: string }; readonly configuredProvider?: string } = {},
 ): AgentBackend {
   try {
+    const { getUserConfig } = require('../user-config.js') as typeof import('../user-config.js');
+    const provider = deps.configuredProvider ?? getUserConfig().llm.provider;
+    if (provider === 'grok') {
+      debug.log('agent-mission.backend', 'configured-provider', { provider: 'grok', reason: 'user-configured' });
+      return grokBackend;
+    }
+    if (provider === 'openrouter' || provider === 'glm') {
+      throw new Error(`Codex required: agent mission uses a Codex/PTY backend; configured LLM provider '${provider}' is API-only`);
+    }
     const decide = deps.decide
       ?? (() => {
         // ⛔ 지연 로드 — 이 모듈은 부팅 초기에 읽히는데 oauth 축은 스토어·config 를 건드린다.
@@ -467,11 +489,15 @@ export function resolveDefaultBackend(
       debug.log('agent-mission.backend', 'fallback-switch', { from: 'codex', to: decision.backend, reason: 'codex-exhausted' });
       return decision.backend === 'claude' ? claudeBackend : grokBackend;
     }
+    if (decision.action === 'switch-backend' && (decision.backend === 'openrouter' || decision.backend === 'zai')) {
+      throw new Error(`Codex required: agent mission CLI cannot run API provider '${decision.backend}' as a PTY backend`);
+    }
     if (decision.action === 'codex-credits') {
       // CODEX-CREDITS-STEP — 체인 마지막 칸: codex 로 «돌아와» 선불 크레딧으로 계속(판정 쪽이 이미 관측을 남겼다).
       debug.log('agent-mission.backend', 'fallback-codex-credits', { from: 'codex', to: 'codex', reason: 'chain-last-step' });
     }
   } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Codex required:')) throw err;
     debug.log('agent-mission.backend', 'fallback-failed', { message: (err as Error)?.message }, { level: 'warn' });
   }
   return codexBackend;
@@ -541,6 +567,12 @@ export function decideRuntimeFallback(
     return home ? { ...codexBackend, env: { CODEX_HOME: home } } : codexBackend;
   }
   if (decision.action !== 'switch-backend') return null;
+  if (decision.backend === 'openrouter' || decision.backend === 'zai') {
+    debug.log('agent-mission.backend', 'runtime-fallback-unsupported-api-backend', {
+      currentStep, backend: decision.backend, attemptedChainSteps: [...state.attemptedSteps],
+    }, { level: 'warn' });
+    return null;
+  }
   const nextStep = decision.backend === 'grok' ? 'grok' : decision.backend === 'claude' ? 'claude-pty' : null;
   if (!nextStep || state.attemptedSteps.has(nextStep)) return null;
   return nextStep === 'claude-pty' ? claudeBackend : grokBackend;
@@ -575,6 +607,8 @@ export interface AgentMissionSpec {
   agent?: AgentBackend;
   /** Claude CLI 비대화형 stream-json 실행. 다른 backend 에서는 거부. */
   headless?: boolean;
+  /** Optional second user turn sent by resuming the same Claude/Codex CLI session. */
+  followUp?: string;
   /** Install in the agent's own UI before sending the mission. */
   plugin?: Pick<PluginRequest, 'plugin' | 'marketplace'>;
   /** Pre-mission resource judgment; off skips it. */
@@ -662,6 +696,7 @@ export interface AgentMissionDeps {
   reemitPtyUsage?: typeof reemitPtyUsage;
   checkClaudeSubscription?: typeof checkClaudeSubscription;
   runClaudeHeadless?: typeof runClaudeHeadless;
+  runCodexExec?: typeof runCodexExec;
   checkEvidence?: typeof checkEvidence;
   commitWorktree?: typeof commitWorktree;
   dispatchOpenPullRequest?: typeof dispatchOpenPullRequest;
@@ -1626,10 +1661,13 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (spec.chain && spec.commit === false && spec.chain.includes('elanous')) throw new Error('elanous PR handoff requires commit authorization');
   if (spec.headless && spec.chain) throw new Error('--headless cannot run a PTY handoff chain');
   if (spec.headless && backend.name !== 'claude') throw new Error('--headless 는 --backend claude 전용입니다');
-  if (spec.plugin && (spec.headless || (backend.name !== 'codex' && backend.name !== 'claude'))) throw new Error('--plugin 은 codex/claude PTY 전용입니다');
+  if (spec.followUp !== undefined && (!spec.followUp.trim() || (backend.name !== 'claude' && backend.name !== 'codex'))) throw new Error('--follow-up 은 비어 있지 않은 Claude/Codex 후속 프롬프트여야 합니다');
+  if (spec.followUp !== undefined && spec.chain) throw new Error('--follow-up cannot run a PTY handoff chain');
+  if (spec.plugin && (spec.headless || spec.followUp !== undefined || (backend.name !== 'codex' && backend.name !== 'claude'))) throw new Error('--plugin 은 codex/claude 대화형 backend 전용입니다');
   if (spec.workdir && spec.chain) throw new Error('workdir 모드는 넘기기 사슬을 쓰지 않는다');
+  const llmConfig = getUserConfig().llm;
   const runtimeFallback = deps.runtimeFallback ?? {
-    ...initialRuntimeFallback(backend, normalizeFallbackChain(getUserConfig().llm?.fallbackChain).chain),
+    ...initialRuntimeFallback(backend, normalizeFallbackChain(llmConfig?.fallbackChain, llmConfig?.provider).chain),
     fallbackEligible: spec.agent === undefined && !spec.chain,
   };
   const spawnPty = deps.startPty ?? startPty;
@@ -1717,7 +1755,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
   const runId = ensureRunId();
   env.ELANOUS_RUN_ID = runId;
-  if (spec.headless === true) {
+  if (spec.headless === true || spec.followUp !== undefined) {
     // The non-interactive child receives the mission on stdin, never via a PTY or argv.
     // Keep the same enhancement and additive memory policy as the interactive mission.
     let prompt = spec.mission;
@@ -1741,17 +1779,52 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       else debug.log('agent-mission', 'memory', { injected: false });
     }
     if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
-    const headlessRun = (deps.runClaudeHeadless ?? runClaudeHeadless)({ cwd: wt.path, prompt, env: envLiteral(env), maxTurns: maxRounds, onSpawn: deps.onHeadlessStarted });
-    const result = await (deps.awaitMission ? deps.awaitMission(headlessRun) : headlessRun);
+    type SessionRunResult = {
+      ok: boolean; reason: string; exitCode: number | null; sessionId: string | null; numTurns: number | null;
+      toolEvents?: number; malformedLines?: number; durationMs?: number | null;
+    };
+    const firstRun: Promise<SessionRunResult> = backend.name === 'claude'
+      ? (deps.runClaudeHeadless ?? runClaudeHeadless)({ cwd: wt.path, prompt, env: envLiteral(env), maxTurns: maxRounds, onSpawn: deps.onHeadlessStarted })
+      : (deps.runCodexExec ?? runCodexExec)({ cwd: wt.path, prompt, env: envLiteral(env), onSpawn: deps.onHeadlessStarted });
+    let result: SessionRunResult = await (deps.awaitMission ? deps.awaitMission(firstRun) : firstRun);
+    const sessionId = result.sessionId;
+    if (spec.followUp !== undefined) debug.log('agent-mission', 'session-turn', {
+      backend: backend.name, turn: 'initial', ok: result.ok, reason: result.reason, sessionId: result.sessionId, numTurns: result.numTurns,
+    });
+    if (result.ok && spec.followUp !== undefined) {
+      if (!sessionId) {
+        result = { ...result, ok: false, reason: 'no-session', exitCode: result.exitCode };
+      } else if (deps.isMissionAborted?.()) {
+        return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
+          rounds: result.numTurns ?? 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
+      } else {
+        debug.log('agent-mission', 'session-resume-start', { backend: backend.name, resumeSessionId: sessionId });
+        const followRun: Promise<SessionRunResult> = backend.name === 'claude'
+          ? (deps.runClaudeHeadless ?? runClaudeHeadless)({ cwd: wt.path, prompt: spec.followUp, resumeSessionId: sessionId, env: envLiteral(env), maxTurns: maxRounds, onSpawn: deps.onHeadlessStarted })
+          : (deps.runCodexExec ?? runCodexExec)({ cwd: wt.path, prompt: spec.followUp, resumeSessionId: sessionId, env: envLiteral(env), onSpawn: deps.onHeadlessStarted });
+        const resumed: SessionRunResult = await (deps.awaitMission ? deps.awaitMission(followRun) : followRun);
+        debug.log('agent-mission', 'session-resume-result', {
+          backend: backend.name, ok: resumed.ok, reason: resumed.reason, expectedSessionId: sessionId,
+          returnedSessionId: resumed.sessionId, numTurns: resumed.numTurns,
+        });
+        if (!resumed.ok || resumed.sessionId !== sessionId) {
+          const missingResumedSession = resumed.reason === 'no-session';
+          result = { ...resumed, ok: false,
+            reason: resumed.ok || missingResumedSession ? 'session-mismatch' : resumed.reason, sessionId };
+        } else {
+          result = { ...resumed, sessionId, numTurns: (result.numTurns ?? 0) + (resumed.numTurns ?? 0) };
+        }
+      }
+    }
     debug.log('agent-mission', 'headless-result', {
       ok: result.ok, reason: result.reason, exitCode: result.exitCode,
-      sessionId: result.sessionId, numTurns: result.numTurns, toolEvents: result.toolEvents,
-      malformedLines: result.malformedLines, durationMs: result.durationMs,
+      sessionId: result.sessionId, numTurns: result.numTurns, malformedLines: result.malformedLines,
+      ...(backend.name === 'claude' ? { toolEvents: result.toolEvents, durationMs: result.durationMs } : {}),
     });
     if (!result.ok) return {
       ok: false, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
       evidencePath: null, committed: false, usedOmniCrawl: false,
-      detail: `Claude headless failed (${result.reason}; exit ${result.exitCode ?? 'unknown'}). Check the Claude CLI and retry.`,
+      detail: `${backend.name} session failed (${result.reason}; exit ${result.exitCode ?? 'unknown'}). Check the CLI and retry.`,
     };
     if (deps.isMissionAborted?.()) return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
       rounds: result.numTurns ?? 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
@@ -1770,7 +1843,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     }
     let committed = false;
     if (!deps.isMissionAborted?.() && !spec.workdir && (spec.commit ?? true)) {
-      const c = (deps.commitWorktree ?? commitWorktree)(wt.path, `chore(agent-mission): ${spec.branch} — claude-in-elanous headless 산출`);
+      const c = (deps.commitWorktree ?? commitWorktree)(wt.path, `chore(agent-mission): ${spec.branch} — ${backend.name} resumable session 산출`);
       committed = c.ok;
       debug.log('agent-mission', 'commit', { ok: c.ok, out: c.out.slice(0, 120) });
       if (!c.ok) {
@@ -2406,3 +2479,111 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
 
 /** @deprecated codex 특정 이름 — runAgentMission 을 쓰라(codex 는 기본 backend). */
 export const runCodexMission = runAgentMission;
+
+export interface ResearchGraphHandNodeInput {
+  question: string;
+  /** Optional focused task for this hand; otherwise the question is paired with the agent's default role. */
+  codexMission?: string;
+  claudeMission?: string;
+}
+
+export interface ResearchGraphHandNodeOptions {
+  agent: 'codex' | 'claude';
+  /** Small role-specific focus added when the graph input does not provide an explicit mission. */
+  focus?: string;
+  maxRounds?: number;
+}
+
+export interface ResearchGraphHandNodeDeps {
+  runMission?: typeof runAgentMission;
+  resolveBackend?: typeof resolveBackend;
+  readResultFile?: (path: string) => string;
+}
+
+const RESEARCH_HAND_REPORT = '.elanous/mission-results/hand-result.md';
+const RESEARCH_HAND_REPORT_MAX_CHARS = 12_000;
+
+function graphSegment(value: string): string {
+  const safe = value.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+  return safe || 'run';
+}
+
+function researchHandInput(input: unknown, agent: 'codex' | 'claude'): { question: string; mission?: string } | undefined {
+  if (typeof input === 'string' && input.trim()) return { question: input.trim() };
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const record = input as Record<string, unknown>;
+  const question = typeof record.question === 'string' ? record.question.trim() : '';
+  if (!question) return undefined;
+  const requestedMission = record[`${agent}Mission`];
+  return { question, ...(typeof requestedMission === 'string' && requestedMission.trim() ? { mission: requestedMission.trim() } : {}) };
+}
+
+/**
+ * Build one graph hand node around the existing PTY mission driver. Register one handler per agent
+ * (`handler:research-hand`) in the graph's run-scoped in-process registry; the next node receives a
+ * bounded, redacted report plus the durable report path in `outputs[handNodeId].evidence`.
+ */
+export function createResearchGraphHandNodeHandler(
+  options: ResearchGraphHandNodeOptions,
+  deps: ResearchGraphHandNodeDeps = {},
+): InProcessHandler {
+  if (options.agent !== 'codex' && options.agent !== 'claude') throw new Error('research hand agent must be codex or claude');
+  const maxRounds = options.maxRounds ?? 16;
+  if (!Number.isSafeInteger(maxRounds) || maxRounds <= 0) throw new Error('research hand maxRounds must be a positive integer');
+  const focus = options.focus?.trim() || (options.agent === 'codex'
+    ? '데이터를 수집하고 필요한 계산 코드를 작성·실행해 핵심 근거를 정리하라.'
+    : '주장에 대한 반대 근거와 누락된 전제를 검토하고 검토 보고서를 작성하라.');
+  const runMission = deps.runMission ?? runAgentMission;
+  const backend = (deps.resolveBackend ?? resolveBackend)(options.agent);
+
+  return async (context: InProcessHandlerContext) => {
+    const request = researchHandInput(context.input, options.agent);
+    if (!request) return { ok: false, outcome: 'fail', error: 'research hand node requires a non-empty question in graph input' };
+    const branch = `research-hand-${graphSegment(context.graphId)}-${graphSegment(context.runId)}-${graphSegment(context.nodeId)}-${options.agent}`;
+    const decisionMissionId = `research:${graphSegment(context.graphId)}:${graphSegment(context.runId)}`;
+    const reportPath = join(RESEARCH_HAND_REPORT);
+    const mission = [
+      `연구 질문: ${request.question}`,
+      request.mission ? `이 손의 과제: ${request.mission}` : `역할: ${focus}`,
+      `결과 보고서를 ${reportPath} 에 작성하라. 핵심 결과, 근거와 출처, 불확실성, 다음 취합자가 알아야 할 제한을 간결하게 담고 파일을 비우지 마라.`,
+    ].join('\n\n');
+    const result = await runMission({
+      mission,
+      branch,
+      agent: backend,
+      decisionMissionId,
+      evidence: { kind: 'doc', dirRel: '.elanous/mission-results', glob: /^hand-result[.]md$/i },
+      maxRounds,
+      commit: true,
+      enhance: false,
+      memory: false,
+      resources: 'off',
+      entry: 'external-verbatim',
+    });
+    const absoluteReportPath = join(result.worktree, reportPath);
+    let report = '';
+    if (result.ok) {
+      try { report = (deps.readResultFile ?? ((path) => readFileSync(path, 'utf8')))(absoluteReportPath).trim(); }
+      catch { report = ''; }
+    }
+    const ok = result.ok && report.length > 0;
+    return {
+      ok,
+      outcome: ok ? 'ok' : 'fail',
+      ...(ok ? {} : { error: redactSecretText(result.detail || 'research hand report was missing or empty').slice(0, 500) }),
+      evidence: {
+        hand: options.agent,
+        missionId: decisionMissionId,
+        nodeId: context.nodeId,
+        branch,
+        question: request.question,
+        status: ok ? 'completed' : 'failed',
+        worktree: result.worktree,
+        reportPath: absoluteReportPath,
+        report: ok ? redactSecretText(report).slice(0, RESEARCH_HAND_REPORT_MAX_CHARS) : null,
+        evidencePath: result.evidencePath,
+        detail: redactSecretText(result.detail).slice(0, 500),
+      },
+    };
+  };
+}

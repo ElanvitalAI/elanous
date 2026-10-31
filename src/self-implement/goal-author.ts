@@ -10,6 +10,7 @@ import type { LLMUsage } from '../prompt-cache/types.js';
 import { debug } from '../debug/log.js';
 import { ensureDeviceFirstSteps, inspectDeviceFirstGoal } from './device-first.js';
 import { COMPLETION_BOUNDARY_STEP_PREFIX, FOLDED_DEVICE_FIRST_ACTION_MARKER } from './goal-author-decompose.js';
+import { loadMockScenarioCatalog, type MockScenarioDevice, type MockScenarioEntry } from '../ux-sim/mock-scenario-catalog.js';
 
 function observeGoalAuthor(
   category: 'goal-author' | 'goal-author.clarify',
@@ -20,6 +21,7 @@ function observeGoalAuthor(
   debug.log(category === 'goal-author' ? 'harness.author' : 'harness.author.clarify', event, data);
 }
 import { getUserConfig } from '../user-config.js';
+import { getProviderForConfig, streamLLM, type LLMMessage } from '../llm.js';
 
 export type GoalAuthorGrade = 'full' | 'lite';
 export type GoalAuthorGradeSource = 'flag' | 'env' | 'config' | 'default';
@@ -79,6 +81,10 @@ export interface GoalAuthorDeps {
   ground: (ask: string, groundingDeps?: GoalAuthorGroundingDeps) => Promise<CodebaseGrounding>;
   persistentGrounding?: GoalAuthorGroundingDeps;
   authorGrade?: GoalAuthorGradeSelection;
+  /** Production Terra reviewer precheck; omitted is disabled unless the shared config switch is on. */
+  reviewerPrecheckEnabled?: boolean;
+  /** Optional seam for focused tests; production uses the pinned Terra medium reviewer. */
+  reviewerPrecheck?: (document: string, authorRunId: string) => Promise<GoalAuthorReviewerPrecheckResult>;
   enhance: (ask: string, opts?: EnhanceOpts) => Promise<GoalEnhancement>;
   /** Additive enhancer options supplied by the file-writing entrypoint. */
   enhanceOpts?: EnhanceOpts;
@@ -135,6 +141,209 @@ export interface GoalAuthorDeps {
   authoringLessonIds?: readonly string[];
   /** Bounded prior lessons rendered as explicitly non-normative authoring context. */
   authoringLessons?: string;
+}
+
+export interface GoalAuthorReviewerPrecheckResult {
+  readonly suggestions: readonly string[];
+  readonly fixes: readonly string[];
+  /** Exact, replayable edits in fixes order; together they must explain the entire document diff. */
+  readonly fixEvidence?: readonly { readonly fix: string; readonly originalText: string; readonly revisedText: string }[];
+  readonly remainingNeedsHuman: readonly string[];
+  readonly revisedDocument: string;
+  readonly appliedFixes: readonly string[];
+  readonly unappliedItems: readonly string[];
+}
+
+const GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL = 'gpt-6.1-terra';
+
+export function parseGoalAuthorReviewerPrecheck(raw: string): GoalAuthorReviewerPrecheckResult {
+  const text = raw.trim().replace(/^```(?:json)?\s*/iu, '').replace(/\s*```$/u, '');
+  const value: unknown = JSON.parse(text);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('reviewer response must be an object');
+  const record = value as Record<string, unknown>;
+  const readList = (key: string): string[] => {
+    const candidate = record[key];
+    if (!Array.isArray(candidate) || candidate.some((item) => typeof item !== 'string')) {
+      throw new Error(`reviewer response ${key} must be a string array`);
+    }
+    return candidate;
+  };
+  const revisedDocument = record.revisedDocument;
+  if (typeof revisedDocument !== 'string' || !revisedDocument.trim()) throw new Error('reviewer response revisedDocument must be non-empty text');
+  return {
+    suggestions: readList('suggestions'),
+    fixes: readList('fixes'),
+    ...(record.fixEvidence === undefined ? {} : {
+      fixEvidence: (() => {
+        const candidate = record.fixEvidence;
+        if (!Array.isArray(candidate) || candidate.some((item) => !item || typeof item !== 'object'
+          || typeof (item as Record<string, unknown>).fix !== 'string'
+          || typeof (item as Record<string, unknown>).originalText !== 'string'
+          || typeof (item as Record<string, unknown>).revisedText !== 'string')) {
+          throw new Error('reviewer response fixEvidence must be an array of { fix, originalText, revisedText }');
+        }
+        return candidate as { fix: string; originalText: string; revisedText: string }[];
+      })(),
+    }),
+    remainingNeedsHuman: readList('remainingNeedsHuman'),
+    revisedDocument,
+    appliedFixes: [],
+    unappliedItems: [],
+  };
+}
+
+function reviewerRevisionIsValid(original: string, revised: string): boolean {
+  if (!revised.trim() || verbatimOriginalAsk(revised) !== verbatimOriginalAsk(original)) return false;
+  if (parseGoalId(revised) !== parseGoalId(original)
+    || parseRootIntent(revised) !== parseRootIntent(original)
+    || parseGoalType(revised) !== parseGoalType(original)) return false;
+  if (JSON.stringify(canonicalBlocks(revised)) !== JSON.stringify(canonicalBlocks(original))) return false;
+  return !lintGoalFile(revised, 'reviewer-precheck').some((finding) => finding.level === 'ERROR');
+}
+
+function reviewerEditIsGrounded(original: string, edit: { fix: string; originalText: string; revisedText: string }): boolean {
+  if (!edit.originalText || edit.revisedText === edit.originalText || !edit.revisedText.startsWith(edit.originalText)) return false;
+  const acceptanceStart = original.indexOf('## ACCEPTANCE CRITERIA');
+  const evidenceStart = original.indexOf('## REQUIRED EVIDENCE');
+  const nextHeading = (start: number): number => {
+    const next = original.indexOf('\n## ', start + 1);
+    return next < 0 ? original.length : next;
+  };
+  const editStart = original.indexOf(edit.originalText);
+  if (editStart < 0 || original.indexOf(edit.originalText, editStart + edit.originalText.length) >= 0) return false;
+  const sectionTexts = [
+    acceptanceStart >= 0 ? original.slice(acceptanceStart + '## ACCEPTANCE CRITERIA'.length, nextHeading(acceptanceStart)) : '',
+    evidenceStart >= 0 ? original.slice(evidenceStart + '## REQUIRED EVIDENCE'.length, nextHeading(evidenceStart)) : '',
+  ];
+  const isCompleteCriterion = sectionTexts.some((section) => section.split('\n').some((line) =>
+    /^\s*[-*]\s+\S/u.test(line) && line.trim() === edit.originalText.trim()));
+  if (!isCompleteCriterion) return false;
+  const appended = edit.revisedText.slice(edit.originalText.length);
+  if (!/^\r?\n[ \t]*[-*][ \t]+\S/u.test(appended)) return false;
+  const added = appended
+    .replace(/^\r?\n[ \t]*[-*][ \t]*/u, '')
+    .replace(/^\[[a-z-]+\][ \t]*/iu, '')
+    .trim();
+  if (edit.fix !== added) return false;
+  const ask = verbatimOriginalAsk(original);
+  if (!added || !ask) return false;
+  const sentences = ask
+    .split(/(?<=[.!?])(?:[ \t]+|$)|\r?\n/u)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+  return sentences.includes(added);
+}
+
+export function resolveGoalAuthorReviewerPrecheckEnabled(config = getUserConfig()): boolean {
+  return config.tools.selfImplement.goalAuthorReviewerPrecheck === true;
+}
+
+export async function runGoalAuthorReviewerPrecheck(
+  document: string,
+  deps: { config?: ReturnType<typeof getUserConfig>; stream?: typeof streamLLM } = {},
+): Promise<GoalAuthorReviewerPrecheckResult> {
+  const config = deps.config ?? getUserConfig();
+  const pinnedConfig = {
+    ...config,
+    llm: { ...config.llm, provider: 'openai-codex' as const, model: GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL },
+  };
+  const provider = getProviderForConfig(pinnedConfig, GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL);
+  const prompt = [
+    'Review this completed goal document before it is written. Return only JSON with string-array fields suggestions, fixes, remainingNeedsHuman, a fixEvidence array of { fix, originalText, revisedText }, and a revisedDocument string.',
+    'Apply each necessary fix to revisedDocument exactly once while preserving the original ask, GoalId, RootIntent, GoalType, every existing criterion and scope boundary, and canonical section structure. Be strictly conservative: only append one complete sentence copied verbatim from the original ask to an existing acceptance-criteria or required-evidence line; never append a partial substring or clause, especially one inside a negation or condition, and do not delete or reword existing text, add new scope, or edit other sections. For every fixes item, include one fixEvidence object in the same order: fixes item and fix must both equal the exact complete sentence appended from the original ask; originalText and revisedText must be exact spans where revisedText starts with originalText and appends that sentence, and replaying every single replacement reproduces the complete revisedDocument with no other edits. If you cannot explain and ground every change this way, return no fixes and leave revisedDocument byte-for-byte unchanged. Keep optional suggestions separate; list unresolved decisions or evidence as remainingNeedsHuman.',
+    document,
+  ].join('\n\n');
+  const messages: LLMMessage[] = [{ role: 'user', content: prompt }];
+  let actualProvider = provider.name;
+  let actualModel = GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL;
+  const raw = await (deps.stream ?? streamLLM)(messages, () => undefined, {
+    provider,
+    model: GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL,
+    reasoningEffort: 'medium',
+    maxTokens: 3000,
+    usageRole: 'review',
+    usagePhase: 'author-reviewer-precheck',
+    usageSite: 'author-reviewer-precheck',
+    onResolvedProvider: (resolvedProvider, resolvedModel) => { actualProvider = resolvedProvider; actualModel = resolvedModel; },
+  });
+  debug.log('author.reviewer-precheck', 'response', { provider: actualProvider, model: actualModel, responseChars: raw.length });
+  return parseGoalAuthorReviewerPrecheck(raw);
+}
+
+export async function executeGoalAuthorReviewerPrecheck(
+  enabled: boolean,
+  document: string,
+  authorRunId: string,
+  run: (document: string) => Promise<GoalAuthorReviewerPrecheckResult> = (value) => runGoalAuthorReviewerPrecheck(value),
+  observe: (event: string, data: Record<string, unknown>) => void = (event, data) => debug.log('author.reviewer-precheck', event, data),
+): Promise<{ status: 'skipped' | 'completed' | 'rejected-soft' | 'failed-soft'; result?: GoalAuthorReviewerPrecheckResult }> {
+  if (!enabled) {
+    observe('precheck-skipped', { authorRunId, reason: 'disabled', providerCalls: 0 });
+    return { status: 'skipped' };
+  }
+  try {
+    const proposed = await run(document);
+    const evidence = proposed.fixEvidence ?? [];
+    let replayed = document;
+    let fixesSupported = proposed.fixes.length === 0
+      ? proposed.revisedDocument === document && evidence.length === 0
+      : evidence.length === proposed.fixes.length;
+    if (fixesSupported) {
+      for (let index = 0; index < proposed.fixes.length; index += 1) {
+        const edit = evidence[index];
+        if (!edit || edit.fix !== proposed.fixes[index] || !reviewerEditIsGrounded(document, edit) || !replayed.includes(edit.originalText)) {
+          fixesSupported = false;
+          break;
+        }
+        const at = replayed.indexOf(edit.originalText);
+        if (replayed.indexOf(edit.originalText, at + edit.originalText.length) !== -1) {
+          fixesSupported = false;
+          break;
+        }
+        replayed = replayed.slice(0, at) + edit.revisedText + replayed.slice(at + edit.originalText.length);
+      }
+      fixesSupported = fixesSupported && replayed === proposed.revisedDocument;
+    }
+    const valid = reviewerRevisionIsValid(document, proposed.revisedDocument)
+      && fixesSupported
+      && (proposed.fixes.length === 0 || proposed.revisedDocument !== document);
+    const result: GoalAuthorReviewerPrecheckResult = valid
+      ? { ...proposed, appliedFixes: proposed.fixes, unappliedItems: [] }
+      : {
+        ...proposed,
+        revisedDocument: document,
+        appliedFixes: [],
+        unappliedItems: proposed.fixes,
+        remainingNeedsHuman: [...new Set([...proposed.remainingNeedsHuman, ...proposed.fixes])],
+      };
+    const status = valid ? 'completed' : 'rejected-soft';
+    observe(valid ? 'completed' : 'revision-rejected', {
+      authorRunId,
+      provider: 'openai-codex',
+      model: GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL,
+      status,
+      proposedSuggestionCount: result.suggestions.length,
+      proposedFixCount: result.fixes.length,
+      appliedFixCount: result.appliedFixes.length,
+      appliedFixes: result.appliedFixes,
+      fixEvidence: result.fixEvidence ?? [],
+      correctedItems: result.appliedFixes.length,
+      unappliedItemCount: result.unappliedItems.length,
+      unappliedItems: result.unappliedItems,
+      remainingNeedsHuman: result.remainingNeedsHuman,
+      suggestionsResult: result.suggestions,
+      fixesResult: result.fixes,
+      remainingNeedsHumanResult: result.remainingNeedsHuman,
+    });
+    return { status, result };
+  } catch (error) {
+    observe('failed-soft', {
+      authorRunId,
+      reason: error instanceof Error ? error.message : String(error),
+      correctedItems: 0,
+    });
+    return { status: 'failed-soft' };
+  }
 }
 
 export type GoalAuthorGroundingPath = 'groundMissionInCodebase';
@@ -663,9 +872,139 @@ export function inspectGoalDoneBoundary(document: string): { values: Partial<Rec
   return { values, missing: GOAL_DONE_BOUNDARY_LABELS.filter((label) => !values[label]) };
 }
 
-export function explicitGoalDoneBoundaryLines(ask: string): string[] {
+function goalDoneTestPaths(targetPath: string): string[] {
+  if (/\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(targetPath)) return [targetPath];
+  const source = /^(.*)\.([cm]?[jt]sx?)$/i.exec(targetPath);
+  if (!source) return [`${targetPath}.test.ts`, `${targetPath}.spec.ts`];
+  const extension = source[2]!.toLowerCase();
+  const siblingExtensions = extension === 'tsx' ? ['tsx', 'ts'] : extension === 'jsx' ? ['jsx', 'js'] : extension === 'ts' ? ['ts', 'tsx'] : extension === 'js' ? ['js', 'jsx'] : [extension];
+  return siblingExtensions.flatMap((testExtension) => [`${source[1]}.test.${testExtension}`, `${source[1]}.spec.${testExtension}`]);
+}
+
+function bunTestEvidencePath(command: string | undefined): string | undefined {
+  if (command === undefined) return undefined;
+  return /^bun\s+test\s+(?:(?:--\s+)?)(\S+\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s|$)/u.exec(unwrapGoalDoneValue(command))?.[1];
+}
+
+function goalPathTokens(paths: readonly string[]): Set<string> {
+  return new Set(paths.map((path) => path.split(/[\\/]/u).at(-1) ?? path)
+    .flatMap((path) => path.toLowerCase().split(/[._-]+/u))
+    .filter((token) => token.length > 2 && !['src', 'test', 'tests', 'spec', 'tsx', 'ts', 'jsx', 'js'].includes(token)));
+}
+
+function goalPathStems(paths: readonly string[]): Set<string> {
+  return new Set(paths.map((path) => (path.split(/[\\/]/u).at(-1) ?? path).toLowerCase()
+    .replace(/\.(?:test|spec)\.[^.]+$/u, '')
+    .replace(/\.[^.]+$/u, '')));
+}
+
+function matchingPathCount(paths: readonly string[], targetPaths: readonly string[]): number {
+  const targetStems = goalPathStems(targetPaths);
+  if ([...goalPathStems(paths)].some((stem) => targetStems.has(stem))) return 10;
+  const targetTokens = goalPathTokens(targetPaths);
+  return [...goalPathTokens(paths)].filter((token) => targetTokens.has(token)).length;
+}
+
+function behaviorTokens(value: string): Set<string> {
+  const stop = new Set(['the', 'and', 'with', 'from', 'this', 'that', 'when', 'then', 'into', 'only', 'are', 'is', 'for', 'bun', 'test', 'code', 'boundary', 'request', 'expected', 'target', 'file', '완료', '경계', '증거', '명령', '대상', '요청', '기대', '시험', '확인', '시나리오']);
+  return new Set((value.toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? []).filter((token) => !stop.has(token)));
+}
+
+function matchingScenarioBehaviorCount(scenario: MockScenarioEntry, ask: string): number {
   const { values } = inspectGoalDoneBoundary(ask);
-  return GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => values[label] ? [`- ${label}: ${values[label]}`] : []);
+  const requestedText = `${values['완료 경계 코드'] ?? ''} ${values['완료 경계 실물'] ?? ''}`;
+  const describedText = `${scenario.name} ${scenario.kind} ${scenario.trigger} ${scenario.observe.join(' ')} ${scenario.expected}`;
+  const requested = behaviorTokens(requestedText);
+  const described = behaviorTokens(describedText);
+  const polarity = (text: string, token: string): boolean => {
+    const words = text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+    return words.some((word, index) => word === token && words.slice(Math.max(0, index - 3), index).some((nearby) => /^(?:not|never|no|without|isn't|doesn't|않|못|아니)/u.test(nearby)));
+  };
+  const oppositePairs = [
+    ['distinct', 'indistinguishable'], ['preserved', 'lost'], ['visible', 'hidden'], ['visible', 'invisible'],
+    ['harvestable', 'unharvestable'], ['independent', 'dependent'], ['succeeds', 'fails'], ['accepted', 'rejected'],
+  ];
+  const shared = [...described].filter((token) => requested.has(token));
+  if (shared.some((token) => polarity(requestedText, token) !== polarity(describedText, token))
+    || oppositePairs.some(([left, right]) => (requested.has(left) && described.has(right)) || (requested.has(right) && described.has(left)))) return 0;
+  return shared.length;
+}
+
+function nextGoalScenarioId(catalogIds: readonly string[], targets: readonly string[]): string {
+  const targetName = targets.map((path) => path.split(/[\\/]/u).at(-1) ?? '')
+    .map((name) => name.replace(/\.[^.]+$/u, '').replace(/\.(?:test|spec)$/u, ''))
+    .find(Boolean) ?? 'TARGET';
+  const slug = targetName.toUpperCase().replace(/[^A-Z0-9]+/gu, '-').replace(/^-|-$/gu, '').slice(0, 32) || 'TARGET';
+  const prefix = `MK-${slug}-TDD-EVIDENCE`;
+  const existing = new Set(catalogIds);
+  for (let sequence = 1; sequence <= 99; sequence++) {
+    const candidate = `${prefix}-${String(sequence).padStart(2, '0')}`;
+    if (!existing.has(candidate)) return candidate;
+  }
+  return `${prefix}-${Date.now().toString(36).toUpperCase()}`;
+}
+
+function selectGoalMockStage(ask: string, targets: readonly string[]): { device: MockScenarioDevice; scenario?: MockScenarioEntry } | undefined {
+  const catalog = loadMockScenarioCatalog();
+  const device = catalog.devices
+    .map((candidate) => ({ candidate, score: matchingPathCount([...candidate.implementation, ...candidate.tests], targets) }))
+    .filter((entry) => entry.score >= 2)
+    .sort((left, right) => right.score - left.score)[0]?.candidate
+    ?? (/(?:author|goal|mission|저작|골|미션)/iu.test(`${targets.join(' ')}\n${ask}`)
+      ? catalog.devices.find((candidate) => candidate.id === 'product-devices')
+      : catalog.devices.find((candidate) => candidate.id === 'scenario-runner'));
+  if (!device) return undefined;
+  const scenario = catalog.scenarios
+    .filter((candidate) => candidate.device === device.id)
+    .map((candidate) => ({ candidate, pathScore: matchingPathCount([...candidate.implementation, ...candidate.tests], targets), behaviorScore: matchingScenarioBehaviorCount(candidate, ask) }))
+    .filter((entry) => entry.pathScore >= 2 && entry.behaviorScore >= 2)
+    .sort((left, right) => right.behaviorScore - left.behaviorScore || right.pathScore - left.pathScore)[0]?.candidate;
+  return { device, ...(scenario ? { scenario } : {}) };
+}
+
+export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: string): string[] {
+  const { values } = inspectGoalDoneBoundary(ask);
+  const explicitLines = GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => values[label] ? [`- ${label}: ${values[label]}`] : []);
+  // Keep the exported extractor's original contract for callers that only ask
+  // for verbatim values. Goal authoring opts into catalog planning by supplying
+  // its repository root at the production call sites below.
+  if (repositoryRoot === undefined) return explicitLines;
+  const unquotedAsk = ask.replace(/```[\s\S]*?```/gu, '');
+  const targets = declaredTargetPaths(unquotedAsk);
+  const existingEvidence = values['완료 경계 증거 명령'];
+  const targetTestPaths = targets.flatMap(goalDoneTestPaths);
+  const existingBunTestPath = bunTestEvidencePath(existingEvidence);
+  const testPath = targetTestPaths.find((path) => existsSync(resolve(repositoryRoot, path)))
+    ?? (existingBunTestPath && targetTestPaths.includes(existingBunTestPath) ? existingBunTestPath : undefined)
+    ?? targetTestPaths[0]
+    ?? existingBunTestPath;
+  const shouldReplaceEvidence = existingBunTestPath === undefined;
+  const plannedTestPath = !shouldReplaceEvidence && existingBunTestPath ? existingBunTestPath : testPath;
+  const evidenceCommand = shouldReplaceEvidence && testPath ? `bun test ${testPath}` : existingEvidence;
+  const needsNewTest = plannedTestPath !== undefined && !existsSync(resolve(repositoryRoot, plannedTestPath));
+  const mockStage = targets.length ? selectGoalMockStage(ask, targets) : undefined;
+  const lines = GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => {
+    if (label === '완료 경계 증거 명령' && evidenceCommand !== undefined) return [`- ${label}: ${evidenceCommand}`];
+    return values[label] ? [`- ${label}: ${values[label]}`] : [];
+  });
+  if (needsNewTest && plannedTestPath) lines.push(`- 신설: ${plannedTestPath}`);
+  if (shouldReplaceEvidence && existingEvidence && /type-?check|tsc|typescript/iu.test(existingEvidence)) {
+    lines.push(`- 증거 보충: ${existingEvidence} (타입검사는 보조 검증)`);
+  }
+  if (mockStage) {
+    lines.push(`- 장치: ${mockStage.device.id} — ${mockStage.device.name} (카탈로그 경로 일치: ${[...mockStage.device.implementation, ...mockStage.device.tests].filter((path) => matchingPathCount([path], targets) > 0).join(' · ') || mockStage.device.target})`);
+    if (mockStage.scenario) {
+      lines.push(`- 시나리오: ${mockStage.scenario.id} — ${mockStage.scenario.name}`);
+    } else {
+      const id = nextGoalScenarioId(loadMockScenarioCatalog().scenarios.map((scenario) => scenario.id), targets);
+      const requestedCode = values['완료 경계 코드'] ?? '요청 대상의 완료 경계';
+      const requestedObservation = values['완료 경계 실물'] ?? '격리 시험에서 요청된 생산 동작과 결과를 관측한다';
+      lines.push(`- 시나리오: 신설 초안 (MS-id 후보: ${id})`);
+      lines.push(`- 시나리오 초안: 사건은 ${targets.join(' · ') || '요청 대상'}에 «${requestedCode}» 경계를 적용한 입력; 기대는 생산 경로에서 «${requestedObservation}»을 관측하고 bun test ${plannedTestPath ?? '<대상 시험 파일>'}로 GREEN을 확인하는 것이다. 자식은 기존 카탈로그 API·ScenarioV0 형식에 맞춰 요청 대상의 사건·기대를 구체화해 등록한다.`);
+    }
+  }
+  if (plannedTestPath) lines.push(`- 검증 계획(TDD): 장치 ${mockStage?.device.id ?? '미선정'} · 시나리오 ${mockStage?.scenario?.id ?? '신설 초안'} · ${needsNewTest ? '신설 시험' : '기존 시험에 요청 동작 회귀 사례 추가'} ${plannedTestPath} · 피처 시험 bun test ${plannedTestPath}를 구현 전에 RED로 확인한다.`);
+  return lines;
 }
 
 /**
@@ -2535,6 +2874,8 @@ export interface AuthoredGoal {
   authorRunId: string;
   /** AUTHOR-TIMEBOX: present only when the `ground` phase was short-circuited for exceeding its budget. */
   groundingTimebox?: GoalAuthorGroundingTimebox;
+  /** Raw structured reviewer output is preserved for the caller and run observability. */
+  reviewerPrecheck?: GoalAuthorReviewerPrecheckResult;
 }
 
 /** AUTHOR-TIMEBOX 산출 — 예산과 실제 경과. 둘 다 «잰 값»이고 지어낸 값이 아니다. */
@@ -6236,7 +6577,7 @@ async function authorGoalWithSupersededRootIntent(
       '',
       '## ACCEPTANCE CRITERIA',
       ...enhancement.checklist.map(requestedCriterionLine),
-      ...explicitGoalDoneBoundaryLines(ask),
+      ...explicitGoalDoneBoundaryLines(ask, deps.repositoryRoot ?? process.cwd()),
       '',
       '## REQUIRED EVIDENCE',
       '- [requested] Verify the decision signal and the verbatim ask.',
@@ -6721,7 +7062,7 @@ async function authorGoalWithSupersededRootIntent(
       : ['## STEPS', ...(resolvedSteps.length ? resolvedSteps.map((step) => `- ${step}`) : ['- No externally injected steps.']), '']),
     '## ACCEPTANCE CRITERIA',
     ...acceptanceSection,
-    ...explicitGoalDoneBoundaryLines(ask),
+    ...explicitGoalDoneBoundaryLines(ask, deps.repositoryRoot ?? process.cwd()),
     ...preservationAmbiguityCriteria(ambiguities, clarificationAnswers),
     ...preservationAmbiguityNotice(ambiguities),
     ...preservationAmbiguityClarification(clarificationQuestions, clarificationResponses),
@@ -7067,6 +7408,19 @@ export async function writeAuthoredGoal(
         ...(supersededGoalId && { goalId: supersededGoalId }),
         ...(supersededRootIntent !== null && { supersessionRootIntent: supersededRootIntent }),
       });
+    const reviewerPrecheckEnabled = resolvedDeps.reviewerPrecheckEnabled ?? resolveGoalAuthorReviewerPrecheckEnabled();
+    const precheck = await executeGoalAuthorReviewerPrecheck(
+      reviewerPrecheckEnabled,
+      authored.document,
+      authored.authorRunId,
+      (document) => (resolvedDeps.reviewerPrecheck
+        ? resolvedDeps.reviewerPrecheck(document, authored.authorRunId)
+        : runGoalAuthorReviewerPrecheck(document)),
+    );
+    if (precheck.result) {
+      authored.reviewerPrecheck = precheck.result;
+      if (precheck.status === 'completed') authored.document = precheck.result.revisedDocument;
+    }
     const stampedAt = fileDeps.now?.() ?? new Date();
   const identity = identityLines(ask, cwd, fileDeps.env ?? process.env, stampedAt);
   if (identity.length) {

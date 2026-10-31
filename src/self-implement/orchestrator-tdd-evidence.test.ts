@@ -1,8 +1,12 @@
 // ⭐ TDD-AS-LOGIC 회귀 시험 — «쪼개기·TDD 가 로직에 박혀 있나»(대표 10-26 20:5x) 에 대한
 //   RED(구현 전 실패)→GREEN(구현 뒤 같은 명령 통과) 기록을 로직으로 요구하는 회귀 시험.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { judgeTddEvidence, tddPlanFromGoal, parseOffDiffEvidence } from './off-diff-evidence.js';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assessTddBaseHeadTest, judgeTddEvidence, tddPlanFromGoal, parseOffDiffEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest } from './off-diff-evidence.js';
+import { classifyAbandonedRun } from './abandoned-classification.js';
 import { ensureDeviceFirstSteps } from './device-first.js';
 
 const goalWithTddPlan = [
@@ -106,6 +110,143 @@ test('judgeTddEvidence — TDD 계획이 없는 골은 수리 대상이 아니�
   expect(judgment.needsRepair).toBe(false);
 });
 
+test('실제 child tool output은 계획된 같은 시험의 PASS만 tdd-green 원장 기록으로 받아 적는다', () => {
+  const transcript = readFileSync(new URL('./fixtures/tdd-green-missing-passing-child-transcript.txt', import.meta.url), 'utf8');
+  const redOnly = parseOffDiffEvidence(`${redRecord}\n`);
+  const greenMissing = judgeTddEvidence(goalWithTddPlan, redOnly);
+  expect(greenMissing.missing).toEqual(['tdd-green']);
+  expect(receiveObservedTddGreen({ goal: goalWithTddPlan, judgment: greenMissing, transcript, resultParsed: true }))
+    .toMatchObject({ accepted: false, reason: 'passing-test-command-mismatch' });
+  expect(receiveObservedTddGreen({ goal: goalWithTddPlan, judgment: greenMissing, transcript, resultParsed: false }))
+    .toMatchObject({ accepted: false, reason: 'child-result-unparsed' });
+
+  const matchingOutput = `⏺ Bash({"command":"bun test -- 'src/self-implement/orchestrator-tdd-evidence.test.ts'"})\\n ↳ 9 pass 0 fail`;
+  const accepted = receiveObservedTddGreen({ goal: goalWithTddPlan, judgment: greenMissing, transcript: `${redRecord}\n${matchingOutput}`, resultParsed: true });
+  expect(accepted).toMatchObject({ accepted: true, reason: 'matching-test-output-recorded', result: '9 pass · 0 fail' });
+  expect(judgeTddEvidence(goalWithTddPlan, parseOffDiffEvidence(accepted.transcript)).missing).toEqual([]);
+
+  const failedAfterPass = `${redRecord}\n${matchingOutput}\\n⏺ Bash({"command":"bun test src/self-implement/orchestrator-tdd-evidence.test.ts"})\\n ↳ 1 pass 1 fail`;
+  expect(receiveObservedTddGreen({ goal: goalWithTddPlan, judgment: greenMissing, transcript: failedAfterPass, resultParsed: true }))
+    .toMatchObject({ accepted: false, reason: 'latest-matching-test-failed' });
+
+  const noGreen = receiveObservedTddGreen({ goal: goalWithTddPlan, judgment: greenMissing, transcript: 'bun test completed successfully', resultParsed: true });
+  expect(noGreen).toMatchObject({ accepted: false, reason: 'no-adjacent-passing-bun-test' });
+
+  expect(classifyAbandonedRun({
+    worktreePorcelain: '', stage: 'aborted', terminationReason: 'tdd-evidence-missing',
+    reviewResultObserved: true, citedEvidenceExists: false,
+    completionDisposition: 'completed-without-changes', mustFixReported: false,
+  })).toMatchObject({
+    classification: 'implementation-deficit',
+    classificationBasis: 'tdd-evidence-missing',
+    terminationReason: 'tdd-evidence-missing',
+  });
+});
+
+test('실패·통과 도구 출력이 같은 계획 시험 순서로 있을 때만 tdd-red를 수확한다', () => {
+  const judgment = judgeTddEvidence(goalWithTddPlan, parseOffDiffEvidence('구조화 TDD 기록 없음'));
+  const run = (result: string) => `[child-test-output] command=${tddTestCommand}\n[child-test-result] ${result}`;
+  const transcript = `${run('0 pass · 1 fail')}\n${run('9 pass · 0 fail')}`;
+  const red = receiveObservedTddRed({ goal: goalWithTddPlan, judgment, transcript, resultParsed: true });
+  expect(red).toMatchObject({ accepted: true, reason: 'matching-test-failure-recorded', result: '0 pass · 1 fail' });
+  const withGreen = receiveObservedTddGreen({
+    goal: goalWithTddPlan, judgment: judgeTddEvidence(goalWithTddPlan, parseOffDiffEvidence(red.transcript)),
+    transcript: red.transcript, resultParsed: true,
+  });
+  expect(withGreen.accepted).toBe(true);
+  expect(judgeTddEvidence(goalWithTddPlan, parseOffDiffEvidence(withGreen.transcript)).missing).toEqual([]);
+
+  const absent = receiveObservedTddRed({ goal: goalWithTddPlan, judgment, transcript: run('9 pass · 0 fail'), resultParsed: true });
+  expect(absent).toMatchObject({ accepted: false, reason: 'no-matching-failing-test-output' });
+  const redWithoutGreen = receiveObservedTddRed({ goal: goalWithTddPlan, judgment, transcript: run('0 pass · 1 fail'), resultParsed: true });
+  expect(redWithoutGreen).toMatchObject({ accepted: false, reason: 'no-later-matching-passing-test-output' });
+  const wrongCommand = receiveObservedTddRed({
+    goal: goalWithTddPlan, judgment,
+    transcript: `${run('0 pass · 1 fail').replace(tddTestCommand, 'bun test src/other.test.ts')}\n${run('9 pass · 0 fail')}`,
+    resultParsed: true,
+  });
+  expect(wrongCommand.accepted).toBe(false);
+  expect(receiveObservedTddRed({ goal: goalWithTddPlan, judgment, transcript, resultParsed: false }).reason)
+    .toBe('child-result-unparsed');
+});
+
+test('하니스는 변경 시험의 base 실패·head 통과만 RED/GREEN으로 기록하고 base 통과는 계속 거부한다', () => {
+  const judgment = judgeTddEvidence(goalWithTddPlan, parseOffDiffEvidence('자식이 남긴 시험 원문 없음'));
+  const verified = assessTddBaseHeadTest({
+    command: tddTestCommand,
+    baseExitCode: 1,
+    baseOutput: '8 pass · 1 fail',
+    headExitCode: 0,
+    headOutput: '9 pass · 0 fail',
+  });
+  expect(verified).toMatchObject({ accepted: true, reason: 'base-red-head-green', baseResult: '8 pass · 1 fail', headResult: '9 pass · 0 fail' });
+  const red = receiveObservedTddRed({ goal: goalWithTddPlan, judgment, transcript: verified.transcript!, resultParsed: true });
+  expect(red).toMatchObject({ accepted: true, source: 'harness-base', result: '8 pass · 1 fail' });
+  const green = receiveObservedTddGreen({
+    goal: goalWithTddPlan,
+    judgment: judgeTddEvidence(goalWithTddPlan, parseOffDiffEvidence(red.transcript)),
+    transcript: red.transcript,
+    resultParsed: true,
+  });
+  expect(green).toMatchObject({ accepted: true, source: 'harness-head', result: '9 pass · 0 fail' });
+  expect(judgeTddEvidence(goalWithTddPlan, parseOffDiffEvidence(green.transcript)).missing).toEqual([]);
+
+  const baseAlsoPasses = assessTddBaseHeadTest({
+    command: tddTestCommand,
+    baseExitCode: 0,
+    baseOutput: '9 pass · 0 fail',
+    headExitCode: 0,
+    headOutput: '9 pass · 0 fail',
+  });
+  expect(baseAlsoPasses).toMatchObject({ accepted: false, reason: 'base-test-did-not-prove-red' });
+  const headStillFails = assessTddBaseHeadTest({
+    command: tddTestCommand,
+    baseExitCode: 1,
+    baseOutput: '8 pass · 1 fail',
+    headExitCode: 1,
+    headOutput: '8 pass · 1 fail',
+  });
+  expect(headStillFails).toMatchObject({ accepted: false, reason: 'head-test-did-not-pass' });
+});
+
+test('실제 base worktree에는 head의 변경 시험만 덮고, base RED·head GREEN을 수확한다', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'tdd-base-head-fixture-'));
+  try {
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(join(repo, 'node_modules'));
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'tdd-base-head-fixture', type: 'module' }));
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
+    writeFileSync(join(repo, 'src', 'value.ts'), "export const value = 'old';\n");
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 'TDD fixture'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['add', 'package.json', 'bun.lock', 'src/value.ts'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repo, stdio: 'ignore' });
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    writeFileSync(join(repo, 'src', 'value.ts'), "export const value = 'fixed';\n");
+    writeFileSync(join(repo, 'src', 'value.test.ts'), [
+      "import { expect, test } from 'bun:test';",
+      "import { value } from './value';",
+      "test('implemented behavior', () => expect(value).toBe('fixed'));",
+    ].join('\n'));
+
+    const result = runTddBaseHeadTest({
+      cwd: repo,
+      baseSha,
+      goal: [
+        '## 검증 계획 (TDD)',
+        '- ③ 먼저 쓸 시험(RED): bun test src/value.test.ts',
+        '- ④ GREEN 뒤 같은 명령: bun test src/value.test.ts',
+      ].join('\n'),
+    });
+    expect(result).toMatchObject({ accepted: true, reason: 'base-red-head-green', baseResult: '0 pass · 1 fail', headResult: '1 pass · 0 fail' });
+    expect(result.transcript).toContain('[harness-base-test-output] command=bun test src/value.test.ts');
+    expect(result.transcript).toContain('[harness-head-test-result] 1 pass · 0 fail');
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('device-first — 조각 계획이 RED→GREEN 기록 필드를 자식에게 실어 넘긴다', () => {
   const goal = [
     '완료 경계 증거 명령: bun test src/self-implement/tdd-demo.test.ts',
@@ -129,4 +270,6 @@ test('오케스트레이터가 첫 조각 커밋에 피처 시험·구현 전 �
   // ⭐ RED/GREEN 기록이 없으면 수리 라운드를 돌린다.
   expect(orchestratorSource).toContain('implementation-tdd-rework');
   expect(orchestratorSource).toContain('tdd-evidence-missing');
+  expect(orchestratorSource).toContain('runHarnessBaseTddWhenRedMissing');
+  expect(orchestratorSource).toContain('runTddBaseHeadTest');
 });

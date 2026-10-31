@@ -1,4 +1,5 @@
 # Add RSS 2.0 feeds here; no crawler changes are required.
+# Issue-derived watch subscriptions are durable state entries run by intake-source-run-due; they retain the Linear secretary issue identifier as their link key.
 sources:
   - name: AI타임스
     rss: https://www.aitimes.com/rss/allArticle.xml

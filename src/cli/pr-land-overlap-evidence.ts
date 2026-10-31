@@ -14,6 +14,9 @@
  *   ③ 리뷰 — 증거가 가리키는 `review-results/<card>-<pr>-<head접두 10~40>.json`(TA 가 받는 `self review --json` stdout)이
  *      파일명에서 같은 PR·머리 접두이고 내용에서 전체 PR·머리가 정확히 같으며 `reviewed:true` · `verdict ∈ {pass, warn}` · must-fix 가 «잰 수» 0 인가
  *      (자동 병합 canAuto · TA-LAND-WARN-MUSTFIX0 과 같은 규칙 — must-fix 를 못 셌으면 거부).
+ *   ③' 공급자(PRLAND-ACP-CLAUDE-ALLOW) — 백엔드가 `acp:claude`(또는 `acp:claude/…`, acp-fallback+`claude`)인 리뷰도
+ *      ③ 을 만족하고 «같은 머리의 선택된 리뷰» 이면 착지 증거다. 같은 머리의 실패한 금지 리뷰는 후보에서
+ *      superseded 로 제외되고(supersedes 장부), 유효한 같은-머리 리뷰가 없으면 종전처럼 거부한다(fail-closed).
  *   ⓐ 이미 조상(TC #26019 실측) — 겹친 최근 착지 커밋이 «전부» 고정 머리의 조상이면 그 겹침은 이미 그 머리의 게이트·리뷰에
  *      반영됐다 ⇒ ①② 없이 ③ 만으로 통과(관측 reason `already-ancestor`). 하나라도 조상이 아니면 ①②③ 전부.
  *   ⓐ' 증거 파일이 없을 때(`verifyAncestorAutoPass`) — 같은 ⓐ 를 표준 자리 `review-results/*-<pr>-<head접두 10~40>.json` 만으로 잰다
@@ -453,6 +456,7 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
   if (!review.head || review.head.toLowerCase() !== reviewHead) return { ok: false, reason: 'review-head-mismatch', baseTip };
   // The capture parser projects away model provenance; inspect the same last result-shaped line here.
   const raw = lastReviewRecord(text);
+  let acpClaudeEvidence: { actualBackend: string; model: string; reviewRoute: string } | undefined;
   if (raw) {
     if (raw.reviewer === 'OP-waiver') {
       const waiver = validOpWaiver(raw, input.pr, head);
@@ -463,10 +467,15 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
     const route = typeof raw.reviewRoute === 'string' ? raw.reviewRoute.trim().toLowerCase() : '';
     const respondedProvider = typeof raw.respondedProvider === 'string' ? raw.respondedProvider.trim().toLowerCase() : '';
     const respondedModel = typeof raw.respondedModel === 'string' ? raw.respondedModel.trim().toLowerCase() : '';
+    // PRLAND-ACP-CLAUDE-ALLOW — `acp:claude` is no longer refused outright. A review that satisfies
+    // the landing contract below (same PR/head, reviewed, pass|warn, counted must-fix 0) is evidence
+    // whatever backend produced it; a failed acp:claude attempt is excluded by the same-head
+    // supersedes ledger instead of blocking every landing. This note records the provenance only —
+    // the contract below still decides, so an invalid or other-head acp:claude review stays rejected.
     if (actualBackend === 'acp:claude' || actualBackend.startsWith('acp:claude/')
       || model === 'acp:claude' || model.startsWith('acp:claude/')
       || ((route === 'acp' || route === 'acp-fallback') && typeof raw.fallbackBackend === 'string' && raw.fallbackBackend.trim().toLowerCase() === 'claude')) {
-      return { ok: false, reason: 'review-forbidden-acp-claude', baseTip };
+      acpClaudeEvidence = { actualBackend, model, reviewRoute: route };
     }
     const requested = typeof raw.requestedModel === 'string' ? raw.requestedModel.trim().toLowerCase() : '';
     if (requested) {
@@ -490,6 +499,9 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
   if (review.reviewed !== true) return { ok: false, reason: 'review-not-reviewed', baseTip };
   if (review.verdict === null || !ACCEPTED_REVIEW_VERDICTS.has(review.verdict)) return { ok: false, reason: `review-verdict-${review.verdict ?? 'null'}`, baseTip };
   if (review.mustFix !== 0) return { ok: false, reason: review.mustFix === null ? 'review-must-fix-unknown' : `review-must-fix-${review.mustFix}`, baseTip };
+  if (acpClaudeEvidence) {
+    debug.log('pr.land', 'review-acp-claude-accepted', { pr: input.pr, head, reviewResult: e.reviewResult, ...acpClaudeEvidence });
+  }
   if (carry) {
     if (!input.cwd || !input.remote || !input.branch) return { ok: false, reason: 'carry-repo-unmeasured', baseTip };
     const digest = createHash('sha256').update(text).digest('hex');

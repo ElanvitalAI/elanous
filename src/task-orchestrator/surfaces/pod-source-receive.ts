@@ -107,6 +107,10 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     // Count calls performed by this Pod source stage. Branch validation via
     // assertRemoteBase runs on the host before Job creation and is outside it.
     'pod_source_io_origin_calls=0',
+    ...(source.kind === 'default' && baseSha ? [
+      'pod_source_base_sha_origin_fallback=false',
+      'pod_source_base_sha_mirror_fetch_attempted=false',
+    ] : []),
     'pod_source_io_started=$(date +%s)',
     'pod_source_io_reported=0',
     'pod_source_io_measured=0',
@@ -117,7 +121,9 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     '  [ -n "${pod_source_io_seconds:-}" ] || pod_source_io_seconds=$(( $(date +%s) - pod_source_io_started ))',
     '  [ -n "${pod_source_io_files:-}" ] || pod_source_io_files=null',
     '  pod_source_io_status=incomplete; if [ "$pod_source_io_measured" -eq 1 ]; then pod_source_io_status=complete; fi',
-    '  printf \'ELANOUS_POD_SOURCE_IO {"originCalls":%s,"checkoutFiles":%s,"sourceVia":"%s","sourceSeconds":%s,"sourceStatus":"%s","pushCalls":null,"installRan":null,"installSeconds":null}\\n\' "$pod_source_io_origin_calls" "$pod_source_io_files" "${source_via:-unknown}" "$pod_source_io_seconds" "$pod_source_io_status"',
+    ...(source.kind === 'default' && baseSha
+      ? ['  printf \'ELANOUS_POD_SOURCE_IO {"originCalls":%s,"baseShaOriginFallback":%s,"checkoutFiles":%s,"sourceVia":"%s","sourceSeconds":%s,"sourceStatus":"%s","pushCalls":null,"installRan":null,"installSeconds":null}\\n\' "$pod_source_io_origin_calls" "$pod_source_base_sha_origin_fallback" "$pod_source_io_files" "${source_via:-unknown}" "$pod_source_io_seconds" "$pod_source_io_status"']
+      : ['  printf \'ELANOUS_POD_SOURCE_IO {"originCalls":%s,"checkoutFiles":%s,"sourceVia":"%s","sourceSeconds":%s,"sourceStatus":"%s","pushCalls":null,"installRan":null,"installSeconds":null}\\n\' "$pod_source_io_origin_calls" "$pod_source_io_files" "${source_via:-unknown}" "$pod_source_io_seconds" "$pod_source_io_status"']),
     '  pod_source_result_emit "$pod_source_exit"',
     '}',
     'trap pod_source_io_emit EXIT',
@@ -174,7 +180,7 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     `if ! [ -d ${quotedMirror} ]; then mirror_skip=no-mount`,
     `elif ! git -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=rev-parse-failed`,
     ...(source.kind === 'default' && baseSha
-      ? [`elif ! git init -q -b main repo || ! git -C repo fetch --quiet --no-write-fetch-head ${quotedMirror} '${baseSha}' || ! git -C repo cat-file -e '${baseSha}^{commit}' 2>/dev/null; then mirror_skip=sha-fetch-failed`]
+      ? [`elif pod_source_base_sha_mirror_fetch_attempted=true; ! git init -q -b main repo || ! git -C repo fetch --quiet --no-write-fetch-head ${quotedMirror} '${baseSha}' || ! git -C repo cat-file -e '${baseSha}^{commit}' 2>/dev/null; then mirror_skip=sha-fetch-failed`]
       : [`elif ! git clone -q --shared -- ${quotedMirror} repo || ! git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=clone-failed`]),
     'fi',
     'if [ -z "$mirror_skip" ]; then',
@@ -187,10 +193,9 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     "  printf 'ELANOUS_POD_SOURCE_MIRROR_SKIP %s\\n' \"$mirror_skip\"",
     '  if [ -e repo ]; then rm -r -- repo || exit 5; fi',
     ...(source.kind === 'default' && baseSha ? [] : ['  pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))']),
-    ...(source.kind === 'default' && baseSha ? [
-        `  pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${baseSha}'`,
-      '  exit 5',
-    ] : [`  ${clone} || exit 5`]),
+    ...(source.kind === 'default' && baseSha
+      ? [`  git init -q -b main repo && git -C repo remote add origin ${quotedUrl} || exit 5`]
+      : [`  ${clone} || exit 5`]),
     '  source_via=github',
     'fi',
     'fi',
@@ -209,12 +214,19 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
       return [
         ...ioStart,
         ...start,
-        // «실제 객체 출처» 마커: image 라우트는 핀 객체, mirror 라우트는 --shared alternates 가
-        // 해결된 SHA 를 이미 갖고 있으면 그 쪽이 출처다. 어느 쪽에도 없으면 호스트 미러에서
-        // raw-SHA fetch 로 Pod 전용 object store 에 직접 가져온다(프로덕션 미러 = push 로 심은
-        // bare 저장소, upload-pack 기본 설정 · refs/브랜치 경유 없음).
+        // «실제 객체 출처» 마커: image pin을 우선 쓰고, SHA가 없으면 host mirror 다음 origin에서
+        // raw-SHA fetch 해 Pod 전용 object store 에 넣는다. origin 시도 수·성공 여부는 IO summary로
+        // debug.log 에 남겨 다음 실패에서 소스 부재와 네트워크 fallback을 구분한다.
         'pod_source_base_sha_from="$source_via"',
-        `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${sha}'; exit 5; fi`,
+        `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then`,
+        `  if [ "$pod_source_base_sha_mirror_fetch_attempted" = false ] && [ -d ${quotedMirror} ]; then pod_source_base_sha_mirror_fetch_attempted=true; if git fetch --quiet --no-write-fetch-head ${quotedMirror} '${sha}'; then pod_source_base_sha_from=mirror; else printf 'ELANOUS_POD_SOURCE_BASE_SHA_MIRROR_FETCH failed %s\\n' '${sha}'; fi; fi`,
+        `  if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then`,
+        '    pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
+        '    pod_source_base_sha_origin_fallback=true',
+        `    printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH start %s\\n' '${sha}'`,
+        `    if git fetch --quiet --no-write-fetch-head origin '${sha}'; then pod_source_base_sha_from=origin; source_via=origin; printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH complete %s\\n' '${sha}'; else pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH failed %s\\n' '${sha}'; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${sha}'; exit 5; fi`,
+        '  fi',
+        'fi',
         `printf 'ELANOUS_POD_SOURCE_BASE_SHA_FROM %s\\n' "$pod_source_base_sha_from"`,
         `git checkout -q -B ${quotedBase} '${sha}' || exit 5`,
         `git update-ref ${quotedTrackingRef} '${sha}' || exit 5`,

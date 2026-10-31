@@ -666,6 +666,7 @@ describe('orchestrateSelfDev (S1 · parallel self-dev driver)', () => {
     let release!: () => void;
     const held = new Promise<SelfImplementJobDone>((resolve) => { release = () => resolve({ exitCode: 0, output: '' }); });
     const launches: string[] = [];
+    const taskIds: string[] = [];
     const events: string[] = [];
     const otherText = 'a different branch from the CLI';
     const other = withOrchestrateGoalKey({ feature: otherText });
@@ -673,10 +674,12 @@ describe('orchestrateSelfDev (S1 · parallel self-dev driver)', () => {
     const off = debug.registerSink({ name: 'authored-goal-key', emit: (record) => {
       if (record.category === 'self-dev.orchestrate' && record.event === 'same-key-in-flight') events.push(String((record.data as { key: string }).key));
     } });
-    const spawn: SelfImplementJobSpawn = (input) => { launches.push(input.feature); return { address: input.spaceId, done: held }; };
+    const spawn: SelfImplementJobSpawn = (input) => { launches.push(input.feature); if (input.taskId) taskIds.push(input.taskId); return { address: input.spaceId, done: held }; };
     try {
       const run = orchestrateSelfDev({ goals: [created, withOrchestrateGoalKey({ feature: goalText }), other], concurrency: 3, spawn });
       expect(launches).toHaveLength(2);
+      expect(taskIds).toHaveLength(2);
+      expect(taskIds.every(Boolean)).toBe(true);
       expect(launches.some((feature) => feature.startsWith(otherText))).toBe(true);
       expect(events).toEqual([created.planBranch!]);
       release();
@@ -2779,7 +2782,9 @@ describe('triageRun — 실패를 «다음 행동»으로 옮긴다', () => {
       failureClassification: 'report-deficit', completionDisposition: 'completed-without-changes',
       prNumber: 30468, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/30468',
       error: { code: 'pod-job-failed', message: 'BackoffLimitExceeded' },
-    } as never;
+    } as SelfDevJobResult;
+    const withPrPointer = (base: SelfDevJobResult, prNumber: unknown, prUrl: string | undefined): SelfDevJobResult =>
+      ({ ...base, prNumber, prUrl } as SelfDevJobResult);
     const triage = triageRun([incident]);
     expect(triage.classifications).toMatchObject([{
       kind: 'awaiting-human', action: 'needs-human', errorCode: 'PR_CHANGE_CONFLICT',
@@ -2789,9 +2794,9 @@ describe('triageRun — 실패를 «다음 행동»으로 옮긴다', () => {
     expect(triage.rerunnable).toEqual([]);
     expect(triage.actionable).toBe(false);
     expect(triage.needsHuman).toEqual(['RUN-DOCTOR-LIVE']);
-    expect(classifyFailure({ ...incident, prNumber: undefined, prUrl: undefined })).toBe('unconverged');
+    expect(classifyFailure(withPrPointer(incident, undefined, undefined))).toBe('unconverged');
     for (const prNumber of [null, 0, -1, 1.5, Number.NaN]) {
-      expect(classifyFailure({ ...incident, prNumber, prUrl: undefined })).toBe('unconverged');
+      expect(classifyFailure(withPrPointer(incident, prNumber, undefined))).toBe('unconverged');
     }
     for (const prUrl of [
       'https://github.com/owner/repo/issues/30468',
@@ -2804,17 +2809,17 @@ describe('triageRun — 실패를 «다음 행동»으로 옮긴다', () => {
       'https://github.com/owner/repo/pull/30468/',
       'https://github.com/owner/repo/pull/30468/files',
       'https://github.com/owner/repo/pull/9007199254740993',
-    ]) expect(classifyFailure({ ...incident, prNumber: null, prUrl })).toBe('unconverged');
-    expect(classifyFailure({ ...incident, prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' })).toBe('awaiting-human');
-    expect(classifyFailures([{ ...incident, prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' }])[0]?.errorMessage)
+    ]) expect(classifyFailure(withPrPointer(incident, null, prUrl))).toBe('unconverged');
+    expect(classifyFailure(withPrPointer(incident, null, 'https://github.com/owner/repo/pull/30468'))).toBe('awaiting-human');
+    expect(classifyFailures([withPrPointer(incident, null, 'https://github.com/owner/repo/pull/30468')])[0]?.errorMessage)
       .toContain('https://github.com/owner/repo/pull/30468');
-    expect(classifyFailure({ ...incident, prNumber: 30468, prUrl: undefined })).toBe('awaiting-human');
-    const opened = { ...incident, status: 'done', stage: 'pr-opened' };
-    expect(classifyFailure({ ...opened, prNumber: null, prUrl: undefined })).not.toBe('awaiting-human');
-    expect(classifyFailure({ ...opened, prNumber: null, prUrl: 'https://github.com/owner/repo/issues/30468' })).not.toBe('awaiting-human');
-    expect(classifyFailure({ ...opened, prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' })).toBe('awaiting-human');
-    expect(classifyFailure({ ...opened, prNumber: null, prUrl: 'https://example.test/pull/7' })).toBe('awaiting-human');
-    expect(openPrAwaitingHumanMessage({ prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' }))
+    expect(classifyFailure(withPrPointer(incident, 30468, undefined))).toBe('awaiting-human');
+    const opened: SelfDevJobResult = { ...incident, status: 'done', stage: 'pr-opened' };
+    expect(classifyFailure(withPrPointer(opened, null, undefined))).not.toBe('awaiting-human');
+    expect(classifyFailure(withPrPointer(opened, null, 'https://github.com/owner/repo/issues/30468'))).not.toBe('awaiting-human');
+    expect(classifyFailure(withPrPointer(opened, null, 'https://github.com/owner/repo/pull/30468'))).toBe('awaiting-human');
+    expect(classifyFailure(withPrPointer(opened, null, 'https://example.test/pull/7'))).toBe('awaiting-human');
+    expect(openPrAwaitingHumanMessage(withPrPointer(incident, null, 'https://github.com/owner/repo/pull/30468')))
       .toContain('https://github.com/owner/repo/pull/30468');
   });
 

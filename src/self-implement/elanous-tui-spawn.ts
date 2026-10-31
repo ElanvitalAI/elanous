@@ -17,6 +17,9 @@ import { debug } from '../debug/log.js';
  *  같은 값인지는 elanous-tui-spawn-identity.test.ts 가 잡는다. */
 export const PREAMBLE_SYNC_BLOCK_ENV = 'ELANOUS_TEST_PREAMBLE_SYNC_BLOCK_MS';
 
+/** Bare held TUI startup includes Nexus/test-universe initialization; 30s is below observed cold-start latency. */
+export const DEFAULT_TUI_TEST_READY_TIMEOUT_MS = 180_000;
+
 export interface ElanousTuiSpawnOptions {
   readonly repoRoot: string;
   readonly cwd: string;

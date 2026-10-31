@@ -578,8 +578,8 @@ describe('doctor CLI', () => {
     expect(gitRuns).toBeGreaterThan(0);
   });
 
-  test('missing required git fails, prints a platform fix, and JSON lists requiredMissing; optional commands do not fail', async () => {
-    const catalog = 'commands:\n  - name: git\n    tier: required\n  - name: optional-tool\n    tier: capability\n';
+  test('missing capability git is reported with a platform fix but does not block boot or populate requiredMissing', async () => {
+    const catalog = 'commands:\n  - name: git\n    tier: capability\n  - name: optional-tool\n    tier: capability\n';
     for (const installed of [false, true]) {
       for (const json of [false, true]) {
         const output: string[] = [];
@@ -594,12 +594,12 @@ describe('doctor CLI', () => {
           out: { log: (line) => output.push(line) }, setExitCode: (code) => codes.push(code),
         });
         await program.parseAsync(['doctor', ...(json ? ['--json'] : [])], { from: 'user' });
-        if (json) expect(JSON.parse(output[0]!).requiredMissing).toEqual(installed ? [] : ['git']);
+        if (json) expect(JSON.parse(output[0]!).requiredMissing).toEqual([]);
         else if (!installed) {
-          expect(output[0]).toContain('⛔ Required commands missing: git');
-          expect(output[0]).toContain('git: missing (required)\n  Fix: sudo apt-get update && sudo apt-get install -y git');
+          expect(output[0]).not.toContain('⛔ Required commands missing: git');
+          expect(output[0]).toContain('git: missing (capability)\n  Fix: sudo apt-get update && sudo apt-get install -y git');
         }
-        expect(codes).toEqual(installed ? [] : [1]);
+        expect(codes).toEqual([]);
       }
     }
   });

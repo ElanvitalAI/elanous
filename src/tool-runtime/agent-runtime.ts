@@ -15,6 +15,7 @@ export const agentRuntime: ToolRuntime<Record<string, unknown>, AgentToolResult>
       hostTools: ctx.agentHostTools,
       dispatchTool: ctx.agentDispatchTool,
       buildChildToolCatalog: ctx.buildChildToolCatalog,
+      inheritGeneralPurposeToolCatalog: ctx.inheritGeneralPurposeToolCatalog,
       signal: ctx.signal,
     });
   },

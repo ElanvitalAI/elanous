@@ -4,6 +4,8 @@ import { applyGraphOverlays, defaultOverlaysDir, loadGraphOverlays, selectOverla
 import { L1_PROTECTED_ROUTE_NODES, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
 import { evaluateOverlayCondition } from '../self-implement/graph-overlay-condition.js';
 import { journeyJoinFields } from './graph-journey-nodes.js';
+import { defaultProfilesDir, loadGraphProfiles, selectGraphProfiles, type GraphProfileSpec } from '../self-implement/graph-profile-yaml.js';
+import { appendRunLedgerEntry, runLedgerDir } from '../self-implement/run-ledger.js';
 
 /** ⭐ HARNESS-FULL-GRAPH 2판 — 「다음 노드」를 코드가 아니라 «그래프»가 정한다.
  *
@@ -29,11 +31,14 @@ export interface JourneyRoute {
   readonly skippedNode?: string;
   readonly skipCondition?: string;
   readonly skippedNodes?: readonly { readonly node: string; readonly condition: string }[];
+  readonly profileIds?: readonly string[];
+  readonly profileRejections?: readonly string[];
 }
 
 /** ⛔ 캐시하지 않는다 — 여러 런을 처리하는 프로세스(데몬·대기열 tick)가 다음 발사에서 오버레이 변경을 봐야 한다.
  *  여정 판정은 발사당 몇 번뿐이라 디렉터리 한 번 읽기가 싸다. */
 let overlaysForTesting: readonly GraphOverlaySpec[] | undefined;
+let profilesForTesting: readonly GraphProfileSpec[] | undefined;
 function launchOverlays(): readonly GraphOverlaySpec[] {
   if (overlaysForTesting !== undefined) return overlaysForTesting;
   try { return loadGraphOverlays(defaultOverlaysDir()).overlays; }
@@ -45,21 +50,50 @@ export function setJourneyOverlaysForTesting(overlays: readonly GraphOverlaySpec
   overlaysForTesting = overlays;
 }
 
+/** Test seam for a stable profile set; undefined reads the profile directory beside the graph sources. */
+export function setJourneyProfilesForTesting(profiles: readonly GraphProfileSpec[] | undefined): void {
+  profilesForTesting = profiles;
+}
+
+function launchProfiles(): { readonly profiles: readonly GraphProfileSpec[]; readonly errors: readonly string[] } {
+  if (profilesForTesting !== undefined) return { profiles: profilesForTesting, errors: [] };
+  const loaded = loadGraphProfiles(defaultProfilesDir());
+  return { profiles: loaded.profiles, errors: loaded.errors.map((issue) => `${issue.path}: ${issue.message}`) };
+}
+
 /** 상태 값으로 고른 «이 런의 여정 선언» — 기준 YAML ⊕ 조건이 맞는 launch 오버레이. */
 export function journeySpec(
   state: Readonly<Record<string, unknown>>,
   base: GraphTemplateSpec | undefined = GRAPH_SPECS['self-implement'],
   overlays: readonly GraphOverlaySpec[] = launchOverlays(),
-): { readonly spec: GraphTemplateSpec | undefined; readonly applied: readonly string[] } {
-  if (base === undefined) return { spec: undefined, applied: [] };
+  profiles: readonly GraphProfileSpec[] = launchProfiles().profiles,
+  profileLoadErrors: readonly string[] = [],
+): { readonly spec: GraphTemplateSpec | undefined; readonly applied: readonly string[]; readonly profileIds: readonly string[]; readonly profileRejections: readonly string[] } {
+  if (base === undefined) return { spec: undefined, applied: [], profileIds: [], profileRejections: [] };
   try {
-    const { applied } = selectOverlays(overlays, { graphId: base.graphId, stage: 'launch', state });
-    if (applied.length === 0) return { spec: base, applied: [] };
+    const selection = selectGraphProfiles(profiles, state);
+    const profileIds = selection.applied.map((profile) => profile.profileId);
+    const profileOverlayIds = new Set(selection.applied.flatMap((profile) => profile.overlays));
+    const overlayRejections = [...profileOverlayIds].flatMap((id) => {
+      const overlay = overlays.find((candidate) => candidate.overlayId === id);
+      if (!overlay) return [`profile overlay not found: ${id}`];
+      if (overlay.target !== base.graphId) return [`profile overlay target mismatch: ${id} (${overlay.target})`];
+      if (overlay.stage !== 'launch') return [`profile overlay wrong stage: ${id} (${overlay.stage})`];
+      return [];
+    });
+    const profileRejections = [...profileLoadErrors, ...selection.errors, ...overlayRejections];
+    if (profileRejections.length > 0) return { spec: base, applied: [], profileIds: [], profileRejections };
+    const { applied: candidates } = selectOverlays(overlays, { graphId: base.graphId, stage: 'launch', state: selection.state });
+    const ownedState = Object.assign({}, ...selection.applied.map((profile) => profile.state));
+    const applied = candidates.filter((overlay) => !profileOverlayIds.has(overlay.overlayId)
+      || evaluateOverlayCondition(overlay.appliesWhen, ownedState).kind === 'applies');
+    if (applied.length === 0) return { spec: base, applied: [], profileIds, profileRejections: [] };
     const result = applyGraphOverlays(base, applied);
     // ⛔ 거절된 오버레이는 길을 바꾸지 않는다 — 기준 선언으로 간다.
-    return result.ok ? { spec: result.template, applied: result.overlayIds } : { spec: base, applied: [] };
+    return result.ok ? { spec: result.template, applied: result.overlayIds, profileIds, profileRejections: [] }
+      : { spec: base, applied: [], profileIds: [], profileRejections: result.rejections.map((item) => `${item.kind}: ${item.overlayId}`) };
   } catch {
-    return { spec: base, applied: [] };
+    return { spec: base, applied: [], profileIds: [], profileRejections: ['profile selection failed'] };
   }
 }
 
@@ -69,10 +103,11 @@ export function readJourneyEdge(
   from: string,
   label: string,
   state: Readonly<Record<string, unknown>> = {},
-  deps: { readonly base?: GraphTemplateSpec; readonly overlays?: readonly GraphOverlaySpec[] } = {},
+  deps: { readonly base?: GraphTemplateSpec; readonly overlays?: readonly GraphOverlaySpec[]; readonly profiles?: readonly GraphProfileSpec[] } = {},
 ): JourneyRoute {
-  const { spec, applied } = journeySpec(state, deps.base ?? GRAPH_SPECS['self-implement'], deps.overlays ?? launchOverlays());
-  let route: JourneyRoute = { from, on: null, label, to: null, source: 'code-default', overlays: applied };
+  const profileSet = deps.profiles === undefined ? launchProfiles() : { profiles: deps.profiles, errors: [] as readonly string[] };
+  const { spec, applied, profileIds, profileRejections } = journeySpec(state, deps.base ?? GRAPH_SPECS['self-implement'], deps.overlays ?? launchOverlays(), profileSet.profiles, profileSet.errors);
+  let route: JourneyRoute = { from, on: null, label, to: null, source: 'code-default', overlays: applied, profileIds, profileRejections };
   const outgoing = (spec?.edges ?? []).filter(edge => edge.from === from);
   const protectedFrom = L1_PROTECTED_ROUTE_NODES.has(from) || spec?.nodes.some(node => node.nodeId === from && node.kind === 'gate') ||
     spec?.terminalNodes.includes(from);
@@ -80,14 +115,14 @@ export function readJourneyEdge(
   const matching = conditions.filter(({ verdict }) => verdict.kind === 'applies').map(({ edge }) => edge);
   const unobservedConditions = conditions.filter(({ verdict }) => verdict.kind === 'key-absent').map(({ edge }) => edge.when!);
   if (matching.length === 1 && unobservedConditions.length === 0 && matching[0]!.to !== undefined) {
-    route = { from, on: null, label, to: matching[0]!.to!, source: 'graph', overlays: applied,
+    route = { ...route, from, on: null, label, to: matching[0]!.to!, source: 'graph', overlays: applied,
       via: 'when', condition: matching[0]!.when };
   } else {
     const mapped = outgoing.find(edge => edge.when === undefined && edge.map !== undefined && Object.hasOwn(edge.map, label));
     const defaultEdge = mapped ?? outgoing.find(edge => edge.when === undefined && edge.to !== undefined);
-    if (defaultEdge?.map !== undefined) route = { from, on: defaultEdge.on ?? null, label,
+    if (defaultEdge?.map !== undefined) route = { ...route, from, on: defaultEdge.on ?? null, label,
       to: defaultEdge.map[label]!, source: 'graph', overlays: applied, via: 'outcome' };
-    else if (defaultEdge?.to !== undefined) route = { from, on: null, label,
+    else if (defaultEdge?.to !== undefined) route = { ...route, from, on: null, label,
       to: defaultEdge.to, source: 'graph', overlays: applied, via: 'outcome' };
     if (matching.length > 1) route = { ...route, ambiguousConditions: matching.map(edge => edge.when!) };
     if (unobservedConditions.length > 0) route = { ...route, unobservedConditions };
@@ -129,31 +164,51 @@ export interface JourneyEdgeFields {
   readonly [key: string]: unknown;
 }
 
+function recordGraphPathEvent(event: string, data: Record<string, unknown>, runId?: string): void {
+  try { debug.log('graph.path', event, data); } catch { /* fail-soft */ }
+  if (!runId) return;
+  try { appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'graph.path', data: { event, ...data } }, runLedgerDir()); }
+  catch { /* path observation must not change execution */ }
+}
+
 /** 실제로 탄 간선을 남긴다 — `taken` 은 실제 다음 노드(그래프 답과 다르면 `honored: false` · 그 이유를 `reason` 에). */
 export function recordJourneyEdge(route: JourneyRoute, taken: string, reason?: string, data: JourneyEdgeFields = {}): void {
   try {
+    const runId = typeof data.runId === 'string' ? data.runId : undefined;
+    for (const rejection of route.profileRejections ?? []) recordGraphPathEvent('profile-rejected', {
+      graphId: 'self-implement', reason: rejection, profileIds: route.profileIds ?? [],
+      ...(runId === undefined ? {} : { runId }), ...journeyJoinFields(),
+    }, runId);
     if (route.ambiguousConditions?.length) debug.log('self-implement', 'edge-ambiguous', {
       graphId: 'self-implement', from: route.from, conditions: route.ambiguousConditions,
       fallback: taken, ...journeyJoinFields(),
     });
+    if (route.ambiguousConditions?.length) recordGraphPathEvent('edge-ambiguous', {
+      graphId: 'self-implement', from: route.from, conditions: route.ambiguousConditions,
+      fallback: taken, profileIds: route.profileIds ?? [], ...(runId === undefined ? {} : { runId }), ...journeyJoinFields(),
+    }, runId);
     if (route.unobservedConditions?.length) debug.log('self-implement', 'edge-unobserved', {
       graphId: 'self-implement', from: route.from, conditions: route.unobservedConditions,
       fallback: taken, ...journeyJoinFields(),
     });
-    if (route.to === taken) for (const skipped of route.skippedNodes ?? []) debug.log('self-implement', 'node-skipped', {
-      graphId: 'self-implement', node: skipped.node, reason: 'condition', condition: skipped.condition,
-      ...journeyJoinFields(),
-    });
+    if (route.to === taken) for (const skipped of route.skippedNodes ?? []) {
+      const skippedData = { graphId: 'self-implement', node: skipped.node, reason: 'condition', condition: skipped.condition,
+        profileIds: route.profileIds ?? [], ...(runId === undefined ? {} : { runId }), ...journeyJoinFields() };
+      debug.log('self-implement', 'node-skipped', skippedData);
+      recordGraphPathEvent('node-skipped', skippedData, runId);
+    }
     // Evidence never overrides an edge field: the later spread wins. Explicit repair join keys win over ambient context.
     const { reason: _reservedReason, journeyKey: _reservedJourney, queueLaunchId: _reservedLaunch,
-      runId, card, pr, head, moveId, ...evidence } = data ?? {};
-    debug.log('self-implement', 'graph-edge-taken', {
+      runId: _reservedRunId, card, pr, head, moveId, ...evidence } = data ?? {};
+    const edgeData = {
       ...evidence, graphId: 'self-implement', ...route, taken, honored: route.to === null || route.to === taken,
       ...(reason === undefined ? {} : { reason }), ...journeyJoinFields(),
       ...(runId === undefined ? {} : { runId }), ...(card === undefined ? {} : { card }),
       ...(pr === undefined ? {} : { pr }), ...(head === undefined ? {} : { head }),
       ...(moveId === undefined ? {} : { moveId }),
-    });
+    };
+    debug.log('self-implement', 'graph-edge-taken', edgeData);
+    recordGraphPathEvent('edge-taken', edgeData, runId);
   } catch { /* 관측은 fail-soft */ }
 }
 
@@ -162,10 +217,10 @@ export function routeJourneyEdge(
   from: string,
   label: string,
   state: Readonly<Record<string, unknown>> = {},
-  deps: { readonly base?: GraphTemplateSpec; readonly overlays?: readonly GraphOverlaySpec[] } = {},
+  deps: { readonly base?: GraphTemplateSpec; readonly overlays?: readonly GraphOverlaySpec[]; readonly profiles?: readonly GraphProfileSpec[]; readonly runId?: string } = {},
 ): JourneyRoute {
   const route = readJourneyEdge(from, label, state, deps);
-  recordJourneyEdge(route, route.to ?? label);
+  recordJourneyEdge(route, route.to ?? label, undefined, deps.runId === undefined ? {} : { runId: deps.runId });
   return route;
 }
 

@@ -106,7 +106,7 @@ export function formatAutoMergeSuccessMessage(input: {
 import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-run-store.js';
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
 import { getUserConfig } from '../user-config.js';
-import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, runLedgerDir, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
+import { appendRunLedgerEntries, appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, pathSignatureOf, queryRunChain, runLedgerDir, type RunChainShardSibling, type RunLedgerBatchWriter, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
 import { buildRunStopTerminalEvidence, classifyMergeHoldStop, classifyTerminalHarnessFailure, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
 import { autohealFromStop, parseAutohealMode, pickAutohealAction, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
 import { operationalAutohealActions } from './stop-autoheal-operational.js';
@@ -228,7 +228,8 @@ import { formatGateFailedId, type PremiseReviewCard, type PremiseReviewInput } f
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import { mapReworkVerdict, supervisionObservationFields } from './supervision-vocabulary.js';
 import { resolveRunOutcome } from './run-outcome.js';
-import { authorLimitationCountFromGoal, authoredSignalExecution, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, judgeTddEvidence, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { authorLimitationCountFromGoal, authoredSignalExecution, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, judgeTddEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import type { TddRecordTag } from './tdd-evidence-tags.js';
 import { resolveEvidenceHeadCommit } from './evidence-command-budget.js';
 import { pressDecisionSignals, type DecisionSignalPressResult } from './decision-signal-press.js';
 import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations } from '../../scripts/ask-marker-check.js';
@@ -320,6 +321,7 @@ import { createArtifactStore } from '../artifact/index.js';
 import { mapStageToRunStatus, type SelfImplementStage } from './run-status-mapping.js';
 import type { LifecycleScreenComparison } from './lifecycle-screen-scoreboard.js';
 import { buildRuntimeOverlayState } from './graph-overlay-condition.js';
+import { runtimeOverlayRunSteps } from './runtime-overlay-run-steps.js';
 import { activeTemplate, decideTemplate, graphAuthorityFields, nodeNameForStage, overlayDecisionObservation, resolveGraphAuthorityForUserConfig, routeGate, visitBudgetOf } from './graph-authority.js';
 import type { GraphTemplate } from './graph-templates.js';
 import { defaultOverlaysDir, loadGraphOverlays, type GraphOverlaySpec } from './graph-overlay-yaml.js';
@@ -1068,6 +1070,8 @@ export type ImplementTerminalStatus = {
 export interface SelfImplementSeams {
   /** Run-observer ledger sink. Tests inject an in-memory sink to avoid touching user state. */
   writeRunLedger?: RunLedgerWriter;
+  /** Atomic sink for one accepted runtime graph overlay's structural event batch. */
+  writeRunLedgerBatch?: RunLedgerBatchWriter;
   checkUnwiredExports?: typeof findUnwiredExports;
   /** STOP-AUTOHEAL — heal action seams (live mode only runs actions given here; missing = needs-owner). */
   stopAutohealActions?: AutohealActions;
@@ -1228,6 +1232,8 @@ export interface SelfImplementSeams {
   headCommit?: (cwd: string) => string | undefined;
   /** Test seam for required evidence command execution; production uses its bounded shell runner. */
   evidenceCommandRunner?: (command: string, cwd: string) => Pick<ReturnType<typeof spawnSync>, 'status' | 'stdout' | 'stderr' | 'error'>;
+  /** Replays the goal's changed Bun test on base and head when child RED output is absent. */
+  runTddBaseHeadTest?: typeof runTddBaseHeadTest;
   /** `commit` pins the pushed state; without it the worktree HEAD is pushed. */
   preserveBlockedBranch?: (ctx: { cwd: string; branch: string; title: string; commit?: string }) => boolean | Promise<boolean>;
   /** DRAFT-NOT-ARCHIVE — `tools.selfImplement.draftOnStop` 읽기 seam. 생략하면 user-config(실패·부재 = 'always' · 종전). */
@@ -2406,7 +2412,9 @@ export interface SelfImplementResult {
   /** Additive hard-cap disposition; outcome remains the stable public terminal contract. */
   salvage?: 'launched' | 'parked';
   /** Rework stopped on exclusively baseline/flaky/precondition failures; do not retry this goal against the same base. */
-  terminationReason?: 'blocked-by-baseline' | 'goal-only-rework-exhausted';
+  terminationReason?: 'blocked-by-baseline' | 'goal-only-rework-exhausted' | 'tdd-evidence-missing';
+  /** Structured TDD failure survives child JSON/result truncation and parent-ledger mapping. */
+  tddEvidenceFailure?: { reason: 'tdd-evidence-missing'; round: number; missing: readonly TddRecordTag[] };
   sessionId?: string;
   worktreePath?: string;
   branch?: string;
@@ -2895,6 +2903,8 @@ type BlockedDraftPrState = {
   childSummaryArtifact?: ChildSummaryArtifactRef;
   terminalStatus?: ImplementTerminalStatus;
   planRevision?: ReworkPlanRevision;
+  stopStage?: string;
+  stopClass?: ReturnType<typeof classifyTerminalHarnessFailure>;
   /** Classifier output for this unfinished run. Omitted means the cause was not classified. */
   abandonedClassification?: AbandonedClassificationResult;
 };
@@ -2909,29 +2919,39 @@ export type BlockedDraftClassificationRecord = {
   readonly classification: string;
   readonly classificationBasis: string;
   readonly worktreeClean: boolean | null;
+  readonly stop: { readonly class: ReturnType<typeof classifyTerminalHarnessFailure>; readonly stage: string };
 };
 
 export function blockedDraftClassificationRecord(
   classification: AbandonedClassificationResult | undefined,
+  stop: { readonly stage?: string; readonly class?: ReturnType<typeof classifyTerminalHarnessFailure> } = {},
 ): BlockedDraftClassificationRecord {
+  const stage = typeof stop.stage === 'string' && stop.stage.trim() ? stop.stage : 'unknown';
+  const stopClass = stop.class ?? classifyTerminalHarnessFailure({
+    stage,
+    ...(classification ? { abandonedClassification: classification.classification } : {}),
+  });
   if (!classification) {
     return {
       classification: BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION,
       classificationBasis: BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION,
       worktreeClean: null,
+      stop: { class: stopClass, stage },
     };
   }
   return {
     classification: classification.classification,
     classificationBasis: classification.classificationBasis,
     worktreeClean: classification.worktreeClean ?? null,
+    stop: { class: stopClass, stage },
   };
 }
 
 export function formatBlockedDraftClassificationSection(
   classification: AbandonedClassificationResult | undefined,
+  stop: { readonly stage?: string; readonly class?: ReturnType<typeof classifyTerminalHarnessFailure> } = {},
 ): string[] {
-  const record = blockedDraftClassificationRecord(classification);
+  const record = blockedDraftClassificationRecord(classification, stop);
   const human = record.classification === BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION
     ? `${record.classification} (분류를 못 함)`
     : record.classification;
@@ -2942,6 +2962,8 @@ export function formatBlockedDraftClassificationSection(
     `- classification: ${record.classification}`,
     `- classificationBasis: ${record.classificationBasis}`,
     `- worktreeClean: ${worktreeCleanText}`,
+    `- stop.class: ${record.stop.class}`,
+    `- stop.stage: ${record.stop.stage}`,
     '',
     '```json',
     JSON.stringify(record),
@@ -2967,7 +2989,7 @@ function blockedDraftPrBody(feature: string, implSummary: string, state: Blocked
     ...(state.childSummaryArtifact ? [`- child summary artifact: ${state.childSummaryArtifact.path}`] : []),
     ...(state.terminalStatus ? [`- child terminal status: reached=${state.terminalStatus.reached}; changed=${state.terminalStatus.changed}; toolCalls=${state.terminalStatus.toolCalls}; timedOut=${state.terminalStatus.timedOut}`] : []),
     '',
-    ...formatBlockedDraftClassificationSection(state.abandonedClassification),
+    ...formatBlockedDraftClassificationSection(state.abandonedClassification, { stage: state.stopStage, class: state.stopClass }),
     '',
     '## 미배달 감독 수리 지시',
     ...(state.undeliveredSupervisorInputs.length
@@ -3103,10 +3125,12 @@ export function assembleBlockedDraftPrBody(
   persist?: SelfImplementSeams['persistPrBodyArtifact'],
 ): { body: string; truncated: boolean; originalChars: number } {
   const raw = blockedDraftPrBody(feature, implSummary, state, goalFile);
-  const classificationRecord = blockedDraftClassificationRecord(state.abandonedClassification);
+  const classificationRecord = blockedDraftClassificationRecord(state.abandonedClassification, { stage: state.stopStage, class: state.stopClass });
   const essentialSuffix = [
     `- reason: ${state.reason}`,
     `- classification: ${classificationRecord.classification}`,
+    `- stop.class: ${classificationRecord.stop.class}`,
+    `- stop.stage: ${classificationRecord.stop.stage}`,
     JSON.stringify(classificationRecord),
     ...(state.reasonTruncated ? ['- reason truncated: true'] : []),
     ...(state.terminalStatus ? [`- child terminal status: reached=${state.terminalStatus.reached}; changed=${state.terminalStatus.changed}; toolCalls=${state.terminalStatus.toolCalls}; timedOut=${state.terminalStatus.timedOut}`] : []),
@@ -4203,6 +4227,49 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         unjoinedNodes: unjoined,
       }, { category: 'graph.path' });
     }
+    if (runGraphTemplate?.graphId === 'self-implement') {
+      const profileIds = new Set<string>();
+      let journeyEvidenceStatus: 'read' | 'missing' | 'read-error' = 'missing';
+      let journeyEvidenceError: string | undefined;
+      const journeySteps: Array<{ from: string; to: string; skipped?: string[] }> = [];
+      try {
+        // `recordJourneyEdge` appends graph.path synchronously to the canonical run ledger.
+        // Reading that same append boundary avoids a potentially lagging debug LogStore mirror.
+        const entries = loadRunLedger(runId, runLedgerDir());
+        if (entries !== null) {
+          journeyEvidenceStatus = 'read';
+          for (const entry of entries) {
+            if (entry.event !== 'graph.path') continue;
+            const data = entry.data;
+            if (Array.isArray(data.profileIds)) for (const id of data.profileIds) if (typeof id === 'string') profileIds.add(id);
+            if (data.event !== 'edge-taken' || typeof data.from !== 'string' || typeof data.taken !== 'string') continue;
+            const skipped = Array.isArray(data.skippedNodes)
+              ? data.skippedNodes.flatMap((item) => item && typeof item === 'object'
+                && typeof (item as { node?: unknown }).node === 'string' ? [(item as { node: string }).node] : [])
+              : [];
+            journeySteps.push({ from: data.from, to: data.taken, ...(skipped.length > 0 ? { skipped } : {}) });
+          }
+        }
+      } catch (error) {
+        journeyEvidenceStatus = 'read-error';
+        journeyEvidenceError = error instanceof Error ? error.message : String(error);
+      }
+      const pathBasis = 'self-implement-pipeline-and-journey-v1';
+      const pipelineNodes = traversedNodes.map(String);
+      const pipelineSteps = pipelineNodes.slice(1).map((to, index) => ({ from: pipelineNodes[index]!, to }));
+      const pathSteps = [...pipelineSteps, ...journeySteps];
+      const visitedNodes = [
+        ...pipelineNodes,
+        ...journeySteps.flatMap((step) => [step.from, ...(step.skipped ?? []), step.to]),
+      ];
+      const pathSignature = pathSignatureOf(pathSteps);
+      observeOuter('path-signature', {
+        ...graphIdentityOf(runGraphTemplate), ...journeyJoinFields(), pathBasis,
+        profileIds: [...profileIds].sort(), pathSignature, pathSteps, visitedNodes,
+        journeyEdgeCount: journeySteps.length,
+        journeyEvidenceStatus, ...(journeyEvidenceError ? { journeyEvidenceError } : {}),
+      }, { category: 'graph.path' });
+    }
     try {
       const checked = terminalNode
         ? (opts.seams.checkPipelineTraversal ?? checkPipelineTraversal)(traversedNodes, terminalNode)
@@ -4897,6 +4964,7 @@ export function attachAbandonedClassification(
       ...(credentialFailure ? { credentialFailure: true } : {}),
       ...(providerError ? { providerError: true } : {}),
       ...(providerError && result.providerErrors?.category ? { providerErrorCategory: result.providerErrors.category } : {}),
+      ...(result.terminationReason === 'tdd-evidence-missing' ? { terminationReason: result.terminationReason } : {}),
       worktreePorcelain: worktree.worktreePorcelain,
       ...(worktree.gitResidue ? { gitResidue: worktree.gitResidue } : {}),
       ...(result.completionDisposition ? { completionDisposition: result.completionDisposition } : {}),
@@ -4931,6 +4999,7 @@ export function observeRunOutcome(
     worktreePath: SelfImplementResult['worktreePath'] | undefined;
     review: SelfImplementResult['review'] | undefined;
     completionDisposition: SelfImplementResult['completionDisposition'] | undefined;
+    terminationReason?: SelfImplementResult['terminationReason'];
     supervisorVerdict: SelfImplementResult['supervisorVerdict'] | undefined;
     goalCauseObserved?: SelfImplementResult['goalCauseObserved'];
     mergeApprovalReceived: SelfImplementResult['mergeApprovalReceived'] | undefined;
@@ -4972,6 +5041,7 @@ export function observeRunOutcome(
       ...(result.quotaExhaustionAssessment?.exhausted ? { quotaExhausted: true } : {}),
       ...(result.quotaExhaustionAssessment?.accountAvailability ? { quotaAccountAvailability: result.quotaExhaustionAssessment.accountAvailability } : {}),
       ...(result.providerErrors?.category ? { providerError: true, providerErrorCategory: result.providerErrors.category } : {}),
+      ...(result.terminationReason === 'tdd-evidence-missing' ? { terminationReason: result.terminationReason } : {}),
       stage: result.stage,
       reviewResultObserved: result.review !== undefined,
       mustFixReported: (result.review?.mustFix.length ?? 0) > 0,
@@ -5319,6 +5389,7 @@ async function runSelfImplementInner(
   if (graphAuthority.enabled) onGraphTemplateResolved(graphTemplate);
   // ⛔ 선택을 «전부» 싣는다 — 얹힌 것만 실으면 「왜 안 얹혔나」를 사후에 못 묻는다.
   let reviewRepeat: number | undefined;
+  const recordedRuntimeStructuralSteps = new Set<string>();
   /** ⭐ ③ «다이나믹» — 라운드마다 runtime 오버레이를 다시 고른다.
    *  ⛔ **매번 «기준 선언»에서 다시 얹는다** — 이전 라운드 결과 위에 겹쳐 얹으면
    *    「이 걸음을 무엇이 만들었나」가 «누적»이 되어 사후에 못 푼다.
@@ -5339,6 +5410,7 @@ async function runSelfImplementInner(
       ...(stopClass === undefined ? {} : { stopClass }),
       ...(reviewRepeat === undefined ? {} : { reviewRepeat }),
     });
+    const beforeRuntimeGraph = graphTemplate;
     const decision = decideTemplate({
       goalType: graphGoalType,
       authority: graphAuthority,
@@ -5347,7 +5419,41 @@ async function runSelfImplementInner(
       stage: 'runtime',
       ...(variantSpec ? { specs: { [variantSpec.graphId]: variantSpec } } : {}),
     });
-    if (decision.appliedIds.length > 0) graphTemplate = decision.template;
+    if (decision.appliedIds.length > 0) {
+      graphTemplate = decision.template;
+      const structuralEvents = runtimeOverlayRunSteps({
+        runId: runIdentity.runId,
+        timestamp: new Date().toISOString(),
+        before: beforeRuntimeGraph,
+        after: graphTemplate,
+        overlayIds: decision.appliedIds,
+        round,
+      });
+      const pendingStructuralEvents = structuralEvents.map((entry) => ({
+        entry,
+        key: entry.event === 'node-added'
+          ? `${entry.event}:${entry.data.node}`
+          : `${entry.event}:${entry.data.from}:${entry.data.outcome}:${entry.data.was}:${entry.data.to}`,
+      })).filter(({ key }) => !recordedRuntimeStructuralSteps.has(key));
+      if (pendingStructuralEvents.length > 0) {
+        try {
+          const batch = pendingStructuralEvents.map(({ entry }) => entry);
+          if (opts.seams.writeRunLedgerBatch) opts.seams.writeRunLedgerBatch(batch);
+          else if (opts.seams.writeRunLedger) for (const entry of batch) opts.seams.writeRunLedger(entry);
+          else appendRunLedgerEntries(batch);
+          for (const { key } of pendingStructuralEvents) recordedRuntimeStructuralSteps.add(key);
+        } catch (error) {
+          const first = pendingStructuralEvents[0]!.entry;
+          observe('graph-overlay-step-write-failed', {
+            runId: runIdentity.runId,
+            round,
+            event: first.event,
+            events: pendingStructuralEvents.map(({ entry }) => entry.event),
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
     // ⭐ SELFIMPL-NODE-SEAMS-BACK — 같은 NodeContext 가 라운드로 이어진다: 체크포인트를 옮기고,
     //   부품이 도는 중에 다른 판으로 바뀌었으면 그 사실을 값으로 낸다(걸음과 신원이 갈리는 것을 막는다).
     if (nodeContext !== undefined) {
@@ -5722,8 +5828,8 @@ async function runSelfImplementInner(
   //   거짓 표시한다 · 리뷰 4R). 수확본이 비면 **요약에서 수확**한다 — 요약 원문을 통째로 싣지 않는다.
   const harvestedForPr = (): string | undefined => {
     if (!impl) return undefined;
-    const fromChild = impl.evidenceTranscript?.trim() ? impl.evidenceTranscript : undefined;
-    const picked = fromChild ?? harvestEvidenceLines(impl.summary);
+    const fromChild = impl.evidenceTranscript?.trim() ? harvestEvidenceLines(impl.evidenceTranscript) : undefined;
+    const picked = fromChild?.trim() ? fromChild : harvestEvidenceLines(impl.summary);
     return picked.trim() ? picked : undefined;
   };
   let offDiffEvidence: OffDiffEvidenceParse = { items: [], discardedMissingVerify: 0, discardedEmptyClaim: 0, missingResult: 0, orphanResult: 0, truncatedResult: 0, anchoredEvidence: 0 };
@@ -6194,6 +6300,7 @@ async function runSelfImplementInner(
   };
   let blockedDraftNoChanges = false;
   let blockedDraftPrFailure: string | undefined;
+  let blockedDraftPrFailureKind: 'blocked-draft-pr-guard' | undefined;
   let repairLink: { originalPr: number; salvageRef: string } | undefined;
   const reviewBlockedResult = (pr: { url: string; number: number } | undefined) => ({
     stage: blockedDraftNoChanges && podReviewBlockedDraft ? 'no-changes' as const : podReviewBlockedDraft && !pr ? 'aborted' as const : 'review-blocked' as const,
@@ -6264,14 +6371,26 @@ async function runSelfImplementInner(
       observe('blocked-draft-decision-signal-failed', { stage, error: decisionSignalObservation.error }, { level: 'warn' });
     }
     const abandonedClassification = classifyUnfinishedRun(stage, verdict, decomposition);
-    const classificationRecord = blockedDraftClassificationRecord(abandonedClassification);
+    const stopClass = classifyTerminalHarnessFailure({
+      stage,
+      abandonedClassification: abandonedClassification.classification,
+      ...(verdict ? { supervisorVerdict: verdict } : {}),
+    });
+    const classificationRecord = blockedDraftClassificationRecord(abandonedClassification, { stage, class: stopClass });
     observe('blocked-draft-classification', {
       stage,
       ...classificationRecord,
     }, { level: 'warn' });
+    observe('draft-stop-classified', {
+      stage,
+      stop: classificationRecord.stop,
+      classification: classificationRecord.classification,
+      classificationBasis: classificationRecord.classificationBasis,
+    }, { level: 'warn' });
     const observation = {
       branch: wt.branch,
       stage,
+      stopClass: classificationRecord.stop.class,
       verdict: verdict ?? null,
       reason: reason.slice(0, 240),
       rounds: round,
@@ -6314,6 +6433,8 @@ async function runSelfImplementInner(
         reason,
         rounds: round,
         undeliveredSupervisorInputs: undeliveredSupervisorInputSnapshot(),
+        stopStage: stage,
+        stopClass,
         abandonedClassification,
         ...(decomposition ? { decomposition } : {}),
         ...(harvestedForPr() ? { evidence: harvestedForPr() as string } : {}),
@@ -6585,6 +6706,9 @@ async function runSelfImplementInner(
         ...(artifactPath ? { prBodyArtifactPath: artifactPath } : {}),
         ...(artifactError ? { prBodyArtifactError: artifactError } : {}),
       }, { level: 'warn' });
+      blockedDraftPrFailureKind = /self-implement PR guard 실패/.test(prError) && /(?:same-cell|goal-only)/.test(prError)
+        ? 'blocked-draft-pr-guard' : undefined;
+      blockedDraftPrFailure = `draft PR 생성 실패: ${prError}`;
       // STOP-RECORD: a failed blocked-draft PR open (e.g. same-branch rerun with a PR already open) left no stop reason.
       let draftStopEntry: RunLedgerEntry | undefined;
       try {
@@ -7798,7 +7922,61 @@ async function runSelfImplementInner(
     //   ② 첫 조각 커밋의 피처 시험·구현 전 실행 RED 기록과 구현 뒤 같은 명령 GREEN 기록이
     //     없으면 수리 라운드 1회(완료 경계·기존 동작은 보존), 그래도 없으면 fail-closed.
     //   ③ 관측 원장에 tdd-red/tdd-green 이벤트를 남긴다.
-    let tddJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(impl.evidenceTranscript?.trim() || impl.summary));
+    let tddTranscript = [impl.evidenceTranscript, impl.summary].filter((part): part is string => Boolean(part?.trim())).join('\n');
+    let tddJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddTranscript));
+    const runHarnessBaseTddWhenRedMissing = (input: {
+      readonly round: number;
+      readonly goal: string;
+      readonly transcript: string;
+      readonly judgment: ReturnType<typeof judgeTddEvidence>;
+      readonly implementation: typeof impl;
+    }): { readonly transcript: string; readonly judgment: ReturnType<typeof judgeTddEvidence> } => {
+      if (!input.judgment.planned || input.judgment.red.observed || !input.implementation.ok
+        || input.implementation.terminalStatus?.reached !== true) {
+        return { transcript: input.transcript, judgment: input.judgment };
+      }
+      if (!wt.resolvedBase) {
+        observe('tdd-base-test', { round: input.round, status: 'unmeasured', reason: 'base-commit-unavailable' }, { level: 'warn' });
+        return { transcript: input.transcript, judgment: input.judgment };
+      }
+      const result = (s.runTddBaseHeadTest ?? runTddBaseHeadTest)({ cwd: wt.path, baseSha: wt.resolvedBase, goal: input.goal });
+      observe('tdd-base-test', {
+        round: input.round, status: result.accepted ? 'red-green' : 'unmeasured', reason: result.reason,
+        baseSha: wt.resolvedBase, command: result.command, baseResult: result.baseResult ?? null, headResult: result.headResult ?? null,
+      }, result.accepted ? {} : { level: 'warn' });
+      if (!result.accepted || !result.transcript) return { transcript: input.transcript, judgment: input.judgment };
+      const transcript = `${result.transcript}\n${input.transcript}`;
+      return { transcript, judgment: judgeTddEvidence(input.goal, parseOffDiffEvidence(transcript)) };
+    };
+    const baseTdd = runHarnessBaseTddWhenRedMissing({ round, goal: roundGoal, transcript: tddTranscript, judgment: tddJudgment, implementation: impl });
+    tddTranscript = baseTdd.transcript;
+    tddJudgment = baseTdd.judgment;
+    const receivedTddRed = receiveObservedTddRed({
+      goal: roundGoal, judgment: tddJudgment, transcript: tddTranscript,
+      resultParsed: impl.ok && impl.terminalStatus?.reached === true,
+    });
+    debug.log('self-implement.tdd-evidence', 'red-receive', {
+      round, source: 'child-tool-output', accepted: receivedTddRed.accepted, reason: receivedTddRed.reason,
+      observedTestCommand: receivedTddRed.command ?? null, observedTestResult: receivedTddRed.result ?? null,
+    });
+    if (receivedTddRed.accepted) {
+      tddTranscript = receivedTddRed.transcript;
+      tddJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddTranscript));
+    }
+    const receivedTddGreen = receiveObservedTddGreen({
+      goal: roundGoal, judgment: tddJudgment, transcript: tddTranscript,
+      resultParsed: impl.ok && impl.terminalStatus?.reached === true,
+    });
+    debug.log('self-implement.tdd-evidence', 'green-receive', {
+      round, source: 'child-tool-output', accepted: receivedTddGreen.accepted, reason: receivedTddGreen.reason,
+      taggedGreenPresent: tddJudgment.green.observed, observedTestCommand: receivedTddGreen.command ?? null,
+      observedTestResult: receivedTddGreen.result ?? null,
+    });
+    if (receivedTddGreen.accepted) {
+      tddTranscript = receivedTddGreen.transcript;
+      tddJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddTranscript));
+    }
+    let tddEvidenceFailure: SelfImplementResult['tddEvidenceFailure'];
     if (tddJudgment.needsRepair && impl.ok && round < effectiveMax && opts.goalFile
       && !hasCurrentProviderError() && !hasCurrentCredentialFailure()) {
       let goalDocument: string | undefined;
@@ -7835,14 +8013,55 @@ async function runSelfImplementInner(
           tddRetryAbort.abort();
           tddRetryImpl = { ...beforeTddRetry, ok: false, summary: `[구현 재작업 · tdd-evidence-missing] 수리 라운드 실패 — ${safeErrorDescription(error)}` };
         }
-        const tddRetryJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddRetryImpl.evidenceTranscript?.trim() || tddRetryImpl.summary));
+        let tddRetryTranscript = [tddRetryImpl.evidenceTranscript, tddRetryImpl.summary]
+          .filter((part): part is string => Boolean(part?.trim())).join('\n');
+        let tddRetryJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddRetryTranscript));
+        const retryBaseTdd = runHarnessBaseTddWhenRedMissing({
+          round: tddRetryRound, goal: roundGoal, transcript: tddRetryTranscript, judgment: tddRetryJudgment, implementation: tddRetryImpl,
+        });
+        tddRetryTranscript = retryBaseTdd.transcript;
+        tddRetryJudgment = retryBaseTdd.judgment;
+        const retryTddRed = receiveObservedTddRed({
+          goal: roundGoal, judgment: tddRetryJudgment, transcript: tddRetryTranscript,
+          resultParsed: tddRetryImpl.ok && tddRetryImpl.terminalStatus?.reached === true,
+        });
+        debug.log('self-implement.tdd-evidence', 'red-receive', {
+          round: tddRetryRound, source: 'child-tool-output', accepted: retryTddRed.accepted, reason: retryTddRed.reason,
+          observedTestCommand: retryTddRed.command ?? null, observedTestResult: retryTddRed.result ?? null,
+        });
+        if (retryTddRed.accepted) {
+          tddRetryTranscript = retryTddRed.transcript;
+          tddRetryJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddRetryTranscript));
+        }
+        const retryTddGreen = receiveObservedTddGreen({
+          goal: roundGoal, judgment: tddRetryJudgment, transcript: tddRetryTranscript,
+          resultParsed: tddRetryImpl.ok && tddRetryImpl.terminalStatus?.reached === true,
+        });
+        debug.log('self-implement.tdd-evidence', 'green-receive', {
+          round: tddRetryRound, source: 'child-tool-output', accepted: retryTddGreen.accepted, reason: retryTddGreen.reason,
+          taggedGreenPresent: tddRetryJudgment.green.observed, observedTestCommand: retryTddGreen.command ?? null,
+          observedTestResult: retryTddGreen.result ?? null,
+        });
+        if (retryTddGreen.accepted) {
+          tddRetryTranscript = retryTddGreen.transcript;
+          tddRetryJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddRetryTranscript));
+        }
         if (tddRetryImpl.ok && !tddRetryJudgment.needsRepair) {
-          observe('implementation-tdd-rework', { status: 'succeeded', round: tddRetryRound, missing: [] });
+          observe('implementation-tdd-rework', { status: 'succeeded', round: tddRetryRound, missing: [...tddRetryJudgment.missing] });
           tddJudgment = tddRetryJudgment;
           impl = tddRetryImpl;
           round = tddRetryRound;
         } else {
           observe('implementation-tdd-rework', { status: 'exhausted', round: tddRetryRound, missing: [...tddRetryJudgment.missing] }, { level: 'warn' });
+          // Only an initially successful implementation can enter this one retry. Goal-only exhaustion
+          // has impl.ok=false before this point, so these two terminal reason codes cannot compete.
+          if (tddRetryJudgment.missing.length > 0) {
+            tddEvidenceFailure = {
+              reason: 'tdd-evidence-missing',
+              round: tddRetryRound,
+              missing: [...tddRetryJudgment.missing],
+            };
+          }
           impl = { ...beforeTddRetry, ok: false, summary: `[구현 재작업 · tdd-evidence-missing] RED/GREEN 기록 결손 — ${beforeTddRetry.summary}` };
         }
       }
@@ -7933,7 +8152,7 @@ async function runSelfImplementInner(
     //   창 밖으로 밀려 파서에 도달조차 못 하던 자리다. 미주입 seam 은 종전대로 요약에서 판다(무회귀).
     // ⛔ `??` 가 아니라 **빈 문자열도 폴백**이다 — 수확본이 비면 *"수확했다"* 가 아니라 *"없다"* 이고,
     //    `??` 로 두면 관측이 `harvested` 라 **거짓을 말한다**(리뷰 3R).
-    const harvested = impl.evidenceTranscript?.trim() ? impl.evidenceTranscript : undefined;
+    const harvested = impl.evidenceTranscript?.trim() ? harvestEvidenceLines(impl.evidenceTranscript) : undefined;
     const childEvidenceSource = harvested ?? impl.summary;
     let diffEvidence = '';
     let roundObservationMeasurementBasis: ObservationMeasurementBasis | undefined;
@@ -8028,6 +8247,8 @@ async function runSelfImplementInner(
     observe('implemented', { ok: impl.ok, round, ...(materializedPaths ? { materializedPaths: [...materializedPaths] } : {}),
       ...(effectiveDisposition ? { completionDisposition: effectiveDisposition } : {}) });
     progress('implemented', impl.ok ? (round === 0 ? '구현 완료' : `rework ${round} 완료`) : impl.completionDisposition ? '변경 없이 완료 검증' : '구현 실패(worktree 보존)');
+    // TDD exhaustion marks impl failed above; this return precedes finished-child commit and gate handling,
+    // so those success-only terminal paths cannot swallow the structured report-deficit facts.
     if (!impl.ok) {
       finalizeSupervisorDeliveries('next-round-implement-not-ok');
       const abort = buildImplementAbortRecord(impl.summary, impl.terminalStatus);
@@ -8051,7 +8272,11 @@ async function runSelfImplementInner(
         salvageStatusExpected: false,
         ...(abort.terminalStatus ? { terminalStatus: abort.terminalStatus } : {}),
       });
-      return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), ...(goalOnlyReworkExhausted ? { terminationReason: 'goal-only-rework-exhausted' as const } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: impl.summary };
+      return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }),
+        ...(tddEvidenceFailure ? { terminationReason: tddEvidenceFailure.reason, tddEvidenceFailure }
+          : goalOnlyReworkExhausted ? { terminationReason: 'goal-only-rework-exhausted' as const } : {}),
+        sessionId, worktreePath: wt.path, branch: wt.branch, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: blockedDraftPrFailure ?? impl.summary,
+        ...(blockedDraftPrFailureKind ? { detailKind: blockedDraftPrFailureKind } : {}) };
     }
 
     if (finishedChildCommitMissing) {

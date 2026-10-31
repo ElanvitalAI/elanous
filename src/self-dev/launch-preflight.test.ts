@@ -25,6 +25,7 @@ import {
   measurePairedTestFile,
   siblingTestPath,
   resolveRecentChangeWindowDays,
+  renderSiblingContextLines,
 } from './launch-preflight.js';
 import { queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, runLedgerDir } from '../self-implement/run-ledger.js';
 import type { RunningRunsResult } from '../self-implement/running-runs.js';
@@ -4029,5 +4030,49 @@ describe('countRepeatedBlocks — 같은 경로가 같은 이유로 몇 번 막�
     expect(renderRepeatedBlockNotice(0)).toBeNull();
     expect(renderRepeatedBlockNotice(-1)).toBeNull();
     expect(renderRepeatedBlockNotice(3)).toContain('3번');
+  });
+});
+
+describe('sibling context', () => {
+  const base = { paths: ['src/a.ts'], liveRunWindowMs: WINDOW, preexistingFailures: { state: 'checked' as const, files: [] } };
+
+  test('renders each overlapping axis with its identifiers', () => {
+    const result = evaluateLaunchPreflight({
+      ...base,
+      openPrs: [{ number: 42, title: 'sibling', isDraft: true, files: [{ path: 'src/a.ts' }] }],
+      unfinishedRuns: [{ runId: 'run-1', plannedPaths: ['src/a.ts'], lastActivityAgeMs: 0 }],
+      recentChanges: { 'src/a.ts': 1 },
+      recentChangeWindowDays: 1,
+    });
+
+    expect(renderSiblingContextLines(result, [{ cardId: 'card-1', runId: 'run-1', overlapPaths: ['src/a.ts'] }])).toEqual([
+      '[sibling-context] 같은 경로 도는 런: run-1 · 카드 card-1 · src/a.ts',
+      '[sibling-context] 같은 경로 열린 PR: #42 (draft) · src/a.ts',
+      '[sibling-context] 같은 경로 최근 1일 착지: sha·PR 미상 · src/a.ts 1건',
+    ]);
+  });
+
+  test('renders checked-empty axes differently from unmeasured axes', () => {
+    const empty = evaluateLaunchPreflight({ ...base, openPrs: [], unfinishedRuns: [], recentChanges: {} });
+    const unmeasured = evaluateLaunchPreflight({
+      ...base,
+      openPrs: null,
+      openPrsUnknownReason: 'PR API unavailable',
+      unfinishedRuns: null,
+      unfinishedRunsUnknownReason: 'ledger unavailable',
+      recentChanges: null,
+      recentChangesUnknownReason: 'git unavailable',
+    });
+
+    expect(renderSiblingContextLines(empty)).toEqual([
+      '[sibling-context] 같은 경로 도는 런: 없음',
+      '[sibling-context] 같은 경로 열린 PR: 없음',
+      '[sibling-context] 같은 경로 최근 7일 착지: 없음',
+    ]);
+    expect(renderSiblingContextLines(unmeasured)).toEqual([
+      '[sibling-context] 같은 경로 도는 런: 못 쟀다 (ledger unavailable)',
+      '[sibling-context] 같은 경로 열린 PR: 못 쟀다 (PR API unavailable)',
+      '[sibling-context] 같은 경로 최근 7일 착지: 못 쟀다 (git unavailable)',
+    ]);
   });
 });

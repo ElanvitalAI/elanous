@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GATE_REMOTE_DEFAULTS, runOnRemote, type GateRemoteRunner, type SshResult } from './gate-remote.js';
-import { runTrainGateOnHost, trainGateOnHost, trainGateScript, type TrainGateObservation } from './train-gate-remote.js';
+import { runTrainGateOnHost, trainGateOnHost, type TrainGateObservation } from './train-gate-remote.js';
+import { computeReceiptKey, GATE_RECEIPT_SCHEMA, loadGateReceipts, type GateReceiptIdentity } from './gate-receipt-registry.js';
 
 // Every remote call goes through an injected fake — no test reaches a real host.
 const COMMIT = 'a'.repeat(40);
@@ -77,12 +78,129 @@ describe('runTrainGateOnHost', () => {
     expect(runner.calls.every((call) => call[0] === 'git')).toBe(true);
     expect(runner.scripts).toHaveLength(1);
     const script = runner.scripts[0]!;
-    expect(script).toContain('ci-typecheck-changed');
-    expect(script).toContain('test:deterministic');
-    expect(script).toContain('ci-pwa-build-gate');
-    expect(script).toContain(`TSC_BASE_REF=`);
+    expect(script).toContain('src/self-implement/train-gate-receipt.ts');
+    expect(script).toContain(`"commit":"${COMMIT}"`);
+    expect(script).toContain(`"baseSha":"${BASE}"`);
+    expect(script).toContain('"changedFiles":["src/a.ts","src/a.test.ts"]');
     expect(script).toContain(`git checkout -q --detach ${COMMIT}`);
     expect(observed).toEqual([expect.objectContaining({ host: 'node-b', commit: COMMIT, baseSha: BASE, outcome: 'pass', rc: 0, changedFiles: 2 })]);
+  });
+
+  test('train receipts round-trip through the remote scratch payload into the shared git registry', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'train-gate-shared-receipts-'));
+    try {
+      const runner = fakeRunner();
+      const fallback = runner.local.bind(runner);
+      runner.local = (cmd, args, cwd, options) => args[0] === 'rev-parse' && args[1] === '--path-format=absolute'
+        ? { rc: 0, stdout: `${registryRoot}\n`, stderr: '' }
+        : fallback(cmd, args, cwd, options);
+      const identity: GateReceiptIdentity = {
+        headCommit: COMMIT,
+        baseCommit: BASE,
+        bunVersion: '1.4.2',
+        lockfileHash: 'absent',
+        radiusFiles: ['src/a.test.ts'],
+        checks: ['train:changed-file-typecheck', 'train:deterministic-tests', 'train:pwa-build'],
+        envFingerprint: 'e'.repeat(64),
+      };
+      const receipt = {
+        ...identity,
+        schema: GATE_RECEIPT_SCHEMA,
+        key: computeReceiptKey(identity, 'passed'),
+        verdict: 'passed' as const,
+        savedAt: '2026-10-29T00:00:00.000Z',
+      };
+      const encoded = Buffer.from(JSON.stringify({ [receipt.key]: receipt })).toString('base64');
+      runner.ssh = (_host, script) => {
+        runner.scripts.push(script);
+        return { rc: 0, stdout: `gate output\n__GATE_RECEIPTS__${encoded}\n`, stderr: `\n__GATE_REMOTE_RC=0\n` };
+      };
+
+      const result = await runTrainGateOnHost({ repo: '/r', commit: COMMIT, baseSha: BASE, changedFiles: ['src/a.test.ts'], settings }, runner, { observe: () => {} });
+
+      expect(result.outcome, result.reason).toBe('pass');
+      expect(runner.scripts[0]).toContain('ELANOUS_GATE_RECEIPT_REGISTRY_PATH');
+      expect(runner.scripts[0]).toContain(`cat > "$W/payload-0" <<'__GATE_REMOTE_PAYLOAD_0__' || infra payload\n{}\n__GATE_REMOTE_PAYLOAD_0__`);
+      expect(loadGateReceipts(join(registryRoot, 'elanous-host-regate', 'gate-receipts.json'))[receipt.key]).toEqual(receipt);
+    } finally { rmSync(registryRoot, { recursive: true, force: true }); }
+  });
+
+  test('a failed remote run cannot merge a returned passed receipt', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'train-gate-failed-receipt-'));
+    try {
+      const identity: GateReceiptIdentity = {
+        headCommit: COMMIT,
+        baseCommit: BASE,
+        bunVersion: '1.4.2',
+        lockfileHash: 'absent',
+        radiusFiles: ['src/a.test.ts'],
+        checks: ['train:changed-file-typecheck', 'train:deterministic-tests', 'train:pwa-build'],
+        envFingerprint: 'e'.repeat(64),
+      };
+      const receipt = {
+        ...identity,
+        schema: GATE_RECEIPT_SCHEMA,
+        key: computeReceiptKey(identity, 'passed'),
+        verdict: 'passed' as const,
+        savedAt: '2026-10-29T00:00:00.000Z',
+      };
+      const encoded = Buffer.from(JSON.stringify({ [receipt.key]: receipt })).toString('base64');
+      const runner = fakeRunner({ ssh: {
+        rc: 0,
+        stdout: `gate output\n__GATE_RECEIPTS__${encoded}\n`,
+        stderr: '\n__GATE_REMOTE_RC=1\n',
+      } });
+      const fallback = runner.local.bind(runner);
+      runner.local = (cmd, args, cwd, options) => args[0] === 'rev-parse' && args[1] === '--path-format=absolute'
+        ? { rc: 0, stdout: `${registryRoot}\n`, stderr: '' }
+        : fallback(cmd, args, cwd, options);
+
+      const result = await runTrainGateOnHost({ repo: '/r', commit: COMMIT, baseSha: BASE, changedFiles: ['src/a.test.ts'], settings }, runner, { observe: () => {} });
+
+      expect(result).toMatchObject({ outcome: 'fail', rc: 1 });
+      expect(Object.values(loadGateReceipts(join(registryRoot, 'elanous-host-regate', 'gate-receipts.json'))))
+        .toHaveLength(0);
+    } finally { rmSync(registryRoot, { recursive: true, force: true }); }
+  });
+
+  test('a corrupt local registry is recovered when a passing remote receipt returns', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'train-gate-corrupt-shared-receipt-'));
+    try {
+      const registryPath = join(registryRoot, 'elanous-host-regate', 'gate-receipts.json');
+      mkdirSync(join(registryRoot, 'elanous-host-regate'), { recursive: true });
+      writeFileSync(registryPath, '{broken json');
+      const identity: GateReceiptIdentity = {
+        headCommit: COMMIT,
+        baseCommit: BASE,
+        bunVersion: '1.4.2',
+        lockfileHash: 'absent',
+        radiusFiles: ['src/a.test.ts'],
+        checks: ['train:changed-file-typecheck', 'train:deterministic-tests', 'train:pwa-build'],
+        envFingerprint: 'e'.repeat(64),
+      };
+      const receipt = {
+        ...identity,
+        schema: GATE_RECEIPT_SCHEMA,
+        key: computeReceiptKey(identity, 'passed'),
+        verdict: 'passed' as const,
+        savedAt: '2026-10-29T00:00:00.000Z',
+      };
+      const encoded = Buffer.from(JSON.stringify({ [receipt.key]: receipt })).toString('base64');
+      const runner = fakeRunner({ ssh: {
+        rc: 0,
+        stdout: `gate output\n__GATE_RECEIPTS__${encoded}\n`,
+        stderr: '\n__GATE_REMOTE_RC=0\n',
+      } });
+      const fallback = runner.local.bind(runner);
+      runner.local = (cmd, args, cwd, options) => args[0] === 'rev-parse' && args[1] === '--path-format=absolute'
+        ? { rc: 0, stdout: `${registryRoot}\n`, stderr: '' }
+        : fallback(cmd, args, cwd, options);
+
+      const result = await runTrainGateOnHost({ repo: '/r', commit: COMMIT, baseSha: BASE, changedFiles: ['src/a.test.ts'], settings }, runner, { observe: () => {} });
+
+      expect(result).toMatchObject({ outcome: 'pass', rc: 0 });
+      expect(loadGateReceipts(registryPath)[receipt.key]).toEqual(receipt);
+    } finally { rmSync(registryRoot, { recursive: true, force: true }); }
   });
 
   test('a tool rc != 0 is fail', async () => {
@@ -117,13 +235,6 @@ describe('runTrainGateOnHost', () => {
   });
 });
 
-describe('trainGateScript', () => {
-  test('steps chain with && and skip tests when no test file changed', () => {
-    expect(trainGateScript(BASE, ['src/a.ts'])).toBe(`TSC_BASE_REF='${BASE}' bun scripts/ci-typecheck-changed.ts --local && bun scripts/ci-pwa-build-gate.ts --changed-files 'src/a.ts'`);
-    expect(trainGateScript(BASE, ['x.test.ts', "q'.ts"])).toContain(`bun run test:deterministic 'x.test.ts' && bun scripts/ci-pwa-build-gate.ts --changed-files 'x.test.ts' 'q'\\''.ts'`);
-  });
-});
-
 describe('runOnRemote explicit commit', () => {
   test('a dirty worktree with commit pushes that sha; without commit it stays dirty-tree', () => {
     const runner = fakeRunner({ dirty: true });
@@ -141,18 +252,16 @@ describe('trainGateOnHost adapter', () => {
     const gate = trainGateOnHost({ repo: '/r', baseSha: BASE, settings }, runner, { observe: () => {} });
     expect(await gate(COMMIT, [1, 2])).toBe('pass');
     expect(runner.calls[0]).toEqual(['git', 'diff', '--name-status', '-z', BASE, COMMIT]);
-    expect(runner.scripts[0]).toContain(`'src/a.test.ts'`);
+    expect(runner.scripts[0]).toContain('"changedFiles":["src/a.ts","src/a.test.ts"]');
   });
   test('a deleted test file reaches tsc/PWA but is never run as a test (review must-fix)', async () => {
     const runner = fakeRunner({ diff: 'D\0src/gone.test.ts\0M\0src/a.ts\0R100\0src/old.test.ts\0src/new.test.ts\0' });
     const gate = trainGateOnHost({ repo: '/r', baseSha: BASE, settings }, runner, { observe: () => {} });
     expect(await gate(COMMIT, [1])).toBe('pass');
     const script = runner.scripts[0]!;
-    const testStep = script.split(' && ').find((step) => step.startsWith('bun run test:deterministic')) ?? '';
-    expect(testStep).toContain(`'src/new.test.ts'`);
-    expect(testStep).not.toContain('gone.test.ts');
-    expect(testStep).not.toContain('old.test.ts');
-    expect(script).toContain(`'src/gone.test.ts'`); // still in the PWA changed-file reach
+    expect(script).toContain('train-gate-receipt.ts');
+    expect(script).toContain('"changedFiles":["src/gone.test.ts","src/a.ts","src/old.test.ts","src/new.test.ts"]');
+    expect(script).toContain('"deletedFiles":["src/gone.test.ts","src/old.test.ts"]');
   });
   test('a throwing local git is «unmeasured», not a rejected promise, and is observed (review must-fix)', async () => {
     const runner = fakeRunner({});
