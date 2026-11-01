@@ -1,5 +1,11 @@
 # 오버레이 — 「기본 템플릿을 «언제·어떻게» 변형하나」
 
+## ARG-PROMOTE rehearsal
+
+`graph promote evaluate --fixture <json> --json` evaluates an **injected fixture only**. It checks at least five same-trigger adaptation runs, a same-trigger baseline, a landing-rate gain of at least 20 percentage points, seven days of comparative evidence, and a subsequent seven-day shadow interval whose observations are accepted. The result is marked `mockOnly: true`; an eligible result is a proposal object with `promoted_from`, evidence, rollback guidance, and the ELA-53 human patent-review reminder. This command never writes an overlay, changes a profile, opens a PR, or lands anything. Production promotion still requires independently observed evidence and an L0 human-reviewed PR.
+
+The fixture event shape is `{ runId, timestamp, trigger, phase, landed?, shadowAccepted? }`, where `phase` is `adaptation`, `baseline`, or `shadow`. Fixture counts are rehearsal evidence only and must not be copied into production evidence as real runs.
+
 대표 지시(2026-09-08): *「최초 결정 시 템플릿을 변형하고, 실제 구현 간 다이나믹 대응으로 바꿀 수 있게」*
 
 ## ⛔ 층이 «셋»이고 각 층이 바꿀 수 있는 것이 «다르다»

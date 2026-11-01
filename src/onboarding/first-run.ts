@@ -3,7 +3,7 @@ import { detectProviders, type DetectedProvider } from '../llm/provider-detect.j
 import { debug } from '../debug/log.js';
 import { detectLocale, type Locale } from '../expression/locale.js';
 import { unattendedNextStepLine } from './entry-hints.js';
-import { resolveProviderCredential } from '../llm/provider-credentials.js';
+import { providerEnvKey, resolveProviderCredential, resolveProviderCredentialAsync } from '../llm/provider-credentials.js';
 import { zaiCodingPlanAvailable } from '../llm/zai-coding-plan.js';
 import { collectServiceKeys, printKeySetupReport } from './key-setup.js';
 import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js';
@@ -121,8 +121,8 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   // An incomplete onboarding marker does not mean the user's LLM is unconfigured.
   // Keep an already usable provider, key and model rather than replacing it with a detected subscription.
   const existing = cfg.llm.provider !== 'auto'
-    ? resolveProviderCredential({ provider: cfg.llm.provider, rotation: cfg.llm.rotation,
-        baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey, env: deps.env })
+    ? await resolveProviderCredentialAsync({ provider: cfg.llm.provider, rotation: cfg.llm.rotation,
+        baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey, env: deps.env }, deps.getSecretAsync)
     : undefined;
   const configured = existing && existing.source !== 'none'
     ? cfg.llm.provider
@@ -185,11 +185,11 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
     }
   }
   const credential = inputs === 1 || provider !== cfg.llm.provider
-    ? resolveProviderCredential({
+    ? await resolveProviderCredentialAsync({
         provider, rotation: cfg.llm.rotation,
         baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey,
         env: deps.env,
-      })
+      }, deps.getSecretAsync)
     : undefined;
   if (inputs === 1 && credential?.source === 'none'
     && !(providerSetUpInPlace && provider === 'openai-codex')) {
@@ -206,7 +206,45 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
       });
       printKeySetupReport(results, print);
       if (results.length === 0 || results.some((result) => result.status !== 'success')) return needsLlm(inputs);
-      return needsLlm(inputs, [text.keyStoredNotReady]);
+      // Probe the same lookup the runtime will use before marking first-run ready.
+      const secretId = providerEnvKey(provider);
+      let storedValue: string | undefined;
+      try {
+        storedValue = secretId
+          ? await (deps.getSecretAsync ?? getSecretAsync)(secretId)
+          : undefined;
+      } catch { /* keep the first-run state unready without exposing backend errors */ }
+      const storedCredential = resolveProviderCredential({
+        provider,
+        rotation: cfg.llm.rotation,
+        baseProvider: provider,
+        env: deps.env,
+        secretStoreApiKey: storedValue,
+      });
+      if (!storedValue?.trim() || storedCredential.source === 'none') return needsLlm(inputs, [text.keyStoredNotReady]);
+      // Only remove any legacy config key after the runtime can read its replacement.
+      // A failed SecretStore write/readback must leave the prior working config intact.
+      (deps.saveConfig ?? saveUserConfig)({
+        ...cfg,
+        llm: {
+          ...cfg.llm,
+          provider,
+          apiKey: undefined,
+          ...(provider !== cfg.llm.provider ? { baseUrl: undefined, model: undefined } : {}),
+        },
+      }, path);
+      (deps.saveConfig ?? saveUserConfig)({
+        ...cfg,
+        llm: {
+          ...cfg.llm,
+          provider,
+          apiKey: undefined,
+          ...(provider !== cfg.llm.provider ? { baseUrl: undefined, model: undefined } : {}),
+        },
+        onboarding: { ...cfg.onboarding, ready: true },
+      }, path);
+      observe('ready', inputs);
+      return { outcome: 'ready', provider, inputs };
     } catch {
       return needsLlm(inputs, [text.keySetupFailed]);
     }

@@ -15,7 +15,15 @@ import dagre from '@dagrejs/dagre';
 export type GraphFlowDirection = 'horizontal' | 'vertical';
 
 export interface RouteNode { id: string; x: number; y: number; width: number; height: number }
-export interface RouteEdgeInput { from: string; to: string; outcome: string }
+export interface RouteEdgeInput {
+  from: string;
+  to: string;
+  outcome: string;
+  /** Explicit family (fallback) stays unmerged with regular to/map edges on the same pair. */
+  family?: EdgeFamily;
+  /** Seam names a fallback hop requires; shown on the fallback label. */
+  requires?: readonly string[];
+}
 export interface MergedEdge {
   /** Stable id `e<first index>` — the editor's selection reads the first underlying index from it. */
   id: string;
@@ -25,8 +33,10 @@ export interface MergedEdge {
   outcomes: string[];
   /** Indexes into the input edge list this merged edge stands for. */
   indexes: number[];
+  family?: EdgeFamily;
+  requires?: string[];
 }
-export type EdgeFamily = 'pass' | 'fail' | 'rework' | 'neutral';
+export type EdgeFamily = 'pass' | 'fail' | 'rework' | 'neutral' | 'fallback';
 export type EdgeRouteKind = 'forward' | 'detour' | 'back';
 export interface Point { x: number; y: number }
 export interface LabelBox { x: number; y: number; width: number; height: number }
@@ -45,10 +55,13 @@ export interface RoutedEdge extends MergedEdge {
 const PASS = new Set(['pass', 'ok', 'passed', 'success', 'done', 'merged', 'approved']);
 const FAIL = new Set(['fail', 'failed', 'error', 'blocked', 'rejected', 'aborted']);
 const REWORK = new Set(['rework', 'retry', 'changes-requested']);
+const FALLBACK = new Set(['fallback']);
 
 /** Outcome family → colour family. Mixed families stay neutral. */
 export function edgeFamily(outcomes: readonly string[]): EdgeFamily {
   if (outcomes.length === 0) return 'neutral';
+  if (outcomes[0] === 'fallback') return 'fallback';
+  if (outcomes.every((name) => FALLBACK.has(name))) return 'fallback';
   if (outcomes.every((name) => PASS.has(name))) return 'pass';
   if (outcomes.every((name) => FAIL.has(name))) return 'fail';
   if (outcomes.every((name) => REWORK.has(name))) return 'rework';
@@ -60,6 +73,7 @@ export const EDGE_FAMILY_COLOR: Record<EdgeFamily, string> = {
   pass: 'var(--chart-2, #16a34a)',
   fail: 'var(--destructive, #ef4444)',
   rework: 'var(--chart-3, #f59e0b)',
+  fallback: 'var(--chart-4, #8b5cf6)',
   neutral: 'var(--muted-foreground, #64748b)',
 };
 
@@ -96,12 +110,25 @@ export function mergeParallelEdges(edges: readonly RouteEdgeInput[]): MergedEdge
   const byPair = new Map<string, MergedEdge>();
   edges.forEach((edge, index) => {
     const key = `${edge.from}\u0000${edge.to}`;
-    const found = byPair.get(key);
+    const familyKey = edge.family === 'fallback' ? 'fallback' : 'regular';
+    const pairKey = key + String.fromCharCode(0) + familyKey;
+    const found = byPair.get(pairKey);
+    const outcomes = edge.family === 'fallback'
+      ? [edge.outcome, ...(edge.requires ?? [])].filter((name, i, all) => Boolean(name) && all.indexOf(name) === i)
+      : (edge.outcome ? [edge.outcome] : []);
     if (found) {
       found.indexes.push(index);
-      if (edge.outcome && !found.outcomes.includes(edge.outcome)) found.outcomes.push(edge.outcome);
+      for (const name of outcomes) if (!found.outcomes.includes(name)) found.outcomes.push(name);
+      if (edge.requires?.length) {
+        found.requires ??= [];
+        for (const name of edge.requires) if (!found.requires.includes(name)) found.requires.push(name);
+      }
     } else {
-      byPair.set(key, { id: `e${index}`, from: edge.from, to: edge.to, outcomes: edge.outcome ? [edge.outcome] : [], indexes: [index] });
+      byPair.set(pairKey, {
+        id: `e${index}`, from: edge.from, to: edge.to, outcomes, indexes: [index],
+        ...(edge.family ? { family: edge.family } : {}),
+        ...(edge.requires?.length ? { requires: [...edge.requires] } : {}),
+      });
     }
   });
   return [...byPair.values()];
@@ -411,7 +438,8 @@ export function routeEdges(
     const text = edgeLabelText(edge.outcomes, options.rename);
     return {
       id: edge.id, from: edge.from, to: edge.to, outcomes: edge.outcomes, indexes: edge.indexes,
-      kind: edge.kind, lane: edge.lane, family: edgeFamily(edge.outcomes), points: realPoints, path: finalPath,
+      ...(edge.requires ? { requires: edge.requires } : {}),
+      kind: edge.kind, lane: edge.lane, family: edge.family ?? edgeFamily(edge.outcomes), points: realPoints, path: finalPath,
       label: text ? { text, x: 0, y: 0, ...labelSize(text) } : null,
       candidates: candidates.map(out),
     };

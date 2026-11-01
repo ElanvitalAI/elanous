@@ -973,6 +973,7 @@ import {
 } from './context-menu-action-runtime.js';
 import { createDashboardTerminalPopupRuntime } from './terminal-popup-runtime.js';
 import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAgentMission } from './sidetab-runtime.js';
+import { visibleMissionFailureLogData } from './visible-mission-diagnostics.js';
 import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, createClassicSidetabMissionPairSessionRegistry, type ClassicSidetabHandReplyInput, type ClassicSidetabMissionAgent, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionPairResult, type ClassicSidetabMissionResult, type ClassicSidetabMissionTrioResult } from './classic-sidetab-mission.js';
 import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
 import { enqueueClassicSidetabMissionCompletion } from './classic-sidetab-mission-job.js';
@@ -13861,7 +13862,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             error: `${agent}: 설치·로그인 상태를 확인하지 못했습니다`,
           };
         }
-        return runDashboardAgentMission({
+        const result = await runDashboardAgentMission({
           agent,
           requestedOutputPath,
           open: () => TerminalPopup.agent(agent === 'claude' ? 'claude-code' : 'codex').cwd(workingDir.cwd).open() ?? undefined,
@@ -13886,6 +13887,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             if (terminalModalRouter.current()?.id === session.id) terminalModalRouter.close();
           },
         });
+        const failure = visibleMissionFailureLogData(agent, result);
+        if (failure) debug.log('classic-sidetab.mission', 'failed', failure, { level: 'warn' });
+        return result;
       },
       detach: (row) => {
         if (row?.currentProcess) {
@@ -14073,6 +14077,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const result = await resultPromise.finally(() => { missionFinished = true; });
           await askMonitor;
           handReplyTargets.delete(missionId!);
+          const failure = visibleMissionFailureLogData(member, result, missionId);
+          if (failure) debug.log('classic-sidetab.mission-pair', 'member-failed', failure, { level: 'warn' });
           if (result.ok) await missionStore.complete(missionId!);
           else await missionStore.finish(missionId!, { status: 'failed', error: result.error ?? 'visible mission failed' });
           return { ...result, status: result.ok ? 'completed' as const : 'failed' as const, interactionId: missionId };
@@ -14144,6 +14150,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             outputPath,
             handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
           });
+          const failure = visibleMissionFailureLogData(member, result, missionId);
+          if (failure) debug.log('classic-sidetab.mission-trio', 'member-failed', failure, { level: 'warn' });
           return { ...result, status: result.ok ? 'completed' : 'failed', interactionId: missionId, finalScreen: session.preview.renderForLLM() };
         } catch (error) {
           return {

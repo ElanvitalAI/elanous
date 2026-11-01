@@ -734,8 +734,8 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
   {
     id: 'elanous_linear_secretary',
     kind: 'other', aliases: ['ElanousLinearSecretary'], displayName: 'ElanousLinearSecretary',
-    description: 'Ground a request in repository evidence and create a Linear parent issue with 3–5 assigned subtasks. Requires an explicit due date and verified evidence. Uses the configured project unless the request contains `projectless=true` and exactly one explicit `teamKey=<KEY>` token; never guesses a destination, date or citation.',
-    promptSummary: '`elanous_linear_secretary` (ground and create a parent with 3–5 evidence-backed subtasks; team-only needs projectless=true plus one explicit teamKey=<KEY>)',
+    description: 'DEMO-only grounded Linear secretary. Create a dated evidence-backed parent with 3–5 subtasks, record a child progress/Done transition using actual intake records and approved browser evidence, or open one local pending approval per parent. Repeated approval calls return the existing card state; no external notifications are sent.',
+    promptSummary: '`elanous_linear_secretary` (DEMO create/progress/Done/evidence/approval; approval is local and sends nothing externally)',
     host: ['tui', 'mcp'], safety: ['mutating', 'network'], supportsParallel: false, defaultEnabled: true,
     intentScope: 'ops-fleet',
   },

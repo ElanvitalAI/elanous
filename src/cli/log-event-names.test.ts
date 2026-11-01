@@ -21,3 +21,16 @@ test('capability tool tier split and task-agent tier split have distinct event n
   expect(KNOWN_LOG_EVENT_NAMES.has('tool-tier-split')).toBe(true);
   expect(KNOWN_LOG_EVENT_NAMES.has('tier-split')).toBe(true);
 });
+
+test('AUTHOR-REVIEWER-SUPERVISOR-DIALOG observations are allowlisted', () => {
+  expect(KNOWN_LOG_EVENT_NAMES).toEqual(expect.objectContaining(new Set([
+    'author.reviewer.round',
+    'author.dialog.closed',
+    'supervisor.reauthor-request',
+    'supervisor.reauthor-unjoined',
+    'author.reviewer-precheck.skipped',
+    'author.reviewer-precheck.completed',
+    'author.reviewer-precheck.revision-rejected',
+    'author.reviewer-precheck.failed-soft',
+  ])));
+});

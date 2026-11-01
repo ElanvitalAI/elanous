@@ -46,6 +46,47 @@ const make = (drafts: SweepDraft[], merged: SweepMergedPr[] = []) => {
 };
 const sweep = (adapters: DraftSweepAdapters, apply = false) => runDraftSweep({ repository: 'owner/repo', adapters, apply, now });
 
+describe('runDraftSweep — draft intent hold', () => {
+  it('keeps a valid body hold after claim-release classification and emits the hold observation', async () => {
+    const expiresAt = '2026-09-30T01:00:00.000Z';
+    const marker = `<!-- elanous:draft-intent-hold ${JSON.stringify({ owner: 'OPT', reason: 'focused repair', expiresAt })} -->`;
+    const row = draft(401, { labels: [stalled], createdAt: '2026-09-27T00:00:00.000Z',
+      updatedAt: '2026-09-27T00:00:00.000Z', body: `칸: DRAFT-INTENT-HOLD\n${marker}` });
+    const fixture = make([row]);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await sweep(fixture.adapters, true);
+      expect(result.complete).toBe(true);
+      expect(result.entries).toEqual([{ number: 401, action: 'keep',
+        reason: `intent-hold owner=OPT; reason=focused repair; expiresAt=${expiresAt}`, applied: false }]);
+      expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([]);
+      expect(log).toHaveBeenCalledWith('self-dev.draft-sweep', 'intent-hold-kept',
+        { pr: 401, owner: 'OPT', reason: 'focused repair', expiresAt });
+    } finally { log.mockRestore(); }
+  });
+
+  it('keeps the outside-harness reason when a valid intent marker is present', async () => {
+    const expiresAt = '2026-09-30T01:00:00.000Z';
+    const marker = `<!-- elanous:draft-intent-hold ${JSON.stringify({ owner: 'OPT', reason: 'focused repair', expiresAt })} -->`;
+    const fixture = make([draft(402, { branch: 'feature/manual', labels: [], body: marker })]);
+    const result = await sweep(fixture.adapters);
+    expect(result.entries).toEqual([{ number: 402, action: 'keep', reason: 'outside-harness', applied: false }]);
+  });
+
+  it('observes a present but rejected noncanonical marker and falls through to regular triage', async () => {
+    const expiresAt = '2026-09-30T01:00:00.000Z';
+    const marker = `<!-- elanous:draft-intent-hold ${JSON.stringify({ reason: 'focused repair', owner: 'OPT', expiresAt })} -->`;
+    const fixture = make([draft(403, { labels: [stalled], body: marker })]);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await sweep(fixture.adapters);
+      expect(result.entries[0]).toMatchObject({ number: 403, action: 'close' });
+      expect(log).toHaveBeenCalledWith('self-dev.draft-sweep', 'intent-hold-rejected',
+        { pr: 403, reason: 'noncanonical-json' });
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('runDraftSweep — frozen apply plan', () => {
   const plan: DraftSweepApplyPlan = { version: 1, closeCap: 1, closeCapSource: 'flag', entries: [
     { number: 1, action: 'close', reason: 'superseded-by #3', statusLabel: superseded, applied: false,

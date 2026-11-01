@@ -139,6 +139,18 @@ export interface PodProviderFailureFact {
   readonly httpStatusCode?: number;
 }
 
+export interface PodFirstLlmFact {
+  readonly status: 'started' | 'ok' | 'error';
+  readonly provider: string;
+  readonly model: string;
+  readonly accountName: string | null;
+  readonly startedAt: string;
+  readonly respondedAt?: string;
+  readonly httpStatus?: number;
+  readonly errorFirstLine?: string;
+  readonly firstToolCallAt?: string;
+}
+
 export const POD_EXIT_CLASSES = ['oom-killed', 'deadline-exceeded', 'gh-login-failed', 'pod-secret', 'ask-reprompt', 'provider-error', 'child-unconverged', 'child-error', 'no-result-line', 'unknown'] as const;
 
 export type PodExitClass = typeof POD_EXIT_CLASSES[number];
@@ -163,6 +175,8 @@ export function podChildEvidenceLedgerRow(input: {
   podTermination?: PodTermination | null;
   /** OBS-GAP-BATCH-1030 — 실패 행에만 붙는 두 스칼라(provider · HTTP status). 없으면 종전 행 그대로. */
   providerFailure?: PodProviderFailureFact | null;
+  /** POD-CHILD-FIRST-LLM-CALL-OBS — collected child-ledger first-call timeline. */
+  firstLlm?: PodFirstLlmFact | null;
 }): Record<string, unknown> | null {
   const { result } = input;
   const persist = input.state === 'failed' || input.state === 'aborted' || input.noResultLogEvidence != null
@@ -185,6 +199,7 @@ export function podChildEvidenceLedgerRow(input: {
     job: input.job,
     ...(input.providerFailure?.provider ? { provider: input.providerFailure.provider } : {}),
     ...(input.providerFailure?.httpStatusCode !== undefined ? { httpStatusCode: input.providerFailure.httpStatusCode } : {}),
+    ...(input.firstLlm ? { firstLlm: input.firstLlm } : {}),
     ...(input.podTermination ? { podTermination: input.podTermination } : {}),
     ...(childResult && Object.keys(childResult).length > 0 ? { childResult } : {}),
   };

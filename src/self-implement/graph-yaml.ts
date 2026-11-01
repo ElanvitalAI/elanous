@@ -50,6 +50,11 @@ export interface GraphEdgeSpec {
   /** 조건부 엣지 — 라우터가 읽는 «상태 키». ⛔ 값은 코드가 낸다(RFC §4.3 ⑵). */
   readonly on?: string;
   readonly map?: Readonly<Record<string, string>>;
+  /** Explicit fan-out destinations keyed by outcome. Each selected branch runs concurrently and joins at `join`. */
+  readonly branches?: Readonly<Record<string, readonly string[]>>;
+  readonly join?: string;
+  /** Failed warning branches remain visible in the join output but do not fail the barrier. */
+  readonly warningBranches?: readonly string[];
   /** 심이 «주입 안 됐을 때» 내려가는 순서. `requires` 는 그 심 이름들. */
   readonly fallback?: readonly { readonly node: string; readonly requires: readonly string[]; readonly observed?: number }[];
   readonly observed?: number;
@@ -273,14 +278,19 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     if (!known.has(from)) { errors.push({ path: `${at}/from`, message: `'${from}' 은 선언된 노드가 아니다` }); continue; }
     const hasTo = typeof e.to === 'string';
     const hasMap = e.map !== null && typeof e.map === 'object';
+    const hasBranches = e.branches !== null && typeof e.branches === 'object' && !Array.isArray(e.branches);
     if (e.when !== undefined && (typeof e.when !== 'string' || !parseOverlayCondition(e.when).ok))
       errors.push({ path: `${at}/when`, message: 'when 은 오버레이 조건 한 개(key op literal)여야 한다' });
     if (e.when !== undefined && (L1_PROTECTED_ROUTE_NODES.has(from) || nodes.some(node => node.nodeId === from && node.kind === 'gate') || terminalNodes.includes(from)))
       errors.push({ path: `${at}/when`, message: `'${from}' 의 필수 검증·착지 결과는 when 간선으로 덮을 수 없다` });
     if (e.when !== undefined && (!hasTo || hasMap || e.on !== undefined))
       errors.push({ path: `${at}/when`, message: 'when 은 to 간선에서만 쓴다' });
-    if (hasTo === hasMap) {
-      errors.push({ path: at, message: 'to 와 map 중 «정확히 하나»를 써야 한다' });
+    if (!hasTo && !hasMap && !hasBranches) {
+      errors.push({ path: at, message: 'to 또는 map/branches 조합을 써야 한다' });
+      continue;
+    }
+    if (hasTo && (hasMap || hasBranches)) {
+      errors.push({ path: at, message: 'to 는 map·branches 와 함께 쓸 수 없다' });
       continue;
     }
     const map: Record<string, string> = {};
@@ -291,6 +301,35 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
         map[key] = value;
       }
       if (typeof e.on !== 'string') errors.push({ path: `${at}/on`, message: 'map 을 쓰면 on(라우터가 읽는 상태 키)이 필요하다' });
+    }
+    let branches: Record<string, readonly string[]> | undefined;
+    let warningBranches: readonly string[] | undefined;
+    if (hasBranches) {
+      branches = {};
+      for (const [outcome, destinations] of Object.entries(e.branches as Record<string, unknown>)) {
+        if (!Array.isArray(destinations) || destinations.length < 2 || !destinations.every((value) => typeof value === 'string')) {
+          errors.push({ path: `${at}/branches/${outcome}`, message: 'branches 목적지는 두 개 이상의 노드 id 목록이어야 한다' });
+          continue;
+        }
+        if (new Set(destinations).size !== destinations.length)
+          errors.push({ path: `${at}/branches/${outcome}`, message: 'branches 목적지는 중복될 수 없다' });
+        for (const [index, destination] of destinations.entries()) {
+          if (!known.has(destination)) errors.push({ path: `${at}/branches/${outcome}/${index}`, message: `'${destination}' 는 선언된 노드가 아니다` });
+        }
+        branches[outcome] = destinations as string[];
+      }
+      if (typeof e.on !== 'string' || typeof e.join !== 'string' || !known.has(e.join))
+        errors.push({ path: at, message: 'branches 에는 on 과 선언된 join 노드가 필요하다' });
+      if (e.fallback !== undefined || e.when !== undefined) errors.push({ path: at, message: 'branches 는 fallback·when 과 함께 쓸 수 없다' });
+      if (hasMap && Object.keys(map).some((outcome) => Object.hasOwn(e.branches as object, outcome)))
+        errors.push({ path: `${at}/branches`, message: 'map 과 branches 의 outcome 키는 겹칠 수 없다' });
+      if (e.warning_branches !== undefined) {
+        if (!Array.isArray(e.warning_branches) || e.warning_branches.some((branch) => typeof branch !== 'string' || !branch.trim()) ||
+            new Set(e.warning_branches).size !== e.warning_branches.length ||
+            e.warning_branches.some((branch) => !Object.values(branches!).some((destinations) => destinations.includes(branch as string)))) {
+          errors.push({ path: `${at}/warning_branches`, message: 'warning_branches 는 중복 없는 branches 목적지 목록이어야 한다' });
+        } else warningBranches = e.warning_branches as string[];
+      }
     }
     if (hasTo && !known.has(e.to as string)) { errors.push({ path: `${at}/to`, message: `'${String(e.to)}' 는 선언된 노드가 아니다` }); continue; }
 
@@ -309,6 +348,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       from,
       ...(hasTo ? { to: e.to as string } : {}),
       ...(hasMap ? { on: String(e.on), map } : {}),
+      ...(branches ? { on: String(e.on), branches, join: String(e.join), ...(warningBranches ? { warningBranches } : {}) } : {}),
       ...(fallback.length > 0 ? { fallback } : {}),
       ...(typeof e.observed === 'number' ? { observed: e.observed } : {}),
       ...(typeof e.when === 'string' ? { when: e.when } : {}),
@@ -325,6 +365,25 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     if (edge.when === undefined) continue;
     if (!edges.some(candidate => candidate.from === edge.from && candidate.when === undefined))
       errors.push({ path: `${label}/edges/${edge.from}/when`, message: 'when 간선에는 모호·미관측 때 탈 무조건 기본 간선이 필요하다' });
+  }
+  const fanOutDestinations = new Map<string, string>();
+  const fanOutJoins = new Map<string, string>();
+  for (const edge of edges) {
+    if (!edge.branches || !edge.join) continue;
+    const sourceNode = nodes.find(node => node.nodeId === edge.from);
+    if (sourceNode && sourceNode.maxVisits !== 1) errors.push({ path: `${label}/edges/${edge.from}/branches`, message: 'fan-out 출발 노드는 재방문할 수 없어 max_visits: 1 이어야 한다' });
+    if (fanOutJoins.has(edge.join) && fanOutJoins.get(edge.join) !== edge.from) errors.push({ path: `${label}/edges/${edge.from}/join`, message: 'join 노드는 하나의 fan-out barrier만 소유할 수 있다' });
+    fanOutJoins.set(edge.join, edge.from);
+    if (edge.join === edge.from || Object.values(edge.branches).some((branches) => branches.includes(edge.join!)))
+      errors.push({ path: `${label}/edges/${edge.from}/join`, message: 'join 노드는 fan-out source나 branch 목적지일 수 없다' });
+    for (const branch of new Set(Object.values(edge.branches).flat())) {
+      if (fanOutDestinations.has(branch) && fanOutDestinations.get(branch) !== edge.from) errors.push({ path: `${label}/edges/${edge.from}/branches`, message: `branch '${branch}' 는 하나의 fan-out source 에서만 실행할 수 있다` });
+      fanOutDestinations.set(branch, edge.from);
+      if (edges.some(candidate => candidate.from === branch)) errors.push({ path: `${label}/edges/${edge.from}/branches`, message: `branch '${branch}' 는 단일 노드만 지원하며 후속 간선은 허용되지 않는다` });
+    }
+    const joinEdge = edges.find((candidate) => candidate.from === edge.join && candidate.on === 'outcome');
+    if (!joinEdge?.map || !Object.hasOwn(joinEdge.map, 'ok') || !Object.hasOwn(joinEdge.map, 'fail'))
+      errors.push({ path: `${label}/edges/${edge.join}`, message: 'fan-out join 은 ok·fail 출구를 모두 선언해야 한다' });
   }
 
   if (entryNode !== undefined && !known.has(entryNode)) errors.push({ path: `${label}/entry_node`, message: `'${entryNode}' 는 선언된 노드가 아니다` });
@@ -535,6 +594,13 @@ export function edgeMapOf(template: GraphTemplateSpec): Record<string, string[]>
     const push = (t: string) => { if (!targets.includes(t)) targets.push(t); };
     if (edge.to) push(edge.to);
     for (const t of Object.values(edge.map ?? {})) push(t);
+    for (const destinations of Object.values(edge.branches ?? {})) for (const destination of destinations) {
+      push(destination);
+      if (edge.join) {
+        const branchTargets = edges[destination] ?? (edges[destination] = []);
+        if (!branchTargets.includes(edge.join)) branchTargets.push(edge.join);
+      }
+    }
     for (const fb of edge.fallback ?? []) push(fb.node);
   }
   return edges;

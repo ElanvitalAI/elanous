@@ -4,6 +4,7 @@ import type { BloomResearchQuestion, ResearchEvidenceEnvelope } from '../auto-re
 import { getAvailableResearchWebSearchProviders } from '../web-search/index.js';
 import type { WebSearchHit, WebSearchProvider } from '../web-search/provider.js';
 import { debug } from '../debug/log.js';
+import { dispatchWebFetch } from '../skills/tools/webfetch.js';
 
 const RESEARCH_SEARCH_ENGINES = ['exa', 'firecrawl'] as const;
 const RESEARCH_WEB_FALLBACK_IDS = ['exa', 'firecrawl'] as const;
@@ -42,8 +43,9 @@ export type AxisSearch = (query: string, signal?: AbortSignal, context?: AxisSea
 
 export interface AxisFanoutDeps {
   search?: AxisSearch;
+  fetchPage?: (url: string, question: BloomResearchQuestion, signal?: AbortSignal) => Promise<{ url: string; output: string }>;
   signal?: AbortSignal;
-  admitToolCall?: (toolName: 'OmniSearch') => boolean;
+  admitToolCall?: (toolName: 'OmniSearch' | 'WebFetch') => boolean;
 }
 
 interface ProviderHealth {
@@ -201,15 +203,34 @@ export async function fanOutAxisEvidence(
     throw new Error('research axis question IDs must be unique');
   }
   const search = deps.search ?? createResearchAxisSearcher();
-  const settled = await Promise.allSettled(plan.map(call => {
+  const fetchPage = deps.fetchPage ?? (!deps.search
+    ? async (url: string, question: BloomResearchQuestion, signal?: AbortSignal) =>
+      dispatchWebFetch({ url, prompt: question.prompt }, { signal })
+    : undefined);
+  const fetchedQuestions = new Set<string>();
+  const settled = await Promise.allSettled(plan.map(async call => {
     if (deps.admitToolCall && !deps.admitToolCall('OmniSearch')) {
-      return Promise.resolve({ hits: [], errors: ['research tool budget reached'] } satisfies AxisSearchResult);
+      return { hits: [], errors: ['research tool budget reached'] } satisfies AxisSearchResult;
     }
     const question = questions.find(candidate => candidate.id === call.questionId)!;
-    return search(call.query, deps.signal, {
+    const raw = await search(call.query, deps.signal, {
       questionPrompt: question.prompt,
       requestedWindow: question.requestedWindow,
     });
+    const response = Array.isArray(raw) ? { hits: raw, errors: [] } : raw;
+    if (!fetchPage || response.hits.length === 0 || fetchedQuestions.has(question.id)) return response;
+    fetchedQuestions.add(question.id);
+    if (deps.admitToolCall && !deps.admitToolCall('WebFetch')) return response;
+    try {
+      const page = await fetchPage(response.hits[0]!.url, question, deps.signal);
+      return { ...response, fetchedPage: page };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      debug.log('research.search', 'native-fetch-failed', {
+        questionId: question.id, reason: message.slice(0, 200),
+      }, { level: 'warn' });
+      return response;
+    }
   }));
   const axes: AxisEvidenceGroup[] = questions.map(question => ({ questionId: question.id, evidence: [] }));
   const groups = new Map(axes.map(axis => [axis.questionId, axis]));
@@ -226,9 +247,23 @@ export async function fanOutAxisEvidence(
     const group = groups.get(call.questionId)!;
     const question = byQuestion.get(call.questionId)!;
     if (outcome.status === 'fulfilled') {
-      const response = Array.isArray(outcome.value) ? { hits: outcome.value, errors: [] } : outcome.value;
+      const response = outcome.value;
       if (response.hits.length === 0 && response.errors.length === 0) {
         group.evidence.push({ ...failedEvidence(question, call.query, 'no hits returned'), outcome: 'partial' });
+      }
+      const fetchedPage = 'fetchedPage' in response ? response.fetchedPage : undefined;
+      if (fetchedPage) {
+        const content = fetchedPage.output;
+        const excerpt = Array.from(content).slice(0, 8_000).join('');
+        group.evidence.push({
+          questionId: question.id,
+          sourceKind: 'web-fetch',
+          source: fetchedPage.url,
+          ...(question.requestedWindow ? { requestedWindow: question.requestedWindow } : {}),
+          content: excerpt,
+          outcome: excerpt ? 'complete' : 'partial',
+          truncated: Array.from(content).length > 8_000,
+        });
       }
       for (const hit of response.hits) {
         try {

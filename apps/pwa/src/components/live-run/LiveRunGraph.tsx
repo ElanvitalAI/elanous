@@ -20,6 +20,7 @@ import { EDGE_FAMILY_COLOR, hoverFocus, WIRING_STYLE, wiringEdgeStyle } from '@/
 import type { TidyEdgeData } from '@/components/workflows/TidyEdge';
 import { durationLabel, kstClock, replayDelayMs, sceneAt, type LiveNodeState, type SceneEdge, type TraversalStep } from '@/lib/live-run-scene';
 import { graphFromSteps, mergeWalked, runStatusLabel } from '@/lib/live-run-view';
+import { liveRunMetricCells } from '@/lib/live-run-metrics';
 import { aggregateGroupState, collapseGroups, GROUP_NODE_PREFIX, groupBoxes, groupNames, groupOf, isGroupNodeId, type GroupedRunGraph } from '@/components/editor/graph-groups';
 import { GROUP_BOX_NODE_TYPES, type GroupBoxData } from '@/components/editor/GraphGroupBox';
 
@@ -36,6 +37,7 @@ const STATE_CLASS: Record<LiveNodeState, string> = {
   passed: 'workflow-node-status workflow-node-status-done', failed: 'workflow-node-status workflow-node-status-failed',
 };
 const SPEEDS = [1, 4, 16] as const;
+const DEFAULT_SPEED = SPEEDS[1];
 /** 좁은 화면(폰) 문턱 — 390px 실물 폭 판정은 이 값 하나로 한다(렌더 시험도 이 문턱을 잰다). */
 const NARROW_VIEWPORT = 700;
 /** 따라가기 배율 — 넓은 화면은 900px 기준 비율(바닥 0.78), 좁은 화면은 바닥을 0.72 로 낮춰 카드와 양옆 간선이 통째로 들어온다.
@@ -97,12 +99,13 @@ function LiveEdge({ id, data, markerEnd, style }: EdgeProps) {
   if (!edge?.route) return null;
   const { route } = edge;
   const color = EDGE_FAMILY_COLOR[route.family];
-  const dashed = route.kind === 'back';
+  const dashed = route.kind === 'back' || route.family === 'fallback';
+  const dasharray = route.family === 'fallback' ? '8 4' : '6 4';
   return (
     <>
       <g data-testid={edge.taken ? `edge-token-${route.from}-${route.to}` : undefined}>
         <BaseEdge id={id} path={route.path} markerEnd={markerEnd}
-          style={{ stroke: color, strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: '6 4' } : {}), ...style, ...(style?.stroke ? { opacity: 1 } : {}) }} />
+          style={{ stroke: color, strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: dasharray } : {}), ...style, ...(style?.stroke ? { opacity: 1 } : {}) }} />
       </g>
       {edge.active && (
         <g key={edge.tokenKey} opacity={style?.opacity}>
@@ -133,12 +136,14 @@ function LiveEdge({ id, data, markerEnd, style }: EdgeProps) {
 
 const NODE_TYPES = { live: LiveNode, ...GROUP_BOX_NODE_TYPES };
 const EDGE_TYPES = { live: LiveEdge };
-export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }: {
+export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion = 0, onNodeSelect }: {
   runId: string;
   /** `?units=folded` — start with every unit folded. */
   initialFolded?: boolean;
-  /** Render the current ledger scene without exposing replay/fold controls. */
-  sceneOnly?: boolean;
+  /** Increment to clear embedded node focus and restore the complete graph view. */
+  clearFocusVersion?: number;
+  /** Let an embedding showcase open a ledger-backed evidence preview for a tapped node. */
+  onNodeSelect?: (nodeId: string | null) => void;
 }) {
   const client = useNexusClient();
   const traversal = useQuery({
@@ -187,11 +192,11 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
 
   const live = run?.status === 'running';
   const [mode, setMode] = useState<'live' | 'replay' | null>(null);
-  const effectiveMode = sceneOnly ? 'live' : mode ?? (live ? 'live' : 'replay');
+  const effectiveMode = mode ?? (live ? 'live' : 'replay');
   const [cursor, setCursor] = useState(-1);
   const [entering, setEntering] = useState(false);
   const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(4);
+  const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(DEFAULT_SPEED);
   const [focus, setFocus] = useState<string | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
   // 카메라 따라가기 — 그래프가 넓으면 전체 맞춤은 글자가 작아진다. 재생·라이브 중엔 지금 노드로 다가가 따라간다.
@@ -201,6 +206,7 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
   // onInit 뒤에 카메라 따라가기를 다시 걸기 위한 신호(첫 이동이 인스턴스 준비 전에 지나가지 않게).
   const [flowReady, setFlowReady] = useState(0);
   const started = useRef(false);
+  const previousRunId = useRef(runId);
   // 화면 폭 — 캔버스 높이·타임라인 높이·물러나기가 같은 문턱(700)을 본다(390px 실물 = 좁은 화면).
   const [viewportWidth, setViewportWidth] = useState(() => (typeof window === 'undefined' || !(window.innerWidth > 0) ? 1024 : window.innerWidth));
   useEffect(() => {
@@ -210,13 +216,30 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
   }, []);
   const narrow = viewportWidth < NARROW_VIEWPORT;
 
+  // Run-specific scene state resets without remounting its surrounding showcase panel.
+  useEffect(() => {
+    if (previousRunId.current === runId) return;
+    previousRunId.current = runId;
+    started.current = false;
+    foldApplied.current = false;
+    setCollapsed(new Set());
+    setMode(null);
+    setCursor(-1);
+    setEntering(false);
+    setPlaying(false);
+    setSpeed(DEFAULT_SPEED);
+    setFocus(null);
+    setHovered(null);
+    setFollow(true);
+  }, [runId]);
+
   // 처음 열면: 라이브 런은 마지막 노드에, 끝난 런은 처음부터 자동 재생.
   useEffect(() => {
     if (!run || started.current || steps.length === 0) return;
     started.current = true;
-    if (run.status === 'running' || sceneOnly) { setCursor(steps.length - 1); setEntering(steps.at(-1)!.outcome === null); }
+    if (run.status === 'running') { setCursor(steps.length - 1); setEntering(steps.at(-1)!.outcome === null); }
     else { setCursor(0); setEntering(true); setPlaying(true); }
-  }, [run, steps, sceneOnly]);
+  }, [run, steps]);
 
   // 라이브 따라가기 — 새 노드가 원장에 들어오면 커서가 따라간다.
   useEffect(() => {
@@ -246,8 +269,16 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
       else if (event.type === 'unit-expanded') labels.set(event.node, '깊이 상승');
       else if (event.type === 'edge-rerouted') { labels.set(event.from, '경로 수리'); labels.set(event.to, '경로 수리'); }
     }
+    // A visited step absent from the declared snapshot is visible structural growth even
+    // when its graph event was not captured in the traversal response.
+    if (graphQuery.data) {
+      const declared = new Set(graphQuery.data.nodes.map((node) => node.node_id));
+      for (const step of steps) {
+        if (!declared.has(step.node) && !labels.has(step.node)) labels.set(step.node, '새로 추가');
+      }
+    }
     return labels;
-  }, [run?.graphEvents]);
+  }, [run?.graphEvents, graphQuery.data, steps]);
   const scene = useMemo(() => sceneAt(flow?.nodes.map((node) => node.id) ?? [], sceneEdges, viewSteps, cursor, entering), [flow, sceneEdges, viewSteps, cursor, entering]);
   const toggleUnit = useCallback((group: string) => setCollapsed((current) => {
     const next = new Set(current);
@@ -296,6 +327,20 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
     else void instance.fitView({ duration: 600, padding: 0.08, minZoom: 0.5 });
   }, []);
 
+  const previousClearFocusVersion = useRef(clearFocusVersion);
+  useEffect(() => {
+    if (previousClearFocusVersion.current === clearFocusVersion) return;
+    previousClearFocusVersion.current = clearFocusVersion;
+    zoomTo(null);
+  }, [clearFocusVersion, zoomTo]);
+
+  const previousCameraRunId = useRef(runId);
+  useEffect(() => {
+    if (previousCameraRunId.current === runId) return;
+    previousCameraRunId.current = runId;
+    zoomTo(null);
+  }, [runId, zoomTo]);
+
   const followNode = viewSteps[cursor]?.node ?? null;
   useEffect(() => {
     if (!follow || focus || !followNode || !flow) return;
@@ -327,6 +372,7 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
 
   const focusVisits = focus ? steps.map((step, index) => ({ step, index })).filter(({ step }) => (view?.resolve(step.node) ?? step.node) === focus) : [];
   const current = cursor >= 0 ? steps[cursor] : undefined;
+  const metrics = liveRunMetricCells(run, graph);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
@@ -340,13 +386,13 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
       </div>
 
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        {!sceneOnly && <div role="group" aria-label="보기" className="flex overflow-hidden rounded border border-border">
+        <div role="group" aria-label="보기" className="flex overflow-hidden rounded border border-border">
           <button type="button" disabled={!live} onClick={() => { setMode('live'); setPlaying(false); }}
             className={`px-2 py-1 ${effectiveMode === 'live' ? 'bg-primary text-primary-foreground' : ''} disabled:opacity-40`}>● 라이브</button>
           <button type="button" onClick={() => { setMode('replay'); }}
             className={`px-2 py-1 ${effectiveMode === 'replay' ? 'bg-primary text-primary-foreground' : ''}`}>리플레이</button>
-        </div>}
-        {!sceneOnly && effectiveMode === 'replay' && (
+        </div>
+        {effectiveMode === 'replay' && (
           <>
             <button type="button" aria-label={playing ? '일시정지' : '재생'} onClick={() => {
               if (!playing && cursor >= steps.length - 1) { setCursor(0); setEntering(true); }
@@ -364,14 +410,33 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
           </>
         )}
         <span className="text-text-tertiary">{Math.max(0, cursor + 1)}/{steps.length} 단계{current ? ` · ${current.node} ×${current.visit}` : ''}</span>
-        <button type="button" onClick={() => { setFollow(false); zoomTo(null); }} className="rounded border border-border px-2 py-1">전체 보기</button>
-        <button type="button" aria-pressed={follow} onClick={() => { setFollow(!follow); setFocus(null); }}
+        <button type="button" onClick={() => { setFollow(false); onNodeSelect?.(null); zoomTo(null); }} className="rounded border border-border px-2 py-1">전체 보기</button>
+        <button type="button" aria-pressed={follow} onClick={() => { setFollow(!follow); onNodeSelect?.(null); setFocus(null); }}
           className={`rounded border px-2 py-1 ${follow ? 'border-primary text-primary' : 'border-border'}`}>카메라 따라가기</button>
-        {!sceneOnly && units.length > 0 && (
-          <button type="button" data-testid="toggle-units" onClick={() => { setFocus(null); setCollapsed(collapsed.size === units.length ? new Set() : new Set(units)); }}
+        {units.length > 0 && (
+          <button type="button" data-testid="toggle-units" onClick={() => { onNodeSelect?.(null); setFocus(null); setCollapsed(collapsed.size === units.length ? new Set() : new Set(units)); }}
             className="rounded border border-border px-2 py-1">{collapsed.size === units.length ? '묶음 펼치기 (통합 보기)' : '묶음 접기'}</button>
         )}
       </div>
+
+      <dl data-testid="live-run-metrics" aria-label="런 지표" className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+        <div data-testid="metric-nodes" className="rounded border border-border bg-surface px-2 py-1">
+          <dt className="text-text-tertiary">노드 수</dt>
+          <dd className="font-mono font-semibold text-text-primary">{metrics.nodeCount}</dd>
+        </div>
+        <div data-testid="metric-edges" className="rounded border border-border bg-surface px-2 py-1">
+          <dt className="text-text-tertiary">간선 수</dt>
+          <dd className="font-mono font-semibold text-text-primary">{metrics.edgeCount}</dd>
+        </div>
+        <div data-testid="metric-elapsed" className="rounded border border-border bg-surface px-2 py-1">
+          <dt className="text-text-tertiary">경과 시간</dt>
+          <dd className="font-mono font-semibold text-text-primary">{metrics.elapsed}</dd>
+        </div>
+        <div data-testid="metric-cost" className="rounded border border-border bg-surface px-2 py-1">
+          <dt className="text-text-tertiary">비용</dt>
+          <dd className="font-mono font-semibold text-text-primary">{metrics.cost}</dd>
+        </div>
+      </dl>
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
         {/* 좁은 화면(세로 쌓임)에서는 그래프가 이 화면의 본체 — 타임라인을 300px 로 낮춘 만큼 캔버스를 더 준다. */}
@@ -389,13 +454,15 @@ export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }
                   // 접힌 묶음을 누르면 그 묶음을 펼치고 그 안으로 들어간다.
                   const group = (node.data as { group?: string }).group ?? node.id.slice('group:'.length);
                   toggleUnit(group);
+                  onNodeSelect?.(null);
                   setFocus(null);
                   window.setTimeout(() => void flowRef.current?.fitView({ nodes: [{ id: `box:${group}` }], duration: 600, maxZoom: 1.4, padding: 0.2 }), 80);
                   return;
                 }
+                onNodeSelect?.(focus === node.id ? null : node.id);
                 zoomTo(focus === node.id ? null : node.id);
               }}
-              onPaneClick={() => { if (focus) zoomTo(null); }}
+              onPaneClick={() => { if (focus) { onNodeSelect?.(null); zoomTo(null); } }}
               fitView fitViewOptions={{ padding: 0.08, minZoom: 0.5 }} minZoom={0.2} maxZoom={2}
               nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} edgesFocusable={false} deleteKeyCode={null}
               proOptions={{ hideAttribution: true }} className="!bg-surface">

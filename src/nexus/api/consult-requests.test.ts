@@ -1,6 +1,6 @@
-import { afterEach, expect, spyOn, test } from 'bun:test';
+import { afterEach, expect, test } from 'bun:test';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
-import { resetUserConfig, setUserConfigOverlay } from '../../user-config.js';
+import { getUserConfig, resetUserConfig, setUserConfigOverlay } from '../../user-config.js';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +12,7 @@ import { NexusEventBus } from './event-bus.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { ConsultLimiter, ConsultQueue, handleConsultPost, validateConsult } from '../../hooks/consult-intake.js';
 import { routeRequest } from './http-server.js';
+import { openDeliveryDb } from '../outbound/delivery-ledger.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -86,15 +87,37 @@ test('authenticated POST records a private 0600 JSONL receipt and sends one cont
   expect(JSON.stringify(all)).not.toContain(valid.contact);
 });
 
-test('default receipt path delivers exactly once to the configured OP Telegram channel, never to report or another surface', async () => {
+test('default receipt path routes once through the existing Telegram adapter and records delivery without a network call', async () => {
   const { root, opts } = fixture();
-  const liveOpts = { ...opts, consultRequests: { root: opts.consultRequests.root, now: opts.consultRequests.now } };
+  const deliveryDb = openDeliveryDb(':memory:');
+  const requests: Array<{ url: string; method?: string; body: { chat_id: number; text: string } }> = [];
+  let completeDelivery!: () => void;
+  const delivered = new Promise<void>(resolve => { completeDelivery = resolve; });
+  const liveOpts = { ...opts, consultRequests: { root: opts.consultRequests.root, now: opts.consultRequests.now,
+    routeDeps: {
+      deliveryDb, now: () => '2026-10-02T06:00:01.000Z', spill: (text: string) => ({ text, spilled: false }),
+      fetchImpl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ url: String(url), method: init?.method, body: JSON.parse(String(init?.body)) as { chat_id: number; text: string } });
+        completeDelivery();
+        return Response.json({ ok: true, result: { message_id: 1 } });
+      }) as typeof fetch,
+    } } };
   setElanousConfigDir(root);
   resetUserConfig();
   const opToken = '10001:test-only-ops';
   const tradeToken = '20002:test-only-trade';
   setUserConfigOverlay(cfg => ({
     ...cfg,
+    raw: {
+      ...cfg.raw,
+      outbound: {
+        channels: [
+          { type: 'discord', webhookUrl: 'https://example.invalid/webhook' },
+          { type: 'pushcut', notification: 'unrelated-alert' },
+        ],
+        routes: { 'ops-alert': ['discord', 'pushcut'] },
+      },
+    },
     telegram: {
       ...cfg.telegram, enabled: true, botToken: opToken, allowedUsers: [303], homeChannel: 303,
       reportChannel: { botToken: tradeToken, chatId: 404 },
@@ -104,14 +127,7 @@ test('default receipt path delivers exactly once to the configured OP Telegram c
       ],
     },
   }));
-  const deliveries: Array<{ url: string; method: string | undefined; body: Record<string, unknown> }> = [];
-  let completeDelivery!: () => void;
-  const delivered = new Promise<void>(resolve => { completeDelivery = resolve; });
-  const network = spyOn(globalThis, 'fetch').mockImplementation((async (url: RequestInfo | URL, init?: RequestInit) => {
-    deliveries.push({ url: String(url), method: init?.method, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
-    completeDelivery();
-    return Response.json({ ok: true, result: { message_id: 1 } });
-  }) as typeof fetch);
+  expect(roleForKind(getUserConfig(), 'ops-alert')).toBe('system');
   try {
     const response = await routeRequest(new Request('http://localhost/v1/consult-requests', {
       method: 'POST', headers: { origin: 'http://localhost', 'sec-fetch-site': 'same-origin' }, body: JSON.stringify(valid),
@@ -127,15 +143,24 @@ test('default receipt path delivers exactly once to the configured OP Telegram c
       clearTimeout(timer);
     }
     await new Promise<void>(resolve => setImmediate(resolve));
-    expect(deliveries).toEqual([{
+    expect(requests).toEqual([{
       url: `https://api.telegram.org/bot${opToken}/sendMessage`, method: 'POST',
       body: { chat_id: 303, text: `📮 상담 문의 ${receipt.receiptId} · 홍길동(AX 연구소) · 관심 A\n앱에서 보기` },
     }]);
-    expect(JSON.stringify(deliveries)).not.toContain(valid.contact);
+    type DeliveryRow = { kind: string; text: string; channels: string };
+    let row: DeliveryRow | undefined;
+    for (let attempt = 0; attempt < 500 && !row; attempt += 1) {
+      const found = deliveryDb.query('SELECT kind, text, channels FROM deliveries').get() as DeliveryRow | null;
+      if (found) row = found;
+      else await Bun.sleep(10);
+    }
+    if (!row) throw new Error('delivery ledger row was not recorded');
+    expect(row).toEqual({ kind: 'ops-alert', text: requests[0]!.body.text, channels: '[{"type":"telegram","ok":true}]' });
+    expect(row.text).not.toContain(valid.contact);
     expect(readFileSync(join(root, 'consult-requests', 'requests.jsonl'), 'utf8').trimEnd().split('\n').map(line => JSON.parse(line)))
       .toEqual([{ ...valid, ...receipt }]);
   } finally {
-    network.mockRestore();
+    deliveryDb.close();
   }
 });
 
@@ -234,6 +259,4 @@ test('CS1 — the receipt answers at once even when the alert channel never answ
   // the event loop until it times out (10-01: 25 s · unreachable · alert lost).
   const source = readFileSync(new URL('./consult-requests.ts', import.meta.url), 'utf8');
   expect(source).not.toMatch(/import\s*\{[^}]*\bsendOutbound\b/);
-  expect(source).not.toMatch(/import\s*\{[^}]*\brouteOutbound\b/);
-  expect(source).toContain('sendTelegramReport(getUserConfig(), text, { markdown: false, kind })');
 });

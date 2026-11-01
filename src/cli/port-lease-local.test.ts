@@ -2,11 +2,23 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:net';
+import { RELEASE_PWA_FIXED_HTTP_PORT } from '../control-plane/ports.js';
 import { debug } from '../debug/log.js';
 import { leaseTestPort, releaseTestPort, transferTestPort, RESERVED, TEST_BAND } from './port-lease-local.js';
 
 const dirs: string[] = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'lease-test-')); dirs.push(dir); return dir; };
+async function isPortOccupied(port: number): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'EADDRINUSE' || error.code === 'EACCES') resolve(true);
+      else reject(error);
+    });
+    probe.listen(port, '127.0.0.1', () => probe.close(() => resolve(false)));
+  });
+}
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('local test-port lease', () => {
@@ -36,7 +48,7 @@ describe('local test-port lease', () => {
 
   test('reserved ports are never issued; ports in use are skipped; exhaustion returns no-port', async () => {
     const dir = temp();
-    expect(RESERVED).toEqual([31413, 31415, 31420]);
+    expect(RESERVED).toEqual([31413, 31415, 31420, RELEASE_PWA_FIXED_HTTP_PORT]);
     expect(TEST_BAND).toEqual({ start: 31450, end: 31499 });
     const taken = await leaseTestPort({ owner: 'taken', dir, inUse: port => port === 31450 });
     expect(taken).toMatchObject({ port: 31451 });
@@ -67,6 +79,38 @@ describe('local test-port lease', () => {
     releaseTestPort(claim.port, claim.pid + 100, dir);
     expect(readdirSync(dir)).toEqual([]);
   });
+});
+
+test('isolated test lease skips a listener on the release PWA fixed port', async () => {
+  const listener = createServer();
+  let ownsListener = false;
+  await new Promise<void>((resolve, reject) => {
+    listener.once('error', (error: NodeJS.ErrnoException) => {
+      // A live release PWA is itself a valid occupied-port fixture on a shared host.
+      if (error.code === 'EADDRINUSE') resolve();
+      else reject(error);
+    });
+    listener.listen(RELEASE_PWA_FIXED_HTTP_PORT, '127.0.0.1', () => { ownsListener = true; resolve(); });
+  });
+  try {
+    expect(await isPortOccupied(RELEASE_PWA_FIXED_HTTP_PORT)).toBe(true);
+    const dir = temp();
+    const claim = await leaseTestPort({
+      owner: 'tui-isolation', dir,
+      inUse: async port => port <= 31452 || await isPortOccupied(port),
+    });
+    expect(claim).toMatchObject({ owner: 'tui-isolation' });
+    expect('port' in claim ? claim.port : 0).toBeGreaterThan(RELEASE_PWA_FIXED_HTTP_PORT);
+    expect('port' in claim ? claim.port : -1).not.toBe(RELEASE_PWA_FIXED_HTTP_PORT);
+  } finally {
+    if (ownsListener) await new Promise<void>((resolve, reject) => listener.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test('isolated test lease reserves the fixed release port even when the probe says it is free', async () => {
+  const dir = temp();
+  const claim = await leaseTestPort({ owner: 'tui-race', dir, inUse: port => port <= 31452 });
+  expect(claim).toMatchObject({ port: RELEASE_PWA_FIXED_HTTP_PORT + 1, owner: 'tui-race' });
 });
 
 // 🩸 2026-09-27: pid 1(launchd · 늘 살아 있음)이 주인으로 적힌 임대가 영영 안 풀려 시험 대역이 샜다.

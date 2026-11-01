@@ -26,6 +26,22 @@ describe('next TUI sidetab', () => {
     expect(listCompatibility.formatSidetabLines).not.toBe(formatSidetabLines);
   });
 
+  test('renders shared control state through the Next compatibility path without changing row width', () => {
+    const rows: SidetabRow[] = [{
+      id: 'pty:agent', label: 'agent', kind: 'agent', badge: 'busy',
+      controlState: {
+        actor: 'agent', badge: '🤖', label: '🤖 엘라누스 조작 중',
+        title: '🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기', emphasized: true,
+      },
+    }];
+    const lines = listCompatibility.formatSidetabLines(rows, 0, 80);
+    expect(lines[0]).toContain('🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기');
+    expect(lines[0]).toContain('\u001b[1;36m');
+    expect(lines[2]).toContain('› 🤖 busy agent');
+    expect(lines[2]).toContain('\u001b[1;36m');
+    expect(Bun.stringWidth(lines[2]!)).toBe(80);
+  });
+
   test('toggle opens and closes without changing selection', () => {
     const closed = createSidetabState();
     const opened = applySidetabKey(closed, 'toggle', 2);
@@ -112,10 +128,10 @@ describe('next TUI sidetab', () => {
   });
 
   test('renders only the selected row snapshot beneath that row', () => {
-    const rows = [
+    const rows: Array<SidetabRow & { readonly previewSource: string }> = [
       { id: 'pty:1', label: 'first › marker', kind: 'shell', badge: 'idle', previewSource: 'first-output' },
       { id: 'pty:2', label: 'second', kind: 'agent', badge: 'busy', previewSource: 'old\nlatest-output' },
-    ] as SidetabRow[];
+    ];
     const lines = listCompatibility.formatSidetabLines(rows, 1, 28, 12);
     const selectedLine = lines.findIndex((line) => line.includes('› busy second'));
     expect(selectedLine).toBeGreaterThanOrEqual(0);
@@ -356,15 +372,15 @@ describe('next TUI sidetab', () => {
           { label: 'clear-prompt', keys: '\x15', timeoutMs: 15_000, until: (screen) => screen.includes('❯ ') && !screen.includes('❯ nx') },
           { label: 'open-new-menu', keys: '/side new\r', timeoutMs: 15_000, until: (screen) => screen.includes('새 PTY') },
           { label: 'spawn-shell', keys: 's', timeoutMs: 15_000, until: (screen) => screen.includes('shell ─') },
-          { label: 'detach-shell', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next T') },
+          { label: 'detach-shell', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next TUI') },
           { label: 'attach-shell', keys: '\x1b[B\r', timeoutMs: 15_000, until: (screen) => screen.includes('shell ─') },
-          { label: 'detach-shell-again', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next T') && !screen.includes('╭') },
+          { label: 'detach-shell-again', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next TUI') && !screen.includes('╭') },
           { label: 'kill-shell', keys: '/side kill\r', timeoutMs: 15_000, until: (screen) => screen.includes('종료 요청 완료') },
         ],
         quitKeys: '\x11',
       });
       expect(run.frames.some((frame) => frame.label === 'spawn-shell' && frame.screen.includes('shell'))).toBe(true);
-      expect(run.frames.some((frame) => frame.label === 'detach-shell' && frame.screen.includes('shell · Next T'))).toBe(true);
+      expect(run.frames.some((frame) => frame.label === 'detach-shell' && frame.screen.includes('PTY 분리됨') && frame.screen.includes('shell · Next TUI'))).toBe(true);
       expect(run.frames.some((frame) => frame.label === 'attach-shell' && frame.screen.includes('shell'))).toBe(true);
       expect(run.frames.some((frame) => frame.label === 'kill-shell' && frame.screen.includes('종료 요청 완료'))).toBe(true);
       expect(run.exitCode).toBe(0);

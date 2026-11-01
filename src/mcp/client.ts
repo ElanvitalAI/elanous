@@ -91,6 +91,11 @@ export interface McpToolCallContent {
   [k: string]: unknown;
 }
 
+/** Per-call MCP metadata. `elanousRunId` is only a correlation key. */
+export interface McpCallMeta extends Record<string, unknown> {
+  elanousRunId?: string;
+}
+
 /** The remote server answered with a JSON-RPC `error` envelope.
  *
  *  ⛔⭐ **「서버가 안 된다고 했다」와 「서버에 못 닿았다」는 다른 값이다.**
@@ -749,11 +754,13 @@ export class McpClient {
   async callTool(
     name: string,
     args: Record<string, unknown>,
+    meta?: McpCallMeta,
   ): Promise<McpToolCallResult> {
     this.requireReady('callTool');
     const result = (await this.send('tools/call', {
       name,
       arguments: args,
+      ...(meta && Object.keys(meta).length > 0 ? { _meta: meta } : {}),
     })) as McpToolCallResult;
     return result;
   }

@@ -12,8 +12,9 @@ import { runLightMember, type LightResource } from '../control-plane/light-membe
 import { RESOURCE_KINDS, type ResourceKind } from '../control-plane/ledger.js';
 import { runControlJoin, type ControlJoinOptions } from './control-join-cli.js';
 import type { ResourceView } from '../control-plane/ledger.js';
-import { issueMemberToken, revokeMemberToken, listMemberTokens } from '../control-plane/member-tokens.js';
+import { issueMemberToken, issueMemberTokenToFile, revokeMemberToken, listMemberTokens } from '../control-plane/member-tokens.js';
 import { collectControlStatus, readControlHqLease } from '../control/control-status.js';
+import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 
 function controlPort(flag?: string): number {
@@ -98,7 +99,7 @@ export async function runResourcesQuery(options: { where?: string; kind?: string
   }
 }
 
-export async function runControlServe(options: { port?: string; host?: string; followLease?: boolean; followHqLease?: boolean; bucket?: string;
+export async function runControlServe(options: { port?: string; host?: string; allowClusterBind?: boolean; followLease?: boolean; followHqLease?: boolean; bucket?: string;
   read?: (bucket: string) => RoleLeaseRead | Promise<RoleLeaseRead>; machine?: string;
   readHq?: typeof readControlHqLease; hqHostName?: string;
   /** 시험 seam — 이 신호로 멈춘다. ⛔ 시험이 `process.emit('SIGTERM')` 로 멈추면 같은 프로세스의 다른 SIGTERM 처리기
@@ -131,7 +132,10 @@ export async function runControlServe(options: { port?: string; host?: string; f
     },
   }) : undefined;
   let server: ReturnType<typeof startControlServer>;
-  try { server = startControlServer({ port, hostname: options.host, ...(leaseView ? { leaseView, requireKnownLeaseForWrites: true } : {}) }); }
+  if (options.allowClusterBind && options.host === '0.0.0.0') {
+    debug.log('control-plane', 'cluster-bind-enabled', { hostname: options.host, port, exposure: 'operator-restricted-cluster-service' });
+  }
+  try { server = startControlServer({ port, hostname: options.host, allowClusterBind: options.allowClusterBind, ...(leaseView ? { leaseView, requireKnownLeaseForWrites: true } : {}) }); }
   catch (error) { console.error(`관제부 시작 실패: ${reasonFor(error)}`); process.exitCode = 2; return; }
   await new Promise<void>(resolve => {
     const stop = () => {
@@ -214,10 +218,11 @@ export function registerControlCommands(program: Command): void {
   control.command('serve').description('관제부를 포그라운드에서 실행')
     .option('--port <n>', '리스닝 포트(0=임시 포트)')
     .option('--host <addr>', '루프백 또는 tailnet 바인드 주소')
+    .option('--allow-cluster-bind', '클러스터 내부 Service용 0.0.0.0 바인드를 명시 허용')
     .option('--follow-lease', '임대 보유자일 때만 쓰기')
     .option('--follow-hq-lease', 'HQ 임대 보유자일 때만 쓰기')
     .option('--bucket <bucket>', 'GCS 임대 버킷')
-    .action((options: { port?: string; host?: string; followLease?: boolean; followHqLease?: boolean; bucket?: string }) => runControlServe(options));
+    .action((options: { port?: string; host?: string; allowClusterBind?: boolean; followLease?: boolean; followHqLease?: boolean; bucket?: string }) => runControlServe(options));
   control.command('member').description('합류 기계의 자원을 포그라운드에서 등록·심박')
     .option('--resource <kind:name=url>', '등록할 자원', (value: string, previous: string[]) => [...previous, value], [] as string[])
     .option('--interval <seconds>', '심박 간격(초)')
@@ -244,8 +249,12 @@ export function registerControlCommands(program: Command): void {
     });
   const token = control.command('token').description('기계별 범위 토큰 관리');
   token.command('issue <machine>').description('기계 토큰 발급 또는 교체')
-    .action((machine: string) => {
-      try { console.log(issueMemberToken(machine)); }
+    .option('--token-file <path>', '토큰을 새 0600 파일로만 쓰고 stdout에 출력하지 않음')
+    .action((machine: string, options: { tokenFile?: string }) => {
+      try {
+        if (options.tokenFile) issueMemberTokenToFile(machine, options.tokenFile);
+        else console.log(issueMemberToken(machine));
+      }
       catch (error) { console.error(reasonFor(error)); process.exitCode = 2; }
     });
   token.command('revoke <machine>').description('기계 토큰 폐기')

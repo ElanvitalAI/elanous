@@ -945,10 +945,10 @@ describe('낡은 부모 보고 — 읽기 전용', () => {
 });
 
 /** 실제 셸로 원격 스크립트를 돌린다(ssh 대신 로컬 sh · HOME = 임시 디렉터리). */
-function localShell(home: string): SshRunner {
+function localShell(home: string, path = process.env.PATH ?? '/usr/bin:/bin'): SshRunner {
   return (_host, script, timeoutMs, stdin) => {
     const result = spawnSync('sh', ['-c', script], { encoding: 'utf8', timeout: timeoutMs, input: stdin,
-      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } });
+      env: { PATH: path, HOME: home } });
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   };
 }
@@ -1628,11 +1628,58 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
 
     const secret = 'SECRET-TOKEN-VALUE';
     writeFileSync(join(home, '.elanous/auth.json'), JSON.stringify({ version: 1, providers: { 'openai-codex': { accessToken: secret }, 'openai-codex:team': { accessToken: secret }, anthropic: { accessToken: secret } } }, null, 2));
+    const mirrorDir = join(home, '.elanous/remote-parent-credentials/cli-mirror');
+    mkdirSync(mirrorDir, { recursive: true });
+    const activeToken = { accessToken: secret, refreshToken: '', refresh_token: '', expiresAt: Date.now() + 60_000 };
+    writeFileSync(join(mirrorDir, 'auth.json'), JSON.stringify({ version: 1, providers: {
+      'openai-codex': { tokens: activeToken },
+      'openai-codex:team': { tokens: activeToken },
+      'openai-codex:third': { tokens: activeToken },
+      'openai-codex:no-refresh-fields': { tokens: { accessToken: secret, expiresAt: Date.now() + 60_000 } },
+      'openai-codex:expired': { tokens: { ...activeToken, expiresAt: Date.now() - 1 } },
+      'openai-codex:refreshful': { tokens: { ...activeToken, refreshToken: 'must-not-count' } },
+    } }));
     writeFileSync(join(home, '.grok/auth.json'), JSON.stringify({ 'https://auth.x.ai::abc': { key: secret, expires_at: '2030-01-01T00:00:00Z' } }));
     writeFileSync(join(home, '.cache/openrouter_api_key'), secret);
     const after = run();
-    expect(after).toMatchObject({ codexAccounts: '2', grok: '1', openrouter: '1' });
+    expect(after).toMatchObject({ codexAccountsDefault: '2', codexAccountsMirror: '4', codexAccountsMirrorAdditional: '2', codexAccountsMirrorStatus: 'measured', codexAccounts: '4', grok: '1', openrouter: '1' });
     expect(JSON.stringify(after)).not.toContain(secret);
+
+    const noBunFacts: Record<string, string> = {};
+    for (const line of localShell(home, '/usr/bin:/bin')('h', preflightScript({ host: 'h', cwd }), 20_000).stdout.split('\n')) {
+      const at = line.indexOf('=');
+      if (at > 0) noBunFacts[line.slice(0, at)] = line.slice(at + 1);
+    }
+    expect(noBunFacts).toMatchObject({ codexAccountsDefault: '2', codexAccountsMirror: 'unknown', codexAccountsMirrorStatus: 'unknown', codexAccounts: '2' });
+    expect(judgeParentHostCredentials(noBunFacts)).toContain('codex-account-mirror-unmeasured');
+    expect(JSON.stringify(noBunFacts)).not.toContain(secret);
+
+    const candidateLogs: Array<Record<string, unknown>> = [];
+    const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'task-agent.parent-host' && event === 'codex-account-candidates') candidateLogs.push(data ?? {});
+    }) as typeof debug.log);
+    try {
+      preflightParentHost({ target: { host: 'h', cwd }, localVersion: '0.2.20-dev.0', launchHoldActive: false, ssh: localShell(home) });
+      expect(candidateLogs).toHaveLength(1);
+      expect(candidateLogs[0]).toEqual({
+        host: 'h',
+        sources: [
+          { path: '~/.elanous/auth.json', count: 2 },
+          { path: '~/.elanous/remote-parent-credentials/cli-mirror/auth.json', count: 4, additional: 2 },
+        ],
+        mirrorStatus: 'measured',
+        totalCandidates: 4,
+      });
+      expect(JSON.stringify(candidateLogs)).not.toContain(secret);
+      candidateLogs.length = 0;
+      preflightParentHost({ target: { host: 'h', cwd }, localVersion: '0.2.20-dev.0', launchHoldActive: false,
+        ssh: localShell(home, '/usr/bin:/bin') });
+      expect(candidateLogs[0]?.sources).toEqual([
+        { path: '~/.elanous/auth.json', count: 2 },
+        { path: '~/.elanous/remote-parent-credentials/cli-mirror/auth.json', count: null, additional: null },
+      ]);
+      expect(candidateLogs[0]?.mirrorStatus).toBe('unknown');
+    } finally { logSpy.mockRestore(); }
   });
 });
 

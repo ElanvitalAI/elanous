@@ -56,7 +56,7 @@ cases:
     expect:
       status: failed
       mustVisit: [export-check, traffic-failed-restore, failed]
-      mustNotVisit: [prefetch, gate, publish]
+      mustNotVisit: [gate, publish]
   - id: cut-tip-moved-after-resume
     mode: cut-tip-moved-after-resume
     expect:
@@ -70,8 +70,28 @@ cases:
       evidence: { cacheMiss: true, continueToGate: true }
     expect:
       status: done
-      mustVisit: [prefetch, gate, publish, npm-publish, done]
+      mustVisit: [prefetch, pre-gate-join, gate, publish, npm-publish, done]
       mustNotVisit: [failed]
+  - id: prefetch-warning-failure-overlaps-checklist
+    mode: baseline
+    nodeOutcomes:
+      checklist-gate: { outcome: ok, delayMs: 40 }
+      prefetch: { outcome: error, delayMs: 60 }
+    expect:
+      status: done
+      mustVisit: [checklist-gate, prefetch, pre-gate-join, gate, publish, done]
+      mustNotVisit: [failed]
+      overlap: [checklist-gate, prefetch]
+  - id: mac-smoke-warning-failure-overlaps-pwa
+    mode: baseline
+    nodeOutcomes:
+      mac-smoke: { outcome: fail, delayMs: 60 }
+      pwa: { outcome: ok, delayMs: 40 }
+    expect:
+      status: done
+      mustVisit: [mac-smoke, pwa, pre-prepare-join, prepare, publish, done]
+      mustNotVisit: [failed]
+      overlap: [mac-smoke, pwa]
   - id: publish-command-fails
     fault:
       node: publish
@@ -88,5 +108,5 @@ cases:
       evidence: { timeoutSeconds: 900, restoreTraffic: true }
     expect:
       status: failed
-      mustVisit: [pwa, traffic-failed-restore, failed]
+      mustVisit: [mac-smoke, pwa, pre-prepare-join, traffic-failed-restore, failed]
       mustNotVisit: [prepare, publish]

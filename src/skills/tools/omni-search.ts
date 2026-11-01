@@ -40,6 +40,7 @@ export type OmniSearchEngineEvent =
   | { engine: string; phase: 'complete'; hits: number; durationMs: number; error?: string };
 
 export interface OmniSearchDispatchOpts {
+  signal?: AbortSignal;
   /** Observational only: callback failures must not interrupt a provider search. */
   onEngine?: (event: OmniSearchEngineEvent) => void;
   onSource?: (source: WebSearchHit & { engine: string }) => void;
@@ -239,10 +240,11 @@ async function dispatchWithProviders(
           : remainingMs;
         if (timeoutMs <= 0) throw new DOMException('Research search budget exhausted', 'TimeoutError');
         const controller = new AbortController();
+        const signal = opts.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal;
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           result = await Promise.race([
-            p.search(query, controller.signal),
+            p.search(query, signal),
             new Promise<never>((_, reject) => {
               timer = setTimeout(() => {
                 controller.abort();
@@ -254,7 +256,7 @@ async function dispatchWithProviders(
           if (timer !== undefined) clearTimeout(timer);
         }
       } else {
-        result = await p.search(query);
+        result = await p.search(query, opts.signal);
       }
       perEngine[p.id] = { hits: result.hits, durationMs: Date.now() - start };
       for (const hit of result.hits) {

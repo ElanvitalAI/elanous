@@ -1,4 +1,4 @@
-import { layeredPositions, mergeParallelEdges, routeEdges, type GraphFlowDirection } from './graph-edge-route';
+import { layeredPositions, mergeParallelEdges, routeEdges, type GraphFlowDirection, type RouteEdgeInput } from './graph-edge-route';
 import type { Edge, Node } from '@xyflow/react';
 import type { HarnessGraphEventWire, RunGraphDetail } from '../nexus/client';
 
@@ -85,10 +85,20 @@ export function applyRunGraphEvents(graph: RunGraphDetail, events: readonly Harn
 /** GRAPH-EDGE-TIDY — outcomes that share a target merge into one edge labelled «a · b»; ranks follow forward edges
  *  only; every edge is pre-routed (graph-edge-route.ts) and drawn by the `tidy` edge type. */
 export function runGraphToFlow(graph: RunGraphDetail): { nodes: Node<RunGraphNodeData>[]; edges: Edge[] } {
-  const raw = graph.edges.flatMap((edge) => edge.map
-    ? Object.entries(edge.map).map(([outcome, to]) => ({ from: edge.from, to, outcome }))
-    : edge.to ? [{ from: edge.from, to: edge.to, outcome: '' }] : []);
-  const outcomesOf = (id: string) => raw.filter((edge) => edge.from === id && edge.outcome).map((edge) => edge.outcome);
+  const raw: RouteEdgeInput[] = graph.edges.flatMap((edge) => {
+    const mapped: RouteEdgeInput[] = edge.map
+      ? Object.entries(edge.map).map(([outcome, to]) => ({ from: edge.from, to, outcome }))
+      : edge.to ? [{ from: edge.from, to: edge.to, outcome: '' }] : [];
+    const mappedTargets = new Set(mapped.map((item) => item.to));
+    const fallbacks: RouteEdgeInput[] = (edge.fallback ?? [])
+      .filter((item) => !mappedTargets.has(item.node))
+      .map((item) => ({
+        from: edge.from, to: item.node, outcome: 'fallback',
+        family: 'fallback', requires: item.requires,
+      }));
+    return [...mapped, ...fallbacks];
+  });
+  const outcomesOf = (id: string) => raw.filter((edge) => edge.from === id && edge.outcome && edge.family !== 'fallback').map((edge) => edge.outcome);
   const sized = graph.nodes.map((node) => ({ id: node.node_id, width: RUN_NODE_WIDTH, height: outcomesOf(node.node_id).length ? 86 : 70 }));
   const positions = layeredPositions(sized, raw, { entry: graph.entry_node, flow, margin: 25 });
   const placed = sized.map((node) => ({ ...node, ...(positions.get(node.id) ?? { x: 0, y: 0 }) }));

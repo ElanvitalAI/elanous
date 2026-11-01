@@ -2155,7 +2155,12 @@ async function runSelfReviewCliCommandPinned(
     }
     const diffRead = diffResult.read;
     const loopLock = readReviewLoopBreakerLock(pr);
-    if (loopLock) {
+    // A cap refusal writes a loop-breaker lock before an OP can authorize the
+    // retry. Let the normal cap preflight/one-use claim govern that specific
+    // lock; other loop-breaker reasons remain an unconditional stop.
+    const opAuthorizedCapRetry = loopLock?.reason === 'review-cap-exceeded'
+      && previousRoundCount >= 5 && opAllowsReviewOverCap(pr) && Boolean(reason);
+    if (loopLock && !opAuthorizedCapRetry) {
       const message = `PR ${pr}: 반복 리뷰 중단 (${String(loopLock.reason ?? 'waiver-needed')}); OP 웨이버가 필요합니다.`;
       deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
       deps.log('review.loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
@@ -2551,7 +2556,10 @@ async function runSelfReviewCliCommandPinned(
       phaseIntent: intent,
       evidenceNote: evidenceLine,
       ...(reviewerContext.items.length ? { reviewerContext: reviewerContext.items } : {}),
-      ...(decompositionContext.runId ? { reviewContext: { runId: decompositionContext.runId } } : {}),
+      reviewContext: {
+        ...(decompositionContext.runId ? { runId: decompositionContext.runId } : {}),
+        round: previousRoundCount + 1,
+      },
       ...(deps.readReferencedFile ? { readReferencedFile: deps.readReferencedFile } : {}),
       ...(goalAcceptance.acceptance ? { acceptance: goalAcceptance.acceptance } : {}),
     };

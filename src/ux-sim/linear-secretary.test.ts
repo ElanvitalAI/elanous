@@ -30,7 +30,7 @@ describe('DEMO1104-LINEAR-SECRETARY integrated test device', () => {
       const checkerEvents = checkerStore.queryByDataKeys({ exactCategories: ['ux.sim.linear-secretary'], runIds: [result.runId] });
       expect(checkerEvents.filter(row => row.event === 'completed')).toHaveLength(1);
       expect(JSON.parse(String(checkerEvents.find(row => row.event === 'browser-capture-attached')?.data))).toMatchObject({ runId: result.runId });
-      expect(JSON.parse(String(checkerEvents.find(row => row.event === 'approval-card-opened')?.data))).toMatchObject({ runId: result.runId });
+      expect(JSON.parse(String(checkerEvents.find(row => row.event === 'approval-card-opened')?.data))).toMatchObject({ runId: result.runId, status: 'open', localOnly: true });
     } finally { checkerStore.close(); }
     expect(result.runEvents).toEqual([
       'request-received', 'secretary-started', 'intake-submit-observed', 'intake-ledger-seam-completed', 'breakdown-created', 'subtask-absorbed',

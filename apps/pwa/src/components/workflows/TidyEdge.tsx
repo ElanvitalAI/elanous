@@ -13,14 +13,15 @@ export function TidyEdge({ id, data, selected, markerEnd, style, interactionWidt
   const route = (data as TidyEdgeData | undefined)?.route;
   if (!route) return null;
   const color = EDGE_FAMILY_COLOR[route.family];
-  const dashed = route.kind === 'back';
+  const dashed = route.kind === 'back' || route.family === 'fallback';
+  const dasharray = route.family === 'fallback' ? '8 4' : '6 4';
   return (
     <>
       <BaseEdge id={id} path={route.path} markerEnd={markerEnd} interactionWidth={interactionWidth ?? 16}
-        style={{ stroke: color, strokeWidth: selected ? 3 : 2, ...(dashed ? { strokeDasharray: '6 4' } : {}), ...style }} />
+        style={{ stroke: color, strokeWidth: selected ? 3 : 2, ...(dashed ? { strokeDasharray: dasharray } : {}), ...style }} />
       {route.label && (
         <EdgeLabelRenderer>
-          <div data-testid={`edge-label-${route.from}-${route.to}`} data-edge-family={route.family}
+          <div data-testid={`edge-label-${route.from}-${route.to}`} data-edge-family={route.family} data-edge-requires={(route.requires ?? []).join(',')}
             className="nodrag nopan pointer-events-none absolute whitespace-nowrap rounded-full border px-1.5 font-mono text-[12px] leading-[18px]"
             style={{
               transform: `translate(-50%, -50%) translate(${route.label.x}px, ${route.label.y}px)`,

@@ -2,10 +2,25 @@ import { resolveInstanceName } from '../instance-identity.js';
 import type { LLMToolSpec } from '../llm.js';
 import { listPtyManifestRows, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { describePtyRunState } from '../pty-shell/tui-run-state.js';
+import { ptyWriteControlState } from '../pty-shell/pty-write-provenance.js';
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
 export type SidetabBadge = 'busy' | 'idle' | 'stale' | 'unknown' | 'exited';
+
+export interface SidetabControlInput {
+  readonly accessMode: 'read' | 'write' | 'auto';
+  readonly lastWriter: 'agent' | 'human' | null;
+  readonly activeMission: string | null;
+}
+
+export interface SidetabControlState {
+  readonly actor: 'agent' | 'human' | 'waiting';
+  readonly badge: '🤖' | '👤' | '⏸';
+  readonly label: string;
+  readonly title: string;
+  readonly emphasized: boolean;
+}
 
 export interface SidetabRow {
   readonly id: string;
@@ -17,6 +32,15 @@ export interface SidetabRow {
   readonly nestDepth?: number;
   readonly ownerPid?: number;
   readonly currentProcess?: boolean;
+  readonly controlState?: SidetabControlState;
+  readonly runId?: string;
+  readonly virtual?: boolean;
+  readonly attention?: boolean;
+  readonly status?: string;
+  readonly seat?: string;
+  readonly host?: string;
+  readonly cardId?: string;
+  readonly version?: string;
 }
 
 export interface SidetabState {
@@ -25,11 +49,44 @@ export interface SidetabState {
 }
 
 export interface SidetabScope {
+  /** `all` is retained for existing callers; `mode` is the three-scope contract. */
+  readonly mode?: 'mine' | 'runs' | 'all';
   readonly all?: boolean;
   readonly currentPtyId?: string;
   readonly currentPid?: number;
   /** Current classic chat session; classic shell rows carry it in their purpose tag. */
   readonly currentSessionId?: string;
+  readonly controlByPtyId?: Readonly<Record<string, SidetabControlInput>>;
+  readonly filters?: readonly string[];
+  readonly crossInstanceParent?: readonly string[];
+  readonly expandedRunIds?: readonly string[];
+  readonly podRows?: readonly SidetabPodRow[];
+  readonly harnessRuns?: readonly SidetabHarnessRun[];
+  readonly maxTabs?: number;
+}
+
+export interface SidetabHarnessRun {
+  readonly runId: string;
+  readonly label?: string;
+  readonly instance?: string;
+  readonly parentPtyId?: string;
+  readonly status?: string;
+  readonly attention?: boolean;
+  readonly seat?: string;
+  readonly host?: string;
+  readonly cardId?: string;
+  readonly version?: string;
+}
+
+export interface SidetabPodRow {
+  readonly id: string;
+  readonly runId: string;
+  readonly label: string;
+  readonly status?: string;
+  readonly seat?: string;
+  readonly host?: string;
+  readonly cardId?: string;
+  readonly version?: string;
 }
 
 export type SidetabKey = 'toggle' | 'up' | 'down' | 'other';
@@ -60,15 +117,36 @@ export function applySidetabKey(state: SidetabState, key: SidetabKey, rowCount: 
   return { ...state, selected: (state.selected + delta + rowCount) % rowCount };
 }
 
+function sidetabControlState(input: SidetabControlInput): SidetabControlState {
+  const actor = input.lastWriter === 'human'
+    ? 'human'
+    : input.lastWriter === 'agent' && input.accessMode === 'auto'
+      ? 'agent'
+      : 'waiting';
+  if (actor === 'agent') {
+    return {
+      actor,
+      badge: '🤖',
+      label: '🤖 엘라누스 조작 중',
+      title: input.activeMission ? '🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기' : '🤖 엘라누스 조작 중 · 입력하면 넘겨받기',
+      emphasized: true,
+    };
+  }
+  return actor === 'human'
+    ? { actor, badge: '👤', label: '사람', title: '', emphasized: false }
+    : { actor, badge: '⏸', label: '대기', title: '', emphasized: false };
+}
+
 export function sidetabRowsFromManifest(
   rows: readonly PtyManifestRow[],
   instance: string,
   runState: (row: PtyManifestRow) => { turn: string; stale: boolean | null } = describePtyRunState,
   scope?: SidetabScope,
 ): SidetabRow[] {
+  const mode = scope?.mode ?? (scope?.all ? 'all' : 'mine');
   const currentPid = scope?.currentPid ?? process.pid;
   const currentSessionId = scope?.currentSessionId;
-  const eligible = rows.filter((row) => row.instance === instance && (
+  const eligible = rows.filter((row) => (row.instance === instance || scope?.crossInstanceParent?.includes(row.id)) && (
     (row.kind === 'tui' && Boolean(row.sessionId))
     || Boolean(row.parentPtyId)
     || row.purpose?.startsWith('next-tui-sidetab:')
@@ -81,7 +159,7 @@ export function sidetabRowsFromManifest(
   if (scope) {
     const parent = eligible.find((row) => row.kind === 'tui'
       && (row.id === (scope.currentPtyId ?? `tui:${currentPid}`) || row.ownerPid === currentPid));
-    if (!scope.all) {
+    if (mode === 'mine') {
       const includedIds = new Set<string>(parent ? [parent.id] : []);
       const includedPids = new Set<number>(parent ? [parent.ownerPid, parent.ptyPid, currentPid] : [currentPid]);
       let changed = true;
@@ -99,9 +177,9 @@ export function sidetabRowsFromManifest(
       }
       scoped = eligible.filter((row) => includedIds.has(row.id));
     }
-    if (!scope.all) scoped = scoped.filter((row) => row.alive);
+    if (mode === 'mine') scoped = scoped.filter((row) => row.alive);
   }
-  return scoped
+  const basicRows = scoped
     .map((row) => {
       const badge: SidetabBadge = !row.alive
         ? 'exited'
@@ -123,15 +201,113 @@ export function sidetabRowsFromManifest(
         nestDepth: row.nestDepth,
         ownerPid: row.ownerPid,
         currentProcess: row.kind === 'tui' && row.ownerPid === process.pid,
+        ...(scope?.controlByPtyId?.[row.id]
+          ? { controlState: sidetabControlState(scope.controlByPtyId[row.id]!) }
+          : {}),
         ...(sessionId ? { sessionId } : classicTerminalSessionId ? { sessionId: classicTerminalSessionId } : {}),
+        ...(row.runId ? { runId: row.runId } : {}),
       };
     });
+  if (!scope) return basicRows;
+
+  // The pre-scope loader exposed manifest PTYs as selectable rows, even
+  // when they carried a runId. Keep that contract for existing callers:
+  // run grouping, filtering, expansion and tab caps are opt-in scope UI.
+  // In particular, do not synthesize run: ids or more:tabs rows in the
+  // classic all/mine list, whose actions target manifest PTY ids.
+  const scopedRunView = scope.mode !== undefined
+    || scope.harnessRuns !== undefined
+    || scope.podRows !== undefined
+    || scope.filters !== undefined
+    || scope.expandedRunIds !== undefined
+    || scope.maxTabs !== undefined;
+  if (!scopedRunView) return basicRows;
+
+  const runMeta = new Map((scope.harnessRuns ?? []).map((run) => [run.runId, run]));
+  const visibleRunIds = new Set(basicRows.flatMap((row) => row.runId ? [row.runId] : []));
+  for (const run of scope.harnessRuns ?? []) {
+    if (mode === 'all' || mode === 'runs' || (run.parentPtyId && basicRows.some((row) => row.id === run.parentPtyId))) visibleRunIds.add(run.runId);
+  }
+  const runs: SidetabRow[] = [...visibleRunIds].map((runId) => {
+    const members = basicRows.filter((row) => row.runId === runId);
+    const meta = runMeta.get(runId);
+    const pods = (scope.podRows ?? []).filter((row) => row.runId === runId);
+    const status = meta?.status ?? (members.some((row) => row.badge === 'stale') ? 'stuck' : members.some((row) => row.badge === 'busy') ? 'running' : 'idle');
+    const attention = meta?.attention ?? /^(asking|hitl|stuck|failed|error|blocked)$/i.test(status);
+    return {
+      id: `run:${runId}`, runId, label: meta?.label ?? runId, kind: 'harness-run', badge: status === 'failed' || status === 'error' ? 'stale' : members[0]?.badge ?? 'unknown',
+      attention, status, ...(meta?.seat ? { seat: meta.seat } : {}), ...(meta?.host ? { host: meta.host } : {}),
+      ...(meta?.cardId ? { cardId: meta.cardId } : {}), ...(meta?.version ? { version: meta.version } : {}),
+      nestDepth: 0,
+      ...(pods.length ? { sessionId: `${members.length} child · ${pods.length} pod` } : members.length ? { sessionId: `${members.length} child` } : {}),
+    };
+  });
+  const filters = scope.filters ?? [];
+  const filterRows = (items: readonly SidetabRow[]): SidetabRow[] => items.filter((row) => filters.every((raw) => {
+    const colon = raw.indexOf(':');
+    if (colon < 0) return true;
+    const key = raw.slice(0, colon); const values = raw.slice(colon + 1).split('|').map((value) => value.trim().toLowerCase()).filter(Boolean);
+    if (values.length === 0) return true;
+    if (key === 'status') return values.some((value) => row.status?.toLowerCase() === value || row.badge === value);
+    if (key === 'seat') return values.includes(row.seat?.toLowerCase() ?? '');
+    if (key === 'host') return values.includes(row.host?.toLowerCase() ?? '');
+    if (key === 'card') return values.includes(row.cardId?.toLowerCase() ?? '');
+    if (key === 'version') return values.includes(row.version?.toLowerCase() ?? '');
+    return true;
+  }));
+  let output: SidetabRow[];
+  if (mode === 'runs' || mode === 'all') {
+    const orderedRuns = runs.sort((a, b) => Number(Boolean(b.attention)) - Number(Boolean(a.attention)) || a.label.localeCompare(b.label));
+    output = mode === 'runs' ? orderedRuns : [...orderedRuns, ...basicRows.filter((row) => !row.runId)];
+  } else {
+    const runIds = new Set(runs.map((row) => row.runId!));
+    const outsideAttention = (scope.harnessRuns ?? []).filter((run) => run.attention && !runIds.has(run.runId));
+    output = [
+      ...(outsideAttention.length ? [{
+        id: 'attention:outside-runs', label: `${outsideAttention.length} 함대 주의 런`, kind: 'attention-badge', badge: 'stale' as const,
+        attention: true, status: 'attention',
+      }] : []),
+      ...basicRows.filter((row) => !row.runId || !runIds.has(row.runId)),
+      ...runs,
+    ];
+  }
+  output = filterRows(output);
+  const expanded = new Set(scope.expandedRunIds ?? []);
+  const expandedRows: SidetabRow[] = [];
+  for (const row of output) {
+    expandedRows.push(row);
+    if (row.kind !== 'harness-run' || !expanded.has(row.runId!)) continue;
+    expandedRows.push(...filterRows(basicRows.filter((child) => child.runId === row.runId)).map((child) => ({ ...child, nestDepth: 1 })));
+    expandedRows.push(...filterRows((scope.podRows ?? []).filter((pod) => pod.runId === row.runId).map((pod) => ({
+      id: `pod:${pod.id}`, runId: pod.runId, label: pod.label, kind: 'pod', badge: 'unknown' as const, virtual: true, nestDepth: 1,
+      ...(pod.status ? { status: pod.status } : {}), ...(pod.seat ? { seat: pod.seat } : {}), ...(pod.host ? { host: pod.host } : {}),
+      ...(pod.cardId ? { cardId: pod.cardId } : {}), ...(pod.version ? { version: pod.version } : {}),
+    }))));
+  }
+  const maxTabs = Math.max(1, scope.maxTabs ?? 8);
+  if (expandedRows.length > maxTabs) {
+    const visible = expandedRows.slice(0, Math.max(0, maxTabs - 1));
+    visible.push({ id: 'more:tabs', label: `+${expandedRows.length - visible.length} 더`, kind: 'overflow', badge: 'unknown' });
+    return visible;
+  }
+  return expandedRows;
 }
 
-export function loadSidetabRows(all = false, currentSessionId?: string): SidetabRow[] {
-  return sidetabRowsFromManifest(listPtyManifestRows(), resolveInstanceName(), describePtyRunState, {
+export function loadSidetabRows(all = false, currentSessionId?: string, scopeOverrides?: Partial<SidetabScope>): SidetabRow[] {
+  const manifestRows = listPtyManifestRows();
+  const controlByPtyId = Object.fromEntries(manifestRows.flatMap((row) => {
+    const control = ptyWriteControlState(row.id);
+    if (!control) return [];
+    // Purpose/nickname/kind identify a PTY, not its active task. Keep the
+    // control indicator honest until a mission source is wired into this
+    // loader; sidetabControlState will then show the generic control label.
+    return [[row.id, { ...control, activeMission: null }]];
+  }));
+  return sidetabRowsFromManifest(manifestRows, resolveInstanceName(), describePtyRunState, {
     all,
+    controlByPtyId,
     ...(currentSessionId ? { currentSessionId } : {}),
+    ...scopeOverrides,
   });
 }
 
@@ -157,9 +333,12 @@ export function formatSidetabLines(
     if (truncated && width > 0) { result += '…'; used++; }
     return result + ' '.repeat(Math.max(0, width - used));
   };
+  const selectedControl = mode === 'list' ? rows[selected]?.controlState : undefined;
+  const titleLine = fit(selectedControl?.title || ' 세션 · PTY');
+  const emphasizedTitle = selectedControl?.emphasized ? `\u001b[1;36m${titleLine}\u001b[0m` : titleLine;
   const lines = mode === 'new'
     ? [fit(' 새 PTY'), fit(' s shell · e elanous'), fit(' c codex · l claude · Esc')]
-    : [fit(' 세션 · PTY'), fit(' ↑↓ 전환 · 클릭 선택')];
+    : [emphasizedTitle, fit(' ↑↓ 전환 · 클릭 선택')];
   const rowCapacity = Math.max(0, Math.floor(height) - lines.length - (mode === 'list' ? 1 : 0));
   const visibleCount = Math.min(rows.length || 1, rowCapacity);
   const start = rows.length <= visibleCount
@@ -170,7 +349,13 @@ export function formatSidetabLines(
     const index = start + offset;
     const row = rows[index]!;
     const marker = index === selected ? '›' : ' ';
-    lines.push(fit(` ${marker} ${row.badge} ${row.label}`));
+    const controlBadge = row.controlState ? `${row.controlState.badge} ` : '';
+    // `unknown` contributes no actionable state and made the pre-existing
+    // classic PTY label truncate after adding the control badge. Keep the
+    // known control actor and the complete selectable label visible.
+    const runBadge = row.controlState && row.badge === 'unknown' ? '' : `${row.badge} `;
+    const rowLine = fit(` ${marker} ${controlBadge}${runBadge}${row.label}`);
+    lines.push(row.controlState?.emphasized && index === selected ? `\u001b[1;36m${rowLine}\u001b[0m` : rowLine);
   }
   if (mode === 'list' && lines.length < Math.floor(height)) lines.push(fit(' + new · /side new'));
   return lines;
@@ -187,6 +372,7 @@ export interface NextSidetabRequest {
   target?: string;
   character?: 'shell' | 'elanous';
   mission?: string;
+  parallelMission?: string;
   agent?: 'codex' | 'claude';
   confirm?: boolean;
 }
@@ -201,6 +387,7 @@ export interface NextSidetabHostDeps {
   detach(): unknown;
   spawn(character: 'shell' | 'elanous'): unknown;
   runMission?(agent: 'codex' | 'claude', mission: string): Promise<unknown>;
+  runMissionPair?(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
   kill(row: SidetabRow): unknown;
 }
 export interface NextSidetabIpcProcess {
@@ -210,7 +397,7 @@ export interface NextSidetabIpcProcess {
 
 export const nextSidetabToolSpec: LLMToolSpec = {
   name: NEXT_SIDETAB_TOOL_NAME,
-  description: 'Control the Next TUI side tab: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, run a mission in a visible Codex or Claude side-tab and return its verified result file, or kill a PTY. Ask the user to confirm before calling kill with confirm=true.',
+  description: 'Control the Next TUI side tab: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, run one visible Codex or Claude mission, or split one task into complementary graph branches that launch both visible agents concurrently. For a parallelMission, return both verified result files through the existing Codex + Claude pair-synthesis pipeline, with one comparison/adoption artifact and attribution table; do not create a second synthesis. Ask the user to confirm before calling kill with confirm=true.',
   parameters: {
     type: 'object',
     properties: {
@@ -218,6 +405,7 @@ export const nextSidetabToolSpec: LLMToolSpec = {
       target: { type: 'string', description: 'Optional exact or partial row id/label; required for targeted actions.' },
       character: { type: 'string', enum: ['shell', 'elanous'], description: 'Only used with action=new.' },
       mission: { type: 'string', description: 'Mission text to type visibly into a new Codex or Claude side-tab PTY; the tool appends a result-file path and checks the completion marker.' },
+      parallelMission: { type: 'string', description: 'Optional second mission. Starts the other agent concurrently and returns both verified result files together for synthesis.' },
       agent: { type: 'string', enum: ['codex', 'claude'], description: 'Coding agent for action=mission; defaults to codex.' },
       confirm: { type: 'boolean', description: 'Must be true only after the user explicitly confirmed killing the selected PTY.' },
     },
@@ -251,8 +439,15 @@ export function createNextSidetabHostHandler(deps: NextSidetabHostDeps): NextSid
     if (request.action === 'mission') {
       const mission = request.mission?.trim();
       if (!mission) return { error: 'mission 텍스트가 필요합니다' };
-      if (!deps.runMission) return { error: '사이드탭 미션 실행기가 연결되지 않았습니다' };
+      if (!deps.runMission && !deps.runMissionPair) return { error: '사이드탭 미션 실행기가 연결되지 않았습니다' };
       if (request.agent !== undefined && request.agent !== 'codex' && request.agent !== 'claude') return { error: 'agent는 codex 또는 claude여야 합니다' };
+      const parallelMission = request.parallelMission?.trim();
+      if (request.parallelMission !== undefined && !parallelMission) return { error: 'parallelMission 텍스트가 비었습니다' };
+      if (parallelMission) {
+        if (!deps.runMissionPair) return { error: 'Codex/Claude pair 실행기가 연결되지 않았습니다' };
+        return deps.runMissionPair(request.agent ?? 'codex', mission, parallelMission);
+      }
+      if (!deps.runMission) return { error: '단일 사이드탭 미션 실행기가 연결되지 않았습니다' };
       return deps.runMission(request.agent ?? 'codex', mission);
     }
     if (request.action === 'detach') return deps.detach();

@@ -1,14 +1,36 @@
 import { hostname } from 'node:os';
-import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import { loadTokens, type ProviderAuthState } from './store.js';
 
 export const CODEX_OWNER_MIRROR_RELATIVE_PATH = join('remote-parent-credentials', 'cli-mirror', 'auth.json');
-export const CODEX_OWNER_MIRROR_REQUIRED = 'Codex 주인 미러가 없거나 만료됐다 — 주인 호스트에서 `eln codex mirror push <host>` 를 실행해야 한다';
+export const CODEX_OWNER_MIRROR_REQUIRED = 'Codex owner access mirror rejected — inspect llm.codex/owner-mirror-rejected for the precise reason';
 
 export function codexOwnerMirrorAuthPath(): string {
-  return join(elanousStateRoot(), CODEX_OWNER_MIRROR_RELATIVE_PATH);
+  const stateRoot = elanousStateRoot();
+  const derivedPath = join(stateRoot, CODEX_OWNER_MIRROR_RELATIVE_PATH);
+  const configuredPath = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1'
+    ? process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH?.trim()
+    : undefined;
+  const path = configuredPath && isAbsolute(configuredPath) ? configuredPath : derivedPath;
+  try {
+    debug.log('llm.codex', 'owner-mirror-path-compared', {
+      source: path === derivedPath ? 'state-root' : 'remote-explicit',
+      stateRootSha256: rootFingerprint(stateRoot),
+      derivedMirrorRootSha256: rootFingerprint(dirname(dirname(dirname(derivedPath)))),
+      resolvedMirrorRootSha256: rootFingerprint(dirname(dirname(dirname(path)))),
+      explicitPathAccepted: Boolean(configuredPath && path === configuredPath),
+    });
+  } catch { /* diagnostics must not block auth */ }
+  return path;
+}
+
+function rootFingerprint(root: string): string {
+  return createHash('sha256').update(root).digest('hex').slice(0, 16);
 }
 
 function normalizedHost(value: string): string {
@@ -30,15 +52,30 @@ export function readCodexOwnerAccessMirror(
   const path = opts.path ?? codexOwnerMirrorAuthPath();
   const now = opts.now ?? Date.now();
   let state: ProviderAuthState | null = null;
-  try { state = loadTokens(storeKey, path); } catch { /* fail closed below */ }
+  let readFailure: 'missing-file' | 'read-error' | 'invalid-json' | undefined;
+  try {
+    const raw = readFileSync(path, 'utf8');
+    try { JSON.parse(raw); } catch { readFailure = 'invalid-json'; }
+  } catch (error) {
+    readFailure = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing-file' : 'read-error';
+  }
+  if (!readFailure) {
+    try { state = loadTokens(storeKey, path); } catch { /* classify safely below */ }
+  }
   const tokenFields = state?.tokens as (ProviderAuthState['tokens'] & { refresh_token?: unknown }) | undefined;
   const expiresAt = state?.tokens.expiresAt;
-  if (!state || state.authMode !== 'chatgpt' || !state.tokens.accessToken
-    || tokenFields?.refreshToken !== '' || tokenFields?.refresh_token !== ''
-    || typeof expiresAt !== 'number'
-    || !Number.isFinite(expiresAt) || expiresAt <= now + 120_000) {
-    throw new Error(CODEX_OWNER_MIRROR_REQUIRED);
+  const reason = readFailure ?? (!state || !state.tokens ? 'no-access'
+      : state.authMode !== 'chatgpt' ? 'authMode'
+      : !state.tokens.accessToken ? 'no-access'
+      : typeof tokenFields?.refreshToken !== 'string' || typeof tokenFields?.refresh_token !== 'string' ? 'refresh-missing'
+      : tokenFields.refreshToken !== '' || tokenFields.refresh_token !== '' ? 'refresh-not-empty'
+      : typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= now + 120_000 ? 'expiry'
+      : undefined);
+  if (reason) {
+    const root = dirname(dirname(dirname(path)));
+    try { debug.log('llm.codex', 'owner-mirror-rejected', { reason, storeKey, rootSha256: rootFingerprint(root) }, { level: 'warn' }); } catch { /* fail-soft */ }
+    throw new Error(`${CODEX_OWNER_MIRROR_REQUIRED} (reason=${reason}; storeKey=${storeKey}; rootSha256=${rootFingerprint(root)})`);
   }
-  return state;
+  return state!;
 }
 

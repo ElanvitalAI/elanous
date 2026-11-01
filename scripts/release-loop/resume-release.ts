@@ -17,7 +17,7 @@ import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, p
 import { gateAssignableTestsAtCommit, gateEnvFingerprint } from './gate-baseline-receipt.js';
 import { readGateShardManifest, readGateShardResult } from './gate-shard-receipts.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
-import { assertReleaseResumeApprovalBoundary, releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
+import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
 import { releaseLoopConfig } from './unattended-release.js';
@@ -138,8 +138,9 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (state.graphId !== 'release-loop' || state.runId !== runId) throw new Error(`run identity mismatch: ${statePath}`);
   if (state.status !== 'failed') throw new Error(`release run ${runId} is ${state.status} — only a failed run is resumed`);
-  const restartAt = from === undefined ? -1 : state.path.indexOf(from);
-  if (from !== undefined && (restartAt < 0 || state.path.lastIndexOf(from) !== restartAt)) throw new Error(`--from ${from} is not a node on the saved path of ${runId}`);
+  const branchFork = from === undefined || state.path.includes(from) ? undefined : releaseFanOutForkIndex(state, from);
+  const restartAt = from === undefined ? -1 : state.path.indexOf(from) >= 0 ? state.path.indexOf(from) : branchFork ?? -1;
+  if (from !== undefined && (restartAt < 0 || (branchFork === undefined && state.path.lastIndexOf(from) !== restartAt))) throw new Error(`--from ${from} is not a node on the saved path of ${runId}`);
   const index = state.nodes.findIndex((node) => node.nodeId === 'version-release');
   const record = index >= 0 ? state.nodes[index]! : undefined;
   const output = record ? lastJsonObject(record.output) : undefined;
@@ -490,7 +491,7 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
       const path = dryRun ? undefined : writeRecheckPlan(root, recheckPlan);
       debug.log('release-loop.resume', 'interference-recheck-planned', { version: tip.version, commit: tip.to,
         remeasureFileCount: recheckPlan.files.length, fallbackReason: null, ...(path ? { path } : {}), dryRun });
-      return { requested: true, applied: true, files: recheckPlan.files.length, priorCommit: tip.to, ...(auto ? { auto: true as const } : {}) };
+      return { requested: true, applied: true, files: recheckPlan.files.length, plannedFiles: recheckPlan.files, priorCommit: tip.to, ...(auto ? { auto: true as const } : {}) };
     }
     const stalled = previousGate?.stalledShards;
     const summary = previousGate?.partialSummary as { pass?: unknown; fail?: unknown; errors?: unknown; ran?: unknown; files?: unknown } | undefined;
@@ -664,7 +665,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     waiverCommit = recorded;
   }
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
-  const fromIndex = savedRun.path.indexOf(opts.from);
+  const fromIndex = savedRun.path.indexOf(opts.from) >= 0 ? savedRun.path.indexOf(opts.from) : releaseFanOutForkIndex(savedRun, opts.from) ?? -1;
   const gateIndex = savedRun.path.indexOf('gate');
   const gateWillRun = fromIndex >= 0 && gateIndex >= fromIndex;
   if (opts.rerouteShard !== undefined && tip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
@@ -929,8 +930,9 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
   if (fromNode === 'version-release') {
     throw new Error(`--from version-release would cut again — recover at a later node; ${branch} was not moved`);
   }
-  const restartAt = savedRun.path.indexOf(fromNode);
-  if (restartAt < 0 || savedRun.path.lastIndexOf(fromNode) !== restartAt) {
+  const branchFork = savedRun.path.includes(fromNode) ? undefined : releaseFanOutForkIndex(savedRun, fromNode);
+  const restartAt = savedRun.path.indexOf(fromNode) >= 0 ? savedRun.path.indexOf(fromNode) : branchFork ?? -1;
+  if (restartAt < 0 || (branchFork === undefined && savedRun.path.lastIndexOf(fromNode) !== restartAt)) {
     throw new Error(`--from ${fromNode} is not a node on the saved path of ${opts.runId}; ${branch} was not moved`);
   }
   const consumers = ['export-check', 'gate'].map((node) => savedRun.path.indexOf(node)).filter((index) => index >= 0);

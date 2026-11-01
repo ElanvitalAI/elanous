@@ -3,8 +3,8 @@
 // ⭐ 이 파일의 존재 이유: 2026-07-26 실측에서 self-dev escalate(tier=opus)가 **100% 401 즉사**했다.
 //    provider 만 anthropic 으로 바뀌고 apiKey 는 openai-codex 것이 따라갔기 때문. 아래 첫 테스트가
 //    **정확히 그 시나리오**를 재현한다 — 되돌리면 그 테스트가 실패한다.
-import { test, expect, describe } from 'bun:test';
-import { providerEnvKey, isKeylessProvider, resolveProviderCredential, observeCredentialResolution } from './provider-credentials.js';
+import { test, expect, describe, spyOn } from 'bun:test';
+import { providerEnvKey, isKeylessProvider, resolveProviderCredential, resolveProviderCredentialAsync, observeCredentialResolution } from './provider-credentials.js';
 import { debug } from '../debug/log.js';
 import type { DebugEvent } from '../debug/log.js';
 import { LOG_DIET_SUMMARY_MIN_INTERVAL_MS, LogDietGuard } from '../debug/log-diet.js';
@@ -113,6 +113,41 @@ describe('providerEnvKey — SSOT(catalog 파생 + 명시 오버레이)', () => 
 });
 
 describe('resolveProviderCredential — 우선순위 rotation → env → (미전환 시만) 상속', () => {
+  test('test environment skips the host SecretStore unless a reader is explicitly injected', async () => {
+    const resolved = await resolveProviderCredentialAsync({
+      provider: 'openrouter',
+      baseProvider: 'auto',
+      env: { NODE_ENV: 'test' },
+    });
+    expect(resolved.source).toBe('none');
+  });
+
+  test('SecretStore setup key is used after rotation/env and before legacy config without exposing it in metadata', async () => {
+    const secret = 'test-secret-store-value-never-log';
+    const input = {
+      provider: 'anthropic', baseProvider: 'anthropic', baseApiKey: 'legacy-config-key',
+      rotation: [{ provider: 'grok', apiKey: 'other-provider-key' }], env: {} as NodeJS.ProcessEnv,
+    };
+    const ids: string[] = [];
+    const stored = await resolveProviderCredentialAsync(input, async (id) => { ids.push(id); return secret; });
+    expect(ids).toEqual(['ANTHROPIC_API_KEY']);
+    expect(stored).toMatchObject({ apiKey: secret, source: 'secret-store' });
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try { observeCredentialResolution('anthropic', stored, 'test'); }
+    finally { log.mockRestore(); }
+    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+    expect(JSON.stringify(log.mock.calls)).not.toContain('legacy-config-key');
+
+    const rotation = await resolveProviderCredentialAsync({ ...input, rotation: [{ provider: 'anthropic', apiKey: 'rotation-key' }] }, async () => {
+      throw new Error('must not read SecretStore when rotation wins');
+    });
+    expect(rotation).toMatchObject({ apiKey: 'rotation-key', source: 'rotation' });
+    const fromEnv = await resolveProviderCredentialAsync({ ...input, env: { ANTHROPIC_API_KEY: 'env-key' } }, async () => {
+      throw new Error('must not read SecretStore when env wins');
+    });
+    expect(fromEnv).toMatchObject({ apiKey: 'env-key', source: 'env' });
+  });
+
   test('⭐ 401 재현 가드 — provider 가 바뀌면 base 키를 절대 상속하지 않는다', () => {
     // 2026-07-26 실측 그대로: base=openai-codex(키 보유) → escalate 로 provider 만 anthropic 이 됨.
     // 종전 코드는 여기서 openai 키를 그대로 실어 anthropic 에 붙였다 → 401.

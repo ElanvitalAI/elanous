@@ -6,7 +6,15 @@ import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 const applyDeferredToolsActual = deferredModule.applyDeferredTools;
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
-import { isResearchToolAllowed, requestsResearchDocumentWrite, RESEARCH_TOOL_ALLOWLIST } from './research-policy.js';
+import {
+  isResearchToolAllowed,
+  requestsResearchDocumentWrite,
+  RESEARCH_TOOL_ALLOWLIST,
+  RESEARCH_TURN_DEEP_BUDGET_MS,
+  RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS,
+  RESEARCH_TURN_SHALLOW_BUDGET_MS,
+  RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS,
+} from './research-policy.js';
 import { runCoreTurn } from './run-core-turn.js';
 
 const tool: LLMToolSpec = {
@@ -26,6 +34,13 @@ const webFetchTool: LLMToolSpec = {
   name: 'WebFetch', description: 'Fetch a URL', parameters: { type: 'object', properties: {} },
 };
 const signal = new AbortController().signal;
+
+test('deep research answer deadline stays below its parent abort timer; shallow stays at 180s', () => {
+  expect(RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS).toBe(480_000);
+  expect(RESEARCH_TURN_DEEP_BUDGET_MS).toBeGreaterThan(RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS);
+  expect(RESEARCH_TURN_SHALLOW_BUDGET_MS).toBe(180_000);
+  expect(RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS).toBeLessThan(RESEARCH_TURN_SHALLOW_BUDGET_MS);
+});
 
 function createManualTimers() {
   const scheduled: Array<{ delayMs: number; callback: () => void; handle: ReturnType<typeof setTimeout>; cleared: boolean }> = [];
@@ -104,6 +119,47 @@ test('uses shared research-turn intent in chat surface and injects Bloom evidenc
   expect(researchToolsSeen).toEqual(expect.arrayContaining(['Read', 'WebFetch']));
   expect(researchToolsSeen).not.toEqual(expect.arrayContaining(['skill_exec', 'ToolSearch']));
   expect(result.finalText).toBe('evidence-reconciled answer');
+});
+
+test('Q2v2 fixed-input mock exposes WebSearch on the first model call and records exclusions', async () => {
+  const request = '2026-10-31 기준 HBM4(12단)의 상태를 SK하이닉스·삼성전자·마이크론 세 회사에 한정해 조사하라. 회사마다 «발표·샘플 출하·고객 인증·양산 출하» 네 단계 중 어디까지 1차 자료(회사 발표·실적 발표)로 확인되는지를 날짜와 원문 URL로 한 줄씩 표로 제시하고, 확인되지 않는 단계는 «미확인»으로 둬라. 공급망 병목은 베이스 다이 파운드리 의존 하나만 골라 인과를 3문장으로 설명하라. 일정 지연을 뒷받침하는 가장 강한 반대 근거 1개와 2026년 말까지 확인할 관측 지표 3개를 제시하라. 보고서는 1,500자 이내로 쓴다.';
+  expect(isResearchAgentIntent(request)).toBe(true);
+  let firstCallTools: string[] = [];
+  let capturedFirstCall = false;
+  let tierSplit: Record<string, unknown> | undefined;
+  spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'capability.resolve' && event === 'tier-split' && data && typeof data === 'object') {
+      tierSplit = data as Record<string, unknown>;
+    }
+  });
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, options) => {
+    const callTools = options?.tools?.map(spec => spec.name) ?? [];
+    if (!capturedFirstCall) {
+      firstCallTools = callTools;
+      capturedFirstCall = true;
+    }
+    return 'mock provisional answer';
+  });
+  const shellTool: LLMToolSpec = { ...tool, name: 'Shell' };
+
+  await runCoreTurn({
+    sessionId: 'q2v2-fixed-input-mock',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool, webSearchTool, webFetchTool, omniSearchTool, shellTool],
+    dispatchTool: async () => null,
+    signal,
+    userText: request,
+  }, { runResearch: async () => ({ ok: true, output: 'fixture evidence only' }) });
+
+  expect(firstCallTools).toContain('WebSearch');
+  expect(firstCallTools).toContain('WebFetch');
+  expect(firstCallTools).not.toContain('Shell');
+  expect(tierSplit).toMatchObject({
+    sessionId: 'q2v2-fixed-input-mock',
+    researchTurn: true,
+    activeTools: expect.arrayContaining(['Read', 'WebSearch', 'WebFetch']),
+    excludedTools: expect.arrayContaining([{ name: 'Shell', reason: 'research-tool-allowlist' }]),
+  });
 });
 
 test('deep non-research prompts get Bloom without skill or search tools', async () => {
@@ -265,21 +321,41 @@ test('explicit named skill request skips the text-only research answer and invok
 test('headless research runs in core-turn keep the 20-call ceiling and shared allowlist', async () => {
   const request = 'Research recent battery policy updates using current sources.';
   const calledToolSets: string[][] = [];
+  const stopEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
   let deniedDispatch: unknown;
+  let deniedRunShellDispatch: unknown;
   let budgetDispatch: unknown;
+  let forcedSynthesisPrompt = false;
+  let synthesisReceivedEvidence = false;
+  let modelCalls = 0;
+  spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'research.stop' && data && typeof data === 'object' && !Array.isArray(data)) {
+      stopEvents.push({ event, data: data as Record<string, unknown> });
+    }
+  });
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
+    modelCalls += 1;
     calledToolSets.push(options?.tools?.map((item) => item.name) ?? []);
     expect(options?.maxTurns).toBe(20);
-    deniedDispatch = await handlers.dispatchTool('Bash', { command: 'echo should-not-run' });
-    for (let i = 0; i < 21; i += 1) {
-      const result = await handlers.dispatchTool('OmniSearch', { query: `research-${i}` });
-      if (i === 20) budgetDispatch = result;
+    if (modelCalls === 1) {
+      deniedDispatch = await handlers.dispatchTool('Bash', { command: 'echo should-not-run' });
+      deniedRunShellDispatch = await handlers.dispatchTool('RunShell', { command: 'echo should-not-run' });
+      for (let i = 0; i < 21; i += 1) {
+        const result = await handlers.dispatchTool('OmniSearch', { query: `research-${i}` });
+        if (i === 20) budgetDispatch = result;
+      }
+      return 'provisional answer';
     }
-    return 'research complete';
+    expect(options?.tools).toEqual([]);
+    forcedSynthesisPrompt = _messages.some(message => typeof message.content === 'string'
+      && message.content.includes('The research budget has ended. Synthesize now'));
+    synthesisReceivedEvidence = _messages.some(message => typeof message.content === 'string'
+      && message.content.includes('partial research evidence'));
+    return 'forced synthesis';
   });
   let dispatches = 0;
   let searchDispatches = 0;
-  await runCoreTurn({
+  const result = await runCoreTurn({
     sessionId: 'headless-research-policy',
     messages: [{ role: 'user', content: request }],
     tools: [
@@ -301,20 +377,32 @@ test('headless research runs in core-turn keep the 20-call ceiling and shared al
     userText: request,
   }, { runResearch: async (_request, _signal, admitToolCall) => {
     for (let i = 0; i < 10; i += 1) expect(admitToolCall?.('OmniSearch')).toBe(true);
-    return { ok: false, output: '', error: 'no evidence in policy test' };
+    return { ok: true, output: 'partial research evidence' };
   } });
 
   expect(isResearchAgentIntent(request)).toBe(true);
-  expect(calledToolSets).toEqual([[], []]);
-  expect(RESEARCH_TOOL_ALLOWLIST).toEqual(['OmniSearch', 'WebFetch', 'Agent', 'Read', 'memory_recall', 'MsgList']);
+  expect(modelCalls).toBe(2);
+  expect(calledToolSets).toEqual([['OmniSearch', 'WebFetch', 'Agent', 'Read', 'WebSearch'], []]);
+  expect(RESEARCH_TOOL_ALLOWLIST).toEqual(['OmniSearch', 'WebSearch', 'WebFetch', 'Agent', 'Read', 'memory_recall', 'MsgList']);
   expect(isResearchToolAllowed('memory_recall')).toBe(true);
   expect(isResearchToolAllowed('MsgList')).toBe(true);
   expect(isResearchToolAllowed('Bash')).toBe(false);
   expect(isResearchToolAllowed('RunShell')).toBe(false);
   expect(deniedDispatch).toEqual({ error: 'This research turn may only use the research tool allowlist.' });
+  expect(deniedRunShellDispatch).toEqual({ error: 'This research turn may only use the research tool allowlist.' });
   expect(budgetDispatch).toEqual({ error: 'Research tool budget reached. Answer with the evidence collected so far.' });
   expect(searchDispatches).toBe(10);
   expect(dispatches).toBe(10);
+  expect(forcedSynthesisPrompt).toBe(true);
+  expect(synthesisReceivedEvidence).toBe(true);
+  // Stop reasons are deduplicated per turn; both denied dispatch results above
+  // prove Bash and RunShell were blocked, while this event records the first.
+  expect(stopEvents.filter(event => event.data.reason === 'tool-not-allowed').map(event => event.data.tool))
+    .toEqual(['Bash']);
+  expect(stopEvents.map(event => event.data.reason)).toEqual(expect.arrayContaining([
+    'tool-not-allowed', 'tool-budget', 'forced-synthesis',
+  ]));
+  expect(result.finalText).toBe('forced synthesis');
 });
 
 test('research turns expose Edit/Write only for explicit document paths and still deny Bash', async () => {
@@ -364,13 +452,13 @@ test('research Agent calls wait for results and narrow child tools to read-only 
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
     modelCalls += 1;
     if (modelCalls === 1) {
-      await handlers.dispatchTool('Agent', {
-        description: 'check source', prompt: 'read sources only', subagent_type: 'general-purpose',
-        run_in_background: true, wait_for_slot: true, max_turns: 99,
-        tool_filter: { allow: ['Bash'], deny: [] },
-      });
       return 'Provisional answer';
     }
+    await handlers.dispatchTool('Agent', {
+      description: 'check source', prompt: 'read sources only', subagent_type: 'general-purpose',
+      run_in_background: true, wait_for_slot: true, max_turns: 99,
+      tool_filter: { allow: ['Bash'], deny: [] },
+    });
     return 'Final answer';
   });
   const request = 'Research recent battery policy updates using current sources.';
@@ -379,13 +467,40 @@ test('research Agent calls wait for results and narrow child tools to read-only 
     messages: [{ role: 'user', content: request }],
     tools: [tool, { name: 'WebFetch', description: 'fetch', parameters: { type: 'object' } }, { name: 'Agent', description: 'agent', parameters: { type: 'object' } }],
     dispatchTool: async (_name, args) => { dispatched.push(args); return 'agent findings'; }, signal, userText: request,
-  }, { runResearch: async () => ({ ok: false, output: '', error: 'no evidence' }) });
+  }, { runResearch: async () => ({ ok: false, output: '', error: 'no evidence', axisCount: 3 }) });
 
   expect(dispatched).toHaveLength(1);
   expect(dispatched[0]).toMatchObject({
     subagent_type: 'general-purpose', run_in_background: false, max_turns: 20,
     tool_filter: { allow: ['Read', 'WebFetch'], deny: ['Bash', 'Edit', 'Grep'] },
   });
+  expect(debug.events(500).some(event => event.category === 'research.turn'
+    && event.event === 'subagent-completed'
+    && (event.data as { completionMode?: string } | undefined)?.completionMode === 'awaited-tool-result')).toBe(true);
+});
+
+test('research Agent is not dispatched until at least three judgment axes exist', async () => {
+  const dispatched: string[] = [];
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
+    modelCalls += 1;
+    if (modelCalls === 1) return 'Provisional answer';
+    await handlers.dispatchTool('Agent', { description: 'delegate', prompt: 'judge these sources' });
+    return 'Final answer';
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  await runCoreTurn({
+    sessionId: 'research-agent-minimum-axes',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool, { name: 'Agent', description: 'agent', parameters: { type: 'object' } }],
+    dispatchTool: async (name) => { dispatched.push(name); return 'agent findings'; },
+    signal, userText: request,
+  }, { runResearch: async () => ({ ok: false, output: '', error: 'no evidence', axisCount: 2 }) });
+
+  expect(dispatched).toHaveLength(0);
+  expect(debug.events(500).some(event => event.category === 'research.turn'
+    && event.event === 'subagent-skipped'
+    && (event.data as { reason?: string } | undefined)?.reason === 'insufficient-judgment-axes')).toBe(true);
 });
 
 test('a research turn emits a transparent first response at the 15-second limit', async () => {
@@ -398,7 +513,7 @@ test('a research turn emits a transparent first response at the 15-second limit'
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
     modelCalls += 1;
     if (modelCalls === 1) {
-      expect(options?.tools).toEqual([]);
+      expect(options?.tools?.map(item => item.name)).toEqual(['Read']);
       return new Promise<string>(() => {});
     }
     expect(options?.tools?.map(item => item.name)).toEqual(['Read']);
@@ -429,7 +544,7 @@ test('a research turn emits a transparent first response at the 15-second limit'
   expect(result.finalText).toBe('Grounded answer');
 });
 
-test('the three-minute research deadline aborts tools and forces a no-tools synthesis from partial evidence', async () => {
+test('the configured research wall-clock deadline aborts tools and forces a no-tools synthesis from partial evidence', async () => {
   const manual = createManualTimers();
   const stopEvents: Array<Record<string, unknown>> = [];
   spyOn(debug, 'log').mockImplementation((category, _event, data) => {
@@ -479,6 +594,49 @@ test('the three-minute research deadline aborts tools and forces a no-tools synt
   expect(stopEvents.map(event => event.reason)).toContain('forced-synthesis');
 });
 
+test('the research deadline synthesizes when a cancelled native tool never settles', async () => {
+  const manual = createManualTimers();
+  let startedResearch!: () => void;
+  const researchStarted = new Promise<void>(resolve => { startedResearch = resolve; });
+  let researchSignal: AbortSignal | undefined;
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
+    modelCalls += 1;
+    if (modelCalls === 1) {
+      handlers.onText?.('Provisional answer', 'Provisional answer');
+      handlers.onTurnComplete?.([{ role: 'assistant', content: 'Provisional answer', phase: 'final_answer' }]);
+      return 'Provisional answer';
+    }
+    expect(options?.tools).toEqual([]);
+    handlers.onText?.('Deadline answer', 'Deadline answer');
+    handlers.onTurnComplete?.([{ role: 'assistant', content: 'Deadline answer', phase: 'final_answer' }]);
+    return 'Deadline answer';
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  const pending = runCoreTurn({
+    sessionId: 'research-deadline-unsettled-tool',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool], dispatchTool: async () => null, signal, userText: request,
+  }, {
+    timers: manual.timers,
+    researchWallClockBudgetMs: 30,
+    runResearch: (_request, signal) => {
+      researchSignal = signal;
+      startedResearch();
+      // Models a native search/fetch adapter that doesn't honor AbortSignal.
+      return new Promise(() => {});
+    },
+  });
+  await researchStarted;
+  await Promise.resolve();
+  manual.fire(30);
+  const result = await pending;
+
+  expect(researchSignal?.aborted).toBe(true);
+  expect(modelCalls).toBe(2);
+  expect(result.finalText).toBe('Deadline answer');
+});
+
 test('unnamed English and Korean skill mentions keep the research evidence prepass', async () => {
   const requests = [
     'Use a skill to research one practical source on fuzzy skill discovery.',
@@ -490,7 +648,7 @@ test('unnamed English and Korean skill mentions keep the research evidence prepa
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, _handlers, options) => {
     modelCalls += 1;
     if (modelCalls % 2 === 1) {
-      expect(options?.tools).toEqual([]);
+      expect(options?.tools?.map(spec => spec.name)).toEqual(['Read']);
       expect(messages.some(message => message.role === 'system'
         && typeof message.content === 'string' && /later evidence-reconciliation phase can use tools/i.test(message.content))).toBe(true);
       return 'provisional answer';
@@ -550,8 +708,9 @@ test('streams the first answer before awaiting a pending research prepass', asyn
   await firstStreamStarted;
   expect(researchStarted).toBe(true);
   expect(modelCalls).toBe(1);
-  expect(statuses[0]).toContain('검색 도구로 요청한 주제의 근거를 찾습니다.');
-  expect(statuses[0]).toContain('질문 범위에 맞춰 결론과 근거를 정리합니다.');
+  expect(statuses[0]).toContain('Read로 질문에 나온 주제와 요구 조건의 근거를 찾습니다.');
+  expect(statuses[0]).toContain('출처의 주장과 제약을 비교해 확인된 사실을 가립니다.');
+  expect(statuses[0]).toContain('확인한 결론과 짧은 근거로 답합니다.');
   expect(statuses).not.toContain('먼저 답변을 시작하고 근거를 확인합니다.');
   expect(visible).toContain('first answer');
 
@@ -566,11 +725,12 @@ test('commits only the evidence-reconciled answer and replaces the provisional s
   const completions: unknown[][] = [];
   const visibleDeltas: string[] = [];
   const replacements: string[] = [];
+  const callbackOrder: string[] = [];
   let modelCalls = 0;
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, handlers, options) => {
     modelCalls += 1;
     if (modelCalls === 1) {
-      expect(options?.tools).toEqual([]);
+      expect(options?.tools?.map(spec => spec.name)).toEqual(['Read']);
       handlers.onText('draft', 'draft');
       handlers.onTurnComplete?.([{ role: 'assistant', content: 'provisional', phase: 'final_answer' }]);
       return 'provisional';
@@ -588,8 +748,8 @@ test('commits only the evidence-reconciled answer and replaces the provisional s
     userText: 'compare bond yields',
     callbacks: {
       onText: delta => visibleDeltas.push(delta),
-      onReplaceText: full => replacements.push(full),
-      onTurnComplete: messages => completions.push(messages),
+      onReplaceText: full => { callbackOrder.push('replace'); replacements.push(full); },
+      onTurnComplete: messages => { callbackOrder.push('complete'); completions.push(messages); },
     },
   }, { runResearch: async () => ({ ok: true, output: 'counterevidence' }) });
 
@@ -598,6 +758,45 @@ test('commits only the evidence-reconciled answer and replaces the provisional s
   expect(completions[0]).toEqual([{ role: 'assistant', content: 'grounded answer', phase: 'final_answer' }]);
   expect(visibleDeltas).toEqual(['draft']);
   expect(replacements).toEqual(['grounded answer']);
+  expect(callbackOrder).toEqual(['replace', 'complete']);
+});
+
+test('a synthesis stream without a completion frame still replaces the provisional answer once', async () => {
+  const completions: unknown[][] = [];
+  const replacements: string[] = [];
+  const callbackOrder: string[] = [];
+  const toolHistory = [
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'read-1', name: 'Read', input: { path: 'notes.md' } }] },
+    { role: 'user' as const, content: [{ type: 'tool_result' as const, tool_use_id: 'read-1', content: 'market notes' }] },
+  ];
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
+    modelCalls += 1;
+    if (modelCalls === 1) {
+      handlers.onText('draft', 'draft');
+      handlers.onTurnComplete?.(toolHistory);
+      return 'provisional answer';
+    }
+    handlers.onText?.('final answer', 'final answer');
+    return 'final answer';
+  });
+  const result = await runCoreTurn({
+    sessionId: 'research-no-synthesis-completion-frame',
+    messages: [{ role: 'user', content: 'compare bond yields' }],
+    tools: [tool], dispatchTool: async () => null, signal, userText: 'compare bond yields',
+    callbacks: {
+      onReplaceText: text => { callbackOrder.push('replace'); replacements.push(text); },
+      onTurnComplete: messages => { callbackOrder.push('complete'); completions.push(messages); },
+    },
+  }, { runResearch: async () => ({ ok: true, output: 'evidence' }) });
+
+  expect(result.finalText).toBe('final answer');
+  expect(replacements).toEqual(['final answer']);
+  expect(completions).toEqual([[
+    ...toolHistory,
+    { role: 'assistant', content: 'final answer', phase: 'final_answer' },
+  ]]);
+  expect(callbackOrder).toEqual(['replace', 'complete']);
 });
 
 test('aborting while research is pending returns the provisional turn and signals research', async () => {
@@ -759,7 +958,7 @@ test('failed research fallback retains non-search tool coverage', async () => {
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, options) => {
     modelCalls += 1;
     if (modelCalls === 1) {
-      expect(options?.tools).toEqual([]);
+      expect(options?.tools?.map(spec => spec.name)).toEqual(['Read']);
       handlers.onTurnComplete?.([{ role: 'assistant', content: 'provisional', phase: 'final_answer' }]);
       return 'provisional';
     }

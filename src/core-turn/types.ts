@@ -125,6 +125,8 @@ export interface CoreTurnCallbacks {
  *  `src/core-turn/` never imports from dashboard / chat / tui /
  *  display — the headless guard test enforces this structurally. */
 export interface CoreTurnContext {
+  /** Caller-owned identity for correlating this turn's research and debug events. */
+  runId?: string;
   /** Identifier for the hosting session. Piped through for future
    *  correlation; the turn logic does not branch on it. */
   sessionId: string;

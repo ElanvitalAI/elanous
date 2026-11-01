@@ -30,6 +30,8 @@ export interface ClassicSidetabMissionResult {
   finalScreen?: string;
   /** First child PTY frame, retained to explain startup menus and input interception. */
   initialScreen?: string;
+  failureStage?: string;
+  failureScreen?: string;
 }
 export interface ClassicSidetabMissionToolResult {
   status: 'running' | 'done' | 'error' | 'aborted';

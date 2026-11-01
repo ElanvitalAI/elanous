@@ -318,7 +318,7 @@ test('a tick resumes a parked growth after the decision card is answered', async
     entries.push(entry);
     return entry;
   } };
-  const deps = { root, growthDecision: { ledger, list: () => entries },
+  const deps = { root, growthScope: 'task-agent' as const, growthDecision: { ledger, list: () => entries },
     runBash: async (body: string) => ({ stdout: body === 'printf a' ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }),
     growthProposer: () => ({ node: { nodeId: 'grown', kind: 'agent', recipe: 'cmd:grow', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'gate', reason: 'grow before approval' }) };

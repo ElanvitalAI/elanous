@@ -97,6 +97,32 @@ describe('research axis fanout', () => {
     expect(result.axes[2]!.evidence[0]!.content).toContain('research tool budget reached');
   });
 
+  it('fetches one top native search result per axis with WebFetch and preserves fetch provenance', async () => {
+    const question = { ...axes[0]!, searchTerms: ['rate term one', 'rate term two'] };
+    const admitted: string[] = [];
+    const fetched: string[] = [];
+    const result = await fanOutAxisEvidence([question], {
+      search: async (query) => [{ url: `https://example.org/${query.endsWith('one') ? 'one' : 'two'}`, title: 'Rates', snippet: '4.12%', publishedAt: 0 }],
+      fetchPage: async (url, receivedQuestion) => {
+        fetched.push(url);
+        expect(receivedQuestion.id).toBe(question.id);
+        return { url: 'https://example.org/final-source', output: '# Primary source\nThe current yield is 4.12%.' };
+      },
+      admitToolCall: (name) => { admitted.push(name); return true; },
+    });
+
+    expect(admitted.filter(name => name === 'OmniSearch')).toHaveLength(2);
+    expect(admitted.filter(name => name === 'WebFetch')).toHaveLength(1);
+    expect(fetched).toHaveLength(1);
+    expect(result.axes[0]!.evidence).toContainEqual(expect.objectContaining({
+      questionId: question.id,
+      sourceKind: 'web-fetch',
+      source: 'https://example.org/final-source',
+      content: '# Primary source\nThe current yield is 4.12%.',
+      outcome: 'complete',
+    }));
+  });
+
   it('검색 제공자와 원문 URL을 보존하되 없는 관측일·수치 단위는 만들지 않는다', async () => {
     const result = await fanOutAxisEvidence([axes[0]!], { search: async () => [{
       url: 'https://example.org/?a=1&amp;b=2', title: 'yield data', snippet: 'change in percent', engine: 'firecrawl',

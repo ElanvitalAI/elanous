@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from './debug/log.js';
-import { _setGpt6CodexGuardFlagsForTest, _usesAdaptiveThinkingForContractTest, AnthropicProvider, billingRouteForProvider, codexOAuthAvailable, getGpt6CodexGuardFlags, getGpt6CodexGuardStats, logAgentTurnUsage, PROVIDERS, resetGpt6CodexGuardObservations, streamLLM, streamLLMWithTools, type Gpt6CodexGuardId, type LLMProvider } from './llm.js';
+import { _setGpt6CodexGuardFlagsForTest, _usesAdaptiveThinkingForContractTest, AnthropicProvider, billingRouteForProvider, codexOAuthAvailable, getGpt6CodexGuardFlags, getGpt6CodexGuardStats, logAgentTurnUsage, PROVIDERS, resetGpt6CodexGuardObservations, streamLLM, streamLLMWithTools, type Gpt6CodexGuardId, type LLMMessage, type LLMProvider } from './llm.js';
 import { _resetCodexBillingDecisionForTesting, noteCodexBillingDecision } from './oauth/codex-billing-route.js';
 
 test('credits-allowed Codex rotation records credit billing even when Codex auth is not inferred as OAuth', () => {
@@ -303,6 +303,50 @@ test('skill_exec tool_result carries the complete output string to the parent mo
     .flatMap((message) => Array.isArray(message.content) ? message.content : [])
     .find((block) => block.type === 'tool_result');
   expect(toolResult?.type === 'tool_result' ? toolResult.content : undefined).toBe(finalResponse);
+});
+
+test('streamLLMWithTools applies firstTurnTools only to routing and restores full tools afterward', async () => {
+  const requests: string[][] = [];
+  let calls = 0;
+  const provider: LLMProvider = {
+    name: 'first-turn-tools-contract-test',
+    defaultModel: 'test-model',
+    available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat(_messages, opts) {
+      calls++;
+      requests.push((opts?.tools ?? []).map((tool) => tool.name));
+      if (calls === 1) {
+        yield { type: 'tool_call', id: 'skill-route', name: 'skill_exec', args: { skill: 'omni-crawl' } };
+        return;
+      }
+      if (calls === 2) {
+        yield { type: 'tool_call', id: 'followup-search', name: 'WebSearch', args: { query: 'follow-up' } };
+        return;
+      }
+      yield { type: 'text', delta: 'done' };
+    },
+  };
+  const dispatched: string[] = [];
+  const result = await streamLLMWithTools([{ role: 'user', content: 'run skill then follow up' }], {
+    onText() {},
+    dispatchTool: async (name) => { dispatched.push(name); return 'ok'; },
+  }, {
+    provider,
+    model: 'test-model',
+    tools: [
+      { name: 'skill_exec', description: 'run skill', parameters: { type: 'object', properties: {} } },
+      { name: 'WebSearch', description: 'search', parameters: { type: 'object', properties: {} } },
+    ],
+    firstTurnTools: [
+      { name: 'skill_exec', description: 'run skill', parameters: { type: 'object', properties: {} } },
+    ],
+    toolChoice: { name: 'skill_exec' },
+    maxTurns: 3,
+  });
+  expect(result).toBe('done');
+  expect(requests).toEqual([['skill_exec'], ['skill_exec', 'WebSearch'], ['skill_exec', 'WebSearch']]);
+  expect(dispatched).toEqual(['skill_exec', 'WebSearch']);
 });
 
 test('skill_exec failure tool_result preserves its error for the parent model', async () => {

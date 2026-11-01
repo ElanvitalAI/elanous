@@ -1,7 +1,7 @@
 import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { debug } from '../../debug/log.js';
+import { debug, redactSecretText } from '../../debug/log.js';
 import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
 import { fromJsonl, type LogRecord } from '../../mss/logging/record.js';
 
@@ -116,6 +116,24 @@ export function podNoResultDiagnostic(ledger: string): string | null {
     } catch { /* incomplete ledger line */ }
   }
   return stage ? `child terminal result missing; last ledger stage=${stage}; round=${round ?? 'unknown'}; mustFix=${mustFix ?? 'unknown'}` : null;
+}
+
+/** A failed child can lose its terminal JSON line after recording the actionable PR-open error. */
+export function podNoResultChildError(ledger: string): string | null {
+  let error = '';
+  for (const line of ledger.split(/\r?\n/)) {
+    try {
+      const entry = JSON.parse(line) as { event?: unknown; data?: Record<string, unknown> };
+      if (entry?.event === 'pr-open-failed' && entry.data && typeof entry.data === 'object') {
+        error = typeof entry.data.error === 'string' ? entry.data.error : '';
+      }
+      // A later successful PR open proves the earlier guard failure was recovered.
+      if (entry?.event === 'pr-opened') error = '';
+    } catch { /* malformed lines do not replace a valid failure row */ }
+  }
+  if (!error) return null;
+  const line = redactSecretText(error).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').replace(/\s+/gu, ' ').trim();
+  return line.length > 240 ? `${line.slice(0, 228)}…[truncated]` : line;
 }
 
 /** Import valid JSONL log records into the launching host store, with durable per-job line receipts. */

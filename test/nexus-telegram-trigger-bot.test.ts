@@ -102,7 +102,7 @@ describe('createNexusTelegramTriggerBot · factory + tap wiring', () => {
     expect(handle).toBeNull();
   });
 
-  it('toTelegramEvent maps the message tap (no command field)', () => {
+  it('toTelegramEvent maps the message tap (no command field)', async () => {
     const tap: TgTriggerEvent = {
       kind: 'message',
       chat: 'chat-1',
@@ -111,8 +111,10 @@ describe('createNexusTelegramTriggerBot · factory + tap wiring', () => {
       messageId: 42,
       isDm: true,
     };
-    expect(receiveChannelEvent('telegram', tap)).toEqual({ text: 'hi', kind: 'message', channel: 'chat-1', senderId: 'user-1', messageId: 42 });
-    const out = toTelegramEvent(tap);
+    await expect(receiveChannelEvent('telegram', tap)).resolves.toEqual({ text: 'hi', kind: 'message', channel: 'chat-1', senderId: 'user-1', messageId: 42 });
+    const outPromise = toTelegramEvent(tap);
+    expect(outPromise).toBeInstanceOf(Promise);
+    const out = await outPromise;
     expect(out).toMatchObject({
       kind: 'message',
       chat: 'chat-1',
@@ -123,7 +125,7 @@ describe('createNexusTelegramTriggerBot · factory + tap wiring', () => {
     expect(out.raw).toBe(tap);
   });
 
-  it('toTelegramEvent carries the command field through for /cmd taps', () => {
+  it('toTelegramEvent carries the command field through for /cmd taps', async () => {
     const tap: TgTriggerEvent = {
       kind: 'command',
       chat: 'group-99',
@@ -133,7 +135,7 @@ describe('createNexusTelegramTriggerBot · factory + tap wiring', () => {
       messageId: 99,
       isDm: false,
     };
-    const out = toTelegramEvent(tap);
+    const out = await toTelegramEvent(tap);
     expect(out.kind).toBe('command');
     expect(out.command).toBe('runwf');
     expect(out.body).toBe('arg1 arg2');

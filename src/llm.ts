@@ -29,10 +29,13 @@ import {
 import { debug, redactSecrets, redactSecretText } from './debug/log.js';
 import { estimateMessagesTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
+import { resolveCodexAccountForRun } from './oauth/codex-account-store.js';
+import { codexOwnerMirrorAuthPath, readCodexOwnerAccessMirror } from './oauth/codex-owner-mirror.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
 import { ToolCallTiming } from './chat/tool-call-timing.js';
+import { recordChildFirstLlmResponse, recordChildFirstLlmStart, recordChildFirstToolCall } from './llm/child-first-llm-observation.js';
 import {
   dispatchWithParallelSafety,
   isSafeForParallel,
@@ -54,6 +57,7 @@ import {
   type ProviderFallbackTerminalVerdict,
 } from './session-runtime/retry-policy.js';
 import { ApiHttpError, fetchApiWithRetry, OverloadFailoverError, type FetchApiWithRetryOpts } from './session-runtime/retry-api.js';
+import { providerFailureEvidence } from './llm/provider-failure-evidence.js';
 import { isShapeRelevantRejection, summarizeCodexRequestShape } from './llm-request-shape.js';
 import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from './llm/bedrock-provider.js';
 import { OPEN_WEIGHT_TOOL_DISCIPLINE } from './llm/open-weight-discipline.js';
@@ -497,6 +501,9 @@ export interface LLMOpts {
   reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Tool definitions made available to the model for this turn. */
   tools?: LLMToolSpec[];
+  /** Optional tool pool exposed only to the first tool-loop request. The
+   *  normal `tools` pool remains active for later requests and hydration. */
+  firstTurnTools?: LLMToolSpec[];
   /** Tool-calling forcing for THIS turn. In streamLLMWithTools it forces on
    *  turn 0 only, then reverts to auto so the model can finalize. See ToolChoice. */
   toolChoice?: ToolChoice;
@@ -4395,6 +4402,16 @@ function providerDecisionCandidates(): Array<LLMProvider & { name: ProviderDecis
 
 /** Exported (OB1) so onboarding and `setup` judge «is there a usable ChatGPT/Codex login» exactly as the runtime does. */
 export function codexOAuthAvailable(): boolean {
+  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1') {
+    try {
+      const mirrorPath = codexOwnerMirrorAuthPath();
+      const account = resolveCodexAccountForRun(process.env, { storePath: mirrorPath });
+      readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath });
+      return true;
+    } catch {
+      return false;
+    }
+  }
   try {
     const account = resolveCodexAccount(process.env, { storedHome: (key) => loadTokens(key)?.codexHome });
     if (loadTokens(account.storeKey)) return true;
@@ -5114,11 +5131,16 @@ async function consumeProviderText(
 export async function streamLLM(
   messages: LLMMessage[],
   onChunk: (delta: string, full: string) => void,
-  opts: LLMOpts & { provider?: LLMProvider; initialProvider?: LLMProvider; onResolvedProvider?: (provider: string, model: string) => void } = {},
+  opts: LLMOpts & {
+    provider?: LLMProvider;
+    initialProvider?: LLMProvider;
+    onResolvedProvider?: (provider: string, model: string) => void;
+    skipProviders?: readonly string[];
+  } = {},
 ): Promise<string> {
   const started = Date.now();
-  let activeProvider = opts.provider ?? opts.initialProvider ?? resolveDefaultProvider(opts.model);
-  const attemptedProviders = new Set<string>([activeProvider.name]);
+  let activeProvider = opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
+  const attemptedProviders = new Set<string>([activeProvider.name, ...(opts.skipProviders ?? [])]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   let modelOverride = opts.model;
 
@@ -5131,6 +5153,11 @@ export async function streamLLM(
     const activeModel = finalized.model;
     if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
     opts.onResolvedProvider?.(activeProvider.name, activeModel);
+    await recordChildFirstLlmStart({
+      provider: activeProvider.name, model: activeModel,
+      ...(activeProvider.name === 'openai-codex' && process.env.ELANOUS_CODEX_ACCOUNT?.trim()
+        ? { accountName: process.env.ELANOUS_CODEX_ACCOUNT.trim() } : {}),
+    });
     debug.log('llm.router', 'streamLLM', {
       provider: activeProvider.name,
       model: activeModel,
@@ -5153,6 +5180,7 @@ export async function streamLLM(
     );
     const full = consumed.full;
     if (consumed.ok) {
+      await recordChildFirstLlmResponse({ status: 'ok' });
       if (consumed.usage !== 'unmeasured') {
         try {
           logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind });
@@ -5171,6 +5199,11 @@ export async function streamLLM(
     }
 
     const err: any = consumed.error;
+    await recordChildFirstLlmResponse({
+      status: 'error',
+      ...(Number.isSafeInteger(err?.status) ? { httpStatus: err.status as number } : Number.isSafeInteger(err?.statusCode) ? { httpStatus: err.statusCode as number } : {}),
+      error: err,
+    });
     if (err instanceof OverloadFailoverError && !opts.provider) {
       const switched = activeProvider.name === 'openai-codex'
         ? firstAvailableFallbackProvider(attemptedProviders, opts)
@@ -5197,6 +5230,7 @@ export async function streamLLM(
       model: activeModel,
       durationMs: Date.now() - started,
       message: reason,
+      ...providerFailureEvidence(err),
       ...(isAuthRejectionError(err) ? { authRejected: true } : {}),
     }, { level: 'error' });
     if (opts.provider) {
@@ -5340,6 +5374,44 @@ export function resolveDefaultProvider(model?: string): LLMProvider {
       available: p.available(),
     }, { level: 'info' });
     return p;
+  }
+}
+
+/** Async default resolver for requests that can use keys saved by setup service-keys. */
+export async function resolveDefaultProviderAsync(model?: string): Promise<LLMProvider> {
+  try {
+    // Preserve the established resolver as the default for every credential
+    // source it already handles. Besides avoiding provider-factory churn, this
+    // keeps registered providers and injected resolver implementations intact.
+    const existingProvider = resolveDefaultProvider(model);
+    const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
+    const cfg = getUserConfig();
+    const modelHint = cfg.llm.provider !== 'auto' && !isModelCompatible(cfg.llm.provider, model)
+      ? undefined
+      : model;
+    const decision = decideProviderForConfig(cfg, modelHint);
+    let usedSecretStore = false;
+    const asyncProvider = await getProviderForConfigAsync(cfg, modelHint, undefined, process.env, () => {
+      usedSecretStore = true;
+    });
+    const p = usedSecretStore ? asyncProvider : existingProvider;
+    debug.log('llm.router', 'resolveDefaultProvider', {
+      source: cfg.llm.provider === 'auto' ? 'user-config-auto-decision' : 'user-config',
+      configProvider: cfg.llm.provider,
+      configModel: cfg.llm.model,
+      requestedModel: model,
+      decisionProvider: decision.provider,
+      decisionAuth: decision.auth,
+      resolvedTo: p.name,
+      resolvedModel: p.defaultModel,
+      available: p.available(),
+    }, { level: 'info' });
+    return p;
+  } catch {
+    debug.log('llm.router', 'resolveDefaultProvider-secretstore-fallback', {
+      reason: 'async-provider-resolution-failed',
+    }, { level: 'warn' });
+    return resolveDefaultProvider(model);
   }
 }
 
@@ -8596,7 +8668,7 @@ export async function streamLLMWithTools(
   const circuit = !opts.provider && !opts.initialProvider
     ? await import('./session-runtime/provider-circuit.js')
     : undefined;
-  const provider = opts.provider ?? opts.initialProvider ?? resolveDefaultProvider(opts.model);
+  const provider = opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
   const initial = finalizeStreamingProviderModel(provider, opts.model ?? provider.defaultModel);
   let activeProvider = initial.provider;
   let activeModel = initial.model;
@@ -8622,6 +8694,19 @@ export async function streamLLMWithTools(
     }
   }
   opts.onResolvedProvider?.(activeProvider.name, activeModel);
+  await recordChildFirstLlmStart({
+    provider: activeProvider.name, model: activeModel,
+    ...(activeProvider.name === 'openai-codex' && process.env.ELANOUS_CODEX_ACCOUNT?.trim()
+      ? { accountName: process.env.ELANOUS_CODEX_ACCOUNT.trim() } : {}),
+  });
+  const initialToolHandler = handlers.onToolCall;
+  handlers = {
+    ...handlers,
+    onToolCall: (call) => {
+      void recordChildFirstToolCall();
+      initialToolHandler?.(call);
+    },
+  };
   const attemptedProviders = new Set<string>([
     activeProvider.name,
     ...(circuitBlockedInitialProvider ? [circuitBlockedInitialProvider] : []),
@@ -9171,7 +9256,9 @@ export async function streamLLMWithTools(
       const base = {
         ...opts,
         model: activeModel,
-        tools: completionNeedsFinalTurn && !keepToolsNoCall ? [] : activeTools,
+        tools: completionNeedsFinalTurn && !keepToolsNoCall
+          ? []
+          : turn === 0 && opts.firstTurnTools ? opts.firstTurnTools : activeTools,
         remainingFallbacks,
       };
       if (keepToolsNoCall) return { ...base, toolChoice: 'none' as const };
@@ -9304,7 +9391,11 @@ export async function streamLLMWithTools(
           new Promise<{ idle: true }>((res) => { idleTimer = setTimeout(() => res({ idle: true }), streamIdleTimeoutMs); }),
         ]);
         if (step.idle) throw new StreamIdleTimeoutError(streamIdleTimeoutMs);
+        await recordChildFirstLlmResponse({ status: 'ok' });
       } catch (err) {
+        const status = Number.isSafeInteger((err as { status?: unknown })?.status) ? (err as { status: number }).status
+          : Number.isSafeInteger((err as { statusCode?: unknown })?.statusCode) ? (err as { statusCode: number }).statusCode : undefined;
+        await recordChildFirstLlmResponse({ status: 'error', ...(status === undefined ? {} : { httpStatus: status }), error: err });
         if (idleTimer) clearTimeout(idleTimer);
         releaseStreamAttempt(true, err);
         if (err instanceof ApiHttpError && err.status === 400 && providerToolSchemaDiagnostics) {
@@ -12810,14 +12901,14 @@ export function getProviderForConfig(
   }
   const crossFamilyModel = (model || userConfig.llm.model) && resolvedProviderName !== provider;
   if (crossFamilyModel) {
-    const keyPrefix = (userConfig.llm.apiKey || '').slice(0, 7);
-    const keyImplies = keyPrefix.startsWith('sk-ant')
+    const key = userConfig.llm.apiKey || '';
+    const keyImplies = key.startsWith('sk-ant')
       ? 'anthropic'
-      : keyPrefix.startsWith('xai-')
+      : key.startsWith('xai-')
         ? 'grok'
-        : keyPrefix.startsWith('sk-')
+        : key.startsWith('sk-')
           ? 'openai'
-          : keyPrefix
+          : key
             ? 'unknown'
             : 'none';
     const keyMismatch =
@@ -12828,7 +12919,6 @@ export function getProviderForConfig(
       configProvider: provider,
       model: decision.model,
       implied: resolvedProviderName,
-      keyPrefix: keyPrefix || null,
       keyImplies,
       keyMismatch,
     }, { level: 'info' });
@@ -12872,6 +12962,75 @@ export function getProviderForConfig(
   // return + switch combo. Throws so a future provider added to the
   // union without a case here fails loud at first call.
   throw new Error(`unknown provider: ${provider as string}`);
+}
+
+/** Async counterpart used by production request paths. It overlays a SecretStore
+ * credential only on the ephemeral config passed to the provider factory; the
+ * persisted UserConfig is never mutated or saved. */
+export async function getProviderForConfigAsync(
+  userConfig: UserConfig,
+  model?: string,
+  getSecret?: (id: string) => Promise<string | undefined>,
+  env: NodeJS.ProcessEnv = process.env,
+  onSecretStoreCredential?: () => void,
+): Promise<LLMProvider> {
+  const { resolveProviderCredentialAsync } = await import('./llm/provider-credentials.js');
+  const decision = finalizeProviderModelCompatibility(decideProviderForConfig(userConfig, model));
+  let target = decision.provider.startsWith('auto:')
+    ? decision.provider.slice('auto:'.length)
+    : decision.provider;
+
+  // decideProviderForConfig preserves the established env/subscription and
+  // keyless-provider selection. This loop only runs when that resolver found
+  // no synchronous candidate; it then checks persisted setup keys in the same
+  // provider order.
+  if (target === 'auto') {
+    for (const candidate of PROVIDER_DECISION_ORDER) {
+      const credential = await resolveProviderCredentialAsync({
+        provider: candidate,
+        rotation: userConfig.llm.rotation,
+        baseProvider: userConfig.llm.provider,
+        baseApiKey: userConfig.llm.apiKey,
+        env,
+      }, getSecret);
+      if (credential.source !== 'none') {
+        target = candidate;
+        break;
+      }
+    }
+  }
+  if (target === 'auto') return getProviderForConfig(userConfig, model);
+
+  const resolvedModel = decision.provider === 'auto' || decision.model === '(none)'
+    ? defaultModelForProvider(target as ConcreteProviderName)
+    : decision.model;
+
+  const credential = await resolveProviderCredentialAsync({
+    provider: target,
+    rotation: userConfig.llm.rotation,
+    baseProvider: userConfig.llm.provider,
+    baseApiKey: userConfig.llm.apiKey,
+    env,
+  }, getSecret);
+  // Keep the established provider registry/factory path unless this request
+  // actually depends on a setup key. In particular, auto mode may have a
+  // registered provider implementation (test doubles included) that must not
+  // be replaced by a newly constructed provider with an empty ephemeral key.
+  if (credential.source !== 'secret-store') return getProviderForConfig(userConfig, model);
+  onSecretStoreCredential?.();
+  const ephemeralConfig = {
+    ...userConfig,
+    llm: {
+      ...userConfig.llm,
+      provider: target as UserConfig['llm']['provider'],
+      model: resolvedModel,
+      apiKey: credential.apiKey,
+      baseUrl: target === userConfig.llm.provider
+        ? credential.baseUrl ?? userConfig.llm.baseUrl
+        : credential.baseUrl,
+    },
+  };
+  return getProviderForConfig(ephemeralConfig, resolvedModel);
 }
 import { getModelFamily, isGpt6GenerationModel, usesCodexBehaviorGuards } from './models/prompts.js';
 import type { ModelFamily } from './models/prompts.js';

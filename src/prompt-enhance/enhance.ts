@@ -120,6 +120,8 @@ export interface EnhanceOpts {
   groundedFacts?: readonly string[];
   /** Relevant prior-failure lessons for goal-authoring prompts only; never part of the original ask. */
   authoringLessons?: string;
+  /** Canonical reusable mock-device and event-injection inventory; reference only, not a completion gate. */
+  mockScenarioCatalog?: string;
   /** Clock seam for the first-token observation (ms epoch); defaults to `Date.now`. */
   now?: () => number;
 }
@@ -438,6 +440,14 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
             : []),
           ...(opts.authoringLessons?.trim()
             ? ['', '## 지난 실패에서 배운 것', opts.authoringLessons.trim(), '위 교훈은 현재 ask의 대상 경로와 범위에 맞을 때만 적용하고, 맞지 않으면 무시하라.']
+            : []),
+          ...(opts.mockScenarioCatalog?.trim()
+            ? [
+              '',
+              '## 재사용 가능한 목장치·사건 주입 카탈로그 (참고 자료 · 완료 조건이 아님)',
+              opts.mockScenarioCatalog.trim(),
+              '골의 완료 경계가 실물 점검만 요구하면 먼저 제약을 의심하라: 그 제약은 저작 문면의 세계와 구현의 세계에서 같은가? 카탈로그의 목장치나 사건 주입으로 같은 동작을 관찰할 수 있는가? 실제 외부 시스템 확인이 사용자의 의도인 경우에만 실물 점검을 유지하고, 목장치가 맞으면 해당 장치·입력·관측 신호를 제안하라.',
+            ]
             : []),
         ].join('\n'),
       },

@@ -14,6 +14,7 @@ import { requestConfirmation } from '../hitl/confirm.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 import { coordinateBrowserRoundtrip } from '../agent-mission/browser-roundtrip-coordinator.js';
 import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
+import { getHarnessRunId } from '../harness/harness-space.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SELECTION_COMMENT = '이것도 반영';
@@ -194,6 +195,15 @@ async function loadPersona(id: string) {
 
 /** Attached-CDP browser action stays behind harness browser-act's armed, host and reversibility checks. */
 export async function dispatchBrowserHand(args: BrowserHandArgs, _ctx?: ToolRuntimeContext, deps: BrowserHandDeps = {}): Promise<BrowserHandResult> {
+  const runId = _ctx?.runId || getHarnessRunId() || undefined;
+  const browserActDeps = {
+    ...deps.browserActDeps,
+    ...(_ctx?.runId
+      ? { getRunId: () => _ctx.runId! }
+      : deps.browserActDeps?.getRunId
+        ? {}
+        : { getRunId: () => runId ?? null }),
+  };
   const url = args.url.trim();
   const target = args.target.trim();
   const issueId = args.linearSubtaskId.trim();
@@ -240,7 +250,7 @@ export async function dispatchBrowserHand(args: BrowserHandArgs, _ctx?: ToolRunt
     };
     return (deps.browserAct ?? performBrowserAction)({
       url: actionUrl, target, armed: true, entryPoint: 'tool-runtime/browser-hand', ...(persona ? { persona } : {}),
-    }, { ...deps.browserActDeps, observe, reversibilityPolicy: 'navigation-only' });
+    }, { ...browserActDeps, observe, reversibilityPolicy: 'navigation-only' });
   };
   try { sourceText = await inspect(url, pagePort); } catch { /* unavailable observation stays unknown */ }
   let block = blockedKind(sourceText);

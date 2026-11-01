@@ -23,12 +23,64 @@ export function draftClaimRecordLive(at: string, now: Date): boolean {
   return Number.isFinite(updated) && (now.getTime() - updated) / 3_600_000 < CLAIM_IDLE_HOURS;
 }
 
+export interface DraftIntentHold {
+  readonly owner: string;
+  readonly reason: string;
+  readonly expiresAt: string;
+}
+
+function inspectDraftIntentHold(body: string | undefined, now = new Date()): { hold?: DraftIntentHold; rejection?: string } {
+  if (!body || !body.includes('<!-- elanous:draft-intent-hold')) return {};
+  if (!Number.isFinite(now.getTime())) return { rejection: 'invalid-sweep-time' };
+  const matches = [...body.matchAll(/<!-- elanous:draft-intent-hold ([\s\S]*?) -->/g)];
+  const markerStarts = body.match(/<!-- elanous:draft-intent-hold\b/g) ?? [];
+  if (matches.length !== 1 || markerStarts.length !== 1) return { rejection: 'marker-count-or-termination' };
+  const raw = matches[0]![1]!;
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return { rejection: 'invalid-json' }; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { rejection: 'invalid-shape' };
+  const row = value as Record<string, unknown>;
+  if (Object.keys(row).length !== 3 || !Object.hasOwn(row, 'owner') || !Object.hasOwn(row, 'reason') || !Object.hasOwn(row, 'expiresAt')) {
+    return { rejection: 'invalid-fields' };
+  }
+  const { owner, reason, expiresAt } = row;
+  if (typeof owner !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(owner)
+    || typeof reason !== 'string' || !reason.trim() || reason !== reason.trim() || reason.length > 240
+    || /[\r\n;=]/.test(reason) || reason.includes('-->')
+    || typeof expiresAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(expiresAt)) {
+    return { rejection: 'invalid-fields' };
+  }
+  // Compare against the one writer-defined field order. JSON.stringify(parsedObject) alone preserves
+  // incoming key order and would silently accept alternate serializations or duplicate keys.
+  if (JSON.stringify({ owner, reason, expiresAt }) !== raw) return { rejection: 'noncanonical-json' };
+  const expiry = Date.parse(expiresAt);
+  if (!Number.isFinite(expiry) || new Date(expiry).toISOString() !== expiresAt) return { rejection: 'invalid-expiry' };
+  if (expiry <= now.getTime()) return { rejection: 'expired' };
+  return { hold: { owner, reason: reason.trim(), expiresAt } };
+}
+
+/** Only one canonical, complete, unexpired body marker is a hold; malformed or ambiguous markers fail open to normal triage. */
+export function parseDraftIntentHold(body: string | undefined, now = new Date()): DraftIntentHold | undefined {
+  return inspectDraftIntentHold(body, now).hold;
+}
+
+/** Diagnostic for a present but rejected hold marker; absence is not an error. */
+export function draftIntentHoldRejection(body: string | undefined, now = new Date()): string | undefined {
+  return inspectDraftIntentHold(body, now).rejection;
+}
+
+export function draftIntentHoldReason(hold: DraftIntentHold): string {
+  return `intent-hold owner=${hold.owner}; reason=${hold.reason}; expiresAt=${hold.expiresAt}`;
+}
+
 export interface DraftTriagePr {
   number: number;
   title?: string;
   branch: string;
   labels?: readonly string[];
   body?: string;
+  /** Last PR update (push, label, comment); absence is not an expiry timestamp. */
+  updatedAt?: string;
   mergeCommitMessage?: string;
   landingVerifiedComments?: readonly string[];
   createdAt?: string;
@@ -109,7 +161,8 @@ export function assessDraftTriage(input: DraftTriageAssessmentInput): DraftTriag
   const clock = now.getTime();
   const ageHours = Number.isFinite(latestCommit) && Number.isFinite(clock) ? (clock - latestCommit) / 3_600_000 : NaN;
   const protectedLabel = (draft.labels ?? []).find((name) => CLOSE_PROTECTED_LABELS.has(name));
-  const protectedState = Boolean(protectedLabel);
+  const intentHold = parseDraftIntentHold(draft.body, now);
+  const protectedState = Boolean(protectedLabel || intentHold);
   const running = input.runStatus === 'running' || input.runStatus === 'probable-running'
     || (draft.labels ?? []).includes('elanous:running');
   const cellComplete = input.cellStatus === 'green' || input.cellStatus === 'done';
@@ -146,7 +199,8 @@ export function assessDraftTriage(input: DraftTriageAssessmentInput): DraftTriag
       : { state: 'unknown', evidence: '현재 adapter는 같은 칸 병합 PR과 이 초안의 대체 관계를 증명하지 않음; follow-up 필요' },
     'newer-same-card': { state: input.newerSameCellSameCard === undefined ? 'unknown' : input.newerSameCellSameCard ? 'yes' : 'no', evidence: `${input.newerSameCellSameCard === undefined ? '같은 칸·카드 새 draft 관계 미관측' : `same-cell-same-card-newer=${input.newerSameCellSameCard}`}; 관측 표지이며 대체 증거가 아님` },
     'idle-48h': { state: Number.isFinite(ageHours) ? (idle48h ? 'yes' : 'no') : 'unknown', evidence: Number.isFinite(ageHours) ? `head age=${ageHours.toFixed(1)}h` : 'head commit 시각 미관측' },
-    protected: { state: protectedState ? 'yes' : 'no', evidence: protectedLabel ? `보호 표지=${protectedLabel}` : '보호 표지 없음' },
+    protected: { state: protectedState ? 'yes' : 'no', evidence: protectedLabel ? `보호 표지=${protectedLabel}`
+      : intentHold ? draftIntentHoldReason(intentHold) : '보호 표지 없음' },
     'recent-commit': { state: Number.isFinite(latestCommit) ? (recentCommit ? 'yes' : 'no') : 'unknown', evidence: Number.isFinite(latestCommit) ? `last commit=${draft.latestCommitAt}; cutoff=09:30 KST` : 'head commit 시각 미관측' },
     running: { state: running ? 'yes' : runNotRunning ? 'no' : 'unknown', evidence: running ? `run=${input.runStatus ?? 'elanous:running'}` : runNotRunning ? `종결 run=${input.runStatus}` : `run 상태 미관측${input.runStatus ? ` (${input.runStatus})` : ''}` },
     'owner-confirmed': { state: input.ownerConfirmed === undefined ? 'unknown' : input.ownerConfirmed ? 'yes' : 'no', evidence: input.ownerConfirmed === undefined ? '소유자 출처 미관측' : input.ownerConfirmed ? '고유 카드 또는 활성 claim owner 확인' : '고유 소유자 없음' },
@@ -161,6 +215,7 @@ export function assessDraftTriage(input: DraftTriageAssessmentInput): DraftTriag
 
 export interface DraftTriageInput {
   draft: DraftTriagePr;
+  now?: Date;
   runStatus: string | undefined;
   mergedTwins: readonly DraftTriagePr[];
   openDrafts?: readonly DraftTriagePr[];
@@ -251,10 +306,12 @@ export function harvestDeferredMarker(body: string | undefined): boolean {
     && rows.length > 0 && rows.every((value) => value === HARVEST_DEFERRED_MARKER_VALUE);
 }
 
-export function decideDraft({ draft, runStatus, mergedTwins, openDrafts, ageHours, liveBranches, finalRunResult }: DraftTriageInput): DraftDecision {
+export function decideDraft({ draft, runStatus, mergedTwins, openDrafts, ageHours, liveBranches, finalRunResult, now = new Date() }: DraftTriageInput): DraftDecision {
   // DRAFT-ZERO — a verified harvest-deferred marker is the strongest hold: it outranks protected labels
   // and every close rule, so a failed run's harvestable draft survives the sweep for harvest.
   if (runStatus === 'failed' && harvestDeferredMarker(draft.body)) return { action: 'keep', reason: 'harvest-deferred' };
+  const intentHold = parseDraftIntentHold(draft.body, now);
+  if (intentHold) return { action: 'keep', reason: draftIntentHoldReason(intentHold) };
   const held = draft.labels?.find((label) => PROTECTED_LABELS.has(label));
   if (held) return { action: 'keep', reason: `label:${held}` };
   if (runStatus !== 'self-implement.result final' && draft.branch && liveBranches.has(draft.branch)

@@ -28,7 +28,7 @@
 //     daemon exit.
 
 import type { McpServerSpec } from '../../user-config.js';
-import { McpClient, McpConnectionError, type McpTool, type McpToolCallResult } from '../../mcp/client.js';
+import { McpClient, McpConnectionError, type McpCallMeta, type McpTool, type McpToolCallResult } from '../../mcp/client.js';
 import {
   createMcpProxyRuntime,
   createMcpToolAuthorizer,
@@ -41,7 +41,8 @@ import { listNodeKinds } from '../../graph-kinds/registry.js';
 import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nodes.js';
 import { listInstalledPlugins } from '../../plugins/install/plugin-install.js';
 import { pluginEnv, credentialStatus } from '../../plugins/install/plugin-credentials.js';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { getHarnessRunId } from '../../harness/harness-space.js';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 
 export interface McpClientsHandle {
@@ -143,6 +144,8 @@ export interface RegisterMcpClientsOpts {
   toolIndexStore?: McpToolIndexStore;
   /** `lazy` 자식의 SIGTERM→SIGKILL 유예(ms). 기본 2500 — 종료 3초 계약 안쪽. */
   lazyShutdownGraceMs?: number;
+  /** BROWSER-ROUNDTRIP-ASIDE test seam; production defaults to the state-root JSONL ledger. */
+  asideLedger?: AsideRoundtripLedger;
 }
 
 /** 한 서버가 지난 부팅에서 알린 툴 목록. `mcp-tool-index.json` 의 값. */
@@ -155,6 +158,77 @@ export interface McpToolIndexStore {
 }
 
 export const MCP_TOOL_INDEX_FILENAME = 'mcp-tool-index.json';
+
+export interface AsideRoundtripEntry {
+  runId: string;
+  phase: 'call' | 'result';
+  toolName: string;
+  /** null means the caller did not provide a reason; do not invent one. */
+  reason: string | null;
+  at: string;
+  ok?: boolean;
+  classification?: string;
+  outputLength?: number;
+  errorClass?: string;
+}
+
+export interface AsideRoundtripLedger {
+  append(entry: AsideRoundtripEntry): void;
+  list(runId: string): AsideRoundtripEntry[];
+}
+
+const ASIDE_RUN_LEDGER_FILENAME = 'aside-run-roundtrip.jsonl';
+
+/** Persist only the run join and result receipt metadata, never prompt/result contents. */
+export function defaultAsideRoundtripLedger(root: string = elanousStateRoot()): AsideRoundtripLedger {
+  const file = join(root, ASIDE_RUN_LEDGER_FILENAME);
+  return {
+    append(entry) {
+      try {
+        mkdirSync(root, { recursive: true });
+        appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8');
+      } catch (error) {
+        try { debug.log('mcp-client.aside', 'ledger-append-failed', { errorClass: error instanceof Error ? error.name : 'unknown' }); }
+        catch { /* a ledger failure must not block the MCP call */ }
+      }
+    },
+    list(runId) {
+      try {
+        return readFileSync(file, 'utf8').split('\n').flatMap((line) => {
+          if (!line.trim()) return [];
+          try {
+            const row = JSON.parse(line) as AsideRoundtripEntry;
+            return row && row.runId === runId && (row.phase === 'call' || row.phase === 'result') ? [row] : [];
+          } catch { return []; }
+        });
+      } catch { return []; }
+    },
+  };
+}
+
+function asideReason(args: Record<string, unknown>): string | null {
+  const raw = args.reason;
+  return typeof raw === 'string' && raw.trim().length > 0
+    ? redactSecretText(raw.trim()).slice(0, 240)
+    : null;
+}
+
+function asidePrompt(args: Record<string, unknown>, runId: string, reason: string | null): Record<string, unknown> {
+  if (typeof args.prompt !== 'string') return args;
+  const joinLine = `elanous 런 ${runId} · 결과는 elanous 도구로 돌려라.`;
+  if (args.prompt.includes(joinLine)) return args;
+  const instructions = [
+    joinLine,
+    ...(reason ? [`Delegation reason: ${reason}.`] : []),
+    'Use TaskGet to load this run’s task context, then return findings through Elanous MCP tools to the same runId. Keep browser credentials in the browser.',
+  ].join(' ');
+  return { ...args, prompt: `${instructions}\n\n${args.prompt}` };
+}
+
+function asideTextLength(result: McpToolCallResult): number {
+  return (result.content ?? []).reduce((length, block) =>
+    block.type === 'text' && typeof block.text === 'string' ? length + block.text.length : length, 0);
+}
 
 /** 지연 기동 자식의 정리 유예. `McpClient` 기본 5000ms 는 「SIGTERM 3초 안에
  *  안 끝남」이던 classic 종료 계약을 넘긴다 — 2500ms 면 SIGKILL 까지 3초 안쪽. */
@@ -209,11 +283,11 @@ class DeferredMcpClient implements DeferredInner {
     return this.inner.listTools();
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
+  async callTool(name: string, args: Record<string, unknown>, meta?: McpCallMeta): Promise<McpToolCallResult> {
     await this.ensureStarted();
     // ⚠️ 기동 «뒤»의 inner.callTool 을 부른다 — 자격증명 마스킹 래퍼가
     //    createClient 직후 client.callTool 에 씌워지므로 그 래퍼를 탄다.
-    return this.inner.callTool(name, args);
+    return this.inner.callTool(name, args, meta);
   }
 
   async dispose(): Promise<void> {
@@ -259,6 +333,8 @@ export async function registerMcpClients(
   // A boot owns its ledger: same configured ids in concurrent/restarted boots
   // cannot inherit grants or revoke one another's authorization lifetime.
   const authorizer = createMcpToolAuthorizer();
+  let asideLedger = opts.asideLedger;
+  const asideLedgerFor = (): AsideRoundtripLedger => (asideLedger ??= defaultAsideRoundtripLedger());
   // FU3 (2026-05-13) — pipe McpClient lifecycle events into elanous's
   // keytrace logger so `mcp.client.spawn / .ready / .exit / .parse-error
   // / .stderr` all land in the daemon's debug log. Without this hook
@@ -420,14 +496,44 @@ export async function registerMcpClients(
     let client: McpClient | undefined;
     try {
       client = createClient(spec) as McpClient;
-      if (!opts.createClient && spec.transport === 'stdio') {
+      if (spec.transport === 'stdio' && (!opts.createClient || spec.id === 'aside')) {
         const originalCallTool = client.callTool.bind(client);
-        client.callTool = async (name: string, args: Record<string, unknown>): Promise<McpToolCallResult> => {
-          const values = injectedValuesByServer.get(spec.id) ?? [];
+        client.callTool = async (name: string, args: Record<string, unknown>, meta?: McpCallMeta): Promise<McpToolCallResult> => {
+          // Aside test clients use this same invocation boundary but bypass production credential injection.
+          const values = opts.createClient ? [] : injectedValuesByServer.get(spec.id) ?? [];
+          const isAsideExec = spec.id === 'aside' && name === 'exec';
+          const runId = isAsideExec ? (meta?.elanousRunId ?? getHarnessRunId()).trim() : '';
+          const reason = isAsideExec ? asideReason(args) : null;
+          const ledger = isAsideExec && runId ? asideLedgerFor() : undefined;
+          const now = () => new Date().toISOString();
+          const appendReceipt = (entry: AsideRoundtripEntry) => {
+            if (!ledger || !runId) return;
+            try { ledger.append(entry); } catch { /* bookkeeping must not block an MCP call */ }
+          };
+          const callArgs = isAsideExec && runId ? asidePrompt(args, runId, reason) : args;
+          if (isAsideExec && runId) {
+            try { debug.log('mcp-client.aside', 'exec-request', { runId, reason, toolName: name }); }
+            catch { /* observability is best-effort */ }
+            appendReceipt({ runId, phase: 'call', toolName: name, reason, at: now() });
+          }
           try {
-            const result = await originalCallTool(name, args);
+            const result = await originalCallTool(name, callArgs, meta);
+            if (isAsideExec && runId) {
+              const isError = result.isError === true;
+              const classification = isError ? 'mcp-server-error' : undefined;
+              const outputLength = asideTextLength(result);
+              appendReceipt({ runId, phase: 'result', toolName: name, reason, at: now(), ok: !isError, ...(classification ? { classification } : {}), outputLength });
+              try { debug.log('mcp-client.aside', 'exec-result', { runId, reason, toolName: name, ok: !isError, ...(classification ? { classification } : {}), isError, outputLength }); }
+              catch { /* observability is best-effort */ }
+            }
             return maskInjectedValues(result, values) as McpToolCallResult;
           } catch (err) {
+            if (isAsideExec && runId) {
+              const errorClass = err instanceof Error ? err.name : 'unknown';
+              appendReceipt({ runId, phase: 'result', toolName: name, reason, at: now(), ok: false, classification: 'mcp-transport-error', errorClass });
+              try { debug.log('mcp-client.aside', 'exec-error', { runId, reason, toolName: name, callToolRejected: true, errorClass }); }
+              catch { /* observability is best-effort */ }
+            }
             if (err instanceof Error) err.message = redactValues(err.message, values);
             else throw new Error(redactValues(String(err), values));
             throw err;

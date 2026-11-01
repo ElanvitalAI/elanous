@@ -174,26 +174,31 @@ test('failed environment push is reported to the caller and never presented as p
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
   const messages: string[] = [];
   let opened = 0;
+  let rejection = '';
   (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
     events.push({ event, data: data as Record<string, unknown> });
   }) as typeof debug.log;
   try {
-    await expect(runSelfImplement({
+    await runSelfImplement({
       feature: 'failed quota branch push', maxReworkRounds: 0,
       seams: seams({
         ...codexNoCandidateSeams(),
         gate: async () => ({ passed: false, log: 'quota stopped gate' }),
         preservationHasChanges: () => true,
         persistPrBodyArtifact: () => ({ path: '/tmp/blocked-push-failure.md' }),
-        preserveBlockedBranch: async () => { throw new Error('remote rejected'); },
+        preserveBlockedBranch: async () => { throw new Error('remote rejected ghp_abcdefghijklmnopqrstuvwxyz0123456789\nretry later'); },
         openPr: async () => { opened++; return { url: 'https://pr/unexpected', number: 7 }; },
         onProgress: ({ message }) => { messages.push(message); },
       }),
-    })).rejects.toThrow('원격 브랜치 보존 실패');
+    }).catch((error: unknown) => { rejection = error instanceof Error ? error.message : String(error); });
     expect(opened).toBe(0);
-    expect(messages.some((message) => message.includes('원격 브랜치 보존 실패') && message.includes('remote rejected'))).toBe(true);
+    expect(rejection).toContain('원격 브랜치 보존 실패');
+    expect(rejection).toContain('stage=push');
+    expect(rejection).toContain('remote rejected ghp_*** retry later');
+    expect(rejection).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+    expect(messages.some((message) => message.includes('원격 브랜치 보존 실패') && message.includes('remote rejected ghp_*** retry later'))).toBe(true);
     expect(messages.some((message) => message.includes('draft PR 없이 브랜치만 보존:'))).toBe(false);
-    expect(events).toContainEqual(expect.objectContaining({ event: 'rework-blocked-draft-pr', data: expect.objectContaining({ skipped: 'environment-stop', pushed: false, pushError: 'remote rejected', prBodyArtifactPath: '/tmp/blocked-push-failure.md' }) }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'rework-blocked-draft-pr', data: expect.objectContaining({ skipped: 'environment-stop', pushed: false, pushError: 'remote rejected ghp_*** retry later', preservationErrorStep: 'push', prBodyArtifactPath: '/tmp/blocked-push-failure.md' }) }));
   } finally {
     (debug as { log: typeof debug.log }).log = original;
   }

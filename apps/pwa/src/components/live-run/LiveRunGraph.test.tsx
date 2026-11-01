@@ -200,6 +200,20 @@ describe('LiveRunGraph — 390px', () => {
     ]));
   });
 
+  test('선언 그래프 밖에서 실제로 밟은 노드에만 새로 추가 표식을 붙인다', async () => {
+    const addedNode = 'runtime-source-check';
+    const traversal: HarnessRunTraversal = {
+      ...TRAVERSAL,
+      steps: [...STEPS, { node: addedNode, round: null, outcome: null, at: '2026-10-17T09:00:12Z', durationMs: null, visit: 1, maxVisits: 1, detail: null }],
+    };
+    root = await mount(1024, [], traversal);
+    const flow = root.root.findByType(ReactFlow);
+    const nodes = flow.props.nodes as Array<{ id: string; data: { adaptiveLabel?: string } }>;
+    expect(nodes.find((node) => node.id === addedNode)?.data.adaptiveLabel).toBe('새로 추가');
+    expect(nodes.find((node) => node.id === 'ship')?.data.adaptiveLabel).toBeUndefined();
+    expect(root.root.findByProps({ 'data-testid': 'adaptive-event-runtime-source-check' }).children).toEqual(['새로 추가']);
+  });
+
   test('넓은 화면(≥700px) 배치는 그대로 — 좁은 화면 수리가 넓은 골을 침범하지 않는다', async () => {
     (g.window as { innerWidth: number }).innerWidth = 1024;
     root = await mount(1024);

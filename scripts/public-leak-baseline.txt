@@ -794,7 +794,6 @@
 2	runtime-path-outside-export	src/self-implement/project-scaffold.test.ts
 3	runtime-path-outside-export	src/self-implement/run-ledger-cli.test.ts
 1	runtime-path-outside-export	src/workflow-runtime/discovery.ts
-1	runtime-path-outside-export	test/anatomy-doc-source-citations.test.ts
 1	runtime-path-outside-export	test/dev-help-concise.test.ts
 1	runtime-path-outside-export	test/dispatch/authored-goal-queue.test.ts
 1	runtime-path-outside-export	test/federation-guard-f11-paint-cache-opt-in.test.ts

@@ -102,4 +102,6 @@ export interface GateDecision {
   paramDefaults: Record<string, Record<string, unknown>>;
   /** Reasons surfaced by current hints — for prompt injection. */
   hintReasons: string[];
+  /** Why a catalog entry was not selected, keyed by stable catalog id. */
+  excludedReasons?: Record<string, string>;
 }

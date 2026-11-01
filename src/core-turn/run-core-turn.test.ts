@@ -5,7 +5,7 @@ import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 import { debug } from '../debug/log.js';
 import { requestsNamedSkill, runCoreTurn } from './run-core-turn.js';
-import type { CoreTurnResult } from './types.js';
+import type { CoreTurnContext, CoreTurnResult } from './types.js';
 
 const tool: LLMToolSpec = {
   name: 'Read',
@@ -71,6 +71,14 @@ describe('named installed skill research routing', () => {
     let researchCalls = 0;
     let researchTurn: boolean | undefined;
     let toolChoice: unknown;
+    let selectedTools: string[] = [];
+    let firstTurnTools: string[] = [];
+    const routeEvents: Record<string, unknown>[] = [];
+    spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'research.turn' && event === 'named-skill-route-first') {
+        routeEvents.push(data as Record<string, unknown>);
+      }
+    });
     let answerGuidance: string | undefined;
     spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, opts) => {
       events.push('llm');
@@ -79,12 +87,14 @@ describe('named installed skill research routing', () => {
         && message.content.includes('<research-answer-guidance>'))?.content as string | undefined;
       researchTurn = opts?.researchTurn;
       toolChoice = opts?.toolChoice;
+      selectedTools = opts?.tools?.map((candidate) => candidate.name) ?? [];
+      firstTurnTools = opts?.firstTurnTools?.map((candidate) => candidate.name) ?? [];
       return 'done';
     });
     await runCoreTurn({
       sessionId: 'named-skill-first-routing',
       messages: [{ role: 'user', content: prompt }],
-      tools: [{ ...tool, name: 'skill_exec' }],
+      tools: [{ ...tool, name: 'skill_exec' }, { ...tool, name: 'WebSearch' }],
       dispatchTool: async () => null,
       signal,
       userText: prompt,
@@ -95,6 +105,11 @@ describe('named installed skill research routing', () => {
     } });
     expect(researchTurn).toBe(true);
     expect(toolChoice).toEqual({ name: 'skill_exec' });
+    expect(selectedTools).toEqual(['skill_exec', 'WebSearch']);
+    expect(firstTurnTools).toEqual(['skill_exec']);
+    expect(routeEvents).toEqual([expect.objectContaining({
+      requestedSkillName: 'omni-crawl', selectedTool: 'skill_exec', availableToolNames: ['skill_exec'],
+    })]);
     expect(answerGuidance).toContain('작은 후속 작업은 추가 질문 없이 현재 턴에서 먼저 처리한다.');
     expect(answerGuidance).toContain('답은 결론(무엇을 찾았고 무엇을 해 두었는지)을 먼저 말하고, 근거를 짧게 덧붙인다.');
     expect(answerGuidance).toContain('비용·외부 노출·되돌리기 어려움이 큰 다음 단계만 그 하나를 확인한다. 그 밖에는 묻지 않는다.');
@@ -102,10 +117,116 @@ describe('named installed skill research routing', () => {
     expect(answerGuidance).toContain('질문에 필요한 만큼 읽기 좋게 설명하며, 고정 줄 수나 글자 수로 자르지 않는다.');
     expect(answerGuidance).not.toContain('추천 하나');
     expect(researchCalls).toBe(0);
-    expect(statuses).toEqual(['omni-crawl로 요청한 주제의 근거를 찾습니다.\n질문 범위에 맞춰 결론과 근거를 정리합니다.']);
-    expect(statuses[0]!.split('\n')).toHaveLength(2);
+    expect(statuses).toEqual(['omni-crawl (skill_exec)로 질문에 나온 주제와 요구 조건의 근거를 찾습니다.\n출처의 주장과 제약을 비교해 확인된 사실을 가립니다.\n확인한 결론과 짧은 근거로 답합니다.']);
+    expect(statuses[0]!.split('\n')).toHaveLength(3);
     expect(events).toEqual(['status', 'llm']);
     expect(statuses).not.toContain('먼저 답변을 시작하고 근거를 확인합니다.');
+  });
+
+  test('CEO original research answer keeps a readable 45-line mock intact without a forced next-step section', async () => {
+    const prompt = 'omni crawl 로 grokbot 사용사례를 찾아주고 elanous 와 어떤 연계를 하면 될까요?';
+    const answer = [
+      '결론: elanous 연계는 MCP 연결이 가장 빠르고, 로컬 CLI는 터널이 필요합니다.',
+      '[근거](https://example.test/docs) — 공식 문서의 연결 방식입니다.',
+      ...Array.from({ length: 43 }, (_, index) => `세부 근거 ${index + 1}: 질문 범위 안의 비교 자료와 제약입니다.`),
+    ].join('\n');
+    let guidance: string | undefined;
+    let researchCalls = 0;
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages) => {
+      guidance = messages.find((message) => message.role === 'system'
+        && typeof message.content === 'string'
+        && message.content.includes('<research-answer-guidance>'))?.content as string | undefined;
+      return answer;
+    });
+    const result = await runCoreTurn({
+      sessionId: 'research-answer-budget-no-truncation',
+      messages: [{ role: 'user', content: prompt }],
+      tools: [{ ...tool, name: 'skill_exec' }, { ...tool, name: 'WebSearch' }],
+      dispatchTool: async () => null,
+      signal,
+      userText: prompt,
+    }, { runResearch: async () => { researchCalls += 1; return { ok: true, output: 'mock evidence' }; } });
+    expect(guidance).toContain('작은 후속 작업은 추가 질문 없이 현재 턴에서 먼저 처리한다.');
+    expect(guidance).toContain('답은 결론(무엇을 찾았고 무엇을 해 두었는지)을 먼저 말하고, 근거를 짧게 덧붙인다.');
+    expect(guidance).toContain('다음 할 일 목록을 형식으로 요구하지 않는다.');
+    expect(guidance).toContain('고정 줄 수나 글자 수로 자르지 않는다.');
+    expect(answer.split('\n')).toHaveLength(45);
+    expect(researchCalls).toBe(0);
+    expect(result.finalText).toBe(answer);
+    expect(result.finalText).not.toContain('다음 할 일:');
+  });
+
+  test('generic research opening plan names the available research tools and output', async () => {
+    const prompt = 'grokbot 사용사례를 여러 소스로 조사하고 elanous 연계 방법을 비교해줘';
+    const statuses: string[] = [];
+    const events: string[] = [];
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async () => { events.push('llm'); return 'done'; });
+    await runCoreTurn({
+      sessionId: 'research-opening-plan-tools',
+      messages: [{ role: 'user', content: prompt }],
+      tools: [
+        { ...tool, name: 'MsgList' }, { ...tool, name: 'WebFetch' }, { ...tool, name: 'Agent' },
+        { ...tool, name: 'Read' }, { ...tool, name: 'OmniSearch' }, { ...tool, name: 'memory_recall' },
+        { ...tool, name: 'Write' },
+      ],
+      dispatchTool: async () => null,
+      signal,
+      userText: prompt,
+      callbacks: { onStatus: (line) => { statuses.push(line); events.push('status'); } },
+    }, { runResearch: async () => ({ ok: false, output: '' }) });
+    expect(statuses[0]).toBe('OmniSearch → WebFetch → Agent → Read → memory_recall → MsgList로 질문에 나온 주제와 요구 조건의 근거를 찾습니다.\n출처의 주장과 제약을 비교해 확인된 사실을 가립니다.\n확인한 결론과 짧은 근거로 답합니다.');
+    expect(statuses[0]!.split('\n')).toHaveLength(3);
+    expect(events[0]).toBe('status');
+  });
+
+  test('named skill request keeps the full pool when skill_exec is unavailable', async () => {
+    const prompt = 'omni crawl 로 grokbot 사용사례를 찾아주고 elanous 와 어떤 연계를 하면 될까요?';
+    let receivedTools: string[] = [];
+    let firstTurnTools: string[] | undefined;
+    let toolChoice: unknown;
+    const statuses: string[] = [];
+    const routeEvents: Record<string, unknown>[] = [];
+    spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'research.turn' && event === 'named-skill-route-first') {
+        routeEvents.push(data as Record<string, unknown>);
+      }
+    });
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, opts) => {
+      receivedTools = opts?.tools?.map((candidate) => candidate.name) ?? [];
+      firstTurnTools = opts?.firstTurnTools?.map((candidate) => candidate.name);
+      toolChoice = opts?.toolChoice;
+      return 'done';
+    });
+    await runCoreTurn({
+      sessionId: 'named-skill-missing-executor-fallback',
+      messages: [{ role: 'user', content: prompt }],
+      tools: [{ ...tool, name: 'FallbackTool' }, { ...tool, name: 'Read' }],
+      dispatchTool: async () => null,
+      signal,
+      userText: prompt,
+      callbacks: { onStatus: (line) => statuses.push(line) },
+    }, { runResearch: async () => ({ ok: false, output: '' }) });
+    expect(receivedTools).toEqual(['FallbackTool', 'Read']);
+    expect(firstTurnTools).toBeUndefined();
+    expect(toolChoice).toBeUndefined();
+    expect(routeEvents).toEqual([]);
+    expect(statuses[0]).toBe('Read로 질문에 나온 주제와 요구 조건의 근거를 찾습니다.\n출처의 주장과 제약을 비교해 확인된 사실을 가립니다.\n확인한 결론과 짧은 근거로 답합니다.');
+  });
+
+  test('research opening plan does not claim tools are available when the pool is empty', async () => {
+    const prompt = 'grokbot 사례를 여러 소스로 조사해줘';
+    const statuses: string[] = [];
+    await runCoreTurn({
+      sessionId: 'research-opening-plan-no-tools',
+      messages: [{ role: 'user', content: prompt }],
+      tools: [],
+      dispatchTool: async () => null,
+      signal,
+      userText: prompt,
+      callbacks: { onStatus: (line) => statuses.push(line) },
+    }, { runResearch: async () => ({ ok: false, output: '' }) });
+    expect(statuses[0]).toBe('현재 사용할 수 있는 조사 도구가 없습니다.\n근거를 확인할 수 없어 결론을 단정하지 않습니다.\n도구가 활성화되면 출처를 확인해 답합니다.');
+    expect(statuses[0]!.split('\n')).toHaveLength(3);
   });
 });
 
@@ -121,6 +242,32 @@ async function run(messages: LLMMessage[], userText?: string): Promise<void> {
 }
 
 describe('runCoreTurn surface input isolation', () => {
+  test('forwards the active provider, skip list, and runId to the research path', async () => {
+    spyOn(surfaceModule, 'resolveSessionSurfaceProfile').mockReturnValue({
+      id: 'research/agent', domain: 'research', selectionReason: 'test',
+      baselineContexts: [], defaultFamilies: [], conditionalFamilies: [],
+    } as unknown as ReturnType<typeof surfaceModule.resolveSessionSurfaceProfile>);
+    const codexProvider = { name: 'openai-codex', defaultModel: 'gpt-6.1-codex' } as CoreTurnContext['initialProvider'];
+    let routing: Pick<CoreTurnContext, 'initialProvider' | 'skipProviders' | 'runId'> | undefined;
+    await runCoreTurn({
+      sessionId: 'research-provider-routing',
+      messages: [{ role: 'user', content: 'Why are bond yields rising?' }],
+      tools: [tool],
+      dispatchTool: async () => null,
+      signal,
+      userText: 'Why are bond yields rising?',
+      initialProvider: codexProvider,
+      skipProviders: ['anthropic'],
+      runId: 'run-core-turn-research-123',
+    }, { runResearch: async (_request, _signal, _admitToolCall, providerRouting) => {
+      routing = providerRouting;
+      return { ok: true, output: 'mock evidence' };
+    } });
+    expect(routing?.initialProvider).toBe(codexProvider);
+    expect(routing?.skipProviders).toEqual(['anthropic']);
+    expect(routing?.runId).toBe('run-core-turn-research-123');
+  });
+
   test('sets the bounded tool-result policy for the TUI/core-turn history path', async () => {
     let toolResultInlineLimitBytes: number | undefined;
     spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, opts) => {
@@ -187,7 +334,11 @@ describe('runCoreTurn surface input isolation', () => {
     expect(records.filter((record) => record.category === 'capability.resolve' && record.event === 'tool-tier-split')).toEqual([
       expect.objectContaining({ data: expect.objectContaining({ sessionId: 'surface-selection-test', activeCount: 1, immediate: ['Read'] }) }),
     ]);
-    expect(records.some((record) => record.category === 'capability.resolve' && record.event === 'tier-split')).toBe(false);
+    expect(records.filter((record) => record.category === 'capability.resolve' && record.event === 'tier-split')).toEqual([
+      expect.objectContaining({ data: expect.objectContaining({
+        sessionId: 'surface-selection-test', activeTools: ['Read'], excludedTools: [],
+      }) }),
+    ]);
   });
 
   test('reports the model attempted by the tool stream to the hosting callback', async () => {

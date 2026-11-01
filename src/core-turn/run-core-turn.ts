@@ -35,7 +35,10 @@ import {
   RESEARCH_TURN_DEEP_BUDGET_MS,
   RESEARCH_TURN_DEADLINE_STOP_ERROR,
   RESEARCH_TURN_FIRST_REPLY_BUDGET_MS,
+  RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS,
   RESEARCH_TURN_MAX_TOOL_TURNS,
+  RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS,
+  RESEARCH_TURN_SHALLOW_BUDGET_MS,
 } from './research-policy.js';
 import type {
   CoreTurnContext,
@@ -163,7 +166,12 @@ export interface RunCoreTurnOptions {
   timers?: { setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>; clearTimeout(handle: ReturnType<typeof setTimeout>): void };
   firstReplyBudgetMs?: number;
   researchWallClockBudgetMs?: number;
-  runResearch?: (request: string, signal: AbortSignal, admitToolCall?: (name: string) => boolean) => Promise<{ ok: boolean; output: string; error?: string }>;
+  runResearch?: (
+    request: string,
+    signal: AbortSignal,
+    admitToolCall?: (name: string) => boolean,
+    providerRouting?: Pick<CoreTurnContext, 'initialProvider' | 'skipProviders' | 'runId'>,
+  ) => Promise<{ ok: boolean; output: string; error?: string; axisCount?: number }>;
 }
 
 type ResearchTimer = ReturnType<typeof setTimeout>;
@@ -171,17 +179,20 @@ type ResearchTimer = ReturnType<typeof setTimeout>;
 type AbortRace<T> = { aborted: true } | { aborted: false; value: T };
 
 function settleBeforeAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<AbortRace<T>> {
-  if (signal.aborted) return Promise.resolve({ aborted: true });
   return new Promise((resolve, reject) => {
+    let abortGraceTimer: ReturnType<typeof setTimeout> | undefined;
     const onAbort = () => {
       signal.removeEventListener('abort', onAbort);
-      resolve({ aborted: true });
+      // Let work handlers that synchronously settle in response to abort
+      // expose their final partial result before taking the deadline path.
+      abortGraceTimer = setTimeout(() => resolve({ aborted: true }), 50);
     };
-    signal.addEventListener('abort', onAbort, { once: true });
     work.then(
-      value => { signal.removeEventListener('abort', onAbort); resolve({ aborted: false, value }); },
-      error => { signal.removeEventListener('abort', onAbort); reject(error); },
+      value => { signal.removeEventListener('abort', onAbort); if (abortGraceTimer) clearTimeout(abortGraceTimer); resolve({ aborted: false, value }); },
+      error => { signal.removeEventListener('abort', onAbort); if (abortGraceTimer) clearTimeout(abortGraceTimer); reject(error); },
     );
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -220,6 +231,41 @@ function commitProvisionalTurn(
   commitCompletion(messages, handlers, setFinalPhaseAnswer);
 }
 
+function completionWithFinalText(messages: TurnCompletion | undefined, text: string): TurnCompletion {
+  const completed = [...(messages ?? [])];
+  let lastAssistant = -1;
+  for (let index = completed.length - 1; index >= 0; index -= 1) {
+    if (completed[index]?.role === 'assistant') { lastAssistant = index; break; }
+  }
+  if (lastAssistant < 0) {
+    completed.push({ role: 'assistant', content: text, phase: 'final_answer' });
+  } else {
+    const previous = completed[lastAssistant]!;
+    let content: typeof previous.content;
+    if (typeof previous.content === 'string') {
+      content = text;
+    } else {
+      let lastText = -1;
+      for (let index = previous.content.length - 1; index >= 0; index -= 1) {
+        if (previous.content[index]?.type === 'text') { lastText = index; break; }
+      }
+      if (lastText < 0) {
+        // A tool-only assistant message must stay paired with its tool result;
+        // the synthesized prose is a separate final answer message.
+        completed.push({ role: 'assistant', content: text, phase: 'final_answer' });
+        return completed;
+      }
+      content = previous.content.map((block, index) => index === lastText && block.type === 'text'
+        ? { ...block, text }
+        : block);
+    }
+    completed[lastAssistant] = {
+      ...previous, content, phase: 'final_answer',
+    };
+  }
+  return completed;
+}
+
 function commitStagedTurn(
   messages: TurnCompletion | undefined,
   handlers: StreamWithToolsHandlers,
@@ -228,8 +274,25 @@ function commitStagedTurn(
   setFinalPhaseAnswer: (value: boolean) => void,
   onReplaceText?: (fullText: string) => void,
 ): void {
-  commitCompletion(messages, handlers, setFinalPhaseAnswer);
+  // Replacement must reach the stream bridge before completion: ACP tracks the
+  // visible tail in `onReplaceText` so its completion callback will not emit the
+  // same synthesized answer a second time.
   if (replaceVisibleText && text) onReplaceText?.(text);
+  commitCompletion(messages, handlers, setFinalPhaseAnswer);
+}
+
+function commitSynthesizedTurn(
+  staged: ReturnType<typeof createStagedHandlers>,
+  fallbackMessages: TurnCompletion | undefined,
+  handlers: StreamWithToolsHandlers,
+  finalText: string,
+  provisionalText: string,
+  setFinalPhaseAnswer: (value: boolean) => void,
+  onReplaceText?: (fullText: string) => void,
+): void {
+  const completion = staged.completion() ?? completionWithFinalText(fallbackMessages, finalText);
+  commitStagedTurn(completion, handlers, finalText, finalText !== provisionalText,
+    setFinalPhaseAnswer, onReplaceText);
 }
 
 export async function runCoreTurn(
@@ -270,6 +333,7 @@ export async function runCoreTurn(
       || (enforceResearchDocumentWrite && (RESEARCH_DOCUMENT_WRITE_TOOLS as readonly string[]).includes(name));
     let enforceResearchToolBudget = false;
     let researchToolCallCount = 0;
+    let researchAxisCount = 0;
     let researchStopReason: string | undefined;
     const loggedResearchStops = new Set<string>();
     const logResearchStop = (reason: string, extra: Record<string, unknown> = {}): void => {
@@ -279,6 +343,12 @@ export async function runCoreTurn(
     };
     const admitResearchToolCall = (name: string): boolean => {
       if (!enforceResearchToolBudget) return true;
+      if (name === 'Agent' && researchAxisCount < 3) {
+        debug.log('research.turn', 'subagent-skipped', {
+          sessionId: ctx.sessionId, reason: 'insufficient-judgment-axes', axisCount: researchAxisCount, minimum: 3,
+        });
+        return false;
+      }
       if (researchToolCallCount >= RESEARCH_TURN_MAX_TOOL_TURNS) {
         // A prior denied tool is observable, but it must not mask the hard
         // budget stop that requires tool-free synthesis. A wall-clock stop is
@@ -392,6 +462,15 @@ export async function runCoreTurn(
         success = true;
         return result;
       } finally {
+        if (name === 'Agent' && enforceResearchToolAllowlist) {
+          debug.log('research.turn', 'subagent-completed', {
+            sessionId: ctx.sessionId,
+            dispatchCount: currentDispatchCount,
+            durationMs: now() - startedAt,
+            completionMode: 'awaited-tool-result',
+            success,
+          });
+        }
         try {
           debug.log('core.turn', 'dispatch-done', {
             sessionId: ctx.sessionId,
@@ -475,15 +554,17 @@ export async function runCoreTurn(
   );
   // Preserve the pre-routing contract: a named skill only skips the research
   // prepass when skill_exec is actually active after the normal tier split.
-  let explicitSkillToolRequest = requestsNamedSkill(surfaceUserText)
-    && tieredTools.some((tool) => tool.name === 'skill_exec');
-  if (!explicitSkillToolRequest && researchTurn && surfaceUserText?.trim()
-    && tieredTools.some((tool) => tool.name === 'skill_exec')) {
-    // Korean named-skill requests need the installed index to recognize the
-    // skill slug before the research allowlist filters the normal tool loop.
+  // Resolve the installed skill name even if skill_exec is deferred/missing:
+  // a named request with no executor falls back to the unfiltered normal pool.
+  let installedSkillNames: string[] = [];
+  if (researchTurn && surfaceUserText?.trim()) {
     const { getSkillIndex } = await import('../skills/index.js');
-    explicitSkillToolRequest = requestsNamedSkill(surfaceUserText, getSkillIndex().map(({ name }) => name));
+    installedSkillNames = getSkillIndex().map(({ name }) => name);
   }
+  const namedSkillRequest = requestsNamedSkill(surfaceUserText, installedSkillNames);
+  // A named skill only skips the research prepass when its executor is active.
+  const explicitSkillToolRequest = namedSkillRequest
+    && tieredTools.some((tool) => tool.name === 'skill_exec');
   const constrainDeepNonResearchTools = deepBloomDecision.apply && !researchTurn;
   // ToolSearch routes against the surface's full live pool, so hiding a tool
   // from the model alone is insufficient. Remove the summoner from the
@@ -504,11 +585,19 @@ export async function runCoreTurn(
     });
   }
   enforceResearchToolBudget = researchTurn;
-  enforceResearchToolAllowlist = researchTurn && !explicitSkillToolRequest;
+  enforceResearchToolAllowlist = researchTurn && !namedSkillRequest;
   enforceResearchDocumentWrite = enforceResearchToolAllowlist && requestsResearchDocumentWrite(surfaceUserText);
+  // Codex Responses only supports tool_choice="required" (not a named
+  // function choice). Make the first request deterministic by exposing only
+  // skill_exec there; streamLLMWithTools restores the full pool on later turns.
+  const routedSkillTools = explicitSkillToolRequest
+    ? bloomFilteredTools.filter((tool) => tool.name === 'skill_exec')
+    : [];
   const tools = enforceResearchToolAllowlist
     ? bloomFilteredTools.filter((tool) => isAllowedResearchTool(tool.name))
     : bloomFilteredTools;
+  // Preserve the ordinary pool if a later filter removes the executor.
+  const firstTurnTools = routedSkillTools.length > 0 ? routedSkillTools : undefined;
   const maxToolTurns = researchTurn
     ? Math.min(ctx.maxToolTurns ?? RESEARCH_TURN_MAX_TOOL_TURNS, RESEARCH_TURN_MAX_TOOL_TURNS)
     : ctx.maxToolTurns;
@@ -550,16 +639,41 @@ export async function runCoreTurn(
     });
   }
     let researchResultPromise: Promise<{ ok: boolean; output: string; error?: string } | null> | undefined;
+    let researchDeadlineSignal: AbortSignal | undefined;
     let requestedSkillName: string | undefined;
     if (researchTurn && surfaceUserText?.trim() && explicitSkillToolRequest) {
       // Resolve a display name only for the research opening plan; ordinary
       // turns and unrequested research keep the core startup lean.
-      const { getSkillIndex } = await import('../skills/index.js');
-      const skillNames = getSkillIndex().map(({ name }) => name);
-      requestedSkillName = requestedInstalledSkillName(surfaceUserText, skillNames);
+      requestedSkillName = requestedInstalledSkillName(surfaceUserText, installedSkillNames);
+      const selectedTool = firstTurnTools?.find((tool) => tool.name === 'skill_exec');
+      if (requestedSkillName && selectedTool) {
+        debug.log('research.turn', 'named-skill-route-first', {
+          sessionId: ctx.sessionId,
+          requestedSkillName,
+          selectedTool: selectedTool.name,
+          availableToolNames: firstTurnTools?.map((tool) => tool.name) ?? [],
+        });
+      }
     }
     if (researchTurn && surfaceUserText?.trim()) {
-      const plan = (requestedSkillName ?? '검색 도구') + '로 요청한 주제의 근거를 찾습니다.\n질문 범위에 맞춰 결론과 근거를 정리합니다.';
+      // `tools` is the active post-tier-flip pool; use the shared research
+      // allowlist order so the plan names only currently callable tools.
+      const availableResearchTools = RESEARCH_TOOL_ALLOWLIST
+        .filter((name) => tools.some((tool) => tool.name === name));
+      const planTools = requestedSkillName && firstTurnTools?.some((tool) => tool.name === 'skill_exec')
+        ? [`${requestedSkillName} (skill_exec)`]
+        : availableResearchTools;
+      const plan = planTools.length > 0
+        ? [
+          `${planTools.join(' → ')}로 질문에 나온 주제와 요구 조건의 근거를 찾습니다.`,
+          '출처의 주장과 제약을 비교해 확인된 사실을 가립니다.',
+          '확인한 결론과 짧은 근거로 답합니다.',
+        ].join('\n')
+        : [
+          '현재 사용할 수 있는 조사 도구가 없습니다.',
+          '근거를 확인할 수 없어 결론을 단정하지 않습니다.',
+          '도구가 활성화되면 출처를 확인해 답합니다.',
+        ].join('\n');
       try { ctx.callbacks?.onStatus?.(plan); } catch { /* UI feedback is fail-soft. */ }
     }
     if (researchTurn && surfaceUserText?.trim() && !explicitSkillToolRequest) {
@@ -573,13 +687,17 @@ export async function runCoreTurn(
       // answer-first status that contradicts that plan; stream the provisional
       // answer while evidence collection runs, then reconcile in the second pass.
       const researchController = new AbortController();
+      researchDeadlineSignal = researchController.signal;
       const abortResearchFromParent = (): void => {
         if (researchStopReason !== 'wall-clock-budget') researchStopReason = 'parent-abort';
         researchController.abort(ctx.signal.reason);
       };
       if (ctx.signal.aborted) abortResearchFromParent();
       else ctx.signal.addEventListener('abort', abortResearchFromParent, { once: true });
-      const researchWallClockBudgetMs = options.researchWallClockBudgetMs ?? RESEARCH_TURN_DEEP_BUDGET_MS;
+      const defaultResearchWallClockBudgetMs = deepBloomDecision.apply
+        ? RESEARCH_TURN_DEEP_BUDGET_MS
+        : RESEARCH_TURN_SHALLOW_BUDGET_MS;
+      const researchWallClockBudgetMs = options.researchWallClockBudgetMs ?? defaultResearchWallClockBudgetMs;
       let researchDeadlineTimer: ResearchTimer | undefined;
       if (!researchController.signal.aborted) {
         researchDeadlineTimer = timers.setTimeout(() => {
@@ -595,14 +713,23 @@ export async function runCoreTurn(
       }
       researchResultPromise = (async () => {
         try {
-          const work = (options.runResearch ?? (async (request, signal, admitToolCall) => {
+          const work = (options.runResearch ?? (async (request, signal, admitToolCall, providerRouting) => {
             // Keep the Bloom/skill pipeline out of ordinary and packaged TUI startup graphs.
             const { researchTurnForGrounding, runResearchQuestionLadder } = await import('../auto-research/research-turn.js');
             return researchTurnForGrounding(await runResearchQuestionLadder(request, {
+              ...providerRouting,
               signal, admitToolCall, allowPartialOnAbort: true, allowOutputSkill: false,
+              deadlineMs: deepBloomDecision.apply
+                ? RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS
+                : Math.min(RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS, Math.max(1, researchWallClockBudgetMs - 1)),
             }));
-          }))(surfaceUserText, researchController.signal, admitResearchToolCall);
+          }))(surfaceUserText, researchController.signal, admitResearchToolCall, {
+            ...(ctx.initialProvider ? { initialProvider: ctx.initialProvider } : {}),
+            ...(ctx.skipProviders ? { skipProviders: ctx.skipProviders } : {}),
+            ...(ctx.runId ? { runId: ctx.runId } : {}),
+          });
           const result = await work;
+          researchAxisCount = result?.axisCount ?? 0;
           if (researchController.signal.aborted && !researchStopReason) researchStopReason = ctx.signal.aborted ? 'parent-abort' : 'research-aborted';
           if (researchStopReason) logResearchStop(researchStopReason, {
             stage: 'research-prepass',
@@ -635,8 +762,9 @@ export async function runCoreTurn(
     }
     const streamOptions = (turnTools: typeof tools, signal: AbortSignal = ctx.signal) => ({
       tools: turnTools,
+      ...(firstTurnTools ? { firstTurnTools } : {}),
       researchTurn,
-      ...(explicitSkillToolRequest ? { toolChoice: { name: 'skill_exec' } } : {}),
+      ...(firstTurnTools ? { toolChoice: { name: 'skill_exec' } } : {}),
       signal,
       ...(ctx.requestSizeGuard ? { requestSizeGuard: ctx.requestSizeGuard } : {}),
       ...(ctx.reasoningEffort !== undefined ? { reasoningEffort: ctx.reasoningEffort } : {}),
@@ -678,6 +806,28 @@ export async function runCoreTurn(
       deferred: stats.deferredNames,
       unhydratable: stats.unhydratableNames,
     }, { compact: { arrayMax: Number.MAX_SAFE_INTEGER } });
+    const activeToolNames = new Set(tools.map((tool) => tool.name));
+    const immediateToolNames = new Set(tieredTools.map((tool) => tool.name));
+    const bloomToolNames = new Set(bloomFilteredTools.map((tool) => tool.name));
+    const excludedTools = ctx.tools
+      .filter((tool) => !activeToolNames.has(tool.name))
+      .map((tool) => ({
+        name: tool.name,
+        reason: !immediateToolNames.has(tool.name)
+          ? stats.deferredNames.includes(tool.name) ? 'deferred-tool-tier' : 'not-in-immediate-tier'
+          : !bloomToolNames.has(tool.name) ? 'deep-bloom-non-research-suppression'
+            : enforceResearchToolAllowlist && !isAllowedResearchTool(tool.name) ? 'research-tool-allowlist'
+              : 'not-active-after-turn-filtering',
+      }));
+    debug.log('capability.resolve', 'tier-split', {
+      sessionId: ctx.sessionId,
+      surfaceId: surface.id,
+      researchTurn,
+      activeTools: [...activeToolNames],
+      excludedTools,
+      deferredTools: stats.deferredNames,
+      unhydratableTools: stats.unhydratableNames,
+    }, { compact: { arrayMax: Number.MAX_SAFE_INTEGER } });
     if (stats.unhydratableCount > 0) {
       debug.log('capability.resolve', 'unhydratable-capabilities', {
         sessionId: ctx.sessionId,
@@ -714,7 +864,7 @@ export async function runCoreTurn(
           firstReplyTimer = timers.setTimeout(() => resolve({ timedOut: true }), firstReplyBudgetMs);
         });
         try {
-          const firstPass = streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions([], firstPassController.signal))
+          const firstPass = streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(tools, firstPassController.signal))
             .then(text => ({ timedOut: false as const, text }));
           const outcome = await Promise.race([firstPass, deadline]);
           if (outcome.timedOut) {
@@ -745,12 +895,17 @@ export async function runCoreTurn(
         });
       }
       if (researchResultPromise) {
-        const racedResearch = await settleBeforeAbort(researchResultPromise, ctx.signal);
-        if (racedResearch.aborted) {
+        const racedResearch = await settleBeforeAbort(researchResultPromise, researchDeadlineSignal ?? ctx.signal);
+        if (racedResearch.aborted && ctx.signal.aborted) {
           commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
           return { stopReason: 'aborted', finalText };
         }
-        const result = racedResearch.value;
+        // A native research tool can ignore cancellation and leave its promise
+        // pending. The deadline must still end the prepass and enter the
+        // no-tools synthesis path with the provisional answer.
+        const result = racedResearch.aborted
+          ? { ok: false, output: '', error: RESEARCH_TURN_DEADLINE_STOP_ERROR }
+          : racedResearch.value;
         if (ctx.signal.aborted) {
           commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
           return { stopReason: 'aborted', finalText };
@@ -796,12 +951,8 @@ export async function runCoreTurn(
               outputChars: finalText.length,
             });
             logResearchStop('synthesis-complete', { stage: 'synthesis', outputChars: finalText.length });
-            if (staged.completion()) {
-              commitStagedTurn(staged.completion(), handlers, finalText, finalText !== provisionalText,
-                value => { finalPhaseAnswer = value; }, ctx.callbacks?.onReplaceText);
-            } else {
-              commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
-            }
+            commitSynthesizedTurn(staged, provisionalTurnMessages, handlers, finalText, provisionalText,
+              value => { finalPhaseAnswer = value; }, ctx.callbacks?.onReplaceText);
           } catch (error) {
             commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
             const stopReason = classifyStopReason(error, ctx.signal);
@@ -836,12 +987,8 @@ export async function runCoreTurn(
             }
             finalText = fallbackText || staged.text() || provisionalText;
             accumulatedText = finalText;
-            if (staged.completion()) {
-              commitStagedTurn(staged.completion(), handlers, finalText, finalText !== provisionalText,
-                value => { finalPhaseAnswer = value; }, ctx.callbacks?.onReplaceText);
-            } else {
-              commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
-            }
+            commitSynthesizedTurn(staged, provisionalTurnMessages, handlers, finalText, provisionalText,
+              value => { finalPhaseAnswer = value; }, ctx.callbacks?.onReplaceText);
           } catch (error) {
             commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
             const stopReason = classifyStopReason(error, ctx.signal);

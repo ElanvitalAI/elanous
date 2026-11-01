@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 import type { ClassicSidetabMissionDispatchContext, ClassicSidetabMissionPairSessionRegistry, ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
 import { redactMissionResultPath } from './mission-cli-consumer.js';
 import type { ClassicMissionNotificationEnqueue } from './classic-sidetab-mission-job.js';
@@ -70,10 +71,10 @@ function renderTrioSynthesis(mission: string, results: Record<ClassicMissionAgen
     ...candidates,
     '',
     '## 채택 결과',
-    '_부모 응답에서 확정_',
+    '_최종 채택문은 알림을 받은 부모 응답에서 작성한다. 성공 후보가 있으면 이 후보들만 근거로 채택하고, 성공 후보가 하나면 그 결과를 그대로 채택한다._',
     '',
     '## 채택 근거',
-    '_부모 응답에서 확정_',
+    '_후보별 상태와 원문은 위 표에 기록했다. 실패한 손은 채택 근거에서 제외한다._',
     '',
   ].join('\n');
 }
@@ -124,12 +125,14 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
   const missionIds = [...ids.values()];
   deps.registry.register(missionIds, sessionIds);
   const outcomes = new Map<ClassicMissionAgent, Promise<MissionOutcome>>();
+  const completedOutcomes = new Map<ClassicMissionAgent, MissionOutcome>();
   for (const agent of agents) {
     const session = sessions.get(agent) ?? null;
     if (agent === 'grok' && !session) continue;
-    outcomes.set(agent, Promise.resolve().then(() => deps.runVisible(agent, deps.mission, session, ids.get(agent))).catch((error) => ({
+    const outcome = Promise.resolve().then(() => deps.runVisible(agent, deps.mission, session, ids.get(agent))).catch((error): MissionOutcome => ({
       ok: false, status: 'failed', error: error instanceof Error ? error.message : String(error),
-    })));
+    }));
+    outcomes.set(agent, outcome.then((result) => { completedOutcomes.set(agent, result); return result; }));
   }
   const members: Record<ClassicMissionAgent, ClassicSidetabMissionResult> = {
     codex: sessions.get('codex') ? { ok: true, status: 'running', interactionId: ids.get('codex') } : { ok: false, status: 'failed', error: 'Codex sidetab PTY could not start' },
@@ -146,7 +149,7 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
     }, timeoutMs);
   });
   const settled = Promise.all([...outcomes].map(async ([agent, promise]) => [agent, await promise] as const));
-  const completion = Promise.race([settled.then((results) => ({ didTimeout: false, results })), timedOut.then(() => ({ didTimeout: true, results: [] as const }))]).then(({ didTimeout, results }) => {
+  const completion = Promise.race([settled.then((results) => ({ didTimeout: false, results })), timedOut.then(() => ({ didTimeout: true, results: [...completedOutcomes.entries()] as const }))]).then(({ didTimeout, results }) => {
     const finishedAt = now();
     const all: Record<ClassicMissionAgent, MissionOutcome> = {
       codex: { ...members.codex, ...(members.codex.status === 'running' ? { error: undefined } : {}) },
@@ -173,27 +176,47 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
     } else {
       synthesisError = 'no sidetab workspace was available for the synthesis record';
     }
-    const timeoutReason = didTimeout ? 'mission exceeded the one-hour safety timeout' : undefined;
+    const timeoutReason = didTimeout ? 'mission exceeded the configured safety timeout' : undefined;
     const answer = (agent: ClassicMissionAgent): string => {
       const result = all[agent];
       const screen = result.finalScreen?.trim();
       const screenRecord = screen ? `\n\n${agent} final raw PTY screen:\n${screen.length > MAX_FINAL_SCREEN_CHARS ? `${screen.slice(-MAX_FINAL_SCREEN_CHARS)}\n[screen tail truncated]` : screen}` : '';
       const initial = result.initialScreen?.trim();
       const initialRecord = initial ? `\n\n${agent} first PTY snapshot:\n${initial.length > 1_200 ? `${initial.slice(-1_200)}\n[first screen tail truncated]` : initial}` : '';
-      if (timeoutReason && (result.status === 'running' || result.error === undefined)) return `${agent}: ${timeoutReason}${initialRecord}${screenRecord}`;
+      if (timeoutReason && result.status === 'running') return `${agent}: ${timeoutReason}${initialRecord}${screenRecord}`;
       if (!result.ok) return `${agent}: ${result.error ?? 'failed; no answer returned'}${initialRecord}${screenRecord}`;
       const content = result.content?.trim();
       if (!content) return `${agent}: completed without an answer${screenRecord}`;
       const safe = redactMissionResultPath(content, result.path);
       return `${agent} candidate:\n${safe.length > MAX_ANSWER_CHARS ? `${safe.slice(0, MAX_ANSWER_CHARS)}\n[answer truncated]` : safe}${initialRecord}${screenRecord}`;
     };
-    const grokFailed = !all.grok.ok;
+    const grokFailed = Boolean(grokFallback) || !all.grok.ok;
+    // When Grok cannot start, the run is explicitly a two-hand fallback;
+    // do not count the unstarted Grok hand as missing coverage or a failure.
+    const expectedAgents = grokFallback ? (['codex', 'claude'] as const) : (['codex', 'claude', 'grok'] as const);
+    const candidateAgents = expectedAgents.filter((agent) => all[agent].ok && Boolean(all[agent].content?.trim()));
+    const failedMembers = expectedAgents
+      .filter((agent) => !candidateAgents.includes(agent))
+      .map((agent) => ({
+        agent,
+        reason: timeoutReason && all[agent].status === 'running'
+          ? timeoutReason
+          : all[agent].error ?? (all[agent].ok ? 'completed without an answer' : all[agent].status ?? 'failed'),
+      }));
+    // A completed notification with at least one candidate lets the parent
+    // synthesize/adopt the available work. `coverage` describes partial runs;
+    // state and JSON status intentionally share the same done/error value.
+    const notificationStatus = candidateAgents.length > 0 ? 'done' : 'error';
+    const coverage = candidateAgents.length === 0 ? 'none' : candidateAgents.length === expectedAgents.length ? 'complete' : 'partial';
     const body = [
       `Three-hand comparison · same goal · ${grokFailed ? `Grok unavailable; continued with Codex + Claude (${all.grok.error ?? 'failed'})` : 'Codex + Claude + Grok results'}`,
+      `Coverage: ${coverage}; successful candidates: ${candidateAgents.length ? candidateAgents.join(', ') : 'none'}; failed members: ${failedMembers.length ? failedMembers.map(({ agent, reason }) => `${agent} (${reason})`).join('; ') : 'none'}.`,
       synthesisPath ? `Synthesis record: ${synthesisPath}` : `Synthesis record unavailable: ${synthesisError ?? 'unknown write failure'}`,
-      'The record contains the candidate results and attribution table; fill its adoption and rationale sections with the selected synthesis.',
+      candidateAgents.length > 0
+        ? 'Adopt or synthesize the final answer from the successful candidates only. If exactly one candidate succeeded, adopt it directly. Name failed members and never imply they succeeded.'
+        : 'No candidate succeeded; explicitly report that no result can be adopted.',
       '', answer('codex'), '', answer('claude'), '', answer('grok'), '',
-      'Compare the available candidates, select or combine the strongest answer, and present the adopted result with a short reason. Do not claim an unavailable or failed candidate succeeded.',
+      candidateAgents.length > 0 ? 'Present a non-empty adopted result and a short reason.' : 'Leave the adopted result explicitly unavailable; do not fabricate one.',
     ].join('\n');
     try {
       deps.enqueue({
@@ -201,8 +224,8 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
         ...(deps.context?.parentSessionId ? { parentSessionId: deps.context.parentSessionId } : {}),
         agentName: grokFailed ? 'Codex + Claude (Grok fallback)' : 'Codex + Claude + Grok',
         label: 'sidetab mission comparison',
-        state: all.codex.ok && all.claude.ok ? 'done' : 'error',
-        output: JSON.stringify({ status: grokFailed ? 'partial' : 'done', body, artifacts: synthesisPath ? [synthesisPath] : [], id: ids.get('codex') ?? ids.get('claude') ?? taskId, grokFallback: grokFailed ? all.grok.error : undefined }),
+        state: notificationStatus,
+        output: JSON.stringify({ status: notificationStatus, coverage, successfulMembers: candidateAgents, failedMembers, body, artifacts: synthesisPath ? [synthesisPath] : [], id: ids.get('codex') ?? ids.get('claude') ?? taskId, grokFallback: grokFailed ? all.grok.error : undefined }),
         ...(synthesisPath ? { resultPath: synthesisPath } : {}),
         truncated: body.includes('[answer truncated]'),
         durationMs: Math.max(0, finishedAt - startedAt),

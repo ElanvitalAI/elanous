@@ -13,6 +13,7 @@ import { requestCoordinatorPort, runPwaTest, type PwaTestOpts } from '../src/cli
 import { resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir';
 import { setTestStateRoot } from '../src/nexus/paths';
 import { PORT_LEASE_TTL_MS } from '../src/control-plane/port-lease-heartbeat';
+import { PORT_BANDS } from '../src/control-plane/ports';
 import type { PwaStartOpts } from '../src/cli/pwa-start';
 
 interface CapturedOut {
@@ -129,7 +130,7 @@ describe('runPwaTest — tool cwd forwarding', () => {
 });
 
 const inTestBand = (port: number | undefined): boolean => port !== undefined && port >= 31450 && port <= 31499;
-const PRODUCTION_PORTS = [31413, 31415, 31420, 31421, 31422, 31423, 31424];
+const PRODUCTION_PORTS = [...PORT_BANDS.reserved, 31421, 31422, 31423, 31424];
 
 describe('coordinator lease primary wiring', () => {
   const member = 'a'.repeat(64);

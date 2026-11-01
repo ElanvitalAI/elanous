@@ -4,6 +4,7 @@ import {
   formatSidetabLines as formatCoreSidetabLines,
   loadSidetabRows as loadCoreSidetabRows,
   type SidetabRow,
+  type SidetabScope,
 } from '../../sidetab-core/model.js';
 import { listPtyManifestRows } from '../../pty-shell/pty-manifest.js';
 import { formatSidetabPeekLines } from './peek.js';
@@ -11,9 +12,9 @@ import { formatSidetabPeekLines } from './peek.js';
 type PreviewSidetabRow = SidetabRow & { readonly previewSource?: string };
 
 /** Attach the latest manifest snapshot without changing the shared row contract. */
-export function loadSidetabRows(all = false, currentSessionId?: string): SidetabRow[] {
+export function loadSidetabRows(all = false, currentSessionId?: string, scopeOverrides?: Partial<SidetabScope>): SidetabRow[] {
   const snapshots = new Map<string, string>(listPtyManifestRows().map((row) => [row.id, row.snapshot || row.frame] as const));
-  return loadCoreSidetabRows(all, currentSessionId).map((row) => ({
+  return loadCoreSidetabRows(all, currentSessionId, scopeOverrides).map((row) => ({
     ...row,
     previewSource: snapshots.get(row.id) ?? '',
   }));

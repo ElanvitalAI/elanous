@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadFreshCodexAuthState } from './codex.js';
+import { debug } from '../debug/log.js';
+import '../llm.js';
 import { CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 
 const oldEnv = {
@@ -12,6 +14,7 @@ const oldEnv = {
   account: process.env.ELANOUS_CODEX_ACCOUNT,
   runId: process.env.ELANOUS_RUN_ID,
   accessOnly: process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY,
+  remoteMirrorPath: process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH,
 };
 const roots: string[] = [];
 const fixture = () => {
@@ -27,9 +30,9 @@ const fixture = () => {
   return { root, path: join(root, 'state', CODEX_OWNER_MIRROR_RELATIVE_PATH) };
 };
 const jwt = (exp: number) => `e30.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.sig`;
-const writeMirror = (path: string, accessToken: string, expiresAt: number, refreshToken = '', refreshSnake = '') => writeFileSync(path, JSON.stringify({
+const writeMirror = (path: string, accessToken: string, expiresAt: number, refreshToken = '', refreshSnake = '', authMode = 'chatgpt') => writeFileSync(path, JSON.stringify({
   version: 1,
-  providers: { 'openai-codex': { authMode: 'chatgpt', tokens: {
+  providers: { 'openai-codex': { authMode, tokens: {
     accessToken, refreshToken, refresh_token: refreshSnake, expiresAt, tokenType: 'Bearer',
   } } },
 }));
@@ -41,12 +44,53 @@ afterEach(() => {
   }
   if (oldEnv.accessOnly === undefined) delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
   else process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = oldEnv.accessOnly;
+  if (oldEnv.remoteMirrorPath === undefined) delete process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH;
+  else process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = oldEnv.remoteMirrorPath;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("remote direct Codex uses the owner's access-only mirror", () => {
   test('default owner mirror path follows the resolved state root', () => {
     const { path } = fixture();
+    expect(codexOwnerMirrorAuthPath()).toBe(path);
+  });
+
+  test('remote child uses the parent-installed mirror when its isolated state root differs', async () => {
+    const { path: derivedPath, root } = fixture();
+    const parentMirrorRoot = join(root, 'pod-home', '.elanous');
+    const parentMirror = join(parentMirrorRoot, CODEX_OWNER_MIRROR_RELATIVE_PATH);
+    mkdirSync(join(parentMirrorRoot, 'remote-parent-credentials', 'cli-mirror'), { recursive: true, mode: 0o700 });
+    const exp = Math.floor(Date.now() / 1000 + 3600) * 1000;
+    writeMirror(parentMirror, jwt(exp / 1000), exp);
+    process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = parentMirror;
+
+    const pathLog = spyOn(debug, 'log').mockImplementation(() => {});
+    expect(codexOwnerMirrorAuthPath()).toBe(parentMirror);
+    expect(parentMirror).not.toBe(derivedPath);
+    const pathEvent = pathLog.mock.calls.find(([category, event]) => category === 'llm.codex' && event === 'owner-mirror-path-compared');
+    expect(pathEvent?.[2]).toMatchObject({ source: 'remote-explicit', explicitPathAccepted: true });
+    expect(pathEvent?.[2]).not.toHaveProperty('path');
+    pathLog.mockRestore();
+    const state = await loadFreshCodexAuthState();
+    expect(state?.tokens.accessToken).toBe(jwt(exp / 1000));
+  });
+
+  test('remote Codex provider availability checks the access-only mirror', async () => {
+    const { root } = fixture();
+    const mirrorPath = join(root, 'pod-home', '.elanous', CODEX_OWNER_MIRROR_RELATIVE_PATH);
+    mkdirSync(join(root, 'pod-home', '.elanous', 'remote-parent-credentials', 'cli-mirror'), { recursive: true });
+    const exp = Math.floor(Date.now() / 1000 + 3600) * 1000;
+    writeMirror(mirrorPath, jwt(exp / 1000), exp);
+    process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = mirrorPath;
+    const { _explainAndLogFallbackCandidatesForTest, codexOAuthAvailable } = await import('../llm.js');
+    expect(codexOAuthAvailable()).toBe(true);
+    expect(_explainAndLogFallbackCandidatesForTest([], ['codex-rotate'])).toContain('openai-codex');
+  });
+
+  test('remote mirror override is ignored outside access-only children', () => {
+    const { path, root } = fixture();
+    process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = join(root, 'parent', CODEX_OWNER_MIRROR_RELATIVE_PATH);
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
     expect(codexOwnerMirrorAuthPath()).toBe(path);
   });
 
@@ -76,5 +120,49 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
     const exp = Math.floor(Date.now() / 1000 - 1) * 1000;
     writeMirror(path, jwt(exp / 1000), exp);
     expect(() => readCodexOwnerAccessMirror('openai-codex', { path })).toThrow(CODEX_OWNER_MIRROR_REQUIRED);
+  });
+
+  test('mirror rejection reports a distinct reason without exposing token or raw path', () => {
+    const { path, root } = fixture();
+    const eventLog = spyOn(debug, 'log');
+    const expectReason = (reason: string) => {
+      try { readCodexOwnerAccessMirror('openai-codex', { path }); }
+      catch (error) {
+        expect((error as Error).message).toContain(`reason=${reason}`);
+        expect((error as Error).message).toContain('storeKey=openai-codex');
+        expect((error as Error).message).toMatch(/rootSha256=[a-f0-9]{16}/);
+        expect((error as Error).message).not.toContain(root);
+        expect((error as Error).message).not.toContain('secret');
+        const event = eventLog.mock.calls.find(([category, name, data]) => category === 'llm.codex'
+          && name === 'owner-mirror-rejected' && (data as { reason?: string } | undefined)?.reason === reason);
+        expect(event?.[2]).toMatchObject({ reason, storeKey: 'openai-codex' });
+        expect(event?.[2]).not.toHaveProperty('path');
+        return;
+      }
+      throw new Error(`expected mirror rejection: ${reason}`);
+    };
+
+    expectReason('missing-file');
+    writeFileSync(path, '{');
+    expectReason('invalid-json');
+    rmSync(path);
+    mkdirSync(path);
+    expectReason('read-error');
+    rmSync(path, { recursive: true });
+    writeFileSync(path, JSON.stringify({ version: 1, providers: {} }));
+    expectReason('no-access');
+    writeMirror(path, jwt(Math.floor(Date.now() / 1000 + 3600)), Date.now() + 60 * 60_000, '', '', 'api');
+    expectReason('authMode');
+    writeMirror(path, '', Date.now() + 60 * 60_000);
+    expectReason('no-access');
+    writeFileSync(path, JSON.stringify({ version: 1, providers: { 'openai-codex': {
+      authMode: 'chatgpt', tokens: { accessToken: jwt(Math.floor(Date.now() / 1000 + 3600)), expiresAt: Date.now() + 60 * 60_000 },
+    } } }));
+    expectReason('refresh-missing');
+    writeMirror(path, jwt(Math.floor(Date.now() / 1000 + 3600)), Date.now() + 60 * 60_000, 'refresh', '');
+    expectReason('refresh-not-empty');
+    writeMirror(path, jwt(Math.floor(Date.now() / 1000 - 1)), Date.now() - 1000);
+    expectReason('expiry');
+    eventLog.mockRestore();
   });
 });

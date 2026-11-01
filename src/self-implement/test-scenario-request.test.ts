@@ -26,6 +26,70 @@ describe('requestTestScenario — 저작이 «의뢰»해서 받는 시나리오
     expect(inspection.declaration.liveStatus).toBe('measured');
   });
 
+  test('명령 출처 후보가 둘 이상이면 고르지 않고 후보와 unmeasured 사유를 낸다', () => {
+    const result = requestTestScenario({
+      launch: { port: 31415 },
+      acceptanceCriteria: ['A 가 B 를 한다'],
+      registeredMethodologies: [...REGISTRY],
+      commandSourceCandidates: ['package.json:scripts.dev', 'Makefile:dev'],
+    });
+    expect(result.liveStatus).toBe('unmeasured');
+    expect(result.reason).toBe('ambiguous-command-source');
+    const inspection = inspect(result.sections);
+    expect(inspection.declaration.errors).toEqual([]);
+    expect(inspection.declaration.reason).toBe('ambiguous-command-source');
+    expect(inspection.declaration.candidates).toEqual(['package.json:scripts.dev', 'Makefile:dev']);
+  });
+
+  test('explicit command source does not hide conflicting source candidates', () => {
+    const result = requestTestScenario({
+      launch: { entrypoint: 'bun run app' },
+      acceptanceCriteria: ['works'],
+      registeredMethodologies: ['deliverable-verify'],
+      commandSource: 'package.json:scripts.dev',
+      commandSourceCandidates: ['package.json:scripts.dev', 'Makefile:dev'],
+    });
+    expect(result.reason).toBe('ambiguous-command-source');
+    expect(result.sections.join('\n')).toContain('package.json:scripts.dev, Makefile:dev');
+    expect(result.sections.join('\n')).not.toContain('Port:` 또는 `Entrypoint:`');
+
+    const withoutLaunch = requestTestScenario({
+      launch: null,
+      acceptanceCriteria: ['works'],
+      registeredMethodologies: [],
+      commandSourceCandidates: ['package.json:scripts.dev', 'Makefile:dev'],
+    });
+    expect(withoutLaunch.reason).toBe('ambiguous-command-source');
+    expect(withoutLaunch.sections.join('\n')).toContain('package.json:scripts.dev, Makefile:dev');
+  });
+
+  test('blank explicit command source is treated as absent when a sole candidate exists', () => {
+    const result = requestTestScenario({
+      launch: { entrypoint: 'bun run app' },
+      acceptanceCriteria: ['works'],
+      registeredMethodologies: ['deliverable-verify'],
+      commandSource: '   ',
+      commandSourceCandidates: ['package.json:scripts.dev'],
+    });
+    expect(result.liveStatus).toBe('measured');
+    expect(result.sections.join('\n')).toContain('package.json:scripts.dev');
+  });
+
+  test('legacy path source does not become an invalid file:key ambiguity candidate', () => {
+    const result = requestTestScenario({
+      launch: { entrypoint: 'bun run app' },
+      acceptanceCriteria: ['works'],
+      registeredMethodologies: ['deliverable-verify'],
+      commandSource: 'g.md',
+      commandSourceCandidates: ['package.json:scripts.dev'],
+    });
+    expect(result.reason).toBe('ambiguous-command-source');
+    expect(result.sections.join('\n')).toContain('package.json:scripts.dev');
+    expect(result.sections.join('\n')).toContain('g.md:explicit-command-source');
+    expect(result.sections.join('\n')).toContain('원래 명시 출처(후보와 별도): `g.md`');
+    expect(inspect(result.sections).declaration.errors).toEqual([]);
+  });
+
   test('수용 기준이 «하나하나» U 층에 실린다 — 층을 문서에서 읽을 수 있어야 한다', () => {
     const result = requestTestScenario({
       launch: { port: 8080 },

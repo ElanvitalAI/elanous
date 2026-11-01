@@ -559,10 +559,25 @@ export class PreviewTerminal {
 
   /** 자식 stdin 으로 바이트 전송(응답 채널·public write·마우스 공유). registry 모드면 handle.write,
    *  아니면 dup-fd(기본 경로 무접촉). */
-  private writeToChild(data: string): void {
-    if (this.registryHandle) { try { this.registryHandle.write(data); } catch { /* pty closing */ } return; }
-    if (!this.alive || this.dupFd < 0) return;
-    try { fs.writeSync(this.dupFd, data); } catch { /* pty closing */ }
+  private writeToChild(data: string): boolean {
+    if (this.registryHandle) {
+      try {
+        if (!this.registryHandle.canWrite()) return false;
+        this.registryHandle.write(data);
+        return true;
+      } catch { return false; }
+    }
+    if (!this.alive || this.dupFd < 0) return false;
+    try {
+      const bytes = Buffer.from(data, 'utf8');
+      let offset = 0;
+      while (offset < bytes.length) {
+        const written = fs.writeSync(this.dupFd, bytes, offset, bytes.length - offset);
+        if (written <= 0) return false;
+        offset += written;
+      }
+      return true;
+    } catch { return false; }
   }
 
   private scheduleUpdate(): void {
@@ -606,9 +621,9 @@ export class PreviewTerminal {
     return () => { this.rawOscTaps.delete(cb); };
   }
 
-  /** Send raw bytes to the PTY (stdin from the child's perspective). */
-  write(bytes: string): void {
-    this.writeToChild(bytes);
+  /** Send raw bytes to the PTY and report whether its input handle accepted them. */
+  write(bytes: string): boolean {
+    return this.writeToChild(bytes);
   }
 
   /** Notify the PTY + emulator of new pane dimensions. Called on

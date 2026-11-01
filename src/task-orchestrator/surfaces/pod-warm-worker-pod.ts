@@ -260,7 +260,7 @@ export interface WarmPodTransportResult {
   /** Every non-complete response leaves the existing one-shot Job authoritative. */
   status: 'observed' | 'fallback';
   reason: 'complete' | 'key-drift' | 'pod-unready' | 'pod-replaced' | 'exec-failed' | 'invalid-result' | 'worker-quarantined'
-    | 'no-candidate' | 'lease-unavailable' | 'context-unavailable';
+    | 'no-candidate' | 'lease-unavailable' | 'context-unavailable' | 'control-unavailable';
   reply: WarmWorkerReply | null;
   /** Original local kubectl error when a remote pool context is absent; no Pod was contacted. */
   kubectlStderr?: string;

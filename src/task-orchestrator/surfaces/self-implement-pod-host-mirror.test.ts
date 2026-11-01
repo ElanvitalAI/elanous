@@ -28,7 +28,7 @@ function fakeLaunch(logs: string) {
     return { status: 0, stdout: '', stderr: '' };
   };
   const launch = async (options: Partial<PodSpawnOptions> = {}, spaceId = 'mirror-source') => {
-    const result = await podSelfImplementSpawn({ kubectl, credentials: creds, env: {}, sleep: async () => {}, ...options })({ feature: 'x', spaceId }).done;
+    const result = await podSelfImplementSpawn({ kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, ...options })({ feature: 'x', spaceId }).done;
     expect(result.exitCode).toBe(0);
     return applied.filter((entry) => entry.kind === 'Job').at(-1)!;
   };
@@ -175,10 +175,12 @@ describe('si-task Job result marker and mirror seed', () => {
     return { kubectl, calls, jobs, get token() { return token; }, get polls() { return polls; } };
   }
 
-  function events(name: string, withSkipped = false) {
+  function events(name: string, jobSpaces: readonly string[], withSkipped = false) {
     const seen: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const jobs = new Set(jobSpaces.map(podJobName));
     const off = debug.registerSink({ name, emit: (record) => {
-      if (record.category === 'self-implement.pod' && (record.event === 'result-marker-early' || record.event === 'mirror-seed' || (withSkipped && record.event === 'mirror-seed-skipped'))) seen.push({ event: record.event, data: record.data as Record<string, unknown> });
+      const data = record.data as Record<string, unknown>;
+      if (record.category === 'self-implement.pod' && jobs.has(String(data.job)) && (record.event === 'result-marker-early' || record.event === 'mirror-seed' || (withSkipped && record.event === 'mirror-seed-skipped'))) seen.push({ event: record.event, data });
     } });
     return { seen, off };
   }
@@ -196,9 +198,9 @@ describe('si-task Job result marker and mirror seed', () => {
 
   test('① the marker before the condition ends the wait early with that rc, and the marker is not child output', async () => {
     const run = markerLaunch({ conditionAt: null, tail: (t) => ({ status: 0, stdout: markerOf(t, 0).slice(1) }), full: (t) => `{"stage":"pr-opened","ok":true}\n${markerOf(t, 0)}` });
-    const seen = events('si-marker-early-test');
+    const seen = events('si-marker-early-test', ['marker-early']);
     try {
-      const result = await podSelfImplementSpawn({ kubectl: run.kubectl, credentials: creds, env: {}, sleep: async () => {}, resultMarker: true })({ feature: 'x', spaceId: 'marker-early' }).done;
+      const result = await podSelfImplementSpawn({ kubectl: run.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, resultMarker: true })({ feature: 'x', spaceId: 'marker-early' }).done;
       expect(result.exitCode).toBe(0);
       expect(result.output).not.toContain('__ELANOUS_POD_DONE__');
       expect(run.jobs[0]!.spec.template.spec.containers[0].args[0]).toContain(`'__ELANOUS_POD_DONE__ ${run.token}' "$rc"`);
@@ -206,27 +208,27 @@ describe('si-task Job result marker and mirror seed', () => {
       expect(seen.seen).toEqual([{ event: 'result-marker-early', data: expect.objectContaining({ job: podJobName('marker-early'), rc: 0 }) }]);
     } finally { seen.off(); }
     const failed = markerLaunch({ conditionAt: null, tail: (t) => ({ status: 0, stdout: markerOf(t, 3).slice(1) }), full: (t) => `{"stage":"implement","ok":false,"error":"boom"}\n${markerOf(t, 3)}` });
-    const result = await podSelfImplementSpawn({ kubectl: failed.kubectl, credentials: creds, env: {}, sleep: async () => {}, resultMarker: true })({ feature: 'x', spaceId: 'marker-failed' }).done;
+    const result = await podSelfImplementSpawn({ kubectl: failed.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, resultMarker: true })({ feature: 'x', spaceId: 'marker-failed' }).done;
     expect(result.exitCode).toBe(1);
     expect(failed.polls).toBe(1);
   });
 
   test('② without a marker the wait stays on the condition as before', async () => {
     const run = markerLaunch({ conditionAt: 3, tail: () => ({ status: 0, stdout: 'ELANOUS_RUN_LEDGER_NONE\n{"stage":"pr-opened","ok":true}\n' }), full: () => '{"stage":"pr-opened","ok":true}\n' });
-    const seen = events('si-marker-none-test');
+    const seen = events('si-marker-none-test', ['marker-none', 'marker-pending', 'marker-off']);
     try {
-      const result = await podSelfImplementSpawn({ kubectl: run.kubectl, credentials: creds, env: {}, sleep: async () => {}, resultMarker: true })({ feature: 'x', spaceId: 'marker-none' }).done;
+      const result = await podSelfImplementSpawn({ kubectl: run.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, resultMarker: true })({ feature: 'x', spaceId: 'marker-none' }).done;
       expect(result.exitCode).toBe(0);
       expect(run.polls).toBe(3);
       expect(seen.seen).toEqual([]);
     } finally { seen.off(); }
     // Pending Pod (tail read fails) changes nothing either.
     const pending = markerLaunch({ conditionAt: 2, tail: () => ({ status: 1, stdout: '' }), full: () => '{"stage":"pr-opened","ok":true}\n' });
-    expect((await podSelfImplementSpawn({ kubectl: pending.kubectl, credentials: creds, env: {}, sleep: async () => {}, resultMarker: true })({ feature: 'x', spaceId: 'marker-pending' }).done).exitCode).toBe(0);
+    expect((await podSelfImplementSpawn({ kubectl: pending.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, resultMarker: true })({ feature: 'x', spaceId: 'marker-pending' }).done).exitCode).toBe(0);
     expect(pending.polls).toBe(2);
     // Default with an injected kubectl: no marker line, no tail read — the existing fake-kubectl call order is untouched.
     const off = markerLaunch({ conditionAt: 1, tail: () => { throw new Error('tail read without marker'); }, full: () => '{"stage":"pr-opened","ok":true}\n' });
-    await podSelfImplementSpawn({ kubectl: off.kubectl, credentials: creds, env: {}, sleep: async () => {} })({ feature: 'x', spaceId: 'marker-off' }).done;
+    await podSelfImplementSpawn({ kubectl: off.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined })({ feature: 'x', spaceId: 'marker-off' }).done;
     expect(off.jobs[0]!.spec.template.spec.containers[0].args[0]).not.toContain('__ELANOUS_POD_DONE__');
     expect(off.calls.some((call) => call.includes('--tail=2'))).toBe(false);
   });
@@ -235,9 +237,9 @@ describe('si-task Job result marker and mirror seed', () => {
     let n = 0;
     const tails = [markerOf('run-other-launch', 0).slice(1), '__ELANOUS_POD_DONE__ rc=0\n', '__ELANOUS_POD_DONE__\n'];
     const run = markerLaunch({ conditionAt: 4, tail: () => ({ status: 0, stdout: tails[n++ % tails.length]! }), full: () => '{"stage":"pr-opened","ok":true}\n' });
-    const seen = events('si-marker-other-test');
+    const seen = events('si-marker-other-test', ['marker-other']);
     try {
-      const result = await podSelfImplementSpawn({ kubectl: run.kubectl, credentials: creds, env: {}, sleep: async () => {}, resultMarker: true })({ feature: 'x', spaceId: 'marker-other' }).done;
+      const result = await podSelfImplementSpawn({ kubectl: run.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, resultMarker: true })({ feature: 'x', spaceId: 'marker-other' }).done;
       expect(result.exitCode).toBe(0);
       expect(run.polls).toBe(4);
       expect(n).toBe(3);
@@ -250,12 +252,12 @@ describe('si-task Job result marker and mirror seed', () => {
     const markerLine = `printf '\\n%s rc=%s\\n' '__ELANOUS_POD_DONE__ ${runId}' "$rc"`;
     // A Job made before the marker: no tail read at all — the wait stays on the condition.
     const old = markerLaunch({ conditionAt: 2, tail: () => { throw new Error('tail must not be read for a pre-marker Job'); }, full: () => '{"stage":"pr-opened","ok":true}\n', existing: { runId, script: 'echo child\nexit $rc' } });
-    const r1 = await podSelfImplementSpawn({ kubectl: old.kubectl, credentials: creds, env: {}, sleep: async () => {}, resultMarker: true })({ feature: 'x', spaceId: 'reattach-old' }).done;
+    const r1 = await podSelfImplementSpawn({ kubectl: old.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, resultMarker: true })({ feature: 'x', spaceId: 'reattach-old' }).done;
     expect(r1.exitCode).toBe(0);
     expect(old.calls.some((call) => call.includes('--tail=2'))).toBe(false);
     // A Job that prints this run's marker: the early end applies.
     const marked = markerLaunch({ conditionAt: null, tail: (t) => ({ status: 0, stdout: markerOf(t, 0).slice(1) }), full: (t) => `{"stage":"pr-opened","ok":true}\n${markerOf(t, 0)}`, existing: { runId, script: `echo child\n${markerLine}\nexit $rc` } });
-    const r2 = await podSelfImplementSpawn({ kubectl: marked.kubectl, credentials: creds, env: {}, sleep: async () => {}, resultMarker: true })({ feature: 'x', spaceId: 'reattach-new' }).done;
+    const r2 = await podSelfImplementSpawn({ kubectl: marked.kubectl, credentials: creds, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined, resultMarker: true })({ feature: 'x', spaceId: 'reattach-new' }).done;
     expect(r2.exitCode).toBe(0);
     expect(marked.polls).toBe(1);
   });
@@ -273,7 +275,8 @@ describe('si-task Job result marker and mirror seed', () => {
     for (const outcome of ['ok', 'failed', 'threw'] as const) {
       const run = fakeLaunch('{"stage":"pr-opened","ok":true}\n');
       const seeds: Array<{ host: string; commit: string; callsBefore: number }> = [];
-      const seen = events(`si-mirror-seed-${outcome}-test`, true);
+      const spaceId = `mirror-seed-${outcome}`;
+      const seen = events(`si-mirror-seed-${outcome}-test`, [spaceId], true);
       try {
         const job = await run.launch({ pool: pool as never, source: { kind: 'commit', sha: SHA }, hostMirror: '/srv/mirror.git', mirrorSeedCwd: '/tmp/tree',
           seedMirror: async ({ host, commit, cwd }) => {
@@ -281,7 +284,7 @@ describe('si-task Job result marker and mirror seed', () => {
             seeds.push({ host, commit, callsBefore: run.calls.length });
             if (outcome === 'threw') throw new Error('ssh down');
             return { host, ok: outcome === 'ok', ms: 5, ...(outcome === 'failed' ? { detail: 'push rejected' } : {}) };
-          } }, `mirror-seed-${outcome}`);
+          } }, spaceId);
         expect(job.kind).toBe('Job');
         expect(seeds).toEqual([{ host: 'node-b', commit: SHA, callsBefore: expect.any(Number) }]);
         const applies = run.calls.map((call, index) => call.endsWith('apply -f -') ? index : -1).filter((index) => index >= 0);
@@ -294,7 +297,8 @@ describe('si-task Job result marker and mirror seed', () => {
     // No mirror, a PR source, or (with an injected kubectl) no head resolver for a default source: no seed — one skipped line naming why.
     let called = 0;
     const seedMirror = async () => { called++; return undefined; };
-    const skipped = events('si-mirror-seed-skipped-test', true);
+    const skippedSpaces = ['mirror-seed-default-source', 'mirror-seed-no-mirror', 'mirror-seed-pr', 'mirror-seed-no-pool', 'mirror-seed-no-seeder'];
+    const skipped = events('si-mirror-seed-skipped-test', skippedSpaces, true);
     try {
       await fakeLaunch('{"stage":"pr-opened","ok":true}\n').launch({ pool: pool as never, hostMirror: '/srv/mirror.git', seedMirror }, 'mirror-seed-default-source');
       await fakeLaunch('{"stage":"pr-opened","ok":true}\n').launch({ pool: pool as never, source: { kind: 'commit', sha: SHA }, seedMirror }, 'mirror-seed-no-mirror');
@@ -319,7 +323,8 @@ describe('si-task Job result marker and mirror seed', () => {
       const run = fakeLaunch('{"stage":"pr-opened","ok":true}\n');
       const resolves: Array<{ repoUrl: string; base?: string; cwd: string }> = [];
       const seeds: Array<{ host: string; commit: string; cwd: string; callsBefore: number }> = [];
-      const seen = events(`si-seed-default-${outcome}-test`, true);
+      const spaceId = `seed-default-${outcome}`;
+      const seen = events(`si-seed-default-${outcome}-test`, [spaceId], true);
       try {
         const job = await run.launch({ pool: pool as never, hostMirror: '/srv/mirror.git', mirrorSeedCwd: '/tmp/tree', repoUrl: 'https://example.invalid/r',
           resolveSourceHead: async (o) => {
@@ -327,7 +332,7 @@ describe('si-task Job result marker and mirror seed', () => {
             if (outcome === 'threw') throw new Error('ls-remote hung');
             return outcome === 'resolved' ? { sha: HEAD, originCalls: 1 } : outcome === 'not-a-sha' ? { sha: 'HEAD' } : { reason: 'ls-remote-failed' };
           },
-          seedMirror: async ({ host, commit, cwd }) => { seeds.push({ host, commit, cwd, callsBefore: run.calls.length }); return { host, ok: true, ms: 3 }; } }, `seed-default-${outcome}`);
+          seedMirror: async ({ host, commit, cwd }) => { seeds.push({ host, commit, cwd, callsBefore: run.calls.length }); return { host, ok: true, ms: 3 }; } }, spaceId);
         expect(job.kind).toBe('Job');
         expect(resolves).toEqual([{ repoUrl: 'https://example.invalid/r', cwd: '/tmp/tree' }]);
         if (outcome === 'resolved') {
@@ -361,8 +366,10 @@ describe('si-task Job result marker and mirror seed', () => {
     const run = fakeLaunch('ELANOUS_POD_SOURCE_IO {"originCalls":0,"checkoutFiles":0,"sourceVia":"mirror","sourceSeconds":1,"sourceStatus":"complete","pushCalls":null,"installRan":null,"installSeconds":null}\n{"stage":"pr-opened","ok":true}\n');
     const pool = { tryAcquire: () => ({ context: 'test-context', sshHost: 'node-b', capacity: 2 }), release: () => {}, snapshot: () => ({}) };
     const ioRows: Array<Record<string, unknown>> = [];
+    const job = podJobName('source-io-host-origin-count');
     const off = debug.registerSink({ name: 'si-source-io-host-origin-count-test', emit: (record) => {
-      if (record.category === 'pod.source' && record.event === 'io-summary') ioRows.push(record.data as Record<string, unknown>);
+      const data = record.data as Record<string, unknown>;
+      if (record.category === 'pod.source' && record.event === 'io-summary' && data.job === job) ioRows.push(data);
     } });
     try {
       await run.launch({ pool: pool as never, hostMirror: '/srv/mirror.git', mirrorSeedCwd: '/tmp/tree',

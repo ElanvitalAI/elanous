@@ -165,13 +165,13 @@ test('RELEASE-NOTES-EN-AUTOFIX preserves inline comments and CRLF, accepts ASCII
     stateRoot: state,
     translateLine: (line) => {
       calls.push(line);
-      return line.includes('숫자') ? 'English ٣' : line.includes('계정') ? 'Added 3 accounts' : 'Translated public item';
+      return line.includes('숫자') ? 'English ٣' : line.includes('계정') ? 'Added 3 accounts' : 'Claude·Codex — “Translated public item”';
     },
   });
   expect(result.outcome).toBe('ok');
   expect(result.translationFallbacks).toBe(1);
   expect(calls).toEqual(['한국어 공개 항목', '한국어 계정 항목', '한국어 숫자 항목']);
-  expect(readFileSync(notes, 'utf8')).toBe('# 9.9.9\r\n\r\n## Behavior changes\r\n\r\n- Translated public item <!-- retain this marker -->\r\n- Added 3 accounts\r\n- 한국어 숫자 항목\r\n');
+  expect(readFileSync(notes, 'utf8')).toBe('# 9.9.9\r\n\r\n## Behavior changes\r\n\r\n- Claude·Codex — “Translated public item” <!-- retain this marker -->\r\n- Added 3 accounts\r\n- 한국어 숫자 항목\r\n');
 });
 
 test('RELEASE-NOTES-EN-AUTOFIX preserves inline code, comments, and the original line on partial failure', () => {

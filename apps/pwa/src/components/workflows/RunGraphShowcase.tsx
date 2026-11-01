@@ -6,15 +6,17 @@ import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
 import { LiveRunGraph } from '@/components/live-run/LiveRunGraph';
 import { liveRunPicks } from '@/lib/live-run-view';
 import { runGraphAdaptiveEvidence } from '@/lib/run-graph-flow';
+import { kstClock } from '@/lib/live-run-scene';
 import type { HarnessRunTraversal } from '@/nexus/client';
 
 const PANELS = ['리서치', '업무 비서(리니어·흡수·브라우저)', '만드는 엘라누스(마법사·손·영상)'] as const;
 
-function RunPanel({ index, title, runId, picks, onSelect }: {
+function RunPanel({ index, title, runId, picks, selectionVersion, onSelect }: {
   index: number;
   title: string;
   runId: string | null;
   picks: ReturnType<typeof liveRunPicks>;
+  selectionVersion: number;
   onSelect: (runId: string | null) => void;
 }) {
   const client = useNexusClient();
@@ -25,6 +27,22 @@ function RunPanel({ index, title, runId, picks, onSelect }: {
     refetchInterval: (query) => (query.state.data as HarnessRunTraversal | undefined)?.status === 'running' ? 4000 : false,
   });
   const evidence = useMemo(() => runGraphAdaptiveEvidence(traversal.data?.graphEvents), [traversal.data?.graphEvents]);
+  const [nodeSelection, setNodeSelection] = useState<{ version: number; nodeId: string | null }>({ version: -1, nodeId: null });
+  const selectedNode = nodeSelection.version === selectionVersion ? nodeSelection.nodeId : null;
+  const [reportState, setReportState] = useState<{ version: number; open: boolean }>({ version: -1, open: false });
+  const [focusResetVersion, setFocusResetVersion] = useState(0);
+  const reportOpen = reportState.version === selectionVersion && reportState.open;
+  const selectedSteps = traversal.data?.steps.filter((step) => step.node === selectedNode) ?? [];
+  const selectedEvents = traversal.data?.graphEvents?.filter((event) =>
+    (event.type === 'node-added' && event.node === selectedNode)
+    || (event.type === 'unit-expanded' && event.node === selectedNode)
+    || (event.type === 'unit-collapsed' && event.node === selectedNode)
+    || (event.type === 'edge-rerouted' && (event.from === selectedNode || event.to === selectedNode)),
+  ) ?? [];
+  const run = traversal.data;
+  const elapsed = run?.startedAt && run.endedAt
+    ? Math.max(0, Date.parse(run.endedAt) - Date.parse(run.startedAt))
+    : null;
 
   return (
     <section aria-label={`${title} 그래프 패널`} data-testid={`showcase-panel-${index}`} className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-surface">
@@ -77,8 +95,41 @@ function RunPanel({ index, title, runId, picks, onSelect }: {
               ? evidence.handNodes.map((event) => <p key={`${event.seq}:${event.node}`} className="truncate text-text-secondary" title={event.what ?? event.reason}>{event.who ?? event.decider} → {event.what ?? event.node}{event.missionId ? ` · ${event.missionId}` : ''}</p>)
               : <p className="text-text-tertiary">이 런 원장에 기록된 손 노드 없음</p>}
           </section>
-          <div className="min-h-0 flex-1">
-            <LiveRunGraph runId={runId} sceneOnly />
+          {selectedNode && (
+            <section aria-label={`${title} 노드 근거 미리보기`} data-testid={`node-evidence-${index}`} className="mx-2 mb-2 rounded border border-primary/40 bg-primary/5 p-2 text-[10px]">
+              <header className="flex items-center gap-2">
+                <h4 className="font-semibold">근거 · <span className="font-mono">{selectedNode}</span></h4>
+                <button type="button" className="ml-auto rounded border border-border px-1.5" onClick={() => {
+                  setNodeSelection({ version: selectionVersion, nodeId: null });
+                  setFocusResetVersion((version) => version + 1);
+                }}>닫기</button>
+              </header>
+              {selectedSteps.length > 0 ? <ol className="mt-1 space-y-1">
+                {selectedSteps.map((step, stepIndex) => <li key={`${step.at}:${stepIndex}`}>
+                  방문 {step.visit} · {step.outcome ?? '도는 중'} · <time dateTime={step.at} title={step.at}>{kstClock(step.at)}</time>{step.detail ? ` · ${step.detail}` : ''}
+                </li>)}
+              </ol> : <p className="mt-1 text-text-tertiary">이 노드의 traversal step 기록 없음</p>}
+              {selectedEvents.length > 0 ? <ul className="mt-1 space-y-1">
+                {selectedEvents.map((event) => <li key={`${event.seq}:${event.type}`}>graph event #{event.seq} · {event.type} · <time dateTime={event.ts} title={event.ts}>{kstClock(event.ts)}</time>{'reason' in event ? ` · ${event.reason}` : ''}</li>)}
+              </ul> : <p className="mt-1 text-text-tertiary">연결된 graph event 기록 없음</p>}
+            </section>
+          )}
+          <section className="mx-2 mb-2 rounded border border-border">
+            <button type="button" aria-expanded={reportOpen} aria-controls={`showcase-report-${index}`} data-testid={`showcase-report-toggle-${index}`}
+              onClick={() => setReportState({ version: selectionVersion, open: !reportOpen })} className="flex w-full items-center justify-between p-2 text-left text-[10px] font-semibold">
+              결과 리포트 {reportOpen ? '접기' : '펼치기'} <span aria-hidden="true">{reportOpen ? '−' : '+'}</span>
+            </button>
+            {reportOpen && <div id={`showcase-report-${index}`} data-testid={`showcase-report-${index}`} className="space-y-1 border-t border-border p-2 text-[10px]">
+              <p>{run?.title ?? run?.graphId ?? '이름 없는 런'} · 상태 {run?.status ?? '기록 없음'}{run?.stage ? ` · 단계 ${run.stage}` : ''}</p>
+              <p>시작 {run?.startedAt ?? '기록 없음'} · 종료 {run?.endedAt ?? '진행 중/기록 없음'}{elapsed !== null ? ` · 경과 ${Math.round(elapsed / 1000)}초` : ''}</p>
+              <p>원장 단계 {run?.steps.length ?? 0} · ledger events {run?.ledgerEvents ?? 0}{run?.prNumber !== null && run?.prNumber !== undefined ? ` · PR #${run.prNumber}` : ''}{run?.substrate ? ` · ${run.substrate}` : ''}</p>
+              {run?.steps.length ? <ol className="list-inside list-decimal space-y-0.5">
+                {run.steps.map((step, stepIndex) => <li key={`${step.at}:${stepIndex}`}>{step.node} · {step.outcome ?? '도는 중'}{step.detail ? ` · ${step.detail}` : ''}</li>)}
+              </ol> : <p className="text-text-tertiary">원장에 기록된 단계 없음</p>}
+            </div>}
+          </section>
+          <div className="min-h-[300px] flex-1">
+            <LiveRunGraph runId={runId} clearFocusVersion={focusResetVersion} onNodeSelect={(nodeId) => setNodeSelection({ version: selectionVersion, nodeId })} />
           </div>
         </>
       ) : (
@@ -96,7 +147,10 @@ export function RunGraphShowcase({ onExit }: { onExit?: () => void } = {}) {
     queryFn: () => client.getHarnessRunsSince(7 * 24 * 3600_000),
   });
   const picks = useMemo(() => runs.data ? liveRunPicks(runs.data.entries, runs.data.finished ?? []) : [], [runs.data]);
-  const [runIds, setRunIds] = useState<Array<string | null>>([null, null, null]);
+  const [runSelections, setRunSelections] = useState<Array<{ runId: string | null; version: number }>>([
+    { runId: null, version: 0 }, { runId: null, version: 0 }, { runId: null, version: 0 },
+  ]);
+  const runIds = runSelections.map((selection) => selection.runId);
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
@@ -105,11 +159,11 @@ export function RunGraphShowcase({ onExit }: { onExit?: () => void } = {}) {
         {runs.isLoading && <p className="text-text-tertiary">런 목록을 읽는 중…</p>}
         {runs.isError && <p role="alert" className="text-error">런 목록을 읽지 못했습니다.</p>}
       </div>
-      <div className="grid min-h-0 flex-1 gap-2 overflow-hidden px-2 pb-2 lg:grid-cols-3">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-auto px-2 pb-2 md:grid-cols-2 xl:grid-cols-3">
         {PANELS.map((title, index) => (
-          <RunPanel key={title} index={index} title={title} runId={runIds[index] ?? null}
+          <RunPanel key={title} index={index} title={title} runId={runIds[index] ?? null} selectionVersion={runSelections[index]!.version}
             picks={picks.filter((pick) => !runIds.some((selected, slot) => slot !== index && selected === pick.runId))}
-            onSelect={(next) => setRunIds((current) => current.map((value, slot) => slot === index ? next : value))} />
+            onSelect={(next) => setRunSelections((current) => current.map((selection, slot) => slot === index ? { runId: next, version: selection.version + 1 } : selection))} />
         ))}
       </div>
     </div>

@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { gateImagePinPath, readGateImagePin, resolveGateImagePin, writeGateImagePin } from './gate-image-pin.js';
+import { dirname, join } from 'node:path';
+import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
+  writeGateImagePin } from './gate-image-pin.js';
+import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 
 const digestA = `sha256:${'a'.repeat(64)}`;
 const digestB = `sha256:${'b'.repeat(64)}`;
+const digestC = `sha256:${'c'.repeat(64)}`;
 
 describe('resolveGateImagePin', () => {
   it('selects one immutable digest for the first sweep and excludes pools without it', () => {
@@ -77,4 +80,89 @@ describe('resolveGateImagePin', () => {
         image: `elanous-harness:${'a'.repeat(12)}`, commit: 'a'.repeat(40) });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+it('keeps a Job on its run-pinned digest and reports tag drift without a push', () => {
+  const pinned = `sha256:${'a'.repeat(64)}`;
+  const drifted = `sha256:${'b'.repeat(64)}`;
+  const commit = 'd'.repeat(40);
+  const sync = pinnedGateImageSync({ runId: 'release-run-7', commit, digest: pinned, image: 'elanous-harness:local',
+    members: [{ context: 'pool-test', registry: 'k3d-elanous-registry:5050' }], probeTagDigest: () => drifted });
+  expect(sync.images.get('pool-test')).toEqual({ ok: true, action: 'fresh', detail: 'run-pinned-digest; tag push skipped', ms: 0,
+    imageRef: `k3d-elanous-registry:5050/elanous-harness@${pinned}` });
+  expect(sync.tagDrifts).toEqual([{ event: 'image-tag-drift', runId: 'release-run-7',
+    tag: `k3d-elanous-registry:5050/elanous-harness:${commit.slice(0, 12)}`,
+    pinnedDigest: pinned, observedDigest: drifted, reason: 'digest-changed', context: 'pool-test' }]);
+  const imageRef = sync.images.get('pool-test')!.imageRef;
+  const manifest = podCommandJobManifest({ name: 'gate-pinned-image', namespace: 'elanous-test', image: imageRef,
+    imagePullPolicy: 'IfNotPresent', repoUrl: 'https://example.invalid/repo', command: ['true'], skills: [], clone: true,
+    source: { kind: 'commit', sha: commit }, deadlineSeconds: 120,
+    provenance: { actorKind: 'seat', actor: 'TC', kind: 'gate-shard', run: 'release-run-7', phase: 'release-gate',
+      requestedAt: '2026-10-31T12:00:00.000Z' } });
+  const spec = manifest.spec as { template: { spec: { containers: Array<{ image: string; imagePullPolicy: string }> } } };
+  expect(spec.template.spec.containers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
+});
+
+it('probes a fully-qualified image by commit tag without duplicating the registry prefix', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const observed = `sha256:${'b'.repeat(64)}`;
+  const commit = 'e'.repeat(40);
+  const sync = pinnedGateImageSync({ runId: 'release-run-no-tag', commit, digest, image: 'docker.io/library/elanous-harness',
+    members: [{ context: 'pool-test', registry: 'registry.example' }], probeTagDigest: () => observed });
+
+  expect(sync.tagDrifts).toEqual([{ event: 'image-tag-drift', runId: 'release-run-no-tag',
+    tag: `registry.example/library/elanous-harness:${commit.slice(0, 12)}`, pinnedDigest: digest, observedDigest: observed,
+    reason: 'digest-changed',
+    context: 'pool-test' }]);
+  expect(sync.images.get('pool-test')?.imageRef).toBe(`registry.example/library/elanous-harness@${digest}`);
+});
+
+it('records an unavailable commit tag instead of silently omitting drift evidence', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const commit = 'e'.repeat(40);
+  const sync = pinnedGateImageSync({ runId: 'release-run-missing-tag', commit, digest, image: 'elanous-harness:local',
+    members: [{ context: 'pool-test', registry: 'registry.example:5000' }], probeTagDigest: () => null });
+
+  expect(sync.tagDrifts).toEqual([{ event: 'image-tag-drift', runId: 'release-run-missing-tag',
+    tag: `registry.example:5000/elanous-harness:${commit.slice(0, 12)}`, pinnedDigest: digest,
+    observedDigest: null, reason: 'tag-unavailable', context: 'pool-test' }]);
+});
+
+it('archives every tip transition in an A→B→A→B sequence without overwriting prior pins', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-image-pin-archive-cycle-'));
+  try {
+    const runId = 'run-pin-cycle';
+    const path = gateImagePinPath(root, '0.2.44', runId);
+    const commits = ['a', 'b', 'a', 'b'].map((letter) => letter.repeat(40));
+    writeGateImagePin(path, runId, digestA, `elanous-harness:${commits[0]!.slice(0, 12)}`, commits[0]!);
+    for (const [index, commit] of commits.slice(1).entries()) {
+      const priorCommit = commits[index]!;
+      const nextDigest = index === 1 ? digestC : index % 2 ? digestA : digestB;
+      expect(replaceGateImagePin(path, runId, nextDigest, `elanous-harness:${commit.slice(0, 12)}`,
+        commit, `elanous-harness:${commit.slice(0, 12)}`, priorCommit)).toBeTruthy();
+    }
+    const archives = readdirSync(dirname(path)).filter((name) => name.startsWith(`${path.split('/').at(-1)}.superseded-`));
+    expect(archives).toHaveLength(3);
+    expect(new Set(archives).size).toBe(3);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('retries an interrupted tip replacement while the previous active pin remains readable', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-image-pin-replacement-retry-'));
+  try {
+    const runId = 'run-pin-replace-retry';
+    const oldCommit = 'c'.repeat(40);
+    const newCommit = 'd'.repeat(40);
+    const oldImage = `elanous-harness:${oldCommit.slice(0, 12)}`;
+    const newImage = `elanous-harness:${newCommit.slice(0, 12)}`;
+    const path = gateImagePinPath(root, '0.2.44', runId);
+    writeGateImagePin(path, runId, digestA, oldImage, oldCommit);
+    const interruptedArchive = supersedeGateImagePin(path, runId, oldImage, newCommit);
+    expect(interruptedArchive).not.toBeNull();
+    expect(readGateImagePin(path, runId, oldImage, oldCommit)?.digest).toBe(digestA);
+
+    const archivePath = replaceGateImagePin(path, runId, digestB, newImage, newCommit, newImage, oldCommit);
+    expect(readGateImagePin(path, runId, newImage, newCommit)?.digest).toBe(digestB);
+    expect(JSON.parse(readFileSync(archivePath, 'utf8'))).toMatchObject({ commit: oldCommit, digest: digestA });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

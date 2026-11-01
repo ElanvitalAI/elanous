@@ -16,11 +16,13 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
 import { releaseReadiness } from './release-readiness.js';
 import { latestPublishedPreviousVersion, runUnattendedRelease, type UnattendedReleaseDeps } from './unattended-release.js';
-import { loadExportConfig, run as runPublicExport, selectExportFiles } from '../public-export.js';
+import { gitIgnoredExportFiles, loadExportConfig, run as runPublicExport, selectExportFiles } from '../public-export.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
+import { NODE_REGISTRY, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 
 export type PreflightLevel = 'ok' | 'warn' | 'block';
-export type PreflightCheck = 'checklist' | 'postpub' | 'run-input' | 'freeze' | 'schedule' | 'export' | 'notes' | 'cut-tree' | 'gate-slot' | 'release-notes';
+export type PreflightCheck = 'checklist' | 'postpub' | 'run-input' | 'freeze' | 'schedule' | 'export' | 'notes' | 'cut-tree' | 'gate-slot' | 'release-notes'
+  | 'cutoff-notes' | 'gitignored-export' | 'pwa-build' | 'gate-image';
 export interface PreflightFinding { level: PreflightLevel; check: PreflightCheck; id?: string; message: string; suggestion?: string }
 export interface GateMeasure { version: string; runId: string; gateSeconds: number; toPublishSeconds?: number }
 const compareStable = (a: string, b: string) => { const x = a.split('.').map(Number), y = b.split('.').map(Number); return x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!; };
@@ -33,6 +35,7 @@ export interface PreflightResult {
   findings: PreflightFinding[];
   schedule: { cutAt: string; landBy: string | null; publishAt: string | null; publishAtSource: 'option' | 'schedule' | 'cadence' | null; exportCheckAt: string } | null;
   exportCheck: { mainSha: string; files: number; leaks: number; codeLiterals: number } | null;
+  cutoffExportCheck: { commit: string; gitIgnoredLeaks: number | null; error?: string } | null;
   /** Read-only T−120 evidence. It describes checks only; it never means a release stage ran. */
   countdownReadiness: {
     status: 'green' | 'red' | 'unmeasured';
@@ -128,6 +131,12 @@ export interface PreflightDeps {
   previousVersion?: string;
   /** Injectable for deterministic preflight tests. Production pins origin/main and scans a disposable checkout. */
   exportCheck?: () => Promise<{ mainSha: string; files: number; leaks: number; codeLiterals: number }>;
+  /** Release cut −60: build the pinned candidate PWA from a disposable checkout. */
+  pwaBuildCheck?: (commit: string) => Promise<{ ok: boolean; detail: string; commit?: string }>;
+  /** Release cut −60: count export-gitignored hits against the exact cutoff tree. */
+  gitIgnoredExportCheck?: (commit: string) => Promise<number | null>;
+  /** Release cut −60: prove the candidate's immutable commit tag exists in at least one configured gate pool. */
+  gateImageTagCheck?: (commit: string, poolSpec: string) => { checked: boolean; pools: string[]; detail?: string };
   /** Countdown T−120/T−60/T0: the cut manifest `cutoff.ts` pinned (default `<instance>/release/<v>/manifest.json`). */
   manifest?: (version: string) => CountdownManifest | null;
   /** Countdown T−60: the «node-b» gate-slot record (default `<instance>/release/<v>/gate-slot.json`). */
@@ -146,6 +155,14 @@ function runGit(cwd: string, args: string[]): string {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 << 20 });
   if (result.status !== 0) throw new Error(`git ${args.join(' ')} 실패 rc=${result.status}: ${(result.stderr ?? '').trim().slice(0, 300)}`);
   return (result.stdout ?? '').trim();
+}
+
+/** Avoid partial-clone promisor remotes turning a missing fixture/cut SHA into an implicit network fetch. */
+function hasLocalCommit(repoRoot: string, commit: string): boolean {
+  const result = spawnSync('git', ['cat-file', '-e', `${commit}^{commit}`], {
+    cwd: repoRoot, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' }, encoding: 'utf8', timeout: 5_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
+  return result.status === 0;
 }
 
 /** Read-only main snapshot: all checkout and cleanup writes are contained in a disposable temp directory. */
@@ -223,6 +240,100 @@ export async function scanReleaseNotesAddedLines(previousVersion: string | undef
   const added = Number(numstat.split('\t', 1)[0]);
   if (!Number.isSafeInteger(added) || added < 0) throw new Error(`release/next.md diff 결과를 읽을 수 없다: ${numstat}`);
   return added;
+}
+
+/** Count files selected by the cutoff commit's public-export manifest that its own .gitignore would hide. */
+export async function scanGitIgnoredExportAtCommit(commit: string): Promise<number | null> {
+  if (!/^[0-9a-f]{40}$/i.test(commit)) return null;
+  const repoRoot = runGit(process.cwd(), ['rev-parse', '--show-toplevel']);
+  if (!hasLocalCommit(repoRoot, commit)) return null;
+  const temp = mkdtempSync(join(tmpdir(), 'release-preflight-gitignored-'));
+  const snapshot = join(temp, 'checkout');
+  try {
+    runGit(temp, ['clone', '--shared', '--no-checkout', '--quiet', repoRoot, snapshot]);
+    runGit(snapshot, ['read-tree', commit]);
+    runGit(snapshot, ['checkout-index', '--all', '--force']);
+    const tracked = runGit(snapshot, ['ls-files', '-z']).split('\0').filter(Boolean);
+    const config = loadExportConfig(snapshot);
+    return gitIgnoredExportFiles(snapshot, selectExportFiles(tracked, config)).length;
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+/** Build the PWA from an exact candidate commit in a disposable snapshot; never build the caller's dirty tree. */
+export async function scanPwaBuildAtCommit(commit: string): Promise<{ ok: boolean; detail: string; commit: string }> {
+  if (!/^[0-9a-f]{40}$/i.test(commit)) return { ok: false, detail: `candidate commit is not pinned: ${commit || '(missing)'}`, commit };
+  const repoRoot = runGit(process.cwd(), ['rev-parse', '--show-toplevel']);
+  if (!hasLocalCommit(repoRoot, commit)) return { ok: false, detail: `candidate commit is unavailable locally: ${commit}`, commit };
+  const temp = mkdtempSync(join(tmpdir(), 'release-preflight-pwa-'));
+  const snapshot = join(temp, 'checkout');
+  const run = (cmd: string, args: string[], cwd: string, timeout = 60_000) => spawnSync(cmd, args, {
+    cwd, encoding: 'utf8', timeout, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
+  const failureDetail = (result: ReturnType<typeof run>): string =>
+    (result.stderr || result.stdout || (result.error instanceof Error ? result.error.message : '') || `exit ${result.status}`).trim();
+  try {
+    const clone = run('git', ['clone', '--shared', '--no-checkout', '--quiet', repoRoot, snapshot], temp);
+    if (clone.status !== 0) return { ok: false, detail: `candidate checkout failed: ${failureDetail(clone)}`, commit };
+    const tree = run('git', ['read-tree', commit], snapshot);
+    if (tree.status !== 0) return { ok: false, detail: `candidate tree unavailable: ${failureDetail(tree)}`, commit };
+    const checkout = run('git', ['checkout-index', '--all', '--force'], snapshot);
+    if (checkout.status !== 0) return { ok: false, detail: `candidate files unavailable: ${failureDetail(checkout)}`, commit };
+    const rootInstall = run('bun', ['install', '--frozen-lockfile'], snapshot, 300_000);
+    if (rootInstall.status !== 0) return { ok: false, detail: `candidate dependency install failed: ${failureDetail(rootInstall).slice(-500)}`, commit };
+    const pwaInstall = run('bun', ['install', '--frozen-lockfile'], join(snapshot, 'apps/pwa'), 300_000);
+    if (pwaInstall.status !== 0) return { ok: false, detail: `PWA dependency install failed: ${failureDetail(pwaInstall).slice(-500)}`, commit };
+    const build = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], snapshot, 15 * 60_000);
+    const detail = (build.status === 0 ? build.stdout : failureDetail(build)).trim().slice(-800);
+    // The snapshot was checked out at `commit`; echo that pin so injected evidence still has to match it.
+    return { ok: build.status === 0 && !build.error, detail: detail || `nexus build exit ${build.status}`, commit };
+  } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error), commit };
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+/** Read pool tags with a bounded SSH timeout; local pools use the image's immutable commit label. */
+export function scanGateImageTag(commit: string, poolSpec: string): { checked: boolean; pools: string[]; detail?: string } {
+  if (!/^[0-9a-f]{40}$/i.test(commit)) return { checked: false, pools: [], detail: 'cutoff commit is not pinned' };
+  try {
+    const members = parsePodPool(poolSpec);
+    if (!members.length) return { checked: false, pools: [], detail: 'gate pool is empty' };
+    const pools: string[] = [];
+    const errors: string[] = [];
+    for (const member of members) {
+      if (!member.sshHost) {
+        const local = spawnSync('docker', ['image', 'inspect', 'elanous-harness:local', '--format', '{{index .Config.Labels "elanous.commit"}}'], { encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+        if (local.status === 0 && local.stdout.trim() === commit) pools.push(member.context);
+        else if (local.error || local.status === null) errors.push(`${member.context}: ${local.error?.message ?? 'docker inspection unavailable'}`);
+        continue;
+      }
+      const registry = member.registry ?? NODE_REGISTRY;
+      const portMatch = /:(\d+)$/.exec(registry);
+      if (!portMatch) {
+        errors.push(`${member.context}: registry port is missing (${registry})`);
+        continue;
+      }
+      // Remote registry tags use the 12-character prefix per pod-pool.ts; local elanous.commit labels are full SHAs.
+      const port = portMatch[1]!;
+      const image = 'elanous-harness';
+      const remote = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', member.sshHost,
+        `curl -fsS --max-time 5 http://localhost:${port}/v2/${image}/tags/list 2>/dev/null`], { encoding: 'utf8', timeout: 12_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (remote.status !== 0) {
+        errors.push(`${member.context}: registry query failed${remote.error ? ` (${remote.error.message})` : ` (rc=${remote.status})`}`);
+        continue;
+      }
+      try {
+        const tags = (JSON.parse(remote.stdout) as { tags?: string[] }).tags ?? [];
+        if (tags.includes(commit.slice(0, 12))) pools.push(member.context);
+      } catch { errors.push(`${member.context}: registry tag response was not valid JSON`); }
+    }
+    return { checked: errors.length === 0, pools, ...(errors.length ? { detail: errors.join('; ') } : {}) };
+  } catch (error) {
+    return { checked: false, pools: [], detail: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 const POSTPUB_ID = /^POSTPUB-/i;
@@ -343,6 +454,9 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
   // Always the stored cut (before or after it): the preflight simulates «the cut», not the moment it is run.
   const judgeAt = schedule ? new Date(Date.parse(schedule.cutAt)) : now;
   const data = listChecklist(version);
+  const cutoffManifest = deps.countdown
+    ? (deps.manifest ?? ((v: string) => readReleaseJson<CountdownManifest>(v, 'manifest.json')))(version)
+    : null;
   const { autoMoved, ...gate } = cutChecklistGate(version, schedule?.landBy, judgeAt);
   const p0 = data.items.filter((item) => item.status === 'yellow' && item.priority === 'P0').map((item) => item.id);
   const byId = new Map(data.items.map((item) => [item.id, item]));
@@ -387,7 +501,8 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
 
   // 3a. Public export leakage is measured against one pinned origin/main commit, never this possibly dirty branch.
   try {
-    exportCheck = await (deps.exportCheck ?? scanOriginMainExport)();
+    const scanned = await (deps.exportCheck ?? scanOriginMainExport)();
+    exportCheck = scanned;
     findings.push(exportCheck.leaks
       ? { level: 'block', check: 'export', message: `origin/main ${exportCheck.mainSha.slice(0, 12)} 공개 export 누수 ${exportCheck.leaks}건 · ${exportCheck.files} 파일 검사` }
       : { level: 'ok', check: 'export', message: `origin/main ${exportCheck.mainSha.slice(0, 12)} 공개 export 누수 0건 · ${exportCheck.files} 파일 검사` });
@@ -398,25 +513,90 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
 
   // 3. The same input check `release run --dry-run` makes.
   let runPrevious: string | undefined;
+  let gatePodPool: string | undefined;
   try {
     const result = await (deps.runInput ?? ((v: string) => runUnattendedRelease({ version: v, dryRun: true }, deps.releaseRunDeps ?? {})))(version);
     const input = result.input as { previousVersion?: string; gatePodPool?: string };
     runPrevious = input.previousVersion;
+    gatePodPool = input.gatePodPool;
     findings.push({ level: 'ok', check: 'run-input', message: `release run --dry-run 입력 OK — 직전 판 ${input.previousVersion ?? '-'} · 게이트 풀 ${input.gatePodPool ?? '-'}` });
   } catch (error) {
     findings.push({ level: 'block', check: 'run-input', message: `release run --dry-run 입력 오류 — ${error instanceof Error ? error.message : String(error)}` });
   }
 
   let notesAddedLines: number | null = null;
+  let cutoffExportCheck: PreflightResult['cutoffExportCheck'] = null;
+  const manifestNotesEmpty = cutoffManifest?.escalate?.some((item) => item.kind === 'notes-empty') === true;
+  const fragments = cutoffManifest?.fragments;
+  const manifestNoteSummary = fragments
+    && [fragments.byPr, fragments.byNextMd, fragments.unlinked, fragments.unknown].every(Number.isFinite)
+    ? `PR ${fragments.byPr} · next.md ${fragments.byNextMd} · unlinked ${fragments.unlinked} · unknown ${fragments.unknown}`
+    : null;
   if (deps.countdown) {
     try {
       notesAddedLines = await (deps.releaseNotesCheck ?? scanReleaseNotesAddedLines)(runPrevious, exportCheck?.mainSha);
       findings.push(notesAddedLines > 0
-        ? { level: 'ok', check: 'release-notes', message: `직전 발행 ${runPrevious} 이후 고정 main의 release/next.md 추가 ${notesAddedLines}줄` }
+        ? { level: 'ok', check: 'release-notes', message: `직전 발행 ${runPrevious ?? '-'} 이후 고정 main의 release/next.md 추가 ${notesAddedLines}줄` }
         : { level: 'block', check: 'release-notes', message: `직전 발행 ${runPrevious ?? '-'} 이후 고정 main의 release/next.md 추가 줄이 없다` });
     } catch (error) {
-      findings.push({ level: 'warn', check: 'release-notes', message: `release/next.md 변경을 측정하지 못했다 — ${error instanceof Error ? error.message : String(error)}` });
+      const message = error instanceof Error ? error.message : String(error);
+      findings.push({ level: 'warn', check: 'release-notes', message: `release/next.md 변경을 측정하지 못했다 — ${message}` });
     }
+
+    const candidateCommit = cutoffManifest?.cutoff?.sha ?? '';
+    // cutoff.ts already classifies all public note sources (PR fragments and next.md lines) and emits
+    // notes-empty only when the manifest contains no user-visible feat/fix/security line.
+    const notesEmpty = manifestNotesEmpty;
+    const notesDetail = notesEmpty
+      ? 'notes-empty — 컷 manifest가 공개용 feat/fix/security 노트가 없다고 판정했다'
+      : `컷 manifest 노트 분류: ${manifestNoteSummary ?? '확인 불가'}`;
+    const emptyManifestNotes = fragments !== undefined
+      && fragments.byPr === 0 && fragments.byNextMd === 0 && fragments.unlinked === 0 && fragments.unknown === 0;
+    const cutoffNotesMissing = !candidateCommit || manifestNoteSummary === null || notesEmpty || emptyManifestNotes;
+    findings.push({
+      level: cutoffNotesMissing ? 'block' : 'ok', check: 'cutoff-notes',
+      message: notesDetail,
+      ...(cutoffNotesMissing ? { suggestion: 'cutoff manifest를 만들고 고정 후보 트리의 release/next.md 에 사용자용 feat/fix 줄을 더한 뒤 다시 검사한다' } : {}),
+    });
+
+    let ignoredLeaks: number | null = null;
+    let ignoredLeaksError: string | undefined;
+    try { ignoredLeaks = await (deps.gitIgnoredExportCheck ?? scanGitIgnoredExportAtCommit)(candidateCommit); }
+    catch (error) {
+      ignoredLeaks = null;
+      ignoredLeaksError = error instanceof Error ? error.message : String(error);
+    }
+    cutoffExportCheck = { commit: candidateCommit, gitIgnoredLeaks: ignoredLeaks, ...(ignoredLeaksError ? { error: ignoredLeaksError } : {}) };
+    findings.push(ignoredLeaks === 0
+      ? { level: 'ok', check: 'gitignored-export', message: `컷 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'} public-export export-gitignored 0건` }
+      : { level: 'block', check: 'gitignored-export', message: ignoredLeaks === null || ignoredLeaks === undefined
+        ? `컷 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'} public-export export-gitignored 결과를 확인하지 못했다${ignoredLeaksError ? ` — ${ignoredLeaksError}` : ''}`
+        : `컷 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'} public-export export-gitignored ${ignoredLeaks}건`,
+        suggestion: '공개 export 입력 중 .gitignore 에 걸리는 파일을 제거하거나 공개 정책을 고치고 검사를 다시 실행한다' });
+
+    let pwa: { ok: boolean; detail: string; commit?: string };
+    try {
+      pwa = await (deps.pwaBuildCheck ?? scanPwaBuildAtCommit)(candidateCommit);
+      const pwaOk = pwa.ok && pwa.commit === candidateCommit;
+      findings.push(pwaOk
+        ? { level: 'ok', check: 'pwa-build', message: `PWA 빌드 통과 · ${candidateCommit.slice(0, 12)}` }
+      : { level: 'block', check: 'pwa-build', message: `PWA 빌드 실패 또는 SHA 불일치(${pwa.commit ?? '미기록'} ≠ ${candidateCommit}) · ${pwa.detail}`,
+          suggestion: `고정 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'}에서 apps/pwa 빌드를 통과시킨다` });
+    } catch (error) {
+      pwa = { ok: false, detail: error instanceof Error ? error.message : String(error) };
+      findings.push({ level: 'block', check: 'pwa-build', message: `PWA 빌드 증거를 확인하지 못했다 · ${pwa.detail}`,
+        suggestion: `고정 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'}에서 apps/pwa 빌드를 통과시킨다` });
+    }
+
+    const imageCheck = gatePodPool
+      ? (deps.gateImageTagCheck ?? scanGateImageTag)(candidateCommit, gatePodPool)
+      : { checked: false, pools: [], detail: 'release run 입력에서 gatePodPool을 얻지 못했다' };
+    findings.push(imageCheck.checked && imageCheck.pools.length > 0
+      ? { level: 'ok', check: 'gate-image', message: `컷 후보 gate 이미지 태그 ${candidateCommit.slice(0, 12)} 확인 · 풀 ${imageCheck.pools.join(', ')}` }
+      : { level: 'block', check: 'gate-image', message: imageCheck.checked
+        ? `컷 후보 gate 이미지 태그 ${candidateCommit.slice(0, 12) || '(SHA 없음)'}가 어느 풀에도 없다`
+        : `컷 후보 gate 이미지 태그를 확인하지 못했다 · ${imageCheck.detail ?? '원인 미상'}`,
+        suggestion: `컷 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'}의 gate 이미지를 하나 이상의 풀에 빌드·반입한 뒤 preflight 를 다시 실행한다` });
   }
 
   // 4. Landing freeze (emergency switch since RELEASE-BRANCH): when on, `release run` refuses.
@@ -488,7 +668,7 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
   const blockers = findings.filter((f) => f.level === 'block').length;
   const warnings = findings.filter((f) => f.level === 'warn').length;
   debug.log('release.preflight', 'checked', { version, blockers, warnings });
-  return { version, next, verdict: blockers ? 'block' : warnings ? 'warn' : 'ok', blockers, warnings, findings, schedule: scheduleOut, exportCheck, countdownReadiness, previousVersion, gateMeasure, fallbackGateMeasure };
+  return { version, next, verdict: blockers ? 'block' : warnings ? 'warn' : 'ok', blockers, warnings, findings, schedule: scheduleOut, exportCheck, cutoffExportCheck, countdownReadiness, previousVersion, gateMeasure, fallbackGateMeasure };
 }
 
 const ICON: Record<PreflightLevel, string> = { ok: '✅', warn: '⚠️', block: '⛔' };
@@ -507,13 +687,13 @@ const COUNTDOWN_OFFSET_MINUTES: Record<CountdownStage, number> = { 'T-120': 120,
 /** Which existing finding group each stage judges — the check vocabulary of `releasePreflight`, not a new rule set. */
 const COUNTDOWN_CHECKS: Record<CountdownStage, PreflightCheck[]> = {
   'T-120': ['checklist', 'postpub', 'notes', 'release-notes', 'export'],
-  'T-60': ['run-input', 'freeze', 'cut-tree', 'gate-slot'],
+  'T-60': ['run-input', 'freeze', 'cut-tree', 'gate-slot', 'cutoff-notes', 'gitignored-export', 'pwa-build', 'gate-image'],
   'T-30': ['schedule'],
   T0: [],
 };
 const COUNTDOWN_LABELS: Record<CountdownStage, string> = {
   'T-120': '노트(next.md 새 줄) · 공개 export 누수 · 체크리스트 게이트 모의',
-  'T-60': 'preflight(컷 트리 고정) ⊕ node-b 게이트 자리(디스패처 정지 · podTarget 감축)',
+  'T-60': '컷 후보 P0 네 항목(노트 · gitignore export · PWA · gate 이미지) ⊕ node-b 게이트 자리',
   'T-30': 'gate window 준비(컷→발행 창 ≥ 직전 실측 게이트)',
   T0: '컷 트리 확인(실제 컷 실행은 별도)',
 };

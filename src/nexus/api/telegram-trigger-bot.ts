@@ -123,9 +123,9 @@ export function createTelegramTriggerLogger(
  *  TelegramEvent shape. Congruent fields (`src/telegram.ts:166-180`
  *  comment) so the wire is a near-identity with `raw` carrying the
  *  full payload (messageId · isDm) for debugging. */
-export function toTelegramEvent(tap: TgTriggerEvent): TelegramEvent {
-  const envelope = receiveChannelEvent('telegram', tap);
-  if (!envelope || envelope instanceof Promise) throw new Error('telegram connector cannot normalize accepted tap');
+export async function toTelegramEvent(tap: TgTriggerEvent): Promise<TelegramEvent> {
+  const envelope = await receiveChannelEvent('telegram', tap);
+  if (!envelope) throw new Error('telegram connector cannot normalize accepted tap');
   return {
     kind: tap.kind,
     chat: envelope.channel ?? tap.chat,
@@ -149,10 +149,10 @@ export function buildTelegramTriggerTap(
   return (tap: TgTriggerEvent): void => {
     // Fire-and-forget — workflow dispatch errors surface via the
     // workflow daemon's lifecycle bus, not the polling loop. Any
-    // synchronous throw lands here so the chat reply (no-op in this
-    // bot) keeps flowing.
+    // normalization and dispatch rejections land here so the polling
+    // loop and other accepted taps keep flowing.
     void Promise.resolve()
-      .then(() => dispatch(toTelegramEvent(tap)))
+      .then(async () => dispatch(await toTelegramEvent(tap)))
       .catch((err: unknown) => {
         const reason = err instanceof Error ? err.message : String(err);
         log(`workflow dispatch failed: ${reason}`);

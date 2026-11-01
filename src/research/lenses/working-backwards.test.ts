@@ -93,6 +93,7 @@ test('THINK-LENS-T1-WORKING-BACKWARDS: 채권 금리 질문(지시문 없이)에
   let ladderPrompt = '';
   let followupCalls = 0;
   const result = await runResearchQuestionLadder('미국 10년물 국채 금리는 6개월 안에 어떤 방향으로 움직일까?', {
+    enableResearchFanout: false,
     generateContract: async (prompt) => {
       contractPrompt = prompt;
       return JSON.stringify(contract);
@@ -107,14 +108,14 @@ test('THINK-LENS-T1-WORKING-BACKWARDS: 채권 금리 질문(지시문 없이)에
       plan: [],
       axes: axes.map((axis) => ({
         questionId: axis.id,
-        evidence: axis.id === 'q6' ? [] : [{
+        evidence: axis.id === 'q6' ? [] : ['example.org', 'example.net'].map((host) => ({
           questionId: axis.id,
           sourceKind: 'web-search:test',
-          source: `https://example.org/${axis.id}`,
-          content: `Evidence ${axis.id}`,
+          source: `https://${host}/${axis.id}`,
+          content: `Evidence ${axis.id} from ${host}`,
           outcome: 'complete' as const,
           truncated: false,
-        }],
+        })),
       })),
     }),
     gapFollowup: async () => {
@@ -124,15 +125,15 @@ test('THINK-LENS-T1-WORKING-BACKWARDS: 채권 금리 질문(지시문 없이)에
         timeBudgetMs: 120_000,
         classifications: [{ questionId: 'q6', gap: '비교 섹션 근거 누락', action: 'auto-fill', reason: 'auto-fill-eligible', skill: 'omni-crawl' }],
         followups: [{ questionId: 'q6', skill: 'omni-crawl', query: '미국 10년물 국채 금리는 6개월 안에 어떤 방향으로 움직일까? 비교 섹션 근거 누락' }],
-        followupEvidence: [{
+        followupEvidence: ['example.org', 'example.net'].map((host) => ({
           questionId: 'q6',
-          sourceKind: 'skill:omni-crawl',
-          source: 'omni-crawl',
+          sourceKind: 'web-fetch:omni-crawl',
+          source: `https://${host}/q6`,
           observedAt: '2026-10-26T00:00:00.000Z',
-          content: '시나리오별 비교 근거를 확보했다.',
-          outcome: 'complete',
+          content: `시나리오별 비교 근거 · ${host}`,
+          outcome: 'complete' as const,
           truncated: false,
-        }],
+        })),
       };
     },
     routeOutput: noOutputSkillRoute,
@@ -146,10 +147,14 @@ test('THINK-LENS-T1-WORKING-BACKWARDS: 채권 금리 질문(지시문 없이)에
 
   // 빈 칸이 남아 있으면(q6 미완료) 그 칸에 대한 노드 계획과 함께 갭 후속이 돈다
   expect(followupCalls).toBe(1);
-  expect(result.ladder.evidence).toHaveLength(7);
-  expect(result.ladder.evidence.at(-1)).toMatchObject({ questionId: 'q6', outcome: 'complete' });
+  expect(result.ok).toBe(true);
+  expect(result.ladder.evidence).toHaveLength(13);
+  expect(result.ladder.evidence.slice(-2)).toMatchObject([
+    { questionId: 'q6', source: 'https://example.org/q6', outcome: 'complete' },
+    { questionId: 'q6', source: 'https://example.net/q6', outcome: 'complete' },
+  ]);
 
-  // 골격 칸이 답 구조로 나온다 — 계약 슬롯별 채움 상태, 다 차면 멈춘 경계
+  // 두 게시자의 축 근거 뒤 갭 후속도 독립 출처 두 곳을 돌려 슬롯을 채우면 멈춘다
   expect(result.output).toContain('## Answer skeleton (Working Backwards output contract)');
   expect(result.output).toContain('- [conclusion] 결론 — 각 시나리오에서 선택할 기준을 제시한다. — filled');
   expect(result.output).toContain('- [comparison] 비교 — 가정과 근거가 다른 점을 나란히 보여준다. — filled');
@@ -157,7 +162,7 @@ test('THINK-LENS-T1-WORKING-BACKWARDS: 채권 금리 질문(지시문 없이)에
   expect(result.output.indexOf('## Output contract')).toBeLessThan(result.output.indexOf('## Answer skeleton'));
   expect(result.output.indexOf('## Answer skeleton')).toBeLessThan(result.output.indexOf('## q1 · Bloom'));
 
-  // 완료 경계 관측: 축 산개 뒤 comparison 빈 칸 → axis q6 노드 계획 → 후속 뒤 stop(debug.log)
+  // 완료 경계 관측: 축 산개 뒤 comparison 빈 칸 → axis q6 노드 계획 → 두 웹 게시자 후속 뒤 stop
   // (같은 프로세스의 다른 시험 파일 턴 이벤트와 섞이므로 최신 이벤트부터 이 턴 고유 노드 계획으로 특정한다)
   const latest = debug.events(500).slice().reverse();
   const fanoutBoundary = latest.find((event) => event.category === 'research.turn'
@@ -179,14 +184,14 @@ test('THINK-LENS-T1-WORKING-BACKWARDS: 완료 경계 단위는 출력 계약 →
   ]);
   expect(beforeQuestions.complete).toBe(false);
 
-  const completeEvidence = bondQuestions.map((question) => ({
+  const completeEvidence = bondQuestions.flatMap((question) => ['example.org', 'example.net'].map((host) => ({
     questionId: question.id,
     sourceKind: 'web-search:test',
-    source: `https://example.org/${question.id}`,
-    content: `Evidence ${question.id}`,
+    source: `https://${host}/${question.id}`,
+    content: `Evidence ${question.id} from ${host}`,
     outcome: 'complete' as const,
     truncated: false,
-  }));
+  })));
   const filled = planWorkingBackwardsCompletion(contract, bondQuestions, completeEvidence);
   expect(filled.blankSlots).toEqual([]);
   expect(filled.nodePlan).toEqual([]);

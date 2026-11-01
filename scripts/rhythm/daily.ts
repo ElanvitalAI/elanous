@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { Database } from 'bun:sqlite';
 import { dirname, join } from 'node:path';
@@ -537,6 +538,7 @@ function sendNewsAfterReview(delivery: DeliveryResult, file: string, markdown: s
 }
 
 export type DailyDeps = { now?: () => Date; root?: string; vaultRoot?: string | null; sendEnabled?: boolean; repoRoot?: string; repoName?: string;
+  runId?: string;
   landings?: (now: Date) => Promise<Landing[]>; release?: () => Promise<Release>; loops?: () => Promise<Loop[]>;
   grid?: () => Promise<Seat[]>; decisions?: () => Promise<Pending[]>; news?: () => Promise<News[]>;
   cooAdmin?: (now: Date) => Promise<string>;
@@ -569,6 +571,7 @@ function copyToVault(markdown: string, now: Date, deps: DailyDeps): { vaultError
 
 export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; stage?: 'collect' | 'compose' | 'deliver' } = {}, deps: DailyDeps = {}) {
   const now = (deps.now ?? (() => new Date()))();
+  const runId = deps.runId ?? randomUUID();
   const receiptKey = `RHYTHM-DAILY:${kstDay(now)}`;
   if (options.stage === 'compose' || options.stage === 'deliver') {
     const file = join(deps.root ?? effectiveInstanceRoot(), 'rhythm', 'daily', `${kstDay(now)}.md`);
@@ -628,7 +631,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
             if (deps.log) deps.log('loop.rhythm-daily', 'linear-progress-config-blocked', { reason: 'issue-allowlist-missing' });
             else loopEvent('rhythm-daily', 'linear-progress-config-blocked', { reason: 'issue-allowlist-missing' });
           } else {
-            linearProgress = await (deps.linearProgressSync ?? runLinearProgressSync)({ version: checklistDevVersion(devVersion()), now, root: deps.root,
+            linearProgress = await (deps.linearProgressSync ?? runLinearProgressSync)({ version: checklistDevVersion(devVersion()), now, root: deps.root, runId,
               apply: true, allowIssueIdentifiers,
               log: (event, data) => deps.log ? deps.log('loop.rhythm-daily.linear-progress', event, data)
                 : loopEvent('rhythm-daily.linear-progress', event, data) });

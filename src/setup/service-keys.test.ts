@@ -62,6 +62,54 @@ describe('service key setup storage boundary', () => {
     expect(output.join('\n')).not.toContain('sentinel-unverified');
   });
 
+  test('injects the verifier through the actual import path using catalog service ids', async () => {
+    const root = cacheDir();
+    const env: NodeJS.ProcessEnv = {};
+    const output: string[] = [];
+    const calls: Array<{ provider: string; apiKey: string }> = [];
+    const secret = 'xai-injected-verifier-secret';
+    const result = await importServiceKeys(
+      parseServiceKeyEnv(`XAI_API_KEY=${secret}`),
+      { print: line => output.push(line) },
+      {
+        config: buildUserConfig(join(root, 'config.json')),
+        env,
+        cacheDir: root,
+        verifier: async input => {
+          calls.push(input);
+          return { success: true, verification: 'verified' };
+        },
+      },
+    );
+    expect(calls).toEqual([{ provider: 'xai', apiKey: secret }]);
+    expect(result).toEqual({ stored: ['XAI_API_KEY'], rejected: [], unverified: [] });
+    expect(env.XAI_API_KEY).toBe(secret);
+    expect(output.join('\n')).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  test('injected external failure is reduced to a secret-free reason and does not store the key', async () => {
+    const root = cacheDir();
+    const env: NodeJS.ProcessEnv = {};
+    const output: string[] = [];
+    const secret = 'openrouter-rejected-secret';
+    const result = await importServiceKeys(
+      parseServiceKeyEnv(`OPENROUTER_API_KEY=${secret}`),
+      { print: line => output.push(line) },
+      {
+        config: buildUserConfig(join(root, 'config.json')),
+        env,
+        cacheDir: root,
+        verifier: async () => ({ success: false, reason: 'invalid', httpStatus: 401 }),
+      },
+    );
+    expect(result).toEqual({ stored: [], rejected: ['OPENROUTER_API_KEY'], unverified: [] });
+    expect(env.OPENROUTER_API_KEY).toBeUndefined();
+    expect(output.join('\n')).toContain('검증 invalid (HTTP 401)');
+    expect(output.join('\n')).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
   test('Gemini key is sent in the authentication header, never in the request URL', async () => {
     const secret = 'gemini-key-sentinel';
     let requestedUrl = '';

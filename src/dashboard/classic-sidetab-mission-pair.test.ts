@@ -1,8 +1,21 @@
 import { expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { TaskNotificationQueue } from '../agent/task-notification.js';
+import type { ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
 import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionPairSessionRegistry } from './classic-sidetab-mission.js';
 import { createDashboardClassicSidetabMissionCallbacks } from './index.js';
 import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
+
+let workspaceDir: string;
+function createWorkspace(): string {
+  workspaceDir = mkdtempSync(join(tmpdir(), 'classic-pair-synthesis-'));
+  return workspaceDir;
+}
+function cleanupWorkspace(): void {
+  if (workspaceDir) rmSync(workspaceDir, { recursive: true, force: true });
+}
 
 test('tool response lists both mission IDs in its body without an unused ids field', async () => {
   const mission = createDashboardClassicSidetabMissionCallbacks(
@@ -15,7 +28,7 @@ test('tool response lists both mission IDs in its body without an unused ids fie
     }),
   );
   const result = await mission.dispatchTool(CLASSIC_SIDETAB_MISSION_TOOL_NAME, {
-    agent: 'codex', mission: 'first', parallelMission: 'second',
+    agent: 'codex', mission: 'first', parallelMission: 'second \\| with slash',
   });
   expect(result).toMatchObject({ status: 'running', id: 'codex-mission' });
   expect(result?.body).toContain('codex-mission');
@@ -24,13 +37,14 @@ test('tool response lists both mission IDs in its body without an unused ids fie
 });
 
 test('production pair seam starts both PTYs, binds both IDs, and routes one joined result to the parent call', async () => {
+  const cwd = createWorkspace();
   const queue = new TaskNotificationQueue();
   queue.clear();
   const registry = createClassicSidetabMissionPairSessionRegistry();
   const sessions = new Map<string, { id: string; cwd: string }>();
   const spawned: string[] = [];
   const ran: Array<{ agent: string; prompt: string; sessionId?: string; missionId?: string }> = [];
-  const resolveByAgent = new Map<string, (value: { ok: boolean; content: string }) => void>();
+  const resolveByAgent = new Map<string, (value: ClassicSidetabMissionResult) => void>();
   let id = 0;
 
   const started = startClassicSidetabMissionPair({
@@ -38,7 +52,7 @@ test('production pair seam starts both PTYs, binds both IDs, and routes one join
     context: { callId: 'parent-tool-call-42', parentSessionId: 'parent-session-7' },
     spawnVisible: (agent) => {
       spawned.push(agent);
-      const session = { id: `${agent}-pty`, cwd: '/work' };
+      const session = { id: `${agent}-pty`, cwd };
       sessions.set(session.id, session);
       return session;
     },
@@ -62,8 +76,8 @@ test('production pair seam starts both PTYs, binds both IDs, and routes one join
     { agent: 'claude', prompt: 'Build the first half.', sessionId: 'claude-pty', missionId: 'mission-2' },
   ]);
 
-  resolveByAgent.get('codex')!({ ok: true, content: 'Codex result' });
-  resolveByAgent.get('claude')!({ ok: true, content: 'Claude result' });
+  resolveByAgent.get('codex')!({ ok: true, content: 'Codex result', path: join(cwd, 'codex-result.md') });
+  resolveByAgent.get('claude')!({ ok: true, content: 'Claude result', path: join(cwd, 'claude-result.md') });
   await started.completion;
 
   expect(queue.drainForParentSession('other-parent')).toEqual([]);
@@ -72,19 +86,28 @@ test('production pair seam starts both PTYs, binds both IDs, and routes one join
   expect(delivered[0]).toMatchObject({
     taskId: 'parent-tool-call-42', parentSessionId: 'parent-session-7', agentName: 'Codex + Claude', state: 'done',
   });
-  expect(delivered[0]!.output).toContain('Codex result');
-  expect(delivered[0]!.output).toContain('Claude result');
+  const notification = JSON.parse(delivered[0]!.output) as { body: string };
+  expect(delivered[0]!.output.length).toBeLessThanOrEqual(500);
+  expect(delivered[0]!.resultPath).toBeTruthy();
+  expect(notification.body).toContain('Full comparison attached');
+  const synthesis = readFileSync(delivered[0]!.resultPath!, 'utf8');
+  expect(synthesis).toContain('| Codex | Build the second half. | codex-result.md | 성공 | 채택');
+  expect(synthesis).toContain('| Claude Code | Build the first half. | claude-result.md | 성공 | 채택');
+  expect(synthesis).toContain('Codex result');
+  expect(synthesis).toContain('Claude result');
   expect(registry.cancel('mission-1', (sessionId) => sessions.has(sessionId), (sessionId) => sessions.delete(sessionId))).toBeUndefined();
+  cleanupWorkspace();
 });
 
 test('pair opens Codex last for the completion-marker workaround regardless of primary mission agent', async () => {
+  const cwd = createWorkspace();
   const spawned: string[] = [];
   const ran: Array<{ agent: string; prompt: string; sessionId?: string }> = [];
   const started = startClassicSidetabMissionPair({
     agent: 'codex', mission: 'Codex prompt.', parallelMission: 'Claude prompt.',
     spawnVisible: (agent) => {
       spawned.push(agent);
-      return { id: `${agent}-pty`, cwd: '/work' };
+      return { id: `${agent}-pty`, cwd };
     },
     runVisible: async (agent, prompt, session) => {
       ran.push({ agent, prompt, ...(session ? { sessionId: session.id } : {}) });
@@ -103,9 +126,11 @@ test('pair opens Codex last for the completion-marker workaround regardless of p
     { agent: 'claude', prompt: 'Claude prompt.', sessionId: 'claude-pty' },
   ]);
   await started.completion;
+  cleanupWorkspace();
 });
 
 test('pair safety timeout kills both registered PTYs and still emits one parent error receipt', async () => {
+  const cwd = createWorkspace();
   const queue = new TaskNotificationQueue();
   queue.clear();
   const registry = createClassicSidetabMissionPairSessionRegistry();
@@ -115,7 +140,7 @@ test('pair safety timeout kills both registered PTYs and still emits one parent 
   const started = startClassicSidetabMissionPair({
     agent: 'codex', mission: 'first', parallelMission: 'second',
     context: { callId: 'timeout-call', parentSessionId: 'parent-session-timeout' },
-    spawnVisible: (agent) => { const session = { id: `${agent}-pty`, cwd: '/work' }; sessions.add(session.id); return session; },
+    spawnVisible: (agent) => { const session = { id: `${agent}-pty`, cwd }; sessions.add(session.id); return session; },
     runVisible: async () => new Promise(() => {}),
     registry,
     hasSession: (sessionId) => sessions.has(sessionId),
@@ -127,22 +152,29 @@ test('pair safety timeout kills both registered PTYs and still emits one parent 
 
   await started.completion;
   expect(killed.sort()).toEqual(['claude-pty', 'codex-pty']);
-  expect(queue.drainForParentSession('parent-session-timeout')).toMatchObject([{
+  const receipt = queue.drainForParentSession('parent-session-timeout')[0]!;
+  expect(receipt).toMatchObject({
     taskId: 'timeout-call', parentSessionId: 'parent-session-timeout', state: 'error',
-  }]);
+  });
   expect(registry.cancel('timeout-mission-1', (sessionId) => sessions.has(sessionId), (sessionId) => sessions.delete(sessionId))).toBeUndefined();
+  expect(receipt?.resultPath).toBeTruthy();
+  expect(readFileSync(receipt.resultPath!, 'utf8')).toContain('exceeded the one-hour safety timeout');
+  cleanupWorkspace();
 });
 
 test('pair without a tool call ID still reaches only its parent via session-scoped queue routing', async () => {
+  const cwd = createWorkspace();
   const queue = new TaskNotificationQueue();
   queue.clear();
   const registry = createClassicSidetabMissionPairSessionRegistry();
   let id = 0;
   const started = startClassicSidetabMissionPair({
-    agent: 'codex', mission: 'first', parallelMission: 'second',
+    agent: 'codex', mission: 'first', parallelMission: 'second \\| with slash',
     context: { parentSessionId: 'parent-session-no-call-id' },
-    spawnVisible: (agent) => ({ id: `${agent}-pty`, cwd: '/work' }),
-    runVisible: async (agent) => ({ ok: true, content: `${agent} result` }),
+    spawnVisible: (agent) => ({ id: `${agent}-pty`, cwd }),
+    runVisible: async (agent) => agent === 'codex'
+      ? { ok: true, content: 'Codex contribution' }
+      : { ok: false, status: 'failed', error: 'Claude blocked by auth' },
     registry,
     hasSession: () => true,
     killSession: () => {},
@@ -152,19 +184,29 @@ test('pair without a tool call ID still reaches only its parent via session-scop
 
   await started.completion;
   expect(queue.drainForParentSession('sibling-session')).toEqual([]);
-  expect(queue.drainForParentSession('parent-session-no-call-id')).toMatchObject([{
-    taskId: 'no-call-mission-1', parentSessionId: 'parent-session-no-call-id', state: 'done',
-  }]);
+  const notification = queue.drainForParentSession('parent-session-no-call-id')[0]!;
+  expect(notification).toMatchObject({
+    taskId: 'no-call-mission-1', parentSessionId: 'parent-session-no-call-id', state: 'error',
+  });
+  const saved = JSON.parse(notification.output) as { status: string };
+  expect(notification.output.length).toBeLessThanOrEqual(500);
+  expect(saved.status).toBe('error');
+  expect(notification.resultPath).toBeTruthy();
+  const synthesis = readFileSync(notification.resultPath!, 'utf8');
+  expect(synthesis).toContain('| Claude Code | second &#92;&#124; with slash | 없음 | 실패/빈 결과 | 미채택 — Claude blocked by auth |');
+  expect(synthesis).toContain('| Codex | first | 없음 | 성공 | 채택');
+  cleanupWorkspace();
 });
 
 test('either public mission ID cancels both PTYs through the production pair registry', async () => {
+  const cwd = createWorkspace();
   const registry = createClassicSidetabMissionPairSessionRegistry();
   const sessions = new Set<string>();
   const killed: string[] = [];
   let id = 0;
   const started = startClassicSidetabMissionPair({
     agent: 'codex', mission: 'first', parallelMission: 'second',
-    spawnVisible: (agent) => { const session = { id: `${agent}-pty`, cwd: '/work' }; sessions.add(session.id); return session; },
+    spawnVisible: (agent) => { const session = { id: `${agent}-pty`, cwd }; sessions.add(session.id); return session; },
     runVisible: async (_agent, _prompt, _session, missionId) => ({ ok: false, status: 'cancelled', interactionId: missionId }),
     registry,
     hasSession: (sessionId) => sessions.has(sessionId),
@@ -177,4 +219,62 @@ test('either public mission ID cancels both PTYs through the production pair reg
   expect(killed.sort()).toEqual(['claude-pty', 'codex-pty']);
   await started.completion;
   expect(registry.cancel('cancel-mission-1', (sessionId) => sessions.has(sessionId), (sessionId) => sessions.delete(sessionId))).toBeUndefined();
+  cleanupWorkspace();
+});
+
+test('repeated parent call IDs create distinct pair synthesis files', async () => {
+  const cwd = createWorkspace();
+  let sessionId = 0;
+  let missionId = 0;
+  const runPair = () => startClassicSidetabMissionPair({
+    agent: 'codex' as const, mission: 'first', parallelMission: 'second',
+    context: { callId: 'same-parent-call', parentSessionId: 'repeat-parent' },
+    spawnVisible: (agent: 'codex' | 'claude') => ({ id: `${agent}-repeat-${++sessionId}`, cwd }),
+    runVisible: async (agent: 'codex' | 'claude') => ({ ok: true, content: `${agent} result` }),
+    registry: createClassicSidetabMissionPairSessionRegistry(), hasSession: () => true, killSession: () => {},
+    enqueue: (notification) => queue.enqueue(notification), createId: () => `mission-${'x'.repeat(1000)}-${++missionId}`,
+  });
+  const queue = new TaskNotificationQueue();
+  queue.clear();
+  await runPair().completion;
+  const firstNotice = queue.drainForParentSession('repeat-parent')[0]!;
+  const first = firstNotice.resultPath;
+  expect(firstNotice.output.length).toBeLessThanOrEqual(500);
+  queue.clear();
+  await runPair().completion;
+  const secondNotice = queue.drainForParentSession('repeat-parent')[0]!;
+  const second = secondNotice.resultPath;
+  expect(secondNotice.output.length).toBeLessThanOrEqual(500);
+  expect(first).toBeTruthy();
+  expect(second).toBeTruthy();
+  expect(second).not.toBe(first);
+  cleanupWorkspace();
+});
+
+test('synthesis write failure keeps bounded previews of both successful results', async () => {
+  const cwd = createWorkspace();
+  writeFileSync(join(cwd, '.elanous'), 'blocker');
+  const queue = new TaskNotificationQueue();
+  queue.clear();
+  const started = startClassicSidetabMissionPair({
+    agent: 'codex', mission: 'first', parallelMission: 'second',
+    context: { callId: 'write-failure', parentSessionId: 'write-failure-parent' },
+    spawnVisible: (agent) => ({ id: `${agent}-pty`, cwd }),
+    runVisible: async (agent) => {
+      const path = join(cwd, `${agent}-result.md`);
+      return { ok: true, path, content: `${agent} answer survives writer failure at ${path}` };
+    },
+    registry: createClassicSidetabMissionPairSessionRegistry(), hasSession: () => true, killSession: () => {},
+    enqueue: (notification) => queue.enqueue(notification),
+  });
+  await started.completion;
+  const delivered = queue.drainForParentSession('write-failure-parent')[0]!;
+  expect(delivered.state).toBe('error');
+  expect(delivered.truncated).toBe(true);
+  expect(delivered.resultPath).toBeUndefined();
+  expect(delivered.output.length).toBeLessThanOrEqual(500);
+  expect(delivered.output).toContain('codex answer survives writer failure');
+  expect(delivered.output).toContain('claude answer survives writer failure');
+  expect(delivered.output).not.toContain(join(cwd, 'codex-result.md'));
+  cleanupWorkspace();
 });

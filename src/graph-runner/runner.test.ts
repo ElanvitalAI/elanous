@@ -6,7 +6,7 @@ import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { decideGraphApproval, latestGraphRun, listGraphRuns, manageGraphRun, resolveUnit, runGraph, runGraphClassifyNode, verifyReleaseCommandRoot } from './runner.js';
+import { decideGraphApproval, latestGraphRun, listGraphRuns, manageGraphRun, resolveUnit, runGraph, runGraphClassifyNode, verifyReleaseCommandRoot, type GraphRunOptions } from './runner.js';
 import { classifyReworkBudgetShadow } from '../self-implement/classify-shadow.js';
 import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT } from '../self-implement/rework-budget-judgment.js';
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -19,6 +19,10 @@ import type { DecisionEntry } from '../decisions/decision-ledger.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+function runGraphWithGrowthScope(path: string, options: GraphRunOptions = {}): ReturnType<typeof runGraph> {
+  return runGraph(path, { ...options, deps: { ...options.deps, growthScope: 'task-agent' } });
+}
 
 async function withIsolatedClassifyState<T>(run: (root: string) => Promise<T>): Promise<T> {
   const root = mkdtempSync(join(tmpdir(), 'graph-classify-state-'));
@@ -203,6 +207,94 @@ test('aborting a graph cancels the active command and prevents dispatch of later
   expect(commandSignal).toBe(controller.signal);
   expect(run).toMatchObject({ status: 'failed', reason: 'cancelled', path: ['first'] });
   expect(run.path).not.toContain('second');
+});
+
+test('explicit fan-out runs branches concurrently, joins failures and resumes only the selected failed branch', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-fanout-'));
+  dirs.push(root);
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), [
+    'start:', '  command: "printf \'{\\\"outcome\\\":\\\"ok\\\"}\'"',
+    'a:', '  command: branch-a', 'b:', '  command: branch-b', '',
+  ].join('\n'));
+  writeFileSync(graph, `graph_id: operate-loop
+version: 1
+entry_node: start
+terminal_nodes: [landed, operate-blocked]
+nodes:
+  - { node_id: start, kind: agent, recipe: 'cmd:start', max_visits: 1 }
+  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1 }
+  - { node_id: b, kind: agent, recipe: 'cmd:b', max_visits: 1 }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: operate-blocked, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: start
+    on: outcome
+    branches: { ok: [a, b] }
+    join: joined
+  - { from: joined, on: outcome, map: { ok: landed, fail: operate-blocked } }
+`);
+  let failA = true;
+  let active = 0;
+  let maxActive = 0;
+  const startedBranches = new Set<string>();
+  let releaseBothStarted!: () => void;
+  const bothStarted = new Promise<void>((resolve) => { releaseBothStarted = resolve; });
+  const counts = new Map<string, number>();
+  let releaseBranchA!: () => void;
+  const branchAGate = new Promise<void>((resolve) => { releaseBranchA = resolve; });
+  let finishBranchB!: () => void;
+  const branchBFinished = new Promise<void>((resolve) => { finishBranchB = resolve; });
+  const deps = { root, runBash: async (command: string) => {
+    if (command === 'branch-a' || command === 'branch-b') {
+      counts.set(command, (counts.get(command) ?? 0) + 1);
+      active++;
+      maxActive = Math.max(maxActive, active);
+      startedBranches.add(command);
+      if (startedBranches.size === 2) releaseBothStarted();
+      if (command === 'branch-a') await branchAGate;
+      else { await bothStarted; finishBranchB(); }
+      active--;
+      const ok = command === 'branch-a' ? !failA : true;
+      return { stdout: JSON.stringify({ outcome: ok ? 'ok' : 'fail', artifact: command }), stderr: '', exitCode: ok ? 0 : 1 };
+    }
+    return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+  } };
+  const runId = 'fanout-incremental-persist';
+  const firstPromise = runGraph(graph, { runId, deps });
+  await branchBFinished;
+  const parentStatePath = join(root, 'graph-runs', 'operate-loop', `${runId}.json`);
+  let observedBranchCompletion = false;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (existsSync(parentStatePath)) {
+      const saved = JSON.parse(readFileSync(parentStatePath, 'utf8'));
+      const branches = saved.fanOuts?.['start:ok']?.branches;
+      if (branches?.a?.status === 'running' && branches?.b?.status === 'done') {
+        observedBranchCompletion = true;
+        break;
+      }
+    }
+    await Bun.sleep(5);
+  }
+  expect(observedBranchCompletion).toBe(true);
+  releaseBranchA();
+  const first = await firstPromise;
+  expect(maxActive).toBe(2);
+  expect(first.status).toBe('failed');
+  const fork = first.fanOuts?.['start:ok'];
+  expect(fork?.branches.a).toMatchObject({ status: 'failed', output: expect.any(String), artifactSha256: expect.any(String) });
+  expect(fork?.branches.b).toMatchObject({ status: 'done', output: expect.any(String), artifactSha256: expect.any(String) });
+  const successfulBranch = { ...fork!.branches.b! };
+
+  failA = false;
+  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'a', deps }))
+    .rejects.toThrow("--from cannot resume fan-out branch 'a'; resume from fan-out source 'start' instead");
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
+  expect(resumed.status).toBe('done');
+  expect(counts).toEqual(new Map([['branch-a', 2], ['branch-b', 1]]));
+  expect(resumed.fanOuts?.['start:ok']?.branches.b).toEqual(successfulBranch);
+  expect(resumed.path).toEqual(['start', 'joined', 'landed']);
 });
 
 // A real ledger resolves release versions from git (seconds); park tests only need a card id.
@@ -2067,7 +2159,7 @@ test('grow on follows an added outcome edge to done; off retains fallback', asyn
   expect(off.growth).toBeUndefined();
   writeFileSync(graph, `grow: on\n${source}`);
   const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
-  const on = await runGraph(graph, { deps: { root, runBash, growthProposer: proposer, log: (event, data) => { logs.push({ event, data }); } } });
+  const on = await runGraphWithGrowthScope(graph, { deps: { root, runBash, growthProposer: proposer, log: (event, data) => { logs.push({ event, data }); } } });
   expect(on.status).toBe('done');
   const added = debug.events(500).filter((entry) => entry.category === 'graph.run' && entry.event === 'edge-added' &&
     (entry.data as { runId?: string })?.runId === on.runId);
@@ -2094,10 +2186,43 @@ test('grow off preserves the fallback edge for an unknown outcome without callin
   expect(result.growth).toBeUndefined();
 });
 
+test('Pod env admits graph growth only for the exact harness scope', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8')}`);
+  const previous = process.env.ELANOUS_GRAPH_GROWTH_SCOPE;
+  const proposerCalls: string[] = [];
+  let bashCalls = 0;
+  const runBash = async () => ({ stdout: ++bashCalls === 1 ? '{"outcome":"needs-research"}\n' : '{"outcome":"ok"}\n', stderr: '', exitCode: 0 });
+  const proposer = () => {
+    proposerCalls.push('called');
+    return { node: { nodeId: 'research', kind: 'agent' as const, recipe: 'none', maxVisits: 1,
+      contract: { inputs: [], tools: 'read-only' as const, outputs: [] } }, returnTo: 'second', reason: 'research needed' };
+  };
+  try {
+    process.env.ELANOUS_GRAPH_GROWTH_SCOPE = 'harness';
+    const admitted = await runGraph(graph, { deps: { root, runBash, growthProposer: proposer } });
+    expect(admitted.path).toEqual(['first', 'research', 'second', 'done']);
+    expect(proposerCalls).toHaveLength(1);
+
+    proposerCalls.length = 0;
+    bashCalls = 0;
+    process.env.ELANOUS_GRAPH_GROWTH_SCOPE = 'task-agent';
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const rejected = await runGraph(graph, { deps: { root, runBash, growthProposer: proposer, log: (event, data) => logs.push({ event, data }) } });
+    expect(rejected.path).toEqual(['first', 'second', 'done']);
+    expect(rejected.growth).toBeUndefined();
+    expect(proposerCalls).toHaveLength(0);
+    expect(logs).toContainEqual({ event: 'growth-scope-rejected', data: expect.objectContaining({ reason: 'not-allowlisted' }) });
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_GROWTH_SCOPE;
+    else process.env.ELANOUS_GRAPH_GROWTH_SCOPE = previous;
+  }
+});
+
 test('rejected growth retains the original fallback and records its reason', async () => {
   const { graph, root } = fixture('exit 0');
   writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8')}`);
-  const result = await runGraph(graph, { deps: { root, runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
+  const result = await runGraphWithGrowthScope(graph, { deps: { root, runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
     growthProposer: () => ({ node: { nodeId: 'done', kind: 'agent', recipe: 'none', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'invalid' }) } });
   expect(result.path).toEqual(['first', 'second', 'done']);
@@ -2111,7 +2236,7 @@ test('an accepted growth survives an interrupted run and resume follows its save
   const deps = { root, runBash: async (body: string) => ({ stdout: body.includes('exit 0') ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }),
     growthProposer: () => ({ node: { nodeId: 'research', kind: 'agent', recipe: 'none', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'need research' }) };
-  const first = await runGraph(graph, { deps });
+  const first = await runGraphWithGrowthScope(graph, { deps });
   expect(first.path).toEqual(['first', 'research', 'second', 'done']);
   const saved = JSON.parse(readFileSync(first.statePath, 'utf8'));
   saved.status = 'running';
@@ -2130,7 +2255,7 @@ test('an accepted growth survives an interrupted run and resume follows its save
 test('missing return edge falls back and records a rejection instead of executing a dead-end node', async () => {
   const { graph, root } = fixture('exit 0');
   writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8')}`);
-  const run = await runGraph(graph, { deps: { root, runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
+  const run = await runGraphWithGrowthScope(graph, { deps: { root, runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
     growthProposer: () => ({ node: { nodeId: 'dead-end', kind: 'agent', recipe: 'none', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, reason: 'missing return' }) } });
   expect(run.status).toBe('done');
@@ -2157,9 +2282,10 @@ test('a human growth decision resumes into the added edge or the original fallba
       runBash: async (body: string) => { calls.push(body); return { stdout: calls.length === 1 ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }; },
       growthProposer: () => ({ node: { nodeId: 'publish', kind: 'agent', recipe: 'cmd:publish', maxVisits: 1,
         contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'publish' }) };
-    const parked = await runGraph(graph, { deps });
+    const parked = await runGraphWithGrowthScope(graph, { deps });
     expect(parked.status).toBe('awaiting-approval');
     expect(parked.growthPark?.decisionId).toBe('D-growth');
+    expect(parked.growthEvents?.map((event) => event.phase)).toEqual(['proposal', 'parked']);
     expect(entries).toHaveLength(1);
     await expect(runGraph(graph, { resumeRunId: parked.runId, deps })).rejects.toThrow('growth is parked for human confirmation');
     entries[0] = { ...entries[0]!, status: 'decided', choice, decidedBy: { kind: 'auto', agent: 'robot', delegation: 'test' } };
@@ -2169,6 +2295,10 @@ test('a human growth decision resumes into the added edge or the original fallba
     expect(resumed.status).toBe('done');
     expect(resumed.path).toEqual(choice === 'a' ? ['first', 'publish', 'second', 'done'] : ['first', 'second', 'done']);
     expect(resumed.growth ?? []).toHaveLength(choice === 'a' ? 1 : 0);
+    expect(resumed.growthEvents?.map((event) => event.phase)).toEqual(choice === 'a'
+      ? ['proposal', 'parked', 'applied', 'undo-available']
+      : ['proposal', 'parked', 'rejected']);
+    if (choice === 'b') expect(resumed.growthEvents?.at(-1)).not.toHaveProperty('undo');
     expect(calls.some(body => body.includes('published'))).toBe(choice === 'a');
     expect(entries).toHaveLength(1);
   }
@@ -2189,7 +2319,7 @@ test('a recipe with both approval and command records its resolved command on th
     runBash: async (body: string) => { calls.push(body); return { stdout: calls.length === 1 ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }; },
     growthProposer: () => ({ node: { nodeId: 'publish', kind: 'agent', recipe: 'approval:publish', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'publish' }) };
-  const parked = await runGraph(graph, { deps });
+  const parked = await runGraphWithGrowthScope(graph, { deps });
   expect(parked.status).toBe('awaiting-approval');
   expect(parked.growthPark).toMatchObject({ command: { command: 'printf published' }, approval: 'Publish now?' });
   expect(entries).toHaveLength(1);
@@ -2225,7 +2355,7 @@ test('a card cannot approve a changed parked node, command or approval', async (
       runBash: async (body: string) => { calls.push(body); return { stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }; },
       growthProposer: () => ({ node: { nodeId: 'publish', kind: 'agent', recipe: 'approval:publish', maxVisits: 1,
         contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'publish' }) };
-    const parked = await runGraph(graph, { deps });
+    const parked = await runGraphWithGrowthScope(graph, { deps });
     expect(parked.growthPark).toBeDefined();
     expect(entries).toHaveLength(1);
     entries[0] = { ...entries[0]!, status: 'decided', choice: 'a', decidedBy: { kind: 'human' } };
@@ -2259,7 +2389,7 @@ test('a changed parked command cannot execute under its old human approval', asy
     runBash: async (body: string) => { calls.push(body); return { stdout: calls.length === 1 ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }; },
     growthProposer: () => ({ node: { nodeId: 'publish', kind: 'agent', recipe: 'cmd:publish', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'publish' }) };
-  const parked = await runGraph(graph, { deps });
+  const parked = await runGraphWithGrowthScope(graph, { deps });
   expect(parked.growthPark?.command?.command).toBe('printf original');
   expect(entries[0]?.pendingQuestion).toContain('printf original');
   entries[0] = { ...entries[0]!, status: 'decided', choice: 'a', decidedBy: { kind: 'human' } };
@@ -2292,7 +2422,7 @@ test('an approval-only growth card cannot run a command added to its recipe afte
     runBash: async (body: string) => { calls.push(body); return { stdout: calls.length === 1 ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }; },
     growthProposer: () => ({ node: { nodeId: 'publish', kind: 'agent', recipe: 'approval:publish', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'publish' }) };
-  const parked = await runGraph(graph, { deps });
+  const parked = await runGraphWithGrowthScope(graph, { deps });
   expect(parked.growthPark?.approval).toBe('Publish now?');
   expect(parked.growthPark?.command).toBeUndefined();
   entries[0] = { ...entries[0]!, status: 'decided', choice: 'a', decidedBy: { kind: 'human' } };
@@ -2332,7 +2462,7 @@ test('a rejected approval node never runs its command', async () => {
 test('external side-effect growth parks and cannot be approved into execution', async () => {
   const { graph, root } = fixture('exit 0');
   writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8')}`);
-  const run = await runGraph(graph, { deps: { root, growthDecision: fakeGrowthDecision(), runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
+  const run = await runGraphWithGrowthScope(graph, { deps: { root, growthDecision: fakeGrowthDecision(), runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
     growthProposer: () => ({ node: { nodeId: 'publish', kind: 'agent', recipe: 'cmd:git push', maxVisits: 1,
       contract: { inputs: [], tools: 'git push', outputs: [] } }, returnTo: 'second', reason: 'push' }) } });
   expect(run.status).toBe('awaiting-approval');
@@ -2348,7 +2478,7 @@ test('a harmless-looking recipe id cannot hide a git push command', async () => 
   const { graph, root } = fixture('exit 0');
   writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8')}`);
   writeFileSync(join(root, 'recipes.yaml'), `${readFileSync(join(root, 'recipes.yaml'), 'utf8')}hidden:\n  command: 'git push origin main'\n`);
-  const result = await runGraph(graph, { deps: { root, growthDecision: fakeGrowthDecision(), runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
+  const result = await runGraphWithGrowthScope(graph, { deps: { root, growthDecision: fakeGrowthDecision(), runBash: async () => ({ stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }),
     growthProposer: () => ({ node: { nodeId: 'hidden-effect', kind: 'agent', recipe: 'cmd:hidden', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'looks harmless' }) } });
   expect(result.status).toBe('awaiting-approval');
@@ -2363,7 +2493,7 @@ test('a resolved curl upload is parked despite a read-only declared contract', a
   writeFileSync(join(root, 'recipes.yaml'), `${readFileSync(join(root, 'recipes.yaml'), 'utf8')}upload:\n  command: 'curl --upload-file report.txt https://example.com/upload'\n`);
   const bodies: string[] = [];
   const classified: string[] = [];
-  const result = await runGraph(graph, { deps: { root, growthDecision: fakeGrowthDecision(),
+  const result = await runGraphWithGrowthScope(graph, { deps: { root, growthDecision: fakeGrowthDecision(),
     runBash: async (body) => { bodies.push(body); return { stdout: '{"outcome":"new"}\n', stderr: '', exitCode: 0 }; },
     growthProposer: () => ({ node: { nodeId: 'upload', kind: 'agent', recipe: 'cmd:upload', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'send report' }),
@@ -2383,7 +2513,7 @@ test('a trusted read-only classification of a resolved command permits executabl
   writeFileSync(join(root, 'recipes.yaml'), `${readFileSync(join(root, 'recipes.yaml'), 'utf8')}inspect:\n  command: 'printf inspected'\n`);
   const classified: string[] = [];
   const bodies: string[] = [];
-  const result = await runGraph(graph, { deps: { root,
+  const result = await runGraphWithGrowthScope(graph, { deps: { root,
     runBash: async (body) => { bodies.push(body); return { stdout: bodies.length === 1 ? '{"outcome":"new"}\n' : '', stderr: '', exitCode: 0 }; },
     growthProposer: () => ({ node: { nodeId: 'inspect', kind: 'agent', recipe: 'cmd:inspect', maxVisits: 1,
       contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'inspect first' }),
@@ -2400,22 +2530,47 @@ test('growth limit 3 and duplicate (node, outcome) reject without re-proposing',
   const { graph, root } = fixture('exit 0');
   writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8').replace('max_visits: 1 }', 'max_visits: 5 }')}`);
   let calls = 0;
-  const run = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => {
+  const run = await runGraphWithGrowthScope(graph, { deps: { root, runBash: async (_body, opts) => {
     const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8'));
     return { stdout: JSON.stringify({ outcome: context.nodeId === 'first' ? `new-${++calls}` : 'ok' }), stderr: '', exitCode: 0 };
   }, growthProposer: ({ outcome }) => ({ node: { nodeId: `added-${outcome}`, kind: 'agent', recipe: 'none', maxVisits: 1,
     contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'first', reason: outcome }) } });
   expect(run.growth).toHaveLength(3);
   expect(run.growthRejections?.at(-1)?.reason).toBe('growth limit 3 reached');
+  expect(run.growthEvents?.filter((event) => event.phase === 'proposal')).toHaveLength(3);
+  expect(run.growthEvents?.at(-1)?.phase).toBe('rejected');
   expect(run.path).toEqual(['first', 'added-new-1', 'first', 'added-new-2', 'first', 'added-new-3', 'first', 'second', 'done']);
   expect(calls).toBe(4);
+});
+
+test('growth proposal limit 8 rejects the ninth unmatched outcome without calling the proposer', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-growth-cap-8-'));
+  dirs.push(root);
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'first:\n  command: "exit 0"\n');
+  writeFileSync(graph, `grow: on\ngraph_id: growth-cap-8\nversion: 1\nentry_node: first\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 11 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - from: first\n    on: outcome\n    map: { ok: first, fail: failed }\n`);
+  let nodeCalls = 0;
+  let proposerCalls = 0;
+  const run = await runGraphWithGrowthScope(graph, { deps: { root,
+    runBash: async () => ({ stdout: JSON.stringify({ outcome: ++nodeCalls <= 9 ? `unmapped-${nodeCalls}` : 'fail' }), stderr: '', exitCode: 0 }),
+    growthProposer: async () => { proposerCalls += 1; return undefined; },
+  } });
+  expect(run.growthAttempts).toBe(8);
+  expect(proposerCalls).toBe(8);
+  expect(nodeCalls).toBe(10);
+  expect(run.path).toHaveLength(11);
+  expect(run.growthEvents?.filter((event) => event.phase === 'proposal')).toHaveLength(8);
+  expect(run.growthRejections?.at(-1)?.reason).toBe('growth proposal limit 8 reached');
+  expect(run.growthRejections?.filter((event) => event.reason === 'growth proposal limit 8 reached')).toHaveLength(1);
+  expect(run.growthEvents?.at(-1)?.phase).toBe('rejected');
+  expect(run.growthEvents?.filter((event) => event.phase === 'rejected' && event.reason === 'growth proposal limit 8 reached')).toHaveLength(1);
 });
 
 test('one (node, outcome) growth is reused on a revisit rather than proposed again', async () => {
   const { graph, root } = fixture('exit 0');
   writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8').replace('max_visits: 1 }', 'max_visits: 3 }')}`);
   let proposals = 0;
-  const result = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => ({
+  const result = await runGraphWithGrowthScope(graph, { deps: { root, runBash: async (_body, opts) => ({
     stdout: JSON.stringify({ outcome: JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')).nodeId === 'first' ? 'new' : 'ok' }),
     stderr: '', exitCode: 0,
   }), growthProposer: () => { proposals++; return { node: { nodeId: 'research', kind: 'agent', recipe: 'none', maxVisits: 3,

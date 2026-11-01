@@ -9,7 +9,7 @@ import { podCodex503Scenario, simPodCodex503 } from './fault-pod-codex-503.js';
 import { createFakeKubectl } from './fake-kubectl.js';
 import { measurePoolLease, recommendConcurrency } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
-import { loadMockScenarioCatalog, parseMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioList } from './mock-scenario-catalog.js';
+import { loadMockScenarioCatalog, parseMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioDevices, renderMockScenarioList } from './mock-scenario-catalog.js';
 
 const REPO = resolve(import.meta.dir, '../..');
 const catalog = loadMockScenarioCatalog();
@@ -17,7 +17,7 @@ const catalog = loadMockScenarioCatalog();
 test('catalog schema, scenario/device links, evidence contract, and all ux-sim runtime modules are indexed', () => {
   expect(parseMockScenarioCatalog(catalog)).toEqual(catalog);
   expect(catalog.scenarios.map((scenario) => scenario.id)).toEqual([
-    'UX-MS-01', 'UX-MS-02', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
+    'UX-MS-01', 'UX-MS-02', 'RELEASE-GRAPH-PREPUB-FANOUT', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
     'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11',
   ]);
   expect(catalog.runEvidence.scope).toContain('ScenarioV0 YAML runs only');
@@ -29,11 +29,11 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
     for (const path of [...scenario.implementation, ...scenario.tests]) expect(existsSync(join(REPO, path))).toBe(true);
   }
 
-  expect(catalog.candidateAudit.sourceRows).toBe(34);
-  expect(catalog.candidateAudit.existingPaths).toBe(33);
+  expect(catalog.candidateAudit.sourceRows).toBe(35);
+  expect(catalog.candidateAudit.existingPaths).toBe(34);
   expect(catalog.candidateAudit.excludedPaths).toBe(catalog.candidateAudit.candidates.filter((candidate) => candidate.disposition === 'excluded').length);
-  expect(catalog.candidateAudit.candidates).toHaveLength(33);
-  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(33);
+  expect(catalog.candidateAudit.candidates).toHaveLength(34);
+  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(34);
   expect(catalog.candidateAudit.sourceExclusions).toHaveLength(1);
   expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
   expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
@@ -52,11 +52,46 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
     }
   }
 
+  expect(catalog.candidateAudit.omissionCheck.missingPaths).toEqual([]);
+  for (const path of catalog.candidateAudit.omissionCheck.requiredPaths) {
+    expect(catalog.candidateAudit.candidates.some((candidate) => candidate.path === path) || catalog.candidateAudit.sourceExclusions.some((row) => row.path === path)).toBe(true);
+    expect(existsSync(join(REPO, path))).toBe(true);
+  }
+  expect(catalog.devices.every((device) => device.entryCommands.length > 0 && ['yes', 'no', 'conditional', 'runner-dependent'].includes(device.logsRecorded))).toBe(true);
+
   const unindexed = readdirSync(import.meta.dir)
     .filter((file) => file.endsWith('.ts') && !file.endsWith('.test.ts'))
     .map((file) => `src/ux-sim/${file}`)
     .filter((path) => !implementation.has(path));
   expect(unindexed).toEqual([]);
+});
+
+test('read-only device registry prints entry, logs, event, recent-use, and omission metadata', () => {
+  const output = renderMockScenarioDevices(catalog).join('\n');
+  expect(output).toContain('Mock device registry · read-only');
+  expect(output).toContain('fake-github\tFake GitHub CLI and API');
+  expect(output).toContain('entry=bun test src/ux-sim/fake-gh.test.ts');
+  expect(output).toContain('events=(none recorded)');
+  expect(output).toContain('recent=(not recorded)');
+  expect(output).toContain('omission check: required=2 missing=0');
+});
+
+test('recent-use receipt is parsed and rendered when an observed run exists', () => {
+  const withRecentUse = structuredClone(catalog);
+  const receipt = {
+    observedAt: '2026-11-01T03:00:00.000Z',
+    runId: 'run-4f7b6cc7-1012-45cc-a1b6-0d7d0e6f550e',
+    event: 'ux.sim.scenario/completed',
+    scenarioId: 'UX-MS-01',
+    command: 'bun bin/elanous.mjs --test sim run scenarios/ux-sim/provider-4xx-no-provider.yaml',
+  };
+  withRecentUse.devices[0]!.recentUse = receipt;
+
+  const parsed = parseMockScenarioCatalog(withRecentUse);
+  expect(parsed.devices[0]?.recentUse).toEqual(receipt);
+  expect(renderMockScenarioDevices(parsed).join('\n')).toContain(
+    `recent=${receipt.observedAt} runId=${receipt.runId} event=${receipt.event} scenario=${receipt.scenarioId} cmd=${receipt.command}`,
+  );
 });
 
 test('candidate audit rejects duplicate paths, invalid dispositions, missing exclusions, and bad links', () => {
@@ -166,24 +201,30 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
 
 test('list and show render registered scenarios and unknown ids fail closed', () => {
   expect(renderMockScenarioList(catalog).join('\n')).toContain('UX-MS-01\treport-deficit');
-  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 33/34');
+  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 34/35');
   expect(renderMockScenarioDetails(catalog, 'UX-MS-11').join('\n')).toContain('request-shape 400');
   expect(() => renderMockScenarioDetails(catalog, 'UX-MS-99')).toThrow('unknown mock scenario id');
 });
 
-test('ux-sim list/show CLI exposes the catalog without launching a simulation', () => {
+test('ux-sim list/show/devices CLI exposes the catalog without launching a simulation', () => {
   const list = spawnSync('bun', ['scripts/ux-sim.ts', 'list'], { cwd: REPO, encoding: 'utf8' });
   expect(list.status).toBe(0);
   expect(list.stdout).toContain('UX-MS-01');
   expect(list.stdout).toContain('UX-MS-07');
   expect(list.stdout).toContain('UX-MS-11');
-  expect(list.stdout).toContain('후보 감사 33/34');
+  expect(list.stdout).toContain('후보 감사 34/35');
 
   const show = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-11'], { cwd: REPO, encoding: 'utf8' });
   expect(show.status).toBe(0);
   expect(show.stdout).toContain('Codex request-shape 400 recovery boundary');
 
+  const devices = spawnSync('bun', ['scripts/ux-sim.ts', 'devices'], { cwd: REPO, encoding: 'utf8' });
+  expect(devices.status).toBe(0);
+  expect(devices.stdout).toContain('Mock device registry · read-only');
+  expect(devices.stdout).toContain('recent=(not recorded)');
+  expect(devices.stdout).toContain('omission check: required=2 missing=0');
+
   const unknown = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-99'], { cwd: REPO, encoding: 'utf8' });
   expect(unknown.status).toBe(2);
   expect(unknown.stderr).toContain('unknown mock scenario id');
-});
+}, 15000);

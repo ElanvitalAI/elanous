@@ -38,8 +38,12 @@ export function pwaBuildDecision(pwaDir: string, withPwaBuild = false): 'build' 
   return withPwaBuild ? 'build' : 'skip';
 }
 
-export function buildHeldTuiArgs(entry: string, tuiStateDir: string, readyTimeoutMs: number, cwd: string): string[] {
-  return [entry, '--test', 'dev', '--elanous', '--hold', '--json', '--isolated-root', tuiStateDir, '--ready-timeout-ms', String(readyTimeoutMs), '--cwd', cwd];
+export function buildHeldTuiArgs(entry: string, testStateDir: string, readyTimeoutMs: number, cwd: string): string[] {
+  return [entry, '--test', 'dev', '--elanous', '--hold', '--json', '--isolated-root', testStateDir, '--ready-timeout-ms', String(readyTimeoutMs), '--cwd', cwd];
+}
+
+export function buildHeldTuiLaunch(entry: string, testStateDir: string, readyTimeoutMs: number, cwd: string): { args: string[]; stateDir: string } {
+  return { args: buildHeldTuiArgs(entry, testStateDir, readyTimeoutMs, cwd).slice(1), stateDir: testStateDir };
 }
 
 export function parseReadyHeldPty(output: string): { id: string; runId: string } | undefined {
@@ -77,9 +81,10 @@ function launchHeldTui(entry: string, cwd: string, env: NodeJS.ProcessEnv, state
   const logFd = openSync(logPath, 'a', 0o600);
   let child: ChildProcess;
   try {
-    child = spawnElanous(buildHeldTuiArgs(entry, join(stateDir, '..', '.elanous-test-tui'), Math.max(1, deadline - Date.now()), cwd).slice(1), {
+    const launch = buildHeldTuiLaunch(entry, stateDir, Math.max(1, deadline - Date.now()), cwd);
+    child = spawnElanous(launch.args, {
       bin: entry,
-      stateDir: join(stateDir, '..', '.elanous-test-tui'),
+      stateDir: launch.stateDir,
       cwd, env, detached: true, stdio: ['ignore', logFd, logFd],
     });
   } finally {
@@ -142,7 +147,6 @@ export async function runTuiTestUniverse(options: { readyTimeoutMs?: number; wit
 
   const entry = join(worktree, 'bin/elanous.mjs');
   const testStateDir = join(worktree, '.elanous-test');
-  const tuiStateDir = join(worktree, '.elanous-test-tui');
   const testEnv = { ...process.env };
   delete testEnv.ELANOUS_STATE_DIR;
   delete testEnv.ELANOUS_CONFIG_DIR;

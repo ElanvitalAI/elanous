@@ -80,6 +80,21 @@ describe('GRAPH-EDGE-TIDY · merge', () => {
     expect(edgeFamily(['fail'])).toBe('fail');
     expect(edgeFamily(['code-changed', 'unknown'])).toBe('neutral');
     expect(edgeFamily(['pass', 'fail'])).toBe('neutral');
+    expect(edgeFamily(['fallback'])).toBe('fallback');
+  });
+
+  test('fallback family stays unmerged with a regular edge on the same pair', () => {
+    const merged = mergeParallelEdges([
+      { from: 'gate', to: 'review', outcome: 'pass' },
+      { from: 'gate', to: 'review', outcome: 'fallback', family: 'fallback', requires: ['seam'] },
+    ]);
+    expect(merged).toHaveLength(2);
+    expect(merged.find((edge) => edge.family === 'fallback')).toMatchObject({
+      from: 'gate', to: 'review', outcomes: ['fallback', 'seam'], requires: ['seam'],
+    });
+    expect(merged.find((edge) => edge.family !== 'fallback')).toMatchObject({
+      from: 'gate', to: 'review', outcomes: ['pass'],
+    });
   });
 });
 

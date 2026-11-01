@@ -9,7 +9,277 @@ import {
   isScopeRevertMustFix, isNoneSentinelFinding, NO_VERDICT_LINE_REASON, type ReviewInput, type ReviewerContextItem,
 } from './pr-reviewer.js';
 
+describe('REVIEW-ROUND-REAUTHOR — r3+ 분류 그림자', () => {
+  it('r1/r2 프롬프트는 그대로 두고 r3부터 저작 재점검 절을 넣는다', () => {
+    const input: ReviewInput = { prDiff: 'diff', phaseIntent: 'fixture', reviewContext: { round: 2 } };
+    expect(buildReviewPrompt(input)).not.toContain('Reauthor classification');
+    expect(buildReviewPrompt({ ...input, reviewContext: { round: 3 } })).toContain('Reauthor classification (shadow observation only');
+  });
+
+  it('실제 #32327/#32740 must-fix 문면을 mock 리뷰에 넣어 분류·권고를 관측하고 판정에는 자동 적용하지 않는다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const scopeFinding = 'SCOPE CREEP: 이 조각의 명시 경계는 stop 분류와 같은 부모의 pool-slot 거절 영수증 읽기인데, `doctor-visit.ts`의 새 `doctor-diagnosis` 원장 쓰기 및 `orchestrator.ts`의 진단 수집/`git diff` 실행까지 production 경로에 추가했다. 이 영속적 부수효과는 이 조각에서 제거하거나, 별도 승인된 범위로 분리하고 그 범위의 수용·회귀 증명을 제공해야 한다.';
+    const codeFinding = '`decideTrainBatchClaim`은 live claim의 `prs` dense 여부를 검증하지 않아 `prs: new Array(1)`을 유효한 claim으로 받아 다른 host의 새 claim을 `allowed:true`로 반환한다; 또한 `owner:\'stale\'` claim은 host/PR 형식 검증 전 무시한다.';
+    const response = `VERDICT: FAIL\nMUST-FIX:\n- ${codeFinding}\n- ${scopeFinding}\nSHOULD-FIX:\n- 범위를 줄이고 미포함 live consumer를 FU로 제안\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: ${codeFinding}\n- AUTHORSHIP-DEFECT: ${scopeFinding} | SCOPE CUT + FU: STOP-HEAL-WINNOW-FU; scope-cut=doctor 진단 영속화 제외; paths=src/doctor-visit.ts; boundary=pool-slot receipt shadow 판정; MS-32327`;
+    try {
+      const result = await reviewPullRequest({
+        prDiff: 'diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n',
+        phaseIntent: 'fixture derived from saved PR #32327 and #32740 review JSON',
+        reviewContext: { runId: 'run-reauthor-fixture', round: 3 },
+      }, (prompt) => {
+        expect(prompt).toContain('For each blocker classify');
+        return Promise.resolve(response);
+      });
+      expect(result.verdict).toBe('fail');
+      expect(result.mustFix).toEqual([codeFinding, scopeFinding]);
+      expect(result.reauthorClassifications).toEqual([
+        { class: 'code-defect', finding: codeFinding },
+        { class: 'authorship-defect', finding: scopeFinding, recommendation: 'STOP-HEAL-WINNOW-FU; scope-cut=doctor 진단 영속화 제외; paths=src/doctor-visit.ts; boundary=pool-slot receipt shadow 판정; MS-32327' },
+      ]);
+      const observation = log.mock.calls.find(([category, event]) => category === 'review.reauthor' && event === 'shadow-classification')?.[2] as {
+        round?: number; mode?: string; classifications?: unknown[]; unclassified?: string[];
+      } | undefined;
+      expect(observation).toMatchObject({
+        round: 3,
+        mode: 'shadow-only',
+        classifications: result.reauthorClassifications,
+        unclassified: [],
+      });
+    } finally { log.mockRestore(); }
+  });
+
+  it('AUTHORSHIP-DEFECT 단독 분류도 원래 FAIL과 MUST-FIX를 그대로 보존한다', () => {
+    const finding = '이 phase가 운영 실물 진입점을 요구하지만 acceptance는 mock 경로만 요구한다.';
+    const result = parseReviewResult(`VERDICT: FAIL\nMUST-FIX:\n- ${finding}\nREAUTHOR-CLASSIFICATION:\n- AUTHORSHIP-DEFECT: ${finding} | SCOPE CUT + FU: LIVE-WIRING-FU; scope-cut=운영 진입점 구현은 FU로 분리; paths=src/a.ts; boundary=mock-only invocation; MS-1`, 3);
+    expect(result.verdict).toBe('fail');
+    expect(result.mustFix).toEqual([finding]);
+    expect(result.reauthorClassifications).toEqual([{ class: 'authorship-defect', finding, recommendation: 'LIVE-WIRING-FU; scope-cut=운영 진입점 구현은 FU로 분리; paths=src/a.ts; boundary=mock-only invocation; MS-1' }]);
+  });
+
+  it('r1/r2 결과에는 리뷰어가 자발적으로 낸 reauthor 분류를 노출하지 않는다', async () => {
+    const result = await reviewPullRequest({
+      prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n',
+      phaseIntent: 'legacy round shape', reviewContext: { round: 2 },
+    }, () => Promise.resolve('VERDICT: FAIL\nMUST-FIX:\n- blocker\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: blocker'));
+    expect(result).not.toHaveProperty('reauthorClassifications');
+  });
+
+  it('FU ID가 빠지거나 MUST-FIX와 불일치·중복한 분류는 이벤트에서 제외하고 blocker를 unclassified로 남긴다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const blocker = '원래 blocker';
+    const watch = '비차단 watch';
+    const response = `VERDICT: FAIL\nMUST-FIX:\n- ${blocker}\nSHOULD-FIX:\n- ${watch}\nREAUTHOR-CLASSIFICATION:\n- AUTHORSHIP-DEFECT: ${blocker} | SCOPE CUT + FU: 범위를 줄일 것\n- CODE-DEFECT: ${watch}\n- CODE-DEFECT: ${blocker}\n- CODE-DEFECT: ${blocker}`;
+    try {
+      const result = await reviewPullRequest({
+        prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n',
+        phaseIntent: 'fixture validation',
+        reviewContext: { round: 3 },
+      }, () => Promise.resolve(response));
+      expect(result.reauthorClassifications).toBeUndefined();
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification')?.[2];
+      expect(event).toMatchObject({ classifications: [], unclassified: [blocker] });
+    } finally { log.mockRestore(); }
+  });
+
+  it('FU 토큰만 있거나 구체 scope-cut 필드가 없는 저작 결함은 분류하지 않는다', () => {
+    const finding = 'authorship flaw';
+    for (const recommendation of [
+      'LIVE-WIRING-FU',
+      'LIVE-WIRING-FU; paths=src/a.ts; boundary=mock-only invocation; MS-1',
+      'LIVE-WIRING-FU; scope-cut=범위 축소; paths=src/a.ts; boundary=mock-only invocation; MS-1',
+      'LIVE-WIRING-FU; scope-cut=운영 배선을 FU로 분리; paths=empty; boundary=mock-only invocation; MS-1',
+      'LIVE-WIRING-FU; scope-cut=운영 배선을 FU로 분리; paths=src/a.ts; boundary=todo; MS-1',
+      'LIVE-WIRING-FU; scope-cut=운영 배선을 FU로 분리; paths=src/a.ts; boundary=mock-only invocation',
+      'LIVE-WIRING; scope-cut=운영 배선을 FU로 분리; paths=src/LIVE-WIRING-FU.ts; boundary=mock-only invocation; MS-1',
+    ]) {
+      const result = parseReviewResult(`VERDICT: FAIL\nMUST-FIX:\n- ${finding}\nREAUTHOR-CLASSIFICATION:\n- AUTHORSHIP-DEFECT: ${finding} | SCOPE CUT + FU: ${recommendation}`, 3);
+      expect(result.reauthorClassifications).toBeUndefined();
+      expect(result.mustFix).toEqual([finding]);
+    }
+    const valid = parseReviewResult(`VERDICT: FAIL\nMUST-FIX:\n- ${finding}\nREAUTHOR-CLASSIFICATION: fields follow\n- AUTHORSHIP-DEFECT: ${finding} | SCOPE CUT + FU: LIVE-WIRING-FU; scope-cut=production wiring deferred; paths=src/a.ts; boundary=mock-only invocation; MS-1`, 3);
+    expect(valid.reauthorClassifications).toHaveLength(1);
+  });
+
+  it('단일 패스의 malformed 중복 표지는 유효 분류가 있어도 blocker를 unclassified로 남기고 공개 parse 결과에 내부 상태를 싣지 않는다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const blocker = 'same blocker';
+    try {
+      const result = await reviewPullRequest({
+        prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n', phaseIntent: 'single malformed fixture', reviewContext: { round: 3 },
+      }, () => Promise.resolve(`VERDICT: FAIL\nMUST-FIX:\n- ${blocker}\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: ${blocker}\n- BOGUS: ${blocker}`));
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification')?.[2];
+      expect(result.reauthorClassifications).toBeUndefined();
+      expect(event).toMatchObject({ classifications: [], unclassified: [blocker] });
+      const raw = `VERDICT: FAIL\nMUST-FIX:\n- ${blocker}\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: ${blocker}\n- BOGUS: ${blocker}`;
+      expect(parseReviewResult(raw, 3))
+        .not.toHaveProperty('reauthorInvalidFindings');
+      expect(parseReviewResult(raw)).not.toHaveProperty('reauthorClassifications');
+    } finally { log.mockRestore(); }
+  });
+
+  it('청크 리뷰는 round 전체의 분류와 미분류 blocker를 이벤트 하나에 접는다', async () => {
+    const originalLimit = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const replies = [
+      'VERDICT: FAIL\nMUST-FIX:\n- finding-a\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: finding-a',
+      'VERDICT: FAIL\nMUST-FIX:\n- finding-b\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: finding-b',
+    ];
+    try {
+      process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+      const file = (name: string) => `diff --git a/${name}.ts b/${name}.ts\n@@ -1 +1 @@\n-a\n+${'x'.repeat(1800)}\n`;
+      const result = await reviewPullRequest({
+        prDiff: file('a') + file('b'), phaseIntent: 'chunked fixture', reviewContext: { round: 3 },
+      }, async () => replies.shift()!);
+      const events = log.mock.calls.filter(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification');
+      expect(events).toHaveLength(1);
+      expect(events[0]![2]).toMatchObject({ round: 3, classifications: [
+        { class: 'code-defect', finding: 'finding-a' },
+        { class: 'code-defect', finding: 'finding-b' },
+      ], unclassified: [] });
+      expect(result.mustFix).toEqual(['finding-a', 'finding-b']);
+    } finally {
+      if (originalLimit === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = originalLimit;
+      log.mockRestore();
+    }
+  });
+
+  it('청크 간 중복 분류는 fold에서 거부되어 blocker를 unclassified로 남긴다', async () => {
+    const originalLimit = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const reply = 'VERDICT: FAIL\nMUST-FIX:\n- duplicate-finding\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: duplicate-finding';
+    try {
+      process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+      const file = (name: string) => `diff --git a/${name}.ts b/${name}.ts\n@@ -1 +1 @@\n-a\n+${'x'.repeat(1800)}\n`;
+      const result = await reviewPullRequest({
+        prDiff: file('a') + file('b'), phaseIntent: 'duplicate fixture', reviewContext: { round: 3 },
+      }, async () => reply);
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification')?.[2];
+      expect(result.mustFix).toEqual(['duplicate-finding']);
+      expect(event).toMatchObject({ classifications: [], unclassified: ['duplicate-finding'] });
+    } finally {
+      if (originalLimit === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = originalLimit;
+      log.mockRestore();
+    }
+  });
+
+  it('한 청크의 불완전한 분류를 다른 청크의 유효 분류가 덮지 못한다', async () => {
+    const originalLimit = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const replies = [
+      'VERDICT: FAIL\nMUST-FIX:\n- cross-chunk blocker\nREAUTHOR-CLASSIFICATION:\n- AUTHORSHIP-DEFECT: cross-chunk blocker | SCOPE CUT + FU: follow-up without a FU id',
+      'VERDICT: FAIL\nMUST-FIX:\n- cross-chunk blocker\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: cross-chunk blocker',
+    ];
+    try {
+      process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+      const file = (name: string) => `diff --git a/${name}.ts b/${name}.ts\n@@ -1 +1 @@\n-a\n+${'x'.repeat(1800)}\n`;
+      const result = await reviewPullRequest({
+        prDiff: file('a') + file('b'), phaseIntent: 'invalid cross-chunk fixture', reviewContext: { round: 3 },
+      }, async () => replies.shift()!);
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification')?.[2];
+      expect(result.mustFix).toEqual(['cross-chunk blocker']);
+      expect(event).toMatchObject({ classifications: [], unclassified: ['cross-chunk blocker'] });
+    } finally {
+      if (originalLimit === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = originalLimit;
+      log.mockRestore();
+    }
+  });
+
+  it('MUST-FIX를 내지 않은 청크의 malformed 참조도 다른 청크 blocker의 분류를 무효화한다', async () => {
+    const originalLimit = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const replies = [
+      'VERDICT: PASS\nMUST-FIX:\nREAUTHOR-CLASSIFICATION:\n- BOGUS: beta',
+      'VERDICT: FAIL\nMUST-FIX:\n- beta\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: beta',
+    ];
+    try {
+      process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+      const file = (name: string) => `diff --git a/${name}.ts b/${name}.ts\n@@ -1 +1 @@\n-a\n+${'x'.repeat(1800)}\n`;
+      const result = await reviewPullRequest({
+        prDiff: file('a') + file('b'), phaseIntent: 'cross-chunk malformed reference fixture', reviewContext: { round: 3 },
+      }, async () => replies.shift()!);
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification')?.[2];
+      expect(result.mustFix).toEqual(['beta']);
+      expect(event).toMatchObject({ classifications: [], unclassified: ['beta'] });
+    } finally {
+      if (originalLimit === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = originalLimit;
+      log.mockRestore();
+    }
+  });
+
+  it('겹치는 finding과 다른 blocker의 FU 권고문은 유효 분류를 무효화하지 않는다', async () => {
+    const originalLimit = process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const replies = [
+      'VERDICT: FAIL\nMUST-FIX:\n- foo\n- foobar\n- bar\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: foo\n- CODE-DEFECT: foobar\n- AUTHORSHIP-DEFECT: bar | SCOPE CUT + FU: FOO-FU; scope-cut=unused supervisor wiring deferred; paths=src/a.ts; boundary=mock-only invocation; MS-2',
+      'VERDICT: FAIL\nMUST-FIX:\n- baz\nREAUTHOR-CLASSIFICATION:\n- CODE-DEFECT: baz',
+    ];
+    try {
+      process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = '2000';
+      const file = (name: string) => `diff --git a/${name}.ts b/${name}.ts\n@@ -1 +1 @@\n-a\n+${'x'.repeat(1800)}\n`;
+      const result = await reviewPullRequest({
+        prDiff: file('a') + file('b'), phaseIntent: 'overlapping finding fixture', reviewContext: { round: 3 },
+      }, async () => replies.shift()!);
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification')?.[2];
+      expect(result.mustFix).toEqual(['foo', 'foobar', 'bar', 'baz']);
+      expect(event).toMatchObject({ classifications: [
+        { class: 'code-defect', finding: 'foo' },
+        { class: 'code-defect', finding: 'foobar' },
+        { class: 'authorship-defect', finding: 'bar' },
+        { class: 'code-defect', finding: 'baz' },
+      ], unclassified: [] });
+    } finally {
+      if (originalLimit === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
+      else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = originalLimit;
+      log.mockRestore();
+    }
+  });
+
+  it('r3+ fail-soft 리뷰는 분류 불가 상태를 그림자 이벤트로 남긴다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await reviewPullRequest({
+        prDiff: 'diff', phaseIntent: 'unavailable fixture', reviewContext: { round: 3 },
+      }, async () => { throw new Error('review backend unavailable'); });
+      expect(result).toMatchObject({ reviewed: false, failureReason: 'review backend unavailable' });
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification')?.[2];
+      expect(event).toMatchObject({ round: 3, mode: 'shadow-only', status: 'unavailable', classifications: [], unclassified: [] });
+    } finally { log.mockRestore(); }
+  });
+
+  it('저장된 #32561 mf0 표본은 분류할 blocker 없이 그림자 이벤트를 남긴다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await reviewPullRequest({
+        prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n',
+        phaseIntent: 'fixture derived from saved PR #32561 review JSON (mustFix=[])',
+        reviewContext: { round: 3 },
+      }, () => Promise.resolve('VERDICT: PASS\nMUST-FIX:\nSHOULD-FIX:\n- watch item\nREAUTHOR-CLASSIFICATION:'));
+      expect(result.mustFix).toEqual([]);
+      expect(result.reauthorClassifications).toBeUndefined();
+      const event = log.mock.calls.find(([category, name]) => category === 'review.reauthor' && name === 'shadow-classification');
+      expect(event?.[2]).toMatchObject({ round: 3, mode: 'shadow-only', classifications: [], unclassified: [] });
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('reviewPullRequest — REVIEW-PROMPT-SIZE 관측(review.prompt-size 범주)', () => {
+  it('REVIEW-ROUND-REAUTHOR — 라운드 3부터 저작 재점검 지침을 포함하고 이전 라운드는 보존한다', () => {
+    const input = { prDiff: 'diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n-a\n+b\n', phaseIntent: 'x 고침' };
+    const firstRound = buildReviewPrompt({ ...input, reviewContext: { round: 2 } });
+    const thirdRound = buildReviewPrompt({ ...input, reviewContext: { round: 3 } });
+
+    expect(firstRound).not.toContain('저작 재점검');
+    expect(thirdRound).toContain('저작 재점검 (review round >= 3)');
+    expect(thirdRound).toContain('(a) 코드 결함 또는 (b) 저작 결함');
+    expect(thirdRound).toContain('원래 MUST-FIX 후보는 verdict 와 MUST-FIX 목록에 그대로 보존하라');
+    expect(thirdRound).toContain('`REAUTHOR-CLASSIFICATION:` 아래 정확히 `- CODE-DEFECT: <finding>`');
+    expect(thirdRound).toContain('scope-cut=<specific excluded/deferred work>; paths=<repository paths>; boundary=<observable completion boundary>; MS-<mock scenario id>');
+  });
+
   it('REVIEW-PROMPT-SIZE — 리뷰 1회 → review.prompt-size 이벤트에 promptChars·responseChars 가 실림', async () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     const response = 'VERDICT: PASS\nMUST-FIX:\n- (없음)\nSHOULD-FIX:\n- 사소한 네이밍';
@@ -502,7 +772,8 @@ describe('reviewPullRequest — llmReview seam·fail-soft·reviewed 구분', () 
     ['조인 키 없음', undefined, {}],
   ])('리뷰어 컨텍스트 예산은 %s의 수치와 받은 조인 키만 관측에 남긴다', async (_label, reviewContext, joinKeys) => {
     const context = [{ label: 'sensitive.md', body: 'secret-context-body '.repeat(1_000) }];
-    const expectedPrompt = buildReviewPrompt({ prDiff: '+x', phaseIntent: 'p', reviewerContext: context });
+    const expectedPrompt = buildReviewPrompt({ prDiff: '+x', phaseIntent: 'p', reviewerContext: context,
+      ...(reviewContext ? { reviewContext } : {}) });
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     let seenPrompt = '';
     try {

@@ -2,9 +2,10 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { debug } from '../../debug/log.js';
-import { sendTelegramReport } from '../../telegram-report.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig, type UserConfig } from '../../user-config.js';
+import { roleForKind } from '../../domains/telegram-kind-route.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { routeOutbound, type RouterDeps } from '../outbound/router.js';
 import { jsonResponse } from './json-response.js';
 
 export const CONSULT_REQUESTS_PATH = '/v1/consult-requests';
@@ -27,6 +28,8 @@ export interface ConsultRequestsDeps {
    *  ⛔ Never `sendOutbound` here: it is a synchronous curl to this very daemon's `/v1/outbound`, so inside the
    *  daemon it blocks the event loop until it times out (~25 s · `unreachable`) and the alert is lost (CS1 · 10-01). */
   send?: (text: string, kind: string) => unknown;
+  /** In-process ChannelAdapter delivery seams for mock verification. */
+  routeDeps?: RouterDeps;
 }
 
 function file(root: string): string {
@@ -114,12 +117,21 @@ export async function handleConsultRequests(req: Request, deps: ConsultRequestsD
   const alert = `📮 상담 문의 ${entry.receiptId} · ${entry.name}(${entry.kind === 'personal' ? '개인' : (entry.org ?? '회사')}) · 관심 ${entry.interest}\n앱에서 보기`;
   // Fire and forget — the receipt is already on disk; the answer must not wait for the channel.
   void Promise.resolve()
-    .then(() => (deps.send ?? notifyInProcess)(alert, 'ops-alert'))
+    .then(() => deps.send ? deps.send(alert, 'ops-alert') : notifyInProcess(alert, 'ops-alert', deps.routeDeps))
     .catch((error: unknown) => { debug.log('consult.request', 'notify-failed', { receiptId: entry.receiptId, reason: error instanceof Error ? error.message : String(error) }); });
   return jsonResponse({ receiptId: entry.receiptId, receivedAt: entry.receivedAt }, 202);
 }
 
-async function notifyInProcess(text: string, kind: string): Promise<void> {
-  const delivered = await sendTelegramReport(getUserConfig(), text, { markdown: false, kind });
-  debug.log('consult.request', delivered ? 'notified' : 'notify-failed', { delivered, channels: [`telegram:${delivered ? 'ok' : 'fail'}`] });
+function telegramOnlyConfig(cfg: UserConfig, kind: string): UserConfig {
+  // Deliberately replace all outbound policy for this one notification: it must stay Telegram-only.
+  // The existing Telegram sender resolves credentials and chat targets from cfg.telegram.
+  return { ...cfg, raw: { ...cfg.raw, outbound: { channels: [{ type: 'telegram' }], routes: { [kind]: ['telegram'] } } } };
+}
+
+async function notifyInProcess(text: string, kind: string, routeDeps: RouterDeps = {}): Promise<void> {
+  const cfg = getUserConfig();
+  const route = await routeOutbound(telegramOnlyConfig(cfg, kind), { text, markdown: false, kind, role: roleForKind(cfg, kind) }, routeDeps);
+  debug.log('consult.request', route.delivered ? 'notified' : 'notify-failed', {
+    delivered: route.delivered, channels: route.channels.map(channel => `telegram:${channel.ok ? 'ok' : 'fail'}`),
+  });
 }

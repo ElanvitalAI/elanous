@@ -17,7 +17,7 @@ import { gateEnvFingerprint, gateSourcePins } from './gate-baseline-receipt';
 import { beginGateShardAttempt } from '../../src/release-loop/gate-shards.js';
 import { parseFailures, parseTimedOutFailures } from './gate-diff';
 import { parsePodCpu, runPodCommand, type RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
-import { PodPoolScheduler, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { PodPoolScheduler, parsePodPool, type PodPoolMember, type PoolImageSync } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { WarmPodProvider } from '../../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
 import { warmWorkerPodManifest, type WarmPodSpec } from '../../src/task-orchestrator/surfaces/pod-warm-worker-pod.js';
 import type { WarmWorkerCommand } from '../../src/task-orchestrator/surfaces/pod-warm-worker-protocol.js';
@@ -29,7 +29,7 @@ import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm
 import { inspectReleaseGateHost } from '../../src/release-loop/gate-host-reservation.js';
 import { runGraph } from '../../src/graph-runner/runner.js';
 import { isGateSpawnLaneFile, planGateSpawnSeparatedShards } from './spawn-lane';
-import { gateImagePinPath } from './gate-image-pin.js';
+import { gateImagePinPath, writeGateImagePin } from './gate-image-pin.js';
 import { computeReceiptKey, gateEnvFingerprint as registryEnvFingerprint, gateLockfileHash, saveGateReceipt, type GateReceipt } from '../../src/self-implement/gate-receipt-registry.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -223,6 +223,129 @@ test('GATE-POD-IMAGE-STICKY: graph run pins one image, excludes drifted pools, a
     const missing = await judgeGate({ ...input, instanceRoot: missingRoot, graphRunId: 'prior-run' }, f.runner, () => digestA);
     expect(missing.outcome).toBe('error');
   } finally { rmSync(missingRoot, { recursive: true, force: true }); }
+});
+
+test('GATE-PULL-BY-PINNED-DIGEST: a moved gate tip archives the old run pin and creates a new commit pin', async () => {
+  const f = fake([], [], false);
+  const runId = 'gate-image-pin-tip-moved';
+  const oldCommit = 'a'.repeat(40);
+  const newCommit = 'f'.repeat(40);
+  const oldDigest = `sha256:${'1'.repeat(64)}`;
+  const newDigest = `sha256:${'2'.repeat(64)}`;
+  const pinPath = gateImagePinPath(f.instanceRoot, '1.0.1', runId);
+  writeGateImagePin(pinPath, runId, oldDigest, `elanous-harness:${oldCommit.slice(0, 12)}`, oldCommit);
+  const graphRunPath = join(f.instanceRoot, 'graph-runs', 'release-loop', `${runId}.json`);
+  mkdirSync(dirname(graphRunPath), { recursive: true });
+  writeFileSync(graphRunPath, JSON.stringify({ nodes: [{ nodeId: 'gate', executed: true }] }));
+  const input = { ...options(f.instanceRoot), commit: newCommit, graphRunId: runId, repo: join(f.root, 'repo'),
+    pod: { pool: 'pool-a:1,pool-b:1', shards: 1 } };
+
+  const result = await judgeGate(input, f.runner, () => newDigest);
+
+  expect(result.outcome).toBe('ok');
+  const archivedPin = readdirSync(dirname(pinPath)).find((name) => name.startsWith(`${pinPath.split('/').at(-1)}.superseded-${oldCommit.slice(0, 12)}-`));
+  expect(archivedPin).toBeTruthy();
+  expect(JSON.parse(readFileSync(join(dirname(pinPath), archivedPin!), 'utf8'))).toMatchObject({ runId, digest: oldDigest, commit: oldCommit });
+  expect(JSON.parse(readFileSync(pinPath, 'utf8')))
+    .toMatchObject({ runId, digest: newDigest, commit: newCommit });
+});
+
+test('GATE-PULL-BY-PINNED-DIGEST: a new run with no pool image builds once before writing its pin', async () => {
+  const f = fake([], [], false);
+  const runId = 'gate-image-pin-image-missing';
+  const digest = `sha256:${'3'.repeat(64)}`;
+  let imageReady = false;
+  let syncCalls = 0;
+  const input = { ...options(f.instanceRoot), graphRunId: runId, repo: join(f.root, 'repo'),
+    pod: { pool: 'pool-a:1', shards: 1 } };
+
+  const result = await judgeGate(input, f.runner, () => imageReady ? digest : null, undefined,
+    async (members, image, commit) => {
+      syncCalls++;
+      expect(members.map((member) => member.context)).toEqual(['pool-a']);
+      expect(image).toBe('elanous-harness:local');
+      expect(commit).toBe(CUT);
+      imageReady = true;
+      return new Map(members.map((member) => [member.context, { ok: true, action: 'built' as const, detail: 'mock build/push', ms: 0 }]));
+    });
+
+  expect(result.outcome).toBe('ok');
+  expect(syncCalls).toBe(1);
+  expect(JSON.parse(readFileSync(gateImagePinPath(f.instanceRoot, '1.0.1', runId), 'utf8')))
+    .toMatchObject({ runId, digest, commit: CUT });
+});
+
+test('GATE-PULL-BY-PINNED-DIGEST: an ok:false image sync result fails closed even when a digest appears', async () => {
+  const f = fake([], [], false);
+  const runId = 'gate-image-pin-sync-result-failed';
+  const digest = `sha256:${'4'.repeat(64)}`;
+  const pinPath = gateImagePinPath(f.instanceRoot, '1.0.1', runId);
+  const input = { ...options(f.instanceRoot), graphRunId: runId, repo: join(f.root, 'repo'),
+    pod: { pool: 'pool-a:1', shards: 1 } };
+  let probes = 0;
+  const result = await judgeGate(input, f.runner, () => ++probes === 1 ? null : digest, undefined,
+    async (members) => new Map(members.map((member) => [member.context,
+      { ok: false, action: 'failed' as const, detail: 'injected sync failure', ms: 1 }])));
+  expect(result.outcome).toBe('error');
+  expect(existsSync(pinPath)).toBe(false);
+});
+
+test('GATE-PULL-BY-PINNED-DIGEST: failed sync preserves the old pin and retry establishes the new tip', async () => {
+  const f = fake([], [], false);
+  const runId = 'gate-image-pin-retry-after-sync-failure';
+  const oldCommit = 'a'.repeat(40);
+  const newCommit = 'f'.repeat(40);
+  const oldDigest = `sha256:${'1'.repeat(64)}`;
+  const newDigest = `sha256:${'2'.repeat(64)}`;
+  const pinPath = gateImagePinPath(f.instanceRoot, '1.0.1', runId);
+  writeGateImagePin(pinPath, runId, oldDigest, `elanous-harness:${oldCommit.slice(0, 12)}`, oldCommit);
+  const graphRunPath = join(f.instanceRoot, 'graph-runs', 'release-loop', `${runId}.json`);
+  mkdirSync(dirname(graphRunPath), { recursive: true });
+  writeFileSync(graphRunPath, JSON.stringify({ nodes: [{ nodeId: 'gate', executed: true }] }));
+  const input = { ...options(f.instanceRoot), commit: newCommit, graphRunId: runId, repo: join(f.root, 'repo'),
+    pod: { pool: 'pool-a:1', shards: 1 } };
+  let imageReady = false;
+  let syncCalls = 0;
+  const sync = async (members: readonly PodPoolMember[]): Promise<Map<string, PoolImageSync>> => {
+    syncCalls++;
+    if (syncCalls === 1) return new Map(members.map((member) => [member.context,
+      { ok: false, action: 'failed' as const, detail: 'injected registry push failure', ms: 1 }]));
+    imageReady = true;
+    return new Map(members.map((member) => [member.context,
+      { ok: true, action: 'built' as const, detail: 'recovered', ms: 1 }]));
+  };
+
+  const failed = await judgeGate(input, f.runner, () => imageReady ? newDigest : null, undefined, sync);
+  expect(failed.outcome).toBe('error');
+  expect(JSON.parse(readFileSync(pinPath, 'utf8'))).toMatchObject({ commit: oldCommit, digest: oldDigest });
+  expect(readdirSync(dirname(pinPath)).filter((name) => name.startsWith(`${pinPath.split('/').at(-1)}.superseded-`))).toHaveLength(0);
+  const retried = await judgeGate(input, f.runner, () => imageReady ? newDigest : null, undefined, sync);
+  expect(retried.outcome).toBe('ok');
+  expect(syncCalls).toBe(2);
+  expect(JSON.parse(readFileSync(pinPath, 'utf8'))).toMatchObject({ commit: newCommit, digest: newDigest });
+  expect(readdirSync(dirname(pinPath)).filter((name) => name.startsWith(`${pinPath.split('/').at(-1)}.superseded-`))).toHaveLength(1);
+});
+
+test('GATE-PULL-BY-PINNED-DIGEST: a partial pin identity refuses before launching a shard', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-partial-image-pin-'));
+  scratch.push(root);
+  mkdirSync(join(root, 'src'), { recursive: true });
+  writeFileSync(join(root, 'src/one.test.ts'), '');
+  let podCalls = 0;
+  const pool = new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }], {
+    status: () => ({ recommended: 1 } as never), occupancy: () => ({}), memberMemory: () => [],
+  });
+  const runner = createGateRunner(root, undefined, async (cmd, args) => {
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: 'src/one.test.ts\n' };
+    return { rc: 0, output: '' };
+  }, async () => { podCalls++; throw new Error('partial pin must fail before Pod launch'); }, pool,
+  undefined, { kubectl: () => ({ status: 1, stdout: '', stderr: 'mock' }) });
+
+  await expect(runner.sweep(root, undefined, { pool: 'pool-test:1', shards: 1,
+    pinnedImageDigest: `sha256:${'a'.repeat(64)}` }, ['src/one.test.ts']))
+    .rejects.toThrow('both pinnedImageDigest and pinnedRunId are required');
+  expect(podCalls).toBe(0);
 });
 
 test('GATE-POD-IMAGE-STICKY: a Pod with an observed digest different from its pin is rejected as an unmeasured shard', async () => {
@@ -4784,7 +4907,8 @@ test('gate cut recheck hands a fenced producer to its Job and closes the lease o
       writeFileSync(join(artifactsDir, 'part-0.log'), `[warm-worker] file=${file}\n[warm-worker] cut=${lastWarmInput.cutSha} attempt=${lastWarmInput.attemptId}\nbun test v1.4.2\n${file}:\n(pass) A\n1 pass\n0 fail\nRan 1 test across 1 file.\n[warm-worker] junit-sha256=${digest}\n`);
     } else writeFileSync(join(artifactsDir, 'part-0.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
     return { job: 'gate-job', exitCode: 0, artifactsDir } as Awaited<ReturnType<typeof runPodCommand>>;
-  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]), undefined,
+  { podImageDigest: () => `sha256:${'f'.repeat(64)}` });
   const pod = { pool: 'pool-test', installSlots: 0, warmEligible: true, warmProducerEnabled: true,
     warmCutSha: CUT, warmReplay: async (input: Parameters<NonNullable<NonNullable<Parameters<NonNullable<typeof runner.recheckPod>>[2]>['warmReplay']>>[0]) => {
       lastWarmInput = input;
@@ -4835,6 +4959,12 @@ test('gate cut recheck hands a fenced producer to its Job and closes the lease o
   finalizeFail = true;
   await expect(runner.recheckPod!('src/a.test.ts', CUT, pod, 60_000)).rejects.toThrow('finalize failed');
   expect(outcomes.at(-1)).toBe('quarantine:gate-job-incomplete');
+  finalizeFail = false;
+  const beforePinnedMismatch = outcomes.length;
+  const pinnedMismatch = { ...pod, pinnedImageDigest: `sha256:${'f'.repeat(64)}`, pinnedRunId: 'pinned-recheck-run' };
+  await runner.recheckPod!('src/a.test.ts', CUT, pinnedMismatch, 60_000);
+  expect(requests.at(-1)?.warmProducer).toBeUndefined();
+  expect(outcomes.slice(beforePinnedMismatch)).toEqual(['quarantine:gate-producer-identity']);
 });
 
 test('GATE-WARM-SHADOW: the Job verdict and durable gate record retain separate worker observation', async () => {

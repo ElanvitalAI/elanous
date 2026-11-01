@@ -1,6 +1,6 @@
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { debug } from '../debug/log.js';
-import { assessDraftTriage, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, laterMergedTwins, sameGoalPr, PROTECTED_LABELS, type DraftTriageAssessment, type DraftTriagePr, type DraftTriageReviewState } from './draft-triage-rules.js';
+import { assessDraftTriage, decideDraft, draftClaimComment, draftClaimState, draftIntentHoldReason, draftIntentHoldRejection, draftReleaseComment, harvestDeferredMarker, laterMergedTwins, parseDraftIntentHold, sameGoalPr, PROTECTED_LABELS, type DraftTriageAssessment, type DraftTriagePr, type DraftTriageReviewState } from './draft-triage-rules.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { cardPrNumber, draftTaskOwner, type TaskCard } from '../task-agent/task-hand.js';
@@ -659,12 +659,14 @@ export function resolveDraftSweepCloseCap(input: { flag?: unknown; config?: unkn
 export async function supersedeDraftsOnMerge(input: {
   repository: string;
   merged: SweepMergedPr & { createdAt: string; mergedAt: string };
+  now?: Date;
   /** `pr land` and HQ train invoke only the explicit same-cell successor path. */
   onlyExplicitSameCell?: boolean;
   adapters: Pick<DraftSweepAdapters, 'listDrafts' | 'listLiveBranches' | 'getRunStatus' | 'setLabels' | 'closeDraft'>
     & Pick<Partial<DraftSweepAdapters>, 'getLatestFileChanges' | 'getPrFiles' | 'commentDraft' | 'listIssueComments'>;
 }): Promise<{ closed: number[]; kept: number[] }> {
   const { repository, merged, adapters } = input;
+  const now = input.now ?? new Date();
   const closed: number[] = [];
   const kept: number[] = [];
   let drafts: SweepDraft[] = [];
@@ -691,6 +693,7 @@ export async function supersedeDraftsOnMerge(input: {
       const old = drafts.find((draft) => draft.number === explicitOld);
       if (old && cellIdFromBody(old.body ?? '') === mergedCell
         && Date.parse(old.createdAt) < Date.parse(merged.mergedAt)
+        && !parseDraftIntentHold(old.body, now)
         && !old.labels.some((label) => PROTECTED_LABELS.has(label))
         && PR_LABELS.filter((label) => label.axis === 'state' && old.labels.includes(label.name)).length <= 1) {
         const marker = `<!-- elanous:same-cell-superseded #${old.number} -> #${merged.number} -->`;
@@ -745,7 +748,7 @@ export async function supersedeDraftsOnMerge(input: {
         kept.push(draft.number);
         continue;
       }
-      const decision = decideDraft({ draft, runStatus: statuses.get(draft.number),
+      const decision = decideDraft({ draft, now, runStatus: statuses.get(draft.number),
         mergedTwins: [landed], liveBranches, ageHours: NaN });
       if (decision.action !== 'close' || !decision.reason.startsWith(`superseded-by #${merged.number}`)
         || PR_LABELS.filter((entry) => entry.axis === 'state' && draft.labels.includes(entry.name)).length > 1
@@ -1345,11 +1348,34 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       ...(claimWriteFailed ? { error: claimWriteError, ...(claimPartialApplied ? { partialApplied: true } : {}) } : {}) });
       continue;
     }
+    // DRAFT-ZERO's failed-run harvest evidence remains the strongest explicit hold; this intent marker
+    // must not rewrite its reason or mask the harvest classification.
+    if (runStatus === 'failed' && harvestDeferredMarker(draft.body)) {
+      record({ number: draft.number, action: 'keep', reason: 'harvest-deferred', applied: false });
+      continue;
+    }
+    const intentHoldRejection = draftIntentHoldRejection(draft.body, now);
+    if (intentHoldRejection) {
+      try { debug.log('self-dev.draft-sweep', 'intent-hold-rejected', { pr: draft.number, reason: intentHoldRejection }); } catch { /* fail-soft */ }
+    }
     if (draft.labels.includes(releaseHoldLabel ?? '') || draft.labels.includes(RELEASE_PATH_LABEL)
       || (!contradiction && draft.labels.includes(keepLabel ?? ''))) {
       const held = draft.labels.includes(keepLabel ?? '') ? keepLabel
         : draft.labels.includes(RELEASE_PATH_LABEL) ? RELEASE_PATH_LABEL : releaseHoldLabel;
       record({ number: draft.number, action: 'keep', reason: `label:${held}`, applied: false });
+      continue;
+    }
+    // Outside-harness drafts keep their established jurisdiction reason, even when they carry a valid marker.
+    if (!contradiction && !states.length && !draft.branch.startsWith('self-impl/')) {
+      record({ number: draft.number, action: 'keep', reason: 'outside-harness', applied: false });
+      continue;
+    }
+    const intentHold = parseDraftIntentHold(draft.body, now);
+    if (intentHold) {
+      const reason = draftIntentHoldReason(intentHold);
+      record({ number: draft.number, action: 'keep', reason, applied: false });
+      try { debug.log('self-dev.draft-sweep', 'intent-hold-kept', { pr: draft.number, owner: intentHold.owner,
+        reason: intentHold.reason, expiresAt: intentHold.expiresAt }); } catch { /* fail-soft */ }
       continue;
     }
     const claimState = contradiction ? 'unclaimed' : draftClaimState(draft, now);
@@ -1368,7 +1394,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     const cellNewer = contradiction || lineageNewer ? undefined : newerSameCellDraft(draft, drafts);
     const duplicateNewer = lineageNewer ?? cellNewer;
     if (duplicateNewer) {
-      const base = decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
+      const base = decideDraft({ draft, now, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
         finalRunResult, ageHours: runStatus ? ageHours : idleHours });
       if (!base.reason.startsWith('label:') && !base.reason.startsWith('superseded-by #') && !base.reason.startsWith('duplicate-of-open #')) {
         const runLive = isLiveDraftRun(runStatus, draft.branch, liveBranches);
@@ -1457,7 +1483,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
     // An unobserved claim may still have a merged twin: liveness/holds retain their priority,
     // but a superseded draft must not be hidden by the six-hour claim window.
-    const mergedDecision = isClaimed ? decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
+    const mergedDecision = isClaimed ? decideDraft({ draft, now, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
       finalRunResult, ageHours: idleHours }) : undefined;
     const supersededClaim = mergedDecision?.reason.startsWith('superseded-by #') === true
       || mergedDecision?.reason.startsWith('duplicate-of-open #') === true;
@@ -1509,12 +1535,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       }
       continue;
     }
-    // Unlabelled non-harness drafts are outside the sweeper's jurisdiction.
-    if (!contradiction && !states.length && !draft.branch.startsWith('self-impl/')) {
-      record({ number: draft.number, action: 'keep', reason: 'outside-harness', applied: false });
-      continue;
-    }
-    let decision = supersededClaim ? mergedDecision! : decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
+    let decision = supersededClaim ? mergedDecision! : decideDraft({ draft, now, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
       finalRunResult, ageHours: runStatus ? ageHours : idleHours });
     const fallback = decision.reason === 'unobserved' || decision.reason === 'stale-unobserved'
       || decision.reason === 'recent' || decision.reason.startsWith('recent (') || decision.reason.startsWith('stale-ended-run');

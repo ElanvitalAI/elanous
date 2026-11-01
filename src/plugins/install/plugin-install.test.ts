@@ -1,13 +1,14 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dlopen, FFIType } from 'bun:ffi';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { debug } from '../../debug/log.js';
+import { createTaskPluginWizardHostDeps } from '../../cli/task-plugin-wizard-host.js';
 import { installPlugin, listInstalledPlugins, pluginInstallPath, removePlugin, resolvePluginSource, withLedgerLock, type InstallEvent } from './plugin-install.js';
 import { loadPluginManifestFromDir } from '../core/manifest.js';
 import { addMarket } from './market-fetch.js';
@@ -737,34 +738,48 @@ describe('smart plugin wizard — 도구 없음 → 마켓 → 손 둘 개발 �
     mkdirSync(workspace, { recursive: true });
     const claude = packageAt(join(workspace, 'claude-scenario-plugin'), 'claude-scenario-plugin');
     const codex = packageAt(join(workspace, 'codex-scenario-plugin'), 'codex-scenario-plugin');
+    const canonicalCodex = realpathSync(codex);
     const runId = 'DEMO1104-SELF-PLUGIN-mock-20261031T0543KST';
-    const visibleResults = new Map<string, { ok: boolean; content: string }>();
-    const registry = createClassicSidetabMissionPairSessionRegistry();
-    let pairCompletion: { codex: { ok: boolean; content?: string }; claude: { ok: boolean; content?: string }; status: string } | undefined;
-    const started = startClassicSidetabMissionPair({
-      agent: 'claude', mission: 'Build the local scenario plugin.', parallelMission: 'Build the local scenario plugin.',
-      spawnVisible: (agent) => ({ id: `${agent}-mock-pty`, cwd: workspace }),
-      runVisible: async (agent, prompt) => {
-        expect(prompt).toBe('Build the local scenario plugin.');
-        const path = agent === 'claude' ? claude : codex;
-        const result = { ok: true, content: `Implemented local candidate.\nPLUGIN_SPEC=${path}` };
-        visibleResults.set(agent, result);
-        return result;
-      },
-      registry,
-      hasSession: () => true,
-      killSession: () => {},
-      enqueue: () => {},
-      createId: (() => { let id = 0; return () => `mock-mission-${++id}`; })(),
-      now: () => 100,
-      onComplete: result => { pairCompletion = result; },
-    });
-    await started.completion;
-
     const wizardEvents: Array<{ ts: string; wizardId: string; step: string; text: string; detail?: unknown }> = [];
+    const loggedWizardSteps: Array<{ step?: string; detail?: unknown }> = [];
+    const logSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'wizard.step' && event === 'wizard.step') {
+        const record = data as { step?: string; detail?: unknown };
+        loggedWizardSteps.push(record);
+      }
+    });
     const candidate = { name: 'market-scenario-plugin', version: '1.0.0', market: 'mock-market',
       path: join(root, 'market-candidate'), sha256: null };
-    const result = await composePluginMission({ mission: 'scenario report', missing: 'scenario simulator', root, workspace, wizardId: runId }, {
+    const hostDeps = createTaskPluginWizardHostDeps({
+      runMissionPair: async ({ makers, prompt }) => {
+        expect(makers).toEqual(['claude', 'codex']);
+        expect(prompt).toContain('scenario simulator');
+        const started = startClassicSidetabMissionPair({
+          agent: 'claude', mission: prompt, parallelMission: prompt,
+          spawnVisible: agent => ({ id: `${agent}-mock-pty`, cwd: workspace }),
+          runVisible: async (agent, receivedPrompt) => {
+            expect(receivedPrompt).toBe(prompt);
+            const path = agent === 'claude' ? claude : codex;
+            return { ok: true, content: `Implemented local candidate.\nPLUGIN_SPEC=${path}` };
+          },
+          registry: createClassicSidetabMissionPairSessionRegistry(),
+          hasSession: () => true,
+          killSession: () => {},
+          enqueue: () => {},
+          createId: (() => { let id = 0; return () => `mock-mission-${++id}`; })(),
+          now: () => 100,
+        });
+        const completion = await started.completion;
+        expect(started.result.codex.interactionId).toBeTruthy();
+        return {
+          claude: { ok: completion.claude.ok, content: completion.claude.content },
+          codex: { ok: completion.codex.ok, content: completion.codex.content },
+        };
+      },
+    });
+    let result: Awaited<ReturnType<typeof composePluginMission>>;
+    try {
+      result = await composePluginMission({ mission: 'scenario report', missing: 'scenario simulator', root, workspace, wizardId: runId }, {
       ask: async () => ({ scenario: 'default values only' }),
       searchMarket: async () => ({ candidates: [{ market: 'mock-market', name: candidate.name,
         version: candidate.version, spec: 'market-scenario-plugin@mock-market', score: 1 }], unavailable: [] }),
@@ -774,23 +789,12 @@ describe('smart plugin wizard — 도구 없음 → 마켓 → 손 둘 개발 �
       trial: async request => request.origin === 'market'
         ? { ok: false, score: 1, detail: 'scenario defaults cannot be changed' }
         : { ok: true, score: request.maker === 'codex' ? 9 : 6, detail: `${request.maker} scenario fixture passed` },
-      developPair: async ({ makers, goal, workspace: pairedWorkspace }) => {
-        expect(goal).toContain('scenario simulator');
-        expect(pairedWorkspace).toBe(workspace);
-        expect(makers).toEqual(['claude', 'codex']);
-        expect(pairCompletion).toMatchObject({ status: 'done', codex: { ok: true }, claude: { ok: true } });
-        const spec = (maker: 'claude' | 'codex') => {
-          const content = pairCompletion?.[maker].content ?? '';
-          return { spec: content.split('PLUGIN_SPEC=')[1]!.trim() };
-        };
-        return { claude: spec('claude'), codex: spec('codex') };
-      },
+      developPair: hostDeps.developPair,
       onEvent: event => wizardEvents.push(event),
       notify: () => {},
-    });
+      });
+    } finally { logSpy.mockRestore(); }
 
-    expect(started.result.codex.interactionId).toBeTruthy();
-    expect(visibleResults.size).toBe(2);
     expect(result).toMatchObject({ status: 'done', origin: 'maker', plugin: { name: 'codex-scenario-plugin' } });
     expect(result.trials.map(item => [item.origin, item.maker ?? '-', item.ok, item.score])).toEqual([
       ['market', '-', false, 1], ['maker', 'claude', true, 6], ['maker', 'codex', true, 9],
@@ -798,8 +802,10 @@ describe('smart plugin wizard — 도구 없음 → 마켓 → 손 둘 개발 �
     expect(listInstalledPlugins(root)).toEqual([result.plugin!]);
     const comparison = wizardEvents.find(event => event.step === 'validate');
     expect(comparison).toMatchObject({ wizardId: runId,
-      detail: { winner: { maker: 'codex', spec: codex, score: 9 } } });
+      detail: { winner: { maker: 'codex', spec: canonicalCodex, score: 9 } } });
     expect(comparison && Date.parse(comparison.ts)).toBeGreaterThan(0);
+    expect(loggedWizardSteps).toContainEqual(expect.objectContaining({ step: 'validate',
+      detail: expect.objectContaining({ winner: { maker: 'codex', spec: canonicalCodex, score: 9 } }) }));
     expect(wizardEvents.at(-1)).toMatchObject({ step: 'done', wizardId: runId, detail: { ok: true } });
     expect(result.report).toContain('Done · codex-scenario-plugin@1.2.3');
     expect(result.report).toContain(`작업실: ${workspace}`);

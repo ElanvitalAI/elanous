@@ -28,6 +28,8 @@ export interface TestScenarioRequestInput {
   readonly registeredMethodologies: readonly string[];
   /** 라이브 명령의 «출처» — 보통 저작 중인 골 문서의 경로. 없으면 measured 로 못 간다. */
   readonly commandSource?: string;
+  /** Multiple authoritative source candidates are retained for review, never chosen by priority. */
+  readonly commandSourceCandidates?: readonly string[];
 }
 
 export type TestScenarioLiveStatus = 'measured' | 'unmeasured';
@@ -61,7 +63,25 @@ export function requestTestScenario(input: TestScenarioRequestInput): TestScenar
   const canLaunch = input.launch !== null
     && (input.launch.port !== undefined || (input.launch.entrypoint ?? '').trim() !== '');
   const methodologyAvailable = input.registeredMethodologies.includes(LAUNCH_METHODOLOGY);
-  const commandSource = input.commandSource?.trim();
+  const commandSourceCandidates = [...new Set((input.commandSourceCandidates ?? [])
+    .map((candidate) => candidate.trim())
+    .filter((candidate) => /^[^:\s]+:[^:\s]+$/u.test(candidate)))];
+  const explicitCommandSource = input.commandSource?.trim() || undefined;
+  const candidateConflict = commandSourceCandidates.length > 1
+    || (commandSourceCandidates.length === 1 && explicitCommandSource !== undefined && commandSourceCandidates[0] !== explicitCommandSource);
+  const commandSource = candidateConflict
+    ? undefined
+    : explicitCommandSource || commandSourceCandidates[0];
+  // Ambiguous declarations must use file:key tokens. Preserve a legacy explicit
+  // document path as a labeled source token rather than emitting a malformed item.
+  const explicitAmbiguityCandidate = explicitCommandSource
+    ? (/^[^:\s]+:[^:\s]+$/u.test(explicitCommandSource) ? explicitCommandSource : `${explicitCommandSource}:explicit-command-source`)
+    : undefined;
+  const ambiguityCandidates = [...new Set([
+    ...commandSourceCandidates,
+    ...(candidateConflict && explicitAmbiguityCandidate ? [explicitAmbiguityCandidate] : []),
+  ])];
+  const commandSourceAmbiguous = candidateConflict || (!commandSource && commandSourceCandidates.length > 1);
 
   if (canLaunch && methodologyAvailable && commandSource) {
     return {
@@ -76,15 +96,17 @@ export function requestTestScenario(input: TestScenarioRequestInput): TestScenar
   }
 
   // ⛔ 사유를 «가장 바깥 원인»으로 고른다 — 선언이 없으면 방법론·명령출처를 따질 자리가 아니다.
-  const reason = !canLaunch
-    ? 'no-launch-declaration'
+  const reason = commandSourceAmbiguous
+    ? 'ambiguous-command-source'
+    : !canLaunch
+      ? 'no-launch-declaration'
     : !methodologyAvailable
       ? 'no-methodology'
       : 'no-command-source';
   return {
     sections: [
       scenarioSection(UNKNOWN_DELIVERABLE, input.acceptanceCriteria),
-      unmeasuredLiveSection(reason),
+      unmeasuredLiveSection(reason, reason === 'ambiguous-command-source' ? ambiguityCandidates : [], reason === 'ambiguous-command-source' && candidateConflict ? explicitCommandSource : undefined),
       resultReportSection(),
     ],
     deliverableType: UNKNOWN_DELIVERABLE,
@@ -138,13 +160,22 @@ function measuredLiveSection(methodology: string, commandSource: string, launch:
 }
 
 /** L 층(측정 불가) — ⛔ 방법론·명령출처·기동·눈·기대를 «싣지 않는다»(파서가 금지한다). */
-function unmeasuredLiveSection(reason: string): string {
+function unmeasuredLiveSection(reason: string, candidates: readonly string[] = [], explicitSource?: string): string {
+  const prerequisite = reason === 'no-launch-declaration'
+    ? '골이 `## 산출물을 어떻게 켜나` 절에 `Port:` 또는 `Entrypoint:` 를 선언했으면 됐다'
+    : reason === 'ambiguous-command-source'
+      ? '골이 후보 중 하나를 권위 있는 명령 출처로 확정했으면 됐다'
+      : reason === 'no-methodology'
+        ? '호출자가 등록 방법론 레지스트리에 `deliverable-verify` 를 등록했으면 됐다'
+        : '골이 권위 있는 명령 출처를 선언했으면 됐다';
   return [
     '## L. 라이브',
     '',
     '### 상태 `unmeasured`',
     `- 사유: \`${reason}\``,
-    '- 무엇이 있었으면 됐나: 골이 `## 산출물을 어떻게 켜나` 절에 `Port:` 또는 `Entrypoint:` 를 선언했으면 됐다',
+    ...(reason.startsWith('ambiguous-') ? [`- 후보 목록: ${candidates.join(', ')}`] : []),
+    ...(explicitSource ? [`- 원래 명시 출처(후보와 별도): \`${explicitSource}\``] : []),
+    `- 무엇이 있었으면 됐나: ${prerequisite}`,
     '',
     '> ⚠️ ⛔ 「측정 불가」는 「결함 없음」이 «아니다». 이 골은 라이브 층을 «안 본 채» 끝난다.',
   ].join('\n');

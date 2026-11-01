@@ -99,6 +99,35 @@ test('research tool budget keeps WebSearch, OmniSearch, and WebFetch in the sele
   expect(research.filtered).toContain('web_fetch');
 });
 
+test('research intent reserves WebSearch and WebFetch even when higher-scored tools fill top eight', () => {
+  resetGateCache();
+  const catalog = [
+    ...['web_search', 'web_fetch'].map(id => ({ ...catalogWithDefaultEnabled(true)[0]!, id })),
+    ...Array.from({ length: 12 }, (_, index) => ({
+      ...catalogWithDefaultEnabled(true)[0]!, id: `aaa_research_fixture_${index}`,
+    })),
+  ];
+  const hints = Array.from({ length: 12 }, (_, index) => ({
+    id: `research-fixture-hint-${index}`,
+    kind: 'prefer' as const,
+    tool: `aaa_research_fixture_${index}`,
+    scope: 'turn' as const,
+    createdAt: 0,
+  }));
+  const research = evaluateGate(catalog, hints, {
+    ...signals,
+    modelFamily: 'gpt',
+    intentResearch: true,
+    researchAgent: false,
+    fingerprint: 'research-intent-reserves-native-search',
+  });
+
+  expect(research.filtered).toHaveLength(8);
+  expect(research.filtered).toContain('web_search');
+  expect(research.filtered).toContain('web_fetch');
+  expect(research.filtered.filter(id => id.startsWith('aaa_research_fixture_'))).toHaveLength(6);
+});
+
 test('tool hints recognize explanatory research without widening a code repair or simple fact', () => {
   expect(collectSignals({ recentUserText: '현재 채권 금리가 계속 올라가는 이유는요? omni market 활용' }).intentResearch).toBe(true);
   expect(collectSignals({ recentUserText: '현재 채권 금리가 계속 올라가는 이유는요? omni market 활용' }).researchAgent).toBe(true);

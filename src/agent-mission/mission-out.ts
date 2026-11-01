@@ -6,7 +6,7 @@ import type { Command } from 'commander';
 import { debug, redactSecretText } from '../debug/log.js';
 import type { AsyncLockHandle } from '../storage/file-lock.js';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
-import { createMissionLineStore, MissionLineHttpError, postMissionLineEvent, type MissionLineType } from './mission-line.js';
+import { createMissionLineStore, MissionLineHttpError, postMissionLineEvent, type MissionLineEvent, type MissionLineType } from './mission-line.js';
 import type { LinearMissionLink } from '../intake-plane/linear-mission-sync.js';
 
 const MISSION_CONTEXT_ENV = 'ELANOUS_MISSION_CONTEXT';
@@ -747,7 +747,7 @@ export function registerMissionOutCommand(program: Command, deps: {
             ...(opts.stop !== undefined ? { stop: opts.stop } : {}),
             ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
           };
-          let event: MissionReplyEvent;
+          let event: MissionReplyEvent | MissionLineEvent;
           try {
             const lineEvent = await postMissionLineEvent({
               lineId, missionId, attemptId: lineAttemptId, agent: lineAgent,

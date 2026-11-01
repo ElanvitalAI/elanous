@@ -173,6 +173,7 @@ type SearchTermsLlmClient = {
 export async function defaultSearchTerms(
   goal: string,
   llmClient?: SearchTermsLlmClient,
+  mockScenarioCatalog?: string,
 ): Promise<string[]> {
   const fallback = Array.from(new Set(goal.toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) ?? [])).slice(0, 8);
   const llmGoal = goal.slice(0, 500);
@@ -189,8 +190,11 @@ export async function defaultSearchTerms(
       'Given a software mission goal (Korean or English), output 6-12 code search keywords to find ' +
       'EXISTING related code/docs in this repo: English identifiers, module names, domain nouns ' +
       '(e.g. memory, decay, archive, consolidate, session, surface-events, signal, trade). ' +
+      'When a reusable mock-device catalog is provided, include a device/scenario term only when it directly helps inspect or verify this goal. ' +
       'Comma-separated, lowercase, no explanation.\n\n' +
-      `Goal: ${llmGoal}\nKeywords:`;
+      `Goal: ${llmGoal}` +
+      (mockScenarioCatalog ? `\n\nAvailable mock-device and event-injection catalog (reference only):\n${mockScenarioCatalog}` : '') +
+      '\nKeywords:';
     let full = '';
     await client.streamLLM([{ role: 'user', content: prompt }], (_d, all) => { full = all; }, {
       model,
@@ -647,7 +651,7 @@ export function isCorpusGrounded(corpus: {
 }
 
 export async function groundMissionInCodebase(
-  goal: string, deps: { cwd?: string; seedPaths?: readonly string[]; searchTerms?: SearchTermFn; skillIndex?: SkillIndexFn; pickSkills?: SkillPickFn; recallMemory?: RecallMemoryFn; recallSelf?: RecallSelfFn; refDigest?: RefDigestFn; persistent?: PersistentGroundingDeps | false } & CapsuleGroundingDeps = {},
+  goal: string, deps: { cwd?: string; seedPaths?: readonly string[]; searchTerms?: SearchTermFn; skillIndex?: SkillIndexFn; pickSkills?: SkillPickFn; recallMemory?: RecallMemoryFn; recallSelf?: RecallSelfFn; refDigest?: RefDigestFn; persistent?: PersistentGroundingDeps | false; mockScenarioCatalog?: string } & CapsuleGroundingDeps = {},
 ): Promise<CodebaseGrounding> {
   // 호출자가 준 root를 모든 저장소 채널과 corpus 관측에 공유한다. 미지정 호출은 기존처럼 프로세스 cwd를 쓴다.
   // ⛔ seam 은 «읽기» 만 하지 않는다 — 시작 자리를 소유자(acquireCwdSeam)에게서 받고 finally 에서 돌려준다.
@@ -678,7 +682,7 @@ export async function groundMissionInCodebase(
     const searchTermsStartedAt = performance.now();
     let generatedTerms: string[];
     try {
-      generatedTerms = await (deps.searchTerms ?? defaultSearchTerms)(goal);
+      generatedTerms = await (deps.searchTerms ?? ((value) => defaultSearchTerms(value, undefined, deps.mockScenarioCatalog)))(goal);
     } finally {
       searchTermsElapsedMs = performance.now() - searchTermsStartedAt;
     }

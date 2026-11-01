@@ -8,7 +8,7 @@ export type { SupervisorStopReason } from './run-types.js';
 export { SUPERVISOR_STOP_REASONS } from './run-types.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { readRunChart, recordRunChartDecision } from '../self-implement/run-chart.js';
-import { runLedgerDir } from '../self-implement/run-ledger.js';
+import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
@@ -105,6 +105,25 @@ interface DecomposePromotionObservation {
   hotPathEdges?: number;
 }
 
+export interface SupervisorReauthorObservation {
+  round: number;
+  classifications: Array<{ taskId: string; text: string; kind: 'code-defect' | 'authorship-defect'; action: 'must-fix' | 'scope-reduction-fu' }>;
+  prescription: {
+    outcome: '부분 착지 + FU';
+    narrowedProposal: string;
+    partialLanding: string;
+    followUp: {
+      lane: 'REVIEW-ROUND-REAUTHOR-FU';
+      goalId: string;
+      feature: string;
+      targetPaths: string[];
+      completionBoundary: string;
+      mockScenarioId: string;
+      mockScenario: { id: string; injection: string; observation: string };
+    };
+  };
+}
+
 export interface SupervisorDecision {
   action: 'relaunch' | 'add-repair-task' | 'stop';
   stopReason?: SupervisorStopReason;
@@ -130,6 +149,8 @@ export interface SupervisorDecision {
   reviewMustFixTrend: ReviewRework['trend'];
   /** REVIEW-MUSTFIX-CLASSIFY — this round's leading must-fix class (② › ③ observed › ①); omitted when unmeasured (지금 동작 그대로). */
   mustFix?: MustFixRoundClassification;
+  /** REVIEW-ROUND-REAUTHOR — supervisory reauthoring decision, omitted for ordinary/legacy rounds. */
+  reauthor?: SupervisorReauthorObservation;
   /** REVIEW-MUSTFIX-CLASSIFY — every oscillating task's measured class, so a mixed round keeps each task's decision. */
   mustFixByTask?: Record<string, MustFixRoundClassification>;
   /**
@@ -367,6 +388,70 @@ function mustFixFromResults(results: readonly SupervisorJobResult[]): MustFixRou
   return items.length > 0 ? { items } : {};
 }
 
+function authoringDefect(text: string): boolean {
+  return /(?:불필요한\s*(?:경계|목표)|아직\s*없는\s*(?:부품|운영|배선)|미구현\s*(?:부품|운영|배선)|실물\s*전제|미래\s*가정|out[- ]of[- ]scope|not yet existing|future assumption)/iu.test(text);
+}
+
+function repeatedMustFix(text: string, taskId: string, history: readonly SupervisorRound[]): boolean {
+  const normalized = text.trim().replace(/\s+/gu, ' ').toLowerCase();
+  return history.filter((round) => round.mustFix?.items?.some((item) => item.taskId === taskId
+    && item.text.trim().replace(/\s+/gu, ' ').toLowerCase() === normalized)).length >= 1;
+}
+
+function reauthorObservation(results: readonly SupervisorJobResult[], history: readonly SupervisorRound[]): SupervisorReauthorObservation | undefined {
+  const reviewed = results.flatMap((result) => (result.reviewMustFix ?? []).map((text) => ({ result, text })));
+  if (!reviewed.length) return undefined;
+  const rounds = Math.max(...reviewed.map(({ result }) => result.rework?.rounds ?? 0));
+  const classified = reviewed.map(({ result, text }) => ({ result, text, authored: authoringDefect(text) }));
+  const triggered = classified.some(({ result, text }) => (result.rework?.rounds ?? 0) > 3
+    || repeatedMustFix(text, result.taskId, history));
+  if (!triggered) return undefined;
+  const round = Math.max(rounds, history.length + 1);
+  const classifications = classified.map(({ result, text, authored }) => ({
+    taskId: result.taskId, text, kind: authored ? 'authorship-defect' as const : 'code-defect' as const,
+    action: authored ? 'scope-reduction-fu' as const : 'must-fix' as const,
+  }));
+  const authored = classified.filter((item) => item.authored);
+  const targetPaths = [...new Set(authored.flatMap(({ result }) => result.targetPaths ?? []))];
+  const narrowedProposal = authored.length
+    ? `골·칸·시험에서 제거: ${authored.map(({ text }) => text).join(' · ')}`
+    : '현재 목표와 완료 경계에 한정하고 리뷰에서 확인된 코드 결함만 수정한다';
+  return {
+    round, classifications,
+    prescription: {
+      outcome: '부분 착지 + FU', narrowedProposal,
+      partialLanding: `현재 완결 가능한 범위만 착지한다${targetPaths.length ? ` — ${targetPaths.join(', ')}` : ''}`,
+      followUp: {
+        lane: 'REVIEW-ROUND-REAUTHOR-FU',
+        goalId: `reauthor-fu-${authored[0]?.result.prNumber ?? authored[0]?.result.taskId ?? 'unbound'}`,
+        feature: `저작 결함을 제외한 완결 범위를 구현하고 검증한다 — ${narrowedProposal}`,
+        targetPaths,
+        completionBoundary: targetPaths.length ? `대상 경로: ${targetPaths.join(', ')}; 완료 경계: 해당 경로 내 범위` : '대상 경로 및 완료 경계는 다음 저작에서 재접지한다',
+        mockScenarioId: 'MS-03',
+        mockScenario: {
+          id: 'MS-03',
+          injection: `기존 리뷰 결과 주입: ${authored.map(({ text }) => text).join(' · ') || '반복 must-fix 재검토'}`,
+          observation: '제외된 저작 결함이 must-fix 목록에 없고, 부분 착지 및 FU 완료 경계가 관측된다',
+        },
+      },
+    },
+  };
+}
+
+function reauthorMustFixes(results: readonly SupervisorJobResult[], observation: SupervisorReauthorObservation | undefined): SupervisorJobResult[] {
+  if (!observation) return [...results];
+  const excluded = new Map<string, Set<string>>();
+  for (const item of observation.classifications) {
+    if (item.kind !== 'authorship-defect') continue;
+    const texts = excluded.get(item.taskId) ?? new Set<string>();
+    texts.add(item.text);
+    excluded.set(item.taskId, texts);
+  }
+  return results.map((result) => ({ ...result,
+    reviewMustFix: (result.reviewMustFix ?? []).filter((text) => !excluded.get(result.taskId)?.has(text)),
+  }));
+}
+
 /**
  * REVIEW-MUSTFIX-CLASSIFY — per-task class. `prev` is the preceding round's items of the same task or its repair
  * lineage (`oscillationRepairOf`), and only when that preceding round authored a repair for it — «수리 뒤 같은 지적»
@@ -470,8 +555,9 @@ type DecideNextRunInput = {
 };
 
 function decideNextRunCore(input: DecideNextRunInput): SupervisorDecision {
-  const results = [...input.results];
   const history = [...(input.history ?? [])];
+  const reauthor = reauthorObservation(input.results, history);
+  const results = reauthorMustFixes(input.results, reauthor);
   const maxRounds = input.limits?.maxRounds ?? DEFAULT_MAX_ROUNDS;
   const stallRounds = input.limits?.stallRounds ?? DEFAULT_STALL_ROUNDS;
   const observation = input.deliverableObservation
@@ -537,6 +623,7 @@ function decideNextRunCore(input: DecideNextRunInput): SupervisorDecision {
     deliverableUnmeasured: t.deliverableUnmeasured,
     deliverableMergeCompleteness,
     reviewMustFixTrend,
+    ...(reauthor ? { reauthor } : {}),
     rerunnable: t.rerunnable,
     reworkable: t.reworkable,
     decomposable: t.decomposable,
@@ -983,6 +1070,7 @@ export function appendRound(
     ...(baseCompleted > 0 || base !== undefined ? { baseCompleted, ...(base === undefined ? {} : { base }) } : {}),
     actionable: countActionable(t),
     ...(reviewMustFixTrend === undefined ? {} : { reviewMustFixTrend }),
+    ...(decision?.reauthor ? { reauthor: decision.reauthor } : {}),
     ...((mustFix.items ?? []).length > 0 ? { mustFix } : {}),
     ...(Object.keys(lostTimeMsByTask).length > 0 ? { lostTimeMsByTask } : {}),
     ...(unknownTimeTaskIds.size > 0 ? { unknownTimeTaskIds: [...unknownTimeTaskIds] } : {}),
@@ -1250,6 +1338,55 @@ export interface SuperviseRunOptions {
   }>;
 }
 
+/** Adapt REVIEW-ROUND-REAUTHOR's decision into an observation without duplicating its classification logic. */
+export function supervisorReauthorRequestObservations(
+  decision: SupervisorDecision,
+  parentRunId: string | null,
+  results: readonly SupervisorJobResult[],
+  resolveAuthorRunId: (ledgerRunId: string) => string | null = (ledgerRunId) => {
+    try {
+      const entries = loadRunLedger(ledgerRunId);
+      for (const entry of [...(entries ?? [])].reverse()) {
+        const authorRunId = entry.event === 'goal-authored' ? entry.data.authorRunId : undefined;
+        if (typeof authorRunId === 'string' && authorRunId.trim()) return authorRunId;
+      }
+    } catch { /* an absent or unreadable lineage ledger leaves this event unjoined */ }
+    return null;
+  },
+): Array<{ event: 'supervisor.reauthor-request' | 'supervisor.reauthor-unjoined'; data: Record<string, unknown> }> {
+  const reauthor = decision.reauthor;
+  if (!reauthor) return [];
+  return reauthor.classifications.flatMap((classification): Array<{ event: 'supervisor.reauthor-request' | 'supervisor.reauthor-unjoined'; data: Record<string, unknown> }> => {
+    if (classification.kind !== 'authorship-defect') return [];
+    const result = results.find((candidate) => candidate.taskId === classification.taskId);
+    const sourceReviewRunId = result?.runId;
+    const authorRunId = (parentRunId ? resolveAuthorRunId(parentRunId) : null)
+      ?? (sourceReviewRunId ? resolveAuthorRunId(sourceReviewRunId) : null);
+    if (!authorRunId) return [{
+      event: 'supervisor.reauthor-unjoined',
+      data: {
+        ...(parentRunId ? { parentRunId } : {}),
+        ...(sourceReviewRunId ? { sourceReviewRunId } : {}),
+        taskId: classification.taskId,
+        attempt: reauthor.round,
+        classification: 'authorship-defect',
+        reason: 'author-run-id-unresolved',
+      },
+    }];
+    return [{
+      event: 'supervisor.reauthor-request' as const,
+      data: {
+        conversationId: authorRunId,
+        runId: authorRunId,
+        ...(parentRunId ? { parentRunId } : {}),
+        ...(sourceReviewRunId ? { sourceReviewRunId } : {}),
+        attempt: reauthor.round,
+        classification: 'authorship-defect',
+      },
+    }];
+  });
+}
+
 type SupervisorStopStorageSource = 'operator-dir' | 'run-store-dir' | 'process-default';
 
 function resolveSupervisorStopStorage(runStore: SuperviseRunOptions['runStore']): {
@@ -1345,6 +1482,15 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
         ...(allUnreviewedAreNoDiff ? { reviewReason: 'no-diff' } : {}),
       } : {}),
     });
+    if (decision.reauthor) {
+      try {
+        opts.observe?.('review.reauthor', {
+          round: decision.reauthor.round,
+          classifications: decision.reauthor.classifications,
+          prescription: decision.reauthor.prescription,
+        });
+      } catch { /* fail-open */ }
+    }
     if (chartRunId) {
       recordRunChartDecision({ runId: chartRunId, device: 'outer-supervisor',
         stopKey: `${chartRunId}:outer-supervisor:${history.length + 1}`, observed: `results=${results.length}`,
@@ -1381,6 +1527,10 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
     }
 
     const runId = chartRunId;
+
+    for (const request of supervisorReauthorRequestObservations(decision, runId, results)) {
+      try { opts.observe?.(request.event, request.data); } catch { /* observation is fail-soft */ }
+    }
 
     let decomposePromotion: DecomposePromotionObservation = decision.decomposable.length === 0
       ? { attempted: false, reason: 'no-decomposable-decision' }

@@ -56,6 +56,7 @@ function makeCase(scenario: DraftInventoryScenario, index: number): DraftInvento
   };
   const input: DraftTriageInput = {
     draft,
+    now: new Date(fixedNow),
     runStatus: 'self-implement.result final',
     mergedTwins: [],
     openDrafts: [],
@@ -190,7 +191,7 @@ export function assessDraftInventory(cases = buildDraftInventory()): {
     if ((item.scenario === 'protected-label' || item.scenario === 'running') && decision.action === 'close') {
       protectedOrRunningClosed += 1;
     }
-    if (item.scenario === 'running' && draftClaimState(item.input.draft, new Date(fixedNow)) !== 'claimed') {
+    if (item.scenario === 'running' && draftClaimState({ labels: item.input.draft.labels ?? [], updatedAt: item.input.draft.updatedAt }, new Date(fixedNow)) !== 'claimed') {
       mismatches.push(`${index}:running:draftClaimState expected=claimed`);
     }
   });

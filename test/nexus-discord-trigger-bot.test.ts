@@ -90,7 +90,7 @@ describe('createNexusDiscordTriggerBot · factory + tap wiring', () => {
     expect(handle).toBeNull();
   });
 
-  it('toDiscordEvent maps the tap shape congruently with raw passthrough', () => {
+  it('toDiscordEvent maps the tap shape congruently with raw passthrough', async () => {
     const tap: DcTriggerEvent = {
       kind: 'mention',
       channel: 'ch-123',
@@ -99,8 +99,10 @@ describe('createNexusDiscordTriggerBot · factory + tap wiring', () => {
       messageId: 'msg-789',
       isDm: false,
     };
-    expect(receiveChannelEvent('discord', tap)).toEqual({ text: tap.body, kind: 'mention', channel: 'ch-123', senderId: 'user-456', messageId: 'msg-789' });
-    const out = toDiscordEvent(tap);
+    await expect(receiveChannelEvent('discord', tap)).resolves.toEqual({ text: tap.body, kind: 'mention', channel: 'ch-123', senderId: 'user-456', messageId: 'msg-789' });
+    const outPromise = toDiscordEvent(tap);
+    expect(outPromise).toBeInstanceOf(Promise);
+    const out = await outPromise;
     expect(out).toMatchObject({
       kind: 'mention',
       channel: 'ch-123',

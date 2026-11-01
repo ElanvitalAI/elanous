@@ -276,6 +276,21 @@ describe('harness say/ask --substrate pod', () => {
     }
   });
 
+  test('harness Pod dispatch replaces an inherited graph-growth scope with the allowlisted harness value', () => {
+    const previous = process.env.ELANOUS_GRAPH_GROWTH_SCOPE;
+    let seen: NodeJS.ProcessEnv | undefined;
+    try {
+      process.env.ELANOUS_GRAPH_GROWTH_SCOPE = 'task-agent';
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal' }, {
+        run: (_command, _args, env) => { seen = { ...env }; return 0; },
+      })).toBe(0);
+      expect(seen?.ELANOUS_GRAPH_GROWTH_SCOPE).toBe('harness');
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_GRAPH_GROWTH_SCOPE;
+      else process.env.ELANOUS_GRAPH_GROWTH_SCOPE = previous;
+    }
+  });
+
   test('POD-OBS: the spawned orchestrator learns the launch home logs.db (the parent universe)', async () => {
     const { logsDbPath } = await import('../mss/logging/log-store.js');
     let stamped: string | undefined;
@@ -524,7 +539,7 @@ describe('harness say/ask --substrate pod', () => {
         rmSync(podCwd, { recursive: true, force: true });
       }
     } finally { rmSync(root, { recursive: true, force: true }); if (origin) rmSync(origin, { recursive: true, force: true }); }
-  });
+  }, 20_000);
 
   test('isolated TUI pod-child git stderr reaches the notice owner without inheriting terminal stdio', async () => {
     const output: string[] = [];

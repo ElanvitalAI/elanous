@@ -5262,20 +5262,21 @@ describe('runSelfImplement — Fix A rework', () => {
     expect(orchestratorSource).toContain('surfaces: [DEV_PIPELINE_SINK_SURFACE]');
   });
 
-  test('구조화된 자식 router 오류는 provider-error로 분류하고 자격 거부를 분리한다', async () => {
+  test('구조화된 자식 router 401은 credential-failure로 분류하고 안전한 응답 코드를 원장에 남긴다', async () => {
     const row = (over: Partial<{ instance: string; surface: string; category: string; ts_ms: number; data: string }> = {}) => ({
       id: 1, ts: '2026-08-17T13:44:48.899Z', ts_ms: 100, level: 'error', instance: 'test:child', surface: 'dev-pipeline', category: 'llm.router.error', event: 'streamLLM', session_id: null, trace_id: null,
-      data: JSON.stringify({ provider: 'openai-codex', model: 'gpt-5.6-terra', durationMs: 81429, message: 'Codex API error: upstream' }), ...over,
+      data: JSON.stringify({ provider: 'openai-codex', model: 'gpt-5.6-terra', durationMs: 81429, message: 'Codex API error: upstream', httpStatus: 401, providerErrorCode: 'invalid_api_key', providerErrorType: 'invalid_request_error', authRejected: true }), ...over,
     });
     const matching = queryStructuredChildProviderErrors(['test:child'], 0, 200, (query) => {
       expect(query).toMatchObject({ instances: ['test:child'], surfaces: [DEV_PIPELINE_SINK_SURFACE], exactCategories: ['llm.router.error'], sinceMs: 0, untilMs: 200 });
       return [row()];
     });
-    expect(matching).toMatchObject({ status: 'found', providerErrorCount: 1, credentialFailureCount: 0, lastProviderError: { provider: 'openai-codex', model: 'gpt-5.6-terra', observedAt: '2026-08-17T13:44:48.899Z', message: 'Codex API error: upstream' } });
+    expect(matching).toMatchObject({ status: 'found', providerErrorCount: 1, credentialFailureCount: 1, lastProviderError: { provider: 'openai-codex', model: 'gpt-5.6-terra', observedAt: '2026-08-17T13:44:48.899Z', message: 'Codex API error: upstream', httpStatus: 401, providerErrorCode: 'invalid_api_key', providerErrorType: 'invalid_request_error' }, lastCredentialFailure: { httpStatus: 401, providerErrorCode: 'invalid_api_key', providerErrorType: 'invalid_request_error' } });
     expect(queryStructuredChildProviderErrors([], 0, 200, () => [])).toMatchObject({ status: 'unavailable' });
     expect(queryStructuredChildProviderErrors(['test:child'], 0, 200, () => [])).toEqual({ status: 'none' });
     expect(queryStructuredChildProviderErrors(['test:child'], 0, 200, () => { throw new Error('logs unavailable'); })).toMatchObject({ status: 'unavailable' });
     const observations: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
     const originalLog = debug.log;
     (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
       observations.push({ event, data: data as Record<string, unknown> });
@@ -5286,6 +5287,7 @@ describe('runSelfImplement — Fix A rework', () => {
       feature: 'child structured provider error',
       runId: 'child-provider-run',
       seams: seams({
+        writeRunLedger: (entry) => { ledger.push({ event: entry.event, data: entry.data }); },
         implement: async () => ({ ok: false, completionDisposition: 'completed-without-changes', summary: 'child stopped' }),
         queryChildProviderErrors: async ({ runId, sinceMs, untilMs }) => {
           expect(runId).toBe('child-provider-run');
@@ -5297,19 +5299,23 @@ describe('runSelfImplement — Fix A rework', () => {
     } finally {
       (debug as { log: typeof debug.log }).log = originalLog;
     }
-    expect(result.abandonedClassification).toMatchObject({ classification: 'provider-error', providerError: true });
+    expect(result.abandonedClassification).toMatchObject({ classification: 'credential-failure', providerError: true, credentialFailure: true, providerErrorCategory: 'credential' });
     expect(observations).toContainEqual({
       event: 'failure-classification-inputs',
       data: expect.objectContaining({
-        classification: 'provider-error', providerErrorCount: 1, credentialFailureCount: 0,
-        queriedProviderErrorCount: 1, queriedCredentialFailureCount: 0,
-        lastProviderError: { provider: 'openai-codex', model: 'gpt-5.6-terra', observedAt: '2026-08-17T13:44:48.899Z' },
-        currentProviderError: true, currentCredentialFailure: false,
+        classification: 'credential-failure', providerErrorCount: 1, credentialFailureCount: 1,
+        queriedProviderErrorCount: 1, queriedCredentialFailureCount: 1,
+        lastProviderError: { provider: 'openai-codex', model: 'gpt-5.6-terra', observedAt: '2026-08-17T13:44:48.899Z', httpStatus: 401, providerErrorCode: 'invalid_api_key', providerErrorType: 'invalid_request_error' },
+        lastCredentialFailure: { provider: 'openai-codex', model: 'gpt-5.6-terra', observedAt: '2026-08-17T13:44:48.899Z', httpStatus: 401, providerErrorCode: 'invalid_api_key', providerErrorType: 'invalid_request_error' },
+        currentProviderError: true, currentCredentialFailure: true,
       }),
     });
     const inputs = observations.find((entry) => entry.event === 'failure-classification-inputs')!.data;
     expect(Number(inputs.lastProviderErrorSeq)).toBeGreaterThan(Number(inputs.lastFailedGateSeq));
     expect(Number(inputs.lastMustFixReviewSeq)).toBe(0);
+    expect(ledger.find((entry) => entry.event === 'failure-classification-inputs')?.data).toMatchObject({
+      lastCredentialFailure: { httpStatus: 401, providerErrorCode: 'invalid_api_key', providerErrorType: 'invalid_request_error' },
+    });
   });
 
   test('provider-error abandoned classification carries the start provider identity only when known', async () => {

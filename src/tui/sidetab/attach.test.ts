@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { splitKeys } from '../../tui.js';
-import { runVisibleAgentMission } from '../../sidetab-core/visible-agent-mission.js';
+import { runVisibleAgentMission, type VisibleMissionPty, type VisibleMissionResult } from '../../sidetab-core/visible-agent-mission.js';
 import { createSidetabAttachmentController, sidetabMissionFailureLog } from './attach.js';
 import type { HerdrSidetabPortal } from './herdr-portal.js';
 
@@ -72,6 +75,62 @@ describe('next TUI sidetab attachments', () => {
       expect(controller.hasModal()).toBe(false);
     } finally {
       controller.close();
+    }
+  });
+
+  test('starts both visible agent PTYs before dispatch and routes both files through pair synthesis', async () => {
+    const events: string[] = [];
+    const cwd = mkdtempSync(join(tmpdir(), 'sidetab-pair-'));
+    let releaseCodex: () => void = () => {};
+    const codexGate = new Promise<void>((resolve) => { releaseCodex = resolve; });
+    let markClaudeStarted: () => void = () => {};
+    const claudeStarted = new Promise<void>((resolve) => { markClaudeStarted = resolve; });
+    const controller = createSidetabAttachmentController({
+      drawBase: () => {}, termSize: () => ({ cols: 80, rows: 24 }), setStatus: () => {}, drawRemoteFrame: () => {},
+      detectAgentCli: async (agent) => ({ agent, installed: true, version: 'test', login: 'ready', message: `${agent} ready` }),
+      createVisibleMissionPty: (agent) => {
+        events.push(`spawn:${agent}`);
+        const pty: VisibleMissionPty = { snapshot: () => '', write: () => {}, isAlive: () => true };
+        return { pty, cwd };
+      },
+      visibleMissionRunner: async ({ agent, mission, outputPath }): Promise<VisibleMissionResult> => {
+        events.push(`run:${agent}:${mission}`);
+        if (agent === 'codex') await codexGate;
+        else markClaudeStarted();
+        return { ok: true, path: outputPath, content: `# ${agent}`, firstLine: `# ${agent}`, promptReady: true, missionVisible: true, promptReturned: true, completionMarker: true };
+      },
+    });
+
+    try {
+      const completion = controller.runMissionPair('codex', 'implement', 'review');
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const secondStarted = await Promise.race([
+        claudeStarted.then(() => true),
+        new Promise<boolean>((resolve) => { timeout = setTimeout(() => resolve(false), 2_000); }),
+      ]);
+      if (timeout) clearTimeout(timeout);
+      releaseCodex();
+      const pair = await completion;
+      expect(secondStarted).toBe(true);
+      expect(events.slice(0, 2)).toEqual(['spawn:codex', 'spawn:claude']);
+      expect(events.slice(2)).toEqual(['run:codex:implement', 'run:claude:review']);
+      const result = pair as { ok: boolean; pair: string; finalFile: string; graph: Array<{ id: string; state: string; resultFile?: string }> };
+      expect(result).toMatchObject({ ok: true, pair: 'codex+claude', graph: [
+        { id: 'plan', state: 'complete' },
+        { id: 'codex', state: 'complete' },
+        { id: 'claude', state: 'complete' },
+        { id: 'synthesis', state: 'complete' },
+      ] });
+      expect(result.finalFile).toContain(join(cwd, '.elanous', 'mission-results', 'classic-pair-synthesis-'));
+      const synthesis = readFileSync(result.finalFile, 'utf8');
+      expect(synthesis).toContain('## 비교·채택 표');
+      expect(synthesis).toContain('| Codex | implement |');
+      expect(synthesis).toContain('| Claude Code | review |');
+      expect(synthesis).toContain('# codex');
+      expect(synthesis).toContain('# claude');
+    } finally {
+      controller.close();
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 

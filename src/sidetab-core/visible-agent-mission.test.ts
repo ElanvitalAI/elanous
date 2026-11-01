@@ -167,7 +167,7 @@ test('Codex prompt is ready even when a dismissed update banner remains in the s
 });
 
 test('startup timeout error never includes arbitrary PTY frame contents', async () => {
-  const privateFrame = 'Update available · account token abc123';
+  const privateFrame = 'Update available · account token abc123 · \u001b[32mPASSWORD\u001b[0m="correct horse battery staple" · API_TOKEN="another multi word secret" · Authorization: Bearer "bearer phrase secret"';
   const result = await runVisibleAgentMission({
     agent: 'claude', pty: { snapshot: () => privateFrame, write: () => {}, isAlive: () => true },
     mission: 'Write a note.', outputPath: '/tmp/startup-timeout.md', handleTrust: () => false,
@@ -175,6 +175,12 @@ test('startup timeout error never includes arbitrary PTY frame contents', async 
   });
   expect(result.error).not.toContain('abc123');
   expect(result.error).not.toContain(privateFrame);
+  expect(result.failureStage).toBe('prompt-readiness');
+  expect(result.failureScreen).not.toContain('abc123');
+  expect(result.failureScreen).not.toContain('correct horse battery staple');
+  expect(result.failureScreen).not.toContain('another multi word secret');
+  expect(result.failureScreen).not.toContain('bearer phrase secret');
+  expect(result.failureScreen).toContain('PASSWORD=[redacted credential]');
 });
 
 test('visible mission requires a visible request, result file, idle prompt, and output-only marker', async () => {
@@ -221,9 +227,11 @@ test('visible mission requires a visible request, result file, idle prompt, and 
     firstLine: '# Demo result',
     promptReady: true,
     missionVisible: true,
+    missionTyped: true,
+    missionSubmitted: true,
     promptReturned: true,
     completionMarker: true,
-    initialScreen: '\u001b[32m\n›\n\u001b[0m',
+    initialScreen: '\n›\n',
   });
   expect(writes).toHaveLength(4);
   expect(writes[0]).toContain('/tmp/demo1104-result.md');
@@ -259,6 +267,8 @@ test('marker request appearing only in input is not accepted as completion outpu
   });
 
   expect(result).toMatchObject({ ok: false, promptReady: true, missionVisible: true, promptReturned: true, completionMarker: false });
+  expect(result.failureStage).toBe('marker-completion');
+  expect(result.failureScreen).toBeDefined();
   expect(result.error).toContain('completion marker');
   expect(screen).toMatch(/Say M-[a-f0-9]{12} alone and write it to the exact file path /);
   expect(screen).not.toMatch(/^\s*(?:[•⏺└│╰⎿]\s*)?M-[a-f0-9]{12}\s*$/m);
@@ -572,8 +582,136 @@ test('does not submit a mission that is not visible in the PTY', async () => {
     sleep: async () => { await new Promise(resolve => setTimeout(resolve, 1)); }, pollMs: 0, visibilityTimeoutMs: 5,
   });
 
-  expect(result).toMatchObject({ ok: false, promptReady: true, missionVisible: false, promptReturned: false, completionMarker: false });
+  expect(result).toMatchObject({ ok: false, promptReady: true, missionVisible: false, missionTyped: true, missionSubmitted: false, promptReturned: false, completionMarker: false });
   expect(result.error).toContain('not visible');
   expect(writes).toHaveLength(1);
   expect(writes[0]).toContain('Write a note.');
+});
+
+test('types long UTF-8 missions in bounded PTY chunks and records typed/submitted states', async () => {
+  const writes: string[] = [];
+  let screen = '\n› Ask Codex to do anything\n';
+  let screenAtSubmit = '';
+  let resultReady = false;
+  let markerPath: string | undefined;
+  let markerText: string | undefined;
+  let markerSubmitted = false;
+  const sleeps: number[] = [];
+  const outputPath = '/tmp/chunked-mission.md';
+  const result = await runVisibleAgentMission({
+    pty: {
+      snapshot: () => screen,
+      write: bytes => {
+        writes.push(bytes);
+        if (bytes === '\r') {
+          if (!resultReady) { screenAtSubmit = screen; resultReady = true; screen = '\n› Ask Codex to do anything\n'; }
+          else { markerSubmitted = true; screen = `\n└ ${markerText}\n`; }
+        } else {
+          screen += bytes;
+          if (bytes.startsWith('Say M-')) {
+            markerText = bytes.match(/M-[a-f0-9]{12}/)?.[0];
+            markerPath = bytes.match(/exact file path (\S+?)\.$/)?.[1];
+          }
+        }
+        return true;
+      },
+      isAlive: () => true,
+    },
+    mission: `Write a note with UTF-8 payload: ${'한글🙂'.repeat(180)}`,
+    outputPath,
+    handleTrust: () => false,
+    readFile: path => {
+      if (path === outputPath && resultReady) return '# Chunked result\n';
+      if (path === markerPath && markerSubmitted && markerText) return `${markerText}\n`;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    },
+    sleep: async ms => { sleeps.push(ms); },
+    pollMs: 0,
+    completionTimeoutMs: 30,
+  });
+
+  expect(result).toMatchObject({ ok: true, promptReady: true, missionVisible: true, missionTyped: true, missionSubmitted: true, promptReturned: true, completionMarker: true });
+  const missionSubmit = writes.indexOf('\r');
+  const missionChunks = writes.slice(0, missionSubmit);
+  expect(missionChunks.every(write => Buffer.byteLength(write, 'utf8') <= 256)).toBe(true);
+  expect(screenAtSubmit).toContain(`Write a note with UTF-8 payload: ${'한글🙂'.repeat(180)}`);
+  expect(sleeps).toContain(10);
+});
+
+test('reports the failed input stage and last observed screen when the PTY rejects a write', async () => {
+  const secret = 'sk-123456789abcdefgh';
+  const phrase = 'correct horse battery staple';
+  let snapshots = 0;
+  const result = await runVisibleAgentMission({
+    pty: {
+      snapshot: () => { if (++snapshots > 1) throw new Error('closed PTY'); return `\n› Ask Codex to do anything\nOPENAI_API_KEY=${secret}\nPASSWORD="${phrase}"\nAPI_TOKEN="another multi word secret"\nAuthorization: Bearer "bearer phrase secret"\n`; },
+      write: () => false, isAlive: () => true,
+    },
+    mission: 'Read package.json and report only package name/version.', outputPath: '/tmp/rejected-write.md',
+    handleTrust: () => false,
+  });
+  expect(result).toMatchObject({
+    ok: false, promptReady: true, failureStage: 'mission-write',
+    missionTyped: false, missionSubmitted: false,
+    failureScreen: '\n› Ask Codex to do anything\nOPENAI_API_KEY=[redacted credential]\nPASSWORD=[redacted credential]\nAPI_TOKEN=[redacted credential]\nAuthorization: Bearer [redacted]\n',
+  });
+  expect(result.error).toMatch(/Mission input write was rejected after 0\/\d+ UTF-8 bytes/);
+  expect(result.missionVisible).toBe(false);
+  expect(result.failureScreen).not.toContain(secret);
+  expect(result.initialScreen).toContain('PASSWORD=[redacted credential]');
+  expect(result.initialScreen).toContain('API_TOKEN=[redacted credential]');
+  expect(result.initialScreen).not.toContain(phrase);
+  expect(result.initialScreen).not.toContain('another multi word secret');
+  expect(result.initialScreen).not.toContain('bearer phrase secret');
+  expect(result.initialScreen).not.toContain(secret);
+});
+
+test('uses one absolute safety cap across readiness and mission visibility', async () => {
+  const started = Date.now();
+  const result = await runVisibleAgentMission({
+    pty: { snapshot: () => '\n› Ask Codex to do anything\n', write: () => true, isAlive: () => true },
+    mission: 'Write a note.', outputPath: '/tmp/shared-cap.md', handleTrust: () => false,
+    sleep: async ms => { await new Promise(resolve => setTimeout(resolve, Math.min(ms || 2, 2))); },
+    pollMs: 0, visibilityTimeoutMs: 1_000, completionTimeoutMs: 20,
+  });
+  expect(Date.now() - started).toBeLessThan(250);
+  expect(result).toMatchObject({ ok: false, failureStage: 'mission-visibility' });
+});
+
+test('visibility receives only the time remaining after readiness uses the shared deadline', async () => {
+  let snapshots = 0;
+  const started = Date.now();
+  const result = await runVisibleAgentMission({
+    pty: {
+      snapshot: () => ++snapshots === 1 ? 'Starting up...' : '\n› Ask Codex to do anything\n',
+      write: () => true, isAlive: () => true,
+    },
+    mission: 'Write a note.', outputPath: '/tmp/readiness-spent-cap.md', handleTrust: () => false,
+    sleep: async ms => { await new Promise(resolve => setTimeout(resolve, Math.min(ms, 65))); },
+    readyTimeoutMs: 1_000, visibilityTimeoutMs: 1_000, completionTimeoutMs: 100, pollMs: 65,
+  });
+  expect(result).toMatchObject({ ok: false, failureStage: 'mission-visibility' });
+  expect(Date.now() - started).toBeLessThan(155);
+});
+
+test('records marker-write rejection instead of waiting for an impossible echo', async () => {
+  let screen = '\n›\n';
+  let missionSubmitted = false;
+  const result = await runVisibleAgentMission({
+    pty: {
+      snapshot: () => screen,
+      write: bytes => {
+        if (bytes === '\r') { missionSubmitted = true; screen = '\n›\n'; return true; }
+        if (bytes.startsWith('Say M-')) return false;
+        screen += bytes;
+        return true;
+      },
+      isAlive: () => true,
+    },
+    mission: 'Write a note.', outputPath: '/tmp/marker-write-rejected.md',
+    handleTrust: () => false,
+    readFile: () => missionSubmitted ? '# Result\n' : (() => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); })(),
+    sleep: async () => {}, pollMs: 0,
+  });
+  expect(result).toMatchObject({ ok: false, firstLine: '# Result', failureStage: 'marker-write', error: 'Completion marker input write was rejected by the agent PTY' });
 });

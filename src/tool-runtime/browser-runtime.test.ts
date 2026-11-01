@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrowserActionDeps, BrowserActionResult } from '../harness/browser-act.js';
+import type { ToolRuntimeContext } from './types.js';
 import { dispatchBrowserHand } from './browser-hand-runtime.js';
 
 const ISSUE = 'c0ffee00-0000-4000-8000-000000000001';
@@ -54,7 +55,8 @@ describe('BrowserHand (DEMO1104-BROWSER-INTERACTION)', () => {
   test('uses the attached-CDP safety function, uploads its captured artifact and attaches to the named Linear subtask', async () => {
     const path = capture();
     const calls: unknown[] = [];
-    const result = await dispatchBrowserHand({ url: 'https://ir.example.test/report', target: 'body', armed: true, linearSubtaskId: ISSUE, persona: PERSONA.personaId }, undefined, {
+    const runId = 'run-browser-hand-mcp-context';
+    const result = await dispatchBrowserHand({ url: 'https://ir.example.test/report', target: 'body', armed: true, linearSubtaskId: ISSUE, persona: PERSONA.personaId }, { runId } as ToolRuntimeContext, {
       confirmHuman: async () => true,
       browserAct: async (request, deps) => {
         calls.push({ request, deps });
@@ -69,8 +71,33 @@ describe('BrowserHand (DEMO1104-BROWSER-INTERACTION)', () => {
 
     expect(result).toMatchObject({ ok: true, captureUrl: 'https://uploads.example.test/capture.png', attachmentId: 'attachment-1' });
     expect(calls[0]).toMatchObject({ request: { armed: true, url: 'https://ir.example.test/report', target: 'body' }, deps: { reversibilityPolicy: 'navigation-only' } });
+    expect((calls[0] as { deps: BrowserActionDeps }).deps.getRunId?.()).toBe(runId);
     expect(calls[1]).toEqual(['upload', expect.objectContaining({ apiKey: 'test-key', filename: 'capture.png', contentType: 'image/png', body: Buffer.from('png fixture') })]);
     expect(calls[2]).toEqual(['attach', expect.objectContaining({ apiKey: 'test-key', issueId: ISSUE, url: 'https://uploads.example.test/capture.png' })]);
+  });
+
+  test('preserves an injected dynamic runId getter when no tool context runId is supplied', async () => {
+    const path = capture();
+    let getterCalls = 0;
+    let forwardedGetter: BrowserActionDeps['getRunId'];
+    const dynamicGetter: NonNullable<BrowserActionDeps['getRunId']> = () => `dynamic-${++getterCalls}`;
+    await dispatchBrowserHand({ url: 'https://ir.example.test/report', target: 'body', armed: true, linearSubtaskId: ISSUE, persona: PERSONA.personaId }, undefined, {
+      confirmHuman: async () => true,
+      browserAct: async (request, deps) => {
+        forwardedGetter = deps?.getRunId;
+        return actionWithCapture(request, deps, path);
+      },
+      browserActDeps: { getRunId: dynamicGetter },
+      getApiKey: async () => 'test-key',
+      resolvePersona: async () => PERSONA,
+      readPageText: async () => '',
+      upload: async () => 'https://uploads.example.test/capture.png',
+      attach: async () => 'attachment-1',
+    });
+
+    expect(forwardedGetter).toBe(dynamicGetter);
+    expect(forwardedGetter?.()).toBe('dynamic-1');
+    expect(getterCalls).toBe(1);
   });
 
   test('a login/paywall failure detours once to an allowed alternate and records the existing repair-node branch', async () => {

@@ -79,6 +79,21 @@ function fakeSkill(over: Partial<SkillIndexEntry>): SkillIndexEntry {
 }
 
 describe('defaultSearchTerms 관측 계약', () => {
+  test('uses the mock-device catalog as grounding search reference without replacing the goal', async () => {
+    const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
+      resolveDefaultProvider: () => undefined,
+      streamLLM: async (messages, onChunk) => {
+        expect(messages[0]?.content).toContain('Goal: inspect the authored completion boundary');
+        expect(messages[0]?.content).toContain('Available mock-device and event-injection catalog (reference only):');
+        expect(messages[0]?.content).toContain('fake-kubectl: inject Pod failure');
+        expect(messages[0]?.content).toContain('only when it directly helps inspect or verify this goal');
+        onChunk('goal-author', 'goal-author');
+        return 'goal-author';
+      },
+    };
+    expect(await defaultSearchTerms('inspect the authored completion boundary', client, 'fake-kubectl: inject Pod failure')).toEqual(['goal-author']);
+  });
+
   test('LLM 입력이 500자를 넘으면 실제 절단량과 제한된 ask를 관측한다', async () => {
     const logs: { category: string; event: string; data: unknown }[] = [];
     const goal = `${'a'.repeat(500)} tail-token`;

@@ -4,7 +4,8 @@ import { sanitizeForPtyInput } from '../agent-mission/provision.js';
 
 export interface VisibleMissionPty {
   snapshot(): string;
-  write(bytes: string): void;
+  /** A false result means the PTY input handle rejected the write. */
+  write(bytes: string): boolean | number | void;
   isAlive(): boolean;
 }
 
@@ -15,11 +16,17 @@ export interface VisibleMissionResult {
   firstLine?: string;
   promptReady: boolean;
   missionVisible: boolean;
+  /** Every UTF-8 byte in the mission prompt was accepted by the PTY input handle. */
+  missionTyped?: boolean;
+  /** Enter was accepted only after the complete mission became visible. */
+  missionSubmitted?: boolean;
   promptReturned: boolean;
   completionMarker: boolean;
   /** Bounded first PTY frame, retained to diagnose startup screens that intercepted input. */
   initialScreen?: string;
   startupScreen?: AgentStartupScreen;
+  failureStage?: 'prompt-readiness' | 'mission-write' | 'mission-visibility' | 'mission-submit' | 'mission-completion' | 'result-read' | 'marker-write' | 'marker-visibility' | 'marker-submit' | 'marker-completion' | 'pty-error';
+  failureScreen?: string;
   error?: string;
 }
 
@@ -42,6 +49,30 @@ export interface VisibleMissionDeps {
 }
 
 const sleepDefault = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+const INPUT_CHUNK_BYTES = 256;
+const INPUT_CHUNK_DELAY_MS = 10;
+
+async function writeMissionInput(text: string, pty: VisibleMissionPty, sleep: (ms: number) => Promise<void>): Promise<{ complete: boolean; acceptedBytes: number; totalBytes: number }> {
+  let chunk = '';
+  let chunkBytes = 0;
+  let acceptedBytes = 0;
+  const totalBytes = Buffer.byteLength(text, 'utf8');
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (chunk && chunkBytes + charBytes > INPUT_CHUNK_BYTES) {
+      if (pty.write(chunk) === false) return { complete: false, acceptedBytes, totalBytes };
+      acceptedBytes += chunkBytes;
+      await sleep(INPUT_CHUNK_DELAY_MS);
+      chunk = '';
+      chunkBytes = 0;
+    }
+    chunk += char;
+    chunkBytes += charBytes;
+  }
+  if (chunk && pty.write(chunk) === false) return { complete: false, acceptedBytes, totalBytes };
+  acceptedBytes += chunkBytes;
+  return { complete: true, acceptedBytes, totalBytes };
+}
 
 export function isAgentInputPrompt(screen: string): boolean {
   const plain = stripAnsi(screen);
@@ -66,12 +97,22 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, 'utf8'));
   let promptReady = false;
   let missionVisible = false;
+  let missionTyped = false;
+  let missionSubmitted = false;
   let promptReturned = false;
   let completionMarker = false;
   let initialScreen: string | undefined;
   let startupScreen: AgentStartupScreen | undefined;
   let codexUpdateSkipSent = false;
   let startupScreenReported = false;
+  let lastObservedScreen = '';
+  const completionDeadline = Date.now() + (deps.completionTimeoutMs ?? 300_000);
+  const stageDeadline = (timeoutMs: number): number => Math.min(completionDeadline, Date.now() + timeoutMs);
+  const snapshot = (): string => { lastObservedScreen = deps.pty.snapshot(); return lastObservedScreen; };
+  const safeSnapshot = (): string => { try { return snapshot(); } catch { return lastObservedScreen; } };
+  const failure = (result: Omit<VisibleMissionResult, 'ok' | 'failureStage' | 'failureScreen'>, stage: NonNullable<VisibleMissionResult['failureStage']>, screen = safeSnapshot()): VisibleMissionResult => ({
+    ...result, missionTyped, missionSubmitted, ok: false, failureStage: stage, failureScreen: screenTail(screen),
+  });
   const observeStartupScreen = (screen: string): AgentStartupScreen | undefined => {
     const detected = classifyAgentStartupScreen(deps.agent, screen);
     // This field describes the blocker present in the current/final frame,
@@ -86,7 +127,10 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     return detected;
   };
   try {
-  const readyDeadline = Date.now() + (deps.readyTimeoutMs ?? 60_000);
+  // Readiness is settled by the observed prompt/input echo; this is only one
+  // shared safety cap, not a per-stage 60s/5s guess.
+  const safetyCapMs = deps.completionTimeoutMs ?? 300_000;
+  const readyDeadline = stageDeadline(deps.readyTimeoutMs ?? safetyCapMs);
   let lastScreen = '';
 
   while (Date.now() < readyDeadline) {
@@ -94,14 +138,14 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
       // The process may exit before the first poll; its final frame can still
       // identify the startup screen that prevented the prompt from appearing.
       try {
-        lastScreen = deps.pty.snapshot();
-        initialScreen ??= lastScreen.slice(-1_200);
+        lastScreen = snapshot();
+        initialScreen ??= redactSensitive(stripAnsi(lastScreen)).slice(-1_200);
         observeStartupScreen(lastScreen);
       } catch { /* an exited remote PTY may no longer expose its final frame */ }
-      return { ok: false, path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, ...(initialScreen ? { initialScreen } : {}), ...(startupScreen ? { startupScreen } : {}), error: 'Agent PTY exited before its prompt appeared' };
+      return failure({ path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, ...(initialScreen ? { initialScreen } : {}), ...(startupScreen ? { startupScreen } : {}), error: 'Agent PTY exited before its prompt appeared' }, 'prompt-readiness', lastScreen);
     }
-    lastScreen = deps.pty.snapshot();
-    initialScreen ??= lastScreen.slice(-1_200);
+    lastScreen = snapshot();
+    initialScreen ??= redactSensitive(stripAnsi(lastScreen)).slice(-1_200);
     const detectedScreen = observeStartupScreen(lastScreen);
     if (detectedScreen) {
       if (detectedScreen === 'codex-update-choice') {
@@ -128,43 +172,49 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     await sleep(pollMs);
   }
   if (!promptReady) {
-    return {
-      ok: false, path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false,
+    return failure({
+      path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false,
       initialScreen,
       ...(startupScreen ? { startupScreen } : {}),
-      error: 'Agent input prompt was not observed before the startup timeout',
-    };
+      error: 'Agent input prompt was not observed before the startup safety cap',
+    }, 'prompt-readiness', lastScreen);
   }
 
   const mission = sanitizeForPtyInput(deps.mission, 4_000);
-  if (!mission) return { ok: false, path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Mission text is empty after input sanitization' };
+  if (!mission) return failure({ path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Mission text is empty after input sanitization' }, 'mission-write');
   try {
     readFile(deps.outputPath);
-    return { ok: false, path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Result path already exists; refusing to reuse a previous mission file' };
+    return failure({ path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Result path already exists; refusing to reuse a previous mission file' }, 'result-read');
   } catch (error) {
     if (!isFileNotFound(error)) {
-      return { ok: false, path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: `Could not verify a fresh result path: ${error instanceof Error ? error.message : String(error)}` };
+      return failure({ path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: `Could not verify a fresh result path: ${error instanceof Error ? error.message : String(error)}` }, 'result-read');
     }
   }
   const missionPrompt = `Write the result to the exact file path ${deps.outputPath} (create parent directories if needed). ${mission}`;
-  deps.pty.write(missionPrompt);
-  const visibleMissionTail = mission.slice(-Math.min(24, mission.length));
-  const visibilityDeadline = Date.now() + (deps.visibilityTimeoutMs ?? 5_000);
+  const missionWrite = await writeMissionInput(missionPrompt, deps.pty, sleep);
+  missionTyped = missionWrite.complete;
+  if (!missionTyped) {
+    return failure({ path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, ...(startupScreen ? { startupScreen } : {}), error: `Mission input write was rejected after ${missionWrite.acceptedBytes}/${missionWrite.totalBytes} UTF-8 bytes` }, 'mission-write');
+  }
+  const visibleMissionTail = Array.from(mission).slice(-24).join('');
+  const visibilityDeadline = stageDeadline(deps.visibilityTimeoutMs ?? safetyCapMs);
   while (Date.now() < visibilityDeadline) {
-    const visibleText = normalizeVisibleText(deps.pty.snapshot());
+    const visibleText = normalizeVisibleText(snapshot());
     if (visibleText.includes(normalizeVisibleText(visibleMissionTail))) { missionVisible = true; break; }
     await sleep(Math.min(pollMs || 25, Math.max(1, visibilityDeadline - Date.now())));
   }
   if (!missionVisible) {
-    return { ok: false, path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, ...(startupScreen ? { startupScreen } : {}), error: 'Mission text was not visible in the agent PTY before submission' };
+    return failure({ path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, ...(startupScreen ? { startupScreen } : {}), error: 'Mission text was not visible in the agent PTY before submission' }, 'mission-visibility');
   }
-  deps.pty.write('\r');
+  if (deps.pty.write('\r') === false) {
+    return failure({ path: deps.outputPath, promptReady, missionVisible, promptReturned: false, completionMarker: false, initialScreen, ...(startupScreen ? { startupScreen } : {}), error: 'Mission submit key was rejected by the agent PTY' }, 'mission-submit');
+  }
+  missionSubmitted = true;
 
-  const completionDeadline = Date.now() + (deps.completionTimeoutMs ?? 300_000);
   let resultFileObserved = false;
   while (Date.now() < completionDeadline) {
     if (!deps.pty.isAlive()) break;
-    lastScreen = deps.pty.snapshot();
+    lastScreen = snapshot();
     if (deps.handleTrust(lastScreen, bytes => deps.pty.write(bytes))) {
       await sleep(500);
       continue;
@@ -179,40 +229,44 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     await sleep(pollMs);
   }
   if (!resultFileObserved) {
-    return { ok: false, path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Agent did not create a non-empty result file before the timeout' };
+    return failure({ path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Agent did not create a non-empty result file before the timeout' }, 'mission-completion', lastScreen);
   }
   if (!promptReturned) {
-    return { ok: false, path: deps.outputPath, promptReady, missionVisible, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Agent did not return to its input prompt after writing the result file' };
+    return failure({ path: deps.outputPath, promptReady, missionVisible, promptReturned: false, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Agent did not return to its input prompt after writing the result file' }, 'mission-completion', lastScreen);
   }
 
   let content: string;
   try { content = readFile(deps.outputPath); }
   catch (error) {
-    return { ok: false, path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: `Result file disappeared after the agent returned: ${error instanceof Error ? error.message : String(error)}` };
+    return failure({ path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: `Result file disappeared after the agent returned: ${error instanceof Error ? error.message : String(error)}` }, 'result-read', safeSnapshot());
   }
   const firstLine = content.split(/\r?\n/).map(line => line.trim()).find(Boolean);
-  if (!firstLine) return { ok: false, path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Result file is empty' };
+  if (!firstLine) return failure({ path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Result file is empty' }, 'result-read');
 
   // Keep the marker request separate and short: the marker itself never occurs
   // in the mission prompt, so only the agent's final output can satisfy it.
   const completionMarkerText = `M-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
   const completionMarkerPath = `${deps.outputPath}.completion-${completionMarkerText}`;
   const markerPrompt = `Say ${completionMarkerText} alone and write it to the exact file path ${completionMarkerPath}.`;
-  deps.pty.write(markerPrompt);
-  const markerVisibleDeadline = Date.now() + (deps.visibilityTimeoutMs ?? 5_000);
+  if (deps.pty.write(markerPrompt) === false) {
+    return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker input write was rejected by the agent PTY' }, 'marker-write');
+  }
+  const markerVisibleDeadline = stageDeadline(deps.visibilityTimeoutMs ?? safetyCapMs);
   let markerRequestVisible = false;
   while (Date.now() < markerVisibleDeadline) {
-    const markerInputScreen = stripAnsi(deps.pty.snapshot()).replace(/\s+/g, ' ');
+    const markerInputScreen = stripAnsi(snapshot()).replace(/\s+/g, ' ');
     if (markerInputScreen.includes(completionMarkerText)) { markerRequestVisible = true; break; }
     await sleep(Math.min(pollMs || 25, Math.max(1, markerVisibleDeadline - Date.now())));
   }
   if (!markerRequestVisible) {
-    return { ok: false, path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker request was not visible in the agent PTY' };
+    return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker request was not visible in the agent PTY' }, 'marker-visibility');
   }
-  if (screenShowsCompletionMarker(deps.pty.snapshot(), completionMarkerText)) {
-    return { ok: false, path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker appeared in the PTY input before submission' };
+  if (screenShowsCompletionMarker(snapshot(), completionMarkerText)) {
+    return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker appeared in the PTY input before submission' }, 'marker-submit');
   }
-  deps.pty.write('\r');
+  if (deps.pty.write('\r') === false) {
+    return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker submit key was rejected by the agent PTY' }, 'marker-submit');
+  }
 
   while (Date.now() < completionDeadline) {
     try {
@@ -220,32 +274,36 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     } catch { /* the agent has not written the completion marker file yet */ }
     if (!deps.pty.isAlive()) break;
     try {
-      if (screenShowsCompletionMarker(deps.pty.snapshot(), completionMarkerText)) { completionMarker = true; break; }
+      if (screenShowsCompletionMarker(snapshot(), completionMarkerText)) { completionMarker = true; break; }
     } catch { /* detached PTYs may no longer expose a screen snapshot */ }
     await sleep(pollMs);
   }
   if (!completionMarker) {
-    return { ok: false, path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Agent did not show its completion marker before the timeout' };
+    return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Agent did not show its completion marker before the timeout' }, 'marker-completion');
   }
-  return { ok: true, path: deps.outputPath, content, firstLine, promptReady, missionVisible, promptReturned, completionMarker, initialScreen, ...(startupScreen ? { startupScreen } : {}) };
+  return { ok: true, path: deps.outputPath, content, firstLine, promptReady, missionVisible, missionTyped, missionSubmitted, promptReturned, completionMarker, initialScreen, ...(startupScreen ? { startupScreen } : {}) };
   } catch (error) {
-    return {
-      ok: false,
-      path: deps.outputPath,
-      promptReady,
-      missionVisible,
-      promptReturned,
-      completionMarker,
-      ...(initialScreen ? { initialScreen } : {}),
-      ...(startupScreen ? { startupScreen } : {}),
-      error: error instanceof Error ? error.message : String(error),
-    };
+    return failure({ path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker, ...(initialScreen ? { initialScreen } : {}), ...(startupScreen ? { startupScreen } : {}), error: error instanceof Error ? error.message : String(error) }, 'pty-error');
   }
 }
 
 function screenShowsCompletionMarker(screen: string, marker: string): boolean {
   const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`^\\s*(?:(?:[•⏺└│╰⎿])\\s*)?${escaped}\\s*$`, 'm').test(stripAnsi(screen));
+}
+
+function screenTail(screen: string): string {
+  return redactSensitive(stripAnsi(screen)).slice(-1_200);
+}
+
+function redactSensitive(screen: string): string {
+  return screen
+    .replace(/(authorization\s*:\s*(?:basic|bearer|token|apikey|api[- ]key)\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|\S+)/gi, '$1[redacted]')
+    .replace(/((?:[A-Z0-9_]*(?:api[_-]?key|api[_-]?token|access[_-]?key|secret|password|credential|auth[_-]?token|refresh[_-]?token)))\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]*)/gi, '$1=[redacted credential]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/(?:sk|xai|gsk|gh[pousr])-[A-Za-z0-9_-]{8,}/g, '[redacted credential]')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted email]')
+    .replace(/(account[-_ ]+token)\s*[:=]?\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi, '$1=[redacted credential]');
 }
 
 function stripAnsi(screen: string): string {

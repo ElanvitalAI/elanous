@@ -273,3 +273,13 @@ test('오케스트레이터가 첫 조각 커밋에 피처 시험·구현 전 �
   expect(orchestratorSource).toContain('runHarnessBaseTddWhenRedMissing');
   expect(orchestratorSource).toContain('runTddBaseHeadTest');
 });
+
+test('미실행 TDD base 시험은 생략 이유를 관측하고 구현 실패를 종료 이유로 보존한다', () => {
+  const source = readFileSync(new URL('./orchestrator.ts', import.meta.url), 'utf8');
+  expect(source).toContain("observe('tdd-base-test', { round: input.round, status: 'skipped', reason: skippedReason");
+  expect(source).toContain("? 'not-planned'");
+  expect(source).toContain("? 'child-red-present'");
+  expect(source).toContain("? 'impl-not-ok'");
+  expect(source).toContain('implementationFailure: input.implementation.summary.slice(0, 240)');
+  expect(source).toContain('terminationReason: implementationStop ||');
+});

@@ -173,6 +173,9 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     return 2;
   }
   const env = { ...process.env, ...oldDoorInternalEnv('self-orchestrate') };
+  // harness ask/say is the only Pod entry admitted to implicit graph growth.
+  // Replace inherited values so callers cannot smuggle another scope through.
+  env.ELANOUS_GRAPH_GROWTH_SCOPE = 'harness';
   // POD-OBS(10-06): 자식 orchestrate 는 트리 파생 우주에서 돈다 — Pod 원장 재방출을 «발사한 집»의 logs.db 에도 남기게 경로를 넘긴다.
   env[POD_REEMIT_LOGS_DB_ENV] = logsDbPath();
   let tempDir: string | undefined;

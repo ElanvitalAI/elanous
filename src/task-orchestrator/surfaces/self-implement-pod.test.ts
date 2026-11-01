@@ -32,6 +32,7 @@ import { makeScriptedKubectlDevice, type PodDeviceEvent } from '../../ux-sim/tas
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { buildPodConfigSnapshot } from './pod-config-snapshot.js';
+import { podSpawnWithSiWarm } from './pod-si-warm-entry.js';
 
 import { buildUserConfig, resetUserConfig, userConfigPath, type UserConfig } from '../../user-config.js';
 import { worktreeAddTimeoutForRepo } from '../../git-fs/worktree.js';
@@ -888,7 +889,7 @@ describe('pod codex rotation credentials', () => {
   test('a single named account still gets the base openai-codex entry the auto resolver reads', async () => {
     const { k, calls } = fakeKubectl(['Complete'], '');
     const creds = (account: string) => ({
-      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, refreshToken: '' } } } }),
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, expiresAt: Date.now() + 3_600_000, refreshToken: '' } } } }),
       codexAuth: JSON.stringify({ tokens: { access_token: `access-${account}`, refresh_token: '' } }), ghToken: 'gh',
     });
     await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, accountBroker: () => 'third', rotationAccounts: ['third'], credentials: creds, env: {} })({ feature: 'x', spaceId: 'single-named', autoDrive: 'safe', signal: new AbortController().signal } as never).done.catch(() => {});
@@ -913,7 +914,7 @@ describe('pod codex rotation credentials', () => {
     const creds = (account: string) => {
       selected.push(account);
       return {
-        elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, refreshToken: '' } } } }),
+        elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, expiresAt: Date.now() + 3_600_000, refreshToken: '' } } } }),
         codexAuth: JSON.stringify({ tokens: { access_token: `access-${account}`, refresh_token: '' } }), ghToken: 'gh',
       };
     };
@@ -1492,6 +1493,23 @@ test('a host-recorded dispatch marker reaches the actual Pod Job without alterin
   expect(job.spec.template.spec.containers[0].args[0]).toContain('elanous self implement');
 });
 
+test('Pod Job preserves only the validated harness graph-growth scope', async () => {
+  const launch = async (scope: string | undefined, armScope?: string) => {
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {
+      ...(scope === undefined ? {} : { ELANOUS_GRAPH_GROWTH_SCOPE: scope }),
+    }, passEnv: ['ELANOUS_GRAPH_GROWTH_SCOPE'],
+    armEnv: armScope === undefined ? undefined : { ELANOUS_GRAPH_GROWTH_SCOPE: armScope } })({ feature: 'fix it', spaceId: `growth-scope-${scope ?? 'unset'}-${armScope ?? 'none'}` }).done;
+    const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!))
+      .find((manifest) => manifest.kind === 'Job');
+    return job.spec.template.spec.containers[0].env.filter((entry: { name: string }) => entry.name === 'ELANOUS_GRAPH_GROWTH_SCOPE');
+  };
+  expect(await launch('harness')).toEqual([{ name: 'ELANOUS_GRAPH_GROWTH_SCOPE', value: 'harness' }]);
+  expect(await launch(undefined, 'harness')).toEqual([]);
+  expect(await launch('task-agent')).toEqual([]);
+  expect(await launch('attacker')).toEqual([]);
+});
+
 test('TA card slot reaches the actual Pod Job from the host launch environment', async () => {
   const { k, calls } = fakeKubectl(['Complete'], '');
   await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_SLOT_ID: 'TA-DRAFT-NO-LEFTOVER', ELANOUS_TASK_BOUND_PR: '29365' } })
@@ -1528,13 +1546,16 @@ test('WARM-REUSE-TA-FLAG-WIRE: TA evidence gates the injected SI warm provider a
       },
     } as const;
     let unmeasuredAttempts = 0;
-    const unmeasuredRun = await podSelfImplementSpawn({
+    // Empty env isolates the config flag from any host-level ELANOUS_SI_WARM_REUSE opt-in.
+    const unmeasuredSpawn = await podSpawnWithSiWarm({
       kubectl: k, credentials: CREDS, env: { ELANOUS_TASK_CARD_ID: 'ta-test-card' },
       warmReuseConfig: () => ({ gateRecheck: true, land: true, ta: true }),
       warmReuseEvidence: () => evidence,
-      siWarmAttempt: async () => { unmeasuredAttempts++; return null; },
-      siWarmHostPostprocess: async (result) => result,
-    })({ feature: 'fix it', spaceId: 'ta-warm-unmeasured' }).done;
+    }, {}, {
+      acquire: async () => { unmeasuredAttempts++; return { status: 'no-entry', reason: 'no-candidate' }; },
+      postprocess: async (_input, result) => result,
+    });
+    const unmeasuredRun = await unmeasuredSpawn({ feature: 'fix it', spaceId: 'ta-warm-unmeasured' }).done;
     expect(unmeasuredRun.exitCode).toBe(0);
     expect(unmeasuredAttempts).toBe(0);
     expect(warmEvents).toContainEqual({ event: 'switch-decision', data: expect.objectContaining({ consumer: 'ta', live: false, reason: 'evidence-unmeasured' }) });
@@ -1546,13 +1567,16 @@ test('WARM-REUSE-TA-FLAG-WIRE: TA evidence gates the injected SI warm provider a
     let liveAttempts = 0;
     const fullyMeasured = { ...evidence, ta: evidence.land };
     const livePath = fakeKubectl(['Complete'], '');
-    const measuredRun = await podSelfImplementSpawn({
+    // Same isolated env; only the injected measured evidence changes the decision.
+    const measuredSpawn = await podSpawnWithSiWarm({
       kubectl: livePath.k, credentials: CREDS, env: { ELANOUS_TASK_CARD_ID: 'ta-test-card' },
       warmReuseConfig: () => ({ gateRecheck: true, land: true, ta: true }),
       warmReuseEvidence: () => fullyMeasured,
-      siWarmAttempt: async () => { liveAttempts++; return null; },
-      siWarmHostPostprocess: async (result) => result,
-    })({ feature: 'fix it', spaceId: 'ta-warm-live-decision' }).done;
+    }, {}, {
+      acquire: async () => { liveAttempts++; return { status: 'no-entry', reason: 'no-candidate' }; },
+      postprocess: async (_input, result) => result,
+    });
+    const measuredRun = await measuredSpawn({ feature: 'fix it', spaceId: 'ta-warm-live-decision' }).done;
     expect(measuredRun.exitCode).toBe(0);
     expect(liveAttempts).toBe(1);
     expect(warmEvents).toContainEqual({ event: 'switch-decision', data: expect.objectContaining({ consumer: 'ta', live: true, reason: 'live' }) });
@@ -2918,6 +2942,32 @@ describe('podSelfImplementSpawn', () => {
     } finally { off(); }
   });
 
+test('branch-preservation stage and sanitized cause reach parent Pod failure evidence', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-preservation-cause-'));
+  const parentRunId = 'run-pod-preservation-cause-fixture';
+  const secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+  const terminalError = `환경 탓 중단 — 원격 브랜치 보존 실패: self-impl/branch (stage=push; error=remote rejected ${secret}; worktree: ~/worktrees/branch)`;
+  const { k } = fakeKubectl(['Failed'], `${JSON.stringify({ stage: 'error', ok: false, error: terminalError })}\n`, 1);
+  const finished: Array<Record<string, unknown>> = [];
+  const off = debug.registerSink({ name: 'pod-preservation-cause', emit: (record) => {
+    if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+  } });
+  try {
+    const result = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS,
+      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })({
+      feature: 'preserve child branch failure detail', spaceId: 'pod-preservation-cause', taskId: 'preservation-cause',
+    }).done;
+    const expectedError = terminalError.replace(secret, 'ghp_***');
+    expect(result.error?.code).toBe('pod-job-failed');
+    expect(result.error?.message).toContain(`childStage=error · childError=${expectedError}`);
+    expect(result.error?.message).not.toContain(secret);
+    expect(finished[0]).toMatchObject({ childStage: 'error', childError: expectedError });
+    const failure = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? []).find((entry) => entry.event === 'pod-task-failure');
+    expect(failure?.data).toMatchObject({ childStage: 'error', childError: expectedError });
+    expect(JSON.stringify(failure?.data)).not.toContain(secret);
+  } finally { off(); rmSync(root, { recursive: true, force: true }); }
+});
+
   test('long PR worktree failure keeps the actionable tail and observed blocker identities', async () => {
     const location = `draft PR 생성 실패(worktree·branch 보존 · ${'long-path-'.repeat(40)})`;
     const detail = `${'noise-'.repeat(50)}self-implement PR guard 실패: same-cell: OPEN PR; candidateCardId=ta-candidate; blockers=#29829:ta-existing`;
@@ -3340,6 +3390,55 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(finished[0]).toMatchObject({ state: 'failed', childError: 'no-result-line' });
       expect(finished[0]).not.toHaveProperty('childStage');
     } finally { off(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('failed Pod uplinks bounded pr-open-failed ledger error when its terminal line is missing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-pr-open-no-result-'));
+    const parent = 'run-parent-pr-open-no-result';
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const ledgerError = `self-implement PR guard 실패: hunk-overlap src/a.ts ${secret} · ${'detail '.repeat(50)}`;
+    let childRunId = '';
+    const finished: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-pr-open-no-result', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+    } });
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'test-context', stderr: '' };
+      if (args.includes('apply') && input) {
+        const manifest = JSON.parse(input);
+        if (manifest.kind === 'Job') childRunId = manifest.spec.template.spec.containers[0].env.find((e: { name: string }) => e.name === 'ELANOUS_RUN_ID').value;
+      }
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Failed', stderr: '' };
+      if (args.includes('logs')) {
+        const ledger = `${JSON.stringify({ runId: childRunId, event: 'pr-open-failed', data: { error: ledgerError } })}\n`;
+        const full = `ELANOUS_RUN_LEDGER ${childRunId} 1/1 ${gzipSync(ledger).toString('base64')}\n`;
+        return { status: 0, stdout: args.includes('--tail=400') ? '' : full, stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS,
+        env: { ELANOUS_RUN_ID: parent, ELANOUS_STATE_DIR: root } })({ feature: 'uplink no-result PR error', spaceId: 'pr-open-no-result' }).done;
+      expect(result.error?.code).toBe('pod-job-failed');
+      expect(result.error?.message).toContain('childStage=pr-open-failed · childError=self-implement PR guard 실패: hunk-overlap src/a.ts ghp_***');
+      expect(result.error?.message).not.toContain(secret);
+      expect(result.error?.message?.length).toBeLessThan(900);
+      expect(finished[0]).toMatchObject({ state: 'failed', childStage: 'pr-open-failed' });
+      expect(String(finished[0]?.childError)).toContain('hunk-overlap');
+      expect(String(finished[0]?.childError)).not.toContain(secret);
+      recordClassifiedHarnessPodExit(parent, 'pod-failure', result.exitCode ?? 1, { output: result.error?.message ?? result.output });
+      const incident = readRunExits(root).find((row) => row.runId === parent);
+      expect(JSON.stringify(incident)).toContain('hunk-overlap');
+      expect(JSON.stringify(incident)).not.toContain(secret);
+    } finally {
+      off();
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('terminal result observation distinguishes same provider signature with and without a result row', async () => {
@@ -5649,6 +5748,95 @@ setDefaultTimeout(60_000);
 
 describe('pod remote continuity', () => {
   const jwt = (expSec: number) => `h.${Buffer.from(JSON.stringify({ exp: expSec })).toString('base64url')}.s`;
+  test('non-owner Pod bootstrap writes injected Codex accounts to a refreshless owner mirror', async () => {
+    const home = mkdtempSync(pjoin(tmpdir(), 'pod-owner-mirror-'));
+    const credsDir = pjoin(home, 'creds'); mkdirSync(credsDir);
+    const accessByAccount = new Map(['team', 'third'].map((name) => [name, jwt(Math.floor(Date.now() / 1000) + 3600)]));
+    const credentials = (name: string) => ({
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': {
+        authMode: 'chatgpt', tokens: { accessToken: accessByAccount.get(name), expiresAt: Date.now() + 3_600_000, refreshToken: '' },
+      } } }),
+      codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: accessByAccount.get(name), refresh_token: '' } }),
+      ghToken: 'gh-test',
+    });
+    const { k, calls } = fakeKubectl(['Complete'], '{"ok":true,"stage":"complete"}\n');
+    try {
+      await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials,
+        accountBroker: () => 'team', rotationAccounts: ['team', 'third'], env: {} })({ feature: 'owner mirror regression', spaceId: 'owner-mirror-regression' }).done;
+      const applied = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+      const secret = applied.find((item) => item.kind === 'Secret')!;
+      for (const [index] of ['team', 'third'].entries()) {
+        writeFileSync(pjoin(credsDir, `codex-${index}.json`), secret.stringData[`codex-${index}.json`]);
+      }
+      const job = applied.find((item) => item.kind === 'Job')!;
+      const setupLine = job.spec.template.spec.containers[0].args[0].split('\n')
+        .find((line: string) => line.startsWith('POD_CODEX_ACCOUNTS='))!;
+      const accessOnlyExport = job.spec.template.spec.containers[0].args[0].split('\n')
+        .find((line: string) => line === 'export ELANOUS_REMOTE_CODEX_ACCESS_ONLY=1')!;
+      const mirrorPathExport = job.spec.template.spec.containers[0].args[0].split('\n')
+        .find((line: string) => line === 'export ELANOUS_REMOTE_CODEX_MIRROR_PATH="$HOME/.elanous/remote-parent-credentials/cli-mirror/auth.json"')!;
+      const runnable = setupLine.replaceAll('"/creds/codex-', `"${credsDir}/codex-`);
+      const execution = spawnSync('bash', ['-c', `mkdir -p "$HOME/.elanous" "$HOME/.codex"\n${runnable}`], { cwd: home, env: { ...process.env, HOME: home }, encoding: 'utf8' });
+      if (execution.status !== 0) throw new Error(`Pod credential setup failed (${execution.status}): ${execution.stderr.slice(-1_000)}`);
+
+      const mirrorPath = pjoin(home, '.elanous/remote-parent-credentials/cli-mirror/auth.json');
+      const mirror = JSON.parse(readFileSync(mirrorPath, 'utf8'));
+      expect(Object.keys(mirror.providers).sort()).toEqual(['openai-codex', 'openai-codex:team', 'openai-codex:third']);
+      for (const provider of Object.values(mirror.providers) as Array<{ tokens?: { refreshToken?: unknown; refresh_token?: unknown } }>) {
+        expect(provider.tokens?.refreshToken).toBe('');
+        expect(provider.tokens?.refresh_token).toBe('');
+      }
+      expect((statSync(pjoin(home, '.elanous/remote-parent-credentials/cli-mirror')).mode & 0o777)).toBe(0o700);
+      const ownerAuthPath = pjoin(home, '.elanous/auth.json');
+      const ownerAuth = JSON.parse(readFileSync(ownerAuthPath, 'utf8'));
+      const decoy = jwt(Math.floor(Date.now() / 1000) + 3600);
+      for (const key of ['openai-codex:team', 'openai-codex:third']) {
+        ownerAuth.providers[key].tokens.accessToken = decoy;
+        ownerAuth.providers[key].tokens.expiresAt = Date.now() + 3_600_000;
+      }
+      writeFileSync(ownerAuthPath, JSON.stringify(ownerAuth));
+      const childEnv: NodeJS.ProcessEnv = { ...process.env, HOME: home, ELANOUS_STATE_DIR: pjoin(home, '.elanous/isolated-child-state'),
+        BUN_TEST: '1', EXPECTED_CODEX_ACCESS_TEAM: accessByAccount.get('team')!, EXPECTED_CODEX_ACCESS_THIRD: accessByAccount.get('third')! };
+      delete childEnv.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+      const verify = spawnSync('bash', ['-c', `${accessOnlyExport}\n${mirrorPathExport}\nbun -e 'import { loadFreshCodexAuthState } from "./src/oauth/codex.js"; for (const name of ["team", "third"]) { process.env.ELANOUS_CODEX_ACCOUNT=name; const state=await loadFreshCodexAuthState(); if(state?.tokens.accessToken!==process.env["EXPECTED_CODEX_ACCESS_"+name.toUpperCase()])process.exit(7); }'`],
+        { cwd: process.cwd(), env: childEnv, encoding: 'utf8' });
+      if (verify.status !== 0) throw new Error(`Pod provider did not resolve the injected owner mirror for both accounts (${verify.status})`);
+      expect(mirrorPathExport).toBe('export ELANOUS_REMOTE_CODEX_MIRROR_PATH="$HOME/.elanous/remote-parent-credentials/cli-mirror/auth.json"');
+      expect((statSync(mirrorPath).mode & 0o777)).toBe(0o600);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+  test('non-owner Pod bootstrap setup exits 5 when codex-i.json is malformed', async () => {
+    const home = mkdtempSync(pjoin(tmpdir(), 'pod-owner-mirror-malformed-'));
+    const credsDir = pjoin(home, 'creds'); mkdirSync(credsDir);
+    const accessToken = jwt(Math.floor(Date.now() / 1000) + 3_600);
+    const credentials = () => ({
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': {
+        authMode: 'chatgpt', tokens: { accessToken, expiresAt: Date.now() + 3_600_000, refreshToken: '' },
+      } } }),
+      codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: accessToken, refresh_token: '' } }),
+      ghToken: 'gh-test',
+    });
+    const { k, calls } = fakeKubectl(['Complete'], '{"ok":true,"stage":"complete"}\n');
+    try {
+      await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials,
+        accountBroker: () => 'team', rotationAccounts: ['team'], env: {} })({ feature: 'malformed Codex mirror regression', spaceId: 'owner-mirror-malformed' }).done;
+      const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!))
+        .find((item) => item.kind === 'Job')!;
+      const setupLine = job.spec.template.spec.containers[0].args[0].split('\n')
+        .find((line: string) => line.startsWith('POD_CODEX_ACCOUNTS='))!;
+      const accessOnlyExport = job.spec.template.spec.containers[0].args[0].split('\n')
+        .find((line: string) => line === 'export ELANOUS_REMOTE_CODEX_ACCESS_ONLY=1')!;
+      writeFileSync(pjoin(credsDir, 'codex-0.json'), '{"elanousAuth":');
+      const runnable = setupLine.replaceAll('"/creds/codex-', `"${credsDir}/codex-`);
+      const execution = spawnSync('bash', ['-c', `mkdir -p "$HOME/.elanous" "$HOME/.codex"\n${runnable}`], {
+        cwd: home, env: { ...process.env, HOME: home }, encoding: 'utf8',
+      });
+      expect(accessOnlyExport).toBe('export ELANOUS_REMOTE_CODEX_ACCESS_ONLY=1');
+      expect(execution.status).toBe(5);
+      expect(readFileSync(pjoin(credsDir, 'codex-0.json'), 'utf8')).toBe('{"elanousAuth":');
+      expect(existsSync(pjoin(home, '.elanous/remote-parent-credentials/cli-mirror/auth.json'))).toBe(false);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
   test('P4: the elanous copy carries the checked codex token, never a stale store token or any refresh token', () => {
     const dir = mkdtempSync(pjoin(tmpdir(), 'pod-cred-'));
     const codexHome = pjoin(dir, 'codex'); mkdirSync(codexHome);

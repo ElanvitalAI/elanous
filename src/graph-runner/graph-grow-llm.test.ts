@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GraphTemplateSpec } from '../self-implement/graph-yaml.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
+import { listNodeKinds } from '../graph-kinds/registry.js';
 import { proposeGrowth, type GrowthDecisionDeps } from './graph-grow.js';
 import { createLLMGrowthProposer, graphGrowthLlmOptions } from './graph-grow-llm.js';
 import { getUserConfig, isModelRole, MODEL_ROLES } from '../user-config.js';
-import { runGraph } from './runner.js';
+import { runGraph, withGraphGrowthScope } from './runner.js';
 import { subscribeInsideEvent } from '../nexus/api/inside-events.js';
 
 const graph: GraphTemplateSpec = {
@@ -57,11 +58,32 @@ test('fake LLM sees graph nodes, recipe kinds, edges, blocked output tail and un
   expect(tail).toEndWith('-last-line');
   expect(tail).not.toContain('prefix-');
   expect(result.ok).toBe(true);
+  expect(prompts[0]).toContain('only allowed kinds are agent, observe, and judge');
   if (result.ok) {
     expect(result.growth.node.nodeId).toBe('research');
     expect(result.growth.reason).toBe('research the missing evidence');
     expect(result.graph.edges.at(-1)).toEqual({ from: 'research', to: 'done' });
     expect(graph.edges[0]?.map).toEqual({ ok: 'done' });
+  }
+});
+
+test('LLM growth proposals reject node kinds outside the approved trio', async () => {
+  const registeredKindsBefore = listNodeKinds('harness').map(({ kind }) => kind).sort();
+  for (const kind of ['agent', 'observe', 'judge']) {
+    const nodeId = `research-${kind}`;
+    const reply = JSON.stringify({ node: { nodeId, kind, recipe: 'none', maxVisits: 1,
+      contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'done', reason: 'allowed kind' });
+    const result = await proposeGrowth(input, createLLMGrowthProposer(async () => reply));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.growth.node).toMatchObject({ nodeId, kind });
+    expect(listNodeKinds('harness').map(({ kind: registered }) => registered).sort()).toEqual(registeredKindsBefore);
+  }
+  for (const kind of ['gate', 'git', 'prompt', 'hitl', 'subgraph']) {
+    const reply = JSON.stringify({ node: { nodeId: 'unsafe-kind', kind, recipe: 'none', maxVisits: 1,
+      contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'done', reason: 'unsupported kind' });
+    const result = await proposeGrowth(input, createLLMGrowthProposer(async () => reply));
+    expect(result).toMatchObject({ ok: false, reason: 'no proposal' });
+    expect(listNodeKinds('harness').map(({ kind: registered }) => registered).sort()).toEqual(registeredKindsBefore);
   }
 });
 
@@ -74,10 +96,10 @@ test('runner forwards the blocked output to the LLM proposer on an unseen outcom
     writeFileSync(join(root, 'recipes.yaml'), 'judge:\n  command: "exit 0"\n');
     writeFileSync(path, `grow: on\ngraph_id: growth\nversion: 1\nentry_node: judge\nterminal_nodes: [done]\nnodes:\n  - { node_id: judge, kind: judge, recipe: 'cmd:judge', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - from: judge\n    on: outcome\n    map: { ok: done }\n`);
     const prompts: string[] = [];
-    const run = await runGraph(path, { deps: { root,
+    const run = await withGraphGrowthScope('harness', () => runGraph(path, { deps: { root,
       runBash: async () => ({ stdout: 'blocked output tail\n{"outcome":"needs-research"}\n', stderr: '', exitCode: 0 }),
       growthLLM: async prompt => { prompts.push(prompt); return answer; },
-    } });
+    } }));
     expect(run.status).toBe('done');
     expect(run.growthRejections).toBeUndefined();
     expect(run.path).toEqual(['judge', 'research', 'done']);
@@ -108,6 +130,27 @@ test('grow off keeps the existing fallback and never calls the fake LLM', async 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('grow on without an approved scope keeps fallback and never calls the fake LLM', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-grow-unscoped-'));
+  try {
+    const path = join(root, 'graph.yaml');
+    writeFileSync(join(root, 'recipes.yaml'), 'judge:\n  command: "exit 0"\n');
+    writeFileSync(path, `grow: on\ngraph_id: growth\nversion: 1\nentry_node: judge\nterminal_nodes: [done]\nnodes:\n  - { node_id: judge, kind: judge, recipe: 'cmd:judge', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - from: judge\n    on: outcome\n    map: { ok: done }\n`);
+    let calls = 0;
+    const events: string[] = [];
+    const run = await runGraph(path, { deps: { root,
+      runBash: async () => ({ stdout: '{"outcome":"needs-research"}\n', stderr: '', exitCode: 0 }),
+      growthLLM: async () => { calls++; return answer; },
+      log: (event) => events.push(event),
+    } });
+    expect(run.status).toBe('done');
+    expect(run.path).toEqual(['judge', 'done']);
+    expect(run.growth).toBeUndefined();
+    expect(calls).toBe(0);
+    expect(events).toContain('growth-skipped-no-scope');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('grow on rejects malformed LLM JSON via the existing fallback and parks a side-effect recipe', async () => {
   for (const [reply, expected] of [
     ['not json', 'done'],
@@ -120,7 +163,7 @@ test('grow on rejects malformed LLM JSON via the existing fallback and parks a s
       const path = join(root, 'graph.yaml');
       writeFileSync(join(root, 'recipes.yaml'), 'judge:\n  command: "exit 0"\npublish:\n  command: "exit 0"\n');
       writeFileSync(path, `grow: on\ngraph_id: growth\nversion: 1\nentry_node: judge\nterminal_nodes: [done]\nnodes:\n  - { node_id: judge, kind: judge, recipe: 'cmd:judge', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - from: judge\n    on: outcome\n    map: { ok: done }\n`);
-      const run = await runGraph(path, { deps: { root,
+      const run = await runGraph(path, { deps: { root, growthScope: 'task-agent',
         growthDecision: { ledger: fakeDecisionLedger(decisionRefs) },
         runBash: async () => ({ stdout: '{"outcome":"needs-research"}\n', stderr: '', exitCode: 0 }),
         growthLLM: async () => { if (reply === 'throw') throw new Error('offline'); return reply; },

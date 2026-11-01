@@ -382,30 +382,37 @@ describe('gate — model-family cap', () => {
 });
 
 describe('gate — observability', () => {
-  test('records one summary with the reducing stage and unexecuted stages distinct from no-op stages', () => {
+  test('records active tool names and exclusion reasons with reducing and unexecuted stages', () => {
     const catalog = [
-      mini({ id: 'kept' }),
-      mini({ id: 'tiered', minTier: 'T1' }),
-      mini({ id: 'already-off', defaultEnabled: false }),
+      mini({ id: 'kept', displayName: 'kept' }),
+      mini({ id: 'tiered', displayName: 'tiered', minTier: 'T1' }),
+      mini({ id: 'already-off', displayName: 'already-off', defaultEnabled: false }),
     ];
     evaluateGate(catalog, [], { ...bareSignals(), modelTier: 'T2', modelFamily: 'claude' });
 
     const events = gateEvents();
     expect(events).toHaveLength(1);
     expect(events[0].data).toMatchObject({ catalogCount: 3, filteredCount: 1, removedCount: 2, cacheHit: false });
+    expect(events[0].data.activeTools).toEqual(['kept']);
+    expect(events[0].data.excludedTools).toEqual([
+      { name: 'tiered', reason: 'min-tier:T1' },
+      { name: 'already-off', reason: 'default-disabled' },
+    ]);
     expect(events[0].data.stages.minTier).toEqual({ executed: true, before: 2, after: 1, removed: 1 });
     expect(events[0].data.stages.probe).toEqual({ executed: true, before: 2, after: 2, removed: 0 });
     expect(events[0].data.stages.intentScope).toEqual({ executed: false, before: null, after: null, removed: null });
     expect(events[0].data.stages.modelFamilyCap).toEqual({ executed: false, before: null, after: null, removed: null });
   });
 
-  test('records a no-op model-family cap when it executes without reducing and never includes tool names', () => {
+  test('records active names for a no-op model-family cap without changing stage accounting', () => {
     const catalog = Array.from({ length: 8 }, (_, i) => mini({ id: `tool-${i}` }));
     evaluateGate(catalog, [], { ...bareSignals(), modelFamily: 'codex' });
 
     const [event] = gateEvents();
     expect(event.data.stages.modelFamilyCap).toEqual({ executed: true, before: 8, after: 8, removed: 0 });
     expect(event.data).not.toHaveProperty('tools');
+    expect(event.data.activeTools).toHaveLength(8);
+    expect(event.data.excludedTools).toEqual([]);
   });
 
   test('records exactly one summary for a cache hit without re-running stages', () => {

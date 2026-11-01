@@ -146,7 +146,7 @@ export function isKeylessProvider(provider: string | undefined): boolean {
 }
 
 /** 키가 어디서 왔나 — 관측·진단용(제1원칙: "왜 이 키인가"가 로그로 답해져야 한다). */
-type CredentialSource = 'rotation' | 'env' | 'inherited' | 'none';
+type CredentialSource = 'rotation' | 'env' | 'secret-store' | 'inherited' | 'none';
 
 interface ResolvedCredential {
   /** 해석된 키. 없으면 undefined(호출자가 provider 기본 인증으로 폴백하거나 명시 실패). */
@@ -176,6 +176,8 @@ interface ResolveCredentialInput {
   /** base config 의 `llm.provider` — 전환 여부 판정용. */
   baseProvider?: string | undefined;
   env?: NodeJS.ProcessEnv;
+  /** 이미 조회한 SecretStore 값. 값은 런타임 메모리에서만 전달한다. */
+  secretStoreApiKey?: string | undefined;
 }
 
 /**
@@ -184,8 +186,9 @@ interface ResolveCredentialInput {
  * 우선순위(대표 결정 (a)):
  *   ① `llm.rotation` 에서 같은 provider 엔트리의 apiKey (config·감사 가능)
  *   ② `providerEnvKey(provider)` 로 읽은 env
- *   ③ provider 가 **안 바뀐** 경우에 한해 base `llm.apiKey` 상속
- *   ④ 없음 — 호출자가 판단(구독/OAuth provider 는 이게 정상일 수 있다)
+ *   ③ 기존 SecretStore (`providerEnvKey` 와 같은 ID)
+ *   ④ provider 가 **안 바뀐** 경우에 한해 base `llm.apiKey` 상속
+ *   ⑤ 없음 — 호출자가 판단(구독/OAuth provider 는 이게 정상일 수 있다)
  *
  * ⚠️ ③ 이 마지막인 것이 이 수리의 핵심이다. 종전엔 ③ 이 **무조건 첫 번째**였고, 그래서 provider 가
  * 바뀌어도 옛 provider 의 키가 따라갔다(= 401 의 근본). provider 가 바뀌었으면 base 키는 **틀린 키**다.
@@ -230,7 +233,12 @@ export function resolveProviderCredential(input: ResolveCredentialInput): Resolv
     if (fromEnv) return { apiKey: fromEnv, source: 'env', envKey: candidate, ...withUrl };
   }
 
-  // ③ 상속 — **provider 가 확실히 그대로일 때만.** 바뀌었으면 base 키는 다른 provider 것이라 틀렸다.
+  // ③ SecretStore — setup service-keys uses providerEnvKey(provider) as its secret ID.
+  // The value is never copied to config or observability fields.
+  const stored = input.secretStoreApiKey?.trim();
+  if (stored) return { apiKey: stored, source: 'secret-store', ...(envKey ? { envKey } : {}), ...withUrl };
+
+  // ④ 상속 — **provider 가 확실히 그대로일 때만.** 바뀌었으면 base 키는 다른 provider 것이라 틀렸다.
   //   ⚠️ 리뷰 must-fix(#5488 2R): 종전 판정은 `!switched` 였는데 `baseProvider` 가 없으면 switched=false
   //      가 되어 **전환 여부를 모르는데 상속**했다 = 401 재현. 상속은 `provider === baseProvider` 가
   //      **명시적으로 참**일 때만 허용한다(모르면 상속 안 함 = fail-closed).
@@ -244,6 +252,54 @@ export function resolveProviderCredential(input: ResolveCredentialInput): Resolv
   }
 
   return { source: 'none', ...(envKey ? { envKey } : {}), ...withUrl };
+}
+
+function canReadHostSecretStore(env: NodeJS.ProcessEnv): boolean {
+  if (env.NODE_ENV === 'test' || env.ELANOUS_TEST_HOME?.trim()) return false;
+  const bunMain = (globalThis as { Bun?: { main?: string } }).Bun?.main;
+  if (bunMain && /\.(test|spec)\.[cm]?[jt]sx?$/.test(bunMain)) return false;
+  try {
+    const { resolveCurrentInstance } = require('../instance/current.js') as typeof import('../instance/current.js');
+    if (resolveCurrentInstance().kind !== 'prod') return false;
+    // `input.env` is injectable for deterministic callers. Preserve the same
+    // test-universe rule when it supplies a non-production parent stamp.
+    if (env.ELANOUS_STATE_DIR?.trim()) {
+      const { resolveInstance } = require('../instance/resolve.js') as typeof import('../instance/resolve.js');
+      if (resolveInstance({ stampedStateDir: env.ELANOUS_STATE_DIR }).kind !== 'prod') return false;
+    }
+    return true;
+  } catch {
+    // If the operational universe cannot be established, fail closed on host secrets.
+    return false;
+  }
+}
+
+/** Async runtime lookup for keys written by `setup service-keys`. Existing
+ * rotation and environment precedence is resolved before the SecretStore is
+ * queried; a legacy same-provider config key remains the final compatibility
+ * source. The secret value is returned only to the caller for the live request. */
+export async function resolveProviderCredentialAsync(
+  input: ResolveCredentialInput,
+  getSecret?: (id: string) => Promise<string | undefined>,
+): Promise<ResolvedCredential> {
+  const withoutStore = resolveProviderCredential(input);
+  if (withoutStore.source === 'rotation' || withoutStore.source === 'env') return withoutStore;
+  const secretId = providerEnvKey(input.provider);
+  if (!secretId) return withoutStore;
+  const env = input.env ?? process.env;
+  // Bun's test runner changes HOME, but the OS SecretStore (for example the
+  // macOS Keychain) is host-global. Never let those credentials alter a test's
+  // provider selection; callers can still inject a deterministic reader.
+  if (!getSecret && !canReadHostSecretStore(env)) return withoutStore;
+  let stored: string | undefined;
+  try {
+    if (getSecret) stored = await getSecret(secretId);
+    else {
+      const { getSecretAsync } = await import('../nexus/config/secrets/index.js');
+      stored = await getSecretAsync(secretId);
+    }
+  } catch { /* keep the legacy source fallback; never expose backend errors */ }
+  return resolveProviderCredential({ ...input, secretStoreApiKey: stored });
 }
 
 /**

@@ -69,6 +69,7 @@ import { intakeTakesQueue, readJourneyEdge, recordJourneyEdge } from '../self-de
 import { appendBenchLedger, BENCH_LOG_CATEGORY, benchBaseBranch, defaultBenchGitRun, ensureBenchBase, nextBenchRound, parseBenchSpec, readBenchLedger, type BenchBase, type BenchGitRun } from '../bench/bench.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { codeRevision } from '../version/code-revision.js';
+import { withGraphGrowthScope } from '../graph-runner/runner.js';
 
 let harnessPlanRfcForTesting: typeof runHarnessPlanRfc | undefined;
 let harnessAskMarkerInspectorForTesting: ((ask: string) => readonly string[]) | undefined;
@@ -4003,7 +4004,8 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : (announceLocalChildProvider(stampedOpts), ask(goalPath, normalizeHarnessAskSayOptions(stampedOpts)));
+            return resolved.substrate === 'pod' ? onPod(stampedOpts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask)
+              : withGraphGrowthScope('harness', () => { announceLocalChildProvider(stampedOpts); return ask(goalPath, normalizeHarnessAskSayOptions(stampedOpts)); });
           },
           deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit, deps.bench,
         );
@@ -4049,7 +4051,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             }
             return resolved.substrate === 'pod'
               ? onPod(stampedOpts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask, !(opts as HarnessSubstrateOpts).repairCommitOnly && harnessAuthorOnPod())
-              : (announceLocalChildProvider(stampedOpts), say(sentence, normalizeHarnessAskSayOptions(stampedOpts)));
+              : withGraphGrowthScope('harness', () => { announceLocalChildProvider(stampedOpts); return say(sentence, normalizeHarnessAskSayOptions(stampedOpts)); });
           },
           deps.launchGate, queueDeps, immediateLaunch, queueDeps.launch ? undefined : immediateExit, deps.bench,
         );

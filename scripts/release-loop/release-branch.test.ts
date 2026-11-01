@@ -50,6 +50,11 @@ function writeVersion(tree: string, version: string): void {
   writeFileSync(join(tree, 'bun.lock'), JSON.stringify({ workspaces: { '': { name: 'fixture', version, dependencies: {} } } }));
 }
 
+function addResumeRuntimeDirs(root: string): void {
+  mkdirSync(join(root, 'node_modules'), { recursive: true });
+  mkdirSync(join(root, 'apps', 'pwa', 'node_modules'), { recursive: true });
+}
+
 /** A bare origin, a seat clone that lands on main, and the release checkout the node runs in. */
 function fixture(mainVersion = '0.2.18-dev.3') {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'release-branch-')));
@@ -223,6 +228,7 @@ test('RELEASE-BRANCH: a repair appended with cut-branch --append becomes the tip
 
 test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not failed, and a restart at version-release', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-resume-'));
+  addResumeRuntimeDirs(root);
   try {
     const runFile = join(root, 'graph-runs', 'release-loop', 'r.json');
     mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
@@ -279,6 +285,7 @@ test('moved tip in the early export graph cannot resume at gate and skip leak-ch
 
 test('GATE-REUSE-BY-DIFF: a current-graph export-check resume plans the later gate carry', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-export-carry-'));
+  addResumeRuntimeDirs(root);
   try {
     const old = 'a'.repeat(40), tip = 'b'.repeat(40), version = '0.2.18';
     const runFile = join(root, 'graph-runs/release-loop/r.json');
@@ -304,6 +311,7 @@ test('GATE-REUSE-BY-DIFF: a current-graph export-check resume plans the later ga
 
 test('RELEASE-APPEND-SCOPE-SKIP: export-check resume plans only the verified JSON reader test', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-json-partial-'));
+  addResumeRuntimeDirs(root);
   try {
     const old = 'a'.repeat(40), tip = 'b'.repeat(40), version = '0.2.34';
     const releaseDir = join(root, 'release', version);
@@ -446,9 +454,9 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(0, 7)).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate']);
+    expect(first.path.slice(0, 6)).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    expect(seen.map((item) => item.nodeId)).toEqual(['traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'gate-triage', 'traffic-failed-restore']);
+    expect(seen.map((item) => item.nodeId)).toEqual(['traffic-cut-start', 'cutoff', 'export-check', 'checklist-gate', 'prefetch', 'gate', 'gate-triage', 'traffic-failed-restore']);
     expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut, cut, cut]);
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
@@ -481,11 +489,16 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     expect(resumed.tip).toMatchObject({ changed: false, from: tip, to: tip });
     expect(resumed.state.status).toBe('done');
     expect(seen.slice(finalStart).map((item) => item.nodeId).slice(0, 2)).toEqual(['known-issues', 'notes-check']);
-    expect(seen.slice(finalStart).at(-1)?.nodeId).toBe('version-dev-bump');
+    const finalNodes = seen.slice(finalStart).map((item) => item.nodeId);
+    const verifyAt = finalNodes.indexOf('verify');
+    expect(verifyAt).toBeGreaterThan(finalNodes.indexOf('docs-land'));
+    expect(verifyAt).toBeGreaterThan(finalNodes.indexOf('version-dev-bump'));
+    expect(finalNodes.at(-1)).toBe('ops-upgrade');
     expect(seen.map((item) => item.nodeId)).toContain('docs');
     expect(seen.map((item) => item.nodeId)).toContain('publish');
     // The final resumed tail includes the graph's publication and verification stages.
-    expect(resumed.state.path.slice(-14)).toEqual(['known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(resumed.state.path.slice(-13)).toEqual(['known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published',
+      'release-post-publish-join', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     // Shadow publication on the real resume path: the three post-approval visits must dispatch three
     // distinct commands. The injected runner never publishes anything outside this temporary test universe.
     expect(seen.filter((item) => ['publish', 'npm-publish', 'docs-land'].includes(item.nodeId)).map((item) => [item.nodeId, item.command]))
@@ -494,13 +507,12 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
         ['docs-land', 'bun scripts/release-loop/docs-land-node.ts']]);
     const dispatches = debug.events(500).filter((entry) => entry.category === 'graph.run' && entry.event === 'command-dispatch' &&
       (entry.data as { runId?: string }).runId === first.runId);
-    expect(dispatches.filter((entry) => ['publish', 'npm-publish', 'docs-land'].includes(String((entry.data as { nodeId?: string }).nodeId)))
+    expect(dispatches.filter((entry) => ['publish', 'npm-publish'].includes(String((entry.data as { nodeId?: string }).nodeId)))
       .map((entry) => {
         const data = entry.data as { nodeId: string; recipe: string; argvSha256: string; pid: number | null };
         return [data.nodeId, data.recipe, data.argvSha256.length, data.pid];
       }))
-      .toEqual([['publish', 'cmd:publish-command', 64, null], ['npm-publish', 'cmd:npm-publish', 64, null],
-        ['docs-land', 'cmd:docs-land', 64, null]]);
+      .toEqual([['publish', 'cmd:publish-command', 64, null], ['npm-publish', 'cmd:npm-publish', 64, null]]);
     expect(dispatches.some((entry) => (entry.data as { nodeId?: string }).nodeId === 'failed')).toBe(false);
     expect(new Set(seen.map((item) => item.commit))).toEqual(new Set([tip]));
     // The real gate node reads that context and measures the repaired tip.
@@ -577,6 +589,7 @@ test('RELEASE-REHEARSAL-RC: docs-land and ops-upgrade skip a prerelease; its pub
 
 test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; --partial plans test-only changes and falls back otherwise', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-resume-partial-'));
+  addResumeRuntimeDirs(root);
   const ledger = mkdtempSync(join(tmpdir(), 'release-resume-ledger-'));
   try {
     const runFile = join(root, 'graph-runs', 'release-loop', 'r.json');

@@ -111,9 +111,9 @@ export function createDiscordTriggerLogger(
  *  DiscordEvent shape. The two were intentionally kept congruent
  *  (`src/discord.ts:160-172` comment) so the wire is a near-identity
  *  with `raw` carrying the full gateway payload for debugging. */
-export function toDiscordEvent(tap: DcTriggerEvent): DiscordEvent {
-  const envelope = receiveChannelEvent('discord', tap);
-  if (!envelope || envelope instanceof Promise) throw new Error('discord connector cannot normalize accepted tap');
+export async function toDiscordEvent(tap: DcTriggerEvent): Promise<DiscordEvent> {
+  const envelope = await receiveChannelEvent('discord', tap);
+  if (!envelope) throw new Error('discord connector cannot normalize accepted tap');
   return {
     kind: tap.kind,
     channel: envelope.channel ?? tap.channel,
@@ -136,10 +136,10 @@ export function buildDiscordTriggerTap(
   return (tap: DcTriggerEvent): void => {
     // Fire-and-forget — workflow dispatch errors are surfaced via the
     // workflow daemon's lifecycle bus, not the gateway loop. Any
-    // synchronous throw lands here so the chat reply (no-op in this
-    // bot) keeps flowing.
+    // normalization and dispatch rejections land here so the gateway
+    // loop and other accepted taps keep flowing.
     void Promise.resolve()
-      .then(() => dispatch(toDiscordEvent(tap)))
+      .then(async () => dispatch(await toDiscordEvent(tap)))
       .catch((err: unknown) => {
         const reason = err instanceof Error ? err.message : String(err);
         log(`workflow dispatch failed: ${reason}`);

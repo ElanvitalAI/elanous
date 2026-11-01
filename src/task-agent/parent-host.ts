@@ -281,6 +281,7 @@ export interface ParentHostPreflight { ok: boolean; gaps: string[]; warnings: st
 export function preflightScript(target: ParentHostConfig): string {
   const elanous = remotePath(target.elanous ?? DEFAULT_REMOTE_ELANOUS);
   const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
+  const codexCliMirrorDir = remotePath(REMOTE_CODEX_CLI_MIRROR_DIR);
   const grokCredentialFloorSeconds = Math.ceil(PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS / 1_000);
   return [
     `echo "version=$(${elanous} --version 2>/dev/null | tail -1 | cut -d' ' -f1)"`,
@@ -290,7 +291,10 @@ export function preflightScript(target: ParentHostConfig): string {
     `command -v kubectl >/dev/null 2>&1 && echo kubectl=1`,
     `{ command -v grok >/dev/null 2>&1 || [ -x "$HOME/.grok/bin/grok" ]; } && echo grokCli=1`,
     `{ command -v codex >/dev/null 2>&1 || [ -x "$HOME/.local/bin/codex" ]; } && echo codexCli=1`,
-    `n=$(grep -Ec '^[[:space:]]*"openai-codex(:[^"]*)?"[[:space:]]*:[[:space:]]*\\{' ${configDir}/auth.json 2>/dev/null); echo "codexAccounts=\${n:-0}"`,
+    // Default auth retains its historical provider-profile count, including expired entries.
+    // The CLI mirror is access-only; unusable/expired profiles do not count and duplicates do not count twice.
+    // A missing remote Bun is reported as unknown rather than a misleading zero.
+    `codexCount=$(grep -Ec '^[[:space:]]*"openai-codex(:[^"]*)?"[[:space:]]*:[[:space:]]*\\{' ${configDir}/auth.json 2>/dev/null); codexAccountsDefault=\${codexCount:-0}; if command -v bun >/dev/null 2>&1; then codexProbe=$(bun -e 'const fs=require("node:fs");const read=(p)=>{try{return JSON.parse(fs.readFileSync(p,"utf8"))}catch{return {}}};const isCodex=(key)=>/^openai-codex(?::[^\"]+)?$/.test(key);const parent=read(process.argv[1]).providers||{};const mirror=read(process.argv[2]).providers||{};const activeMirror=Object.entries(mirror).filter(([key,p])=>isCodex(key)&&typeof p?.tokens?.accessToken==="string"&&p.tokens.accessToken.length>0&&!p.tokens.refreshToken&&!p.tokens.refresh_token&&typeof p.tokens.expiresAt==="number"&&Number.isFinite(p.tokens.expiresAt)&&p.tokens.expiresAt>Date.now());const additional=activeMirror.filter(([key])=>!Object.prototype.hasOwnProperty.call(parent,key)).length;process.stdout.write([activeMirror.length,additional].join("|"))' ${configDir}/auth.json ${codexCliMirrorDir}/auth.json 2>/dev/null); codexProbeStatus=measured; else codexProbe=''; codexProbeStatus=unknown; fi; case "$codexProbe" in *'|'*) codexAccountsMirror=\${codexProbe%%|*}; codexAccountsMirrorAdditional=\${codexProbe#*|};; *) codexProbeStatus=unknown; codexAccountsMirror=unknown; codexAccountsMirrorAdditional=0;; esac; codexAccounts=$((codexAccountsDefault + codexAccountsMirrorAdditional)); echo "codexAccountsDefault=\${codexAccountsDefault}"; echo "codexAccountsMirror=\${codexAccountsMirror}"; echo "codexAccountsMirrorAdditional=\${codexAccountsMirrorAdditional}"; echo "codexAccountsMirrorStatus=\${codexProbeStatus}"; echo "codexAccounts=\${codexAccounts}"`,
     `{ grep -Eq '"key"[[:space:]]*:[[:space:]]*"[^"]+"' "$HOME/.grok/auth.json" 2>/dev/null || [ -n "\${XAI_API_KEY:-}\${GROK_API_KEY:-}\${GROK_CODE_XAI_API_KEY:-}" ]; } && echo grok=1`,
     // The remote host owns its device-auth session. Ignore the legacy HQ mirror entry; it can outlive and mask the host credential.
     // Read only expiry metadata, never credential values, and compare against the shared minimum lifetime.
@@ -366,6 +370,7 @@ export function judgeParentHostCredentials(facts: Record<string, string>): strin
   if (facts.unreachable) return [];
   const warnings: string[] = [];
   if (!(Number(facts.codexAccounts) > 1)) warnings.push('codex-accounts-low');
+  if (facts.codexAccountsMirrorStatus === 'unknown') warnings.push('codex-account-mirror-unmeasured');
   if (facts.grok !== '1') warnings.push('grok-credential-missing');
   if (facts.openrouter !== '1') warnings.push('openrouter-key-missing');
   return warnings;
@@ -391,6 +396,19 @@ export function preflightParentHost(input: PreflightInput): ParentHostPreflight 
     } catch { /* fail-soft */ }
   }
   const warnings = judgeParentHostCredentials(facts);
+  try {
+    debug.log('task-agent.parent-host', 'codex-account-candidates', {
+      host: input.target.host,
+      sources: [
+        { path: `${input.target.configDir ?? '~/.elanous'}/auth.json`, count: Number(facts.codexAccountsDefault) || 0 },
+        { path: `${REMOTE_CODEX_CLI_MIRROR_DIR.replace(/^\$HOME/, '~')}/auth.json`,
+          count: facts.codexAccountsMirrorStatus === 'unknown' ? null : Number(facts.codexAccountsMirror) || 0,
+          additional: facts.codexAccountsMirrorStatus === 'unknown' ? null : Number(facts.codexAccountsMirrorAdditional) || 0 },
+      ],
+      mirrorStatus: facts.codexAccountsMirrorStatus ?? 'unknown',
+      totalCandidates: Number(facts.codexAccounts) || 0,
+    });
+  } catch { /* fail-soft */ }
   if (warnings.length) {
     try {
       debug.log('task-agent.parent-host', 'credential-warning', {

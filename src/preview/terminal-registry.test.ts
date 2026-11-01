@@ -12,8 +12,10 @@ function stub() {
   const handle = {
     id: 'preview_abc',
     writes: [] as string[],
+    writeAllowed: true,
     resizes: [] as Array<[number, number]>,
     kills: [] as Array<string | undefined>,
+    canWrite() { return this.writeAllowed; },
     write(s: string) { this.writes.push(s); },
     resize(cols: number, rows: number) { this.resizes.push([cols, rows]); },
     kill(sig?: NodeJS.Signals) { this.kills.push(sig); },
@@ -43,6 +45,18 @@ describe('PreviewTerminal useRegistry (P0b-2 · 공유 버스 흡수)', () => {
     expect(o.accessMode).toBe('write');
     expect(o.workdir).toBe('/tmp');
     expect(pt.isAlive).toBe(true);
+    pt.stop();
+  });
+
+  test('write reports registry acceptance and denied writes to visible mission callers', () => {
+    const s = stub();
+    const pt = new PreviewTerminal({ cols: 80, rows: 24, cwd: '/tmp', env: {}, useRegistry: true }, undefined, s.deps);
+    pt.start();
+    expect(pt.write('mission prompt')).toBe(true);
+    expect(s.handle.writes).toEqual(['mission prompt']);
+    s.handle.writeAllowed = false;
+    expect(pt.write('\r')).toBe(false);
+    expect(s.handle.writes).toEqual(['mission prompt']);
     pt.stop();
   });
 

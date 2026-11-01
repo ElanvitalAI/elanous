@@ -1,4 +1,5 @@
 import { buildGitSnapshot } from '../git-fs/index.js';
+import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { debug } from '../debug/log.js';
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { resolve } from 'node:path';
@@ -224,6 +225,16 @@ interface SessionToolFamilyRule {
   match(text: string): boolean;
   isAvailable?(toolName: string): boolean;
 }
+
+// Keep generic approvals (for example, Herdr session approvals) out of the decision-ledger lookup.
+const DECISION_PENDING_LOOKUP_TERMS = [
+  '결정 카드', '결정카드', '미결 결정', '열린 결정', '대기 결정', '결정 대기', '결정 승인 대기',
+  'pending decision', 'open decision', 'decision inbox',
+] as const;
+const OPS_SEATS_LOOKUP_TERMS = [
+  '자리 현황', '자리별 현황', '자리 상태', '자리별 상태', '좌석 현황',
+  'seat status', 'seat overview',
+] as const;
 
 const SESSION_TOOL_FAMILY_RULES: SessionToolFamilyRule[] = [
   {
@@ -1871,13 +1882,34 @@ export function buildSessionRuntimeToolSpecs(opts: {
     optionalTools: opts.optionalTools ?? [],
     toolAvailability: opts.toolAvailability,
   });
+  // These owner-read facts tools are valid ACP lookup targets, but are too
+  // specific to carry on every dashboard turn. Keep the advertised catalog
+  // aligned with the current question so a routed lookup can actually call it.
+  const lookupRoute = classifyTuiChatIntent(opts.userText).route === '조회';
+  const normalizedIntentText = opts.userText.toLowerCase();
+  const intentHostNames = lookupRoute ? [
+    ...(hasAny(normalizedIntentText, DECISION_PENDING_LOOKUP_TERMS) ? ['decisions_pending'] : []),
+    ...(hasAny(normalizedIntentText, OPS_SEATS_LOOKUP_TERMS) ? ['ops_seats'] : []),
+  ] : [];
+  const hostByName = new Map(opts.hostTools.map(tool => [tool.name, tool] as const));
+  const intentHostSpecs = intentHostNames
+    .filter(name => isToolAvailable(name, opts.toolAvailability))
+    .map(name => hostByName.get(name))
+    .filter((tool): tool is LLMToolDef => !!tool)
+    .map(toSpec);
   const droppedNames = new Set(['Edit', 'Write']);
-  const finalSpecs: LLMToolSpec[] = hasDevHarnessIntent(opts.userText)
-    ? essentialSpecs.filter(spec => !droppedNames.has(spec.name))
-    : essentialSpecs;
-  if (finalSpecs.length !== essentialSpecs.length) {
+  const dropWriteTools = hasDevHarnessIntent(opts.userText);
+  const droppedWriteSpecs = dropWriteTools
+    ? essentialSpecs.filter(spec => droppedNames.has(spec.name))
+    : [];
+  const finalSpecs: LLMToolSpec[] = [...new Map(
+    [...essentialSpecs, ...intentHostSpecs]
+      .filter(spec => !dropWriteTools || !droppedNames.has(spec.name))
+      .map(spec => [spec.name, spec] as const),
+  ).values()];
+  if (droppedWriteSpecs.length > 0) {
     debug.log('session-runtime.tools', 'harness-phrase-write-tools-dropped', {
-      dropped: ['Edit', 'Write'],
+      dropped: droppedWriteSpecs.map(spec => spec.name),
     });
   }
   // Forensic — final tool list returned to streamLLMWithTools. Lets

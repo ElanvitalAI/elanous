@@ -248,7 +248,7 @@ test('host-down from runGateNode is preserved through resume and switches the sa
     const state = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { input: Record<string, unknown>; path: string[]; nodes: Array<Record<string, unknown>>; executed: number };
     state.input.gatePodPool = 'pool-test';
     state.input.previousVersion = '0.2.18';
-    state.path = ['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate'];
+    state.path = ['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate'];
     state.nodes = state.path.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true,
       output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
         : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
@@ -329,7 +329,7 @@ test('interference partial-resume rechecks only affected files at the same cut',
   runState.input.commit = SHA;
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
-  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate'];
+  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
     output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'gate' ? JSON.stringify(gateOutput)
@@ -400,7 +400,7 @@ test('load-flaky autoheal rechecks only the affected files when interferenceErro
   runState.input.commit = SHA;
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
-  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate'];
+  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
     output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));

@@ -120,7 +120,7 @@ const RESEARCH_ASCII_RE = /\b(research|find out|look up|investigate|latest (on|n
 const RESEARCH_KO_RE = /(최신|뉴스|찾아(?:줘|봐)|알아봐|조사|리서치)/;
 const RESEARCH_SKILL_RE = /\b(?:omni[ -]market|omni[ -]crawl|social[ -]pulse)\b/i;
 const RESEARCH_EXPLANATION_RE = /(?:왜|이유|원인|전망|분석|비교|조사|\bwhy\b|\bcause\b|\boutlook\b|\banalysis\b|\bcompare\b)/i;
-const RESEARCH_TOPIC_RE = /(?:금리|채권|시장|경제|물가|환율|주가|기업|산업|정책|선거|역사|기후|질병|의학|과학|\bbond\b|\byield\b|\bmarket\b|\beconomy\b|\binflation\b|\bstock\b|\bpolicy\b|\belection\b|\bhistory\b|\bclimate\b|\bhealth\b|\bscience\b)/i;
+const RESEARCH_TOPIC_RE = /(?:금리|채권|시장|경제|물가|환율|주가|기업|산업|정책|선거|역사|기후|질병|의학|과학|반도체|HBM\d?|메모리|공급망|양산|인증|마이크론|삼성전자|SK하이닉스|\bbond\b|\byield\b|\bmarket\b|\beconomy\b|\binflation\b|\bstock\b|\bpolicy\b|\belection\b|\bhistory\b|\bclimate\b|\bhealth\b|\bscience\b)/i;
 const RESEARCH_CODING_RE = /(?:코드|함수|버그|테스트|빌드|커밋|하니스|설정|오류|구현|수리|고쳐|수정|저장소|\brepo\b|\bcode\b|\bfunction\b|\bbug\b|\btest\b|\bbuild\b|\bcommit\b|\bconfig\b|\bimplement\b|\bfix\b)/i;
 const DEEP_RESEARCH_INTENT_TERMS = [
   'research', 'deep research', 'triangulate', 'compare sources',

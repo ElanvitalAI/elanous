@@ -26,7 +26,7 @@ export function createLLMGrowthProposer(callLLM: GrowthLLM = defaultGrowthLLM): 
     const serializedOutput = typeof input.output === 'string' ? input.output : input.output === undefined ? '' : JSON.stringify(input.output);
     const prompt = [
       'Propose exactly one new contracted graph node to handle the unseen outcome and one return edge to an existing node.',
-      'Reply with only JSON: {"node":{"nodeId":"...","kind":"agent","recipe":"none","maxVisits":1,"contract":{"inputs":[],"tools":"read-only","outputs":[]}},"returnTo":"existing-node-id","reason":"..."}.',
+      'Reply with only JSON: {"node":{"nodeId":"...","kind":"agent","recipe":"none","maxVisits":1,"contract":{"inputs":[],"tools":"read-only","outputs":[]}},"returnTo":"existing-node-id","reason":"..."}. The only allowed kinds are agent, observe, and judge.',
       'Use only an existing recipe type (none, an existing cmd:/approval: recipe ID, or a catalog role); never invent commands. The missing-outcome edge and the return edge are built from node and returnTo after validation.',
       'Do not alter existing nodes or edges. The proposal will be validated independently; do not assume a recipe is safe.',
       `Graph snapshot: ${JSON.stringify(input.graph)}`,
@@ -42,6 +42,8 @@ export function createLLMGrowthProposer(callLLM: GrowthLLM = defaultGrowthLLM): 
     const proposal = parsed as Record<string, unknown>;
     if (!proposal.node || typeof proposal.node !== 'object' || Array.isArray(proposal.node) ||
       typeof proposal.reason !== 'string' || !proposal.reason.trim() || typeof proposal.returnTo !== 'string') return undefined;
+    const node = proposal.node as Record<string, unknown>;
+    if (typeof node.kind !== 'string' || !['agent', 'observe', 'judge'].includes(node.kind)) return undefined;
     return { node: proposal.node, reason: proposal.reason, returnTo: proposal.returnTo } as GrowthProposal;
   };
 }

@@ -5515,10 +5515,10 @@ const selfOrchestrateCmd = selfCmd
           const quotaPolicy = resolvedQuota.policy;
           const { normalizeFallbackChain } = await import('./oauth/fallback-chain.js');
           const fallbackEnabled = codexPolicyAllowsFallback(quotaPolicy)
-            && normalizeFallbackChain(launchPolicy.llm?.fallbackChain).chain.includes('grok');
+            && normalizeFallbackChain(launchPolicy.llm?.fallbackChain, launchPolicy.llm?.provider).chain.includes('grok');
           // CODEX-CREDITS-STEP — 체인 마지막 칸(크레딧). 켜져 있을 때만 grok 잔량을 잰다(발사 관문과 같은 80% 상한).
           //   Pod 는 «grok 뒤» 순서(문서화된 배치)만 따른다 — grok 앞에 둔 체인은 Pod 계획에서 크레딧 칸을 쓰지 않는다.
-          const launchChain = normalizeFallbackChain(launchPolicy.llm?.fallbackChain).chain;
+          const launchChain = normalizeFallbackChain(launchPolicy.llm?.fallbackChain, launchPolicy.llm?.provider).chain;
           const codexCreditsStep = codexPolicyAllowsFallback(quotaPolicy)
             && launchChain.includes('codex-credits')
             && (!launchChain.includes('grok') || launchChain.indexOf('codex-credits') > launchChain.indexOf('grok'));

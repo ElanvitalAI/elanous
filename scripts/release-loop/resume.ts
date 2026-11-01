@@ -5,13 +5,22 @@ import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 
 export interface AcceptedRegression { id: string; note: string }
 
+/** Return the saved fork-node index when --from names a failed fan-out branch rather than a parent-path node. */
+export function releaseFanOutForkIndex(state: GraphRunState, branchId: string): number | undefined {
+  const matches = Object.values(state.fanOuts ?? {}).filter((fanout) => fanout.branches[branchId]?.status === 'failed');
+  if (matches.length !== 1) return undefined;
+  const fork = matches[0]!.from;
+  const index = state.path.indexOf(fork);
+  return index >= 0 && state.path.lastIndexOf(fork) === index ? index : undefined;
+}
+
 /** Match the graph runner's approval boundary before release resume performs tip refresh or writes an attempt. */
 export function assertReleaseResumeApprovalBoundary(state: GraphRunState, from: string): void {
   if (!Array.isArray(state.path)) return;
-  const start = state.path.indexOf(from);
-  if (start < 0 || state.path.lastIndexOf(from) !== start) {
-    return;
-  }
+  const pathStart = state.path.indexOf(from);
+  const branchStart = pathStart < 0 ? releaseFanOutForkIndex(state, from) : undefined;
+  const start = pathStart >= 0 ? pathStart : branchStart;
+  if (start === undefined || start < 0 || (pathStart >= 0 && state.path.lastIndexOf(from) !== start)) return;
   for (let index = 0; index < state.nodes.length; index++) {
     const record = state.nodes[index]!;
     if (typeof record.decidedAt !== 'string') continue;

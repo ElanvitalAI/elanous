@@ -98,6 +98,39 @@ test('RunGraphView renders a core list and non-interactive outcome-labelled canv
   queries.clear();
 });
 
+test('HARNESS-FULL-GRAPH-UNITS-PWA-FALLBACK: mock-nexus getRunGraphFlat path renders fallback-only edges apart from regular to/map', async () => {
+  const { queries, client } = fixture();
+  const flat: RunGraphDetail = {
+    ...detail,
+    nodes: [...detail.nodes, { node_id: 'main-sync', kind: 'git', recipe: 'main-sync', max_visits: 1 }],
+    edges: [
+      {
+        from: 'investigate', on: 'changed-files', map: { 'documents-only': 'judge' },
+        fallback: [{ node: 'main-sync', requires: ['mergeMain'] }],
+      },
+      { from: 'judge', to: 'merge' },
+    ],
+  };
+  const flatClient = { ...client, getRunGraphFlat: async () => flat } as unknown as NexusClient;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => { renderer = create(<NexusProvider client={flatClient} queryClient={queries}><RunGraphView /></NexusProvider>); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  const canvas = renderer.root.findByType(ReactFlow);
+  expect(canvas.props.nodesDraggable).toBe(false);
+  expect(canvas.props.nodesConnectable).toBe(false);
+  expect(canvas.props.edgeTypes.tidy).toBeDefined();
+  const fallback = canvas.props.edges.find((edge: { source: string; target: string }) => edge.source === 'investigate' && edge.target === 'main-sync');
+  const regular = canvas.props.edges.find((edge: { source: string; target: string }) => edge.source === 'investigate' && edge.target === 'judge');
+  expect(fallback).toMatchObject({ label: 'fallback · mergeMain', type: 'tidy' });
+  expect(fallback.data.route.family).toBe('fallback');
+  expect(fallback.data.route.requires).toEqual(['mergeMain']);
+  expect(regular).toMatchObject({ label: 'documents-only', type: 'tidy' });
+  expect(regular.data.route.family).not.toBe('fallback');
+  expect(canvas.props.nodes.some((node: { id: string }) => node.id === 'main-sync')).toBe(true);
+  await act(async () => renderer.unmount());
+  queries.clear();
+});
+
 test('RunGraphView uses the server-flattened read-only graph for core unit calls', async () => {
   const { queries, client } = fixture();
   const flat: RunGraphDetail = {

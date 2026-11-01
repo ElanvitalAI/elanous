@@ -62,6 +62,54 @@ test('DEMO1104-ARG-ADAPTIVE-VIEW: three scene evidence stays ordered and records
   expect(evidence.handNodes).toMatchObject([{ who: 'codex', what: 'compare evidence', missionId: 'mission-1' }]);
 });
 
+test('HARNESS-FULL-GRAPH-UNITS-PWA-FALLBACK: runGraphToFlow emits fallback-only destinations and requires as distinct flow edges', () => {
+  const withFallback: RunGraphDetail = {
+    id: 'fallback-loop', source: 'core', editable: false,
+    entry_node: 'gate', terminal_nodes: ['open-pr'],
+    nodes: [
+      { node_id: 'gate', kind: 'gate', recipe: 'gate-baseline', max_visits: 2 },
+      { node_id: 'review', kind: 'judge', recipe: 'pr-reviewer', max_visits: 2 },
+      { node_id: 'main-sync', kind: 'git', recipe: 'main-sync', max_visits: 1 },
+      { node_id: 'open-pr', kind: 'git', recipe: 'open-pr', max_visits: 1 },
+    ],
+    edges: [
+      {
+        from: 'gate', on: 'outcome', map: { pass: 'review' },
+        fallback: [
+          { node: 'main-sync', requires: ['mergeMain', 'commitWork'] },
+          { node: 'open-pr', requires: [] },
+          { node: 'review', requires: ['already-mapped'] },
+        ],
+      },
+      { from: 'review', to: 'open-pr' },
+    ],
+  };
+  const flow = runGraphToFlow(withFallback);
+  const routeOf = (source: string, target: string) => {
+    const edge = flow.edges.find((item) => item.source === source && item.target === target);
+    return edge as typeof edge & { data: { route: { family: string; requires?: string[] } } };
+  };
+
+  const regular = routeOf('gate', 'review');
+  expect(regular).toMatchObject({ label: 'pass', type: 'tidy' });
+  expect(regular.data.route.family).not.toBe('fallback');
+  expect(flow.edges.filter((edge) => edge.source === 'gate' && edge.target === 'review')).toHaveLength(1);
+
+  const required = routeOf('gate', 'main-sync');
+  expect(required).toMatchObject({ label: 'fallback · mergeMain · commitWork', type: 'tidy' });
+  expect(required.data.route.family).toBe('fallback');
+  expect(required.data.route.requires).toEqual(['mergeMain', 'commitWork']);
+
+  const emptyRequires = routeOf('gate', 'open-pr');
+  expect(emptyRequires).toMatchObject({ label: 'fallback', type: 'tidy' });
+  expect(emptyRequires.data.route.family).toBe('fallback');
+
+  const reviewToPr = routeOf('review', 'open-pr');
+  expect(reviewToPr.label).toBeUndefined();
+  expect(reviewToPr.data.route.family).not.toBe('fallback');
+  expect(flow.nodes.find((node) => node.id === 'gate')?.data.outcomes).toEqual(['pass']);
+});
+
 test('ARG evidence counts only recorded node, resolution, repair, and hand events in sequence order', () => {
   const evidence = runGraphAdaptiveEvidence([
     { seq: 4, ts: '2026-10-29T00:00:03.000Z', type: 'edge-rerouted', from: 'lookup', outcome: '$default', was: 'done', to: 'fallback', decider: 'runtime-overlay', reason: 'source unavailable' },

@@ -29,6 +29,8 @@ type TranslationRunner = (line: string) => string;
 type AskSpawn = (command: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
 
 const HANGUL = /[\uac00-\ud7a3]/;
+// Allow common English typography without accepting arbitrary non-ASCII letters, digits, or symbols.
+const PUBLIC_TRANSLATION_NON_ASCII = /[^\x00-\x7f\u00a0\u00a1\u00ab\u00b7\u00bb\u00bf\u2010-\u2015\u2018-\u201f\u2022\u2026]/u;
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 function splitMarkdownPrefix(raw: string): { prefix: string; text: string } {
@@ -130,8 +132,8 @@ function translatePublicText(text: string, runner: TranslationRunner, failures: 
       try {
         const candidate = runner(source).trim();
         const alphanumeric = [...candidate].filter((character) => /[\p{L}\p{N}]/u.test(character));
-        if (!candidate || HANGUL.test(candidate) || alphanumeric.length === 0 || /[^\x00-\x7f]/.test(candidate)) {
-          throw new Error('translation is empty or contains non-Latin writing');
+        if (!candidate || HANGUL.test(candidate) || alphanumeric.length === 0 || PUBLIC_TRANSLATION_NON_ASCII.test(candidate)) {
+          throw new Error('translation is empty or contains unsupported non-ASCII characters');
         }
         translated = candidate;
         cache.set(source, candidate);

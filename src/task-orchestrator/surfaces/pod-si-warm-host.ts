@@ -80,12 +80,22 @@ export async function adoptSiWarmBytes(command: SiWarmCommand, _reply: SiWarmRep
 
 type ChildInput = Parameters<SelfImplementJobSpawn>[0];
 
-/** Reuse only the source and auth form the fixed worker currently supports. */
-export function siWarmEligible(input: ChildInput, options: PodSpawnOptions): boolean {
+/** Reuse only the source, provider and auth form the fixed worker currently supports. */
+export function siWarmEligible(input: ChildInput, options: PodSpawnOptions, configuredProvider?: string): boolean {
+  // An explicit Codex child override is authoritative. Otherwise, an absent or
+  // auto child choice inherits the configured provider and must not mask it.
+  const requestedProvider = options.provider as string | undefined;
+  const provider = requestedProvider === 'openai-codex'
+    ? 'openai-codex'
+    : requestedProvider === undefined || requestedProvider === 'auto'
+      ? configuredProvider
+      : requestedProvider;
+  const providerSupported = provider === undefined || provider === null || provider === '' || provider === 'auto'
+    || provider === 'openai-codex';
   // Merge-ready children need the cold path's full host ACP/regate/land sequence.
   // Until that sequence is shared, admit only draft-producing children.
   return input.autoMerge === false && !input.after && !options.repairCommitOnly && !options.source
-    && (!options.provider || options.provider === 'openai-codex')
+    && providerSupported
     && (!options.accountBroker || !!options.rotationAccounts?.length)
     && !options.extraArgs?.length && !options.passEnv?.length
     && !options.skillEnv && !options.armEnv && !options.groundingUrl;
@@ -147,11 +157,12 @@ export function siWarmPayload(input: ChildInput, options: PodSpawnOptions, runId
       ...(env.ELANOUS_HARNESS_SEAT ? { ELANOUS_HARNESS_SEAT: env.ELANOUS_HARNESS_SEAT } : {}) } };
 }
 
-/** Carry the same normalized child fallback config as a fresh Pod Job. */
-export function siWarmFallbackFiles(raw: unknown, grok: { grokAuth?: string; grokApiKey?: string } | null):
+/** Carry the same normalized child fallback config as a fresh Pod Job. configuredProvider is required to preserve provider-derived defaults. */
+export function siWarmFallbackFiles(raw: unknown, grok: { grokAuth?: string; grokApiKey?: string } | null,
+  configuredProvider: string | undefined):
   Record<string, string> {
   // The fixed warm runner only carries Codex accounts and optional Grok credentials.
-  const available = normalizeFallbackChain(raw).chain.filter(step =>
+  const available = normalizeFallbackChain(raw, configuredProvider).chain.filter(step =>
     step === 'codex-rotate' || (step === 'grok' && !!(grok?.grokAuth || grok?.grokApiKey)));
   // A configured chain with no carryable provider cannot enter the warm worker.
   // Its caller catches this before acquiring a lease and uses the cold Job path.
@@ -174,6 +185,8 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
   if (!siWarmEligible(input, options)) return { status: 'no-entry', reason: 'invalid-input' };
   let prepared: Parameters<typeof acquireSiWarmLease>[0];
   try {
+    const config = (options.fallbackConfig ?? getUserConfig)();
+    if (!siWarmEligible(input, options, config.llm.provider)) return { status: 'no-entry', reason: 'invalid-input' };
     const sourceSha = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${input.base ?? 'origin/HEAD'}^{commit}`],
       { cwd: process.cwd(), encoding: 'utf8' }).trim();
     if (!/^[a-f0-9]{40}$/.test(sourceSha)) return { status: 'no-entry', reason: 'invalid-input' };
@@ -189,8 +202,7 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
       ? [plannedAccount, ...rotation!.filter(name => name !== plannedAccount)] : undefined;
     const credentials = (options.credentials ?? hostCredentials)(plannedAccount);
     const deadlineMs = (options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS) * 1000;
-    const config = (options.fallbackConfig ?? getUserConfig)();
-    const fallback = normalizeFallbackChain(config.llm.fallbackChain).chain;
+    const fallback = normalizeFallbackChain(config.llm.fallbackChain, config.llm.provider).chain;
     let grok: { grokAuth?: string; grokApiKey?: string } | null = null;
     if (fallback.includes('grok')) {
       try { grok = hostGrokCredentials({ minValidityMs: deadlineMs,
@@ -206,7 +218,7 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
         : { 'elanous-auth.json': credentials.elanousAuth,
           'codex-auth.json': credentials.codexAuth }),
       'gh-token': credentials.ghToken,
-      ...siWarmFallbackFiles(config.llm.fallbackChain, grok) },
+      ...siWarmFallbackFiles(config.llm.fallbackChain, grok, config.llm.provider) },
     ...(accounts ? { accounts } : {}) };
     const payload = Buffer.from(JSON.stringify(siWarmPayload(input, options, runId)));
     const credentialBundle = Buffer.from(JSON.stringify(bundle));

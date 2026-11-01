@@ -120,6 +120,60 @@ test('graph adapt-report windows by start time and separates in-flight and missi
   expect(invalid.stderr).toContain('invalid adaptation measurement window');
 }, 120_000);
 
+test('graph promote evaluates an injected same-trigger E4 ledger into a human-only overlay proposal', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-promote-fixture-'));
+  dirs.push(dir);
+  const fixturePath = join(dir, 'evidence.json');
+  const dates = ['2026-10-01', '2026-10-03', '2026-10-05', '2026-10-07', '2026-10-08'];
+  const events = [
+    ...dates.map((date, index) => ({ runId: `adapt-${index}`, timestamp: `${date}T00:00:00Z`, trigger: 'same-trigger', phase: 'adaptation', landed: index < 4 })),
+    ...dates.map((date, index) => ({ runId: `base-${index}`, timestamp: `${date}T00:00:00Z`, trigger: 'same-trigger', phase: 'baseline', landed: index < 3 })),
+    { runId: 'shadow-start', timestamp: '2026-10-09T00:00:00Z', trigger: 'same-trigger', phase: 'shadow', shadowAccepted: true },
+    { runId: 'shadow-end', timestamp: '2026-10-16T00:00:00Z', trigger: 'same-trigger', phase: 'shadow', shadowAccepted: true },
+  ];
+  writeFileSync(fixturePath, JSON.stringify({ trigger: 'same-trigger', candidate: {
+    overlayId: 'profile-repeat-path', target: 'self-implement', appliesWhen: 'profile == repeat-path',
+    patch: [{ op: 'replace', path: '/nodes/0/maxVisits', value: 2 }],
+  }, events }));
+
+  const result = spawnGraphAt(join(dir, 'test-state'), dir, 'promote', 'evaluate', '--fixture', fixturePath, '--json');
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    mockOnly: true, verdict: 'eligible-for-human-pr', blockers: [],
+    metrics: { adaptationRuns: 5, adaptationLandingRate: 0.8, baselineRuns: 5,
+      baselineLandingRate: 0.6, adaptationWindowDays: 7, shadowObservations: 2, shadowWindowDays: 7 },
+    proposal: { action: 'proposal-only', promoted_from: ['adapt-0', 'adapt-1', 'adapt-2', 'adapt-3', 'adapt-4'],
+      evidence: { source: 'injected-mock-fixture' }, overlay: { overlay_id: 'profile-repeat-path', stage: 'launch' },
+      rollback: expect.any(String), patentReview: 'ELA-53 human review pending' },
+  });
+  expect(JSON.parse(result.stdout).metrics.landingDelta).toBeCloseTo(0.2);
+  expect(existsSync(join(dir, 'profile-repeat-path.yaml'))).toBe(false);
+}, 120_000);
+
+test('graph promote keeps a mock candidate held when shadow evidence declines', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-promote-decline-'));
+  dirs.push(dir);
+  const fixturePath = join(dir, 'evidence.json');
+  const dates = ['2026-10-01', '2026-10-03', '2026-10-05', '2026-10-07', '2026-10-08'];
+  const events = [
+    ...dates.map((date, index) => ({ runId: `adapt-${index}`, timestamp: `${date}T00:00:00Z`, trigger: 'same-trigger', phase: 'adaptation', landed: index < 4 })),
+    ...dates.map((date, index) => ({ runId: `base-${index}`, timestamp: `${date}T00:00:00Z`, trigger: 'same-trigger', phase: 'baseline', landed: index < 3 })),
+    { runId: 'shadow-start', timestamp: '2026-10-09T00:00:00Z', trigger: 'same-trigger', phase: 'shadow', shadowAccepted: true },
+    { runId: 'shadow-end', timestamp: '2026-10-16T00:00:00Z', trigger: 'same-trigger', phase: 'shadow', shadowAccepted: false },
+  ];
+  writeFileSync(fixturePath, JSON.stringify({ trigger: 'same-trigger', candidate: {
+    overlayId: 'profile-repeat-path', target: 'self-implement', appliesWhen: 'profile == repeat-path',
+    patch: [{ op: 'replace', path: '/nodes/0/maxVisits', value: 2 }],
+  }, events }));
+  const result = spawnGraphAt(join(dir, 'test-state'), dir, 'promote', 'evaluate', '--fixture', fixturePath, '--json');
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ mockOnly: true, verdict: 'held',
+    blockers: ['shadow-evaluation-declined'] });
+  expect(JSON.parse(result.stdout).proposal).toBeUndefined();
+  expect(JSON.parse(result.stdout).metrics.landingDelta).toBeCloseTo(0.2);
+  expect(existsSync(join(dir, 'profile-repeat-path.yaml'))).toBe(false);
+}, 120_000);
+
 test('graph wizard-run is exposed as the smart wizard request entrypoint', () => {
   const program = new Command();
   registerGraphCommands(program);

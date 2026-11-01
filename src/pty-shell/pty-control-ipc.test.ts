@@ -17,7 +17,7 @@ process.env.ELANOUS_STATE_DIR = stateDir;
 
 const { migratePtyControlSchema, requestRemotePtyControl, requestRemotePtyControlCapabilities, processPtyControlRequests, resetPtyControlIpcForTesting, signalPtyControlWake, beginPtyHumanTypingSession } = await import('./pty-control-ipc.js');
 const { RemotesStore } = await import('../cli/remotes.js');
-const { externalWriteProvenance } = await import('./pty-write-provenance.js');
+const { externalWriteProvenance, ptyWriteControlState } = await import('./pty-write-provenance.js');
 const { upsertPtyManifest, ptyManifestDbPath, getPtyManifest } = await import('./pty-manifest.js');
 const { resetPtyEventLogForTesting } = await import('./pty-event-log.js');
 const { getPtyControlTarget, registerPtyControlTarget, resetForTesting, setPtyAdapterForTesting, startPty } = await import('./registry.js');
@@ -101,6 +101,24 @@ function registryHandle(accessMode: 'auto' | 'write', write: (chars: string) => 
 }
 
 describe('pty-control-ipc round-trip', () => {
+  test('records only the actor of the last successful arbiter write', () => {
+    const writes: string[] = [];
+    const successful = registryHandle('auto', (chars) => { writes.push(chars); });
+    expect(successful.lastWriteActor).toBeNull();
+    expect(ptyWriteControlState(successful.id)).toEqual({ accessMode: 'auto', lastWriter: null });
+    successful.write('agent-input', 'agent');
+    expect(successful.lastWriteActor).toBe('agent');
+    expect(ptyWriteControlState(successful.id)).toEqual({ accessMode: 'auto', lastWriter: 'agent' });
+    successful.write('denied-human-input', 'human');
+    expect(successful.lastWriteActor).toBe('agent');
+    expect(ptyWriteControlState(successful.id)).toEqual({ accessMode: 'auto', lastWriter: 'agent' });
+
+    const failed = registryHandle('auto', () => { throw new Error('adapter write failed'); });
+    expect(() => failed.write('failed-agent-input', 'agent')).toThrow('adapter write failed');
+    expect(failed.lastWriteActor).toBeNull();
+    expect(writes).toEqual(['agent-input']);
+  });
+
   test('record-start and record-stop cross the owner queue and save timed PTY output', async () => {
     let onData: ((chunk: string) => void) | undefined;
     setPtyAdapterForTesting(() => ({ pid: 7, write() {}, kill() {},

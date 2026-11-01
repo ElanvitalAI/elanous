@@ -45,7 +45,7 @@ describe('first run', () => {
     try {
       const result = await runFirstRun({
         path: f.path,
-        config: buildUserConfig(f.path),
+        config: { ...buildUserConfig(f.path), llm: { ...buildUserConfig(f.path).llm, baseUrl: 'https://old-provider.example/v1' } },
         isTTY: true,
         locale: 'ko',
         detectProviders: async () => [],
@@ -56,13 +56,76 @@ describe('first run', () => {
         probeKey: async () => ({ success: true, durationMs: 0, model: 'mock' }),
         print: (line) => output.push(line),
       });
-      expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
+      expect(result).toEqual({ outcome: 'ready', provider: 'anthropic', inputs: 1 });
       expect(stored).toEqual(new Map([['ANTHROPIC_API_KEY', secret]]));
       expect(output.join('\n')).toContain('✅ Anthropic');
-      expect(output.join('\n')).toContain('키를 저장하고 검증했지만 첫 실행에서 사용할 provider 연결은 아직 완료되지 않았습니다.');
+      expect(output.join('\n')).not.toContain('키를 저장하고 검증했지만 첫 실행에서 사용할 provider 연결은 아직 완료되지 않았습니다.');
       expect(output.join('\n')).not.toContain(secret);
+      expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
+      expect(buildUserConfig(f.path).llm.provider).toBe('anthropic');
+      expect(buildUserConfig(f.path).llm.apiKey).toBeUndefined();
+      expect(buildUserConfig(f.path).llm.baseUrl).toBeUndefined();
+
+      // A subsequent pass reads the same SecretStore value and keeps it out of config.
+      const ready = await runFirstRun({
+        path: f.path, isTTY: false, locale: 'ko', detectProviders: async () => [],
+        getSecretAsync: async (id) => stored.get(id), print: (line) => output.push(line),
+      });
+      expect(ready).toEqual({ outcome: 'ready', provider: 'anthropic', inputs: 0 });
+      expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
+      expect(buildUserConfig(f.path).llm.apiKey).toBeUndefined();
+      expect(output.join('\n')).not.toContain(secret);
+    } finally { f.cleanup(); }
+  });
+
+  test('first run stays unready when the runtime cannot read back the stored key', async () => {
+    const f = fixture();
+    const output: string[] = [];
+    try {
+      const result = await runFirstRun({
+        path: f.path,
+        config: buildUserConfig(f.path),
+        isTTY: true,
+        locale: 'ko',
+        detectProviders: async () => [],
+        chooseProvider: async () => 'anthropic',
+        promptSecret: async () => 'ANTHROPIC_API_KEY=probe-only-secret',
+        getSecretAsync: async () => undefined,
+        setSecretAsync: async () => undefined,
+        probeKey: async () => ({ success: true, durationMs: 0, model: 'mock' }),
+        print: (line) => output.push(line),
+      });
+      expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
       expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
-      expect(buildUserConfig(f.path).llm.provider).toBe('auto');
+      expect(output.join('\n')).toContain('키를 저장하고 검증했지만 첫 실행에서 사용할 provider 연결은 아직 완료되지 않았습니다.');
+      expect(output.join('\n')).not.toContain('probe-only-secret');
+    } finally { f.cleanup(); }
+  });
+
+  test('failed SecretStore readback preserves the existing config key', async () => {
+    const f = fixture();
+    const original = buildUserConfig(f.path);
+    original.llm = { ...original.llm, provider: 'auto', apiKey: 'existing-working-key' };
+    saveUserConfig(original, f.path);
+    try {
+      const result = await runFirstRun({
+        path: f.path,
+        config: original,
+        isTTY: true,
+        locale: 'ko',
+        detectProviders: async () => [],
+        chooseProvider: async () => 'anthropic',
+        promptSecret: async () => 'ANTHROPIC_API_KEY=new-secret',
+        getSecretAsync: async () => undefined,
+        setSecretAsync: async () => undefined,
+        probeKey: async () => ({ success: true, durationMs: 0, model: 'mock' }),
+        print: () => undefined,
+      });
+      expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
+      expect(buildUserConfig(f.path).llm).toMatchObject({
+        provider: 'auto', apiKey: 'existing-working-key',
+      });
+      expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }
   });
 

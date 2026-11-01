@@ -23,6 +23,7 @@ import { readBudgetInputsLive, type BudgetInputs } from '../self-implement/budge
 import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
 import { newLaunchUtteranceId, recordLaunchUtterance } from '../harness/launch-utterance-ledger.js';
 import { debug } from '../debug/log.js';
+import { priorLessonsFor } from './recall-inject.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { LAUNCH_DOOR_RECEIPT_ENV, openLaunchRequestDoor, type LaunchRequestDoor } from '../execution-loop/launch-gate.js';
 import { withFileLockSync } from '../storage/file-lock.js';
@@ -1280,6 +1281,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const { normalizeEvidenceCommandLines } = await import('./evidence-command-normalize.js');
   const normalized = normalizeEvidenceCommandLines(opts.text.trim());
   let text = normalized.text;
+  let metadataText = text;
   if (!text) throw new Error('과제 한 줄이 비어 있다');
   for (const warning of normalized.warnings) {
     console.error(`⚠ ${warning}`);
@@ -1319,6 +1321,18 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const completion = opts.completion ?? 'code-pr';
   const now = (opts.now ?? (() => new Date()))();
   const id = opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
+  if (opts.checklistId) {
+    const priorCards = withFileLockSync(`${path}.lock`, () =>
+      Object.values(readState(path).tasks ?? {}).filter((card) => card.id !== id));
+    const recall = priorLessonsFor(opts.checklistId, priorCards);
+    if (recall.block) {
+      text = `${text}\n\n${recall.block}`;
+    }
+    try {
+      debug.log('task-agent', 'recall-inject-filled', { card: id, checklistId: opts.checklistId,
+        priorCards: recall.priorCards, items: recall.items, chars: recall.chars, truncated: recall.truncated });
+    } catch { /* fail-soft observation */ }
+  }
   let project: TaskCard['project'];
   let targetIsGit: boolean | null = null;
   if (opts.project) {
@@ -1449,17 +1463,19 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   // Injected launchers are test seams and opt in explicitly at the contract test.
   if (opts.live && opts.preflightGoalDoneBoundary && !selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') {
     readTaskAgentState(path);
-    const drafted = draftMissingGoalDoneBoundary(text, targetPaths);
+    const metadataBeforeDraft = metadataText;
+    const drafted = draftMissingGoalDoneBoundary(metadataText, targetPaths);
     if (drafted.added.length > 0) {
-      text = drafted.document;
+      metadataText = drafted.document;
+      text = `${text}${drafted.document.slice(metadataBeforeDraft.length)}`;
       card = { ...card, text };
       move = graphRun && graphRunPath ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } : nextMoveFor(card, opts.landed);
       try { debug.log('task-agent.hand', 'boundary-autodrafted', { taskId: id, labels: drafted.added, targetPathCount: targetPaths.length }); } catch { /* fail-soft */ }
     }
-    const { missing } = inspectGoalDoneBoundary(text);
+    const { missing } = inspectGoalDoneBoundary(metadataText);
     if (missing.length > 0) throw new Error(`goal-revision-required: 완료 경계 누락 ${missing.join(' · ')}`);
     // ENTRANCE-EVIDENCE-COMMAND-ONLY — 존재 검사와 구분된 형태 판정: 증거 명령 줄은 명령 원문만 받는다.
-    const formViolations = goalEvidenceCommandFormViolations(text);
+    const formViolations = goalEvidenceCommandFormViolations(metadataText);
     if (formViolations.length > 0) {
       throw new Error(`goal-revision-required: 완료 경계 증거 명령은 명령 원문이어야 한다 ${formViolations.join(' · ')} — 증거 명령 줄에 설명 접미(예: → 0 fail)나 백틱 장식을 붙이지 말고 명령만 적은 뒤 다시 넘기세요`);
     }
@@ -1520,6 +1536,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
         runId,
         input: { ask: text, context: project ? { worktree: project.target } : {}, prior: {} },
         quiet: true,
+        deps: { growthScope: 'task-agent' },
       });
     } catch (error) {
       // 조합 파일·대상 node가 없으면 runGraph 가 구체 사유로 던진다 — 임의 성공 처리하지 않는다.
@@ -1705,13 +1722,15 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   writeCard(path, launched);
   // INFLIGHT-REGISTRY — 출발 때 맥락을 남긴다(머지 때 같은 파일 줄의 의도를 스마트 머지가 읽는다 · 착지하면 지운다).
   try {
-    const [head = '', ...rest] = text.split(/\r?\n/);
+    // Preserve any completion-boundary draft while keeping the recall-only suffix out of intent/path metadata.
+    const inflightText = metadataText;
+    const [head = '', ...rest] = inflightText.split(/\r?\n/);
     const intentLines = (/^\s*(?:대상\s*경로|target\s*paths?)\s*[:：]/i.test(head) ? rest : [head, ...rest])
       .filter((line) => !/^\s*(?:[-*]\s*)?완료 경계 (?:코드|실물|증거 명령)\s*:/.test(line));
     registerInflight({
       runId: boundRunId ?? runId, cell: card.checklistId ?? card.id, cardId: card.id,
-      intent: intentLines.join(' ').trim() || text,
-      files: parseAskTargetPathHints(text),
+      intent: intentLines.join(' ').trim() || inflightText,
+      files: parseAskTargetPathHints(inflightText),
     }, { path: join(dirname(path), INFLIGHT_REGISTRY_FILE), ...(opts.now ? { now: opts.now } : {}) });
   } catch (error) {
     try { debug.log('pr-tool.inflight', 'register-failed', { taskId: id, error: String((error as Error)?.message ?? error).slice(0, 200) }, { level: 'warn' }); } catch { /* fail-soft */ }

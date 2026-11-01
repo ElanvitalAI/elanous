@@ -12,6 +12,12 @@ export interface SetupKeysIO {
   print(message: string): void;
 }
 
+export type SetupKeyProvider = Extract<(typeof SERVICE_KEY_CATALOG)[number], { kind: 'api-key' }>['id'];
+export type SetupKeyValidationResult =
+  | { success: true; verification: 'verified' | 'unsupported' }
+  | { success: false; reason: 'invalid' | 'rate-limited' | 'unavailable'; httpStatus?: number };
+export type SetupKeyVerifier = (input: { provider: SetupKeyProvider; apiKey: string }) => Promise<SetupKeyValidationResult>;
+
 export interface SetupKeysOptions {
   config: UserConfig;
   env?: NodeJS.ProcessEnv;
@@ -19,6 +25,8 @@ export interface SetupKeysOptions {
   includeOptional?: boolean;
   /** Existing OAuth fetch injection used by deterministic login simulation. */
   loginWithCodex?: typeof loginWithCodex;
+  /** Verification seam for deterministic setup simulations; the production default remains verifyServiceKey. */
+  verifier?: SetupKeyVerifier;
 }
 
 function providerForService(id: string): string | undefined {
@@ -80,20 +88,24 @@ export async function importServiceKeys(values: ParsedServiceKeyEnv, io: Pick<Se
     const item = SERVICE_KEY_CATALOG.find(candidate => candidate.kind === 'api-key' && candidate.envNames.includes(name));
     if (!item) { rejected.push(name); continue; }
     if (env[name]?.trim() === value) io.print(`${name}: 환경에서 이미 제공됨 · 캐시에도 저장합니다 · 값 출력 0`);
-    const verification = await verifyServiceKey(item.id, value, {
-      env,
-      cacheDir: options.cacheDir,
-      baseUrl: providerBaseUrl(options.config, item.id),
-    });
-    if (verification.result === 'verified') accepted.set(name, value);
-    else if (verification.result === 'unsupported') {
+    const verification = options.verifier
+      ? await options.verifier({ provider: item.id as SetupKeyProvider, apiKey: value })
+      : await verifyServiceKey(item.id, value, {
+        env,
+        cacheDir: options.cacheDir,
+        baseUrl: providerBaseUrl(options.config, item.id),
+      }).then(({ result, httpStatus }): SetupKeyValidationResult => result === 'verified' || result === 'unsupported'
+        ? { success: true, verification: result }
+        : { success: false, reason: result, ...(httpStatus === undefined ? {} : { httpStatus }) });
+    if (verification.success && verification.verification === 'verified') accepted.set(name, value);
+    else if (verification.success && verification.verification === 'unsupported') {
       accepted.set(name, value);
       unverified.push(name);
       io.print(`${item.label}: 최소 확인을 지원하지 않아 검증 없이 저장합니다 · 값 출력 0`);
     }
     else {
       rejected.push(name);
-      io.print(`${item.label}: 검증 ${verification.result}${verification.httpStatus ? ` (HTTP ${verification.httpStatus})` : ''} · 저장 안 함`);
+      io.print(`${item.label}: 검증 ${verification.reason}${verification.httpStatus ? ` (HTTP ${verification.httpStatus})` : ''} · 저장 안 함`);
     }
   }
   const saved = accepted.size ? storeServiceKeys(accepted, { env, cacheDir: options.cacheDir }) : { stored: [] };

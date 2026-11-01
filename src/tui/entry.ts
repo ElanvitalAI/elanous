@@ -611,10 +611,21 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             firstResponseSeen = true;
             dashboardRuntime.endTurnStartSegments(turnSessionId, 'stream-open');
           }
-          // The first model token is visible before the final JSONL frame. Keep only
-          // a bounded tail until session history becomes the canonical display.
-          streamingReply = replace ? delta.slice(-32_768) : (streamingReply + delta).slice(-32_768);
-          activity = streamReplyLines(streamingReply, process.stdout.columns || 80);
+          // The first model token is visible while the turn runs. Once the core
+          // replaces that provisional answer, let the persisted final message
+          // become canonical instead of showing the same answer in both layers.
+          if (replace) {
+            streamingReply = '';
+            activity = [];
+            if (streamRenderTimer !== null) clearTimeout(streamRenderTimer);
+            streamRenderTimer = null;
+            streamRenderAt = performance.now();
+            render();
+            return;
+          } else {
+            streamingReply = (streamingReply + delta).slice(-32_768);
+            activity = streamReplyLines(streamingReply, process.stdout.columns || 80);
+          }
           const now = performance.now();
           if (streamRenderAt === 0 || now - streamRenderAt >= 33) {
             streamRenderAt = now;
@@ -657,7 +668,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         activity = [];
         streamingReply = '';
         busy = false;
-        reportTuiTurn('idle');
         turnAbort = null;
         scroll = 0;
         settle();
@@ -680,8 +690,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         const switchAfterTurn = pendingSidetabSwitch;
         pendingSidetabSwitch = null;
-        if (switchAfterTurn) await switchSidetabSession(switchAfterTurn);
-        render();
+        try {
+          if (switchAfterTurn) await switchSidetabSession(switchAfterTurn);
+        } finally {
+          try {
+            render();
+          } finally {
+            // Publish idle only after the canonical history has replaced the stream preview
+            // on screen. External PTY observers use this edge as their capture boundary.
+            reportTuiTurn('idle');
+          }
+        }
       });
   };
 
@@ -754,6 +773,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         detach: () => { if (sidetabAttachments?.hasRemoteView()) sidetabAttachments.showMain(); else if (sidetabAttachments?.hasModal()) { sidetabAttachments.handleKey({ name: '\\', ctrl: true, shift: false, raw: '' }); sidetabAttachments.handleKey({ name: 'd', ctrl: false, shift: false, raw: 'd' }); } render(); return { ok: true, action: 'detach' }; },
         spawn: async (character) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.spawn(character); refreshSidetabRows(); render(); return { ok, action: 'new', character }; },
         runMission: async (agent, mission) => { await ensureSidetabAttachments(); const result = await sidetabAttachments!.runMission(agent, mission); refreshSidetabRows(); render(); return result; },
+        runMissionPair: async (agent, mission, parallelMission) => { await ensureSidetabAttachments(); const result = await sidetabAttachments!.runMissionPair(agent, mission, parallelMission); refreshSidetabRows(); render(); return result; },
         kill: async (row) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.kill(row); refreshSidetabRows(); render(); return { ok, action: 'kill', target: row.id }; },
       }));
       const gate = wakeup.gate;

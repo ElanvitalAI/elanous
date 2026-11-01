@@ -100,6 +100,29 @@ describe('createMcpProxyRuntime', () => {
     expect(rt.surfaces).toEqual(['mcp', 'tui']);
   });
 
+  test('sends run correlation metadata only to the Aside MCP server', async () => {
+    const received: Array<{ serverId: string; runId?: string }> = [];
+    for (const serverId of ['aside', 'elanous', 'third-party']) {
+      const rt = createMcpProxyRuntime({
+        serverId,
+        mcpTool: { name: 'exec' },
+        client: {
+          callTool: async (_name: string, _args: Record<string, unknown>, meta?: { elanousRunId?: string }) => {
+            received.push({ serverId, runId: meta?.elanousRunId });
+            return { content: [] };
+          },
+        },
+        authorizer: alwaysAuthorized,
+      });
+      await rt.run({}, { surface: 'mcp', runId: 'run-aside-context' });
+    }
+    expect(received).toEqual([
+      { serverId: 'aside', runId: 'run-aside-context' },
+      { serverId: 'elanous', runId: undefined },
+      { serverId: 'third-party', runId: undefined },
+    ]);
+  });
+
   test('is discoverable from both tui and mcp surfaces without changing native tui tools', () => {
     const proxy = createMcpProxyRuntime({
       serverId: 'remote',

@@ -22,7 +22,7 @@ import { isVerifiedOpenGatewayModel } from '../../llm/opengateway-models.js';
 import { configuredOpenGatewayKeys } from '../../llm/provider-credentials.js';
 import { collectPodLedgers, createPodLedgerFollower } from './pod-ledger-collect.js';
 import { captureFailedPodJobs } from './pod-ledger-events.js';
-import { collectPodArtifacts, podNoResultDiagnostic, POD_SALVAGE_BUNDLE_FILE_LIMIT, POD_SALVAGE_BUNDLE_TOTAL_LIMIT } from './pod-artifact-return.js';
+import { collectPodArtifacts, podNoResultChildError, podNoResultDiagnostic, POD_SALVAGE_BUNDLE_FILE_LIMIT, POD_SALVAGE_BUNDLE_TOTAL_LIMIT } from './pod-artifact-return.js';
 import { readPodRepairArtifact } from './pod-repair-commit.js';
 import { isValidAccountName, resolveCodexAccount } from '../../oauth/codex-account.js';
 import { createCodexAccessMirror } from '../../oauth/codex-access-mirror.js';
@@ -32,6 +32,7 @@ import { finishPodFragment, writePodFragment } from '../../harness/self-send-tar
 import { mintRunId, normalizeRunId } from '../../harness/harness-space.js';
 import { TA_LAND_ENV } from '../../task-agent/task-hand.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath, type RunLedgerEntry } from '../../self-implement/run-ledger.js';
+import { childFirstLlmFact, childFirstLlmReportFact } from '../../llm/child-first-llm-observation.js';
 import { recordRunStop } from '../../self-implement/run-stop.js';
 import { gateFailureReceipt, gateFailureReceiptLines } from '../../self-implement/gate-failure-signature.js';
 import { runSuffixKey } from '../../self-implement/salvage-branches.js';
@@ -148,6 +149,19 @@ import { findGitDir } from '../../git-fs/locate.js';
 import { hostLeaseBaseDir } from '../../pod-lease/host-lease.js';
 import { acquireLockAsync } from '../../storage/file-lock.js';
 import { debug, redactSecretText } from '../../debug/log.js';
+
+function readPodChildFirstLlmFact(runId: string, ledgerDir: string, report = false) {
+  try {
+    const entries = loadRunLedger(runId, ledgerDir) ?? [];
+    return report ? childFirstLlmReportFact(entries) : childFirstLlmFact(entries);
+  } catch (error) {
+    debug.log('self-implement.pod', 'child-first-llm-ledger-unavailable', {
+      childRunId: runId,
+      reason: error instanceof Error ? error.message : String(error),
+    }, { level: 'warn' });
+    return undefined;
+  }
+}
 import { enterJourneyNode, exitJourneyNode, passJourneyNode } from '../../self-dev/graph-journey-nodes.js';
 import { routeJourneyEdge } from '../../self-dev/graph-journey-route.js';
 import { selectLiveDetail } from '../../live/detail-switch.js';
@@ -1003,9 +1017,11 @@ function podCodexAccountScript(accounts: readonly string[]): string {
   return [
     'mkdir -p "$HOME/.elanous" "$HOME/.codex"',
     // Names travel as JSON data, never as shell syntax. Reconstruct the account-store keys that elanous resolves at runtime.
-    `POD_CODEX_ACCOUNTS='${JSON.stringify(accounts)}' bun -e 'const fs=require("node:fs"),path=require("node:path");const names=JSON.parse(process.env.POD_CODEX_ACCOUNTS),home=process.env.HOME;const providers={};let version;for(let i=0;i<names.length;i++){const payload=JSON.parse(fs.readFileSync("/creds/codex-"+i+".json","utf8"));const row=JSON.parse(payload.elanousAuth);if(i===0)version=row.version;const entry=row.providers["openai-codex"];if(!entry)throw Error("missing codex account credential "+i);const codexHome=path.join(home,".elanous/codex-accounts",String(i));fs.mkdirSync(codexHome,{recursive:true});fs.writeFileSync(path.join(codexHome,"auth.json"),payload.codexAuth,{mode:0o600});fs.chmodSync(path.join(codexHome,"auth.json"),0o600);providers[names[i]==="default"?"openai-codex":"openai-codex:"+names[i]]={...entry,codexHome}}if(!providers["openai-codex"])providers["openai-codex"]=providers["openai-codex:"+names[0]];fs.writeFileSync(path.join(home,".elanous/auth.json"),JSON.stringify({version,providers}),{mode:0o600});fs.chmodSync(path.join(home,".elanous/auth.json"),0o600);fs.copyFileSync(path.join(home,".elanous/codex-accounts/0/auth.json"),path.join(home,".codex/auth.json"));fs.chmodSync(path.join(home,".codex/auth.json"),0o600)' || exit 5`,
+    `POD_CODEX_ACCOUNTS='${JSON.stringify(accounts)}' bun -e 'const fs=require("node:fs"),path=require("node:path");const names=JSON.parse(process.env.POD_CODEX_ACCOUNTS),home=process.env.HOME;const providers={},mirrorProviders={};let version;for(let i=0;i<names.length;i++){const payload=JSON.parse(fs.readFileSync("/creds/codex-"+i+".json","utf8"));const row=JSON.parse(payload.elanousAuth);if(i===0)version=row.version;const entry=row.providers["openai-codex"];if(!entry||!entry.tokens||typeof entry.tokens.accessToken!=="string"||!entry.tokens.accessToken||typeof entry.tokens.expiresAt!=="number"||!Number.isFinite(entry.tokens.expiresAt))throw Error("missing Codex access snapshot "+i);const accountKey=names[i]==="default"?"openai-codex":"openai-codex:"+names[i];const codexHome=path.join(home,".elanous/codex-accounts",String(i));fs.mkdirSync(codexHome,{recursive:true});fs.writeFileSync(path.join(codexHome,"auth.json"),payload.codexAuth,{mode:0o600});fs.chmodSync(path.join(codexHome,"auth.json"),0o600);providers[accountKey]={...entry,codexHome};mirrorProviders[accountKey]={authMode:"chatgpt",tokens:{accessToken:entry.tokens.accessToken,expiresAt:entry.tokens.expiresAt,refreshToken:"",refresh_token:""}}}if(!providers["openai-codex"])providers["openai-codex"]=providers["openai-codex:"+names[0]];if(!mirrorProviders["openai-codex"])mirrorProviders["openai-codex"]=mirrorProviders["openai-codex:"+names[0]];fs.writeFileSync(path.join(home,".elanous/auth.json"),JSON.stringify({version,providers}),{mode:0o600});fs.chmodSync(path.join(home,".elanous/auth.json"),0o600);const mirrorDir=path.join(home,".elanous/remote-parent-credentials/cli-mirror");fs.mkdirSync(mirrorDir,{recursive:true,mode:0o700});fs.chmodSync(mirrorDir,0o700);const mirrorPath=path.join(mirrorDir,"auth.json");fs.writeFileSync(mirrorPath,JSON.stringify({version,providers:mirrorProviders}),{mode:0o600});fs.chmodSync(mirrorPath,0o600);fs.copyFileSync(path.join(home,".elanous/codex-accounts/0/auth.json"),path.join(home,".codex/auth.json"));fs.chmodSync(path.join(home,".codex/auth.json"),0o600)' || exit 5`,
     `export ELANOUS_CODEX_ACCOUNT='${accounts[0]!.replace(/'/g, `'\\''`)}'`,
     'export ELANOUS_CODEX_ACCOUNT_HOME="$HOME/.elanous/codex-accounts/0" CODEX_HOME="$HOME/.elanous/codex-accounts/0"',
+    'export ELANOUS_REMOTE_CODEX_ACCESS_ONLY=1',
+    'export ELANOUS_REMOTE_CODEX_MIRROR_PATH="$HOME/.elanous/remote-parent-credentials/cli-mirror/auth.json"',
     podQuotaPolicyExport(),
   ].join('\n');
 }
@@ -1504,7 +1520,9 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
               // ⭐ 런 계약(graph-run-contract.ts) — 이 칸이 «실제로» Pod 이고, 부모가 정한 계약도 Pod 다. 안의 그래프가 노드마다 대조한다.
               { name: ACTUAL_SUBSTRATE_ENV, value: 'pod' }, { name: RUN_CONTRACT_ENV, value: carryRunContract({ substrate: 'pod' }) },
               ...Object.entries(o.armEnv ?? {}).map(([name, value]) => ({ name, value })),
-              ...o.passEnv.map((key) => ({ name: key, valueFrom: { secretKeyRef: { name: `${o.name}-creds`, key: `env-${key}` } } })),
+              // Growth admission is host-validated control state, never a caller-provided Secret env.
+              ...o.passEnv.filter((key) => key !== 'ELANOUS_GRAPH_GROWTH_SCOPE')
+                .map((key) => ({ name: key, valueFrom: { secretKeyRef: { name: `${o.name}-creds`, key: `env-${key}` } } })),
               ...(o.bedrock ? bedrockPodEnv(o.bedrock) : []),
               ...(o.zai || o.zaiFallback ? zaiPodEnv(o.zai ?? o.zaiFallback!) : []),
             ],
@@ -2631,7 +2649,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
         }
         // Grok 자격은 전용 Secret 키 하나로만 보낸다 — passEnv 의 API 키 중복 전달은 막는다.
-        const passKeys = [...new Set([...(options.passEnv ?? []), ...(openrouterCredentialNeeded && openrouterKey ? ['OPENROUTER_API_KEY'] : []), ...(openGateway ? ['OPENGATEWAY_API_KEY'] : []), ...(anthropic ? ['ANTHROPIC_API_KEY'] : [])])].filter((key) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL'
+        const passKeys = [...new Set([...(options.passEnv ?? []), ...(openrouterCredentialNeeded && openrouterKey ? ['OPENROUTER_API_KEY'] : []), ...(openGateway ? ['OPENGATEWAY_API_KEY'] : []), ...(anthropic ? ['ANTHROPIC_API_KEY'] : [])])].filter((key) => key !== 'ELANOUS_GRAPH_GROWTH_SCOPE' && key !== 'ELANOUS_LIVE_DETAIL_UNTIL'
           && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV
           && (!grok || !['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'].includes(key)));
         const skillEnvs: Record<string, string> = options.skillEnv
@@ -2811,7 +2829,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const hostKey = (k: string): string | undefined => k === 'OPENROUTER_API_KEY' && openrouterCredentialNeeded ? openrouterKey : k === 'OPENGATEWAY_API_KEY' && openGateway ? openGatewayKey : k === 'ANTHROPIC_API_KEY' && anthropic ? anthropicKey : env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k);
         const hostFallbackNames = hostConfig.llm.fallbackChain;
         const zaiOverage = zaiLaunchOverage ?? zaiSettingsFromConfig(hostConfig.llm).overage;
-        const normalizedFallback = normalizeFallbackChain(hostFallbackNames);
+        const normalizedFallback = normalizeFallbackChain(hostFallbackNames, hostConfig.llm.provider);
         let fallbackSteps = normalizedFallback.chain;
         let zaiFallbackSpec: ZaiPodSpec | undefined;
         const codexChild = options.provider === undefined || options.provider === 'openai-codex';
@@ -2996,10 +3014,11 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           ...(credentialRelay ? [POD_CREDENTIAL_TOKEN_ENV] : []),
           ...(githubRelay ? [POD_GITHUB_CREDENTIAL_TOKEN_ENV] : []),
         ];
+        const podGrowthScope = env.ELANOUS_GRAPH_GROWTH_SCOPE === 'harness' ? 'harness' : undefined;
         const detail = selectLiveDetail(options.liveDetailFile ? { path: options.liveDetailFile } : {}).state;
         const detailUntil = detail && (detail.scope === 'all' || detail.scope === parentRunId || detail.scope === launchRunId) && detail.until > Date.now()
           ? String(detail.until) : undefined;
-        const armEnv = Object.fromEntries(Object.entries(options.armEnv ?? {}).filter(([key]) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL' && !key.startsWith('ELANOUS_PROMPT_ENHANCE_') && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV && (!hostRefresh || !['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'].includes(key))));
+        const armEnv = Object.fromEntries(Object.entries(options.armEnv ?? {}).filter(([key]) => key !== 'ELANOUS_GRAPH_GROWTH_SCOPE' && key !== 'ELANOUS_LIVE_DETAIL_UNTIL' && !key.startsWith('ELANOUS_PROMPT_ENHANCE_') && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV && (!hostRefresh || !['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'].includes(key))));
         const seat = env.ELANOUS_HARNESS_SEAT;
         const authorEnv = authorChoice ? {
           ...(authorChoice.modelSource !== 'default' || inferProviderFromModel(authorChoice.model) === 'openai-codex' ? {
@@ -3018,9 +3037,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const reviewDeferredToHost = input.autoMerge === true
           && resolvePodHostAcpReview(options.hostAcpReview, env, options.kubectl ? () => undefined : getUserConfig).enabled;
         if (reviewDeferredToHost) debug.log('self-implement.pod', 'review-deferred-armed', { job: name, env: REVIEW_DEFERRED_TO_HOST_ENV, ...(reviewerPin ? { reviewerPinUnused: reviewerPin } : {}) });
-        const jobArmEnv = grounding || credentialRelay || githubRelay || env.ELANOUS_DISPATCH_RECORDED === '1' || options.armEnv || detailUntil || seat || env.ELANOUS_POD_AUTHOR_ON_POD === '1' || reviewerPin || reviewDeferredToHost || budgetSnapshot
+        const jobArmEnv = grounding || credentialRelay || githubRelay || podGrowthScope || env.ELANOUS_DISPATCH_RECORDED === '1' || options.armEnv || detailUntil || seat || env.ELANOUS_POD_AUTHOR_ON_POD === '1' || reviewerPin || reviewDeferredToHost || budgetSnapshot
           ? {
               ...armEnv,
+              ...(podGrowthScope ? { ELANOUS_GRAPH_GROWTH_SCOPE: podGrowthScope } : {}),
               ...(budgetSnapshot ? { [BUDGET_SNAPSHOT_ENV]: encodeBudgetSnapshot(budgetSnapshot) } : {}),
               ...authorEnv,
               ...(reviewerPin ? { [roleLlmEnvName('review')]: reviewerPin } : {}),
@@ -3667,7 +3687,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           }
         }
-        const childFailure = state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
+        let childFailure = state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
           ? lastPodChildFailure(logs) : null;
         let childPrFailure: ReturnType<typeof podPrOpenFailure> = null;
         if (childFailure) {
@@ -3692,6 +3712,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           };
         }
         let noResultDiagnostic: string | null = null;
+        let noResultLedgerText: string | null = null;
         let noResultLedgerObservation: { available: boolean; bytes: number; rows: number; lastEvent: string | null } = {
           available: false, bytes: 0, rows: 0, lastEvent: null,
         };
@@ -3701,6 +3722,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (noResultCandidate) {
           try {
             const ledgerText = readFileSync(runLedgerPath(liveChildRunId, ledgerDir), 'utf8');
+            noResultLedgerText = ledgerText;
             const ledgerRows = ledgerText.split('\n').filter(Boolean);
             let lastEvent: string | null = null;
             try {
@@ -3712,6 +3734,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           catch { /* ledger not returned: do not invent a stage */ }
           noResultDiagnostic ??= 'child terminal result missing; last ledger stage=unknown; round=unknown; mustFix=unknown';
+        }
+        if (!childFailure && state === 'failed' && noResultCandidate && noResultLedgerText) {
+          const childError = podNoResultChildError(noResultLedgerText);
+          if (childError) childFailure = { stage: 'pr-open-failed', error: childError, rawError: childError };
         }
         // POD-FAIL-EVIDENCE-CAPTURE: failed Pods are collected/deleted immediately after terminal handling.
         //   Preserve a bounded log tail for every non-OOM/non-deadline failure, including known child stages:
@@ -3792,6 +3818,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const noResultIncident = state === 'failed' && failedReason !== 'DeadlineExceeded' && !disposition;
         if (reportDeficit || noResultIncident) {
           const evidence = disposition?.childEvidence;
+          const firstLlm = readPodChildFirstLlmFact(liveChildRunId, ledgerDir, true);
           const diagnosticLines = [
             ...(Array.isArray(evidence?.podLogTail) ? evidence.podLogTail : []),
             ...(typeof evidence?.detail === 'string' ? evidence.detail.split('\n') : []),
@@ -3812,6 +3839,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             reason: failedReason || containerReason || 'unknown',
             terminationReason: evidence?.terminationReason ?? null,
             providerErrors: disposition?.providerErrors ?? null,
+            firstLlm: firstLlm ?? null,
             oomKilled, podTermination: podTermination ?? null,
             detailTail: evidence?.detailTail ?? null,
             lastLines: diagnosticLines,
@@ -3926,6 +3954,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const childProviderFailure = podChildProviderFailureFact(logs, {
           providerHint: options.provider ?? podChildProviderOf(podDelegatedChildLlm(jobArgs)?.provider),
         });
+        const childFirstLlm = readPodChildFirstLlmFact(liveChildRunId, ledgerDir);
         const childEvidenceRow = podChildEvidenceLedgerRow({
           job: name,
           childRunId: liveChildRunId,
@@ -3935,6 +3964,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           noResultLogEvidence,
           podTermination,
           providerFailure: childProviderFailure,
+          firstLlm: childFirstLlm,
         });
         if (childEvidenceRow) {
           // Every terminal attempt writes a marker, including one with no parseable child facts.

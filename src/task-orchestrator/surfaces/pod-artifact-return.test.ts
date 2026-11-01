@@ -7,7 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { LogStore } from '../../mss/logging/log-store.js';
 import { debug } from '../../debug/log.js';
-import { collectPodArtifacts, importPodLogs, parsePodArtifactChunks } from './pod-artifact-return.js';
+import { collectPodArtifacts, importPodLogs, parsePodArtifactChunks, podNoResultChildError } from './pod-artifact-return.js';
 
 function transfer(path: string, bytes: Buffer): string[] {
   const token = Buffer.from(path).toString('base64url');
@@ -17,6 +17,18 @@ function transfer(path: string, bytes: Buffer): string[] {
 }
 
 describe('pod artifact return', () => {
+  test('no-result child error is flattened, redacted, and bounded', () => {
+    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const ledger = `${JSON.stringify({ event: 'pr-open-failed', data: { error: `hunk-overlap: rejected ${secret}\nretry after resolving overlap` } })}\n`;
+    const error = podNoResultChildError(ledger)!;
+    expect(error).toContain('hunk-overlap: rejected ghp_*** retry after resolving overlap');
+    expect(error).not.toContain(secret);
+    expect(error).not.toContain('\n');
+    expect(error.length).toBeLessThanOrEqual(240);
+    expect(podNoResultChildError('not-json\n')).toBeNull();
+    expect(podNoResultChildError(`${ledger}${JSON.stringify({ event: 'pr-opened', data: {} })}\n`)).toBeNull();
+  });
+
   test('restores pod logs under the job and reports line count', () => {
     const dir = mkdtempSync(join(tmpdir(), 'pod-artifacts-'));
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];

@@ -260,6 +260,24 @@ test('a stalled Exa is aborted early enough for Firecrawl within the shared rese
   expect(result.metadata.perEngine.firecrawl?.hits).toBe(1);
 });
 
+test('research dispatch propagates caller cancellation into provider requests', async () => {
+  _resetWebSearchProvidersForTests(false);
+  const controller = new AbortController();
+  let providerSignal: AbortSignal | undefined;
+  addWebSearchProvider(provider('exa', async (_query, signal) => {
+    providerSignal = signal;
+    return new Promise<never>((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  }));
+  const pending = dispatchResearchOmniSearch({ query: 'cancel this search', engines: ['exa'] }, { signal: controller.signal });
+  await Promise.resolve();
+  controller.abort(new Error('parent research cancelled'));
+  const result = await pending;
+
+  expect(providerSignal).toBeInstanceOf(AbortSignal);
+  expect(providerSignal?.aborted).toBe(true);
+  expect(result.metadata.perEngine.exa?.error).toContain('parent research cancelled');
+});
+
 test('research stops at Exa hits before invoking the Firecrawl fallback', async () => {
   _resetWebSearchProvidersForTests(false);
   const hits = (id: string) => [1, 2].map(n => ({ url: `https://${id}.example/${n}`, title: `${id}-${n}`, snippet: '' }));

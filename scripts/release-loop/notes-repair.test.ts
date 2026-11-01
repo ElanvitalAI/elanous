@@ -1,9 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { atomicallyRepairFiles, repairKoreanMarkdown, runNotesRepair } from './notes-repair.js';
+import { atomicallyRepairFiles, glmTranslator, notesRepairLlmConfig, repairKoreanMarkdown, runNotesRepair } from './notes-repair.js';
+import { _resetKeyCacheForTests } from '../../src/config.js';
+import { getUserConfig, setUserConfigOverlay } from '../../src/user-config.js';
 
 function ownedDocsFixture() {
   const root = mkdtempSync(join(tmpdir(), 'release-notes-owned-'));
@@ -42,6 +44,63 @@ function ownedDocsFixture() {
 }
 
 describe('release notes Korean repair', () => {
+  test('GLM repair uses the OpenRouter environment key instead of another provider key', async () => {
+    const config = getUserConfig();
+    const originalRouterKey = process.env.OPENROUTER_API_KEY;
+    const originalCacheDir = process.env.ELANOUS_KEY_CACHE_DIR;
+    const cacheDir = mkdtempSync(join(tmpdir(), 'release-notes-openrouter-key-'));
+    const envKey = 'openrouter-env-secret-sentinel';
+    const foreignKey = 'foreign-provider-secret-sentinel';
+    const foreignBaseUrl = 'https://foreign-provider.invalid/v1';
+    const sent: Array<{ authorization: string | null; url: string; headers: string; body: string }> = [];
+    process.env.OPENROUTER_API_KEY = envKey;
+    process.env.ELANOUS_KEY_CACHE_DIR = cacheDir;
+    _resetKeyCacheForTests();
+    setUserConfigOverlay((current) => ({ ...current, llm: { ...current.llm, provider: 'anthropic', apiKey: foreignKey, baseUrl: foreignBaseUrl } }));
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input, init) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      sent.push({ authorization: headers.get('authorization'), url, headers: JSON.stringify([...headers.entries()]), body: String(init?.body ?? '') });
+      return new Response('unauthorized', { status: 401 });
+    }) as typeof fetch);
+    try {
+      const selected = notesRepairLlmConfig({ ...config, llm: { ...config.llm, provider: 'anthropic', apiKey: foreignKey, baseUrl: foreignBaseUrl } }, 'openrouter/z-ai/glm-5.3');
+      expect('apiKey' in selected.llm).toBe(false);
+      expect('baseUrl' in selected.llm).toBe(false);
+      await expect(glmTranslator('Korean line', 'openrouter/z-ai/glm-5.3')).rejects.toThrow();
+      expect(sent.length).toBeGreaterThan(0);
+      expect(sent.every((request) => request.authorization === `Bearer ${envKey}`)).toBe(true);
+      expect(sent.every((request) => request.url.startsWith('https://openrouter.ai/api/v1/chat/completions'))).toBe(true);
+      expect(sent.every((request) => !request.url.includes('?'))).toBe(true);
+      const foreignRequests = JSON.stringify(sent);
+      expect(foreignRequests).not.toContain(foreignKey);
+      expect(foreignRequests).not.toContain(foreignBaseUrl);
+
+      const configuredKey = 'openrouter-config-secret-sentinel';
+      const configuredBaseUrl = 'https://openrouter-config.invalid/v1';
+      sent.length = 0;
+      _resetKeyCacheForTests();
+      setUserConfigOverlay((current) => ({ ...current, llm: { ...current.llm, provider: 'openrouter', apiKey: configuredKey, baseUrl: configuredBaseUrl } }));
+      const configured = notesRepairLlmConfig({ ...config, llm: { ...config.llm, provider: 'openrouter', apiKey: configuredKey, baseUrl: configuredBaseUrl } }, 'openrouter/z-ai/glm-5.3');
+      expect(configured.llm.apiKey).toBe(configuredKey);
+      expect(configured.llm.baseUrl).toBe(configuredBaseUrl);
+      await expect(glmTranslator('Korean line', 'openrouter/z-ai/glm-5.3')).rejects.toThrow();
+      expect(sent.length).toBeGreaterThan(0);
+      expect(sent.every((request) => request.authorization === `Bearer ${configuredKey}`)).toBe(true);
+      expect(sent.every((request) => request.url.startsWith(`${configuredBaseUrl}/chat/completions`))).toBe(true);
+      expect(JSON.stringify(sent)).not.toContain(envKey);
+    } finally {
+      fetchSpy.mockRestore();
+      setUserConfigOverlay(null);
+      _resetKeyCacheForTests();
+      if (originalRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = originalRouterKey;
+      if (originalCacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR;
+      else process.env.ELANOUS_KEY_CACHE_DIR = originalCacheDir;
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+
   test('0.2.36 B1 failure reaches the repair node and fails closed without calling a model', async () => {
     const root = mkdtempSync(join(tmpdir(), 'release-notes-b1-'));
     const notes = join(root, '0.2.36.md');

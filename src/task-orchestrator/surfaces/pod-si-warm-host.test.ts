@@ -30,6 +30,11 @@ test('unsupported source, repair and predecessor stay on the fresh Job path', ()
   expect(siWarmEligible({ ...draft, after: 123 }, {})).toBe(false);
   expect(siWarmEligible(draft, { repairCommitOnly: { pr: 1, baseHead: 'a'.repeat(40) } })).toBe(false);
   expect(siWarmEligible(draft, { provider: 'openrouter' })).toBe(false);
+  expect(siWarmEligible(draft, {}, 'openrouter')).toBe(false);
+  expect(siWarmEligible(draft, {}, 'glm')).toBe(false);
+  expect(siWarmEligible(draft, { provider: 'auto' as never }, 'openrouter')).toBe(false);
+  expect(siWarmEligible(draft, { provider: 'openai-codex' }, 'openrouter')).toBe(true);
+  expect(siWarmEligible(draft, {}, 'auto')).toBe(true);
   expect(siWarmEligible(input, {})).toBe(false);
   expect(siWarmEligible(draft, {})).toBe(true);
   expect(siWarmEligible(draft, { accountBroker: () => 'team', rotationAccounts: ['team', 'backup'] })).toBe(true);
@@ -39,21 +44,27 @@ test('unsupported source, repair and predecessor stay on the fresh Job path', ()
 });
 
 test('warm credential bundle carries normalized fallback config and drops unavailable Grok', () => {
-  const withoutGrok = siWarmFallbackFiles(['codex-rotate', 'grok'], null);
+  const withoutGrok = siWarmFallbackFiles(['codex-rotate', 'grok'], null, undefined);
   expect(JSON.parse(withoutGrok['llm-fallback-config.json']!)).toEqual({
     llm: { fallbackChain: ['codex-rotate'] },
   });
   expect(withoutGrok['grok-auth.json']).toBeUndefined();
   const withGrok = siWarmFallbackFiles(['codex-rotate', 'grok', 'grok'],
-    { grokAuth: '{"grok.com":{"key":"fixture"}}' });
+    { grokAuth: '{"grok.com":{"key":"fixture"}}' }, undefined);
   expect(JSON.parse(withGrok['llm-fallback-config.json']!)).toEqual({
     llm: { fallbackChain: ['codex-rotate', 'grok'] },
   });
   expect(withGrok['grok-auth.json']).toContain('fixture');
-  expect(JSON.parse(siWarmFallbackFiles(['codex-rotate', 'zai', 'claude-pty', 'openrouter', 'codex-credits'], null)
+  expect(JSON.parse(siWarmFallbackFiles(['codex-rotate', 'zai', 'claude-pty', 'openrouter', 'codex-credits'], null, undefined)
     ['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate'] } });
-  expect(() => siWarmFallbackFiles(['zai'], null)).toThrow('no carryable warm fallback provider');
-  expect(() => siWarmFallbackFiles(['grok'], null)).toThrow('no carryable warm fallback provider');
+  expect(() => siWarmFallbackFiles(['zai'], null, undefined)).toThrow('no carryable warm fallback provider');
+  expect(() => siWarmFallbackFiles(['grok'], null, undefined)).toThrow('no carryable warm fallback provider');
+  // An explicitly selected single-provider default must not silently become
+  // Codex/Grok just because the warm worker cannot carry OpenRouter credentials.
+  expect(() => siWarmFallbackFiles(undefined, null, 'openrouter')).toThrow('no carryable warm fallback provider');
+  expect(() => siWarmFallbackFiles(undefined, null, 'glm')).toThrow('no carryable warm fallback provider');
+  const autoFallback = siWarmFallbackFiles(undefined, { grokAuth: 'fixture-grok-auth' }, 'auto');
+  expect(JSON.parse(autoFallback['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'grok'] } });
 });
 
 test('a repeated feature receives a distinct artifact execution key for each run', () => {

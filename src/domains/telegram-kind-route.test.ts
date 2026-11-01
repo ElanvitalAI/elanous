@@ -10,7 +10,7 @@ import { deleteSecret, setSecret } from '../nexus/config/secrets/index.js';
 import { debug } from '../debug/log.js';
 import { resolveReportTarget, sendReportPhoto, sendReportPhotoBuffer, sendTelegramReport } from '../telegram-report.js';
 import { flushDeferred, sendTelegramDirect, setInProcessOutbound } from './outbound-alert.js';
-import { DEFAULT_KIND_ROLES, explainReportRoute, roleForKind } from './telegram-kind-route.js';
+import { DEFAULT_KIND_ROLES, explainReportRoute, kindRouteTarget, roleForKind } from './telegram-kind-route.js';
 import { routeOutbound } from '../nexus/outbound/router.js';
 
 const main = 'MAIN:token-not-real';
@@ -65,6 +65,25 @@ test('explicit system channel wins for operational and mission kinds without fal
   expect(DEFAULT_KIND_ROLES.regression).toBe('system');
   expect(DEFAULT_KIND_ROLES['agent-mission']).toBe('system');
   expect(log.mock.calls.filter(([category]) => category === 'telegram.kind-route')).toHaveLength(0);
+});
+
+test('op-report cannot follow a report-role override into conatus and stays on main/system', () => {
+  const cfg = config();
+  cfg.telegram.channels = [
+    { name: 'main', botToken: main, chatId: 101, interactive: true, roles: ['qa', 'default', 'system', 'mission', 'tuning'] },
+    { name: 'conatus', botToken: trading, chatId: 202, interactive: true, roles: ['investment', 'finance', 'trade', 'signal', 'report'] },
+  ];
+  cfg.telegram.kindRoles = { 'op-report': 'report' };
+  const sent: Array<{ token: string; chatId: string | number }> = [];
+  expect(roleForKind(cfg, 'op-report')).toBe('system');
+  expect(kindRouteTarget(cfg, 'op-report')).toEqual({ botToken: main, chatId: 101 });
+  expect(explainReportRoute(cfg, 'op-report')).toMatchObject({ reason: 'routed', role: 'system' });
+  expect(sendTelegramDirect('login link', 'op-report', {
+    config: cfg,
+    sendRaw: (token, chatId) => { sent.push({ token, chatId }); return true; },
+    legacyEnv: () => { throw new Error('must not fall back to an environment bot'); },
+  })).toBe(true);
+  expect(sent).toEqual([{ token: main, chatId: '101' }]);
 });
 
 test('unmapped ops-report without reportChannel uses allowedUsers home fallback; missing home fails closed', () => {

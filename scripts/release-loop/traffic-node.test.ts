@@ -155,7 +155,7 @@ test('graph resume reruns the cut node and restores traffic again after a second
     const resumed = await run.resume('traffic-cut-start');
     expect(resumed.status).toBe('failed');
     expect(resumed.path).toContain('traffic-cut-start');
-    expect(resumed.path.slice(-3)).toEqual(['pwa', 'traffic-failed-restore', 'failed']);
+    expect(resumed.path.slice(-3)).toEqual(['pre-prepare-join', 'traffic-failed-restore', 'failed']);
     expect(run.snapshots.get('traffic-cut-start')?.global).toBe('gate');
     const restored = JSON.parse(readFileSync(run.trafficFile, 'utf8')) as TrafficFile;
     expect(restored.global).toBe(run.initial.global);

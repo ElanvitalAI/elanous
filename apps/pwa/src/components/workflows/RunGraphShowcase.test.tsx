@@ -9,7 +9,7 @@ import { RunGraphShowcase } from './RunGraphShowcase';
 
 // Snapshot copied from `eln logs --instance prod --grep 49669d4d-75d9-44bd-9679-2e080c78fb0e
 // --category graph.run --limit 30 --json`: four node-entry events, three matching node exits.
-// Graph shape is copied from graphs/steward/steward.yaml; node IDs/outcomes match the captured records.
+// Uses the steward graph's node/edge shape and captured traversal IDs; explicit group tags are added only to exercise the grouping UI.
 const TRAVERSAL: HarnessRunTraversal = {
   runId: '49669d4d-75d9-44bd-9679-2e080c78fb0e', graphId: 'steward', title: '스튜어드', status: 'running', stage: 'triage',
   startedAt: '2026-10-29T09:15:09.192Z', endedAt: null, prNumber: null, substrate: null,
@@ -22,11 +22,12 @@ const TRAVERSAL: HarnessRunTraversal = {
   ledgerEvents: 22,
 };
 
-const GRAPH: RunGraphDetail = {
+type GroupedTestGraph = RunGraphDetail & { nodes: Array<RunGraphDetail['nodes'][number] & { group?: string }> };
+const GRAPH: GroupedTestGraph = {
   id: 'steward', source: 'core', editable: false, entry_node: 'resync', terminal_nodes: ['done', 'failed'],
   nodes: [
-    { node_id: 'resync', kind: 'agent', recipe: 'cmd:steward-resync', max_visits: 1 },
-    { node_id: 'rejudge', kind: 'agent', recipe: 'cmd:steward-rejudge', max_visits: 1 },
+    { node_id: 'resync', kind: 'agent', recipe: 'cmd:steward-resync', max_visits: 1, group: 'research' },
+    { node_id: 'rejudge', kind: 'agent', recipe: 'cmd:steward-rejudge', max_visits: 1, group: 'research' },
     { node_id: 'sync', kind: 'agent', recipe: 'cmd:steward-sync', max_visits: 1 },
     { node_id: 'triage', kind: 'agent', recipe: 'cmd:steward-triage', max_visits: 1 },
     { node_id: 'schedule', kind: 'agent', recipe: 'cmd:steward-schedule', max_visits: 1 },
@@ -48,8 +49,11 @@ const GRAPH: RunGraphDetail = {
   ],
 };
 const RUNS = {
-  entries: [{ runId: TRAVERSAL.runId, status: 'running', lastActivityTimestamp: '2026-10-29T09:26:42.631Z', objective: '스튜어드' }],
-  finished: [], total: 1,
+  entries: [
+    { runId: TRAVERSAL.runId, status: 'running', lastActivityTimestamp: '2026-10-29T09:26:42.631Z', objective: '스튜어드' },
+    { runId: 'run-second', status: 'running', lastActivityTimestamp: '2026-10-29T09:27:00.000Z', objective: '다른 런' },
+  ],
+  finished: [], total: 2,
 };
 
 test('첫 장면 고정 입력은 실제 steward 런 원장의 사건열을 사용한다', () => {
@@ -74,7 +78,15 @@ const nodeMock = (width: number) => () => ({
 async function mount(width: number, traversal: HarnessRunTraversal = TRAVERSAL) {
   const fetchImpl = (async (url: string) => {
     if (String(url).includes('/v1/harness/runs')) return new Response(JSON.stringify(RUNS), { status: 200 });
-    if (String(url).includes('/v1/harness/run-traversal')) return new Response(JSON.stringify(traversal), { status: 200 });
+    if (String(url).includes('/v1/harness/run-traversal')) {
+      const requestedRunId = new URL(String(url)).searchParams.get('runId');
+      const otherRun = requestedRunId === 'run-second';
+      return new Response(JSON.stringify({
+        ...traversal,
+        runId: requestedRunId ?? traversal.runId,
+        ...(otherRun ? { title: '다른 런', status: 'completed', endedAt: '2026-10-29T09:27:00.000Z', steps: traversal.steps.slice(0, 2) } : {}),
+      }), { status: 200 });
+    }
     if (String(url).includes('/v1/graphs/')) return new Response(JSON.stringify(GRAPH), { status: 200 });
     return new Response('{}', { status: 200 });
   }) as unknown as typeof fetch;
@@ -114,11 +126,10 @@ async function pickRun(root: ReturnType<typeof create>) {
   await waitUntil(() => root.root.findAllByType(ReactFlow).length > 0);
 }
 
-function expectCurrentSceneOnly(root: ReturnType<typeof create>) {
-  expect(root.root.findAllByProps({ role: 'group', 'aria-label': '보기' })).toHaveLength(0);
-  expect(root.root.findAllByProps({ 'data-testid': 'toggle-units' })).toHaveLength(0);
-  expect(text(root.root)).not.toContain('리플레이');
-  expect(text(root.root)).not.toContain('묶음 접기');
+function expectShowcaseControls(root: ReturnType<typeof create>) {
+  expect(root.root.findAllByProps({ role: 'group', 'aria-label': '보기' })).toHaveLength(1);
+  expect(root.root.findAllByProps({ 'data-testid': 'toggle-units' })).toHaveLength(1);
+  expect(text(root.root)).toContain('리플레이');
 }
 
 const text = (node: ReactTestInstance | string): string => typeof node === 'string' ? node : node.children.map(text).join('');
@@ -161,7 +172,7 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
     root = await mount(1280);
     expect(text(root.root.findByProps({ 'data-testid': 'showcase-run-select-0' }))).toContain('도는 중');
     await pickRun(root);
-    expectCurrentSceneOnly(root);
+    expectShowcaseControls(root);
     expect([0, 1, 2].every((index) => root!.root.findAllByProps({ 'data-testid': `showcase-panel-${index}` }).length === 1)).toBe(true);
     expect(root.root.findAllByProps({ role: 'group', 'aria-label': '리서치 적응형 그래프 사건' })).toHaveLength(1);
     expect(root.root.findByProps({ 'data-testid': 'arg-added-count-0' }).children).toEqual(['0']);
@@ -218,7 +229,7 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
     (g.window as { innerWidth: number }).innerWidth = 820;
     root = await mount(820);
     await pickRun(root);
-    expectCurrentSceneOnly(root);
+    expectShowcaseControls(root);
     const section = root.root.findByProps({ 'aria-label': '실행 그래프' });
     expect(section.props['data-viewport']).toBe('wide');
     expect(section.props.className).toContain('h-[60dvh]');
@@ -234,7 +245,7 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
     (g.window as { innerWidth: number }).innerWidth = 390;
     root = await mount(390);
     await pickRun(root);
-    expectCurrentSceneOnly(root);
+    expectShowcaseControls(root);
     const nodes = root.root.findByType(ReactFlow).props.nodes as Array<{ id: string; data: { state: string } }>;
     expect(nodes.find((node) => node.id === 'triage')?.data.state).toBe('running');
     expect(nodes.find((node) => node.id === 'schedule')?.data.state).toBe('pending');
@@ -244,5 +255,91 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
     expect(section.props.className).toContain('h-[65dvh]');
     expect(section.props.className).toContain('min-h-[380px]');
     expect(root.root.findByProps({ 'aria-label': '실행 타임라인' }).props.className).toContain('max-h-[300px]');
+  });
+
+  test('실제 노드 탭은 traversal 근거를 열고 리포트는 기록된 결과만 펼친다', async () => {
+    root = await mount(1280);
+    await pickRun(root);
+    const flow = root.root.findByType(ReactFlow);
+    const node = (flow.props.nodes as Array<{ id: string }>).find((candidate) => candidate.id === 'rejudge')!;
+    await act(async () => {
+      (flow.props.onNodeClick as (event: unknown, node: unknown) => void)({}, node);
+    });
+    await waitUntil(() => root!.root.findAllByProps({ 'data-testid': 'node-evidence-0' }).length === 1);
+    expect(text(root.root.findByProps({ 'data-testid': 'node-evidence-0' }))).toContain('rejudge');
+    expect(text(root.root.findByProps({ 'data-testid': 'node-evidence-0' }))).toContain('exit=0');
+    expect(text(root.root.findByProps({ 'data-testid': 'node-evidence-0' }))).toContain('18:15:10');
+
+    await act(async () => {
+      root!.root.findByProps({ 'data-testid': 'showcase-report-toggle-0' }).props.onClick();
+    });
+    expect(root.root.findByProps({ 'data-testid': 'showcase-report-toggle-0' }).props['aria-expanded']).toBe(true);
+    const report = text(root.root.findByProps({ 'data-testid': 'showcase-report-0' }));
+    expect(report).toContain('triage');
+    expect(report).toContain('원장 단계 4');
+    expect(report).toContain('ledger events 22');
+    expect(report).not.toContain('PR #');
+
+    const selectedFlow = root.root.findByType(ReactFlow);
+    await act(async () => {
+      (selectedFlow.props.onNodeClick as (event: unknown, node: unknown) => void)({}, node);
+    });
+    expect(root.root.findAllByProps({ 'data-testid': 'node-evidence-0' })).toHaveLength(0);
+
+    const focusedFlow = root.root.findByType(ReactFlow);
+    await act(async () => {
+      (focusedFlow.props.onNodeClick as (event: unknown, node: unknown) => void)({}, node);
+    });
+    expect(root.root.findAllByProps({ 'data-testid': 'node-evidence-0' })).toHaveLength(1);
+    await act(async () => {
+      root!.root.findByProps({ 'data-testid': 'node-evidence-0' }).findByType('button').props.onClick();
+    });
+    expect(root.root.findAllByProps({ 'data-testid': 'node-evidence-0' })).toHaveLength(0);
+    const refocusedFlow = root.root.findByType(ReactFlow);
+    await act(async () => {
+      (refocusedFlow.props.onNodeClick as (event: unknown, node: unknown) => void)({}, node);
+    });
+    expect(root.root.findAllByProps({ 'data-testid': 'node-evidence-0' })).toHaveLength(1);
+    const paneFlow = root.root.findByType(ReactFlow);
+    await act(async () => {
+      (paneFlow.props.onPaneClick as () => void)();
+    });
+    expect(root.root.findAllByProps({ 'data-testid': 'node-evidence-0' })).toHaveLength(0);
+
+    await act(async () => {
+      root!.root.findByProps({ 'data-testid': 'toggle-units' }).props.onClick();
+    });
+    const foldedGraph = root.root.findByType(ReactFlow);
+    expect((foldedGraph.props.nodes as Array<{ id: string }>).some((entry) => entry.id === 'group:research')).toBe(true);
+    expect(text(root.root.findByProps({ 'data-testid': 'toggle-units' }))).toContain('묶음 펼치기');
+
+    await act(async () => {
+      root!.root.findByProps({ 'data-testid': 'showcase-run-select-0' }).props.onChange({ target: { value: 'run-second' } });
+    });
+    await waitUntil(() => root!.root.findAllByType(ReactFlow).length > 0 && root!.root.findAllByProps({ 'aria-label': '일시정지' }).length === 1);
+    expect(root.root.findByProps({ 'data-testid': 'showcase-report-toggle-0' }).props['aria-expanded']).toBe(false);
+    expect(root.root.findAllByProps({ 'data-testid': 'node-evidence-0' })).toHaveLength(0);
+    expect(text(root.root.findByProps({ 'aria-label': '실행 타임라인' }))).toContain('rejudge');
+
+    await act(async () => {
+      root!.root.findByProps({ 'data-testid': 'showcase-run-select-0' }).props.onChange({ target: { value: TRAVERSAL.runId } });
+    });
+    await waitUntil(() => root!.root.findAllByProps({ 'data-testid': 'timeline-step-3' }).length === 1);
+    expect(root.root.findByProps({ 'data-testid': 'showcase-report-toggle-0' }).props['aria-expanded']).toBe(false);
+    expect(root.root.findAllByProps({ 'data-testid': 'node-evidence-0' })).toHaveLength(0);
+  });
+
+  test('완료 런 재생은 그래프 마운트 직후 첫 단계부터 시작한다', async () => {
+    const completed: HarnessRunTraversal = {
+      ...TRAVERSAL,
+      status: 'completed',
+      endedAt: '2026-10-29T09:27:00.000Z',
+      steps: TRAVERSAL.steps.map((step) => step.node === 'triage' ? { ...step, outcome: 'ok' } : step),
+    };
+    root = await mount(1280, completed);
+    await pickRun(root);
+    await waitUntil(() => root!.root.findAllByProps({ 'aria-label': '일시정지' }).length === 1);
+    expect(root.root.findByProps({ 'aria-label': '실행 그래프' }).props['data-viewport']).toBe('wide');
+    expect(root.root.findByProps({ 'data-testid': 'timeline-step-0' }).props.className).not.toContain('opacity-35');
   });
 });

@@ -49,6 +49,27 @@ export function isDemotableScopeRevertMustFix(mustFix: string): boolean {
   return isScopeRevertMustFix(mustFix) && !SCOPE_REVERT_KEEP_BLOCKER.test(mustFix);
 }
 
+export interface ReauthorClassification {
+  class: 'code-defect' | 'authorship-defect';
+  finding: string;
+  recommendation?: string;
+}
+
+function hasReauthorFuRecommendation(classification: ReauthorClassification): boolean {
+  const recommendation = classification.recommendation;
+  if (recommendation === undefined) return false;
+  const cellId = recommendation.split(';', 1)[0]?.trim();
+  if (!cellId || !/^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-FU$/u.test(cellId)) return false;
+  const scopeCut = /(?:^|;)\s*scope-cut\s*=\s*([^;]+)/iu.exec(recommendation)?.[1]?.trim();
+  const paths = /(?:^|;)\s*paths\s*=\s*([^;]+)/iu.exec(recommendation)?.[1]?.trim();
+  const boundary = /(?:^|;)\s*boundary\s*=\s*([^;]+)/iu.exec(recommendation)?.[1]?.trim();
+  const hasCutAction = scopeCut !== undefined && /제외|미포함|분리|빼|후속|exclude|omit|remove|split|defer|out.of.scope/iu.test(scopeCut);
+  const hasConcretePaths = paths !== undefined && /[/.\\]/u.test(paths) && paths.length >= 3;
+  const hasBoundary = boundary !== undefined && boundary.length >= 8 && !/^(?:tbd|unknown|todo|n\/a)$/iu.test(boundary);
+  const hasMockScenario = /(?:^|;)\s*MS-[A-Z0-9][A-Z0-9-]*/iu.test(recommendation);
+  return hasCutAction && hasConcretePaths && hasBoundary && hasMockScenario;
+}
+
 export interface ReviewResult {
   verdict: ReviewVerdict;
   mustFix: string[];
@@ -76,7 +97,12 @@ export interface ReviewResult {
   failureReason?: string;
   /** Subscription reviewer unavailable: the default reviewer produced this verdict. */
   reviewerFallback?: string;
+  /** r3+ shadow classification; never triggers checklist mutation or relaunch. */
+  reauthorClassifications?: ReauthorClassification[];
 }
+
+/** Invalid reauthor classifications travel from parsing to chunk folding without entering public review JSON. */
+const invalidReauthorFindingsByResult = new WeakMap<ReviewResult, ReadonlySet<string>>();
 
 /** 모든 리뷰 관측 생산자가 공유하는 diff 예산 필드 계약. 예산 부재는 빈 객체로 보존한다.
  *  ⚠️ 내부 타입 — 소비자는 `...reviewDiffBudgetObservation(r)` 로 스프레드만 하므로 이름을 참조하지
@@ -317,7 +343,7 @@ export function planReviewChunks(
  */
 export function foldReviewResults(
   results: readonly ReviewResult[],
-): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'scopeRevertDemoted' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback'> {
+): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'scopeRevertDemoted' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback' | 'reauthorClassifications'> {
   const dedupe = (values: readonly string[]): string[] => [...new Set(values)];
   const collect = (pick: (r: ReviewResult) => readonly string[] | undefined): string[] =>
     dedupe(results.flatMap((r) => [...(pick(r) ?? [])]));
@@ -330,6 +356,15 @@ export function foldReviewResults(
   const scopeRevertDemoted = collect((r) => r.scopeRevertDemoted);
   const failed = results.find((r) => r.reviewed !== true);
   const reviewerFallback = results.find((r) => r.reviewerFallback)?.reviewerFallback;
+  const reauthorCandidates = results.flatMap((r) => r.reauthorClassifications ?? []);
+  const invalidReauthorFindings = new Set(results.flatMap((r) => [...(invalidReauthorFindingsByResult.get(r) ?? [])]));
+  const candidateCounts = new Map<string, number>();
+  for (const candidate of reauthorCandidates) candidateCounts.set(candidate.finding, (candidateCounts.get(candidate.finding) ?? 0) + 1);
+  const reauthorClassifications = reauthorCandidates.filter((candidate) =>
+    mustFix.includes(candidate.finding)
+    && !invalidReauthorFindings.has(candidate.finding)
+    && candidateCounts.get(candidate.finding) === 1
+    && (candidate.class === 'code-defect' || hasReauthorFuRecommendation(candidate)));
   return {
     verdict,
     mustFix,
@@ -339,6 +374,7 @@ export function foldReviewResults(
     reviewed: results.length > 0 && failed === undefined,
     ...(failed?.failureReason ? { failureReason: failed.failureReason } : {}),
     ...(reviewerFallback ? { reviewerFallback } : {}),
+    ...(reauthorClassifications.length ? { reauthorClassifications } : {}),
   };
 }
 
@@ -618,6 +654,14 @@ export function buildReviewPrompt(
     // ⚠️ 무표식 절단 금지(리뷰 must-fix) — 잘렸으면 **어느 절부터**인지 리뷰어가 알아야 한다.
     phaseIntentHeading, phaseIntent,
     ...(input.acceptance ? ['## Acceptance criteria', input.acceptance.slice(0, 1000)] : []),
+    ...(input.reviewContext?.round !== undefined && input.reviewContext.round >= 3 ? [
+      '## 저작 재점검 (review round >= 3)',
+      '각 MUST-FIX 후보를 (a) 코드 결함 또는 (b) 저작 결함으로 분류하라.',
+      '(b) 불필요한 경계·목표, 아직 없는 부품, 아직 배선되지 않은 운영 경로, 실물 전제 등 미래 가정을 시험/수용기준이 요구하는 경우다.',
+      '원래 MUST-FIX 후보는 verdict 와 MUST-FIX 목록에 그대로 보존하라. 저작 결함의 scope-cut/FU 는 아래 REAUTHOR-CLASSIFICATION 문법으로 별도 관측하라; 분류나 권고로 MUST-FIX 를 제거·대체하지 마라.',
+      '각 원래 blocker 를 `REAUTHOR-CLASSIFICATION:` 아래 정확히 `- CODE-DEFECT: <finding>` 또는 `- AUTHORSHIP-DEFECT: <finding> | SCOPE CUT + FU: <cell>-FU; scope-cut=<specific excluded/deferred work>; paths=<repository paths>; boundary=<observable completion boundary>; MS-<mock scenario id>` 로 한 줄씩 내고, finding 은 원문 그대로 복사하라.',
+      '(a) 실제 코드의 정확성·안전·데이터 손실 결함만 MUST-FIX로 유지하라.',
+    ] : []),
     'This is a POST-PR review of the produced artifact. Judge whether the PR actually',
     'delivers the phase intent CORRECTLY and soundly: (1) correctness/latent bugs, (2) does it meet the stated',
     'acceptance criteria, (3) design/regression risk, (4) missing wiring (new code never called), (5) tests present',
@@ -640,6 +684,13 @@ export function buildReviewPrompt(
     '    On that same finding line, state what would pass: one concrete observation and where to see it. Examples:',
     '    run the real entrypoint and assert runtime output this change did not author; force the call site to fail',
     '    and check that the error names that site; use values the real caller produces instead of synthetic input.',
+    ...(input.reviewContext?.round !== undefined && input.reviewContext.round >= 3 ? [
+      '',
+      '## Reauthor classification (shadow observation only; no automatic cell creation or relaunch)',
+      'For each blocker classify it as CODE-DEFECT (required behavior is incorrectly implemented) or AUTHORSHIP-DEFECT (the goal asks for an unnecessary boundary/goal, absent component, future wiring, or real-world prerequisite not required by this phase).',
+      'Do not change the original verdict, MUST-FIX, or SHOULD-FIX lists because of this classification. For AUTHORSHIP-DEFECT, the recommendation must name a `<cell>-FU` and include a concrete `scope-cut=<specific excluded/deferred work>`, `paths=<repository paths>`, `boundary=<observable completion boundary>`, and `MS-<mock scenario id>`; a FU token by itself is invalid.',
+      'Add one line per original blocker under `REAUTHOR-CLASSIFICATION:` exactly as `- CODE-DEFECT: <finding>` or `- AUTHORSHIP-DEFECT: <finding> | SCOPE CUT + FU: <cell>-FU; scope-cut=<specific excluded/deferred work>; paths=<repository paths>; boundary=<observable completion boundary>; MS-<mock scenario id>`. Keep the finding text verbatim for joining. This is advisory only and must not affect the verdict or finding lists.',
+    ] : []),
     'Do NOT rubber-stamp; an empty review is a failed review — always surface at least a watch item.',
     '',
     ...(input.workingMemory ? ['## Prior decisions / reuse boundaries (working memory)', input.workingMemory.slice(0, 1200)] : []),
@@ -776,20 +827,23 @@ export function isNoneSentinelFinding(finding: string): boolean {
 /** ⭐ `VERDICT: PASS|WARN|FAIL` 판정 줄 — `parseReviewResult` 와 `reviewedResultFromRaw` 가 «같은» 정규식을 쓴다(존재 판정이 갈리면 안 된다). */
 const VERDICT_LINE = /VERDICT:\s*(PASS|WARN|FAIL)/i;
 
-export function parseReviewResult(text: string): ReviewResult {
+export function parseReviewResult(text: string, round?: number): ReviewResult {
   const vm = VERDICT_LINE.exec(text);
   const verdict = (vm ? vm[1]!.toLowerCase() : 'pass') as ReviewVerdict;
   const lines = text.split('\n').map((l) => l.trim());
   const mustFix: string[] = [];
   const shouldFix: string[] = [];
   const requirements: string[] = [];
+  const reauthorCandidates: ReauthorClassification[] = [];
+  const reauthorRawLines: string[] = [];
   let fallbackFinding: string | undefined;
   let droppedNonePlaceholders = 0;
-  let section: 'must' | 'should' | 'requirements' | null = null;
+  let section: 'must' | 'should' | 'requirements' | 'reauthor' | null = null;
   for (const l of lines) {
     if (/^MUST-?FIX/i.test(l)) { section = 'must'; continue; }
     if (/^SHOULD-?FIX/i.test(l)) { section = 'should'; continue; }
     if (/^REQUIREMENTS:\s*$/i.test(l)) { section = 'requirements'; continue; }
+    if (/^REAUTHOR-CLASSIFICATION:/i.test(l)) { section = 'reauthor'; continue; }
     if (/^(WATCH|VERDICT)/i.test(l)) { section = null; continue; }
     if (l.startsWith('- ')) {
       const f = l.slice(2).trim();
@@ -799,6 +853,18 @@ export function parseReviewResult(text: string): ReviewResult {
         else mustFix.push(f);
       } else if (section === 'should') shouldFix.push(f);
       else if (section === 'requirements') requirements.push(f);
+      else if (section === 'reauthor') {
+        reauthorRawLines.push(f);
+        const match = /^(CODE-DEFECT|AUTHORSHIP-DEFECT):\s*(.+)$/.exec(f);
+        if (match) {
+          const [finding, recommendation] = match[2]!.split(/\s+\|\s+SCOPE CUT \+ FU:\s*/i, 2);
+          reauthorCandidates.push({
+            class: match[1] === 'CODE-DEFECT' ? 'code-defect' : 'authorship-defect',
+            finding: finding!.trim(),
+            ...(recommendation?.trim() ? { recommendation: recommendation.trim() } : {}),
+          });
+        }
+      }
       else fallbackFinding ??= f;
     }
   }
@@ -826,15 +892,42 @@ export function parseReviewResult(text: string): ReviewResult {
         remainingMustFix: kept.length, heads: scopeRevertDemoted.map((finding) => safeLogText(finding, 120)) });
     } catch { /* observation must not change parsed review data */ }
   }
+  const candidateCounts = new Map<string, number>();
+  for (const candidate of reauthorCandidates) candidateCounts.set(candidate.finding, (candidateCounts.get(candidate.finding) ?? 0) + 1);
+  const referencedReauthorFindings = [...new Set(reauthorRawLines.map(rawReauthorFinding).filter(Boolean))];
+  const reauthorInvalidFindings = referencedReauthorFindings.filter((finding) => {
+    const rawLines = reauthorRawLines.filter((line) => rawReauthorFinding(line) === finding);
+    const candidates = reauthorCandidates.filter((candidate) => candidate.finding === finding);
+    return rawLines.length !== 1 || candidates.length !== 1
+      || (candidates[0]!.class === 'authorship-defect' && !hasReauthorFuRecommendation(candidates[0]!));
+  });
+  const invalidFindingSet = new Set(reauthorInvalidFindings);
+  const reauthorClassifications = round !== undefined && round >= 3 ? reauthorCandidates.filter((candidate) => {
+    if (!mustFix.includes(candidate.finding) || invalidFindingSet.has(candidate.finding) || candidateCounts.get(candidate.finding) !== 1) return false;
+    if (candidate.class === 'code-defect') return true;
+    return hasReauthorFuRecommendation(candidate);
+  }) : [];
   const fallback = text.match(/\n\[reviewer fallback: ([^\r\n]+)\]$/);
-  return {
+  const result: ReviewResult = {
     verdict: finalVerdict,
     mustFix: mustFix.slice(0, 6),
     shouldFix: shouldFix.slice(0, 6),
     ...(scopeRevertDemoted.length ? { scopeRevertDemoted } : {}),
     ...(fallback ? { reviewerFallback: fallback[1] } : {}),
     ...(requirements.length ? { requirements } : {}),
+    ...(reauthorClassifications.length ? { reauthorClassifications } : {}),
   };
+  if (round !== undefined && round >= 3 && reauthorInvalidFindings.length) {
+    invalidReauthorFindingsByResult.set(result, new Set(reauthorInvalidFindings));
+  }
+  return result;
+}
+
+/** Extract the exact referenced finding from a raw classification bullet, even if its class label is invalid. */
+function rawReauthorFinding(line: string): string {
+  const colon = line.indexOf(':');
+  const body = colon < 0 ? line : line.slice(colon + 1).trim();
+  return body.split(/\s+\|/, 1)[0]!.trim();
 }
 
 /** 판정 줄 없는 응답의 사유 값 — 기존 «리뷰 못 함» 경로(`reviewed:false` ⊕ `failureReason`)를 그대로 탄다. */
@@ -851,8 +944,22 @@ export const NO_VERDICT_LINE_REASON = 'no-verdict-line';
  *   ⛔ 계약: `reviewed:false` 일 때 `verdict` 는 «의미 없는 자리값»(`pass`)이다 — catch·미주입 경로와 같다.
  *      소비처는 `reviewed` 를 «먼저» 본다(`renderReview`·`self-review-cli`·`review-adapter`·orchestrator).
  */
-function reviewedResultFromRaw(raw: string, runId: string | undefined, pass?: { index: number; of: number }): ReviewResult {
-  if (VERDICT_LINE.test(raw)) return { ...parseReviewResult(raw), reviewed: true };
+function reviewedResultFromRaw(
+  raw: string,
+  runId: string | undefined,
+  round?: number,
+  pass?: { index: number; of: number },
+): ReviewResult {
+  if (VERDICT_LINE.test(raw)) {
+    const parsed = parseReviewResult(raw, round);
+    if (round !== undefined && round >= 3) {
+      const result = { ...parsed, reviewed: true };
+      const invalid = invalidReauthorFindingsByResult.get(parsed);
+      if (invalid) invalidReauthorFindingsByResult.set(result, invalid);
+      return result;
+    }
+    return { ...parsed, reviewed: true };
+  }
   try {
     debug.log('review.verdict', NO_VERDICT_LINE_REASON, {
       chars: raw.length,
@@ -863,6 +970,24 @@ function reviewedResultFromRaw(raw: string, runId: string | undefined, pass?: { 
     });
   } catch { /* Observation must not prevent the review. */ }
   return { verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false, failureReason: NO_VERDICT_LINE_REASON };
+}
+
+function observeReauthorClassification(input: ReviewInput, result: ReviewResult): void {
+  const round = input.reviewContext?.round;
+  if (round === undefined || round < 3) return;
+  try {
+    const invalidFindings = invalidReauthorFindingsByResult.get(result) ?? new Set<string>();
+    const classifications = (result.reauthorClassifications ?? []).filter((entry) => !invalidFindings.has(entry.finding));
+    debug.log('review.reauthor', 'shadow-classification', {
+      round,
+      mode: 'shadow-only',
+      status: result.reviewed === false ? 'unavailable' : result.mustFix.length === 0 ? 'no-blockers' : 'observed',
+      classifications,
+      unclassified: (result.mustFix ?? []).filter((finding) =>
+        !classifications.some((entry) => entry.finding === finding)),
+      ...(input.reviewContext?.runId !== undefined ? { runId: input.reviewContext.runId } : {}),
+    });
+  } catch { /* Observation must not prevent the review. */ }
 }
 
 /** REVIEW-PROMPT-SIZE — llmReview 호출 하나(단일·청크 패스)마다 프롬프트·응답 크기를 남긴다.
@@ -908,7 +1033,11 @@ export async function reviewPullRequest(
   /** ⭐ `P4b` — 두 번째 인자로 이미지를 «같이» 받는다. 안 받는 리뷰어(API 백엔드)는 그냥 무시한다. */
   llmReview?: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>,
 ): Promise<ReviewResult> {
-  if (!llmReview) return { verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false }; // 리뷰어 미주입=미검토.
+  if (!llmReview) {
+    const result = { verdict: 'pass' as const, mustFix: [], shouldFix: [], reviewed: false };
+    observeReauthorClassification(input, result);
+    return result; // 리뷰어 미주입=미검토.
+  }
   try {
     const diffBudget = budgetedDiff(input.prDiff);
     // Existing caller: self-review-cli.ts runSelfReviewCliCommand → deps.reviewPullRequest(reviewInput, llmReview).
@@ -1039,10 +1168,13 @@ export async function reviewPullRequest(
         const passImages = reviewImages.length > 0 && index === 0 ? reviewImages : undefined;
         const passRaw = await llmReview(passPrompt, passImages);
         logReviewPromptSize(passPrompt, passRaw, { pass: index + 1, chunked: true }, input.reviewContext?.runId);
-        passResults.push(reviewedResultFromRaw(passRaw, input.reviewContext?.runId, { index, of: plan.passes.length }));
+        const passResult = reviewedResultFromRaw(passRaw, input.reviewContext?.runId, input.reviewContext?.round, { index, of: plan.passes.length });
+        passResults.push(passResult);
       }
+      const folded = foldReviewResults(passResults);
+      observeReauthorClassification(input, folded);
       return {
-        ...foldReviewResults(passResults),
+        ...folded,
         diffBudget: {
           // ⭐ 「전부 봤나」가 truncated 의 «정의»다 — 상한에 걸렸거나 초대형 파일이 있으면 여전히 true.
           truncated: !plan.coversAll,
@@ -1066,8 +1198,10 @@ export async function reviewPullRequest(
     const prompt = buildReviewPrompt(input, diffBudget, referencedContext.text, singleContextBudget);
     const raw = await llmReview(prompt, reviewImages.length > 0 ? reviewImages : undefined);
     logReviewPromptSize(prompt, raw, { pass: 1, chunked: false }, input.reviewContext?.runId);
+    const result = reviewedResultFromRaw(raw, input.reviewContext?.runId, input.reviewContext?.round);
+    observeReauthorClassification(input, result);
     return {
-      ...reviewedResultFromRaw(raw, input.reviewContext?.runId),
+      ...result,
       diffBudget: {
         truncated: diffBudget.truncated,
         shownChars: diffBudget.shownChars,
@@ -1107,7 +1241,9 @@ export async function reviewPullRequest(
     //   출력 «경계마다» 막으면 새 소비처가 생길 때 하나를 빠뜨린다 ⇒ 여기서 한 번 막는다.
     //   ⚠️ `review-observation` 의 `pr-reviewer` import 는 «타입 전용»이라 런타임 순환이 없다.
     const reason = failureReasonText(error);
-    return { verdict: 'pass', mustFix: [], shouldFix: [], reviewed: false, failureReason: reason };
+    const result = { verdict: 'pass' as const, mustFix: [], shouldFix: [], reviewed: false, failureReason: reason };
+    observeReauthorClassification(input, result);
+    return result;
   }
 }
 

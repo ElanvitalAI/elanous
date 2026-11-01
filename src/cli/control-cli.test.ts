@@ -1,10 +1,10 @@
 import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
 import { listMachineResources, runControlServe } from './control-cli.js';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONTROL_PORT, ensureControlTokens } from '../control-plane/server.js';
-import { issueMemberToken } from '../control-plane/member-tokens.js';
+import { issueMemberToken, machineForToken } from '../control-plane/member-tokens.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -39,7 +39,15 @@ function root() {
 }
 function launch(dir: string, ...args: string[]) {
   const child = Bun.spawn(['bun', entry, `--test=${dir}`, ...args], {
-    cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' }, stdout: 'pipe', stderr: 'pipe',
+    cwd, env: {
+      ...process.env,
+      // Child runners may inherit an unrelated host root; keep both axes pinned to this test fixture.
+      HOME: dir,
+      ELANOUS_STATE_DIR: dir,
+      ELANOUS_CONFIG_DIR: dir,
+      ELANOUS_CONTROL_PORT: '',
+      ELANOUS_SUPPRESS_XDG_WARNING: '1',
+    }, stdout: 'pipe', stderr: 'pipe',
   });
   children.push(child);
   return child;
@@ -83,16 +91,21 @@ afterEach(async () => {
 
 test('real control status --json returns seven rows and the table distinguishes measurement states', async () => {
   const dir = root();
+  const installRoot = join(dir, '.local', 'share', 'elanous');
+  mkdirSync(installRoot, { recursive: true });
+  const testCommit = 'a'.repeat(40);
+  writeFileSync(join(installRoot, 'install.json'), JSON.stringify({ version: '0.0.0-test', commit: testCommit }));
   const result = await command(dir, 'control', 'status', '--json');
   expect(result.code).toBe(0);
   const { rows } = JSON.parse(result.stdout) as { rows: Array<{ row: string; state: string; reason?: string }> };
   expect(rows).toHaveLength(7);
   expect(rows.map(r => r.row)).toEqual(['집', '판', '자원', '자격', '동결·몫', '루프', 'config']);
-  for (const row of rows.slice(1, 4)) expect(row).toMatchObject({ state: 'unmeasured', reason: expect.any(String) });
+  expect(rows[1]).toMatchObject({ row: '판', state: 'ok', text: `설치본 0.0.0-test · ${testCommit}` });
+  for (const row of rows.slice(2, 4)) expect(row).toMatchObject({ state: 'unmeasured', reason: expect.any(String) });
   const table = await command(dir, 'control', 'status');
   expect(table.code).toBe(0);
   expect(table.stdout.trim().split('\n')).toHaveLength(7);
-  expect(table.stdout).toContain('판 · 못 쟀다');
+  expect(table.stdout).toContain(`판 · 정상 · 설치본 0.0.0-test · ${testCommit}`);
 }, 120_000);
 
 test('control status keeps a multiline freeze reason inside one table row', async () => {
@@ -224,7 +237,7 @@ test('control serve --host forwards a permitted host and rejects a public bind b
   } finally { reader.releaseLock(); child.kill('SIGTERM'); await child.exited; }
 });
 
-test('control token issue outputs the secret once; replacement, list and revoke never reveal it', async () => {
+test('control token issue preserves one-time stdout behavior; list and revoke never reveal it', async () => {
   const dir = root();
   const issued = await command(dir, 'control', 'token', 'issue', 'fixture-node');
   expect(issued.code).toBe(0);
@@ -233,6 +246,7 @@ test('control token issue outputs the secret once; replacement, list and revoke 
   const listed = await command(dir, 'control', 'token', 'list');
   expect(listed.code).toBe(0);
   expect(listed.stdout).toMatch(/^fixture-node · \d{4}-\d\d-\d\dT.*Z\n$/);
+  expect(listed.stdout).not.toContain(first);
   const replaced = await command(dir, 'control', 'token', 'issue', 'fixture-node');
   expect(replaced.stdout).toMatch(/^[a-f0-9]{64}\n$/);
   expect(replaced.stdout).not.toBe(issued.stdout);
@@ -241,12 +255,35 @@ test('control token issue outputs the secret once; replacement, list and revoke 
   expect(revoked.stdout).toBe('');
   const empty = await command(dir, 'control', 'token', 'list');
   expect(empty.stdout).toBe('');
-  const output = listed.stdout + listed.stderr + replaced.stderr + revoked.stdout + revoked.stderr + empty.stdout + empty.stderr;
+  const output = issued.stderr + replaced.stderr + listed.stdout + listed.stderr + revoked.stdout + revoked.stderr + empty.stdout + empty.stderr;
   expect(output).not.toContain(first);
   expect(output).not.toContain(replaced.stdout.trim());
   const invalid = await command(dir, 'control', 'token', 'issue', '../escape');
   expect(invalid.code).toBe(2);
   expect(invalid.stdout).toBe('');
+}, 20_000);
+
+test('control token issue --token-file writes one private credential without stdout or overwrite', async () => {
+  const dir = root();
+  const tokenFile = join(dir, 'host', 'tokens', 'node-b-member.token');
+  const issued = await command(dir, 'control', 'token', 'issue', 'node-b', '--token-file', tokenFile);
+  expect(issued).toEqual({ code: 0, stdout: '', stderr: '' });
+  const token = readFileSync(tokenFile, 'utf8').trim();
+  expect(token).toMatch(/^[a-f0-9]{64}$/);
+  expect(statSync(tokenFile).mode & 0o777).toBe(0o600);
+  expect(statSync(join(dir, 'host', 'tokens')).mode & 0o077).toBe(0);
+  expect(machineForToken(token, dir)).toBe('node-b');
+
+  const duplicate = await command(dir, 'control', 'token', 'issue', 'node-b', '--token-file', tokenFile);
+  expect(duplicate.code).toBe(2);
+  expect(duplicate.stdout).toBe('');
+  expect(readFileSync(tokenFile, 'utf8').trim()).toBe(token);
+  expect(machineForToken(token, dir)).toBe('node-b');
+
+  const relative = await command(dir, 'control', 'token', 'issue', 'node-c', '--token-file', 'relative.token');
+  expect(relative.code).toBe(2);
+  expect(relative.stdout).toBe('');
+  expect((await command(dir, 'control', 'token', 'list')).stdout).toMatch(/^node-b · /);
 }, 20_000);
 
 test('real CLI serves in foreground, stops on SIGTERM, and query token is required', async () => {
@@ -264,7 +301,7 @@ test('real CLI serves in foreground, stops on SIGTERM, and query token is requir
 test('real CLI --follow-lease reports its bucket and keeps serving when GCS cannot be read', async () => {
   const dir = root();
   const child = Bun.spawn([process.execPath, entry, `--test=${dir}`, 'control', 'serve', '--port', '0', '--follow-lease', '--bucket', 'gs://example-bucket'], {
-    cwd, env: { ...process.env, PATH: '/usr/bin:/bin', HOME: dir, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+    cwd, env: { ...process.env, PATH: '/usr/bin:/bin', HOME: dir, ELANOUS_STATE_DIR: dir, ELANOUS_CONFIG_DIR: dir, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
     stdout: 'pipe', stderr: 'pipe',
   });
   children.push(child);
@@ -517,7 +554,7 @@ test('real join accepts a member token on stdin', async () => {
   } });
   try {
     const child = Bun.spawn(['bun', entry, `--test=${dir}`, 'control', 'join', '--url', peer.url.href, '--machine', 'fixture-node', '--token-stdin'], {
-      cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+      cwd, env: { ...process.env, ELANOUS_STATE_DIR: dir, ELANOUS_CONFIG_DIR: dir, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     });
     children.push(child);
     child.stdin.write(`${credential}\n`);
@@ -588,14 +625,14 @@ test('unreachable listener emits address and reason, not empty resources; explic
   expect(failed.stderr).not.toContain('resources":[]');
   const { port: livePort } = await serve(dir);
   const envCommand = Bun.spawn(['bun', entry, `--test=${dir}`, 'resources', 'list', '--json'], {
-    cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: livePort }, stdout: 'pipe', stderr: 'pipe',
+    cwd, env: { ...process.env, ELANOUS_STATE_DIR: dir, ELANOUS_CONFIG_DIR: dir, ELANOUS_CONTROL_PORT: livePort }, stdout: 'pipe', stderr: 'pipe',
   });
   children.push(envCommand);
   const [envCode, envOut] = await Promise.all([envCommand.exited, new Response(envCommand.stdout).text()]);
   expect(envCode).toBe(0);
   expect(JSON.parse(envOut)).toEqual({ resources: [] });
   const explicitCommand = Bun.spawn(['bun', entry, `--test=${dir}`, 'resources', 'list', '--port', livePort, '--json'], {
-    cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: port }, stdout: 'pipe', stderr: 'pipe',
+    cwd, env: { ...process.env, ELANOUS_STATE_DIR: dir, ELANOUS_CONFIG_DIR: dir, ELANOUS_CONTROL_PORT: port }, stdout: 'pipe', stderr: 'pipe',
   });
   children.push(explicitCommand);
   const [explicitCode, explicitOut] = await Promise.all([explicitCommand.exited, new Response(explicitCommand.stdout).text()]);

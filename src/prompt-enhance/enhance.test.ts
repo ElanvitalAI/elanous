@@ -68,6 +68,20 @@ describe('enhance — authoring model and effort selection', () => {
     } finally { log.mockRestore(); }
   });
 
+  it('injects the mock device catalog as optional authoring context with a constraint challenge', async () => {
+    const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"goal":"g","constraints":[],"checklist":[]}');
+    try {
+      await enhancePrompt('goal ask', {
+        mockScenarioCatalog: 'fake-kubectl: inject Pod failure; observe Job state',
+        config: configFor({ model: 'gpt-6-sol', effort: 'medium' }),
+      });
+      const prompt = stream.mock.calls[0]?.[0][1]?.content;
+      expect(prompt).toContain('fake-kubectl: inject Pod failure');
+      expect(prompt).toContain('완료 경계가 실물 점검만 요구하면 먼저 제약을 의심하라');
+      expect(prompt).toContain('목장치나 사건 주입으로 같은 동작을 관찰할 수 있는가');
+    } finally { stream.mockRestore(); }
+  });
+
   it('defaultGoalAuthorDeps().enhance passes config model/effort to streamLLM and records selection', async () => {
     const before = { model: process.env.ELANOUS_PROMPT_ENHANCE_MODEL, effort: process.env.ELANOUS_PROMPT_ENHANCE_EFFORT };
     delete process.env.ELANOUS_PROMPT_ENHANCE_MODEL;

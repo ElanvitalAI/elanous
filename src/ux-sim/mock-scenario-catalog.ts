@@ -9,6 +9,10 @@ export interface MockScenarioDevice {
   target: string;
   inputs: string[];
   observations: string[];
+  entryCommands: string[];
+  logsRecorded: 'yes' | 'no' | 'conditional' | 'runner-dependent';
+  eventNames: string[];
+  recentUse: { observedAt: string; runId: string; event: string; scenarioId: string; command: string } | null;
 }
 
 export interface MockScenarioEntry {
@@ -35,7 +39,7 @@ export interface MockScenarioCandidate {
 }
 
 export interface MockScenarioCatalog {
-  version: 1;
+  version: 2;
   runEvidence: {
     scope: string;
     runId: string;
@@ -52,6 +56,7 @@ export interface MockScenarioCatalog {
     existingPaths: number;
     excludedPaths: number;
     sourceExclusions: Array<{ path: string; reason: string }>;
+    omissionCheck: { requiredPaths: string[]; missingPaths: string[] };
     candidates: MockScenarioCandidate[];
   };
   discovery: { trackedRoot: string; candidateRoots: string[]; limits: string };
@@ -86,7 +91,7 @@ function uniqueIds(rows: unknown[], path: string): Set<string> {
 
 /** Validate the checked-in index before CLI output or scenario metadata is consumed. */
 export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
-  if (!isRecord(value) || value.version !== 1) throw new Error('mock scenario catalog must declare version: 1');
+  if (!isRecord(value) || value.version !== 2) throw new Error('mock scenario catalog must declare version: 2');
   if (!Array.isArray(value.devices) || !Array.isArray(value.scenarios)) throw new Error('mock scenario catalog requires devices and scenarios arrays');
   const deviceIds = uniqueIds(value.devices, 'devices');
   uniqueIds(value.scenarios, 'scenarios');
@@ -101,6 +106,10 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
       target: requireString(row.target, `devices[${index}].target`),
       inputs: requireStringArray(row.inputs, `devices[${index}].inputs`),
       observations: requireStringArray(row.observations, `devices[${index}].observations`),
+      entryCommands: requireStringArray(row.entryCommands, `devices[${index}].entryCommands`),
+      logsRecorded: parseLogsRecorded(row.logsRecorded, `devices[${index}].logsRecorded`),
+      eventNames: requireStringArray(row.eventNames, `devices[${index}].eventNames`, true),
+      recentUse: parseRecentUse(row.recentUse, `devices[${index}].recentUse`),
     };
   });
   const scenarios = value.scenarios.map((row, index): MockScenarioEntry => {
@@ -195,6 +204,15 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
       ...(excludeReason ? { excludeReason } : {}),
     };
   });
+  const omissionCheck = value.candidateAudit.omissionCheck;
+  if (!isRecord(omissionCheck)) throw new Error('candidateAudit.omissionCheck is required');
+  const requiredPaths = requireStringArray(omissionCheck.requiredPaths, 'candidateAudit.omissionCheck.requiredPaths');
+  const missingPaths = requireStringArray(omissionCheck.missingPaths, 'candidateAudit.omissionCheck.missingPaths', true);
+  const indexedCandidatePaths = new Set([...candidates, ...sourceExclusions].map((row) => row.path));
+  for (const path of requiredPaths) {
+    if (!indexedCandidatePaths.has(path)) throw new Error(`candidateAudit.omissionCheck path is not accounted for: ${path}`);
+  }
+  if (missingPaths.some((path) => !requiredPaths.includes(path))) throw new Error('candidateAudit.omissionCheck.missingPaths must be required paths');
   const candidateAudit = value.candidateAudit;
   const sourceRows = candidateAudit.sourceRows;
   const baseCommit = candidateAudit.baseCommit;
@@ -213,7 +231,7 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
   const event = runEvidence.event;
   const discovery = value.discovery;
   return {
-    version: 1,
+    version: 2,
     devices,
     scenarios,
     candidateAudit: {
@@ -223,6 +241,7 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
       existingPaths: Number(existingPaths),
       excludedPaths: Number(excludedPaths),
       sourceExclusions,
+      omissionCheck: { requiredPaths, missingPaths },
       candidates,
     },
     runEvidence: {
@@ -271,4 +290,37 @@ export function renderMockScenarioDetails(catalog: MockScenarioCatalog, id: stri
     `시험: ${scenario.tests.join(' · ')}`,
     `ScenarioV0 실행 증거: ${catalog.runEvidence.scope} · runId → ${catalog.runEvidence.event.category}/${catalog.runEvidence.event.name} → test logs.db · ${catalog.runEvidence.artifact}`,
   ];
+}
+
+/** Read-only device inventory; it reports stored evidence metadata and never runs a device. */
+export function renderMockScenarioDevices(catalog: MockScenarioCatalog): string[] {
+  return [
+    'Mock device registry · read-only',
+    ...catalog.devices.map((device) => [
+      `${device.id}\t${device.name}`,
+      `entry=${device.entryCommands.join(' ⊕ ')}`,
+      `logs=${device.logsRecorded}`,
+      `events=${device.eventNames.length ? device.eventNames.join(',') : '(none recorded)'}`,
+      `recent=${device.recentUse ? `${device.recentUse.observedAt} runId=${device.recentUse.runId} event=${device.recentUse.event} scenario=${device.recentUse.scenarioId} cmd=${device.recentUse.command}` : '(not recorded)'}`,
+    ].join('\t')),
+    `omission check: required=${catalog.candidateAudit.omissionCheck.requiredPaths.length} missing=${catalog.candidateAudit.omissionCheck.missingPaths.length}`,
+  ];
+}
+
+function parseLogsRecorded(value: unknown, path: string): MockScenarioDevice['logsRecorded'] {
+  const result = requireString(value, path);
+  if (!['yes', 'no', 'conditional', 'runner-dependent'].includes(result)) throw new Error(`${path} is unknown: ${result}`);
+  return result as MockScenarioDevice['logsRecorded'];
+}
+
+function parseRecentUse(value: unknown, path: string): MockScenarioDevice['recentUse'] {
+  if (value === null) return null;
+  if (!isRecord(value)) throw new Error(`${path} must be an object or null`);
+  return {
+    observedAt: requireString(value.observedAt, `${path}.observedAt`),
+    runId: requireString(value.runId, `${path}.runId`),
+    event: requireString(value.event, `${path}.event`),
+    scenarioId: requireString(value.scenarioId, `${path}.scenarioId`),
+    command: requireString(value.command, `${path}.command`),
+  };
 }

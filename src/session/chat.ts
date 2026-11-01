@@ -20,7 +20,7 @@ import { debug } from '../debug/log.js';
 import { createRequestSizeGuard, formatRequestSizeStatus, type RequestSizeGuard } from './request-size-guard.js';
 import type { InputSourceKind } from '../input/input-source-kind.js';
 import {
-  getProviderForConfig, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider,
+  getProviderForConfigAsync, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider,
   type LLMToolSpec, type ContentBlock,
 } from '../llm.js';
 import type { UserConfig } from '../user-config.js';
@@ -407,7 +407,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       reasoningEffort: llmOpts?.reasoningEffort ?? null,
     });
   }
-  const provider = opts.provider ?? getProviderForConfig(opts.userConfig, llmOpts?.model);
+  const provider = opts.provider ?? await getProviderForConfigAsync(opts.userConfig, llmOpts?.model);
 
   // 2) Assemble, trim, call. When images are attached for THIS turn,
   //    swap the string content of the latest user message for

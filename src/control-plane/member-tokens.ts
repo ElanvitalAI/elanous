@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, fsyncSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 interface MemberTokenEntry { sha256: string; issuedAt: string }
@@ -63,6 +63,29 @@ export function issueMemberToken(machine: string, root: string = effectiveInstan
   entries[machine] = { sha256: createHash('sha256').update(token).digest('hex'), issuedAt: new Date().toISOString() };
   writeStore(root, entries);
   return token;
+}
+
+/** Issue a member credential into a new private file without sending the value to stdout. */
+export function issueMemberTokenToFile(machine: string, tokenFile: string, root: string = effectiveInstanceRoot()): void {
+  checkMachine(machine);
+  if (!isAbsolute(tokenFile)) throw new Error('token file path must be absolute');
+  const token = randomBytes(32).toString('hex');
+  mkdirSync(dirname(tokenFile), { recursive: true, mode: 0o700 });
+  let outputCreated = false;
+  try {
+    const fd = openSync(tokenFile, 'wx', 0o600);
+    outputCreated = true;
+    try {
+      writeFileSync(fd, `${token}\n`, 'utf8');
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    const entries = readStore(root);
+    entries[machine] = { sha256: createHash('sha256').update(token).digest('hex'), issuedAt: new Date().toISOString() };
+    writeStore(root, entries);
+  } catch (error) {
+    if (outputCreated) try { unlinkSync(tokenFile); } catch { /* retain the original failure */ }
+    throw error;
+  }
 }
 
 export function revokeMemberToken(machine: string, root: string = effectiveInstanceRoot()): void {

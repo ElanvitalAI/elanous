@@ -43,6 +43,157 @@ export interface OverlayParseResult {
   readonly errors: readonly GraphParseIssue[];
 }
 
+/** Injected ARG promotion evidence used by the graph-promote rehearsal.
+ * This input is deliberately separate from the production run ledger: a fixture
+ * can exercise the decision path, but its output is always labelled mock-only. */
+export interface ArgPromotionEvidenceEvent {
+  readonly runId: string;
+  readonly timestamp: string;
+  readonly trigger: string;
+  readonly phase: 'adaptation' | 'baseline' | 'shadow';
+  readonly landed?: boolean;
+  readonly shadowAccepted?: boolean;
+}
+
+export interface ArgPromotionCandidate {
+  readonly overlayId: string;
+  readonly target: string;
+  readonly appliesWhen: string;
+  readonly patch: readonly OverlayPatchOp[];
+}
+
+export interface ArgPromotionEvaluation {
+  readonly mockOnly: true;
+  readonly verdict: 'eligible-for-human-pr' | 'held';
+  readonly blockers: readonly string[];
+  readonly metrics: {
+    readonly trigger: string;
+    readonly adaptationRuns: number;
+    readonly adaptationLandingRate: number | null;
+    readonly baselineRuns: number;
+    readonly baselineLandingRate: number | null;
+    readonly landingDelta: number | null;
+    readonly adaptationWindowDays: number | null;
+    readonly shadowObservations: number;
+    readonly shadowWindowDays: number | null;
+  };
+  readonly proposal?: {
+    readonly action: 'proposal-only';
+    readonly promoted_from: readonly string[];
+    readonly evidence: Readonly<Record<string, unknown>>;
+    readonly overlay: {
+      readonly overlay_id: string;
+      readonly target: string;
+      readonly stage: 'launch';
+      readonly applies_when: string;
+      readonly patch: readonly OverlayPatchOp[];
+    };
+    readonly rollback: 'open a human-reviewed demotion PR if the 7-day landing rate declines';
+    readonly patentReview: 'ELA-53 human review pending';
+  };
+}
+
+const PROMOTION_DAY_MS = 24 * 60 * 60 * 1000;
+
+function promotionSpanDays(events: readonly ArgPromotionEvidenceEvent[]): number | null {
+  if (events.length < 2) return null;
+  const times = events.map((event) => Date.parse(event.timestamp));
+  if (times.some((time) => !Number.isFinite(time))) return null;
+  return (Math.max(...times) - Math.min(...times)) / PROMOTION_DAY_MS;
+}
+
+/** Evaluate injected evidence without reading a production ledger, writing an overlay, or opening a PR. */
+export function evaluateArgPromotionFixture(input: {
+  readonly trigger: string;
+  readonly candidate: ArgPromotionCandidate;
+  readonly events: readonly ArgPromotionEvidenceEvent[];
+}): ArgPromotionEvaluation {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new Error('ARG promotion fixture root must be an object');
+  const { trigger, candidate, events } = input;
+  if (typeof trigger !== 'string' || typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)
+    || typeof candidate.overlayId !== 'string' || typeof candidate.target !== 'string' || typeof candidate.appliesWhen !== 'string'
+    || !Array.isArray(candidate.patch) || !Array.isArray(events)) {
+    throw new Error('ARG promotion fixture requires trigger, candidate object, patch array and events array');
+  }
+  if (!trigger.trim() || !candidate.overlayId.trim() || !candidate.target.trim() || !candidate.appliesWhen.trim()) {
+    throw new Error('ARG promotion fixture requires trigger, overlayId, target and appliesWhen');
+  }
+  if (candidate.patch.length === 0) throw new Error('ARG promotion candidate patch must not be empty');
+  for (const operation of candidate.patch) {
+    if (operation === null || typeof operation !== 'object' || !['add', 'replace', 'remove'].includes(operation.op)
+      || typeof operation.path !== 'string' || !operation.path.startsWith('/')
+      || (operation.op !== 'remove' && !('value' in operation))) {
+      throw new Error('ARG promotion candidate contains an invalid JSON Patch operation');
+    }
+  }
+  const runIds = new Set<string>();
+  for (const rawEvent of events) {
+    if (rawEvent === null || typeof rawEvent !== 'object' || Array.isArray(rawEvent)) throw new Error('ARG promotion fixture contains a non-object event');
+    const event = rawEvent as ArgPromotionEvidenceEvent;
+    if (typeof event.runId !== 'string' || !event.runId.trim() || typeof event.timestamp !== 'string'
+      || !Number.isFinite(Date.parse(event.timestamp)) || typeof event.trigger !== 'string' || !event.trigger.trim()
+      || !['adaptation', 'baseline', 'shadow'].includes(event.phase)) {
+      throw new Error('ARG promotion fixture contains an invalid event');
+    }
+    if (runIds.has(event.runId)) throw new Error(`ARG promotion fixture repeats runId ${event.runId}`);
+    runIds.add(event.runId);
+    if ((event.phase === 'adaptation' || event.phase === 'baseline') && typeof event.landed !== 'boolean') {
+      throw new Error(`ARG promotion ${event.phase} event requires landed`);
+    }
+    if (event.phase === 'shadow' && typeof event.shadowAccepted !== 'boolean') {
+      throw new Error('ARG promotion shadow event requires shadowAccepted');
+    }
+  }
+
+  const matching = events.filter((event) => event.trigger === trigger);
+  const adaptations = matching.filter((event) => event.phase === 'adaptation');
+  const baseline = matching.filter((event) => event.phase === 'baseline');
+  const shadow = matching.filter((event) => event.phase === 'shadow');
+  const rate = (rows: readonly ArgPromotionEvidenceEvent[]): number | null => rows.length === 0
+    ? null : rows.filter((event) => event.landed === true).length / rows.length;
+  const adaptationLandingRate = rate(adaptations);
+  const baselineLandingRate = rate(baseline);
+  const landingDelta = adaptationLandingRate === null || baselineLandingRate === null
+    ? null : adaptationLandingRate - baselineLandingRate;
+  const adaptationSpanDays = promotionSpanDays(adaptations);
+  const baselineSpanDays = promotionSpanDays(baseline);
+  const adaptationWindowDays = adaptationSpanDays === null || baselineSpanDays === null
+    ? null : Math.min(adaptationSpanDays, baselineSpanDays);
+  const shadowWindowDays = promotionSpanDays(shadow);
+  const evidenceEnd = Math.max(...[...adaptations, ...baseline].map((event) => Date.parse(event.timestamp)));
+  const shadowStart = Math.min(...shadow.map((event) => Date.parse(event.timestamp)));
+  const blockers: string[] = [];
+  if (adaptations.length < 5) blockers.push('same-trigger-adaptations-below-5');
+  if (baseline.length === 0) blockers.push('same-trigger-baseline-missing');
+  if (landingDelta === null || landingDelta < 0.2 - Number.EPSILON) blockers.push('landing-improvement-below-20pp');
+  if (adaptationWindowDays === null || adaptationWindowDays < 7) blockers.push('adaptation-evidence-window-under-7-days');
+  if (shadow.length < 2 || shadowWindowDays === null || shadowWindowDays < 7) blockers.push('shadow-window-under-7-days');
+  if (!Number.isFinite(evidenceEnd) || !Number.isFinite(shadowStart) || shadowStart < evidenceEnd) blockers.push('shadow-starts-before-evidence-window');
+  if (shadow.some((event) => event.shadowAccepted !== true)) blockers.push('shadow-evaluation-declined');
+
+  const metrics = { trigger, adaptationRuns: adaptations.length, adaptationLandingRate,
+    baselineRuns: baseline.length, baselineLandingRate, landingDelta, adaptationWindowDays,
+    shadowObservations: shadow.length, shadowWindowDays };
+  if (blockers.length > 0) return { mockOnly: true, verdict: 'held', blockers, metrics };
+  const promotedFrom = adaptations.map((event) => event.runId).sort();
+  return {
+    mockOnly: true, verdict: 'eligible-for-human-pr', blockers, metrics,
+    proposal: {
+      action: 'proposal-only', promoted_from: promotedFrom,
+      evidence: {
+        source: 'injected-mock-fixture', trigger, adaptationRuns: promotedFrom,
+        baselineRuns: baseline.map((event) => event.runId).sort(),
+        adaptationLandingRate, baselineLandingRate, landingDelta,
+        adaptationWindowDays, shadowRunIds: shadow.map((event) => event.runId).sort(), shadowWindowDays,
+      },
+      overlay: { overlay_id: candidate.overlayId, target: candidate.target, stage: 'launch',
+        applies_when: candidate.appliesWhen, patch: candidate.patch },
+      rollback: 'open a human-reviewed demotion PR if the 7-day landing rate declines',
+      patentReview: 'ELA-53 human review pending',
+    },
+  };
+}
+
 const STAGES = new Set<OverlayStage>(['launch', 'runtime', 'heal']);
 const OPS = new Set(['add', 'replace', 'remove']);
 

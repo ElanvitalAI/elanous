@@ -1356,6 +1356,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   // Wired below once the workflow daemon is constructed.
   let webPushDecisionTimer: ReturnType<typeof setInterval> | undefined;
   let workflowDiscordBot: NexusDiscordTriggerBotHandle | undefined;
+  let workflowGrokbotBot: { start(): void; stop(): Promise<void> } | undefined;
   // V2.2-4 (2026-05-12) — NEXUS-hosted Telegram workflow trigger bot.
   let workflowTelegramBot: NexusTelegramTriggerBotHandle | undefined;
   /** R1 — 토큰마다 뜬 Q&A 폴러 «전부»(재시작 때 함께 비운다 · `workflowTelegramBot` 은 주 토큰 하나뿐). */
@@ -2812,6 +2813,16 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
               for (const wired of handles) adopt(wired);
             }
           }
+          if (process.env.ELANOUS_GROKBOT_ENABLED === '1' && !isAutonomousRunContext()) {
+            const { createGrokbotMainSessionDispatcher, createNexusGrokbotTriggerBot, createSshGrokbotMailbox } = await import('./api/grokbot-trigger-bot.js');
+            const { makeElanousAgentRunTurn } = await import('../agent/monad-agent-turn.js');
+            workflowGrokbotBot = createNexusGrokbotTriggerBot({
+              mailbox: createSshGrokbotMailbox(),
+              dispatch: createGrokbotMainSessionDispatcher(cfg, makeElanousAgentRunTurn(cfg, 'telegram')),
+            });
+            workflowGrokbotBot.start();
+            debug.log('channel.grokbot', 'attached', { agent: 'COO', pollIntervalMs: 15_000 });
+          }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[nexus] trigger bot boot skipped: ${msg}`);
@@ -3592,6 +3603,10 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     await Promise.all([...handles].map(async (handle) => {
       try { await handle.stop(); } catch { /* 종료는 계속 */ }
     }));
+    if (workflowGrokbotBot) {
+      try { await workflowGrokbotBot.stop(); } catch { /* 종료는 계속 */ }
+      workflowGrokbotBot = undefined;
+    }
     await next();
   };
 

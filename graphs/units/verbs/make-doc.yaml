@@ -32,3 +32,4 @@ edges:
   - from: document-draft
     on: outcome
     map: { done: done, rework: rework, needs-human: needs-human, failed: failed }
+    fallback: [{ node: failed, requires: [] }]

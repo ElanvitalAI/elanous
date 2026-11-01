@@ -12,11 +12,16 @@ export const CONTROL_HOSTNAME = '127.0.0.1';
 const MAX_POD_WORKER_TTL_MS = 24 * 60 * 60 * 1000;
 const POD_WORKER_TIMEOUT_FENCE_MS = 150_000;
 
-export function allowedControlHostname(hostname: string): boolean {
+function controlHostnameAllowed(hostname: string, allowClusterBind: boolean): boolean {
+  // Cluster-facing binds require an explicit opt-in; wildcard exposure is never inferred from the address.
+  if (hostname === '0.0.0.0') return allowClusterBind;
   if (hostname === '127.0.0.1' || hostname === '::1') return true;
   const parts = hostname.split('.');
   if (parts.length !== 4 || !parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255)) return false;
   return parts[0] === '100' && Number(parts[1]) >= 64 && Number(parts[1]) <= 127;
+}
+export function allowedControlHostname(hostname: string): boolean {
+  return controlHostnameAllowed(hostname, false);
 }
 export type ControlScope = 'admin' | 'member' | 'query';
 export type ControlTokens = Record<ControlScope, string>;
@@ -89,6 +94,7 @@ export interface ControlServerOptions {
   root?: string;
   port?: number;
   hostname?: string;
+  allowClusterBind?: boolean;
   leaseView?: LeaseHolderView;
   requireKnownLeaseForWrites?: boolean;
 }
@@ -99,7 +105,7 @@ export function startControlServer(opts: ControlServerOptions = {}): {
   stop(): void;
 } {
   const hostname = opts.hostname ?? CONTROL_HOSTNAME;
-  if (!allowedControlHostname(hostname)) throw new Error('invalid control hostname');
+  if (!controlHostnameAllowed(hostname, opts.allowClusterBind ?? false)) throw new Error('invalid control hostname');
   const root = opts.root ?? effectiveInstanceRoot();
   const tokens = ensureControlTokens(root);
   const ledger = new ResourceLedger(root);
@@ -127,7 +133,7 @@ export function startControlServer(opts: ControlServerOptions = {}): {
         const leaseRenewal = /^\/v1\/leases\/port\/([^/]+)\/heartbeat$/.exec(path);
         const workerRegister = path === '/v1/workers/pod' && method === 'POST';
         const workerAcquire = path === '/v1/leases/pod-worker' && method === 'POST';
-        const workerTransition = /^\/v1\/leases\/pod-worker\/([^/]+)\/(renew|release|sanitize|quarantine|timeout)$/.exec(path);
+        const workerTransition = /^\/v1\/leases\/pod-worker\/([^/]+)\/(renew|release|sanitize|quarantine|timeout|reap)$/.exec(path);
         if (!resourcePath && !registerPath && !leaseRequest && !workerRegister && !workerAcquire && !(workerTransition && method === 'POST') && !(leaseDeletion && method === 'DELETE') && !(leaseRenewal && method === 'POST') && !(heartbeat && method === 'POST') && !(deletion && method === 'DELETE')) {
           return json({ error: 'not-found' }, 404);
         }
@@ -177,10 +183,13 @@ export function startControlServer(opts: ControlServerOptions = {}): {
               () => ledger.registerPodWorker({ workerId, machine: workerMachine, podUid, key: podWorkerKey(key), ttlMs, owner })));
           }
           if (workerAcquire) {
-            if (scope !== 'member') throw new ResourceLedgerError(403, 'worker-consumer-required');
+            // A host-scoped provider may acquire only its own worker lease. Global consumers
+            // retain the member scope; a machine credential can never select another host.
+            if (scope !== 'member' && !machine) throw new ResourceLedgerError(403, 'worker-consumer-required');
             const body = podWorkerBody(await req.json());
             const { machine: workerMachine, key, runId, attemptId, ttlMs } = body;
             if (workerMachine !== undefined && (typeof workerMachine !== 'string' || !workerMachine.trim())) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
+            if (machine && workerMachine !== machine) throw new ResourceLedgerError(403, 'machine-scope');
             if (typeof runId !== 'string' || !runId.trim() || typeof attemptId !== 'string' || !attemptId.trim()
               || typeof ttlMs !== 'number' || !Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > MAX_POD_WORKER_TTL_MS) throw new ResourceLedgerError(400, 'invalid-pod-worker-lease');
             const stale = await currentWorkerPrimary();
@@ -192,7 +201,19 @@ export function startControlServer(opts: ControlServerOptions = {}): {
           if (workerTransition) {
             const workerId = decodeURIComponent(workerTransition[1]!);
             if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(workerId)) throw new ResourceLedgerError(400, 'invalid-worker-id');
-            const action = workerTransition[2] as 'renew' | 'release' | 'sanitize' | 'quarantine' | 'timeout';
+            const action = workerTransition[2] as 'renew' | 'release' | 'sanitize' | 'quarantine' | 'timeout' | 'reap';
+            if (action === 'reap') {
+              if (!machine) throw new ResourceLedgerError(403, 'worker-reap-host-required');
+              const body = podWorkerBody(await req.json());
+              const podUid = body.podUid;
+              if (typeof podUid !== 'string' || !podUid.trim()) throw new ResourceLedgerError(400, 'invalid-pod-worker-reap');
+              const id = `pod-worker-lease:${workerId}`;
+              requireTarget(id);
+              const stale = await currentWorkerPrimary();
+              if (stale) return stale;
+              return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
+                () => ledger.reservePodWorkerReap(id, { machine, podUid })));
+            }
             if (action === 'timeout') {
               if (scope !== 'member') throw new ResourceLedgerError(403, 'worker-timeout-scope');
               const body = podWorkerBody(await req.json());

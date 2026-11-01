@@ -207,11 +207,13 @@ function detailOf(id: string, source: 'core' | 'mine', editable: boolean, dir: s
       const group = (node as { group?: unknown }).group;
       return { node_id: nodeId, kind, recipe, max_visits: maxVisits, ...(typeof group === 'string' && group.trim() ? { group: group.trim() } : {}) };
     }),
-    edges: spec.edges.map(({ from, to, on, map }) => ({
+    edges: spec.edges.map(({ from, to, on, map, branches, join }) => ({
       from,
       ...(to === undefined ? {} : { to }),
       ...(on === undefined ? {} : { on }),
       ...(map === undefined ? {} : { map }),
+      ...(branches === undefined ? {} : { branches }),
+      ...(join === undefined ? {} : { join }),
     })),
   });
 }
@@ -287,7 +289,7 @@ export function handleGraphsGet(pathname: string, dir = defaultGraphsDir(), deps
           terminal_nodes: flat.terminalNodes,
           graph_hash: graphVersionHash(flat),
           nodes: flat.nodes.map(({ nodeId, kind, recipe, maxVisits }) => ({ node_id: nodeId, kind, recipe, max_visits: maxVisits })),
-          edges: flat.edges.map(({ from, to, on, map, fallback }) => ({ from, ...(to === undefined ? {} : { to }), ...(on === undefined ? {} : { on }), ...(map === undefined ? {} : { map }), ...(fallback === undefined ? {} : { fallback }) })),
+          edges: flat.edges.map(({ from, to, on, map, fallback, branches, join }) => ({ from, ...(to === undefined ? {} : { to }), ...(on === undefined ? {} : { on }), ...(map === undefined ? {} : { map }), ...(fallback === undefined ? {} : { fallback }), ...(branches === undefined ? {} : { branches }), ...(join === undefined ? {} : { join }) })),
         });
       } catch (error) {
         return jsonResponse({ error: 'unit-flatten-failed', id, message: error instanceof Error ? error.message : String(error) }, 422);

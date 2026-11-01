@@ -164,6 +164,67 @@ test('a timeout fence blocks only its worker, quarantines late replies, and reta
   });
 });
 
+test('a Pod UID cannot be registered under a second worker or machine during quarantine cleanup', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-uid-unique-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const registered = ledger.registerPodWorker({ workerId: 'worker-quarantined', machine: 'node-c', podUid: 'pod-shared',
+    key, owner: 'host', ttlMs: 10_000 }, 100);
+  const acquired = ledger.acquirePodWorker({ key, owner: 'gate', runId: 'reap-run', attemptId: 'reap-attempt', ttlMs: 10_000 }, 101);
+  ledger.transitionPodWorker(registered.id, { owner: 'gate', leaseId: acquired.attrs.leaseId as string,
+    generation: acquired.attrs.generation as number, action: 'quarantine' }, 102);
+  expect(() => ledger.registerPodWorker({ workerId: 'worker-alias', machine: 'other-host', podUid: 'pod-shared',
+    key, owner: 'other-host', ttlMs: 10_000 }, 101)).toThrow('pod-uid-already-registered');
+  expect(ledger.list({ kind: 'pod-worker-lease' })).toHaveLength(1);
+});
+
+test('an expired idle worker cannot be fenced back into eligibility', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-expired-idle-fence-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const registered = ledger.registerPodWorker({ workerId: 'worker-expired-idle', machine: 'node-c', podUid: 'pod-expired',
+    key, owner: 'host', ttlMs: 10 }, 100);
+  expect(() => ledger.fenceTimedOutPodWorker(registered.id,
+    { owner: 'gate', runId: 'expired-run', attemptId: 'expired-attempt', fenceMs: 20 }, 111))
+    .toThrow('stale-timeout-fence');
+  expect(() => ledger.acquirePodWorker({ key, owner: 'gate', runId: 'next-run', attemptId: 'next-attempt', ttlMs: 100 }, 111))
+    .toThrow('no-warm-worker');
+});
+
+test('idle expiry continues through an elapsed timeout fence', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-timeout-preserves-expiry-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const registered = ledger.registerPodWorker({ workerId: 'worker-expiring-fence', machine: 'node-c', podUid: 'pod-expiring',
+    key, owner: 'host', ttlMs: 10 }, 100);
+  ledger.fenceTimedOutPodWorker(registered.id,
+    { owner: 'gate', runId: 'fenced-run', attemptId: 'fenced-attempt', fenceMs: 10 }, 105);
+  expect(() => ledger.acquirePodWorker({ key, owner: 'gate', runId: 'next-run', attemptId: 'next-attempt', ttlMs: 100 }, 115))
+    .toThrow('no-warm-worker');
+  expect(ledger.list({ name: 'worker-expiring-fence' }, 115)[0]).toMatchObject({
+    observedAt: 100, ttlMs: 10, attrs: { state: 'idle' }, expired: true,
+  });
+});
+
+test('a durable reap reservation blocks a timeout-fence expiry acquisition race', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-reap-reservation-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const row = ledger.registerPodWorker({ workerId: 'worker-reap-reservation', machine: 'node-c', podUid: 'pod-reap',
+    key, owner: 'host', ttlMs: 10_000 }, 100);
+  ledger.fenceTimedOutPodWorker(row.id,
+    { owner: 'gate', runId: 'unanswered-run', attemptId: 'unanswered-attempt', fenceMs: 150 }, 102);
+  const reserved = ledger.reservePodWorkerReap(row.id, { machine: 'node-c', podUid: 'pod-reap' }, 251);
+  expect(reserved.attrs.state).toBe('reaping');
+  expect(() => ledger.acquirePodWorker({ key, owner: 'next', runId: 'next-run', attemptId: 'next-attempt', ttlMs: 100 }, 252))
+    .toThrow('no-warm-worker');
+  expect(ledger.list({ name: 'worker-reap-reservation' })[0]?.attrs.state).toBe('reaping');
+});
+
 test('a legacy idle row with a whitespace Pod UID cannot be leased', () => {
   const root = mkdtempSync(join(tmpdir(), 'elanous-worker-blank-uid-'));
   roots.push(root);

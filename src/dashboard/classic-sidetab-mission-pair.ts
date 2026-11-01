@@ -55,10 +55,11 @@ export function startClassicSidetabMissionPair<Session extends ClassicSidetabPai
   // callId is the parent tool invocation identity; falling back to a mission id
   // preserves queue uniqueness for embedders that do not expose a call id.
   const taskId = deps.context?.callId || activeCodexMissionId || activeClaudeMissionId || createId();
+  const workspaceDir = codexSession?.cwd ?? claudeSession?.cwd ?? '';
   const completion = missionIds.length
     ? enqueueClassicSidetabMissionPairCompletion({
-      codex: { missionId: activeCodexMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, completion: codexCompletion },
-      claude: { missionId: activeClaudeMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, completion: claudeCompletion },
+      codex: { missionId: activeCodexMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, mission: codexPrompt, workspaceDir, completion: codexCompletion },
+      claude: { missionId: activeClaudeMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, mission: claudePrompt, workspaceDir, completion: claudeCompletion },
     }, deps.enqueue, deps.now, {
       timeoutMs: deps.timeoutMs,
       onTimeout: () => { for (const sessionId of sessionIds) if (deps.hasSession(sessionId)) deps.killSession(sessionId); },

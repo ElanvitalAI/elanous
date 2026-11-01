@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, spyOn, 
 // 넘긴다(실측 5.9~6.8초). 상한을 파일 단위로 올려 부하에 따른 flake 를 없앤다 — 시험 동작은 불변.
 setDefaultTimeout(30_000);
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
+import { runGraph } from '../graph-runner/runner.js';
 import { loadRunLedger, runLedgerDir, appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 import { readRunStopRecord } from '../self-implement/run-stop.js';
 import { debug } from '../debug/log.js';
@@ -267,6 +268,36 @@ describe('harness CLI command', () => {
     }
     return lines;
   }
+
+  test('local harness ask and say carry the approved graph-growth scope into their handler', async () => {
+    const runScopedGrowthGraph = async () => {
+      const root = mkdtempSync(join(tmpdir(), 'harness-growth-scope-'));
+      try {
+        const graphPath = join(root, 'graph.yaml');
+        writeFileSync(join(root, 'recipes.yaml'), 'judge:\n  command: "true"\n');
+        writeFileSync(graphPath, `grow: on\ngraph_id: growth\nversion: 1\nentry_node: judge\nterminal_nodes: [done]\nnodes:\n  - { node_id: judge, kind: judge, recipe: 'cmd:judge', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - from: judge\n    on: outcome\n    map: { ok: done }\n`);
+        let proposals = 0;
+        const run = await runGraph(graphPath, { deps: { root,
+          runBash: async () => ({ stdout: '{"outcome":"needs-research"}\n', stderr: '', exitCode: 0 }),
+          growthProposer: async () => { proposals += 1; return undefined; },
+        } });
+        expect(run.path).toEqual(['judge', 'done']);
+        expect(run.growthRejections).toHaveLength(1);
+        expect(proposals).toBe(1);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    };
+    const goal = join(tmpdir(), `harness-growth-scope-${crypto.randomUUID()}.md`);
+    writeFileSync(goal, '대상 경로: src/placeholder.ts\n');
+    let askRuns = 0;
+    let sayRuns = 0;
+    const { program } = install(async () => { askRuns += 1; await runScopedGrowthGraph(); }, async () => { sayRuns += 1; await runScopedGrowthGraph(); });
+    try {
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'local', '--seat', 'TC', '--no-queue']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'scope probe', '--substrate', 'local', '--seat', 'TC', '--no-queue']);
+      expect(askRuns).toBe(1);
+      expect(sayRuns).toBe(1);
+    } finally { rmSync(goal, { force: true }); }
+  });
 
   function processFixture(
     overrides: Partial<HarnessProcessRecord> & Pick<HarnessProcessRecord, 'pid'>,

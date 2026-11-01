@@ -16,7 +16,7 @@ export function reflectionFilename(summary: PeriodSummary): string {
 }
 
 /** 결정론 마크다운 리포트(순수). LLM 서사는 opts.narrative 로 주입(opt-in). */
-export function renderReflectionMd(summary: PeriodSummary, opts: { narrative?: string; proposalMd?: string } = {}): string {
+export function renderReflectionMd(summary: PeriodSummary, opts: { narrative?: string; proposalMd?: string; featureProposalMd?: string } = {}): string {
   const { window: w, backtest: b, regime: r, trades: t, highlights } = summary;
   const L: string[] = [];
   L.push(`# ${PERIOD_KO[w.period]} 회고 — ${w.from} ~ ${w.to}`);
@@ -81,6 +81,11 @@ export function renderReflectionMd(summary: PeriodSummary, opts: { narrative?: s
   if (opts.proposalMd && opts.proposalMd.trim()) {
     L.push('## 리밸런싱·목표 제안 (HITL 승인 필요)');
     L.push(opts.proposalMd.trim());
+    L.push('');
+  }
+
+  if (opts.featureProposalMd && opts.featureProposalMd.trim()) {
+    L.push(opts.featureProposalMd.trim());
     L.push('');
   }
 

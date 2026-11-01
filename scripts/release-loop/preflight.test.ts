@@ -62,12 +62,89 @@ function deps(root: string, extra: Partial<PreflightDeps> = {}): PreflightDeps {
     schedule: () => ({ version: '0.2.18', cutAt: '2026-10-06T21:00:00.000Z', landBy: '2026-10-06T20:30:00.000Z', updatedAt: NOW.toISOString(), updatedBy: 'test' }),
     graphRunsRoot: join(root, 'graph-runs', 'release-loop'),
     exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 0 }),
+    gitIgnoredExportCheck: async () => 0,
     releaseNotesCheck: async () => 1,
+    pwaBuildCheck: async () => ({ ok: true, detail: 'fixture build passed', commit: 'b'.repeat(40) }),
+    gateImageTagCheck: () => ({ checked: true, pools: ['pool-test'] }),
     releaseRunDeps: { freezeRoot: root },
     publishAt: '2026-10-06T23:30:00.000Z',
     ...extra,
   };
 }
+
+test('RELEASE-PREFLIGHT-CATCH-FOUR: normal T−60 inputs pass all four release blockers', () => isolated(async (root) => {
+  const result = await releasePreflight('0.2.18', deps(root, {
+    countdown: true,
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 1, byNextMd: 1, unlinked: 0, unknown: 0 }, escalate: [] }),
+  }));
+  for (const check of ['cutoff-notes', 'gitignored-export', 'pwa-build', 'gate-image'] as const) {
+    expect(result.findings.find((finding) => finding.check === check)?.level).toBe('ok');
+  }
+}));
+
+test('RELEASE-PREFLIGHT-CATCH-FOUR: each missing/corrupt cutoff prerequisite blocks independently', () => isolated(async (root) => {
+  const base = { manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 1, byNextMd: 1, unlinked: 0, unknown: 0 }, escalate: [] }) };
+  const notes = await releasePreflight('0.2.18', deps(root, {
+    countdown: true,
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 0, byNextMd: 0, unlinked: 0, unknown: 0 }, escalate: [{ kind: 'notes-empty' }] }),
+  }));
+  expect(notes.findings.find((finding) => finding.check === 'cutoff-notes')).toMatchObject({ level: 'block', message: expect.stringContaining('notes-empty') });
+
+  const prOnlyNotes = await releasePreflight('0.2.18', deps(root, {
+    countdown: true,
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 1, byNextMd: 0, unlinked: 0, unknown: 0 }, escalate: [] }),
+  }));
+  expect(prOnlyNotes.findings.find((finding) => finding.check === 'cutoff-notes')).toMatchObject({ level: 'ok', message: expect.stringContaining('PR 1') });
+
+  const corruptManifest = await releasePreflight('0.2.18', deps(root, {
+    countdown: true,
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: Number.NaN, byNextMd: 0, unlinked: 0, unknown: 0 }, escalate: [] }),
+  }));
+  expect(corruptManifest.findings.find((finding) => finding.check === 'cutoff-notes')).toMatchObject({ level: 'block', message: expect.stringContaining('확인 불가') });
+
+  const emptyManifest = await releasePreflight('0.2.18', deps(root, {
+    countdown: true,
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 0, byNextMd: 0, unlinked: 0, unknown: 0 }, escalate: [] }),
+  }));
+  expect(emptyManifest.findings.find((finding) => finding.check === 'cutoff-notes')).toMatchObject({ level: 'block' });
+
+  const ignored = await releasePreflight('0.2.18', deps(root, {
+    ...base, countdown: true, gitIgnoredExportCheck: async () => 2,
+  }));
+  expect(ignored.findings.find((finding) => finding.check === 'gitignored-export')).toMatchObject({ level: 'block', message: expect.stringContaining('2건') });
+
+  const ignoredError = await releasePreflight('0.2.18', deps(root, {
+    ...base, countdown: true, gitIgnoredExportCheck: async () => { throw new Error('cutoff checkout failed'); },
+  }));
+  expect(ignoredError.findings.find((finding) => finding.check === 'gitignored-export')).toMatchObject({ level: 'block', message: expect.stringContaining('cutoff checkout failed') });
+  expect(ignoredError.cutoffExportCheck).toMatchObject({ commit: 'b'.repeat(40), gitIgnoredLeaks: null, error: 'cutoff checkout failed' });
+
+  const pwa = await releasePreflight('0.2.18', deps(root, { ...base, countdown: true, pwaBuildCheck: async () => ({ ok: false, detail: 'candidate PWA build failed', commit: 'b'.repeat(40) }) }));
+  expect(pwa.findings.find((finding) => finding.check === 'pwa-build')).toMatchObject({ level: 'block', message: expect.stringContaining('PWA 빌드 실패') });
+
+  const mismatchedBuild = await releasePreflight('0.2.18', deps(root, {
+    ...base, countdown: true,
+    pwaBuildCheck: async () => ({ ok: true, commit: 'c'.repeat(40), detail: 'build passed for another SHA' }),
+  }));
+  expect(mismatchedBuild.findings.find((finding) => finding.check === 'pwa-build')).toMatchObject({ level: 'block', message: expect.stringContaining('SHA 불일치') });
+
+  const image = await releasePreflight('0.2.18', deps(root, { ...base, countdown: true, gateImageTagCheck: () => ({ checked: true, pools: [] }) }));
+  expect(image.findings.find((finding) => finding.check === 'gate-image')).toMatchObject({ level: 'block', message: expect.stringContaining('어느 풀에도 없다') });
+}));
+
+test('RELEASE-PREFLIGHT-CATCH-FOUR: countdown assigns all four findings to T−60', () => isolated(async (root) => {
+  addItem('0.2.18', { id: 'A1', title: 'cell A1', owner: 'TC' });
+  setItem('0.2.18', 'A1', { status: 'green' }, 'TC');
+  const result = await runReleaseCountdown('0.2.18', deps(root, {
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 1, byNextMd: 1, unlinked: 0, unknown: 0 }, escalate: [] }),
+    gateSlot: () => ({ dispatcherPaused: true, podTargetFrom: 6, podTargetTo: 2 }),
+  }));
+  const cutoffFindings = result.steps[1]?.findings.filter((finding) => ['cutoff-notes', 'gitignored-export', 'pwa-build', 'gate-image'].includes(finding.check)) ?? [];
+  expect(cutoffFindings).toHaveLength(4);
+  expect(new Set(cutoffFindings.map((finding) => finding.check)).size).toBe(4);
+  expect(result.steps[1]?.level).toBe('ok');
+  expect(result.steps[0]?.findings.some((finding) => ['cutoff-notes', 'gitignored-export', 'pwa-build', 'gate-image'].includes(finding.check))).toBe(false);
+}));
 
 test('T−120 countdown readiness summarizes pinned release notes, public export and checklist without claiming execution', () => isolated(async (root) => {
   const result = await releasePreflight('0.2.18', deps(root, { countdown: true, releaseNotesCheck: async () => 2 }));
@@ -105,6 +182,7 @@ test('ordinary preflight does not run or block on the T−120 release notes chec
 test('F9 export preflight records one main head, separates code literals, and names the cut-minus-60 manual check time', () => isolated(async (root) => {
   const result = await releasePreflight('0.2.18', deps(root, { now: new Date('2026-10-06T20:00:00.000Z'), exportCheck: async () => ({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 2 }) }));
   expect(result.exportCheck).toEqual({ mainSha: 'a'.repeat(40), files: 123, leaks: 0, codeLiterals: 2 });
+  expect(result.cutoffExportCheck).toBeNull();
   expect(result.schedule?.exportCheckAt).toBe('2026-10-06T20:00:00.000Z');
   expect(result.findings.find((f) => f.check === 'export' && f.level === 'ok')?.message).toContain('aaaaaaaaaaaa');
   expect(result.findings.find((f) => f.check === 'export' && f.level === 'warn')?.message).toContain('코드 리터럴 표지 2건');
@@ -250,6 +328,8 @@ test('real CLI: without release.loop.gatePodPool, preflight surfaces the actual 
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
   writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
   writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: {} } }));
+  mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
+  writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
   try {
     const repo = join(import.meta.dir, '../..');
     const env = { ...process.env, HOME: home, ELANOUS_STATE_DIR: root };

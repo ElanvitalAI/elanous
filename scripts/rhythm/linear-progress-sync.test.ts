@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { Checklist } from '../../src/release-loop/checklist.js';
 import type { DecisionEntry } from '../../src/decisions/decision-ledger.js';
 import { renderProgressPreview, resolveExplicitProgressLinks, runLinearProgressSync, type ProgressIssue } from './linear-progress-sync.js';
@@ -12,9 +12,9 @@ const checklist = (items: Checklist['items']): Checklist => ({
 const item = (id: string, title: string, status: Checklist['items'][number]['status'] = 'yellow', evidence?: string): Checklist['items'][number] => ({
   id, title, status, updatedAt: '2026-10-30T00:00:00.000Z', updatedBy: 'OPT', ...(evidence ? { evidence } : {}),
 });
-const issue = (identifier: string, description = ''): ProgressIssue => ({
+const issue = (identifier: string, description = '', teamKey = 'DEMO'): ProgressIssue => ({
   id: `uuid-${identifier}`, identifier, title: `Issue ${identifier}`, url: `https://linear.example/${identifier}`,
-  state: 'Todo', description,
+  state: 'Todo', description, teamKey,
 });
 
 describe('LINEAR-PROGRESS-SYNC explicit references', () => {
@@ -105,6 +105,153 @@ describe('LINEAR-PROGRESS-SYNC explicit references', () => {
       expect(checks).toHaveLength(2);
       expect(posts).toHaveLength(1);
       expect(posts[0]).toContain('<!-- elanous-linear-progress:2026-10-30:DEMO-1 -->');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('mock ELA progress transition requests one summary comment and emits a runId event', async () => {
+    const runId = 'run-linear-progress-mock-e4-0244';
+    const day = '2026-11-01';
+    const cellId = 'LINEAR-PROGRESS-SYNC';
+    const board = checklist([item(cellId, 'Daily progress sync', 'green', 'PR #33703 merged · green(sim)')]);
+    board.history.push({ at: '2026-11-01T02:00:00.000Z', by: 'OPT', id: cellId, field: 'status',
+      from: 'yellow', to: 'green', released: '0.2.43', dev: '0.2.43-dev.0' });
+    const root = mkdtempSync(join(tmpdir(), 'linear-progress-sync-mock-e4-'));
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const requests: Array<{ identifier: string; body: string }> = [];
+    const markerReads: number[] = [];
+    const timeline: string[] = [];
+    try {
+      const result = await runLinearProgressSync({
+        version: '0.2.43', now: new Date('2026-11-01T03:00:00.000Z'), root, runId, checklist: board,
+        issues: [issue('DEMO-1', cellId, 'DEMO')], decisions: [], getApiKey: async () => 'mock-only',
+        countMarker: async () => {
+          const count = markerReads.length === 0 ? 0 : 1;
+          markerReads.push(count);
+          timeline.push(`marker:${count}`);
+          return count;
+        },
+        postComment: async (candidate, body) => {
+          timeline.push('request');
+          requests.push({ identifier: candidate.identifier, body });
+        },
+        apply: true, allowIssueIdentifiers: ['DEMO-1'],
+        log: (event, data) => events.push({ event, data }),
+      });
+      expect(result.posted).toEqual(['DEMO-1']);
+      expect(result.failures).toEqual([]);
+      expect(markerReads).toHaveLength(2);
+      expect(timeline).toEqual(['marker:0', 'request', 'marker:1']);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.body).toContain('- 오늘 상태 변화: LINEAR-PROGRESS-SYNC yellow → green');
+      expect(requests[0]?.body).toContain('- 연결 칸: LINEAR-PROGRESS-SYNC — green(sim)');
+      expect(events).toContainEqual({ event: 'posted', data: expect.objectContaining({
+        day, identifier: 'DEMO-1', markerCount: 1, runId,
+      }) });
+      const capture = { mode: 'mock-only', network: false, assertionsPassed: true, runId, result, markerReads, timeline, requests, events };
+      const capturePath = process.env.ELANOUS_LINEAR_PROGRESS_E4_CAPTURE;
+      if (capturePath) {
+        mkdirSync(dirname(capturePath), { recursive: true });
+        writeFileSync(capturePath, `${JSON.stringify(capture, null, 2)}\n`);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('live apply skips non-DEMO or unknown teams before marker reads and comments', async () => {
+    const board = checklist([
+      item('ELA-SCOPE', 'ELA source', 'yellow', 'linear-ref: ELA-53'),
+      item('DEMO-SCOPE', 'DEMO source', 'yellow', 'linear-ref: DEMO-2'),
+      item('UNKNOWN-SCOPE', 'Unknown source', 'yellow', 'linear-ref: DEMO-3'),
+    ]);
+    const root = mkdtempSync(join(tmpdir(), 'linear-progress-sync-team-scope-'));
+    const markerReads: string[] = [];
+    const posts: string[] = [];
+    try {
+      const result = await runLinearProgressSync({
+        version: '0.2.43', now: new Date('2026-10-30T12:00:00.000Z'), root, checklist: board,
+        issues: [issue('ELA-53', 'ELA-SCOPE', 'ELA'), issue('DEMO-2', 'DEMO-SCOPE'), issue('DEMO-3', 'UNKNOWN-SCOPE', '')],
+        decisions: [], getApiKey: async () => 'test-key',
+        countMarker: async candidate => { markerReads.push(candidate.identifier); return markerReads.length === 1 ? 0 : 1; },
+        postComment: async candidate => { posts.push(candidate.identifier); },
+        apply: true, allowIssueIdentifiers: ['ELA-53', 'DEMO-2', 'DEMO-3'],
+      });
+      expect(result.posted).toEqual(['DEMO-2']);
+      expect(result.skipped.sort()).toEqual(['DEMO-3', 'ELA-53']);
+      expect(result.failures).toEqual([]);
+      expect(markerReads).toEqual(['DEMO-2', 'DEMO-2']);
+      expect(posts).toEqual(['DEMO-2']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('default preview queries DEMO only and parses the returned team key', async () => {
+    const board = checklist([item('DEMO-CELL', 'Demo progress', 'yellow', 'linear-ref: DEMO-1')]);
+    const root = mkdtempSync(join(tmpdir(), 'linear-progress-sync-preview-team-'));
+    const requestedTeams: string[] = [];
+    try {
+      const result = await runLinearProgressSync({
+        version: '0.2.43', now: new Date('2026-10-30T12:00:00.000Z'), root, checklist: board,
+        decisions: [], getApiKey: async () => 'test-key', countMarker: async () => 0,
+        fetch: (async (_input, init) => {
+          const payload = JSON.parse(String(init?.body)) as { variables: { teamKey: string } };
+          requestedTeams.push(payload.variables.teamKey);
+          return Response.json({ data: { issues: { nodes: [{ id: 'uuid-DEMO-1', identifier: 'DEMO-1', title: 'Demo',
+            url: 'https://linear.example/DEMO-1', description: 'DEMO-CELL', state: { name: 'Todo' }, team: { key: 'DEMO' } }],
+            pageInfo: { hasNextPage: false, endCursor: null } } } });
+        }) as typeof fetch,
+      });
+      expect(requestedTeams).toEqual(['DEMO']);
+      expect(result.candidates.map(candidate => candidate.identifier)).toEqual(['DEMO-1']);
+      expect(result.skipped).toEqual(['DEMO-1']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('parsed DEMO team key reaches the injected apply path', async () => {
+    const board = checklist([item('DEMO-CELL', 'Demo progress', 'yellow', 'linear-ref: DEMO-1')]);
+    const root = mkdtempSync(join(tmpdir(), 'linear-progress-sync-parsed-team-'));
+    let markerReads = 0;
+    let commentWrites = 0;
+    try {
+      const result = await runLinearProgressSync({
+        version: '0.2.43', now: new Date('2026-10-30T12:00:00.000Z'), root, checklist: board,
+        decisions: [], getApiKey: async () => 'test-key', apply: true, allowIssueIdentifiers: ['DEMO-1'],
+        countMarker: async () => ++markerReads === 1 ? 0 : 1,
+        postComment: async () => { commentWrites++; },
+        fetch: (async () => Response.json({ data: { issue: { id: 'uuid-DEMO-1', identifier: 'DEMO-1', title: 'Demo',
+          url: 'https://linear.example/DEMO-1', description: 'DEMO-CELL', state: { name: 'Todo' }, team: { key: 'DEMO' } } } })) as unknown as typeof fetch,
+      });
+      expect(result.posted).toEqual(['DEMO-1']);
+      expect(result.failures).toEqual([]);
+      expect(markerReads).toBe(2);
+      expect(commentWrites).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('allowlisted ELA response is rejected before marker lookup or comment write', async () => {
+    const board = checklist([item('ELA-CELL', 'ELA progress', 'yellow', 'linear-ref: ELA-53')]);
+    const root = mkdtempSync(join(tmpdir(), 'linear-progress-sync-allowlist-team-'));
+    let markerReads = 0;
+    let commentWrites = 0;
+    try {
+      const result = await runLinearProgressSync({
+        version: '0.2.43', now: new Date('2026-10-30T12:00:00.000Z'), root, checklist: board,
+        decisions: [], getApiKey: async () => 'test-key', apply: true, allowIssueIdentifiers: ['ELA-53'],
+        countMarker: async () => { markerReads++; return 0; }, postComment: async () => { commentWrites++; },
+        fetch: (async () => Response.json({ data: { issue: { id: 'uuid-ELA-53', identifier: 'ELA-53', title: 'ELA',
+          url: 'https://linear.example/ELA-53', description: 'ELA-CELL', state: { name: 'Todo' }, team: { key: 'ELA' } } } })) as unknown as typeof fetch,
+      });
+      expect(result.skipped).toEqual(['ELA-53']);
+      expect(result.posted).toEqual([]);
+      expect(markerReads).toBe(0);
+      expect(commentWrites).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

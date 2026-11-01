@@ -13,7 +13,8 @@ export interface ReleaseSimRigCase {
   id: string;
   mode?: 'baseline' | 'cut-tip-moved-after-resume';
   fault?: { node: string; outcome: 'fail' | 'error' | 'timeout'; evidence?: Record<string, unknown> };
-  expect: { status: 'done' | 'failed' | 'resume-refused'; mustVisit: string[]; mustNotVisit: string[] };
+  nodeOutcomes?: Record<string, { outcome: 'ok' | 'fail' | 'error'; delayMs?: number }>;
+  expect: { status: 'done' | 'failed' | 'resume-refused'; mustVisit: string[]; mustNotVisit: string[]; overlap?: [string, string]; refusalIncludes?: string };
 }
 
 export interface ReleaseSimRigScenario {
@@ -32,7 +33,9 @@ export interface ReleaseSimRigCaseResult {
   path: string[];
   dispatchedNodes: string[];
   unexpectedEdges: Array<{ from: string; to: string; outcome: string; expectedTo?: string }>;
-  checks: { status: boolean; mustVisit: boolean; mustNotVisit: boolean; ledgerEvents: boolean };
+  checks: { status: boolean; mustVisit: boolean; mustNotVisit: boolean; overlap: boolean; ledgerEvents: boolean };
+  fanOuts?: GraphRunState['fanOuts'];
+  nodeTimings?: Record<string, { startedAtMs: number; endedAtMs: number }>;
   injectedEvidence: Record<string, unknown>;
   ledgerEvents: Array<Record<string, unknown>>;
   statePath: string;
@@ -46,6 +49,7 @@ function unexpectedEdges(path: string[], state: GraphRunState, edges: Map<string
     const from = path[index]!;
     const to = path[index + 1]!;
     const edge = edges.get(from);
+    if (edge?.branches && edge.join === to) continue; // The runner records a fan-out's barrier as the parent-path successor.
     const output = nodes.get(from)?.output;
     let parsed: Record<string, unknown> = {};
     if (typeof output === 'string') {
@@ -100,8 +104,10 @@ function releaseGraphShape(): { nodeIds: Set<string>; edges: Map<string, Record<
   const edges = new Map<string, Record<string, unknown>>();
   for (const raw of graph.edges) {
     const edge = record(raw, 'release edge');
-    if (typeof edge.from !== 'string' || edge.on !== 'outcome' || !edge.map || typeof edge.map !== 'object') {
-      throw new Error('release simulation requires outcome edges with explicit maps');
+    const mapped = !!edge.map && typeof edge.map === 'object';
+    const branched = !!edge.branches && typeof edge.branches === 'object' && typeof edge.join === 'string';
+    if (typeof edge.from !== 'string' || edge.on !== 'outcome' || (!mapped && !branched)) {
+      throw new Error('release simulation requires outcome edges with explicit maps or fan-out joins');
     }
     if (edges.has(edge.from)) throw new Error(`release graph has multiple outcome edges from ${edge.from}`);
     edges.set(edge.from, edge);
@@ -128,7 +134,7 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
   const ids = new Set<string>();
   const cases = rawCases.map((raw, index): ReleaseSimRigCase => {
     const row = record(raw, `scenario.cases[${index}]`);
-    exactKeys(row, ['id', 'mode', 'fault', 'expect'], `scenario.cases[${index}]`);
+    exactKeys(row, ['id', 'mode', 'fault', 'nodeOutcomes', 'expect'], `scenario.cases[${index}]`);
     if (typeof row.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.id) || ids.has(row.id)) throw new Error(`scenario.cases[${index}].id must be unique lowercase text`);
     ids.add(row.id);
     let mode: ReleaseSimRigCase['mode'];
@@ -145,14 +151,35 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
       fault = { node: parsed.node, outcome: parsed.outcome, ...(parsed.evidence === undefined ? {} : { evidence: record(parsed.evidence, `scenario.cases[${index}].fault.evidence`) }) };
     }
     if ((mode === undefined) === (fault === undefined)) throw new Error(`scenario.cases[${index}] requires exactly one of mode or fault`);
+    const nodeOutcomes: ReleaseSimRigCase['nodeOutcomes'] = {};
+    if (row.nodeOutcomes !== undefined) {
+      const rawOutcomes = record(row.nodeOutcomes, `scenario.cases[${index}].nodeOutcomes`);
+      for (const [node, value] of Object.entries(rawOutcomes)) {
+        if (!nodeIds.has(node)) throw new Error(`scenario.cases[${index}].nodeOutcomes names unknown release node ${node}`);
+        const injection = record(value, `scenario.cases[${index}].nodeOutcomes.${node}`);
+        exactKeys(injection, ['outcome', 'delayMs'], `scenario.cases[${index}].nodeOutcomes.${node}`);
+        if (injection.outcome !== 'ok' && injection.outcome !== 'fail' && injection.outcome !== 'error') throw new Error(`scenario.cases[${index}].nodeOutcomes.${node}.outcome is invalid`);
+        if (injection.delayMs !== undefined && (!Number.isSafeInteger(injection.delayMs) || (injection.delayMs as number) < 0 || (injection.delayMs as number) > 60_000)) throw new Error(`scenario.cases[${index}].nodeOutcomes.${node}.delayMs must be 0–60000`);
+        nodeOutcomes[node] = { outcome: injection.outcome, ...(injection.delayMs === undefined ? {} : { delayMs: injection.delayMs as number }) };
+      }
+    }
     const expected = record(row.expect, `scenario.cases[${index}].expect`);
-    exactKeys(expected, ['status', 'mustVisit', 'mustNotVisit'], `scenario.cases[${index}].expect`);
+    exactKeys(expected, ['status', 'mustVisit', 'mustNotVisit', 'overlap', 'refusalIncludes'], `scenario.cases[${index}].expect`);
     if (expected.status !== 'done' && expected.status !== 'failed' && expected.status !== 'resume-refused') throw new Error(`scenario.cases[${index}].expect.status is invalid`);
     const mustVisit = stringList(expected.mustVisit, `scenario.cases[${index}].expect.mustVisit`);
     const mustNotVisit = stringList(expected.mustNotVisit, `scenario.cases[${index}].expect.mustNotVisit`);
+    const refusalIncludes = expected.refusalIncludes;
+    if (refusalIncludes !== undefined && (typeof refusalIncludes !== 'string' || !refusalIncludes.trim())) throw new Error(`scenario.cases[${index}].expect.refusalIncludes must be nonempty text`);
+    let overlap: [string, string] | undefined;
+    if (expected.overlap !== undefined) {
+      const pair = stringList(expected.overlap, `scenario.cases[${index}].expect.overlap`);
+      if (pair.length !== 2 || pair[0] === pair[1] || pair.some((id) => !nodeIds.has(id))) throw new Error(`scenario.cases[${index}].expect.overlap must name two different release nodes`);
+      overlap = [pair[0]!, pair[1]!];
+    }
     for (const id of [...mustVisit, ...mustNotVisit]) if (!nodeIds.has(id)) throw new Error(`scenario.cases[${index}] names unknown release node ${id}`);
     if (mustVisit.some((id) => mustNotVisit.includes(id))) throw new Error(`scenario.cases[${index}] visits and excludes the same node`);
-    return { id: row.id, ...(mode ? { mode } : {}), ...(fault ? { fault } : {}), expect: { status: expected.status, mustVisit, mustNotVisit } };
+    return { id: row.id, ...(mode ? { mode } : {}), ...(fault ? { fault } : {}), ...(Object.keys(nodeOutcomes).length ? { nodeOutcomes } : {}),
+      expect: { status: expected.status, mustVisit, mustNotVisit, ...(overlap ? { overlap } : {}), ...(typeof refusalIncludes === 'string' ? { refusalIncludes } : {}) } };
   });
   return { version: 1, kind: 'release-graph', id: root.id, isolation: 'test',
     input: { version: input.version, previousVersion: input.previousVersion }, cases };
@@ -182,11 +209,18 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
   const runId = `release-sim-${scenario.id}-${item.id}`;
   const ledgerEvents: Array<Record<string, unknown>> = [];
   const dispatchedNodes: string[] = [];
+  const nodeTimings: NonNullable<ReleaseSimRigCaseResult['nodeTimings']> = {};
   const runBash = async (command: string, options: { env?: NodeJS.ProcessEnv }) => {
     const { nodeId } = parseContext(options.env ?? {});
     if (!command.trim()) throw new Error(`empty command at simulated node ${nodeId}`);
     dispatchedNodes.push(nodeId);
-    const result = resultForNode(nodeId, item.fault, scenario.input.version);
+    const startedAtMs = performance.now();
+    const injection = item.nodeOutcomes?.[nodeId];
+    const result = injection ? resultForNode(nodeId, injection.outcome === 'ok' ? undefined : {
+      node: nodeId, outcome: injection.outcome, evidence: {},
+    }, scenario.input.version) : resultForNode(nodeId, item.fault, scenario.input.version);
+    if (injection?.delayMs) await new Promise((resolve) => setTimeout(resolve, injection.delayMs));
+    nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
     return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
   };
   const capture = (event: string, data: Record<string, unknown>) => ledgerEvents.push({ event, ...data });
@@ -209,15 +243,20 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
     const interrupted = listGraphRuns(root).runs.find((run) => run.runId === runId);
     const stateFile = interrupted?.statePath ?? '';
     const path = interrupted?.path ?? [];
+    const visited = new Set([...path, ...Object.values(interrupted?.fanOuts ?? {}).flatMap((fanout) => Object.keys(fanout.branches))]);
     recordObservedEdges(path, ledgerEvents);
     const edgeIssues = interrupted ? unexpectedEdges(path, interrupted, edges) : [];
-    const statusOk = item.expect.status === 'resume-refused' && refusal.includes('release command source differs from the saved cut tip');
-    const visitOk = item.expect.mustVisit.every((id) => path.includes(id));
-    const notVisitOk = item.expect.mustNotVisit.every((id) => !path.includes(id));
+    const statusOk = item.expect.status === 'resume-refused' && refusal.includes(item.expect.refusalIncludes ?? 'release command source differs from the saved cut tip');
+    const visitOk = item.expect.mustVisit.every((id) => visited.has(id));
+    const notVisitOk = item.expect.mustNotVisit.every((id) => !visited.has(id));
+    const overlapPair = item.expect.overlap;
+    const overlapOk = !overlapPair || (!!nodeTimings[overlapPair[0]] && !!nodeTimings[overlapPair[1]] &&
+      nodeTimings[overlapPair[0]]!.startedAtMs < nodeTimings[overlapPair[1]]!.endedAtMs &&
+      nodeTimings[overlapPair[1]]!.startedAtMs < nodeTimings[overlapPair[0]]!.endedAtMs);
     const ledgerOk = ledgerEvents.some((row) => row.event === 'node-end')
       && ledgerEvents.filter((row) => row.event === 'edge-observed').length === Math.max(0, path.length - 1);
-    return { id: item.id, pass: statusOk && visitOk && notVisitOk && ledgerOk && edgeIssues.length === 0, status: statusOk ? 'resume-refused' : interrupted?.status ?? 'missing',
-      path, dispatchedNodes, unexpectedEdges: edgeIssues, checks: { status: statusOk, mustVisit: visitOk, mustNotVisit: notVisitOk, ledgerEvents: ledgerOk }, injectedEvidence: {}, ledgerEvents,
+    return { id: item.id, pass: statusOk && visitOk && notVisitOk && overlapOk && ledgerOk && edgeIssues.length === 0, status: statusOk ? 'resume-refused' : interrupted?.status ?? 'missing',
+      path, dispatchedNodes, unexpectedEdges: edgeIssues, checks: { status: statusOk, mustVisit: visitOk, mustNotVisit: notVisitOk, overlap: overlapOk, ledgerEvents: ledgerOk }, injectedEvidence: {}, ledgerEvents,
       statePath: stateFile, ...(refusal ? { refusal } : {}) };
   }
 
@@ -225,17 +264,22 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
   const state = await runGraph(RELEASE_GRAPH, { runId, input: scenario.input, pinChildUniverse: true, quiet: true,
     deps: { root, runBash, log: capture } });
   const path = state.path;
+  const visited = new Set([...path, ...Object.values(state.fanOuts ?? {}).flatMap((fanout) => Object.keys(fanout.branches))]);
   recordObservedEdges(path, ledgerEvents);
   const edgeIssues = unexpectedEdges(path, state, edges);
   const statusOk = state.status === item.expect.status;
-  const visitOk = item.expect.mustVisit.every((id) => path.includes(id));
-  const notVisitOk = item.expect.mustNotVisit.every((id) => !path.includes(id));
+  const visitOk = item.expect.mustVisit.every((id) => visited.has(id));
+  const notVisitOk = item.expect.mustNotVisit.every((id) => !visited.has(id));
+  const overlapPair = item.expect.overlap;
+  const overlapOk = !overlapPair || (!!nodeTimings[overlapPair[0]] && !!nodeTimings[overlapPair[1]] &&
+    nodeTimings[overlapPair[0]]!.startedAtMs < nodeTimings[overlapPair[1]]!.endedAtMs &&
+    nodeTimings[overlapPair[1]]!.startedAtMs < nodeTimings[overlapPair[0]]!.endedAtMs);
   const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
     && ledgerEvents.filter((row) => row.event === 'edge-observed').length === Math.max(0, path.length - 1);
   const injectedEvidence = item.fault ? item.fault.evidence ?? {} : {};
-  return { id: item.id, pass: statusOk && visitOk && notVisitOk && ledgerOk && edgeIssues.length === 0, status: state.status, path, dispatchedNodes, unexpectedEdges: edgeIssues,
-    checks: { status: statusOk, mustVisit: visitOk, mustNotVisit: notVisitOk, ledgerEvents: ledgerOk }, injectedEvidence,
-    ledgerEvents, statePath: state.statePath };
+  return { id: item.id, pass: statusOk && visitOk && notVisitOk && overlapOk && ledgerOk && edgeIssues.length === 0, status: state.status, path, dispatchedNodes, unexpectedEdges: edgeIssues,
+    checks: { status: statusOk, mustVisit: visitOk, mustNotVisit: notVisitOk, overlap: overlapOk, ledgerEvents: ledgerOk }, injectedEvidence,
+    fanOuts: state.fanOuts, nodeTimings, ledgerEvents, statePath: state.statePath };
 }
 
 export async function runReleaseSimRigScenario(source: string): Promise<ReleaseSimRigResult> {

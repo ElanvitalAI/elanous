@@ -1,9 +1,12 @@
 import { ResourceLedger, ResourceLedgerError, type ResourceRecord } from './ledger.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 
-/** Inclusive port bands; only the test band is allocated by the coordinator. */
+/** Release PWA bind configured by OP; isolated test leases must never claim it. */
+export const RELEASE_PWA_FIXED_HTTP_PORT = 31453;
+
+/** Inclusive port bands. Fixed release PWA ports are reserved from every isolated test allocator. */
 export const PORT_BANDS = {
-  reserved: [31413, DEFAULT_NEXUS_HTTP_PORT, 31420],
+  reserved: [31413, DEFAULT_NEXUS_HTTP_PORT, 31420, RELEASE_PWA_FIXED_HTTP_PORT],
   test: { start: 31450, end: 31499 },
   offline: { start: 31500, end: 31509 },
 } as const;
@@ -36,5 +39,7 @@ export function leasePort(request: PortLeaseRequest, ledger: ResourceLedger, now
     throw new ResourceLedgerError(400, 'invalid-port-lease');
   }
   const owner = request.owner ?? machine;
-  return ledger.leaseTestPort({ machine, purpose, ttlMs: Math.min(ttlMs, MAX_PORT_LEASE_TTL_MS), owner }, PORT_BANDS.test, now, request.excluded);
+  const reservedTestPorts = PORT_BANDS.reserved.filter(port => port >= PORT_BANDS.test.start && port <= PORT_BANDS.test.end);
+  const excluded = [...new Set([...(request.excluded ?? []), ...reservedTestPorts])];
+  return ledger.leaseTestPort({ machine, purpose, ttlMs: Math.min(ttlMs, MAX_PORT_LEASE_TTL_MS), owner }, PORT_BANDS.test, now, excluded);
 }

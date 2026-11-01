@@ -50,9 +50,9 @@ export interface BrowserRuntimeDeps {
   observe?: BrowserActionObserver;
 }
 
-function observeBrowserAction(data: Record<string, unknown>): void {
+function observeBrowserAction(data: Record<string, unknown>, explicitRunId?: string): void {
   try {
-    const runId = getHarnessRunId() || null;
+    const runId = explicitRunId || getHarnessRunId() || null;
     (deps.observe ?? ((event, detail) => debug.log('harness.browser-action', event, detail)))('executed', {
       runId,
       sessionId: 'browser-runtime',
@@ -95,17 +95,20 @@ async function defaultCloseClient(): Promise<void> {
   singletonPromise = null;
 }
 
-let deps: BrowserRuntimeDeps = {
+const DEFAULT_DEPS: BrowserRuntimeDeps = {
   getClient: defaultGetClient,
   closeClient: defaultCloseClient,
 };
+let deps: BrowserRuntimeDeps = DEFAULT_DEPS;
 let attachedControlSignalBus: ReturnType<typeof defaultControlSignalBus> | null = null;
+let detachBrowserControlSignalConsumer: (() => void) | null = null;
 
 function ensureBrowserControlSignalConsumer(): void {
   const bus = defaultControlSignalBus();
   if (attachedControlSignalBus === bus) return;
+  detachBrowserControlSignalConsumer?.();
   attachedControlSignalBus = bus;
-  bus.subscribe(
+  detachBrowserControlSignalConsumer = bus.subscribe(
     { kind: 'browser-cdp-stop', minUrgency: 'quick-pass', surface: 'browser' },
     () => {
       void deps.closeClient?.();
@@ -115,6 +118,14 @@ function ensureBrowserControlSignalConsumer(): void {
 
 export function setBrowserRuntimeDeps(next: Partial<BrowserRuntimeDeps>): void {
   deps = { ...deps, ...next };
+}
+
+/** Reset dependency injection after a run-scoped observability test. */
+export function _resetBrowserRuntimeDepsForTest(): void {
+  detachBrowserControlSignalConsumer?.();
+  detachBrowserControlSignalConsumer = null;
+  deps = DEFAULT_DEPS;
+  attachedControlSignalBus = null;
 }
 
 export async function closeBrowserRuntime(): Promise<void> {
@@ -189,6 +200,7 @@ const MAX_NAV_TIMEOUT_MS = 60_000;
 
 export async function dispatchBrowserNavigate(args: BrowserNavigateArgs, ctx?: ToolRuntimeContext): Promise<BrowserNavigateResult> {
   ensureBrowserControlSignalConsumer();
+  const runId = ctx?.runId || getHarnessRunId() || undefined;
   const url = String(args.url ?? '').trim();
   const input = args.input;
   // Input is never an implicit side effect of navigation. Approval is scoped
@@ -215,7 +227,7 @@ export async function dispatchBrowserNavigate(args: BrowserNavigateArgs, ctx?: T
     if (!approved) return { output: '# BrowserNavigate: input not approved', finalUrl: '', title: '', loadMs: 0 };
   }
   if (!url) {
-    observeBrowserAction({ action: 'navigate', url: '', target: 'url', ok: false, error: 'url is required' });
+    observeBrowserAction({ action: 'navigate', url: '', target: 'url', ok: false, error: 'url is required' }, runId);
     return { output: '# BrowserNavigate: error\nurl is required', finalUrl: '', title: '', loadMs: 0 };
   }
   const waitForLoad = args.waitForLoad !== false;
@@ -226,12 +238,12 @@ export async function dispatchBrowserNavigate(args: BrowserNavigateArgs, ctx?: T
     client = await deps.getClient();
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    observeBrowserAction({ action: 'navigate', url, target: url, ok: false, error });
+    observeBrowserAction({ action: 'navigate', url, target: url, ok: false, error }, runId);
     throw err;
   }
   if (!client) {
     const availability = getBrowserCdpAvailability();
-    observeBrowserAction({ action: 'navigate', url, target: url, ok: false, error: 'chrome-unavailable' });
+    observeBrowserAction({ action: 'navigate', url, target: url, ok: false, error: 'chrome-unavailable' }, runId);
     return {
       output: `# BrowserNavigate: Chrome unavailable\n${availability.note}`,
       finalUrl: '',
@@ -264,7 +276,7 @@ export async function dispatchBrowserNavigate(args: BrowserNavigateArgs, ctx?: T
     await client.navigate(url);
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    observeBrowserAction({ action: 'navigate', url, target: url, ok: false, error, loadMs: Date.now() - started });
+    observeBrowserAction({ action: 'navigate', url, target: url, ok: false, error, loadMs: Date.now() - started }, runId);
     return {
       output: `# BrowserNavigate: error\n${error}`,
       finalUrl: url,
@@ -333,7 +345,7 @@ export async function dispatchBrowserNavigate(args: BrowserNavigateArgs, ctx?: T
     timedOut ? 'warning: load event timed out' : '',
   ].filter(Boolean).join('\n');
 
-  observeBrowserAction({ action: 'navigate', url: finalUrl, target: url, ok: true, titleLength: title.length, loadMs, timedOut });
+  observeBrowserAction({ action: 'navigate', url: finalUrl, target: url, ok: true, titleLength: title.length, loadMs, timedOut }, runId);
   return { output, finalUrl, title, loadMs, timedOut: timedOut || undefined };
 }
 
@@ -405,8 +417,9 @@ function escapeForJs(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
-export async function dispatchBrowserRead(args: BrowserReadArgs): Promise<BrowserReadResult> {
+export async function dispatchBrowserRead(args: BrowserReadArgs, ctx?: ToolRuntimeContext): Promise<BrowserReadResult> {
   ensureBrowserControlSignalConsumer();
+  const runId = ctx?.runId || getHarnessRunId() || undefined;
   const mode: BrowserReadMode = args.mode ?? 'text';
   const selector = typeof args.selector === 'string' ? args.selector.trim() : '';
   const maxChars = Math.min(
@@ -419,12 +432,12 @@ export async function dispatchBrowserRead(args: BrowserReadArgs): Promise<Browse
     client = await deps.getClient();
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: false, error, attachmentRef: null, captureOutcome: mode === 'screenshot' ? 'error' : 'not-requested' });
+    observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: false, error, attachmentRef: null, captureOutcome: mode === 'screenshot' ? 'error' : 'not-requested' }, runId);
     throw err;
   }
   if (!client) {
     const availability = getBrowserCdpAvailability();
-    observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: false, error: 'chrome-unavailable', attachmentRef: null, captureOutcome: mode === 'screenshot' ? 'unavailable' : 'not-requested' });
+    observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: false, error: 'chrome-unavailable', attachmentRef: null, captureOutcome: mode === 'screenshot' ? 'unavailable' : 'not-requested' }, runId);
     return {
       output: `# BrowserRead: Chrome unavailable\n${availability.note}`,
       mode,
@@ -435,7 +448,7 @@ export async function dispatchBrowserRead(args: BrowserReadArgs): Promise<Browse
     try {
       const png = await client.screenshot({ format: 'png' });
       const b64 = png.toString('base64');
-      observeBrowserAction({ action: 'read', target: 'screenshot', mode, ok: true, bytes: png.byteLength, base64Length: b64.length, attachmentRef: null, captureOutcome: 'inline-base64' });
+      observeBrowserAction({ action: 'read', target: 'screenshot', mode, ok: true, bytes: png.byteLength, base64Length: b64.length, attachmentRef: null, captureOutcome: 'inline-base64' }, runId);
       return {
         output: `# BrowserRead: screenshot (${png.byteLength} bytes PNG, ${b64.length} chars base64)`,
         mode,
@@ -443,7 +456,7 @@ export async function dispatchBrowserRead(args: BrowserReadArgs): Promise<Browse
       };
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      observeBrowserAction({ action: 'read', target: 'screenshot', mode, ok: false, error, attachmentRef: null, captureOutcome: 'error' });
+      observeBrowserAction({ action: 'read', target: 'screenshot', mode, ok: false, error, attachmentRef: null, captureOutcome: 'error' }, runId);
       return {
         output: `# BrowserRead: screenshot error\n${error}`,
         mode,
@@ -462,7 +475,7 @@ export async function dispatchBrowserRead(args: BrowserReadArgs): Promise<Browse
     value = v == null ? '' : String(v);
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: false, error, attachmentRef: null, captureOutcome: 'not-requested' });
+    observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: false, error, attachmentRef: null, captureOutcome: 'not-requested' }, runId);
     return {
       output: `# BrowserRead: evaluate error\n${error}`,
       mode,
@@ -472,7 +485,7 @@ export async function dispatchBrowserRead(args: BrowserReadArgs): Promise<Browse
   const truncated = value.length > maxChars;
   const out = truncated ? value.slice(0, maxChars) : value;
 
-  observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: true, charLength: value.length, returnedChars: out.length, truncated, attachmentRef: null, captureOutcome: 'not-requested' });
+  observeBrowserAction({ action: 'read', target: selector || 'document.body', mode, ok: true, charLength: value.length, returnedChars: out.length, truncated, attachmentRef: null, captureOutcome: 'not-requested' }, runId);
   return {
     output: [
       `# BrowserRead (${mode}${selector ? ` · selector=${selector}` : ''})`,
@@ -490,8 +503,8 @@ export async function dispatchBrowserRead(args: BrowserReadArgs): Promise<Browse
 export const browserReadRuntime: ToolRuntime<BrowserReadArgs, BrowserReadResult> = {
   id: 'browser_read',
   spec: buildBrowserReadTool(),
-  async run(req, _ctx: ToolRuntimeContext) {
-    return dispatchBrowserRead(req);
+  async run(req, ctx: ToolRuntimeContext) {
+    return dispatchBrowserRead(req, ctx);
   },
 };
 

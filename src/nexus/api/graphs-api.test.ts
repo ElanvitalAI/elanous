@@ -116,6 +116,36 @@ test('GET /flat resolves graph units server-side and returns the shared flattene
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('GET graph detail preserves explicit fan-out branches and the join target', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-graph-fanout-api-'));
+  const graphs = join(root, 'graphs');
+  mkdirSync(graphs, { recursive: true });
+  writeFileSync(join(graphs, 'fanout-api.yaml'), `graph_id: fanout-api
+version: 1
+entry_node: start
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: start, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: a, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: b, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: start
+    on: outcome
+    branches: { ok: [a, b] }
+    join: joined
+  - { from: joined, on: outcome, map: { ok: done, fail: failed } }
+`);
+  try {
+    const response = handleGraphsGet('/v1/graphs/fanout-api', graphs, { coreDir: graphs, mineDir: join(root, 'mine') });
+    expect(response?.status).toBe(200);
+    const body = await response!.json() as { edges: Array<{ from: string; branches?: Record<string, string[]>; join?: string }> };
+    expect(body.edges.find((edge) => edge.from === 'start')).toMatchObject({ branches: { ok: ['a', 'b'] }, join: 'joined' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 const RUN_GRAPH = `graph_id: w9c-run
 version: 1
 entry_node: plan

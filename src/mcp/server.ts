@@ -29,6 +29,7 @@ import { buildCliAgentTools } from '../cli/agent-cli.js';
 import { getUserConfig } from '../user-config.js';
 import type { TokenScope } from '../auth/scope.js';
 import { filterToolsForScope, isToolAllowedForScope } from '../nexus/api/mcp-public-allowlist.js';
+import { normalizeRunId } from '../harness/harness-space.js';
 
 // ─── JSON-RPC shapes ─────────────────────────────────────────────
 
@@ -100,6 +101,30 @@ export interface McpServerContext {
   clientName?: string;
   /** Authenticated HTTP token scope; absent on stdio and other trusted transports. */
   tokenScope?: TokenScope;
+}
+
+/** Accept only an already-safe run identifier from standard MCP params._meta. */
+function mcpRunId(params: Record<string, unknown> | undefined): string | undefined {
+  const meta = params?._meta;
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return undefined;
+  const value = (meta as Record<string, unknown>).elanousRunId;
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(value)) return undefined;
+  const normalized = normalizeRunId(value);
+  return normalized === value ? value : undefined;
+}
+
+function logAsideRunIdDrop(toolName: string, params: Record<string, unknown> | undefined): void {
+  const meta = params?._meta;
+  const raw = meta && typeof meta === 'object' && !Array.isArray(meta)
+    ? (meta as Record<string, unknown>).elanousRunId
+    : undefined;
+  const reason = typeof raw !== 'string'
+    ? 'missing-or-non-string'
+    : !/^[A-Za-z0-9_-]{1,64}$/.test(raw)
+      ? 'invalid-format'
+      : normalizeRunId(raw) !== raw ? 'not-normalized' : 'validation-rejected';
+  try { debug.log('mcp-server.aside', 'elanous-tool-call-run-id-dropped', { toolName, reason }); }
+  catch { /* observation must not block the caller */ }
 }
 
 /** Emit a `system.mcp.proxy_call` user-intent event for a single
@@ -177,8 +202,20 @@ export async function handleMcpRequest(
         const args = (req.params?.arguments as Record<string, unknown>) ?? {};
         const surface = ctx.surface ?? 'mcp';
         const rt = getToolRuntime(name);
+        const runId = ctx.clientName === 'aside' ? mcpRunId(req.params) : undefined;
+        if (ctx.clientName === 'aside' && !runId) logAsideRunIdDrop(name, req.params);
+        const asideReturn = runId !== undefined;
         const isExposedOnSurface = listToolRuntimes(surface).some(runtime => runtime.id === rt?.id);
         if (!rt || !isExposedOnSurface) {
+          if (asideReturn) {
+            try {
+              debug.log('mcp-server.aside', 'elanous-tool-call', { runId, toolName: name });
+              debug.log('mcp-server.aside', 'elanous-tool-result', {
+                runId, toolName: name, ok: false,
+                errorClass: rt ? 'tool_not_exposed' : 'unknown_tool',
+              });
+            } catch { /* observation must not block the caller */ }
+          }
           emitProxyCallIntent(name, ctx.origin, false, 'unknown_tool');
           return {
             ...base,
@@ -186,6 +223,10 @@ export async function handleMcpRequest(
           };
         }
         try {
+          if (asideReturn) {
+            try { debug.log('mcp-server.aside', 'elanous-tool-call', { runId, toolName: name }); }
+            catch { /* observation must not block the caller */ }
+          }
           const isMcpAgent = surface === 'mcp' && rt.id === 'agent';
           const agentArgs = isMcpAgent
             ? { ...args, run_in_background: args.run_in_background ?? true }
@@ -198,6 +239,7 @@ export async function handleMcpRequest(
           const out = await dispatchToolByName(name, agentArgs, {
             surface,
             ...(ctx.clientName ? { mcpClient: ctx.clientName } : {}),
+            ...(runId ? { runId } : {}),
             ...(agentTools ? {
               agentHostTools: agentTools.specs,
               agentCwd,
@@ -212,10 +254,22 @@ export async function handleMcpRequest(
               background: agentArgs.run_in_background === true,
             });
           }
+          if (asideReturn) {
+            const resultRecord = out && typeof out === 'object' ? out as Record<string, unknown> : {};
+            const toolOk = resultRecord.ok === false || resultRecord.isError === true
+              ? false
+              : resultRecord.ok === true ? true : null;
+            try { debug.log('mcp-server.aside', 'elanous-tool-result', { runId, toolName: name, ok: toolOk }); }
+            catch { /* observation must not block the caller */ }
+          }
           emitProxyCallIntent(name, ctx.origin, true);
           return { ...base, result: toMcpToolCallResult(out) };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
+          if (asideReturn) {
+            try { debug.log('mcp-server.aside', 'elanous-tool-result', { runId, toolName: name, ok: false, errorClass: err instanceof Error ? err.name : 'unknown' }); }
+            catch { /* observation must not block the caller */ }
+          }
           emitProxyCallIntent(name, ctx.origin, false, msg);
           throw err;
         }

@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stateDirSourceForChild } from '../../agent/identity-env.js';
@@ -90,6 +90,35 @@ test('two commands execute sequentially with distinct private HOME/state/tmp/XDG
   expect(existsSync(seen[1]!.env.HOME!)).toBe(false);
 });
 
+test('WARM-POOL-WORKER-SANITIZE-FU: a serial worker removes prior scratch and private environment markers before the next request', async () => {
+  const options = root();
+  let firstEnvironment: NodeJS.ProcessEnv | undefined;
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => {
+    calls++;
+    if (calls === 1) {
+      firstEnvironment = request.env;
+      writeFileSync(join(options.scratchDir, 'first-request-scratch-marker'), 'private');
+      for (const path of [request.env.HOME, request.env.ELANOUS_STATE_DIR, request.env.TMPDIR,
+        request.env.XDG_CONFIG_HOME, request.env.XDG_CACHE_HOME, request.env.XDG_DATA_HOME,
+        request.env.XDG_STATE_HOME, request.env.XDG_RUNTIME_DIR])
+        writeFileSync(join(path!, 'first-request-marker'), 'private');
+    } else {
+      expect(existsSync(join(options.scratchDir, 'first-request-scratch-marker'))).toBe(false);
+      for (const path of [firstEnvironment!.HOME, firstEnvironment!.ELANOUS_STATE_DIR, firstEnvironment!.TMPDIR,
+        firstEnvironment!.XDG_CONFIG_HOME, firstEnvironment!.XDG_CACHE_HOME, firstEnvironment!.XDG_DATA_HOME,
+        firstEnvironment!.XDG_STATE_HOME, firstEnvironment!.XDG_RUNTIME_DIR])
+        expect(existsSync(path!)).toBe(false);
+    }
+    complete(request);
+    return 0;
+  } });
+
+  expect((await runtime.handle(options.request('sanitize-first'))).reason).toBe('complete');
+  expect((await runtime.handle(options.request('sanitize-second'))).reason).toBe('complete');
+  expect(calls).toBe(2);
+});
+
 test('cleans each request back to its pinned base before the next request', async () => {
   const options = root();
   const artifact = join(options.repoDir, 'previous-request.tmp');
@@ -134,10 +163,16 @@ test('resets a changed HEAD at the request boundary before quarantining source d
   expect(calls).toBe(1);
 });
 
-test('preserves runtime files reached through an external symlink with a missing final directory', async () => {
+test('removes scratch residue reached through an external symlink with a missing final directory', async () => {
   const options = root();
   const aliasRoot = mkdtempSync(join(tmpdir(), 'warm-runtime-external-alias-'));
   roots.push(aliasRoot);
+  const outsideSentinel = join(aliasRoot, 'outside-scratch-sentinel.txt');
+  writeFileSync(outsideSentinel, 'must remain outside the aliased checkout');
+  const externalScratchTarget = join(aliasRoot, 'external-scratch-target');
+  mkdirSync(externalScratchTarget);
+  const externalScratchSentinel = join(externalScratchTarget, 'must-survive.txt');
+  writeFileSync(externalScratchSentinel, 'outside the scratch tree');
   const alias = join(aliasRoot, 'checkout');
   symlinkSync(options.repoDir, alias);
   const scratchDir = join(alias, 'scratch[1]');
@@ -147,9 +182,10 @@ test('preserves runtime files reached through an external symlink with a missing
     calls++;
     if (calls === 1) {
       mkdirSync(join(options.repoDir, 'scratch[1]'), { recursive: true });
-      writeFileSync(persistent, 'must survive request cleanup');
+      writeFileSync(persistent, 'must not survive request cleanup');
+      symlinkSync(externalScratchTarget, join(options.repoDir, 'scratch[1]', 'external-target'));
     } else {
-      expect(readFileSync(persistent, 'utf8')).toBe('must survive request cleanup');
+      expect(existsSync(persistent)).toBe(false);
     }
     complete(request);
     return 0;
@@ -157,7 +193,9 @@ test('preserves runtime files reached through an external symlink with a missing
   expect((await runtime.handle(options.request('external-alias-1'))).reason).toBe('complete');
   expect((await runtime.handle(options.request('external-alias-2'))).reason).toBe('complete');
   expect(calls).toBe(2);
-  expect(existsSync(persistent)).toBe(true);
+  expect(existsSync(persistent)).toBe(false);
+  expect(existsSync(outsideSentinel)).toBe(true);
+  expect(existsSync(externalScratchSentinel)).toBe(true);
 });
 
 test('a failed request-boundary git cleanup emits evidence and blocks the next request', async () => {
@@ -200,6 +238,43 @@ test('a failed request-boundary git cleanup emits evidence and blocks the next r
   } finally {
     (debug as { log: typeof debug.log }).log = original;
   }
+});
+
+test('quarantines when the scratch remover returns but leaves the path in place', async () => {
+  const options = root();
+  mkdirSync(options.scratchDir);
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    removeScratch: () => {},
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+
+  expect(await runtime.handle(options.request('scratch-remains')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(calls).toBe(0);
+  expect(lstatSync(options.scratchDir).isDirectory()).toBe(true);
+});
+
+test('does not follow a symlink swapped into scratch after removal', async () => {
+  const options = root();
+  const outside = mkdtempSync(join(tmpdir(), 'warm-runtime-scratch-swap-'));
+  roots.push(outside);
+  const sentinel = join(outside, 'must-survive.txt');
+  writeFileSync(sentinel, 'outside scratch');
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options,
+    removeScratch: path => {
+      rmSync(path, { recursive: true, force: true });
+      symlinkSync(outside, path);
+    },
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+
+  expect(await runtime.handle(options.request('scratch-symlink-swap')))
+    .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+  expect(calls).toBe(0);
+  expect(lstatSync(options.scratchDir).isSymbolicLink()).toBe(true);
+  expect(readFileSync(sentinel, 'utf8')).toBe('outside scratch');
 });
 
 test('a failed reset short-circuits before clean or status can run', async () => {
@@ -407,14 +482,14 @@ test('missing JUnit never yields a reply and the worker quarantines before anoth
   expect(calls).toBe(1);
 });
 
-test('cleanup failure marks contamination and prevents reuse even with complete test artifacts', async () => {
+test('persistent scratch cleanup failure quarantines before running a request', async () => {
   const options = root();
   let calls = 0;
   const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => { calls++; complete(request); return 0; },
     removeScratch: () => { throw new Error('busy mount'); } });
   expect(await runtime.handle(options.request('attempt-1'))).toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
   expect(await runtime.handle(options.request('attempt-2'))).toMatchObject({ reply: null, reason: 'quarantined' });
-  expect(calls).toBe(1);
+  expect(calls).toBe(0);
 });
 
 test('invalid identity and traversal paths are refused before a runner or artifact directory is touched', async () => {
@@ -462,6 +537,52 @@ test('tracked symlink cannot redirect a test to untracked bytes', async () => {
   expect(await runtime.handle({ ...options.request('linked'), files: [linked] }))
     .toMatchObject({ reason: 'invalid-command', quarantineWorker: false, reply: null });
   expect(calls).toBe(0);
+});
+
+test('a stale scratch directory whose deletion is uncertain quarantines before executing the next request', async () => {
+  const options = root();
+  mkdirSync(options.scratchDir, { recursive: true });
+  const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    events.push({ category, event, data: data as Record<string, unknown> });
+  }) as typeof debug.log;
+  let calls = 0;
+  try {
+    const runtime = new WarmWorkerRuntime({ ...options,
+      runFile: async () => { calls++; return 0; },
+      removeScratch: () => { throw new Error('stale scratch busy'); },
+    });
+
+    expect(await runtime.handle(options.request('stale-scratch')))
+      .toMatchObject({ reply: null, quarantineWorker: true, reason: 'cleanup-failed' });
+    expect(await runtime.handle(options.request('after-stale-scratch')))
+      .toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+    expect(calls).toBe(0);
+    expect(events).toContainEqual({ category: 'pod.reuse', event: 'clean-failed', data: {
+      runId: 'run-1', attemptId: 'stale-scratch', workerId: 'worker-1', reason: 'scratch-removal-failed',
+      remainingPaths: [options.scratchDir],
+    } });
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+  }
+});
+
+test('removes a dangling scratch symlink before creating the worker scratch root', async () => {
+  const options = root();
+  const scratchParent = mkdtempSync(join(tmpdir(), 'warm-runtime-dangling-scratch-'));
+  roots.push(scratchParent);
+  const scratchDir = join(scratchParent, 'scratch');
+  symlinkSync(join(scratchParent, 'missing-target'), scratchDir);
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options, scratchDir,
+    runFile: async request => { calls++; complete(request); return 0; },
+  });
+
+  expect((await runtime.handle(options.request('dangling-scratch'))).reason).toBe('complete');
+  expect(calls).toBe(1);
+  expect(existsSync(scratchDir)).toBe(true);
+  expect(lstatSync(scratchDir).isSymbolicLink()).toBe(false);
 });
 
 test('a valid request expired while queued quarantines the worker', async () => {

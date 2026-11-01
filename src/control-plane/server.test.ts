@@ -49,7 +49,7 @@ test('warm worker lease API fences attempts and keeps the shared ledger authorit
     id: 'pod-worker-lease:worker-1', kind: 'pod-worker-lease', machine: 'local', name: 'worker-1', attrs: {}, ttlMs: 30_000,
   })).status).toBe(403);
   expect((await call('/v1/workers/pod', hostToken, 'POST', worker)).status).toBe(200);
-  expect((await call('/v1/leases/pod-worker', hostToken, 'POST', { machine: 'local', key, runId: 'run-host', attemptId: 'attempt-host', ttlMs: 10_000 })).status).toBe(403);
+  expect((await call('/v1/leases/pod-worker', hostToken, 'POST', { machine: 'other', key, runId: 'run-host', attemptId: 'attempt-host', ttlMs: 10_000 })).status).toBe(403);
   const claimed = await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'run-1', attemptId: 'attempt-1', ttlMs: 10_000 });
   expect(claimed.status).toBe(200);
   const lease = await claimed.json() as { attrs: { leaseId: string; generation: number; state: string } };
@@ -72,7 +72,47 @@ test('warm worker lease API fences attempts and keeps the shared ledger authorit
   const next = await (await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key, runId: 'run-2', attemptId: 'attempt-2', ttlMs: 10_000 })).json() as typeof lease;
   expect(next.attrs.generation).toBe(lease.attrs.generation + 1);
   expect((await call(`${path}/renew`, tokens.member, 'POST', { leaseId: lease.attrs.leaseId, generation: lease.attrs.generation })).status).toBe(409);
+  expect((await call(`${path}/release`, tokens.member, 'POST', { leaseId: next.attrs.leaseId, generation: next.attrs.generation })).status).toBe(200);
+  expect((await call(`${path}/sanitize`, hostToken, 'POST', { leaseId: next.attrs.leaseId, generation: next.attrs.generation })).status).toBe(200);
+  expect((await call(`${path}/quarantine`, tokens.member, 'POST', { leaseId: next.attrs.leaseId,
+    generation: next.attrs.generation, reason: 'reap-test' })).status).toBe(200);
+  const reserved = await call(`${path}/reap`, hostToken, 'POST', { podUid: 'pod-uid-1' });
+  expect(reserved.status).toBe(200);
+  expect(await reserved.json()).toMatchObject({ attrs: { state: 'reaping', podUid: 'pod-uid-1' } });
+  expect((await call('/v1/leases/pod-worker', tokens.member, 'POST', { machine: 'local', key,
+    runId: 'run-3', attemptId: 'attempt-3', ttlMs: 10_000 })).status).toBe(409);
   expect(readFileSync(join(root, 'control', 'ledger.json'), 'utf8')).toContain('pod-worker-lease:worker-1');
+});
+
+test('machine token may acquire only its own warm worker lease; unrelated paths stay forbidden', async () => {
+  const { root, tokens, call } = setup(heldPrimary);
+  const msb1Token = issueMemberToken('node-b', root);
+  const otherHostToken = issueMemberToken('mbp', root);
+  const key = { context: 'k3d-pool', imageDigest: 'sha256:image', lockHash: 'lock-node-b', architecture: 'arm64' };
+  const worker = { workerId: 'warm-node-b-1', machine: 'node-b', podUid: 'pod-uid-node-b', key, ttlMs: 30_000 };
+  const otherWorker = { workerId: 'warm-mbp-1', machine: 'mbp', podUid: 'pod-uid-mbp', key, ttlMs: 30_000 };
+  expect((await call('/v1/workers/pod', msb1Token, 'POST', worker)).status).toBe(200);
+  expect((await call('/v1/workers/pod', otherHostToken, 'POST', otherWorker)).status).toBe(200);
+  const lease = { machine: 'node-b', key, runId: 'gate-run', attemptId: 'gate-attempt', ttlMs: 10_000 };
+  const crossHost = await call('/v1/leases/pod-worker', msb1Token, 'POST', { ...lease, machine: 'mbp' });
+  expect(crossHost.status).toBe(403);
+  expect(await crossHost.json()).toEqual({ error: 'machine-scope' });
+  const otherHostDenied = await call('/v1/leases/pod-worker', otherHostToken, 'POST', lease);
+  expect(otherHostDenied.status).toBe(403);
+  expect(await otherHostDenied.json()).toEqual({ error: 'machine-scope' });
+  const unspecifiedHostDenied = await call('/v1/leases/pod-worker', msb1Token, 'POST', { ...lease, machine: undefined });
+  expect(unspecifiedHostDenied.status).toBe(403);
+  expect(await unspecifiedHostDenied.json()).toEqual({ error: 'machine-scope' });
+  const queryDenied = await call('/v1/leases/pod-worker', tokens.query, 'POST', lease);
+  expect(queryDenied.status).toBe(403);
+  expect(await queryDenied.json()).toEqual({ error: 'forbidden' });
+  const unrelatedWriteDenied = await call('/v1/leases/pod-worker/warm-node-b-1/release', msb1Token, 'POST');
+  expect(unrelatedWriteDenied.status).toBe(403);
+  expect(await unrelatedWriteDenied.json()).toEqual({ error: 'worker-scope' });
+  const acquired = await call('/v1/leases/pod-worker', msb1Token, 'POST', lease);
+  expect(acquired.status).toBe(200);
+  expect(await acquired.json()).toMatchObject({ machine: 'node-b', name: worker.workerId,
+    attrs: { state: 'leased', runId: 'gate-run', attemptId: 'gate-attempt' } });
 });
 
 test('warm worker writes fail closed when there is no primary observation', async () => {

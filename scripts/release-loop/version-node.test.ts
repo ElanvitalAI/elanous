@@ -472,7 +472,7 @@ test('the chosen cut completes the fake release graph through dev-bump while adv
         return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '' };
       } } });
     expect(result.status).toBe('done');
-    expect(result.path).toContain('version-dev-bump');
+    expect(result.fanOuts?.['traffic-npm-published:ok']?.branches['version-dev-bump']?.status).toBe('done');
     expect(result.nodes.find((node) => node.nodeId === 'version-release')?.output).toContain(chosen);
     expect(bumps).toHaveLength(1);
     expect(bumps[0]!.output).toMatchObject({ outcome: 'ok', version: '0.2.5', commit: 'base-sha' });

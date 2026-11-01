@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { debug, redactSecretText } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { landingFreezeMessage, readLandingFreeze } from '../../src/release-loop/landing-freeze.js';
@@ -20,7 +20,8 @@ import { planGateRadiusShadow, shadowActual, writeGateRadiusShadow, type GateRad
 import { planHardRehearsalRadius, partialGateImagesMatch, preflightGateExecutionIdentity, preflightGateImageDigest } from './gate-radius-live';
 import { actualGatePodImageDigest, gateBaselineReceipt, gateEnvFingerprint, gateGraphPins, gateSourcePins, parseGatePodRuntimeIdentity,
   POD_SWEEP_INTEGRATION_ONLY } from './gate-baseline-receipt';
-import { gateImagePinPath, readGateImagePin, resolveGateImagePin, writeGateImagePin } from './gate-image-pin.js';
+import { gateImagePinPath, normalizeGateImageDigest, pinnedGateImageSync as buildPinnedGateImageSync, readGateImagePin,
+  readGateImagePinForRun, replaceGateImagePin, resolveGateImagePin, writeGateImagePin } from './gate-image-pin.js';
 import { gateReceiptRegistryPath, planGateTrainReceiptCarry } from './gate-train-receipts.js';
 import { gateEnvFingerprint as gateReceiptEnvFingerprint, gateLockfileHash } from '../../src/self-implement/gate-receipt-registry.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
@@ -36,13 +37,15 @@ import { emitNodeResult, readGraphContext } from './node-verdict.js';
 import { isGateExecutor, type GateExecutor } from './gate-executor.js';
 import { runPodCommand, parsePodCpu, podCpuMillis, resolvePodCpu, podCommandImageFor, type RunPodCommandOptions, type PodCommandResult, type PodCpu } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from '../../src/task-orchestrator/surfaces/pod-bun-cache.js';
-import { PodPoolScheduler, parsePodPool, checkPodPool, defaultRemoteRun, snapshotWarmPoolMembers, type PodPoolMember } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { NODE_REGISTRY, PodPoolScheduler, parsePodPool, checkPodPool, defaultRemoteRun, snapshotWarmPoolMembers, syncPoolImages, type PodPoolMember } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { POD_INSTALL_SLOTS_DEFAULT, POD_INSTALL_SLOTS_HOST_PATH, installSlotScript } from '../../src/task-orchestrator/surfaces/pod-install-slots.js';
 import { gateDepsInstallScript, parseGateDeps } from '../../src/task-orchestrator/surfaces/pod-gate-deps.js';
 import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm-artifacts.js';
 import { assessWarmWorkerShadow, parseWarmWorkerReply, type WarmWorkerCommand, type WarmWorkerFileResult, type WarmWorkerKey } from '../../src/task-orchestrator/surfaces/pod-warm-worker-protocol.js';
 import type { WarmPodTransportResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-pod.js';
-import { requestWarmPodReplay, finalizeWarmPodReplay, quarantineWarmPodReplay, type WarmReplayResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
+import { configureWarmPodProvider, loadWarmPodProvider, requestWarmPodReplay, finalizeWarmPodReplay, quarantineWarmPodReplay, type WarmReplayInput, type WarmReplayResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
+import { DEFAULT_CONTROL_PORT } from '../../src/control-plane/server.js';
+import { createRunScopedWarmControlForward, startWarmControlPortForward } from './warm-control-forward.js';
 import { resolveWarmPoolProfile } from '../../src/self-implement/pod-warm-pool-profile.js';
 import { decideWarmReuse, type WarmReuseSwitchConfig, type WarmReuseEvidence } from '../../src/task-orchestrator/surfaces/pod-warm-switch.js';
 import { getUserConfig } from '../../src/user-config.js';
@@ -111,6 +114,8 @@ function redactedGateLogTail(input: string): string {
  * Every field falls back to the real tool, so an absent seam is today's behaviour byte for byte.
  */
 export interface GateTools {
+  /** Graph run identity passed to pool admission for shadow observations. */
+  graphRunId?: string | null;
   /** Wall clock the gate measures with; absent = `Date.now`. */
   now?: () => number;
   /** The Pod Job runner (the fake Pod stage of a scenario); absent = the positional `podCommand`, else `runPodCommand`. */
@@ -340,14 +345,64 @@ export interface GateOptions {
 }
 
 /** Gate-profile opt-in wires the producer only for the process entry, never a test runner seam. */
-export function withWarmGateHooks(opts: GateOptions, config: unknown, injectedRunner = false): GateOptions {
+export function withWarmGateHooks(opts: GateOptions, config: unknown, injectedRunner = false,
+  onWarmCleanup?: (cleanup: () => Promise<void>) => void): GateOptions {
   if (injectedRunner || !opts.pod || resolveWarmPoolProfile(config) !== 'gate') return opts;
   const warmReuseConfig = config && typeof config === 'object' && 'pod' in config
     && config.pod && typeof config.pod === 'object' && 'warmReuse' in config.pod
     ? config.pod.warmReuse as WarmReuseSwitchConfig : undefined;
-  return { ...opts, pod: { ...opts.pod, warmReplay: requestWarmPodReplay,
+  const lifecycle = createRunScopedWarmControlForward(async () => {
+    const configPath = process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG;
+    if (!configPath) throw new Error('warm provider config unavailable');
+    const target = warmProviderTarget(configPath);
+    const forward = await startWarmControlPortForward({ context: target.context, namespace: target.namespace,
+      service: 'elanous-control', remotePort: DEFAULT_CONTROL_PORT });
+    try {
+      const provider = loadWarmPodProvider(configPath, { runtimeOverrides: { controlUrl: forward.url } });
+      configureWarmPodProvider(provider);
+      return forward;
+    } catch (error) {
+      await forward.stop();
+      throw error;
+    }
+  });
+  const replay: NonNullable<GateOptions['pod']>['warmReplay'] = async (input) => {
+    try { await lifecycle.ensure(); }
+    catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      debug.log('pod.warm.control-forward', 'unavailable', { reason, fallback: 'fresh-job' }, { level: 'error' });
+      return { command: null, transport: { status: 'fallback', reason: 'control-unavailable', reply: null } };
+    }
+    return requestWarmPodReplay(input);
+  };
+  const cleanup = async () => {
+    try { await lifecycle.stop(); }
+    finally { configureWarmPodProvider(null); }
+  };
+  onWarmCleanup?.(cleanup);
+  return { ...opts, pod: { ...opts.pod, warmReplay: replay,
     warmFinalize: finalizeWarmPodReplay, warmQuarantine: quarantineWarmPodReplay, warmProducerEnabled: true, warmReuseConfig } };
 }
+
+function warmProviderTarget(path: string): { context: string; namespace: string } {
+  if (!isAbsolute(path) || (statSync(path).mode & 0o077) !== 0) throw new Error('warm provider config must be private');
+  const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid warm provider config');
+  const data = parsed as { candidates?: Array<{ spec?: { kubectlContext?: string; namespace?: string } }>;
+    poolTemplates?: Array<{ spec?: { kubectlContext?: string; namespace?: string } }> };
+  const rows = [...(data.candidates ?? []), ...(data.poolTemplates ?? [])];
+  const targets = new Map<string, { context: string; namespace: string }>();
+  for (const row of rows) {
+    const context = row.spec?.kubectlContext;
+    const namespace = row.spec?.namespace;
+    if (typeof context !== 'string' || !context || typeof namespace !== 'string' || !namespace)
+      throw new Error('warm provider target is incomplete');
+    targets.set(`${context}/${namespace}`, { context, namespace });
+  }
+  if (targets.size !== 1) throw new Error('warm control forward requires one cluster and namespace per gate run');
+  return [...targets.values()][0]!;
+}
+
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
   commit: string;
@@ -1702,7 +1757,45 @@ export interface GateAdmission {
   acquire(signal: AbortSignal): Promise<() => void>;
   /** The pool-wide reading admission waits on (recommended · limitedBy · memorySlots); null before any reading. */
   waitReason(): string | null;
+  /** Optional deterministic-test observation override; production uses poolGateAdmission's unknown-only provider. */
+  priorityShadowObservation?(gateWaiting: boolean): GatePriorityShadowObservation;
 }
+
+export type GatePriorityImageState = 'verified' | 'mismatch' | 'unknown';
+export interface GatePriorityShadowObservation {
+  gateRunId: string | null;
+  host: string | null;
+  competingRunId: string | null;
+  competingHost: string | null;
+  gateImageState: GatePriorityImageState;
+  competingImageState: GatePriorityImageState;
+  gateWaiting: boolean;
+  lowerPriorityWaiting: boolean | null;
+}
+export interface GatePriorityShadowDecision extends GatePriorityShadowObservation {
+  event: 'gate-priority-shadow-decision';
+  decision: 'gate-first' | 'no-contention' | 'insufficient-evidence';
+  selectionRationale: string;
+}
+
+/** A shadow-only policy decision; it has no pool or Pod handle and cannot change runtime state. */
+export function gatePriorityShadowDecision(input: GatePriorityShadowObservation): GatePriorityShadowDecision {
+  const base = { event: 'gate-priority-shadow-decision' as const, ...input };
+  if (!input.gateWaiting || input.lowerPriorityWaiting === false) {
+    return { ...base, decision: 'no-contention', selectionRationale: !input.gateWaiting ? 'gate-not-waiting' : 'no-lower-priority-waiter-observed' };
+  }
+  if (input.lowerPriorityWaiting !== true) {
+    return { ...base, decision: 'insufficient-evidence', selectionRationale: 'lower-priority-wait-state-unknown' };
+  }
+  if (!input.gateRunId || !input.competingRunId || !input.host || input.host !== input.competingHost) {
+    return { ...base, decision: 'insufficient-evidence', selectionRationale: 'same-host-run-identities-unavailable' };
+  }
+  if (input.gateImageState !== 'verified' || input.competingImageState !== 'verified') {
+    return { ...base, decision: 'insufficient-evidence', selectionRationale: 'image-state-not-verified' };
+  }
+  return { ...base, decision: 'gate-first', selectionRationale: 'same-host-contention-and-verified-gate-image; gate-policy-priority' };
+}
+
 export const GATE_ADMISSION_WAIT_SECONDS_DEFAULT = 1800;
 /** Queue pressure scales the default wait but never creates an unbounded admission timer. */
 export function gateAdmissionWaitSeconds(shards: number, slots: number): number {
@@ -1752,17 +1845,38 @@ export function defaultGateMemberProbe(member: PodPoolMember, tools: GateTools =
   return !member.sshHost || (tools.remoteRun ?? defaultRemoteRun)(member.sshHost, 'true').status === 0;
 }
 
-export function poolGateAdmission(pool: PodPoolScheduler): GateAdmission {
-  return { acquire: (signal) => pool.acquireAdmission(signal, undefined, { gate: true }), waitReason: () => pool.waitReason() };
+export function poolGateAdmission(pool: PodPoolScheduler, gateRunId: string | null = null,
+  priorityShadowObservation?: (gateWaiting: boolean) => GatePriorityShadowObservation): GateAdmission {
+  const singleHost = pool.members.length === 1 ? (pool.members[0]!.sshHost ?? hostname()) : null;
+  // The optional provider is a deterministic test seam only. Production never fabricates a competitor or image fact.
+  return {
+    acquire: (signal) => pool.acquireAdmission(signal, undefined, { gate: true }),
+    waitReason: () => pool.waitReason(),
+    // At admission time a multi-host pool has not selected a host yet. Existing measurements do not expose
+    // competing run ids or image states, so keep those unknown rather than deriving them from Job names.
+    priorityShadowObservation: priorityShadowObservation ?? ((gateWaiting) => ({ gateRunId, host: singleHost, competingRunId: null, competingHost: null,
+      gateImageState: 'unknown', competingImageState: 'unknown', gateWaiting, lowerPriorityWaiting: null })),
+  };
 }
-export async function admitGateShard(admission: GateAdmission | undefined, o: { waitMs: number; onWait: (reason: string) => void; reasonPollMs?: number; firstReasonMs?: number }): Promise<GateAdmissionResult> {
+export async function admitGateShard(admission: GateAdmission | undefined, o: { waitMs: number; onWait: (reason: string) => void; reasonPollMs?: number; firstReasonMs?: number;
+  onPriorityShadow?: (decision: GatePriorityShadowDecision) => void }): Promise<GateAdmissionResult> {
   const noop = () => {};
   if (!admission || !(o.waitMs > 0)) return { outcome: 'off', waitedMs: 0, release: noop };
   const started = Date.now();
   const controller = new AbortController();
   let timedOut = false;
   let lastReason: string | undefined;
-  const tell = () => { lastReason = gateAdmissionWaitText(admission.waitReason()); o.onWait(lastReason); };
+  let priorityShadowLogged = false;
+  const tell = () => {
+    lastReason = gateAdmissionWaitText(admission.waitReason());
+    if (!priorityShadowLogged && admission.priorityShadowObservation) {
+      priorityShadowLogged = true;
+      const decision = gatePriorityShadowDecision(admission.priorityShadowObservation(true));
+      if (o.onPriorityShadow) o.onPriorityShadow(decision);
+      else debug.log('release-loop.gate', 'gate-priority-shadow-decision', decision);
+    }
+    o.onWait(lastReason);
+  };
   const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, o.waitMs);
   // A grant inside the first moment never touches the shard row (no flapping in shards.json).
   let ticker: ReturnType<typeof setInterval> | undefined;
@@ -1805,6 +1919,27 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
   const ssh = tools.ssh ?? defaultSshCommand;
   const remoteRun = tools.remoteRun ?? defaultRemoteRun;
   const runPod = tools.podCommand ?? podCommand;
+  const pinnedGateImageSync = (pod: NonNullable<GateOptions['pod']>, commit: string): RunPodCommandOptions['syncImages'] | undefined => {
+    const hasDigest = Boolean(pod.pinnedImageDigest?.trim());
+    const hasRunId = Boolean(pod.pinnedRunId?.trim());
+    if (hasDigest !== hasRunId) throw new Error('gate pinned image: both pinnedImageDigest and pinnedRunId are required');
+    if (!hasDigest) return undefined;
+    return async (members, image, localCommit) => {
+      if (localCommit !== commit) throw new Error('gate pinned image: requested source commit changed');
+      const probe = preflightGateImageDigest;
+      const poolSpecFor = (member: PodPoolMember) => `${member.context}${member.sshHost ? `@${member.sshHost}` : ''}:${member.capacity}#${member.registry ?? NODE_REGISTRY}`;
+      const result = buildPinnedGateImageSync({ runId: pod.pinnedRunId!, commit, digest: pod.pinnedImageDigest!, image,
+        members: members.map((member) => ({ context: member.context, registry: member.registry ?? NODE_REGISTRY })),
+        probeTagDigest: (member) => {
+          const candidate = members.find((row) => row.context === member.context && (row.registry ?? NODE_REGISTRY) === member.registry);
+          return candidate ? probe(poolSpecFor(candidate), commit) : null;
+        } });
+      for (const drift of result.tagDrifts) debug.log('release-loop.gate', 'image-tag-drift', {
+        ...drift, action: 'skip-push-use-pinned-digest',
+      }, { level: 'warn' });
+      return result.images;
+    };
+  };
   // GATE-HOSTMIRROR-EXPLICIT: resolved once per runner and handed to every podCommand (shard · retry · recheck).
   let gateMirror: GateHostMirror | undefined;
   const gateHostMirror = (pod: NonNullable<GateOptions['pod']>): { hostMirror?: string } => {
@@ -1847,6 +1982,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     if (!pod.pool || !Number.isSafeInteger(shardCount) || shardCount < 1
       || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1
       || !Number.isSafeInteger(isolationConcurrency) || isolationConcurrency < 1) throw new Error('invalid pod sweep options');
+    const hasPinnedDigest = Boolean(pod.pinnedImageDigest?.trim());
+    const hasPinnedRunId = Boolean(pod.pinnedRunId?.trim());
+    if (hasPinnedDigest !== hasPinnedRunId) throw new Error('gate pinned image: both pinnedImageDigest and pinnedRunId are required');
     const head = await command('git', ['rev-parse', 'HEAD'], tree);
     check(head, 'cut tree HEAD');
     const commit = head.output.trim();
@@ -1975,7 +2113,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const admissionWaitSeconds = pod.admissionWaitSeconds ?? gateAdmissionWaitSeconds(shards.length, rootSlots);
     if (!Number.isSafeInteger(admissionWaitSeconds) || admissionWaitSeconds < 0) throw new Error('invalid pod sweep options');
     // An injected pool (tests) runs without admission unless `pod.admission` is passed; the gate's own pool asks it.
-    const gateAdmission = pod.admission ?? tools.admission ?? (poolOverride ? undefined : poolGateAdmission(poolScheduler));
+    const gateAdmission = pod.admission ?? tools.admission ?? (poolOverride ? undefined : poolGateAdmission(poolScheduler, tools.graphRunId ?? null));
     debug.log('release-loop.gate', 'pod-admission', { waitSeconds: admissionWaitSeconds, source: pod.admissionWaitSeconds !== undefined ? 'config' : 'default', enabled: !!gateAdmission && admissionWaitSeconds > 0,
       rootSlots, shards: shards.length });
     // GATE-POD-STALL-FAILFAST: a shard with no test output within the stall window is stopped and recorded unmeasured.
@@ -2355,7 +2493,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             stamp('poolPlaced'); jobContext = member.context; jobContextForCapture = member.context; placedOn = member.context; placed();
             if (branch === '-tail') tailPlacedHost = member.context;
           }, skipMembers, depth === 0 && branch === '' && hostRetries === 0 && !retriedNoOutput && !batchIsolation && skipMembers.size === 0), clone: true, source: { kind: 'commit', sha: commit },
-          ...(pod.imagePin === 'cut-commit' ? { imageCommit: commit } : {}), deadlineSeconds: shardDeadline,
+          ...(pod.imagePin === 'cut-commit' || pod.pinnedImageDigest || pod.pinnedRunId ? { imageCommit: commit } : {}),
+          ...(pod.pinnedImageDigest || pod.pinnedRunId ? { syncImages: pinnedGateImageSync(pod, commit)! } : {}), deadlineSeconds: shardDeadline,
           ...gateHostMirror(pod),
           ...(multiHost ? { statusUnreadableMs: memberUnreadableSeconds * 1000 } : {}),
           ...(bunCache ? { bunCache } : {}),
@@ -2982,7 +3121,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     let producer: RunPodCommandOptions['warmProducer'];
     if (leased && replay?.transport.status === 'observed' && replay.transport.reason === 'complete') {
       if (warmCommandMatchesRequest(leased, warmRequest!) && leased.podName && leased.podUid
-        && leased.podContext && leased.image?.endsWith(`@${leased.key.imageDigest}`)) {
+        && leased.podContext && leased.image?.endsWith(`@${leased.key.imageDigest}`)
+        && (!pod.pinnedImageDigest || (normalizeGateImageDigest(pod.pinnedImageDigest) !== null
+          && normalizeGateImageDigest(leased.key.imageDigest) === normalizeGateImageDigest(pod.pinnedImageDigest)))) {
         producer = { pod: leased.podName, podUid: leased.podUid, context: leased.podContext, image: leased.image,
           commit, files: ['package.json', 'bun.lock'] };
       } else await quarantine('gate-producer-identity');
@@ -2996,7 +3137,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         run: process.env.ELANOUS_RUN_ID || attemptId, phase: 'release-gate', requestedAt: new Date().toISOString(),
         graphNode: 'gate-triage', commit, reason: `release gate recheck ${files.length} files`, pool: pod.pool,
         memReq: POD_ISOLATION_MEMORY_LIMIT, warmReused: !!producer },
-      source: { kind: 'commit', sha: commit }, deadlineSeconds, ...(producer ? { warmProducer: producer, image: producer.image, imageCommit: commit } : {}),
+      source: { kind: 'commit', sha: commit }, deadlineSeconds, ...(producer ? { warmProducer: producer, image: producer.image } : {}),
+      ...(producer || pod.pinnedImageDigest || pod.pinnedRunId ? { imageCommit: commit } : {}),
+      ...(pod.pinnedImageDigest || pod.pinnedRunId ? { syncImages: pinnedGateImageSync(pod, commit)! } : {}),
       ...(bunCache ? { bunCache } : {}), ...gateHostMirror(pod),
       ...(installSlots > 0 ? { installSlots: POD_INSTALL_SLOTS_HOST_PATH } : {}), ...(pod.cpu ? { cpu: pod.cpu } : {}),
       memoryLimit: POD_ISOLATION_MEMORY_LIMIT, name: `gate-recheck-${randomUUID()}`, command: ['bash', '-lc', shell] });
@@ -3349,9 +3492,10 @@ export function saveBaselineFileCache(ledger: string, commit: string, rows: Base
   } finally { if (existsSync(temp)) rmSync(temp); }
 }
 
-export async function judgeGate(opts: GateOptions, runner: GateRunner = createGateRunner(opts.repo ?? process.cwd(), opts.remote),
+export async function judgeGate(opts: GateOptions, runner: GateRunner = createGateRunner(opts.repo ?? process.cwd(), opts.remote, undefined, undefined, undefined, undefined, { graphRunId: opts.graphRunId ?? null }),
   imageProbe: typeof preflightGateImageDigest = preflightGateImageDigest,
-  identityProbe: typeof preflightGateExecutionIdentity = preflightGateExecutionIdentity): Promise<GateResult> {
+  identityProbe: typeof preflightGateExecutionIdentity = preflightGateExecutionIdentity,
+  syncImages: typeof syncPoolImages = syncPoolImages): Promise<GateResult> {
   if (opts.pod?.warmReplay) opts = { ...opts, pod: { ...opts.pod,
     warmShadowScope: { requested: false, attempts: 0 } } };
   const explicitConfig = getElanousConfigDirOverride();
@@ -3430,11 +3574,22 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       const pinPath = gateImagePinPath(root, opts.version, pinRunId);
       const gateImageTag = `${podCommandImageFor([], true).split(':')[0]}:${opts.commit.slice(0, 12)}`;
       let savedPin: ReturnType<typeof readGateImagePin>;
+      let supersededPin: ReturnType<typeof readGateImagePinForRun> = null;
+      let stalePinNeedsSuperseding = false;
       try { savedPin = existsSync(pinPath) ? readGateImagePin(pinPath, pinRunId, gateImageTag, opts.commit) : null; }
       catch (error) {
-        debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, currentImages, decision: 'fail-closed',
-          reason: 'saved-image-pin-invalid', error: String(error).slice(0, 300) }, { level: 'error' });
-        throw new Error('gate resume refused: saved image digest pin is invalid');
+        let prior: ReturnType<typeof readGateImagePinForRun> = null;
+        try { prior = readGateImagePinForRun(pinPath, pinRunId, gateImageTag); } catch { /* Keep invalid or corrupt pins fail-closed. */ }
+        if (!prior || prior.commit === opts.commit.toLowerCase()) {
+          debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, currentImages, decision: 'fail-closed',
+            reason: 'saved-image-pin-invalid', error: String(error).slice(0, 300) }, { level: 'error' });
+          throw new Error('gate resume refused: saved image digest pin is invalid');
+        }
+        supersededPin = prior;
+        stalePinNeedsSuperseding = true;
+        savedPin = null;
+        debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, currentImages, decision: 'stale-tip-detected',
+          priorCommit: supersededPin.commit, nextCommit: opts.commit.toLowerCase() });
       }
       const savedDigest = savedPin?.digest ?? null;
       let previouslyExecuted = false;
@@ -3449,10 +3604,33 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           } catch { previouslyExecuted = true; }
         }
       }
-      if (!savedDigest && previouslyExecuted) {
+      if (!savedDigest && previouslyExecuted && !supersededPin) {
         debug.log('release-loop.gate', 'image-pin', { runId: opts.graphRunId, savedDigest: null, currentImages,
           decision: 'fail-closed', reason: 'resume-pin-missing' }, { level: 'error' });
         throw new Error('gate resume refused: saved image digest pin is missing');
+      }
+      const hasPoolImage = [...poolImages.values()].some((images) => images.some((image) => normalizeGateImageDigest(image) !== null));
+      if (!savedDigest && !hasPoolImage) {
+        let syncResults: Awaited<ReturnType<typeof syncPoolImages>>;
+        try { syncResults = await syncImages(members, podCommandImageFor([], true), opts.commit); }
+        catch (error) {
+          debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, decision: 'fail-closed',
+            reason: 'initial-image-sync-failed', error: String(error).slice(0, 300) }, { level: 'error' });
+          throw new Error('gate image pin refused: initial image sync failed');
+        }
+        const failedSyncs = memberSpecs.filter((member) => !syncResults.get(member.context)?.ok);
+        if (failedSyncs.length) {
+          debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, decision: 'fail-closed', reason: 'initial-image-sync-failed',
+            failed: failedSyncs.map((member) => ({ context: member.context, result: syncResults.get(member.context) ?? null })) }, { level: 'error' });
+          throw new Error('gate image pin refused: initial image sync failed');
+        }
+        for (const member of memberSpecs) {
+          const digest = imageProbe(member.spec, opts.commit);
+          currentImages[member.context] = digest;
+          poolImages.set(member.context, digest ? [digest] : []);
+        }
+        debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, decision: 'initial-image-sync',
+          outcomes: [...syncResults].map(([context, result]) => ({ context, ok: result.ok, action: result.action })), currentImages });
       }
       const resolution = resolveGateImagePin({ ...(savedDigest ? { savedDigest } : {}),
         ...(!savedDigest ? { initialDigest: [...poolImages.values()].flat().find(Boolean) ?? null } : {}), poolImages });
@@ -3464,7 +3642,11 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       const selected = memberSpecs.filter((member) => resolution.eligiblePools.includes(member.context));
       if (!selected.length) throw new Error('gate image pin refused: no eligible pool');
       if (!savedDigest) {
-        try { writeGateImagePin(pinPath, pinRunId, resolution.digest, gateImageTag, opts.commit); }
+        try {
+          if (stalePinNeedsSuperseding) {
+            replaceGateImagePin(pinPath, pinRunId, resolution.digest, gateImageTag, opts.commit, gateImageTag, supersededPin!.commit);
+          } else writeGateImagePin(pinPath, pinRunId, resolution.digest, gateImageTag, opts.commit);
+        }
         catch (error) {
           debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, pinnedDigest: resolution.digest,
             currentImages, decision: 'fail-closed', reason: 'pin-write-failed', error: String(error).slice(0, 300) }, { level: 'error' });
@@ -4431,11 +4613,12 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
   judge: (opts: GateOptions, runner?: GateRunner, imageProbe?: typeof preflightGateImageDigest) => Promise<GateResult> = judgeGate,
   imageProbe: typeof preflightGateImageDigest = preflightGateImageDigest): Promise<number> {
   const start = Date.now();
-  let result: GateResult;
+  let result: GateResult | undefined;
   let version = '';
   let graphRunId: string | null = null;
   let autohealStoreRoot = '';
   let placement: { executor: string | null; host: string | null } | undefined;
+  let warmControlCleanup: (() => Promise<void>) | undefined;
   try {
     const parsed = parseOptions(argv, env);
     let config: unknown = null;
@@ -4443,9 +4626,10 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
       try { config = getUserConfig(); }
       catch (error) { debug.log('release-loop.gate', 'warm-profile-unavailable', { error: String(error) }); }
     }
-    const opts = parsed === 'help' ? parsed : withWarmGateHooks(parsed, config, !!runner);
+    const opts = parsed === 'help' ? parsed : withWarmGateHooks(parsed, config, !!runner,
+      cleanup => { warmControlCleanup = cleanup; });
     if (opts !== 'help' && opts.warmPrecutCanary) {
-      const canaryRunner = runner ?? createGateRunner(opts.repo ?? process.cwd(), opts.remote);
+      const canaryRunner = runner ?? createGateRunner(opts.repo ?? process.cwd(), opts.remote, undefined, undefined, undefined, undefined, { graphRunId: opts.graphRunId ?? null });
       const warmPrecutTestSeam = (runner as (GateRunner & { warmPrecutCanaryTestSeam?: {
         config: unknown; hooks: Pick<NonNullable<GateOptions['pod']>, 'warmReplay' | 'warmFinalize' | 'warmQuarantine' | 'warmReuseConfig'>;
       } }) | undefined)?.warmPrecutCanaryTestSeam;
@@ -4483,7 +4667,15 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
   } catch (error) {
     result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start, error: String(error) };
     placement ??= requestedGateExecutor(argv, env);
+  } finally {
+    try { await warmControlCleanup?.(); }
+    catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      debug.log('pod.warm.control-forward', 'cleanup-failed', { version, reason }, { level: 'error' });
+      if (typeof result !== 'undefined') result = { ...result, outcome: 'error', error: [result.error, reason].filter(Boolean).join('; ') };
+    }
   }
+  if (!result) throw new Error('release gate returned without a result');
   if (versionPattern.test(version) && result.stalledShards?.length) {
     result.autoheals = result.stalledShards.map((shard, index) => {
       const shardKey = `pod-${shard.shard}`;

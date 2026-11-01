@@ -16,6 +16,7 @@ type JsonObject = Record<string, unknown>;
 
 export interface WarmPoolProviderConfig {
   candidates: WarmWorkerCandidate[];
+  expandPoolTemplatesToQuota: boolean;
   poolTemplates: Array<{
     host: string;
     tier: 'lite' | 'standard';
@@ -137,6 +138,9 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   const imageRepository = text(pool.imageRepository, 'pod.warmPool.imageRepository').replace(/\/$/, '');
   const imageDigest = text(pool.imageDigest, 'pod.warmPool.imageDigest');
   if (!DIGEST.test(imageDigest)) throw new Error('pod.warmPool.imageDigest must be a sha256 digest');
+  const expandPoolTemplatesToQuota = pool.expandPoolTemplatesToQuota;
+  if (expandPoolTemplatesToQuota !== undefined && typeof expandPoolTemplatesToQuota !== 'boolean')
+    throw new Error('pod.warmPool.expandPoolTemplatesToQuota must be a boolean');
   const lockHash = text(pool.lockHash, 'pod.warmPool.lockHash');
   if (!LOCK_HASH.test(lockHash)) throw new Error('pod.warmPool.lockHash must be a 64-character SHA-256');
   const architecture = text(pool.architecture, 'pod.warmPool.architecture');
@@ -170,7 +174,8 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
       },
     };
   });
-  return { candidates: [], poolTemplates, profileConfig: { pod: { warmPoolProfile: profile } },
+  return { candidates: [], expandPoolTemplatesToQuota: expandPoolTemplatesToQuota === true,
+    poolTemplates, profileConfig: { pod: { warmPoolProfile: profile } },
     controlUrl: controlUrl(input.controlUrl), memberToken: token(input.memberToken, 'member token'), machineTokens };
 }
 

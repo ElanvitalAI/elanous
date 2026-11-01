@@ -20,7 +20,7 @@ export interface ResourceRecord {
 export type ResourceView = ResourceRecord & { ageMs: number; expired: boolean };
 
 export interface PodWorkerKey { context: string; imageDigest: string; lockHash: string; architecture: string }
-type PodWorkerState = 'idle' | 'leased' | 'sanitizing' | 'timeout-fenced' | 'quarantined';
+type PodWorkerState = 'idle' | 'leased' | 'sanitizing' | 'timeout-fenced' | 'quarantined' | 'reaping';
 interface PodWorkerLeaseAttrs {
   key: PodWorkerKey;
   podUid: string;
@@ -35,6 +35,8 @@ interface PodWorkerLeaseAttrs {
   timeoutFenceUntil?: number;
   timeoutRunId?: string;
   timeoutAttemptId?: string;
+  timeoutPreviousObservedAt?: number;
+  timeoutPreviousTtlMs?: number;
   runId?: string;
   attemptId?: string;
   reason?: string;
@@ -216,6 +218,13 @@ export class ResourceLedger {
     now ??= Date.now();
     const rows = this.read();
     const id = `pod-worker-lease:${request.workerId}`;
+    if (rows.some(row => {
+      if (row.kind !== 'pod-worker-lease' || row.name === request.workerId) return false;
+      const attrs = workerAttrs(row);
+      return attrs.podUid === request.podUid
+        && (attrs.state === 'quarantined' || attrs.state === 'timeout-fenced' || attrs.state === 'reaping');
+    }))
+      throw new ResourceLedgerError(409, 'pod-uid-already-registered');
     const index = rows.findIndex(row => row.id === id);
     const previous = index < 0 ? undefined : rows[index]!;
     if (previous && previous.kind !== 'pod-worker-lease') throw new ResourceLedgerError(409, 'worker-id-conflict');
@@ -244,8 +253,10 @@ export class ResourceLedger {
       const idleAttrs: PodWorkerLeaseAttrs = { ...candidateAttrs, state: 'idle' };
       delete idleAttrs.leaseId; delete idleAttrs.leaseOwner; delete idleAttrs.runId; delete idleAttrs.attemptId;
       delete idleAttrs.timeoutFenceUntil; delete idleAttrs.timeoutRunId; delete idleAttrs.timeoutAttemptId;
-      rows[rowIndex] = { ...candidate, attrs: idleAttrs as unknown as Record<string, unknown>, observedAt: at,
-        ttlMs: candidateAttrs.idleTtlMs };
+      const observedAt = candidateAttrs.timeoutPreviousObservedAt ?? at;
+      const ttlMs = candidateAttrs.timeoutPreviousTtlMs ?? candidateAttrs.idleTtlMs;
+      delete idleAttrs.timeoutPreviousObservedAt; delete idleAttrs.timeoutPreviousTtlMs;
+      rows[rowIndex] = { ...candidate, attrs: idleAttrs as unknown as Record<string, unknown>, observedAt, ttlMs };
       expiredFenceChanged = true;
     }
     const index = rows.findIndex(row => row.kind === 'pod-worker-lease' && (!request.machine || row.machine === request.machine)
@@ -283,13 +294,40 @@ export class ResourceLedger {
         && attrs.timeoutAttemptId === request.attemptId;
       const sameLease = attrs.state === 'leased' && attrs.leaseOwner === request.owner
         && attrs.runId === request.runId && attrs.attemptId === request.attemptId;
-      const available = attrs.state === 'idle';
+      const available = attrs.state === 'idle' && Math.max(0, at - row.observedAt) < row.ttlMs;
       if (!request.owner || !request.runId || !request.attemptId || !Number.isSafeInteger(request.fenceMs)
         || request.fenceMs < 1 || !(sameFence || sameLease || available))
         throw new ResourceLedgerError(409, 'stale-timeout-fence');
       const nextAttrs: PodWorkerLeaseAttrs = { ...attrs, state: 'timeout-fenced',
         timeoutFenceUntil: at + request.fenceMs, timeoutRunId: request.runId, timeoutAttemptId: request.attemptId };
+      if (available) {
+        nextAttrs.timeoutPreviousObservedAt = row.observedAt;
+        nextAttrs.timeoutPreviousTtlMs = row.ttlMs;
+      }
       const next: ResourceRecord = { ...row, attrs: nextAttrs as unknown as Record<string, unknown>, observedAt: at };
+      rows[index] = next;
+      this.write(rows);
+      return next;
+    });
+  }
+
+  /** Atomically reserves a fenced Pod UID so a timeout-fence expiry cannot make it leasable during deletion. */
+  reservePodWorkerReap(id: string, request: { machine: string; podUid: string }, now?: number): ResourceRecord {
+    return this.mutate(() => {
+      now ??= Date.now();
+      const rows = this.read();
+      const index = rows.findIndex(row => row.id === id && row.kind === 'pod-worker-lease');
+      if (index < 0) throw new ResourceLedgerError(404, 'not-found');
+      const row = rows[index]!;
+      const attrs = workerAttrs(row);
+      if (row.machine !== request.machine || attrs.podUid !== request.podUid || attrs.leaseId
+        || !['quarantined', 'timeout-fenced', 'reaping'].includes(attrs.state))
+        throw new ResourceLedgerError(409, 'pod-worker-reap-not-eligible');
+      if (rows.some((other, otherIndex) => otherIndex !== index && other.kind === 'pod-worker-lease'
+        && workerAttrs(other).podUid === request.podUid))
+        throw new ResourceLedgerError(409, 'pod-worker-uid-has-other-lease');
+      const next: ResourceRecord = { ...row,
+        attrs: { ...attrs, state: 'reaping' } as unknown as Record<string, unknown>, observedAt: now };
       rows[index] = next;
       this.write(rows);
       return next;

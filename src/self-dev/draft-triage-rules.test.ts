@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { assessDraftTriage, branchStem, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, isAutoTitle, sameGoalPr, sameVerifiedGoal, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
+import { assessDraftTriage, branchStem, decideDraft, draftClaimComment, draftClaimState, draftIntentHoldRejection, draftReleaseComment, isAutoTitle, sameGoalPr, sameVerifiedGoal, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 
 it('preserves manual claim bytes and distinguishes missing timestamps from expiry', () => {
@@ -21,6 +21,34 @@ const base: DraftTriageInput = {
 };
 
 describe('decideDraft', () => {
+  it('keeps only one canonical, complete, unexpired draft intent hold', () => {
+    const now = new Date('2026-10-31T12:00:00.000Z');
+    const marker = (payload: string) => `<!-- elanous:draft-intent-hold ${payload} -->`;
+    const valid = marker(JSON.stringify({ owner: 'OPT', reason: 'focused repair', expiresAt: '2026-10-31T13:00:00.000Z' }));
+    const decide = (body: string) => decideDraft({ ...base, now, draft: { ...base.draft, body } });
+    expect(decide(`stale draft\n${valid}`)).toEqual({ action: 'keep', reason: 'intent-hold owner=OPT; reason=focused repair; expiresAt=2026-10-31T13:00:00.000Z' });
+
+    const invalid = [
+      marker(JSON.stringify({ owner: 'OPT', reason: 'expired', expiresAt: '2026-10-31T11:59:59.999Z' })),
+      `${valid}\n${valid}`,
+      `${valid}\n<!-- elanous:draft-intent-hold {broken duplicate`,
+      marker('{"owner":"OPT","owner":"TC","reason":"duplicate key","expiresAt":"2026-10-31T13:00:00.000Z"}'),
+      marker(JSON.stringify({ owner: 'OPT', reason: 'missing expiry' })),
+      marker(JSON.stringify({ owner: 'OPT', reason: 'multiline\nreason', expiresAt: '2026-10-31T13:00:00.000Z' })),
+      marker(JSON.stringify({ owner: 'OPT', reason: ' padded ', expiresAt: '2026-10-31T13:00:00.000Z' })),
+      marker(JSON.stringify({ owner: 'OPT', reason: 'ambiguous;expiresAt=forged', expiresAt: '2026-10-31T13:00:00.000Z' })),
+      marker(JSON.stringify({ owner: 'OPT', reason: 'closes --> marker', expiresAt: '2026-10-31T13:00:00.000Z' })),
+      marker('{not-json}'),
+    ];
+    for (const body of invalid) expect(decide(body)).toEqual({ action: 'close', reason: 'stale-ended-run' });
+    expect(draftIntentHoldRejection(marker(JSON.stringify({ reason: 'focused repair', owner: 'OPT', expiresAt: '2026-10-31T13:00:00.000Z' })), now))
+      .toBe('noncanonical-json');
+    expect(draftIntentHoldRejection(marker(JSON.stringify({ owner: 'OPT', reason: 'expired', expiresAt: '2026-10-31T11:59:59.999Z' })), now))
+      .toBe('expired');
+    expect(draftIntentHoldRejection(marker(JSON.stringify({ owner: 'OPT', reason: 'ambiguous;expiresAt=forged', expiresAt: '2026-10-31T13:00:00.000Z' })), now))
+      .toBe('invalid-fields');
+  });
+
   it('closes only A against the newer same-title same-stem open B', () => {
     const openDrafts: DraftTriagePr[] = [
       { number: 1, title: 'T', branch: 'self-impl/x-aaaaaaaa-r1', createdAt: '2026-10-03T10:00:00Z' },
@@ -192,6 +220,8 @@ describe('decideDraft', () => {
       labels: ['elanous:harvestable'], body: '칸: DRAFT-ZERO\n수확보류: harvest-deferred', createdAt: '2026-10-21T00:00:00Z' };
     // 검증된 표지 하나 — superseded twin·duplicate·harvestable·24h stale을 모두 이기고, PROTECTED_LABELS 선제 keep보다도 앞선다.
     expect(decide(deferred)).toEqual({ action: 'keep', reason: 'harvest-deferred' });
+    const intentHold = `<!-- elanous:draft-intent-hold ${JSON.stringify({ owner: 'OPT', reason: 'focused repair', expiresAt: '2026-11-02T13:00:00.000Z' })} -->`;
+    expect(decide({ ...deferred, body: `${deferred.body}\n${intentHold}` })).toEqual({ action: 'keep', reason: 'harvest-deferred' });
     expect(decide({ ...deferred, labels: ['elanous:harvestable', 'elanous:keep'] })).toEqual({ action: 'keep', reason: 'harvest-deferred' });
     // 같은 PR/body에서 runStatus만 바꾸면 실패 종료에서만 harvest-deferred 보호가 적용된다.
     expect(decide(deferred, { runStatus: 'completed' })).toEqual({ action: 'close', reason: 'superseded-by #90' });
@@ -299,6 +329,14 @@ describe('assessDraftTriage', () => {
     expect(result.nextAction).toBe('human');
     expect(result.checks.protected).toEqual({ state: 'yes', evidence: `보호 표지=${RELEASE_PATH_LABEL}` });
     expect(result.checks['replacement-landed'].state).toBe('yes');
+  });
+
+  it('does not recommend closure for an unexpired structural intent hold', () => {
+    const hold = `<!-- elanous:draft-intent-hold ${JSON.stringify({ owner: 'OPT', reason: 'focused repair', expiresAt: '2026-10-21T05:00:00.000Z' })} -->`;
+    const result = assessDraftTriage({ draft: { ...triageDraft, body: `${triageDraft.body}\n${hold}` },
+      now: triageNow, runStatus: 'completed', replacement: { number: 900, evidence: 'Supersedes: #101' } });
+    expect(result.nextAction).toBe('human');
+    expect(result.checks.protected).toEqual({ state: 'yes', evidence: 'intent-hold owner=OPT; reason=focused repair; expiresAt=2026-10-21T05:00:00.000Z' });
   });
 
   it('requires repository-bound cell status before recommending close-a', () => {

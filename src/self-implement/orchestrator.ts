@@ -117,7 +117,7 @@ import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSuper
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { enterJourneyNode, exitJourneyNode, journeyJoinFields, withJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { classifyGateEnvDeficit, DEFAULT_GATE_ENV_RETRY, GATE_ENV_DEFICIT_HARVESTABLE_MARK, type GateEnvDeficitKind } from './gate-env-retry.js';
 import { recordFailureEvent } from './heal-intake.js';
@@ -2412,7 +2412,9 @@ export interface SelfImplementResult {
   /** Additive hard-cap disposition; outcome remains the stable public terminal contract. */
   salvage?: 'launched' | 'parked';
   /** Rework stopped on exclusively baseline/flaky/precondition failures; do not retry this goal against the same base. */
-  terminationReason?: 'blocked-by-baseline' | 'goal-only-rework-exhausted' | 'tdd-evidence-missing';
+  terminationReason?: string;
+  /** Child's concrete stop summary when implementation did not converge before TDD evidence adjudication. */
+  terminationDetail?: string;
   /** Structured TDD failure survives child JSON/result truncation and parent-ledger mapping. */
   tddEvidenceFailure?: { reason: 'tdd-evidence-missing'; round: number; missing: readonly TddRecordTag[] };
   sessionId?: string;
@@ -3035,6 +3037,15 @@ type PreparedPrBody = {
 const PR_BODY_TRUNCATION_MARKER_MAX_CHARS = 1_024;
 
 type ChildProviderErrorQueryResult = Exclude<Awaited<ReturnType<NonNullable<SelfImplementSeams['queryChildProviderErrors']>>>, undefined>;
+type ChildProviderErrorDetail = {
+  provider?: string;
+  model?: string;
+  message?: string;
+  observedAt?: string;
+  httpStatus?: number;
+  providerErrorCode?: string;
+  providerErrorType?: string;
+};
 
 /** Aggregates only router-produced structured records; provider messages are never reparsed. */
 export function queryStructuredChildProviderErrors(
@@ -3054,8 +3065,8 @@ export function queryStructuredChildProviderErrors(
     });
     if (rows.length === 0) return { status: 'none' };
     let credentialFailureCount = 0;
-    let lastProviderError: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
-    let lastCredentialFailure: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
+    let lastProviderError: ChildProviderErrorDetail | undefined;
+    let lastCredentialFailure: ChildProviderErrorDetail | undefined;
     for (const row of rows) {
       let data: Record<string, unknown> | undefined;
       try {
@@ -3067,6 +3078,9 @@ export function queryStructuredChildProviderErrors(
         ...(typeof data?.model === 'string' ? { model: data.model } : {}),
         ...(typeof data?.message === 'string' ? { message: data.message } : {}),
         ...(typeof row.ts === 'string' ? { observedAt: row.ts } : {}),
+        ...(typeof data?.httpStatus === 'number' ? { httpStatus: data.httpStatus } : {}),
+        ...(typeof data?.providerErrorCode === 'string' ? { providerErrorCode: data.providerErrorCode } : {}),
+        ...(typeof data?.providerErrorType === 'string' ? { providerErrorType: data.providerErrorType } : {}),
       };
       lastProviderError = detail;
       if (data?.authRejected === true) {
@@ -3878,8 +3892,8 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   const latestVerdictSeq = (): number => Math.max(lastFailedGateSeq, lastMustFixReviewSeq);
   const hasCurrentProviderError = (): boolean => providerErrorCount > 0 && lastProviderErrorSeq > latestVerdictSeq();
   const hasCurrentCredentialFailure = (): boolean => credentialFailureCount > 0 && lastCredentialFailureSeq > latestVerdictSeq();
-  let lastProviderError: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
-  let lastCredentialFailure: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
+  let lastProviderError: ChildProviderErrorDetail | undefined;
+  let lastCredentialFailure: ChildProviderErrorDetail | undefined;
   let childProviderErrorQueryStatus: 'found' | 'none' | 'unavailable' | 'not-configured' = 'not-configured';
   let queriedProviderErrorCount = 0;
   let queriedCredentialFailureCount = 0;
@@ -3929,8 +3943,22 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       credentialFailureCount,
       queriedProviderErrorCount,
       queriedCredentialFailureCount,
-      lastProviderError: lastProviderError ? { provider: lastProviderError.provider ?? null, model: lastProviderError.model ?? null, observedAt: lastProviderError.observedAt ?? null } : null,
-      lastCredentialFailure: lastCredentialFailure ? { provider: lastCredentialFailure.provider ?? null, model: lastCredentialFailure.model ?? null, observedAt: lastCredentialFailure.observedAt ?? null } : null,
+      lastProviderError: lastProviderError ? {
+        provider: lastProviderError.provider ?? null,
+        model: lastProviderError.model ?? null,
+        observedAt: lastProviderError.observedAt ?? null,
+        ...(typeof lastProviderError.httpStatus === 'number' ? { httpStatus: lastProviderError.httpStatus } : {}),
+        ...(typeof lastProviderError.providerErrorCode === 'string' ? { providerErrorCode: lastProviderError.providerErrorCode } : {}),
+        ...(typeof lastProviderError.providerErrorType === 'string' ? { providerErrorType: lastProviderError.providerErrorType } : {}),
+      } : null,
+      lastCredentialFailure: lastCredentialFailure ? {
+        provider: lastCredentialFailure.provider ?? null,
+        model: lastCredentialFailure.model ?? null,
+        observedAt: lastCredentialFailure.observedAt ?? null,
+        ...(typeof lastCredentialFailure.httpStatus === 'number' ? { httpStatus: lastCredentialFailure.httpStatus } : {}),
+        ...(typeof lastCredentialFailure.providerErrorCode === 'string' ? { providerErrorCode: lastCredentialFailure.providerErrorCode } : {}),
+        ...(typeof lastCredentialFailure.providerErrorType === 'string' ? { providerErrorType: lastCredentialFailure.providerErrorType } : {}),
+      } : null,
       lastProviderErrorSeq,
       lastCredentialFailureSeq,
       lastFailedGateSeq,
@@ -3945,7 +3973,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       if (record.category !== 'llm.router.error') return;
       const data = record.data;
       if (!data || typeof data !== 'object') return;
-      const { provider, model, message } = data as Record<string, unknown>;
+      const { provider, model, message, httpStatus, providerErrorCode, providerErrorType } = data as Record<string, unknown>;
       providerErrorCount++;
       lastProviderErrorSeq = ++failureSequence;
       lastProviderError = {
@@ -3953,6 +3981,9 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         ...(typeof model === 'string' ? { model } : {}),
         ...(typeof message === 'string' ? { message } : {}),
         ...(typeof record.ts === 'string' ? { observedAt: record.ts } : {}),
+        ...(typeof httpStatus === 'number' ? { httpStatus } : {}),
+        ...(typeof providerErrorCode === 'string' ? { providerErrorCode } : {}),
+        ...(typeof providerErrorType === 'string' ? { providerErrorType } : {}),
       };
       // ⛔⭐⭐⭐ 자격 거부는 「프로바이더 오류」의 부분집합이지만 ***사람이 할 다음 행동이 다르다***
       //   (2026-08-14 실측 · `[T]` 83차): grok 자식 «둘»이 401 로 죽었는데 부모가 남긴 것은
@@ -4796,6 +4827,14 @@ function safeErrorDescription(error: unknown): string {
   } catch {
     return '[error description unavailable]';
   }
+}
+
+function safePreservationFailure(error: unknown): string {
+  const detail = redactSecretText(safeErrorDescription(error))
+    .replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ')
+    .trim()
+    .slice(0, 400);
+  return detail || '[empty preservation error]';
 }
 
 
@@ -6489,7 +6528,7 @@ async function runSelfImplementInner(
             }
           }
         } catch (error) {
-          pushError = error instanceof Error ? error : new Error(String(error));
+          pushError = new Error(safePreservationFailure(error));
         }
       }
       observe('rework-blocked-draft-pr', {
@@ -6503,9 +6542,10 @@ async function runSelfImplementInner(
       }, pushError ? { level: 'warn' } : undefined);
       if (pushError) {
         const failure = preservationErrorStep === 'worktree' ? '워크트리 부재로 보존 실패' : preservationErrorStep === 'commit' ? '로컬 브랜치 커밋 실패' : '원격 브랜치 보존 실패';
-        progress('aborted', `환경 탓 중단 — ${failure}: ${wt.branch} (${pushError.message}; worktree: ${wt.path})`);
+        const failedStep = preservationErrorStep ?? 'push';
+        progress('aborted', `환경 탓 중단 — ${failure}: ${wt.branch} (stage=${failedStep}; error=${pushError.message}; worktree: ${wt.path})`);
         if (preservationErrorStep === 'worktree') return undefined;
-        throw new Error(`환경 탓 중단 — ${failure}: ${wt.branch} (worktree: ${wt.path})`, { cause: pushError });
+        throw new Error(`환경 탓 중단 — ${failure}: ${wt.branch} (stage=${failedStep}; error=${pushError.message}; worktree: ${wt.path})`, { cause: pushError });
       }
       if (worktreeOnly) {
         progress(stage, artifactPath
@@ -7931,8 +7971,13 @@ async function runSelfImplementInner(
       readonly judgment: ReturnType<typeof judgeTddEvidence>;
       readonly implementation: typeof impl;
     }): { readonly transcript: string; readonly judgment: ReturnType<typeof judgeTddEvidence> } => {
-      if (!input.judgment.planned || input.judgment.red.observed || !input.implementation.ok
-        || input.implementation.terminalStatus?.reached !== true) {
+      const skippedReason = !input.judgment.planned ? 'not-planned'
+        : input.judgment.red.observed ? 'child-red-present'
+          : !input.implementation.ok ? 'impl-not-ok'
+            : input.implementation.terminalStatus?.reached !== true ? 'terminal-not-reached' : undefined;
+      if (skippedReason) {
+        observe('tdd-base-test', { round: input.round, status: 'skipped', reason: skippedReason,
+          ...(skippedReason === 'impl-not-ok' ? { implementationFailure: input.implementation.summary.slice(0, 240) } : {}) }, { level: 'warn' });
         return { transcript: input.transcript, judgment: input.judgment };
       }
       if (!wt.resolvedBase) {
@@ -8272,9 +8317,11 @@ async function runSelfImplementInner(
         salvageStatusExpected: false,
         ...(abort.terminalStatus ? { terminalStatus: abort.terminalStatus } : {}),
       });
+      const implementationStop = impl.summary.split(/\r?\n/u, 1)[0]?.trim().slice(0, 240);
       return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }),
         ...(tddEvidenceFailure ? { terminationReason: tddEvidenceFailure.reason, tddEvidenceFailure }
-          : goalOnlyReworkExhausted ? { terminationReason: 'goal-only-rework-exhausted' as const } : {}),
+          : goalOnlyReworkExhausted ? { terminationReason: 'goal-only-rework-exhausted' as const }
+            : { terminationReason: implementationStop || 'implementation-did-not-converge', terminationDetail: implementationStop || 'implementation did not converge' }),
         sessionId, worktreePath: wt.path, branch: wt.branch, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: blockedDraftPrFailure ?? impl.summary,
         ...(blockedDraftPrFailureKind ? { detailKind: blockedDraftPrFailureKind } : {}) };
     }

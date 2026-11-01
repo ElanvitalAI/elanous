@@ -21,6 +21,11 @@ import { aggregateMissionRetros } from '../src/autopilot/mission-retrospect.js';
 import { recordAutonomousActionSafe } from '../src/domains/autonomy-log.js';
 import { sendOutbound } from '../src/domains/outbound-alert.js';
 import { unknownCronFlag } from '../src/domains/cron-flag-contract.js';
+import { debug } from '../src/debug/log.js';
+import { registerStandaloneLogSink } from '../src/domains/standalone-log-sink.js';
+import { finishRetroCycleRun } from '../src/domains/retro-cycle-observation.js';
+import { readRunExits } from '../src/harness/harness-incidents.js';
+import { doctorVisitIncidentRoot, readDoctorVisits } from '../src/self-implement/doctor-visit.js';
 
 // ⛔⭐ 거부는 «맨 앞»이다 — 이 파일은 모듈 최상위에서 argv 를 읽으므로 그 뒤면 늦다.
 //   ⛔ 그리고 «한 줄»로 낸다 — 최상위 throw 는 스택 트레이스를 흘리고, 크론 로그에서 그것은 잡음이다.
@@ -31,6 +36,10 @@ if (unknownFlag) { console.error(`⛔ 모르는 플래그: ${unknownFlag}`); pro
 const pIdx = process.argv.indexOf('--period');
 const period = (pIdx >= 0 ? process.argv[pIdx + 1] : 'weekly') as RetroPeriod;
 if (!['weekly', 'monthly', 'quarterly', 'annual'].includes(period)) { console.error(`잘못된 period: ${period}`); process.exit(1); }
+
+// This scheduled script runs outside the daemon; attach its debug events to
+// this instance's logs.db so the lifecycle observations remain queryable.
+await registerStandaloneLogSink('retro');
 
 const REPORT_DIR = join(homedir(), '.elanous/conatus/reflections');
 const LOG = join(homedir(), '.elanous/conatus/retro_cycle.log');
@@ -114,6 +123,14 @@ const report = await runRetroCycle({
   // C3 (2026-07-18) — 미션 회고(C1 안착·C2 피드백) 집계를 주간 리포트에 합류(비파괴 opt-in).
   retro: { backtest: backtestAgg, regime: regimeAgg, surface: surfaceAgg, missions: (from, to) => aggregateMissionRetros(from, to) },
   candidates,
+  featureSignals: () => {
+    const incidents = readRunExits(doctorVisitIncidentRoot())
+      .map((row) => ({ runId: row.runId, symptom: row.reason, at: row.at, source: 'incident' as const }));
+    const visits = readDoctorVisits()
+      .filter((row) => !!row.timestamp)
+      .map((row) => ({ runId: row.runId, symptom: row.symptom, at: row.timestamp!, source: 'doctor-visit' as const }));
+    return [...incidents, ...visits];
+  },
   // LLM 정성 서사(fail-soft) — provider 없으면 정량 base 그대로.
   narrate: narrateRetro,
   writeReport: (filename, md) => {
@@ -127,15 +144,20 @@ const report = await runRetroCycle({
   notify: (t) => { log(`[HITL] ${t.replace(/\n/g, ' ')}`); if (!process.argv.includes('--collect-only')) try { sendOutbound(t, 'ops-alert'); } catch { /* fail-soft */ } },
 }, period);
 
-log(`retro ${period}: report=${report.reportPath} · 제안=${report.hasProposal ? report.proposalId : '없음'}`);
+log(`retro ${period}: report=${report.reportPath} · 리밸런싱=${report.hasProposal ? report.proposalId : '없음'} · 반복 증상 제안=${report.featureProposals.length}`);
 
 // Autopilot P0.2 — 자율행동(회고 루프) 회상 로깅. 리밸런싱 제안은 HITL 승인 대기(자율집행 아님).
-recordAutonomousActionSafe({
-  loop: 'retro',
-  action: `${period} 회고 리포트 발행`,
-  rationale: '기간 성과 집계(백테스트·국면·발송) → 리밸런싱 제안(HITL 승인 대기)',
-  outcome: report.hasProposal ? `리밸런싱 제안 ${report.proposalId}(승인 대기)` : '제안 없음',
-  refs: { reportPath: report.reportPath },
+const runId = finishRetroCycleRun(report, {
+  recordAction: ({ runId: actionRunId, reportPath }) => {
+    recordAutonomousActionSafe({
+      loop: 'retro',
+      action: `${period} 회고 리포트 발행`,
+      rationale: '기간 성과 집계(백테스트·국면·발송) → 리밸런싱 제안(HITL 승인 대기)',
+      outcome: report.hasProposal ? `리밸런싱 제안 ${report.proposalId}(승인 대기)` : '제안 없음',
+      refs: { runId: actionRunId, reportPath },
+    });
+  },
+  log: (category, event, data) => debug.log(category, event, data),
 });
 
-console.log(JSON.stringify(report, null, 2));
+console.log(JSON.stringify({ ...report, runId }, null, 2));

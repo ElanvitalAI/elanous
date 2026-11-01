@@ -56,6 +56,19 @@ function pathWithoutCommand(command: string, path = hostPathWithoutEln()): strin
   return filteredDirs.join(':');
 }
 
+function pathWithoutCommands(commands: string[], path = hostPathWithoutEln()): string {
+  return commands.reduce((current, command) => pathWithoutCommand(command, current), path);
+}
+
+function expectCommandsMissing(commands: string[], path: string): void {
+  for (const command of commands) {
+    const lookup = spawnSync('/bin/bash', ['-c', 'command -v "$1" >/dev/null 2>&1', '--', command], {
+      encoding: 'utf8', env: { ...process.env, PATH: path },
+    });
+    expect(lookup.status, `${command} unexpectedly remains available in the filtered PATH`).not.toBe(0);
+  }
+}
+
 function run(args: string[], env: ReturnType<typeof setup> = setup(), path = hostPathWithoutEln(), cwd = repoRoot, extra: Record<string, string> = {}) {
   const result = spawnSync('/bin/bash', [installer, ...args], {
     cwd,
@@ -363,15 +376,18 @@ describe('scripts/install.sh', () => {
     }
   });
 
-  test('npm-pack installer succeeds when Git is removed from its PATH, then non-interactive setup works', () => {
+  test('npm-pack installer succeeds without Git or native build tools, then non-interactive setup works', () => {
     const packed = pack(fixture());
     const env = setup();
-    const path = pathWithoutCommand('git');
+    const missingTools = ['git', 'python', 'python3', 'make', 'g++', 'gcc', 'cc'];
+    const path = pathWithoutCommands(missingTools);
+    expectCommandsMissing(missingTools, path);
     const installed = run(['--source', packed, '--no-modify-path', '--no-setup'], env, path, repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0' });
     expect(installed.result.status, installed.result.stderr).toBe(0);
     expect(installed.result.stdout).toContain('Installed elanous');
     expect(installed.result.stderr).not.toContain('required command missing: git');
-    // node-pty can arrive transitively through the required Gemini CLI package; Git absence must not block core setup.
+    expect(installed.result.stderr).toContain('The Bun TUI needs no system Node.js, Python, or compiler.');
+    // The npm-pack install must not run optional native build scripts or require Git/compiler tools for the core TUI.
 
     const setupReport = spawnSync(join(env.prefix, 'bin', 'elanous'), ['setup', '--non-interactive'], {
       encoding: 'utf8', env: { ...process.env, HOME: env.home, PATH: path, ELANOUS_CONFIG_DIR: join(env.home, '.elanous'), ELANOUS_STATE_DIR: join(env.home, '.elanous') },
@@ -384,7 +400,9 @@ describe('scripts/install.sh', () => {
     const packed = pack(fixture());
     const env = setup();
     const bunInstall = join(env.home, '.bun');
-    const path = pathWithoutCommand('git');
+    const missingTools = ['git', 'python', 'python3', 'make', 'g++', 'gcc', 'cc'];
+    const path = pathWithoutCommands(missingTools);
+    expectCommandsMissing(missingTools, path);
     const added = spawnSync('bun', ['add', '--global', '--ignore-scripts', packed], {
       cwd: env.dir, encoding: 'utf8', timeout: 180_000,
       env: { ...process.env, HOME: env.home, BUN_INSTALL: bunInstall, PATH: path },

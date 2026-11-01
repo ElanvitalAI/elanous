@@ -6,9 +6,15 @@ import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { failureReason } from '../../domains/repeated-failure.js';
 import { McpConnectionError } from '../../mcp/client.js';
+import { handleMcpRequest, type McpServerContext } from '../../mcp/server.js';
+import { HARNESS_RUN_ID_ENV } from '../../harness/harness-space.js';
+import { registerToolRuntime, unregisterToolRuntime } from '../../tool-runtime/registry.js';
+import type { ToolRunResult, ToolRuntime } from '../../tool-runtime/types.js';
 import {
+  defaultAsideRoundtripLedger,
   maskInjectedValues,
   registerMcpClients,
+  type AsideRoundtripEntry,
   type McpToolIndex,
   type McpToolIndexStore,
 } from './register-mcp-clients.js';
@@ -136,6 +142,380 @@ describe('registerMcpClients connect-failed trace', () => {
     }
     await handle.shutdown();
   });
+});
+
+test('Aside exec carries the current run join key and correlates request/result traces', async () => {
+  const previousRunId = process.env[HARNESS_RUN_ID_ENV];
+  process.env[HARNESS_RUN_ID_ENV] = 'run-aside-roundtrip-test';
+  const originalLog = debug.log.bind(debug) as typeof debug.log;
+  const events: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    events.push({ category, event, data });
+  }) as typeof debug.log;
+  const runtimes: ToolRuntime[] = [];
+  let forwarded: Record<string, unknown> | undefined;
+  let handle: Awaited<ReturnType<typeof registerMcpClients>> | undefined;
+  try {
+    handle = await registerMcpClients({
+      servers: [{ ...stdioServer('aside'), authorizedTools: ['exec'] }],
+      createClient: () => ({
+        start: async () => {},
+        listTools: async () => [{
+          name: 'exec', description: 'run an Aside browser task',
+          inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, reason: { type: 'string' } } },
+        }],
+        callTool: async (_name, args) => {
+          forwarded = args;
+          return { content: [{ type: 'text', text: 'release page checked' }] };
+        },
+        dispose: async () => {},
+      }),
+      asideLedger: { append: () => undefined, list: () => [] },
+      registerRuntime: (runtime) => { runtimes.push(runtime); },
+      unregisterRuntime: (_id: string) => undefined,
+      logger: { info: () => {}, warn: () => {} },
+    });
+    const asideExec = runtimes.find((runtime) => runtime.id === 'aside.exec');
+    expect(asideExec).toBeDefined();
+    const result = await asideExec!.run({ prompt: 'Check the signed-in release page.', reason: 'verify release readiness' }, { surface: 'tui' });
+
+    expect(forwarded?.prompt).toContain('elanous 런 run-aside-roundtrip-test · 결과는 elanous 도구로 돌려라.');
+    expect(forwarded?.prompt).toContain('Delegation reason: verify release readiness');
+    expect(forwarded?.prompt).toContain('TaskGet');
+    expect(forwarded?.prompt).toContain('same runId');
+    expect(forwarded?.prompt).toContain('Check the signed-in release page.');
+    expect(result.output).toBe('release page checked');
+    expect(events.filter((row) => row.category === 'mcp-client.aside').map((row) => [row.event, row.data?.runId, row.data?.reason])).toEqual([
+      ['exec-request', 'run-aside-roundtrip-test', 'verify release readiness'],
+      ['exec-result', 'run-aside-roundtrip-test', 'verify release readiness'],
+    ]);
+  } finally {
+    await handle?.shutdown();
+    (debug as { log: typeof debug.log }).log = originalLog;
+    if (previousRunId === undefined) delete process.env[HARNESS_RUN_ID_ENV];
+    else process.env[HARNESS_RUN_ID_ENV] = previousRunId;
+  }
+});
+
+test('Aside exec records zero text length when MCP content is omitted', async () => {
+  const runId = 'run-aside-content-omitted';
+  const previousRunId = process.env[HARNESS_RUN_ID_ENV];
+  process.env[HARNESS_RUN_ID_ENV] = runId;
+  const originalLog = debug.log.bind(debug) as typeof debug.log;
+  const events: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    events.push({ category, event, data });
+  }) as typeof debug.log;
+  const entries: AsideRoundtripEntry[] = [];
+  const runtimes: ToolRuntime[] = [];
+  let handle: Awaited<ReturnType<typeof registerMcpClients>> | undefined;
+  try {
+    handle = await registerMcpClients({
+      servers: [{ ...stdioServer('aside'), authorizedTools: ['exec'] }],
+      createClient: () => ({
+        start: async () => {},
+        listTools: async () => [{ name: 'exec', description: 'run an Aside browser task', inputSchema: { type: 'object', properties: { prompt: { type: 'string' } } } }],
+        callTool: async () => ({}),
+        dispose: async () => {},
+      }),
+      asideLedger: { append: (entry) => { entries.push(entry); }, list: () => [] },
+      registerRuntime: (runtime) => { runtimes.push(runtime); },
+      unregisterRuntime: (_id: string) => undefined,
+      logger: { info: () => {}, warn: () => {} },
+    });
+    const asideExec = runtimes.find((runtime) => runtime.id === 'aside.exec');
+    expect(asideExec).toBeDefined();
+    await asideExec!.run({ prompt: 'Check the page.' }, { surface: 'tui' });
+    expect(entries.find((entry) => entry.phase === 'result')).toMatchObject({ runId, ok: true, outputLength: 0 });
+    expect(events.find((event) => event.event === 'exec-result')?.data).toMatchObject({ runId, ok: true, outputLength: 0 });
+  } finally {
+    await handle?.shutdown();
+    (debug as { log: typeof debug.log }).log = originalLog;
+    if (previousRunId === undefined) delete process.env[HARNESS_RUN_ID_ENV];
+    else process.env[HARNESS_RUN_ID_ENV] = previousRunId;
+  }
+});
+
+test('Aside roundtrip returns the same-run Elanous tool result and records a runId-only receipt', async () => {
+  const runId = 'run-aside-same-run-ledger';
+  const previousRunId = process.env[HARNESS_RUN_ID_ENV];
+  process.env[HARNESS_RUN_ID_ENV] = runId;
+  const logs: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+  const originalLog = debug.log.bind(debug) as typeof debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    logs.push({ category, event, data });
+  }) as typeof debug.log;
+  const entries: Array<Record<string, unknown>> = [];
+  const ledger = {
+    append: (entry: Record<string, unknown>) => { entries.push(entry); },
+    list: (requestedRunId: string) => entries.filter((entry) => entry.runId === requestedRunId),
+  };
+  const runtimes: RegisteredRuntime[] = [];
+  let asidePrompt = '';
+  let asideCallMetaRunId = '';
+  let taskGetRunId = '';
+  let handle: Awaited<ReturnType<typeof registerMcpClients>> | undefined;
+  try {
+    const asideServerContext: McpServerContext = {};
+    await handleMcpRequest({
+      jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'aside' } },
+    }, asideServerContext);
+    const opts = {
+      servers: [
+        { ...stdioServer('elanous'), authorizedTools: ['task_get'] },
+        { ...stdioServer('aside'), authorizedTools: ['exec'] },
+      ],
+      createClient: (spec: { id: string }) => spec.id === 'elanous'
+        ? {
+            start: async () => {},
+            listTools: async () => [{ name: 'task_get', description: 'read run context', inputSchema: { type: 'object', properties: { run: { type: 'string' } } } }],
+            callTool: async (_name: string, args: Record<string, unknown>, meta?: { elanousRunId?: string }) => {
+              taskGetRunId = String(args.run ?? '');
+              return {
+                content: [{ type: 'text', text: `context for ${taskGetRunId}` }],
+                ...(args.fail === true ? { isError: true } : {}),
+              };
+            },
+            dispose: async () => {},
+          }
+        : {
+            start: async () => {},
+            listTools: async () => [{ name: 'exec', description: 'run browser task', inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, reason: { type: 'string' } } } }],
+            callTool: async (_name: string, args: Record<string, unknown>, meta?: { elanousRunId?: string }) => {
+              asidePrompt = String(args.prompt ?? '');
+              asideCallMetaRunId = String(meta?.elanousRunId ?? '');
+              const callRunId = /elanous 런 ([A-Za-z0-9_-]+) · 결과는 elanous 도구로 돌려라\./.exec(asidePrompt)?.[1] ?? '';
+              const returned = await handleMcpRequest({
+                jsonrpc: '2.0',
+                id: 2,
+                method: 'tools/call',
+                params: {
+                  name: 'elanous.task_get',
+                  arguments: { run: callRunId },
+                  _meta: { elanousRunId: callRunId },
+                },
+              }, asideServerContext);
+              if (returned.error) throw new Error(returned.error.message);
+              const content = (returned.result as { content?: Array<{ type: string; text?: string }> } | undefined)?.content ?? [];
+              return { content: [{ type: 'text', text: `aside returned ${content.map((block) => block.text ?? '').join('\n')}` }] };
+            },
+            dispose: async () => {},
+          },
+      asideLedger: ledger,
+      registerRuntime: (runtime: { id: string }) => {
+        captureRuntime(runtimes)(runtime);
+        registerToolRuntime(runtime as unknown as ToolRuntime<never, ToolRunResult>);
+      },
+      unregisterRuntime: (id: string) => { unregisterToolRuntime(id); },
+      logger: { info: () => {}, warn: () => {} },
+    } as unknown as Parameters<typeof registerMcpClients>[0];
+    handle = await registerMcpClients(opts);
+
+    const asideExec = runtimes.find((runtime) => runtime.id === 'aside.exec');
+    expect(asideExec).toBeDefined();
+    const returnedToParent = await asideExec!.run({ prompt: 'Inspect the signed-in release page.', reason: 'verify release readiness' }, {});
+
+    expect(asidePrompt).toContain(`elanous 런 ${runId} · 결과는 elanous 도구로 돌려라.`);
+    expect(asidePrompt).toContain('Delegation reason: verify release readiness');
+    expect(asidePrompt).toContain('TaskGet');
+    expect(asidePrompt).toContain('same runId');
+    expect(taskGetRunId).toBe(runId);
+    expect(asideCallMetaRunId).toBe(runId);
+    expect(resultText(returnedToParent)).toContain(`context for ${runId}`);
+    expect(ledger.list(runId)).toHaveLength(2);
+    expect(ledger.list(runId).map((entry) => entry.phase)).toEqual(['call', 'result']);
+    expect(ledger.list(runId)[1]).toMatchObject({ runId, toolName: 'exec', reason: 'verify release readiness', ok: true });
+    expect(JSON.stringify(ledger.list(runId))).not.toContain('context for');
+    expect(logs.filter((row) => row.category === 'mcp-client.aside').map((row) => [row.event, row.data?.runId])).toEqual([
+      ['exec-request', runId], ['exec-result', runId],
+    ]);
+    expect(logs.filter((row) => row.category === 'mcp-server.aside').map((row) => [row.event, row.data?.runId, row.data?.ok])).toEqual([
+      ['elanous-tool-call', runId, undefined], ['elanous-tool-result', runId, null],
+    ]);
+
+    await asideExec!.run({ prompt: 'Inspect the release date only.' }, {});
+    expect(asidePrompt).toContain(`elanous 런 ${runId} · 결과는 elanous 도구로 돌려라.`);
+    expect(asidePrompt).not.toContain('Delegation reason:');
+    expect(ledger.list(runId)).toHaveLength(4);
+    expect(ledger.list(runId)[2]).toMatchObject({ runId, phase: 'call', reason: null });
+    expect(ledger.list(runId)[3]).toMatchObject({ runId, phase: 'result', reason: null, ok: true });
+
+    await handleMcpRequest({
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'elanous.task_get', arguments: { run: runId, fail: true }, _meta: { elanousRunId: runId } },
+    }, asideServerContext);
+    expect(logs.filter((row) => row.category === 'mcp-server.aside').slice(-2).map((row) => [row.event, row.data?.runId, row.data?.ok])).toEqual([
+      ['elanous-tool-call', runId, undefined], ['elanous-tool-result', runId, false],
+    ]);
+
+    await handleMcpRequest({
+      jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: { name: 'elanous.not_exposed', arguments: {}, _meta: { elanousRunId: runId } },
+    }, asideServerContext);
+    expect(logs.filter((row) => row.category === 'mcp-server.aside').slice(-2).map((row) => [row.event, row.data?.runId, row.data?.ok, row.data?.errorClass])).toEqual([
+      ['elanous-tool-call', runId, undefined, undefined],
+      ['elanous-tool-result', runId, false, 'unknown_tool'],
+    ]);
+
+    await handleMcpRequest({
+      jsonrpc: '2.0', id: 5, method: 'tools/call',
+      params: { name: 'elanous.not_exposed', arguments: {}, _meta: { elanousRunId: 'run with spaces' } },
+    }, asideServerContext);
+    expect(logs.at(-1)).toMatchObject({
+      category: 'mcp-server.aside', event: 'elanous-tool-call-run-id-dropped',
+      data: { toolName: 'elanous.not_exposed', reason: 'invalid-format' },
+    });
+  } finally {
+    await handle?.shutdown();
+    (debug as { log: typeof debug.log }).log = originalLog;
+    if (previousRunId === undefined) delete process.env[HARNESS_RUN_ID_ENV];
+    else process.env[HARNESS_RUN_ID_ENV] = previousRunId;
+  }
+});
+
+test('default Aside ledger creates its JSONL file only on append and indexes by runId', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-aside-ledger-'));
+  const path = join(root, 'aside-run-roundtrip.jsonl');
+  const ledger = defaultAsideRoundtripLedger(root);
+  expect(existsSync(path)).toBe(false);
+  ledger.append({ runId: 'run-one', phase: 'call', toolName: 'exec', reason: null, at: '2026-10-31T00:00:00.000Z' });
+  ledger.append({ runId: 'run-two', phase: 'call', toolName: 'exec', reason: 'verify', at: '2026-10-31T00:00:01.000Z' });
+  expect(existsSync(path)).toBe(true);
+  expect(ledger.list('run-one')).toEqual([{ runId: 'run-one', phase: 'call', toolName: 'exec', reason: null, at: '2026-10-31T00:00:00.000Z' }]);
+});
+
+test('Aside server errors record classification without retaining response text', async () => {
+  const runId = 'run-aside-server-error';
+  const logs: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+  const originalLog = debug.log.bind(debug) as typeof debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    logs.push({ category, event, data });
+  }) as typeof debug.log;
+  const entries: Array<Record<string, unknown>> = [];
+  const ledger = { append: (entry: Record<string, unknown>) => { entries.push(entry); }, list: (id: string) => entries.filter((entry) => entry.runId === id) };
+  const runtimes: RegisteredRuntime[] = [];
+  const previousRunId = process.env[HARNESS_RUN_ID_ENV];
+  process.env[HARNESS_RUN_ID_ENV] = runId;
+  let handle: Awaited<ReturnType<typeof registerMcpClients>> | undefined;
+  try {
+    const opts = {
+      servers: [{ ...stdioServer('aside'), authorizedTools: ['exec'] }],
+      createClient: () => ({
+        start: async () => {},
+        listTools: async () => [{ name: 'exec', description: 'run browser task', inputSchema: { type: 'object', properties: { prompt: { type: 'string' } } } }],
+        callTool: async () => ({ isError: true, content: [{ type: 'text', text: 'private page response body' }] }),
+        dispose: async () => {},
+      }),
+      asideLedger: ledger,
+      registerRuntime: captureRuntime(runtimes),
+      unregisterRuntime: () => undefined,
+      logger: { info: () => {}, warn: () => {} },
+    } as unknown as Parameters<typeof registerMcpClients>[0];
+    handle = await registerMcpClients(opts);
+    const result = await runtimes.find((runtime) => runtime.id === 'aside.exec')!.run({ prompt: 'check page' }, {});
+    expect((result as { classification?: string }).classification).toBe('mcp-server-error');
+    expect(ledger.list(runId)).toHaveLength(2);
+    expect(ledger.list(runId)[1]).toMatchObject({ runId, phase: 'result', ok: false, classification: 'mcp-server-error' });
+    expect(JSON.stringify(ledger.list(runId))).not.toContain('private page response body');
+    expect(logs.find((row) => row.event === 'exec-result')?.data).toMatchObject({ runId, ok: false, classification: 'mcp-server-error' });
+    expect(JSON.stringify(logs)).not.toContain('private page response body');
+  } finally {
+    await handle?.shutdown();
+    (debug as { log: typeof debug.log }).log = originalLog;
+    if (previousRunId === undefined) delete process.env[HARNESS_RUN_ID_ENV];
+    else process.env[HARNESS_RUN_ID_ENV] = previousRunId;
+  }
+});
+
+test('a rejected Aside call records only the transport error class in its same-run receipt', async () => {
+  const runId = 'run-aside-call-rejected';
+  const logs: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+  const originalLog = debug.log.bind(debug) as typeof debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    logs.push({ category, event, data });
+  }) as typeof debug.log;
+  const entries: Array<Record<string, unknown>> = [];
+  const ledger = { append: (entry: Record<string, unknown>) => { entries.push(entry); }, list: (id: string) => entries.filter((entry) => entry.runId === id) };
+  const runtimes: RegisteredRuntime[] = [];
+  const previousRunId = process.env[HARNESS_RUN_ID_ENV];
+  process.env[HARNESS_RUN_ID_ENV] = runId;
+  let handle: Awaited<ReturnType<typeof registerMcpClients>> | undefined;
+  try {
+    const opts = {
+      servers: [{ ...stdioServer('aside'), authorizedTools: ['exec'] }],
+      createClient: () => ({
+        start: async () => {},
+        listTools: async () => [{ name: 'exec', description: 'run browser task', inputSchema: { type: 'object', properties: { prompt: { type: 'string' } } } }],
+        callTool: async () => { throw new Error('private transport detail'); },
+        dispose: async () => {},
+      }),
+      asideLedger: ledger,
+      registerRuntime: captureRuntime(runtimes),
+      unregisterRuntime: () => undefined,
+      logger: { info: () => {}, warn: () => {} },
+    } as unknown as Parameters<typeof registerMcpClients>[0];
+    handle = await registerMcpClients(opts);
+    const result = await runtimes.find((runtime) => runtime.id === 'aside.exec')!.run({ prompt: 'check page' }, {});
+    expect((result as { classification?: string }).classification).toBe('mcp-transport-error');
+    expect(ledger.list(runId)).toHaveLength(2);
+    expect(ledger.list(runId)[1]).toMatchObject({ runId, phase: 'result', ok: false, classification: 'mcp-transport-error', errorClass: 'Error' });
+    expect(JSON.stringify(ledger.list(runId))).not.toContain('private transport detail');
+    expect(logs.find((row) => row.event === 'exec-error')?.data).toMatchObject({ runId, callToolRejected: true, errorClass: 'Error' });
+    expect(JSON.stringify(logs)).not.toContain('private transport detail');
+  } finally {
+    await handle?.shutdown();
+    (debug as { log: typeof debug.log }).log = originalLog;
+    if (previousRunId === undefined) delete process.env[HARNESS_RUN_ID_ENV];
+    else process.env[HARNESS_RUN_ID_ENV] = previousRunId;
+  }
+});
+
+test('non-Aside and non-stdio MCP proxies keep their input and skip Aside bookkeeping', async () => {
+  const runId = 'run-aside-negative-controls';
+  const logs: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+  const originalLog = debug.log.bind(debug) as typeof debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    logs.push({ category, event, data });
+  }) as typeof debug.log;
+  const entries: Array<Record<string, unknown>> = [];
+  const ledger = { append: (entry: Record<string, unknown>) => { entries.push(entry); }, list: () => entries };
+  const previousRunId = process.env[HARNESS_RUN_ID_ENV];
+  process.env[HARNESS_RUN_ID_ENV] = runId;
+  let handle: Awaited<ReturnType<typeof registerMcpClients>> | undefined;
+  try {
+    for (const spec of [stdioServer('demo'), { id: 'aside', transport: 'http', url: 'https://aside.invalid/mcp', authorizedTools: ['exec'] }]) {
+      const runtimes: RegisteredRuntime[] = [];
+      let forwardedPrompt = '';
+      const opts = {
+        servers: [{ ...spec, authorizedTools: ['exec'] }],
+        createClient: () => ({
+          start: async () => {},
+          listTools: async () => [{ name: 'exec', description: 'run task', inputSchema: { type: 'object', properties: { prompt: { type: 'string' } } } }],
+          callTool: async (_name: string, args: Record<string, unknown>) => {
+            forwardedPrompt = String(args.prompt ?? '');
+            return { content: [{ type: 'text', text: 'unchanged response' }] };
+          },
+          dispose: async () => {},
+        }),
+        asideLedger: ledger,
+        registerRuntime: captureRuntime(runtimes),
+        unregisterRuntime: () => undefined,
+        logger: { info: () => {}, warn: () => {} },
+      } as unknown as Parameters<typeof registerMcpClients>[0];
+      handle = await registerMcpClients(opts);
+      await runtimes.find((runtime) => runtime.id === `${spec.id}.exec`)!.run({ prompt: 'unchanged prompt', reason: 'unchanged reason' }, {});
+      expect(forwardedPrompt).toBe('unchanged prompt');
+      await handle.shutdown();
+      handle = undefined;
+    }
+    expect(entries).toHaveLength(0);
+    expect(logs.filter((row) => row.category === 'mcp-client.aside')).toHaveLength(0);
+  } finally {
+    await handle?.shutdown();
+    (debug as { log: typeof debug.log }).log = originalLog;
+    if (previousRunId === undefined) delete process.env[HARNESS_RUN_ID_ENV];
+    else process.env[HARNESS_RUN_ID_ENV] = previousRunId;
+  }
 });
 
 test('MCP results mask injected credential values in object keys as well as values', () => {

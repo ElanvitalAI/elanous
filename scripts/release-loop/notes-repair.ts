@@ -12,6 +12,23 @@ export const REPAIR_MODEL = 'openrouter/z-ai/glm-5.3';
 export type Translator = (line: string, model: string) => Promise<string>;
 export type RepairResult = { text: string; translatedLines: number[]; error?: string };
 
+/** Avoid sending a different provider's configured API key to OpenRouter. */
+export function notesRepairLlmConfig(config: ReturnType<typeof getUserConfig>, model = REPAIR_MODEL) {
+  const isOpenRouterConfig = config.llm.provider === 'openrouter';
+  const llm = { ...config.llm, provider: 'openrouter' as const, model };
+  if (isOpenRouterConfig) {
+    llm.apiKey = config.llm.apiKey;
+    llm.baseUrl = config.llm.baseUrl;
+  } else {
+    delete llm.apiKey;
+    delete llm.baseUrl;
+  }
+  return {
+    ...config,
+    llm,
+  };
+}
+
 function koreanProseLines(text: string): Array<{ index: number; line: string }> {
   let fence: { char: string; length: number } | undefined;
   return text.split(/\r?\n/).flatMap((line, index) => {
@@ -58,7 +75,7 @@ export async function repairKoreanMarkdown(text: string, translate: Translator, 
 export const glmTranslator: Translator = async (line, model) => {
   if (model !== REPAIR_MODEL) throw new Error(`unexpected translator model: ${model}`);
   const config = getUserConfig();
-  const llmConfig = { ...config, llm: { ...config.llm, provider: 'openrouter' as const, model } };
+  const llmConfig = notesRepairLlmConfig(config, model);
   const provider = getProviderForConfig(llmConfig, model);
   if (provider.name !== 'openrouter' || !provider.available()) throw new Error('OpenRouter credentials unavailable for openrouter/z-ai/glm-5.3');
   const messages: LLMMessage[] = [

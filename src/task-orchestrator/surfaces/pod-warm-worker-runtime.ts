@@ -39,6 +39,18 @@ function readInstalledLockHash(repoDir: string): string | null {
   } catch { return null; }
 }
 
+function pathIsAbsent(path: string): boolean {
+  try { lstatSync(path); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT'; }
+}
+
+function isRealDirectory(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch { return false; }
+}
+
 /** Record the image's installed dependency lock once source verification ties it to the worker key. */
 function rememberInstalledLockHash(repoDir: string, lockHash: string): void {
   try {
@@ -261,7 +273,35 @@ export class WarmWorkerRuntime {
       }, { level: 'warn' }); } catch { /* observation cannot revive an unsafe worker */ }
       return { reply: null, quarantineWorker: true, reason: 'cleanup-failed', artifactsDir };
     }
-    mkdirSync(this.options.scratchDir, { recursive: true });
+    try {
+      (this.options.removeScratch ?? ((path: string) => rmSync(path, { recursive: true, force: true })))(this.options.scratchDir);
+      // A successful rm call is not proof of cleanup: a stub can be a no-op, and an
+      // attacker can replace the path with a symlink before the next mkdir.
+      if (!pathIsAbsent(this.options.scratchDir)) throw new Error('scratch path remains after removal');
+    } catch {
+      this.quarantined = true;
+      try { debug.log('pod.reuse', 'clean-failed', {
+        runId: command.runId, attemptId: command.attemptId, workerId: command.workerId,
+        // The worker outcome stays cleanup-failed for callers; this event reason identifies the scratch phase.
+        // Include only a path that lstat can still observe; a failed rm may also have removed it.
+        reason: 'scratch-removal-failed',
+        remainingPaths: pathIsAbsent(this.options.scratchDir) ? [] : [this.options.scratchDir],
+      }, { level: 'warn' }); } catch { /* observation cannot revive an unsafe worker */ }
+      return { reply: null, quarantineWorker: true, reason: 'cleanup-failed', artifactsDir };
+    }
+    try {
+      // Non-recursive mkdir refuses a path that was recreated (for example as a
+      // symlink) after the absence check. Validate the resulting path type as well.
+      mkdirSync(this.options.scratchDir);
+      if (!isRealDirectory(this.options.scratchDir)) throw new Error('scratch path is not a real directory');
+    } catch {
+      this.quarantined = true;
+      try { debug.log('pod.reuse', 'clean-failed', {
+        runId: command.runId, attemptId: command.attemptId, workerId: command.workerId,
+        reason: 'scratch-directory-unsafe', remainingPaths: [this.options.scratchDir],
+      }, { level: 'warn' }); } catch { /* observation cannot revive an unsafe worker */ }
+      return { reply: null, quarantineWorker: true, reason: 'cleanup-failed', artifactsDir };
+    }
     mkdirSync(artifactsRoot, { recursive: true });
     mkdirSync(artifactsDir, { recursive: true, mode: 0o700 });
     const startedAt = now();
@@ -304,8 +344,10 @@ export class WarmWorkerRuntime {
         reason = 'execution-error';
         break;
       } finally {
-        try { (this.options.removeScratch ?? ((path: string) => rmSync(path, { recursive: true } )))(sandbox); }
-        catch { this.quarantined = true; reason = 'cleanup-failed'; }
+        try {
+          (this.options.removeScratch ?? ((path: string) => rmSync(path, { recursive: true, force: true })))(sandbox);
+          if (!pathIsAbsent(sandbox)) throw new Error('request sandbox remains after removal');
+        } catch { this.quarantined = true; reason = 'cleanup-failed'; }
       }
       if (now() >= command.deadlineAt) reason = 'execution-error';
       if (reason !== 'complete') break;

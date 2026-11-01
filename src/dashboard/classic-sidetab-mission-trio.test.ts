@@ -41,8 +41,8 @@ test('two completed hands write one synthesis record with attribution rows and n
     expect(contents).toContain('| claude | Compare the candidates for the demo. | ' + join(cwd, 'claude.md') + ' | 완료 |  |');
     expect(contents).toContain('codex candidate result');
     expect(contents).toContain('claude candidate result');
-    expect(contents).toContain('## 채택 결과\n_부모 응답에서 확정_');
-    expect(contents).toContain('## 채택 근거\n_부모 응답에서 확정_');
+    expect(contents).toContain('## 채택 결과\n_최종 채택문은 알림을 받은 부모 응답에서 작성한다.');
+    expect(contents).toContain('## 채택 근거\n_후보별 상태와 원문은 위 표에 기록했다.');
     const resultFiles = readdirSync(join(cwd, '.elanous', 'mission-results'));
     expect(resultFiles).toEqual([synthesisPath.split('/').at(-1)]);
     const payload = JSON.parse(notification.output) as { artifacts: string[]; body: string };
@@ -120,6 +120,100 @@ test('trio launches three visible agents with the same prompt and enqueues one c
   expect(queue.drainForParentSession('parent-trio')).toHaveLength(1);
 });
 
+test('partial trio completion stays actionable and aligns notification and JSON status', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'sidetab-trio-partial-'));
+  const delivered: PendingTaskNotification[] = [];
+  try {
+    const started = await startClassicSidetabMissionTrio({
+      mission: 'Read package.json and report its name.',
+      checkGrokAuth: () => ({ ok: true }),
+      spawnVisible: agent => ({ id: `${agent}-pty`, cwd }),
+      runVisible: async agent => agent === 'claude'
+        ? { ok: false, status: 'failed', error: 'Mission text was not visible', path: '' }
+        : { ok: true, status: 'completed', content: `${agent} reports elanous` },
+      registry: createClassicSidetabMissionPairSessionRegistry(),
+      hasSession: () => true,
+      killSession: () => {},
+      enqueue: notification => delivered.push(notification),
+      createId: (() => { let id = 0; return () => `partial-${++id}`; })(),
+    });
+
+    await started.completion;
+
+    expect(delivered).toHaveLength(1);
+    const notice = delivered[0]!;
+    const payload = JSON.parse(notice.output) as { status: string; coverage: string; successfulMembers: string[]; failedMembers: Array<{ agent: string; reason: string }>; body: string; artifacts: string[] };
+    expect(notice.state).toBe('done');
+    expect(payload).toMatchObject({ status: notice.state, coverage: 'partial', successfulMembers: ['codex', 'grok'] });
+    expect(payload.failedMembers).toEqual([{ agent: 'claude', reason: 'Mission text was not visible' }]);
+    expect(payload.body).toContain('codex candidate');
+    expect(payload.body).toContain('grok candidate');
+    expect(payload.body).toContain('claude (Mission text was not visible)');
+    expect(payload.body).toContain('Present a non-empty adopted result and a short reason.');
+    expect(payload.artifacts).toHaveLength(1);
+    const synthesis = readFileSync(payload.artifacts[0]!, 'utf8');
+    expect(synthesis).toContain('| claude | Read package.json and report its name. |  | Mission text was not visible |');
+    expect(synthesis).toContain('## 채택 결과\n_최종 채택문은 알림을 받은 부모 응답에서 작성한다.');
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('all failed trio hands produce an error notification with no fabricated adoption', async () => {
+  const delivered: PendingTaskNotification[] = [];
+  const started = await startClassicSidetabMissionTrio({
+    mission: 'Run a missing task.',
+    checkGrokAuth: () => ({ ok: true }),
+    spawnVisible: agent => ({ id: `${agent}-pty`, cwd: '/work' }),
+    runVisible: async agent => ({ ok: false, status: 'failed', error: `${agent} failed`, path: '' }),
+    registry: createClassicSidetabMissionPairSessionRegistry(),
+    hasSession: () => true,
+    killSession: () => {},
+    enqueue: notification => delivered.push(notification),
+    createId: (() => { let id = 0; return () => `failed-${++id}`; })(),
+  });
+  await started.completion;
+  expect(delivered).toHaveLength(1);
+  const notice = delivered[0]!;
+  const payload = JSON.parse(notice.output) as { status: string; coverage: string; successfulMembers: string[]; body: string };
+  expect(notice.state).toBe('error');
+  expect(payload).toMatchObject({ status: notice.state, coverage: 'none', successfulMembers: [] });
+  expect(payload.body).toContain('No candidate succeeded');
+  expect(payload.body).toContain('Leave the adopted result explicitly unavailable');
+});
+
+test('timeout preserves already completed candidates for parent synthesis', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'sidetab-trio-timeout-'));
+  const delivered: PendingTaskNotification[] = [];
+  const resolveRun = new Map<string, (result: { ok: boolean; status: 'completed' | 'failed'; content?: string; error?: string }) => void>();
+  const started = await startClassicSidetabMissionTrio({
+    mission: 'Inspect the package.',
+    checkGrokAuth: () => ({ ok: true }),
+    spawnVisible: agent => ({ id: `${agent}-pty`, cwd }),
+    runVisible: agent => new Promise(resolve => resolveRun.set(agent, resolve)),
+    registry: createClassicSidetabMissionPairSessionRegistry(),
+    hasSession: () => true,
+    killSession: () => {},
+    enqueue: notification => delivered.push(notification),
+    createId: (() => { let id = 0; return () => `timeout-${++id}`; })(),
+    timeoutMs: 150,
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  resolveRun.get('codex')!({ ok: true, status: 'completed', content: 'codex package result' });
+  resolveRun.get('grok')!({ ok: true, status: 'completed', content: 'grok package result' });
+  await started.completion;
+
+  const notice = delivered[0]!;
+  const payload = JSON.parse(notice.output) as { status: string; coverage: string; successfulMembers: string[]; failedMembers: Array<{ agent: string; reason: string }>; body: string };
+  expect(notice.state).toBe('done');
+  expect(payload).toMatchObject({ status: notice.state, coverage: 'partial', successfulMembers: ['codex', 'grok'] });
+  expect(payload.failedMembers).toEqual([{ agent: 'claude', reason: 'mission exceeded the configured safety timeout' }]);
+  expect(payload.body).toContain('codex package result');
+  expect(payload.body).toContain('grok package result');
+  expect(payload.body).toContain('mission exceeded the configured safety timeout');
+  rmSync(cwd, { recursive: true, force: true });
+});
+
 test('unavailable Grok falls back to two hands and discloses why in one notification', async () => {
   const queue = new TaskNotificationQueue();
   queue.clear();
@@ -149,7 +243,9 @@ test('unavailable Grok falls back to two hands and discloses why in one notifica
   expect(notices).toHaveLength(1);
   expect(notices[0]).toMatchObject({ agentName: 'Codex + Claude (Grok fallback)' });
   expect(delivered).toHaveLength(1);
-  const payload = JSON.parse(delivered[0]!.output) as { body: string };
+  const payload = JSON.parse(delivered[0]!.output) as { status: string; coverage: string; successfulMembers: string[]; failedMembers: Array<{ agent: string }>; body: string };
+  expect(delivered[0]!.state).toBe('done');
+  expect(payload).toMatchObject({ status: 'done', coverage: 'complete', successfulMembers: ['codex', 'claude'], failedMembers: [] });
   expect(payload.body).toContain('Grok unavailable; continued with Codex + Claude');
   expect(payload.body).toContain('grok whoami: login required');
 });

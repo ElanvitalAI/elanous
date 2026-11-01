@@ -20,6 +20,8 @@ export interface DashboardMissionResult {
   missionVisible: boolean;
   promptReturned: boolean;
   completionMarker: boolean;
+  failureStage?: string;
+  failureScreen?: string;
   error?: string;
 }
 

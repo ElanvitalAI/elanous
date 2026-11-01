@@ -44,6 +44,7 @@ import {
   type FeedbackEnvelope,
 } from '../feedback/envelope.js';
 import { mcpMediaJobs, mcpResultImages } from '../feedback/media.js';
+import { getHarnessRunId } from '../harness/harness-space.js';
 import { McpServerError } from './client.js';
 import type { McpClient, McpTool, McpToolCallResult } from './client.js';
 
@@ -278,7 +279,11 @@ export function createMcpProxyRuntime(
         };
       }
       try {
-        const result = await opts.client.callTool(opts.mcpTool.name, req);
+        const runId = (ctx.runId || getHarnessRunId()).trim();
+        // The correlation id is needed only for Aside's delegated return path.
+        // Do not disclose the local run identity to other MCP servers.
+        const meta = opts.serverId === 'aside' && runId ? { elanousRunId: runId } : undefined;
+        const result = await opts.client.callTool(opts.mcpTool.name, req, meta);
         const converted = mcpResultToRunResult(result);
         emitMcpMediaFeedback(converted, ctx);
         const capped = capMcpOutput(converted, {

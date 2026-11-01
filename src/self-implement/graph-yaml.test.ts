@@ -19,6 +19,47 @@ import { PIPELINE_EDGES_BY_NODE, TERMINAL_STAGES_BY_NODE } from './pipeline-shap
 const GRAPHS_DIR = join(import.meta.dir, '../../graphs');
 
 describe('RFC §5 0단계 — YAML 파서', () => {
+  test('explicit fan-out requires unique declared branch destinations and a declared join', () => {
+    const source = `graph_id: fanout
+version: 1
+entry_node: start
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: start, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: a, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: b, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: start
+    on: outcome
+    branches: { ok: [a, b] }
+    join: joined
+  - { from: joined, on: outcome, map: { ok: done, fail: failed } }
+`;
+    const parsed = parseGraphTemplateYaml(source);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.edges[0]).toMatchObject({ from: 'start', branches: { ok: ['a', 'b'] }, join: 'joined' });
+    const hybrid = parseGraphTemplateYaml(source.replace('    branches: { ok: [a, b] }', '    map: { fail: failed }\n    branches: { ok: [a, b] }'));
+    expect(hybrid.errors).toEqual([]);
+    expect(hybrid.template?.edges[0]).toMatchObject({ map: { fail: 'failed' }, branches: { ok: ['a', 'b'] }, join: 'joined' });
+    const repeatableSource = parseGraphTemplateYaml(source.replace('node_id: start, kind: gate, recipe: none, max_visits: 1', 'node_id: start, kind: gate, recipe: none, max_visits: 2'));
+    expect(repeatableSource.template).toBeUndefined();
+    expect(repeatableSource.errors).toEqual(expect.arrayContaining([expect.objectContaining({
+      path: '<inline>/edges/start/branches', message: expect.stringContaining('max_visits: 1'),
+    })]));
+    expect(parseGraphTemplateYaml(source.replace('[a, b]', '[a, a]')).errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/edges/0/branches/ok' })]));
+    expect(parseGraphTemplateYaml(source.replace('join: joined', 'join: missing')).errors)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/edges/0' })]));
+    const multistep = parseGraphTemplateYaml(source.replace('  - { from: joined, on: outcome, map:', '  - { from: a, to: b }\n  - { from: joined, on: outcome, map:'));
+    expect(multistep.template).toBeUndefined();
+    expect(multistep.errors).toEqual(expect.arrayContaining([expect.objectContaining({
+      path: '<inline>/edges/start/branches', message: expect.stringContaining('후속 간선'),
+    })]));
+  });
+
   test('ARG L graph/node allowance is parsed and malformed declarations are rejected', () => {
     const valid = parseGraphTemplateYaml(`
 graph_id: allowance
@@ -151,7 +192,7 @@ edges: []
     expect(result.errors.some((e) => e.message.includes('boolean'))).toBe(true);
   });
 
-  test('⛔ to 와 map 을 «둘 다» 쓰거나 «둘 다 안» 쓰면 거절한다', () => {
+  test('⛔ to 는 map/branches 와 혼용할 수 없고, 목적지 선언은 필요하다', () => {
     const base = `
 graph_id: t
 version: 1
@@ -162,9 +203,9 @@ nodes:
   - { node_id: b, kind: git, recipe: r, max_visits: 1 }
 edges:`;
     const both = parseGraphTemplateYaml(`${base}\n  - { from: a, to: b, on: outcome, map: { pass: b } }`, 'both.yaml');
-    expect(both.errors.some((e) => e.message.includes('정확히 하나'))).toBe(true);
+    expect(both.errors.some((e) => e.message.includes('to 는 map·branches'))).toBe(true);
     const neither = parseGraphTemplateYaml(`${base}\n  - { from: a }`, 'neither.yaml');
-    expect(neither.errors.some((e) => e.message.includes('정확히 하나'))).toBe(true);
+    expect(neither.errors.some((e) => e.message.includes('to 또는 map/branches'))).toBe(true);
   });
 
   test('⛔ 없는 노드를 가리키는 엣지·진입·종료를 «전부» 잡는다', () => {

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ResourceLedger } from './ledger.js';
-import { leasePort, MAX_PORT_LEASE_TTL_MS, PORT_BANDS, portLeaseId } from './ports.js';
+import { leasePort, MAX_PORT_LEASE_TTL_MS, PORT_BANDS, portLeaseId, RELEASE_PWA_FIXED_HTTP_PORT } from './ports.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -15,7 +15,7 @@ function ledger(): ResourceLedger {
 const request = { machine: 'machine-a', purpose: 'nexus-test', ttlMs: 100 };
 
 test('bands reserve production ports and separate test and offline candidates', () => {
-  expect(PORT_BANDS.reserved).toEqual([31413, 31415, 31420]);
+  expect(PORT_BANDS.reserved).toEqual([31413, 31415, 31420, RELEASE_PWA_FIXED_HTTP_PORT]);
   expect(PORT_BANDS.test).toEqual({ start: 31450, end: 31499 });
   expect(PORT_BANDS.offline).toEqual({ start: 31500, end: 31509 });
 });
@@ -58,8 +58,8 @@ test('same member cannot renew or delete a reallocated lease using the old lease
 
 test('exhaustion reports no-port; deleted lease is reused before any higher free port', () => {
   const store = ledger();
-  const ports = Array.from({ length: 50 }, () => Number(leasePort(request, store, 1000).attrs.port));
-  expect(ports).toEqual(Array.from({ length: 50 }, (_, i) => 31450 + i));
+  const ports = Array.from({ length: 49 }, () => Number(leasePort(request, store, 1000).attrs.port));
+  expect(ports).toEqual(Array.from({ length: 50 }, (_, i) => 31450 + i).filter(port => port !== 31453));
   expect(ports.some(port => (PORT_BANDS.reserved as readonly number[]).includes(port))).toBe(false);
   expect(() => leasePort(request, store, 1001)).toThrow('no-port');
   store.delete(portLeaseId(31450), 'machine-a');
@@ -73,6 +73,13 @@ test('collision exclusions skip the released occupied port without affecting oth
   const next = leasePort({ ...request, excluded: [31450] }, store, 1001);
   expect(next.attrs.port).toBe(31451);
   expect(store.list({ kind: 'port-lease' }, 1001).map(row => row.attrs.port)).toEqual([31451]);
+});
+
+test('coordinator test leases never issue the release PWA fixed port', () => {
+  const store = ledger();
+  const claimed = Array.from({ length: 5 }, () => Number(leasePort(request, store, 1000).attrs.port));
+  expect(claimed).toEqual([31450, 31451, 31452, RELEASE_PWA_FIXED_HTTP_PORT + 1, RELEASE_PWA_FIXED_HTTP_PORT + 2]);
+  expect(claimed).not.toContain(RELEASE_PWA_FIXED_HTTP_PORT);
 });
 
 test('invalid lease request does not write a ledger', () => {

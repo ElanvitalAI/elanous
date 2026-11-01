@@ -30,7 +30,7 @@ import { resolveWriteDecision, resolveTakeover, type PtyWriteActor } from './pty
 import { addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestNickname, markPtyManifestClosed, removePtyManifest, touchLivePtyManifest } from './pty-manifest.js';
 import { processPtyControlRequests } from './pty-control-ipc.js';
 import { tapPtyOutput, autoStopPtyRecording } from './pty-recording.js';
-import { forgetExternalWriteProvenance, noteExternalWrite } from './pty-write-provenance.js';
+import { forgetExternalWriteProvenance, noteExternalWrite, notePtyAccessMode } from './pty-write-provenance.js';
 import { resolveRunIdentity } from '../harness/harness-space.js';
 import { addSelfDevRunParticipant, selfDevRunsDir } from '../self-dev/run-store.js';
 import { debug } from '../debug/log.js';
@@ -192,6 +192,8 @@ export interface PtyControlTarget {
 export interface PtyHandle extends PtyControlTarget {
   /** 고유 id — `<kind>_<hex>`. 같은 PTY 객체를 부르는 캐논 이름. */
   readonly id: string;
+  /** Actor of the last successful PTY write in this process; denied or failed writes do not update it. */
+  readonly lastWriteActor: PtyWriteActor | null;
   /**
    * 접근 모드(관찰 read / 인터랙션 write / 자율 auto). ⭐정책 매트릭스(§ 입력 중재):
    *  - auto+locked = 보호된 자율(brain 소유·사람 write 불가). 위험 미션 무간섭.
@@ -508,10 +510,13 @@ export function startPty(opts: StartOpts): PtyHandle {
   } catch { term = null; }
 
   let nickname = opts.nickname;
+  let lastWriteActor: PtyWriteActor | null = null;
   let accessMode: PtyAccessMode = opts.accessMode ?? 'write';
   let transitionPolicy: PtyTransitionPolicy = opts.transitionPolicy ?? 'open';
+  notePtyAccessMode(id, accessMode);
   const handle: PtyHandle = {
     id,
+    get lastWriteActor() { return lastWriteActor; },
     kind: ptyKindOf(id),
     get nickname() { return nickname; },
     set nickname(v: string | undefined) { nickname = v; },
@@ -520,13 +525,14 @@ export function startPty(opts: StartOpts): PtyHandle {
       if (ptyManifestEnabled()) updatePtyManifestNickname(id, nickname, Date.now());
     },
     get accessMode() { return accessMode; },
-    set accessMode(v: PtyAccessMode) { accessMode = v; },
+    set accessMode(v: PtyAccessMode) { accessMode = v; notePtyAccessMode(id, v); },
     get transitionPolicy() { return transitionPolicy; },
     set transitionPolicy(v: PtyTransitionPolicy) { transitionPolicy = v; },
     setAccessMode(mode: PtyAccessMode): boolean {
       // 정책 SSOT(canTransitionAccessMode): locked 면 다른 모드로 못 감(read+locked→write = write 불가).
       if (!canTransitionAccessMode(accessMode, mode, transitionPolicy)) return false;
       accessMode = mode;
+      notePtyAccessMode(id, mode);
       return true;
     },
     setTransitionPolicy(policy: PtyTransitionPolicy): void { transitionPolicy = policy; },
@@ -598,6 +604,7 @@ export function startPty(opts: StartOpts): PtyHandle {
         return;
       }
       adapter.write(chars);
+      lastWriteActor = actor;
       debug.log('pty.control', 'write', { ptyId: id, actor, mode: accessMode, bytes: chars.length });
       // ⭐⭐ 여기가 진짜 초크포인트다 — 허용 판정 뒤·바이트가 «실제로» 들어간 뒤. 모든 쓰기가
       //   이 자리로 모인다(크로스-프로세스 IPC · 같은 프로세스 감독 autoAssist · PtyShellSend).

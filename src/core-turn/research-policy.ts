@@ -1,12 +1,18 @@
 /** Shared guardrails for every core-turn research surface. */
 export const RESEARCH_TURN_MAX_TOOL_TURNS = 20;
 export const RESEARCH_TURN_FIRST_REPLY_BUDGET_MS = 15_000;
-export const RESEARCH_TURN_DEEP_BUDGET_MS = 3 * 60_000;
+/** Research returns its best partial evidence before the parent has to abort the turn. */
+export const RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS = 8 * 60_000;
+export const RESEARCH_TURN_DEEP_BUDGET_MS = 9 * 60_000;
+export const RESEARCH_TURN_SHALLOW_BUDGET_MS = 3 * 60_000;
+/** Leave time for shallow partial-answer synthesis before the unchanged parent timeout. */
+export const RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS = RESEARCH_TURN_SHALLOW_BUDGET_MS - 10_000;
 export const RESEARCH_TURN_DEADLINE_STOP_ERROR = 'research stopped by its deadline';
 
 /** Research turns only receive these tools; unrelated writers are never implicit. */
 export const RESEARCH_TOOL_ALLOWLIST = [
   'OmniSearch',
+  'WebSearch',
   'WebFetch',
   'Agent',
   'Read',

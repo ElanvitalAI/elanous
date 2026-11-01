@@ -10,7 +10,7 @@ import type { LLMUsage } from '../prompt-cache/types.js';
 import { debug } from '../debug/log.js';
 import { ensureDeviceFirstSteps, inspectDeviceFirstGoal } from './device-first.js';
 import { COMPLETION_BOUNDARY_STEP_PREFIX, FOLDED_DEVICE_FIRST_ACTION_MARKER } from './goal-author-decompose.js';
-import { loadMockScenarioCatalog, type MockScenarioDevice, type MockScenarioEntry } from '../ux-sim/mock-scenario-catalog.js';
+import { loadMockScenarioCatalog, type MockScenarioCatalog, type MockScenarioDevice, type MockScenarioEntry } from '../ux-sim/mock-scenario-catalog.js';
 
 function observeGoalAuthor(
   category: 'goal-author' | 'goal-author.clarify',
@@ -81,10 +81,12 @@ export interface GoalAuthorDeps {
   ground: (ask: string, groundingDeps?: GoalAuthorGroundingDeps) => Promise<CodebaseGrounding>;
   persistentGrounding?: GoalAuthorGroundingDeps;
   authorGrade?: GoalAuthorGradeSelection;
+  /** Read-only, compact inventory of reusable mocks and event-injection scenarios. */
+  mockScenarioCatalog?: string;
   /** Production Terra reviewer precheck; omitted is disabled unless the shared config switch is on. */
   reviewerPrecheckEnabled?: boolean;
   /** Optional seam for focused tests; production uses the pinned Terra medium reviewer. */
-  reviewerPrecheck?: (document: string, authorRunId: string) => Promise<GoalAuthorReviewerPrecheckResult>;
+  reviewerPrecheck?: (document: string, authorRunId: string, context?: GoalAuthorReviewerPrecheckContext) => Promise<GoalAuthorReviewerPrecheckResult>;
   enhance: (ask: string, opts?: EnhanceOpts) => Promise<GoalEnhancement>;
   /** Additive enhancer options supplied by the file-writing entrypoint. */
   enhanceOpts?: EnhanceOpts;
@@ -152,6 +154,23 @@ export interface GoalAuthorReviewerPrecheckResult {
   readonly revisedDocument: string;
   readonly appliedFixes: readonly string[];
   readonly unappliedItems: readonly string[];
+}
+
+export interface GoalAuthorReviewerPrecheckContext {
+  readonly conversationId: string;
+  readonly round: number;
+  readonly priorRejectionReasonCodes: readonly string[];
+}
+
+export type GoalAuthorReviewerDialogOutcome = 'skipped' | 'converged' | 'cap-hit' | 'provider-error';
+
+export interface GoalAuthorReviewerDialogResult {
+  readonly document: string;
+  readonly status: 'skipped' | 'completed' | 'rejected-soft' | 'failed-soft';
+  readonly outcome: GoalAuthorReviewerDialogOutcome;
+  readonly rounds: number;
+  readonly hitl: boolean;
+  readonly result?: GoalAuthorReviewerPrecheckResult;
 }
 
 const GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL = 'gpt-6.1-terra';
@@ -240,7 +259,7 @@ export function resolveGoalAuthorReviewerPrecheckEnabled(config = getUserConfig(
 
 export async function runGoalAuthorReviewerPrecheck(
   document: string,
-  deps: { config?: ReturnType<typeof getUserConfig>; stream?: typeof streamLLM } = {},
+  deps: { config?: ReturnType<typeof getUserConfig>; stream?: typeof streamLLM; reviewContext?: GoalAuthorReviewerPrecheckContext; mockScenarioCatalog?: string } = {},
 ): Promise<GoalAuthorReviewerPrecheckResult> {
   const config = deps.config ?? getUserConfig();
   const pinnedConfig = {
@@ -250,7 +269,12 @@ export async function runGoalAuthorReviewerPrecheck(
   const provider = getProviderForConfig(pinnedConfig, GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL);
   const prompt = [
     'Review this completed goal document before it is written. Return only JSON with string-array fields suggestions, fixes, remainingNeedsHuman, a fixEvidence array of { fix, originalText, revisedText }, and a revisedDocument string.',
+    'Challenge each completion-boundary constraint instead of treating it as inherently necessary. 제약을 의심하라: 저작 문면의 세계와 구현의 세계에서 같은 제약인가? 카탈로그에 있는 목장치나 사건 주입으로 같은 동작을 관찰할 수 있는가? 실물 점검만 요구하는 경계라면 의도를 보존하는 목장치·주입 사건을 제안하라. Do not require a real-world inspection by default. Preserve a live check when the ask explicitly requires an external-system outcome.',
+    ...(deps.mockScenarioCatalog?.trim() ? ['Reusable mock-device and event-injection catalog (reference only, not a completion gate):', deps.mockScenarioCatalog.trim()] : []),
     'Apply each necessary fix to revisedDocument exactly once while preserving the original ask, GoalId, RootIntent, GoalType, every existing criterion and scope boundary, and canonical section structure. Be strictly conservative: only append one complete sentence copied verbatim from the original ask to an existing acceptance-criteria or required-evidence line; never append a partial substring or clause, especially one inside a negation or condition, and do not delete or reword existing text, add new scope, or edit other sections. For every fixes item, include one fixEvidence object in the same order: fixes item and fix must both equal the exact complete sentence appended from the original ask; originalText and revisedText must be exact spans where revisedText starts with originalText and appends that sentence, and replaying every single replacement reproduces the complete revisedDocument with no other edits. If you cannot explain and ground every change this way, return no fixes and leave revisedDocument byte-for-byte unchanged. Keep optional suggestions separate; list unresolved decisions or evidence as remainingNeedsHuman.',
+    ...(deps.reviewContext ? [
+      `Author feedback for round ${deps.reviewContext.round}: prior proposal rejection codes = ${deps.reviewContext.priorRejectionReasonCodes.join(', ') || '(none)'}. Reconsider only those rejected proposals; do not repeat an unsupported edit.`,
+    ] : []),
     document,
   ].join('\n\n');
   const messages: LLMMessage[] = [{ role: 'user', content: prompt }];
@@ -274,15 +298,16 @@ export async function executeGoalAuthorReviewerPrecheck(
   enabled: boolean,
   document: string,
   authorRunId: string,
-  run: (document: string) => Promise<GoalAuthorReviewerPrecheckResult> = (value) => runGoalAuthorReviewerPrecheck(value),
+  run: (document: string, context?: GoalAuthorReviewerPrecheckContext) => Promise<GoalAuthorReviewerPrecheckResult> = (value) => runGoalAuthorReviewerPrecheck(value),
   observe: (event: string, data: Record<string, unknown>) => void = (event, data) => debug.log('author.reviewer-precheck', event, data),
+  context?: GoalAuthorReviewerPrecheckContext,
 ): Promise<{ status: 'skipped' | 'completed' | 'rejected-soft' | 'failed-soft'; result?: GoalAuthorReviewerPrecheckResult }> {
   if (!enabled) {
     observe('precheck-skipped', { authorRunId, reason: 'disabled', providerCalls: 0 });
     return { status: 'skipped' };
   }
   try {
-    const proposed = await run(document);
+    const proposed = await run(document, context);
     const evidence = proposed.fixEvidence ?? [];
     let replayed = document;
     let fixesSupported = proposed.fixes.length === 0
@@ -346,12 +371,131 @@ export async function executeGoalAuthorReviewerPrecheck(
   }
 }
 
+/** Run a bounded reviewer→author dialogue; every proposal remains grounded by the existing exact-edit validator. */
+export async function executeGoalAuthorReviewerDialog(
+  enabled: boolean,
+  document: string,
+  conversationId: string,
+  run: (document: string, context: GoalAuthorReviewerPrecheckContext) => Promise<GoalAuthorReviewerPrecheckResult> = (value, context) => runGoalAuthorReviewerPrecheck(value, { reviewContext: context }),
+  observe: (event: string, data: Record<string, unknown>) => void = (event, data) => debug.log('author.dialog', event, data),
+): Promise<GoalAuthorReviewerDialogResult> {
+  const emit = (event: string, data: Record<string, unknown>): void => {
+    try { observe(event, data); } catch { /* observability never changes author output */ }
+  };
+  let currentDocument = document;
+  let lastResult: GoalAuthorReviewerPrecheckResult | undefined;
+  let status: GoalAuthorReviewerDialogResult['status'] = 'completed';
+  let outcome: GoalAuthorReviewerDialogOutcome = 'converged';
+  let rolledBack = false;
+  let rounds = 0;
+  let hitl = false;
+  let priorRejectionReasonCodes: string[] = [];
+  const allSuggestions: string[] = [];
+  const allFixes: string[] = [];
+  const allFixEvidence: NonNullable<GoalAuthorReviewerPrecheckResult['fixEvidence']>[number][] = [];
+  const allAppliedFixes: string[] = [];
+  const allUnappliedItems: string[] = [];
+  const allRemainingNeedsHuman: string[] = [];
+
+  if (!enabled) {
+    emit('author.reviewer-precheck.skipped', { authorRunId: conversationId, conversationId, runId: conversationId, reason: 'disabled', providerCalls: 0 });
+    return { document, status: 'skipped', outcome: 'skipped', rounds: 0, hitl: false };
+  }
+
+  for (let round = 1; round <= 2; round += 1) {
+    rounds = round;
+    const context: GoalAuthorReviewerPrecheckContext = { conversationId, round, priorRejectionReasonCodes };
+    const response = await executeGoalAuthorReviewerPrecheck(
+      true,
+      currentDocument,
+      conversationId,
+      (candidate, receivedContext) => run(candidate, receivedContext ?? context),
+      (event, data) => emit(`author.reviewer-precheck.${event}`, data),
+      context,
+    );
+    status = response.status;
+    lastResult = response.result ?? lastResult;
+    if (response.status === 'failed-soft') {
+      outcome = 'provider-error';
+      currentDocument = document;
+      rolledBack = allAppliedFixes.length > 0;
+      break;
+    }
+    if (!response.result) break;
+
+    const result = response.result;
+    allSuggestions.push(...result.suggestions);
+    allFixes.push(...result.fixes);
+    allFixEvidence.push(...(result.fixEvidence ?? []));
+    allAppliedFixes.push(...result.appliedFixes);
+    allUnappliedItems.push(...result.unappliedItems);
+    allRemainingNeedsHuman.push(...result.remainingNeedsHuman);
+    const proposalCount = result.fixes.length;
+    const appliedCount = result.appliedFixes.length;
+    const rejectedCount = result.unappliedItems.length;
+    const reasonCodes = rejectedCount > 0 ? ['fix-not-grounded'] : [];
+    emit('author.reviewer.round', {
+      conversationId,
+      runId: conversationId,
+      round,
+      proposalCount,
+      appliedCount,
+      rejectedCount,
+      rejectionReasonCodes: reasonCodes,
+    });
+    if (response.status === 'completed') currentDocument = result.revisedDocument;
+
+    const unresolved = rejectedCount > 0 || result.remainingNeedsHuman.length > 0;
+    if (!unresolved && appliedCount === 0) {
+      outcome = 'converged';
+      break;
+    }
+    priorRejectionReasonCodes = reasonCodes;
+    if (round === 2) {
+      outcome = 'cap-hit';
+      hitl = true;
+    }
+  }
+
+  emit('author.dialog.closed', { conversationId, runId: conversationId, outcome, rounds, hitl });
+  const aggregatedResult = lastResult ? {
+    ...lastResult,
+    suggestions: [...new Set(allSuggestions)],
+    fixes: [...new Set(allFixes)],
+    fixEvidence: allFixEvidence,
+    appliedFixes: rolledBack ? [] : [...new Set(allAppliedFixes)],
+    unappliedItems: [...new Set([...allUnappliedItems, ...(rolledBack ? allAppliedFixes : [])])],
+    remainingNeedsHuman: [...new Set([...allRemainingNeedsHuman, ...(rolledBack ? allAppliedFixes : [])])],
+    revisedDocument: currentDocument,
+  } : undefined;
+  return {
+    document: currentDocument,
+    status,
+    outcome,
+    rounds,
+    hitl,
+    ...(aggregatedResult ? { result: aggregatedResult } : {}),
+  };
+}
+
 export type GoalAuthorGroundingPath = 'groundMissionInCodebase';
 
 export interface GoalAuthorGroundingDeps {
   /** Omit to preserve persistent grounding; false makes the authoring experiment opt out. */
   persistent?: false;
-  groundMission?: (ask: string, deps: { cwd: string; seedPaths?: readonly string[]; persistent?: false }) => Promise<CodebaseGrounding>;
+  groundMission?: (ask: string, deps: { cwd: string; seedPaths?: readonly string[]; persistent?: false; mockScenarioCatalog?: string }) => Promise<CodebaseGrounding>;
+  /** Reference inventory for selecting existing mock devices during goal grounding. */
+  mockScenarioCatalog?: string;
+}
+
+/** Compact prompt view of the canonical catalog; detailed run evidence stays in the catalog itself. */
+export function renderGoalAuthorMockScenarioCatalog(catalog: MockScenarioCatalog = loadMockScenarioCatalog()): string {
+  return [
+    'Reusable mock devices (src/ux-sim/mock-scenario-catalog.json):',
+    ...catalog.devices.map((device) => `- ${device.id} (${device.name}): target=${device.target}; inputs=${device.inputs.join(', ')}; observes=${device.observations.join(', ')}; entry=${device.entryCommands.join(' | ')}`),
+    'Reusable event-injection scenarios:',
+    ...catalog.scenarios.map((scenario) => `- ${scenario.id} (${scenario.kind}, device=${scenario.device}): trigger=${scenario.trigger}; observe=${scenario.observe.join(', ')}; expected=${scenario.expected}`),
+  ].join('\n');
 }
 
 export interface GoalAuthorGroundingResult {
@@ -912,7 +1056,9 @@ function behaviorTokens(value: string): Set<string> {
 
 function matchingScenarioBehaviorCount(scenario: MockScenarioEntry, ask: string): number {
   const { values } = inspectGoalDoneBoundary(ask);
-  const requestedText = `${values['완료 경계 코드'] ?? ''} ${values['완료 경계 실물'] ?? ''}`;
+  const requestedText = `${values['완료 경계 코드'] ?? ''} ${values['완료 경계 실물'] ?? ''}`
+    .replace(/(?:실물|실제)\s*(?:점검|검증|확인|테스트)\s*(?:으로|로)?/giu, '')
+    .replace(/real[- ]world\s+(?:check|inspection|verification|test)/giu, '');
   const describedText = `${scenario.name} ${scenario.kind} ${scenario.trigger} ${scenario.observe.join(' ')} ${scenario.expected}`;
   const requested = behaviorTokens(requestedText);
   const described = behaviorTokens(describedText);
@@ -925,7 +1071,11 @@ function matchingScenarioBehaviorCount(scenario: MockScenarioEntry, ask: string)
     ['harvestable', 'unharvestable'], ['independent', 'dependent'], ['succeeds', 'fails'], ['accepted', 'rejected'],
   ];
   const shared = [...described].filter((token) => requested.has(token));
+  const covered = new Set(described);
+  if (described.has('independent')) covered.add('distinct');
+  if (described.has('distinct')) covered.add('independent');
   if (shared.some((token) => polarity(requestedText, token) !== polarity(describedText, token))
+    || [...requested].some((token) => !covered.has(token))
     || oppositePairs.some(([left, right]) => (requested.has(left) && described.has(right)) || (requested.has(right) && described.has(left)))) return 0;
   return shared.length;
 }
@@ -944,12 +1094,13 @@ function nextGoalScenarioId(catalogIds: readonly string[], targets: readonly str
   return `${prefix}-${Date.now().toString(36).toUpperCase()}`;
 }
 
-function selectGoalMockStage(ask: string, targets: readonly string[]): { device: MockScenarioDevice; scenario?: MockScenarioEntry } | undefined {
+function selectGoalMockStage(ask: string, targets: readonly string[]): { device: MockScenarioDevice; scenario?: MockScenarioEntry; pathMatched: boolean } | undefined {
   const catalog = loadMockScenarioCatalog();
-  const device = catalog.devices
+  const matched = catalog.devices
     .map((candidate) => ({ candidate, score: matchingPathCount([...candidate.implementation, ...candidate.tests], targets) }))
     .filter((entry) => entry.score >= 2)
-    .sort((left, right) => right.score - left.score)[0]?.candidate
+    .sort((left, right) => right.score - left.score)[0];
+  const device = matched?.candidate
     ?? (/(?:author|goal|mission|저작|골|미션)/iu.test(`${targets.join(' ')}\n${ask}`)
       ? catalog.devices.find((candidate) => candidate.id === 'product-devices')
       : catalog.devices.find((candidate) => candidate.id === 'scenario-runner'));
@@ -959,7 +1110,14 @@ function selectGoalMockStage(ask: string, targets: readonly string[]): { device:
     .map((candidate) => ({ candidate, pathScore: matchingPathCount([...candidate.implementation, ...candidate.tests], targets), behaviorScore: matchingScenarioBehaviorCount(candidate, ask) }))
     .filter((entry) => entry.pathScore >= 2 && entry.behaviorScore >= 2)
     .sort((left, right) => right.behaviorScore - left.behaviorScore || right.pathScore - left.pathScore)[0]?.candidate;
-  return { device, ...(scenario ? { scenario } : {}) };
+  return { device, ...(scenario ? { scenario } : {}), pathMatched: Boolean(matched) };
+}
+
+function isGenericRealWorldInspectionBoundary(boundary: string, ask: string): boolean {
+  const combined = `${boundary}\n${ask}`;
+  const asksForRealInspection = /(?:실물\s*(?:점검|검증|확인|테스트)|실제\s*(?:점검|검증|확인|테스트)|real[- ]world\s+(?:check|inspection|verification|test)|live\s+(?:check|inspection|verification|test))/iu.test(boundary);
+  const namesExternalOutcome = /(?:외부\s*(?:시스템|서비스|서버|클러스터|API|데이터베이스|DB)|실서비스|운영\s*(?:시스템|서비스|서버|클러스터|API|데이터베이스|DB)|실제\s*(?:계정|결제|API|서버|클러스터|고객|사용자)|(?:고객|사용자|customer|client|recipient).{0,20}(?:메일|이메일|email|발송|전송|receive|send)|(?:메일|이메일|email).{0,20}(?:고객|사용자|customer|client|recipient|발송|전송|receive|send)|\b(?:external\s+(?:system|service|server|cluster|api|database|db)|(?:actual|real|live|production|staging|stage|external)\s+(?:[\w-]+\s+){0,2}(?:system|service|server|cluster|api|database|db)|(?:staging|stage|production|prod|test|dev)\s+(?:system|service|server|cluster|api|database|db)|database|db|email|mail|slack|discord|teams|telegram|webhook|channel|gcp\d+|github|stripe|aws|production\s+\w+|live\s+(?:api|service|server|cluster)|(?:posts?|sends?|publishes?|writes?|pushes?|creates?|deletes?|charges?|updates?|submits?|delivers?|notifies?)\b.{0,80}\b(?:to|on|into|against|via))\b)/iu.test(combined);
+  return asksForRealInspection && !namesExternalOutcome;
 }
 
 export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: string): string[] {
@@ -1001,6 +1159,17 @@ export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: stri
       const requestedObservation = values['완료 경계 실물'] ?? '격리 시험에서 요청된 생산 동작과 결과를 관측한다';
       lines.push(`- 시나리오: 신설 초안 (MS-id 후보: ${id})`);
       lines.push(`- 시나리오 초안: 사건은 ${targets.join(' · ') || '요청 대상'}에 «${requestedCode}» 경계를 적용한 입력; 기대는 생산 경로에서 «${requestedObservation}»을 관측하고 bun test ${plannedTestPath ?? '<대상 시험 파일>'}로 GREEN을 확인하는 것이다. 자식은 기존 카탈로그 API·ScenarioV0 형식에 맞춰 요청 대상의 사건·기대를 구체화해 등록한다.`);
+    }
+    const realWorldBoundary = values['완료 경계 실물'];
+    if (realWorldBoundary && isGenericRealWorldInspectionBoundary(realWorldBoundary, ask) && mockStage?.pathMatched) {
+      const { device, scenario } = mockStage;
+      if (scenario) {
+        lines.push(`- 목장치 치환안: 완료 경계 실물의 일반 실물 점검을 ${device.id} (${device.name})로 대체 제안; 기존 사건 주입 ${scenario.id}: ${scenario.trigger}; 관측=${scenario.observe.join(' · ')}; 기대=${scenario.expected}`);
+      } else {
+        const requestedCode = values['완료 경계 코드'] ?? '요청 코드 경계';
+        const requestedObservation = values['완료 경계 실물'] ?? '요청된 생산 동작과 결과';
+        lines.push(`- 목장치 치환안: ${device.id} (${device.name}) 신규 ScenarioV0 초안·미등록; trigger=«${requestedCode}»가 참이 되도록 사건을 입력한다(카탈로그 입력 후보: ${device.inputs.join(' · ')}); observe=«${requestedObservation}»(관측 후보: ${device.observations.join(' · ')}); expected=«${requestedObservation}». 입력·관측 selector를 해당 요청과 맞춰 등록하고 회귀 시험으로 확인할 제안이다.`);
+      }
     }
   }
   if (plannedTestPath) lines.push(`- 검증 계획(TDD): 장치 ${mockStage?.device.id ?? '미선정'} · 시나리오 ${mockStage?.scenario?.id ?? '신설 초안'} · ${needsNewTest ? '신설 시험' : '기존 시험에 요청 동작 회귀 사례 추가'} ${plannedTestPath} · 피처 시험 bun test ${plannedTestPath}를 구현 전에 RED로 확인한다.`);
@@ -6454,6 +6623,16 @@ async function authorGoalWithSupersededRootIntent(
   }
   // ⭐ 이 저작 «한 번»의 id. goalId 보다 «먼저» 있어야 ground·enhance 의 소요를 그 골에 붙일 수 있다.
   const authorRunId = generateGoalId();
+  if (deps.mockScenarioCatalog) {
+    try {
+      observeGoalAuthor('goal-author', 'mock-scenario-catalog-injected', {
+        authorRunId,
+        source: 'src/ux-sim/mock-scenario-catalog.json',
+        availableConsumers: ['ground', 'enhance', 'reviewer-precheck'],
+        contextChars: deps.mockScenarioCatalog.length,
+      });
+    } catch { /* observation must not change authoring */ }
+  }
   const authorGrade = deps.authorGrade ?? resolveGoalAuthorGrade(undefined, getUserConfig().harness?.authorGrade);
   const lite = authorGrade.grade === 'lite';
   // lite 는 판정선을 남기는 대신 단계를 덜 한다 — 요청에 반증 줄이 하나도 없으면 판정선 없는 골이 나가므로 시작 전에 멈춘다.
@@ -6480,7 +6659,10 @@ async function authorGoalWithSupersededRootIntent(
     const groundStartedAt = startGoalAuthorPhase('ground', authorRunId, deps.onProgress);
     const timeboxBudgetMs = deps.groundTimeboxMs ?? GOAL_AUTHOR_GROUND_TIMEBOX_MS;
     try {
-      const groundOutcome = await groundWithinTimebox(() => deps.ground(ask, persistentGrounding.deps), timeboxBudgetMs, groundStartedAt);
+      const groundOutcome = await groundWithinTimebox(() => deps.ground(ask, {
+        ...persistentGrounding.deps,
+        ...(deps.mockScenarioCatalog ? { mockScenarioCatalog: deps.mockScenarioCatalog } : {}),
+      }), timeboxBudgetMs, groundStartedAt);
       if ('timebox' in groundOutcome) {
         // ⛔ `groundingError` 를 «안» 쓴다 — 접지가 던진 것과 예산 초과로 끊긴 것은 다른 사건이고,
         //   처방도 다르다(앞은 채널 복구, 뒤는 더 좁은 ask/재시도). 두 값을 한 칸에 접으면 못 가른다.
@@ -6519,8 +6701,8 @@ async function authorGoalWithSupersededRootIntent(
       ? await deps.enhance(
         enhanceAsk,
         persistentFacts.length > 0
-          ? { ...deps.enhanceOpts, groundedFacts: persistentFacts, onUsage: onEnhanceUsage }
-          : { ...deps.enhanceOpts, onUsage: onEnhanceUsage },
+          ? { ...deps.enhanceOpts, groundedFacts: persistentFacts, onUsage: onEnhanceUsage, ...(deps.mockScenarioCatalog ? { mockScenarioCatalog: deps.mockScenarioCatalog } : {}) }
+          : { ...deps.enhanceOpts, onUsage: onEnhanceUsage, ...(deps.mockScenarioCatalog ? { mockScenarioCatalog: deps.mockScenarioCatalog } : {}) },
       )
       : { original: ask, checklist: [], verbatimPreserved: true };
     // ⭐ goal-context 규범이 «어디에도 안 실린다»는 것을 관측으로 남긴다.
@@ -7185,6 +7367,7 @@ export async function groundForGoalAuthor(
       cwd,
       seedPaths: askPathTokens(ask),
       ...(deps.persistent !== undefined ? { persistent: deps.persistent } : {}),
+      ...(deps.mockScenarioCatalog ? { mockScenarioCatalog: deps.mockScenarioCatalog } : {}),
     }),
   };
 }
@@ -7271,9 +7454,10 @@ async function runDefaultHelpProbe(cwd: string, argv: readonly string[]): Promis
  *   ⇒ 배선만 무는 테스트가 이것을 직접 부른다.
  */
 export function defaultGoalAuthorDeps(cwd: string): GoalAuthorDeps {
+  const mockScenarioCatalog = renderGoalAuthorMockScenarioCatalog();
   return {
     async ground(ask, groundingDeps) {
-      return (await groundForGoalAuthor(ask, cwd, groundingDeps)).facts;
+      return (await groundForGoalAuthor(ask, cwd, { ...groundingDeps, mockScenarioCatalog })).facts;
     },
     /**
      * ⭐⭐ 저작 경로는 체크리스트를 «완주 판정»이 아니라 «골 문서 재료»로 쓴다 — 그래서 용도를 밝힌다.
@@ -7287,8 +7471,9 @@ export function defaultGoalAuthorDeps(cwd: string): GoalAuthorDeps {
      *   이 칸을 «안 주므로» 기본값 `coverage-gate` 로 종전 문면을 그대로 받는다.
      */
     enhance(ask, opts) {
-      return enhancePrompt(ask, { ...opts, checklistUse: 'authoring', config: opts?.config ?? getUserConfig() });
+      return enhancePrompt(ask, { ...opts, mockScenarioCatalog, checklistUse: 'authoring', config: opts?.config ?? getUserConfig() });
     },
+    mockScenarioCatalog,
     readSourceFile: createRepositoryReferencedFileReader(cwd),
     runHelpProbe: (argv) => runDefaultHelpProbe(cwd, argv),
     selfResolveClarification: defaultGoalAuthorSelfResolve,
@@ -7409,17 +7594,17 @@ export async function writeAuthoredGoal(
         ...(supersededRootIntent !== null && { supersessionRootIntent: supersededRootIntent }),
       });
     const reviewerPrecheckEnabled = resolvedDeps.reviewerPrecheckEnabled ?? resolveGoalAuthorReviewerPrecheckEnabled();
-    const precheck = await executeGoalAuthorReviewerPrecheck(
+    const dialog = await executeGoalAuthorReviewerDialog(
       reviewerPrecheckEnabled,
       authored.document,
       authored.authorRunId,
-      (document) => (resolvedDeps.reviewerPrecheck
-        ? resolvedDeps.reviewerPrecheck(document, authored.authorRunId)
-        : runGoalAuthorReviewerPrecheck(document)),
+      (document, context) => (resolvedDeps.reviewerPrecheck
+        ? resolvedDeps.reviewerPrecheck(document, authored.authorRunId, context)
+        : runGoalAuthorReviewerPrecheck(document, { reviewContext: context, mockScenarioCatalog: resolvedDeps.mockScenarioCatalog })),
     );
-    if (precheck.result) {
-      authored.reviewerPrecheck = precheck.result;
-      if (precheck.status === 'completed') authored.document = precheck.result.revisedDocument;
+    authored.document = dialog.document;
+    if (dialog.result) {
+      authored.reviewerPrecheck = dialog.result;
     }
     const stampedAt = fileDeps.now?.() ?? new Date();
   const identity = identityLines(ask, cwd, fileDeps.env ?? process.env, stampedAt);

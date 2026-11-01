@@ -21,10 +21,11 @@
 //   bun scripts/ux-sim.ts emit child-error-long --json # 사건 주입(L0): 격리 우주 원장에 주입 줄 → 소비자 목록
 //
 // catalog list/show 는 재사용 장치의 참조를 보여 준다. 선언된 TUI 장면은 실제 위젯 render() 를 부른다 — 흉내 렌더러가 아니다.
+// catalog devices 는 장치별 진입 명령·logs/event·최근 사용 메타데이터를 읽기 전용으로 출력한다.
 import { simRenderLogFrame } from '../src/ux-sim/render-frame.js';
 import { simTypeaheadState, type TurnPhase, type TurnSimSpec } from '../src/ux-sim/turn-states.js';
 import { renderTurnTypeaheadQueueRow, renderTurnTypeaheadEcho } from '../src/chat/turn-typeahead.js';
-import { loadMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioList } from '../src/ux-sim/mock-scenario-catalog.js';
+import { loadMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioDevices, renderMockScenarioList } from '../src/ux-sim/mock-scenario-catalog.js';
 
 const PHASES: TurnPhase[] = [
   'idle', 'thinking', 'streaming', 'streaming-with-subagents', 'harness-child', 'interrupted',
@@ -35,6 +36,11 @@ const argv = process.argv.slice(2);
 if (argv[0] === 'list') {
   if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts list'); process.exit(2); }
   console.log(renderMockScenarioList(loadMockScenarioCatalog()).join('\n'));
+  process.exit(0);
+}
+if (argv[0] === 'devices') {
+  if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts devices'); process.exit(2); }
+  console.log(renderMockScenarioDevices(loadMockScenarioCatalog()).join('\n'));
   process.exit(0);
 }
 if (argv[0] === 'show') {

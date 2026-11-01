@@ -37,6 +37,7 @@ function makeRunOptions(
   promptCapture: { value: string },
 ): ResearchQuestionLadderRunOptions {
   return {
+    enableResearchFanout: false,
     generateContract,
     routeOutput: noOutputSkillRoute,
     generate: async (prompt: string) => {
@@ -61,19 +62,18 @@ function makeRunOptions(
   };
 }
 
-function retroEventsSince(baseline: number, event: string, topic: string) {
-  return debug.events(500).slice(baseline).filter((e) =>
+function retroEvents(event: string, topic: string) {
+  return debug.events().filter((e) =>
     e.category === 'research.turn' && e.event === event
     && ((e.data as { topic?: string } | undefined)?.topic === topic));
 }
 
 test('RESEARCH-RETRO-LOOP-HOOK: 조사 런 종료 시 회고 레코드 1건 저장 ⊕ 다음 조사 턴에서 같은 주제 레코드가 1단 근거로 주입(debug.log)', async () => {
-  const topic = 'Retro hook persistence across research turns';
-  const baseline = debug.events(500).length;
+  const topic = `Retro hook persistence across research turns ${globalThis.crypto.randomUUID()}`;
   const promptCapture = { value: '' };
   await runResearchQuestionLadder(topic, makeRunOptions(topic, null, promptCapture));
 
-  const saved = retroEventsSince(baseline, 'retro-record-saved', topic);
+  const saved = retroEvents('retro-record-saved', topic);
   expect(saved).toHaveLength(1);
   const record = saved[0]!.data as Record<string, string>;
   expect(record.topic).toBe(topic);
@@ -83,7 +83,7 @@ test('RESEARCH-RETRO-LOOP-HOOK: 조사 런 종료 시 회고 레코드 1건 저�
 
   const secondPrompt = { value: '' };
   await runResearchQuestionLadder(topic, makeRunOptions(topic, null, secondPrompt));
-  const injected = retroEventsSince(baseline, 'retro-grounding-injected', topic);
+  const injected = retroEvents('retro-grounding-injected', topic);
   expect(injected).toHaveLength(1);
   expect((injected[0]!.data as Record<string, string>).observedGap).toBe(record.observedGap);
   expect(secondPrompt.value).toContain('Fill this gap first');
@@ -91,16 +91,15 @@ test('RESEARCH-RETRO-LOOP-HOOK: 조사 런 종료 시 회고 레코드 1건 저�
 });
 
 test('RESEARCH-RETRO-LOOP-HOOK: 격리 우주 채권 금리 질문 2회 — 두 번째 입력이 첫 회고의 공백(기간 프리미엄)을 먼저 채운다', async () => {
-  const topic = 'Retro hook bond yield two-run scenario';
-  const baseline = debug.events(500).length;
+  const topic = `Retro hook bond yield two-run scenario ${globalThis.crypto.randomUUID()}`;
   const firstPrompt = { value: '' };
   await runResearchQuestionLadder(topic, makeRunOptions(topic, 'q5', firstPrompt));
-  const firstRecord = retroEventsSince(baseline, 'retro-record-saved', topic)[0]!.data as Record<string, string>;
+  const firstRecord = retroEvents('retro-record-saved', topic)[0]!.data as Record<string, string>;
   expect(firstRecord.observedGap).toContain('term premium');
 
   const secondPrompt = { value: '' };
   await runResearchQuestionLadder(topic, makeRunOptions(topic, null, secondPrompt));
-  expect(retroEventsSince(baseline, 'retro-grounding-injected', topic)).toHaveLength(1);
+  expect(retroEvents('retro-grounding-injected', topic)).toHaveLength(1);
   expect(secondPrompt.value).toContain('term premium');
   expect(secondPrompt.value).toContain('지난번 대비 달라진 것');
 });

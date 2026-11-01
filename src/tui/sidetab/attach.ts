@@ -8,6 +8,7 @@ import { getSessionCwd } from '../../session/working-dir.js';
 import { TerminalSessionRegistry, type TerminalSession } from '../../terminal/session-registry.js';
 import { requestRemotePtyControl } from '../../pty-shell/pty-control-ipc.js';
 import { runVisibleAgentMission, type VisibleMissionPty, type VisibleMissionResult } from '../../sidetab-core/visible-agent-mission.js';
+import { runVisibleAgentMissionPair } from '../../sidetab-core/visible-agent-mission-pair.js';
 import type { Key } from '../../tui.js';
 import type { SidetabRow } from './list.js';
 import { createHerdrSidetabPortal, herdrPaneIdFromSidetabRow, type HerdrSidetabPortal } from './herdr-portal.js';
@@ -20,6 +21,7 @@ export interface SidetabAttachmentController {
   showMain(): void;
   spawn(character: SidetabCharacter): boolean;
   runMission(agent: 'codex' | 'claude', mission: string): Promise<Awaited<ReturnType<typeof runVisibleAgentMission>>>;
+  runMissionPair(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
   kill(row: SidetabRow): boolean;
   handleKey(key: Key): boolean;
   hasModal(): boolean;
@@ -341,6 +343,116 @@ export function createSidetabAttachmentController(deps: {
       showMain();
       deps.setStatus(result.ok ? `미션 결과 확인 · ${result.path}` : `미션 확인 실패 · ${result.promptReady ? agent : result.startupScreen ?? agent} · ${result.error}`);
       return result;
+    },
+    async runMissionPair(agent, mission, parallelMission) {
+      const missionId = `duo-${randomUUID()}`;
+      const startedAt = Date.now();
+      const members = [agent, agent === 'codex' ? 'claude' : 'codex'] as const;
+      if (deps.detectAgentCli) {
+        const detections = await Promise.all(members.map(async (member) => {
+          try { return await deps.detectAgentCli!(member); }
+          catch (error) {
+            return { agent: member, installed: false, version: null, login: 'unknown' as const,
+              message: `${member} CLI 확인에 실패했습니다: ${error instanceof Error ? error.message : String(error)}` };
+          }
+        }));
+        const unavailable = detections.find(({ installed }) => !installed);
+        if (unavailable) {
+          const message = `${unavailable.message} · pair 미션은 두 CLI 모두 준비돼야 시작합니다`;
+          deps.setStatus(message);
+          return { ok: false, error: message, codex: null, claude: null };
+        }
+      }
+
+      const sessions = new Map<'codex' | 'claude', TerminalSession>();
+      const workspaces = new Map<'codex' | 'claude', string>();
+      const ptySessions = new Map<VisibleMissionPty, TerminalSession>();
+      const pair = await runVisibleAgentMissionPair({
+        spawn: (member) => {
+          lastSpawnedSession = null;
+          const injected = deps.createVisibleMissionPty?.(member);
+          if (injected) {
+            workspaces.set(member, injected.cwd);
+            return injected.pty;
+          }
+          const didSpawn = spawn(member);
+          const session = lastSpawnedSession as TerminalSession | null;
+          if (!didSpawn || !session) return null;
+          sessions.set(member, session);
+          workspaces.set(member, session.cwd);
+          const pty: VisibleMissionPty = {
+            snapshot: () => session.preview.renderForLLM(),
+            write: (bytes) => session.preview.write(bytes),
+            isAlive: () => session.preview.isAlive,
+          };
+          ptySessions.set(pty, session);
+          return pty;
+        },
+        dispose: (preview) => {
+          const session = ptySessions.get(preview);
+          if (session) registry.kill(session.id);
+        },
+        run: async (member, prompt, pty) => {
+          const outputPath = join(workspaces.get(member)!, '.elanous', 'mission-results', `sidetab-pair-${randomUUID()}-${member}.md`);
+          const backend = member === 'codex' ? codexBackend : claudeBackend;
+          const result = await (deps.visibleMissionRunner ?? runVisibleAgentMission)({
+            pty, agent: member, mission: prompt, outputPath,
+            onStartupScreen: (screen) => deps.logEvent?.('agent-mission.sidetab-pair', 'startup-screen', { agent: member, screen }),
+            handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
+          });
+          const failureLog = sidetabMissionFailureLog(member, result);
+          if (failureLog) deps.logEvent?.('agent-mission.sidetab-pair', failureLog.event, failureLog.data);
+          return result;
+        },
+      }, agent, mission, parallelMission);
+      if (pair.error) {
+        showMain();
+        deps.setStatus(pair.error);
+        return pair;
+      }
+      const codexWorkspace = workspaces.get('codex');
+      const claudeWorkspace = workspaces.get('claude');
+      if (!codexWorkspace || !claudeWorkspace || codexWorkspace !== claudeWorkspace) {
+        showMain();
+        const error = '두 사이드탭이 같은 작업 디렉터리를 쓰지 않아 pair 합성을 안전하게 저장할 수 없습니다';
+        deps.setStatus(error);
+        return { ...pair, ok: false, error };
+      }
+      const missionByAgent = new Map([ [agent, mission], [agent === 'codex' ? 'claude' : 'codex', parallelMission] ] as const);
+      const completion = await (await import('../../tui-client/next-dashboard-runtime.js')).completeNextTuiMissionPair({
+        taskId: missionId,
+        codex: {
+          missionId: `${missionId}-codex`, startedAt,
+          mission: missionByAgent.get('codex')!, workspaceDir: codexWorkspace, result: pair.codex!,
+        },
+        claude: {
+          missionId: `${missionId}-claude`, startedAt,
+          mission: missionByAgent.get('claude')!, workspaceDir: claudeWorkspace, result: pair.claude!,
+        },
+      });
+      const notification = completion.notification;
+      const finalFile = notification?.resultPath;
+      deps.logEvent?.('agent-mission.sidetab-pair', 'synthesis-result', {
+        missionId, codexOk: pair.codex?.ok ?? false, claudeOk: pair.claude?.ok ?? false,
+        synthesisOk: Boolean(finalFile), status: completion.status,
+      });
+      showMain();
+      deps.setStatus(finalFile
+        ? `그래프 두 갈래·비교 합성 완료 · ${finalFile}`
+        : '그래프 두 갈래 완료 · 기존 pair 합성 파일 저장 실패');
+      return {
+        ...pair,
+        ok: pair.ok && completion.status === 'done' && Boolean(finalFile),
+        pair: 'codex+claude',
+        graph: [
+          { id: 'plan', state: 'complete', task: `${mission} ⊕ ${parallelMission}` },
+          { id: 'codex', state: pair.codex?.ok ? 'complete' : 'failed', task: missionByAgent.get('codex'), resultFile: pair.codex?.path },
+          { id: 'claude', state: pair.claude?.ok ? 'complete' : 'failed', task: missionByAgent.get('claude'), resultFile: pair.claude?.path },
+          { id: 'synthesis', state: finalFile ? 'complete' : 'failed', resultFile: finalFile },
+        ],
+        finalFile,
+        summary: notification?.output,
+      };
     },
     kill(row) {
       if (row.currentProcess) {

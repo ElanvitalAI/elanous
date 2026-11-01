@@ -7,7 +7,7 @@ import { createTelegramAmbientMessageHandler } from '../intake-plane/adapters/te
 import { createLinearSecretaryBreakdown, updateLinearSecretaryProgress, type LinearSecretaryPlan } from '../intake-plane/linear-wish.js';
 import { submitIntakeWork } from '../intake-plane/submit-intake-work.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
-import { DecisionCardService, type CardRef, type CardTransport, type CardView } from '../decisions/decision-cards.js';
+import { renderCard, type CardView } from '../decisions/decision-cards.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { simBrowserHand } from './browser-hand.js';
 
@@ -174,20 +174,12 @@ export async function simLinearSecretary(): Promise<LinearSecretarySimulationRes
         options: [{ key: 'a', label: '승인', consequence: '공개를 진행한다' }, { key: 'b', label: '보류', consequence: '외부 공개를 멈춘다' }],
         recommendation: { option: 'b', why: '이 장치는 승인 전 경계까지만 재현한다' }, raisedBy: { agent: 'OPT', track: 'O' },
         refs: [parentIssueId, ...childIssueIds] });
-      const sent: Array<{ view: CardView }> = [];
-      const transport: CardTransport = {
-        platform: 'telegram', async ownerChats() { return ['fake-owner']; },
-        async send(_chat: string, view: CardView): Promise<CardRef> { sent.push({ view }); return { chat: 'fake-owner', message: String(sent.length) }; },
-        async edit() {}, async notify() {},
-      };
-      await new DecisionCardService({ transport, ownerIds: ['fake-owner'], ledger, now: () => NOW }).tick();
-      const card = sent.find(item => item.view.text.includes(decision.id));
-      if (!card) throw new Error('approval card did not reach the fake owner transport');
+      const card = renderCard(ledger.show(decision.id));
       approvalDecisionId = decision.id;
-      approvalCard = { id: decision.id, text: card.view.text, buttons: card.view.buttons };
+      approvalCard = { id: decision.id, text: card.text, buttons: card.buttons };
       approvalCardStatus = ledger.show(decision.id).status;
       if (approvalCardStatus !== 'open') throw new Error(`approval card was not left open: ${approvalCardStatus}`);
-      event('approval-card-opened', { decisionId: decision.id, status: approvalCardStatus });
+      event('approval-card-opened', { decisionId: decision.id, status: approvalCardStatus, localOnly: true });
       return { replyCard: result.replyCard };
       } catch (error) {
         failure = error instanceof Error ? error.message : String(error);

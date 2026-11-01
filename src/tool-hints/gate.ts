@@ -36,7 +36,7 @@ export function evaluateGate(
   const key = cacheKey(catalog, hints, signals);
   const cached = CACHE.get(key);
   if (cached) {
-    recordGateEvaluation(catalog.length, cached.filtered.length, {
+    recordGateEvaluation(catalog, cached, {
       defaultEnabled: notRunStage(),
       probe: notRunStage(),
       intentScope: notRunStage(),
@@ -58,10 +58,12 @@ export function evaluateGate(
   };
   const boost = new Map<string, number>();
   const paramDefaults = new Map<string, Record<string, unknown>>();
+  const excludedReasons = new Map<string, string>();
 
   // ─── Step 1: seed with defaultEnabled entries ──────────────────
   for (const tool of catalog) {
     if (tool.defaultEnabled) enabled.add(tool.id);
+    else excludedReasons.set(tool.id, 'default-disabled');
   }
   stages.defaultEnabled = executedStage(catalog.length, enabled.size);
 
@@ -74,6 +76,7 @@ export function evaluateGate(
     const mode = tool.probe.onFail ?? 'hide';
     if (mode === 'hide') enabled.delete(tool.id);
     else if (mode === 'disable') enabled.delete(tool.id);
+    if (mode === 'hide' || mode === 'disable') excludedReasons.set(tool.id, `probe-${mode}`);
     // 'warn': leave enabled; caller may read hintReasons to surface
   }
   stages.probe = executedStage(beforeProbe, enabled.size);
@@ -93,7 +96,10 @@ export function evaluateGate(
     for (const tool of catalog) {
       const scope: ToolIntentScope = tool.intentScope ?? 'always';
       if (scope === 'always') continue;
-      if (!activeScopes.has(scope)) enabled.delete(tool.id);
+      if (!activeScopes.has(scope)) {
+        enabled.delete(tool.id);
+        excludedReasons.set(tool.id, `intent-scope:${scope}`);
+      }
     }
     stages.intentScope = executedStage(beforeIntentScope, enabled.size);
   }
@@ -107,7 +113,10 @@ export function evaluateGate(
     for (const tool of catalog) {
       if (!tool.minTier) continue;
       const need = tierRank[tool.minTier] ?? 2;
-      if (activeRank < need) enabled.delete(tool.id);
+      if (activeRank < need) {
+        enabled.delete(tool.id);
+        excludedReasons.set(tool.id, `min-tier:${tool.minTier}`);
+      }
     }
     stages.minTier = executedStage(beforeMinTier, enabled.size);
   }
@@ -126,8 +135,14 @@ export function evaluateGate(
       if (seenForKind.has(comboKey)) continue;
       seenForKind.set(comboKey, { toolId, kind: h.kind });
 
-      if (h.kind === 'enable')  enabled.add(toolId);
-      if (h.kind === 'disable') enabled.delete(toolId);
+      if (h.kind === 'enable') {
+        enabled.add(toolId);
+        excludedReasons.delete(toolId);
+      }
+      if (h.kind === 'disable') {
+        enabled.delete(toolId);
+        excludedReasons.set(toolId, 'hint-disabled');
+      }
       if (h.kind === 'prefer') boost.set(toolId, (boost.get(toolId) ?? 0) + 2);
       if (h.kind === 'boost')  boost.set(toolId, (boost.get(toolId) ?? 0) + 1);
       if (h.kind === 'avoid')  boost.set(toolId, (boost.get(toolId) ?? 0) - 1);
@@ -181,11 +196,21 @@ export function evaluateGate(
     const beforeModelFamilyCap = keep.length;
     const cap = signals.researchAgent ? 16 : 8;
     if (keep.length > cap) {
-      keep = keep
+      const requiredResearchTools = signals.intentResearch
+        ? ['web_search', 'web_fetch'].filter(id => enabled.has(id))
+        : [];
+      const required = new Set(requiredResearchTools);
+      const ranked = keep
+        .filter(id => !required.has(id))
         .map(id => ({ id, score: boost.get(id) ?? 0 }))
         .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
-        .slice(0, cap)
+        .slice(0, Math.max(0, cap - requiredResearchTools.length))
         .map(x => x.id);
+      keep = [...requiredResearchTools, ...ranked];
+      const selectedBeforeStableSort = new Set(keep);
+      for (const id of enabled) {
+        if (!selectedBeforeStableSort.has(id)) excludedReasons.set(id, 'model-family-cap');
+      }
     }
     stages.modelFamilyCap = executedStage(beforeModelFamilyCap, keep.length);
   }
@@ -204,6 +229,7 @@ export function evaluateGate(
     boost: Object.fromEntries(boost),
     paramDefaults: Object.fromEntries(paramDefaults),
     hintReasons,
+    excludedReasons: Object.fromEntries(excludedReasons),
   };
 
   if (CACHE.size >= CACHE_MAX) {
@@ -212,7 +238,7 @@ export function evaluateGate(
     if (firstKey !== undefined) CACHE.delete(firstKey);
   }
   CACHE.set(key, decision);
-  recordGateEvaluation(catalog.length, decision.filtered.length, stages, false);
+  recordGateEvaluation(catalog, decision, stages, false);
   return decision;
 }
 
@@ -237,18 +263,23 @@ function executedStage(before: number, after: number): GateStage {
 }
 
 function recordGateEvaluation(
-  catalogCount: number,
-  filteredCount: number,
+  catalog: NativeToolCatalogEntry[],
+  decision: GateDecision,
   stages: GateStages,
   cacheHit: boolean,
 ): void {
-  // This is a per-call summary: names stay out so high-cardinality catalogs do not flood observability.
+  const active = new Set(decision.filtered);
   debug.log('capability.resolve', 'tool-gate-evaluated', {
     cacheHit,
-    catalogCount,
-    filteredCount,
-    removedCount: catalogCount - filteredCount,
+    catalogCount: catalog.length,
+    filteredCount: decision.filtered.length,
+    removedCount: catalog.length - decision.filtered.length,
     stages,
+    activeTools: decision.filtered.map((id) => catalog.find((tool) => tool.id === id)?.displayName ?? id),
+    excludedTools: catalog.filter((tool) => !active.has(tool.id)).map((tool) => ({
+      name: tool.displayName,
+      reason: decision.excludedReasons?.[tool.id] ?? 'unclassified-filter',
+    })),
   });
 }
 

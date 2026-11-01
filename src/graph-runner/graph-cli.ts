@@ -55,6 +55,29 @@ export function registerGraphCommands(program: Command, runsDeps: {
         process.exitCode = 1;
       }
     });
+  graph.command('promote')
+    .description('Evaluate an injected ARG promotion fixture; this command never applies or writes an overlay')
+    .command('evaluate')
+    .requiredOption('--fixture <path>', 'JSON fixture containing trigger, candidate and injected evidence events')
+    .option('--json', 'Print the mock-only decision and proposal as JSON')
+    .action(async (opts: { fixture: string; json?: boolean }) => {
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(resolve(opts.fixture), 'utf8'));
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('fixture root must be an object');
+        const fixture = parsed as Record<string, unknown>;
+        if (typeof fixture.trigger !== 'string' || fixture.candidate === null || typeof fixture.candidate !== 'object'
+          || Array.isArray(fixture.candidate) || !Array.isArray(fixture.events)) {
+          throw new Error('fixture requires trigger, candidate object and events array');
+        }
+        const { evaluateArgPromotionFixture } = await import('../self-implement/graph-overlay-yaml.js');
+        const result = evaluateArgPromotionFixture(fixture as Parameters<typeof evaluateArgPromotionFixture>[0]);
+        if (opts.json) await writeStdoutJson(JSON.stringify(result) + '\n');
+        else console.log(`graph promote: ${result.verdict} · mockOnly=${result.mockOnly} · wroteOverlay=false · ${JSON.stringify(result.metrics)}${result.blockers.length ? ` · blockers=${result.blockers.join(',')}` : ''}`);
+      } catch (error) {
+        console.error(`graph promote evaluate: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   graph.command('wizard-run <request>')
     .description('Run one request through the smart wizard graph and stop at its approval gate')
     .option('--json', 'Print run identity and transitions as JSON')
@@ -95,7 +118,7 @@ export function registerGraphCommands(program: Command, runsDeps: {
         }
         const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }) });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
-        else console.log(`${state.graphId} ${state.runId}: ${state.status} (${state.path.join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
+        else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;
       } catch (error) {
         console.error(`graph run: ${error instanceof Error ? error.message : String(error)}`);

@@ -138,6 +138,46 @@ edges:
   expect(run.nodes.find(node => node.nodeId === 'invoke')?.output).toContain('"exercised":true');
 });
 
+test('run-research maps a failed make-doc command to the declared failed unit exit', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'run-research-make-doc-command-failure-'));
+  roots.push(root);
+  const graph = join(projectRoot, 'graphs/work/run-research.yaml');
+  const commands: string[] = [];
+  const run = await runGraph(graph, {
+    input: {
+      ask: 'Exercise the make-doc failure route',
+      context: {},
+      prior: { result: 'prior-result-kept', evidence: { source: 'prior-proof-kept' } },
+    },
+    deps: {
+      root,
+      runBash: async (body, opts) => {
+        commands.push(body);
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('headless-goal-loop.ts')) return { stdout: '', stderr: 'injected missing-worktree failure', exitCode: 1 };
+        throw new Error(`unexpected run-research command: ${body}`);
+      },
+    },
+  });
+
+  expect(commands.some(body => body.includes('headless-goal-loop.ts'))).toBe(true);
+  expect(run.status).toBe('failed');
+  expect(run.path).toEqual(['make-doc', 'failed']);
+  expect(run.unitCalls?.[0]).toMatchObject({ unit: 'verb-make-doc', exit: 'failed' });
+  expect(run.nodes.find(node => node.nodeId === 'make-doc')?.output).toContain('"outcome":"failed"');
+  const childId = run.unitCalls![0]!.childRunId;
+  const child = JSON.parse(readFileSync(join(root, 'graph-runs', 'verb-make-doc', `${childId}.json`), 'utf8'));
+  expect(child.path).toEqual(['prepare', 'document-draft', 'failed']);
+  const childFailureOutput = JSON.parse(String(child.nodes.find((node: { nodeId: string }) => node.nodeId === 'failed').output));
+  expect(childFailureOutput).toEqual({ result: null, evidence: { 'prior-result': 'prior-result-kept', source: 'prior-proof-kept' } });
+  const parentUnitOutput = JSON.parse(String(run.nodes.find(node => node.nodeId === 'make-doc')!.output));
+  expect(parentUnitOutput).toEqual({
+    outcome: 'failed',
+    result: null,
+    evidence: { 'prior-result': 'prior-result-kept', source: 'prior-proof-kept' },
+  });
+});
+
 test('research-report permits a second verify visit after the first verify exits for rework', async () => {
   const root = mkdtempSync(join(tmpdir(), 'research-report-verify-rework-'));
   roots.push(root);

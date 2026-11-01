@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { tddPlanFromGoal } from './off-diff-evidence.js';
-import { authorGoal, runGoalAuthorSelfReview, GOAL_AUTHOR_SELF_REVIEW_CHECKS, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, selectRelevantAuthoringLessons, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { authorGoal, runGoalAuthorReviewerPrecheck, runGoalAuthorSelfReview, GOAL_AUTHOR_SELF_REVIEW_CHECKS, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, selectRelevantAuthoringLessons, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
 import { GOAL_AUTHOR_GROUND_TIMEBOX_MS, readGoalAuthorGroundingTimebox } from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
@@ -269,6 +269,100 @@ describe('goal author grade', () => {
       expect(markdownSection(authored.document, 'ACCEPTANCE CRITERIA')).toContain('- 완료 경계 코드: src/self-dev/dev-pipeline.ts');
       expect(authored.document).not.toContain('## 완료 경계');
     }
+  });
+
+  test('proposes a catalog device and event-injection replacement for generic real-world-only completion checks', () => {
+    const generic = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: child report-deficit remains distinct and harvest result remains visible',
+      '완료 경계 실물: 실물 점검으로 child report-deficit remains distinct and harvest result remains visible',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(generic.some((line) => line.includes('목장치 치환안:'))).toBe(true);
+    expect(generic.some((line) => line.includes('목장치 치환안:') && line.includes('fault-injection'))).toBe(true);
+    expect(generic.some((line) => line.includes('시나리오: UX-MS-01'))).toBe(true);
+
+    const unrelated = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/catalog/query.ts · src/catalog/query.test.ts',
+      '완료 경계 코드: query result remains stable',
+      '완료 경계 실물: 실물 점검으로 query result remains stable',
+      '완료 경계 증거 명령: bun test src/catalog/query.test.ts',
+    ].join('\n'), process.cwd());
+    expect(unrelated.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const explicitExternal = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: child report-deficit remains distinct and harvest result remains visible',
+      '완료 경계 실물: gcp1 외부 클러스터에서 child report-deficit remains distinct and harvest result remains visible',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(explicitExternal.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const externalEmail = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: customer receives the email',
+      '완료 경계 실물: 실물 점검으로 실제 고객에게 이메일이 발송된다',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(externalEmail.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const externalCluster = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/self-implement/goal-fixture.ts · src/self-implement/goal-fixture.test.ts',
+      '완료 경계 코드: goal is accepted',
+      '완료 경계 실물: real-world check on an external cluster',
+      '완료 경계 증거 명령: bun test src/self-implement/goal-fixture.test.ts',
+    ].join('\n'), process.cwd());
+    expect(externalCluster.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const externalSlack = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: accepted message is posted',
+      '완료 경계 실물: real-world check that posts to a production Slack channel',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(externalSlack.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const stagingCluster = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: Pod fails',
+      '완료 경계 실물: real-world check that a Pod fails on the staging cluster',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(stagingCluster.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const slackChannel = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: accepted message is posted',
+      '완료 경계 실물: real-world check that posts to a Slack channel',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(slackChannel.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const noMatchingScenario = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: dashboard summarizes report-deficit separately by tenant',
+      '완료 경계 실물: 실물 점검으로 dashboard summarizes report-deficit separately by tenant',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(noMatchingScenario.some((line) => line.includes('목장치 치환안:'))).toBe(true);
+    expect(noMatchingScenario.some((line) => line.includes('ScenarioV0 초안') && line.includes('trigger=') && line.includes('expected='))).toBe(true);
+    expect(noMatchingScenario.some((line) => line.includes('dashboard summarizes report-deficit separately by tenant'))).toBe(true);
+
+    const actualKubernetes = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '완료 경계 코드: Pod fails',
+      '완료 경계 실물: real-world check that a Pod fails on the actual Kubernetes cluster',
+      '완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n'), process.cwd());
+    expect(actualKubernetes.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+
+    const semanticOnlyFallback = explicitGoalDoneBoundaryLines([
+      '대상 경로: src/self-implement/unrelated-goal-file.ts · src/self-implement/unrelated-goal-file.test.ts',
+      '완료 경계 코드: goal is complete',
+      '완료 경계 실물: 실물 점검으로 goal is complete',
+      '완료 경계 증거 명령: bun test src/self-implement/unrelated-goal-file.test.ts',
+    ].join('\n'), process.cwd());
+    expect(semanticOnlyFallback.some((line) => line.includes('목장치 치환안:'))).toBe(false);
   });
 
   test('typecheck-only evidence is rewritten to a target test and creates a TDD green command', async () => {
@@ -566,6 +660,43 @@ describe('goal author grade', () => {
     expect(authored.document).not.toContain('Grounding timebox:');
     expect(readGoalAuthorGroundingTimebox(authored.document)).toBeNull();
   }, 60_000);
+});
+
+describe('goal author correction devices', () => {
+  test('passes the mock device catalog through grounding and enhancement as reference context', async () => {
+    const catalog = defaultGoalAuthorDeps(process.cwd()).mockScenarioCatalog ?? '';
+    expect(catalog).toContain('fake-kubectl');
+    expect(catalog).toContain('UX-MS-07');
+    const ground = mock(async (_ask: string, options?: unknown) => facts);
+    let enhancementOptions: unknown;
+    await authorGoal('대상 경로: src/example.ts\n판정선(반증): 기존 동작을 확인한다.', {
+      ...deps,
+      ground,
+      mockScenarioCatalog: catalog,
+      enhance: async (raw, options) => {
+        enhancementOptions = options;
+        return { original: raw, checklist: [], verbatimPreserved: true };
+      },
+    });
+    expect(ground.mock.calls[0]?.[1]).toMatchObject({ mockScenarioCatalog: catalog });
+    expect(enhancementOptions).toMatchObject({ mockScenarioCatalog: catalog });
+  });
+
+  test('reviewer precheck asks whether a real-world constraint matches implementation and can use a mock device', async () => {
+    let prompt = '';
+    await runGoalAuthorReviewerPrecheck('goal document', {
+      config: { llm: { provider: 'openai-codex' } } as never,
+      mockScenarioCatalog: 'fake-kubectl: inject Pod failure; observe Job state',
+      stream: (async (messages: Array<{ content: string }>) => {
+        prompt = messages.map((message) => message.content).join('\n');
+        return JSON.stringify({ suggestions: [], fixes: [], fixEvidence: [], remainingNeedsHuman: [], revisedDocument: 'goal document' });
+      }) as never,
+    });
+    expect(prompt).toContain('제약을 의심');
+    expect(prompt).toContain('목장치');
+    expect(prompt).toContain('실물 점검만 요구');
+    expect(prompt).toContain('fake-kubectl: inject Pod failure');
+  });
 });
 
 describe('goal author grounding failure classifier', () => {

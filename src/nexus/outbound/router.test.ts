@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
 import { openDeliveryDb } from './delivery-ledger.js';
-import { normalizeOutbound, outboundAdapters, registerOutboundAdapter, routeOutbound, type ChannelAdapter, type OutboundMsg } from './router.js';
+import { normalizeOutbound, outboundAdapters, receiveChannelEvent, registerOutboundAdapter, routeOutbound, type ChannelAdapter, type ChannelEnvelope, type OutboundMsg } from './router.js';
+import { toTelegramEvent } from '../api/telegram-trigger-bot.js';
+import { toDiscordEvent } from '../api/discord-trigger-bot.js';
 import type { UserConfig } from '../../user-config.js';
 
 const cfg = (outbound?: unknown) => ({ raw: outbound ? { outbound } : {} }) as UserConfig;
@@ -160,7 +162,7 @@ test('a connector exception containing a credential-bearing webhook URL is not r
   } finally { deliveryDb.close(); }
 });
 
-test('built-in connectors declare receive only for existing bot paths, never for pushcut', () => {
+test('built-in connectors declare receive only for existing bot paths, never for pushcut', async () => {
   expect([...outboundAdapters.keys()]).toEqual(['telegram', 'discord', 'pushcut']);
   const expectedKeys = ['send', 'receive', 'thread', 'topic', 'persona', 'channelLifecycle', 'permissions', 'commands',
     'attachments', 'buttons', 'choices', 'deliveryConfirmation', 'rateLimit'].sort();
@@ -172,6 +174,77 @@ test('built-in connectors declare receive only for existing bot paths, never for
     expect(adapter.capabilities.buttons).toBe(false);
     expect(typeof adapter.receive).toBe(adapter.type === 'pushcut' ? 'undefined' : 'function');
   }
+  await expect(receiveChannelEvent('pushcut', {})).resolves.toBeNull();
+  await expect(receiveChannelEvent('telegram', {
+    body: 'telegram event', kind: 'alert', chat: 'chat-1', user: 'sender-1', messageId: 42,
+  })).resolves.toEqual({ text: 'telegram event', kind: 'alert', channel: 'chat-1', senderId: 'sender-1', messageId: 42 });
+  await expect(receiveChannelEvent('discord', {
+    body: 'discord event', kind: 'report', channel: 'channel-2', user: 'sender-2', messageId: 'message-2', extra: 'discarded',
+  })).resolves.toEqual({ text: 'discord event', kind: 'report', channel: 'channel-2', senderId: 'sender-2', messageId: 'message-2' });
+  await expect(receiveChannelEvent('telegram', { body: 'missing kind', chat: 'chat-1' })).resolves.toBeNull();
+});
+
+test('receiveChannelEvent validates and strips connector-specific envelope fields', async () => {
+  const adapter: ChannelAdapter = {
+    ...outboundAdapters.get('telegram')!,
+    type: 'receive-test',
+    parseConfig: raw => raw.type === 'receive-test' ? { type: 'receive-test' } : undefined,
+    receive: async payload => payload === 'invalid'
+      ? { text: 'invalid', kind: '' } as ChannelEnvelope
+      : {
+        text: 'normalized', kind: 'alert', extra: 'discarded',
+        persona: { name: 'Ada', avatarUrl: 42, extra: 'discarded' },
+        attachments: [{ url: '/file', name: 42, extra: 'discarded' }, { url: 42 }],
+        buttons: [{ label: 'Continue', value: 'continue', extra: 'discarded' }, { label: 42, value: 'invalid' }],
+        choices: [{ label: 'Retry', value: 'retry', extra: 'discarded' }, { label: 'invalid', value: 42 }],
+      } as unknown as ChannelEnvelope,
+  };
+  const dispose = registerOutboundAdapter(adapter);
+  try {
+    await expect(receiveChannelEvent('receive-test', 'valid')).resolves.toEqual({
+      text: 'normalized', kind: 'alert', persona: { name: 'Ada' },
+      attachments: [{ url: '/file' }], buttons: [{ label: 'Continue', value: 'continue' }],
+      choices: [{ label: 'Retry', value: 'retry' }],
+    });
+    await expect(receiveChannelEvent('receive-test', 'invalid')).resolves.toBeNull();
+  } finally { dispose(); }
+});
+
+test('receiveChannelEvent always returns a Promise for built-in adapters', async () => {
+  const result = receiveChannelEvent('telegram', {
+    body: 'async contract', kind: 'alert', chat: 'chat-1', user: 'user-1', messageId: 7,
+  });
+  expect(result).toBeInstanceOf(Promise);
+  await expect(result).resolves.toEqual({ text: 'async contract', kind: 'alert', channel: 'chat-1', senderId: 'user-1', messageId: 7 });
+});
+
+test('CHANNEL-ADAPTER-CORE: Telegram and Discord use the production adapter route with stable results and ledger rows when primary changes', async () => {
+  const { calls, deliveryDb, routerDeps } = deps();
+  try {
+    for (const primary of ['telegram', 'discord'] as const) {
+      calls.length = 0;
+      const outbound = { ...config, primary: { alert: primary }, fallback: { alert: primary === 'telegram' ? 'discord' : 'telegram' } };
+      const result = await routeOutbound(cfg(outbound), msg, routerDeps);
+      expect(result).toEqual({ delivered: true, channels: [{ type: primary, ok: true }], messageId: expect.any(String) });
+      expect(calls).toEqual([primary]);
+      const row = deliveryDb.prepare('SELECT kind, text, channels FROM deliveries ORDER BY rowid DESC LIMIT 1').get() as { kind: string; text: string; channels: string };
+      expect(row).toEqual({ kind: 'alert', text: msg.text, channels: JSON.stringify([{ type: primary, ok: true }]) });
+    }
+  } finally { deliveryDb.close(); }
+});
+
+test('CHANNEL-ADAPTER-CORE: production Telegram and Discord trigger mappers preserve their public event shapes', async () => {
+  const telegramTap = { kind: 'message', chat: 'chat-1', user: 'user-1', body: 'hello', messageId: 12, isDm: true } as const;
+  const discordTap = { kind: 'mention', channel: 'channel-1', user: 'user-2', body: 'hello', messageId: 'message-1', isDm: false } as const;
+
+  expect(toTelegramEvent(telegramTap)).toBeInstanceOf(Promise);
+  expect(await toTelegramEvent(telegramTap)).toEqual({
+    kind: 'message', chat: 'chat-1', user: 'user-1', body: 'hello', raw: telegramTap,
+  });
+  expect(toDiscordEvent(discordTap)).toBeInstanceOf(Promise);
+  expect(await toDiscordEvent(discordTap)).toEqual({
+    kind: 'mention', channel: 'channel-1', user: 'user-2', body: 'hello', raw: discordTap,
+  });
 });
 
 test('a failed primary without a configured fallback returns the original failure', async () => {

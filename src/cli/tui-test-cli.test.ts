@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { elanousInvocation } from '../instance/spawn-elanous.js';
-import { buildHeldTuiArgs, parseReadyHeldPty, pwaBuildDecision } from './tui-test-cli.js';
+import { buildHeldTuiArgs, buildHeldTuiLaunch, parseReadyHeldPty, pwaBuildDecision } from './tui-test-cli.js';
 
 describe('tui test setup', () => {
   test('reuses an export, skips missing PWA by default, and builds only when requested', () => {
@@ -29,14 +29,23 @@ test('held TUI readiness comes from an alive same-universe PTY row with a runId'
 });
 
 test('held TUI uses the isolated Git worktree as its cwd', () => {
-  expect(buildHeldTuiArgs('/repo/bin/elanous.mjs', '/repo/.elanous-test-tui', 120_000, '/repo/worktree')).toEqual([
-    '/repo/bin/elanous.mjs', '--test', 'dev', '--elanous', '--hold', '--json', '--isolated-root', '/repo/.elanous-test-tui', '--ready-timeout-ms', '120000', '--cwd', '/repo/worktree',
+  expect(buildHeldTuiArgs('/repo/bin/elanous.mjs', '/repo/worktree/.elanous-test', 120_000, '/repo/worktree')).toEqual([
+    '/repo/bin/elanous.mjs', '--test', 'dev', '--elanous', '--hold', '--json', '--isolated-root', '/repo/worktree/.elanous-test', '--ready-timeout-ms', '120000', '--cwd', '/repo/worktree',
   ]);
+});
+
+test('held TUI launch uses the same test universe that owns Nexus and the PTY registry', () => {
+  const launch = buildHeldTuiLaunch('/repo/bin/elanous.mjs', '/repo/worktree/.elanous-test', 120_000, '/repo/worktree');
+  expect(launch.stateDir).toBe('/repo/worktree/.elanous-test');
+  expect(launch.args).toContain('--isolated-root');
+  expect(launch.args[launch.args.indexOf('--isolated-root') + 1]).toBe('/repo/worktree/.elanous-test');
+  expect(launch.args).toContain('--ready-timeout-ms');
+  expect(launch.args[launch.args.indexOf('--ready-timeout-ms') + 1]).toBe('120000');
 });
 
 test('spawnElanous prepends the held TUI entry once and stamps its isolated state root', () => {
   const entry = '/repo/bin/elanous.mjs';
-  const stateDir = '/repo/.elanous-test-tui';
+  const stateDir = '/repo/worktree/.elanous-test';
   const heldArgs = buildHeldTuiArgs(entry, stateDir, 120_000, '/repo/worktree');
   const invocation = elanousInvocation(heldArgs.slice(1), { bin: entry, stateDir, env: {} });
   expect(invocation.args).toEqual(heldArgs);

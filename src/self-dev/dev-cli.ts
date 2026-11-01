@@ -930,7 +930,9 @@ export function startDraftTriage(
         const inventory = inventories.find((entry) => entry.repository === repository)?.snapshot;
         const enriched = { ...draft, branch: draft.branch ?? '', ...inventoryByUrl.get(draft.url!) };
         if ((!inventory || !inventoryByUrl.has(draft.url!)) && !IN_TEST_PROCESS()) { unobservedDrafts.push(draft.number); continue; }
-        const decision = decideDraft({ draft: enriched, runStatus: resolvedStatus, mergedTwins: inventory?.merged ?? [], ageHours: (nowMs() - draft.openedAtMs) / 3_600_000, liveBranches });
+        const triageNow = nowMs();
+        const decision = decideDraft({ draft: enriched, now: new Date(triageNow), runStatus: resolvedStatus,
+          mergedTwins: inventory?.merged ?? [], ageHours: (triageNow - draft.openedAtMs) / 3_600_000, liveBranches });
         if (decision.reason.startsWith('superseded-by')) decisions.superseded += 1;
         else if (decision.reason === 'stale-ended-run') decisions.staleEndedRun += 1;
         else if (decision.reason.startsWith('label:')) decisions.humanApproval += 1;   // approval-waiting or human «keep»

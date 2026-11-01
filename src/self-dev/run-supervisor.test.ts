@@ -42,6 +42,76 @@ const falseFailure = (id: string) => ({
 }) as unknown as SupervisorJobResult;
 
 describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
+  test('REVIEW-ROUND-REAUTHOR: 장기 mock 리뷰는 저작 결함을 범위 축소 + FU 처방으로 분리한다', async () => {
+    const results = [
+      {
+        taskId: 'pr-32327', feature: 'reviewed scope', status: 'done', stage: 'pr-opened', prNumber: 32327,
+        rework: { trend: 'stable', signature: 'future-ops-assumption', rounds: 7 },
+        reviewMustFix: ['아직 없는 운영 배선을 반드시 요구한다'],
+        changedFiles: ['src/self-dev/run-supervisor.ts'], targetPaths: ['src/self-dev/run-supervisor.ts'],
+      },
+      {
+        taskId: 'pr-32561', feature: 'reviewed boundary', status: 'done', stage: 'pr-opened', prNumber: 32561,
+        rework: { trend: 'worsening', signature: 'unnecessary-goal', rounds: 7 },
+        reviewMustFix: ['불필요한 목표를 새 수용선으로 요구한다'],
+        changedFiles: ['src/self-dev/run-supervisor.ts'], targetPaths: ['src/self-dev/run-supervisor.ts'],
+      },
+      {
+        taskId: 'pr-32740', feature: 'reviewed implementation', status: 'done', stage: 'pr-opened', prNumber: 32740,
+        rework: { trend: 'oscillating', signature: 'missing-piece', rounds: 7 },
+        reviewMustFix: ['아직 없는 부품을 필수로 요구한다', 'Fix null handling'],
+        changedFiles: ['src/self-dev/run-supervisor.ts'], targetPaths: ['src/self-dev/run-supervisor.ts'],
+      },
+    ] as unknown as SupervisorJobResult[];
+    const decision = decideNextRun({ results, history: [
+      { round: 0, landed: 0, actionable: 1, mustFix: { items: [{ text: '아직 없는 운영 배선을 반드시 요구한다', taskId: 'pr-32327' }] } },
+      { round: 1, landed: 0, actionable: 1 },
+      { round: 2, landed: 0, actionable: 1 },
+    ] });
+
+    expect(decision.reauthor).toMatchObject({
+      round: 7,
+      prescription: {
+        outcome: '부분 착지 + FU',
+        narrowedProposal: expect.stringContaining('아직 없는 운영 배선을 반드시 요구한다'),
+        partialLanding: expect.any(String),
+        followUp: {
+          lane: 'REVIEW-ROUND-REAUTHOR-FU', goalId: 'reauthor-fu-32327', feature: expect.any(String),
+          targetPaths: ['src/self-dev/run-supervisor.ts'], completionBoundary: expect.stringContaining('완료 경계'),
+          mockScenarioId: 'MS-03', mockScenario: { id: 'MS-03', injection: expect.any(String), observation: expect.any(String) },
+        },
+      },
+    });
+    for (const [taskId, text] of [
+      ['pr-32327', '아직 없는 운영 배선을 반드시 요구한다'],
+      ['pr-32561', '불필요한 목표를 새 수용선으로 요구한다'],
+      ['pr-32740', '아직 없는 부품을 필수로 요구한다'],
+    ]) {
+      expect(decision.reauthor!.classifications).toContainEqual({ taskId, text, kind: 'authorship-defect', action: 'scope-reduction-fu' });
+    }
+    expect(decision.reauthor!.classifications).toContainEqual({
+      taskId: 'pr-32740', text: 'Fix null handling', kind: 'code-defect', action: 'must-fix',
+    });
+    const observations: Array<{ event: string; data: Record<string, unknown> }> = [];
+    await superviseRun({
+      initial: results,
+      limits: { maxRounds: 1 },
+      rerun: async (previous) => previous,
+      sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+      taskAgentShadow: false,
+      observe: (event, data) => observations.push({ event, data }),
+    });
+    const reauthorEvent = observations.find(({ event }) => event === 'review.reauthor')?.data;
+    expect(reauthorEvent).toMatchObject({
+      round: 7,
+      prescription: {
+        outcome: '부분 착지 + FU',
+        followUp: { lane: 'REVIEW-ROUND-REAUTHOR-FU', goalId: 'reauthor-fu-32327', mockScenarioId: 'MS-03' },
+      },
+    });
+    expect(reauthorEvent?.classifications).toHaveLength(4);
+  });
+
   test('NEEDS-HUMAN-SELF-HEAL-FIRST: PR 없는 unclassified+실증 조각은 실행기가 있을 때만 한 번 분해한다', () => {
     const result = mysteryWithProposal('unknown-with-pieces');
     const first = decideNextRun({ results: [result], decompositionExecution: true });

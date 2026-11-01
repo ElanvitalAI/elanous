@@ -8,11 +8,39 @@ import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { resumeReleaseRun } from './resume-release.js';
-import { releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
+import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
 import './resume-test-traffic.js';
 
 const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';
+
+test('release resume resolves a failed branch id to its saved fork without moving successful siblings', () => {
+  const state = { path: ['traffic-npm-published', 'release-post-publish-join', 'failed'], fanOuts: {
+    'traffic-npm-published:ok': { from: 'traffic-npm-published', join: 'release-post-publish-join', branches: {
+      'docs-land': { runId: 'docs-child', status: 'failed', startedAt: '2026-11-01T00:00:00Z' },
+      'version-dev-bump': { runId: 'bump-child', status: 'done', startedAt: '2026-11-01T00:00:00Z' },
+    } },
+  } } as unknown as GraphRunState;
+  expect(releaseFanOutForkIndex(state, 'docs-land')).toBe(0);
+  expect(releaseFanOutForkIndex(state, 'version-dev-bump')).toBeUndefined();
+});
+
+test('release branch resume checks approval decisions up to the fork boundary', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-branch-approval-'));
+  try {
+    const statePath = join(root, 'run.json');
+    writeFileSync(`${statePath}.1.decision.json`, JSON.stringify({ nodeId: 'publish', decision: 'approved', decidedAt: 't1' }));
+    const state = { statePath, path: ['publish', 'traffic-npm-published', 'release-post-publish-join', 'failed'], nodes: [
+      { nodeId: 'publish', ok: true, exit: 0, executed: true, decidedAt: 't1' }, { nodeId: 'traffic-npm-published', ok: true, exit: 0, executed: true },
+    ], fanOuts: { 'traffic-npm-published:ok': { from: 'traffic-npm-published', join: 'release-post-publish-join', branches: {
+      'docs-land': { runId: 'docs-child', status: 'failed', startedAt: 't1' },
+      'version-dev-bump': { runId: 'bump-child', status: 'done', startedAt: 't1' },
+    } } } } as unknown as GraphRunState;
+    expect(() => assertReleaseResumeApprovalBoundary(state, 'docs-land')).not.toThrow();
+    state.nodes[1] = { nodeId: 'traffic-npm-published', ok: true, exit: 0, executed: true, decidedAt: 't2' };
+    expect(() => assertReleaseResumeApprovalBoundary(state, 'docs-land')).toThrow(/cannot restart across an approval decision/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('waive the failed tui node on the saved release path; record the original failure and pass accepted regressions to known-issues', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-waiver-'));
@@ -358,9 +386,11 @@ test('restarting before a waived tui (from mac-smoke) drops the waiver record an
     expect(waived.state.status).toBe('failed');
     expect(waived.state.path).toContain('known-issues');
     expect((waived.state.input as { acceptedRegressions: unknown[] }).acceptedRegressions).toHaveLength(2);
-    expect(waived.state.path.indexOf('mac-smoke')).toBeGreaterThanOrEqual(0);
-    expect(waived.state.path.indexOf('mac-smoke')).toBeLessThan(waived.state.path.indexOf('tui'));
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'mac-smoke' }, deps);
+    expect(waived.state.path.indexOf('pre-prepare-join')).toBeGreaterThanOrEqual(0);
+    expect(waived.state.path.indexOf('pre-prepare-join')).toBeLessThan(waived.state.path.indexOf('tui'));
+    expect(Object.values(waived.state.fanOuts ?? {}).some((fanout) => fanout.from === 'traffic-gate-passed'
+      && Object.hasOwn(fanout.branches, 'mac-smoke') && Object.hasOwn(fanout.branches, 'pwa'))).toBe(true);
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'pre-prepare-join' }, deps);
     expect(resumed.state.status).toBe('done');
     expect(tuiVisits).toBe(2);
     expect(seen.filter((ctx) => ctx.nodeId === 'known-issues').at(-1)?.input.acceptedRegressions).toEqual([

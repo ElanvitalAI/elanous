@@ -24,14 +24,32 @@
  *  장수 owner(데몬)는 PTY 를 계속 만든다. 훅만 믿으면 «한 번 새면 영영» 샌다. */
 const MAX_TRACKED_PTYS = 512;
 
-const writes = new Map<string, { count: number; lastAt: number; lastActor: string }>();
+const writes = new Map<string, { count: number; lastAt: number; lastActor: string | null; accessMode?: 'read' | 'write' | 'auto' }>();
+
+export function notePtyAccessMode(ptyId: string, accessMode: 'read' | 'write' | 'auto'): void {
+  const prev = writes.get(ptyId);
+  writes.delete(ptyId);
+  writes.set(ptyId, { count: prev?.count ?? 0, lastAt: prev?.lastAt ?? 0, lastActor: prev?.lastActor ?? null, accessMode });
+  while (writes.size > MAX_TRACKED_PTYS) {
+    const oldest = writes.keys().next();
+    if (oldest.done) break;
+    writes.delete(oldest.value);
+  }
+}
+
+export function ptyWriteControlState(ptyId: string): { accessMode: 'read' | 'write' | 'auto'; lastWriter: 'agent' | 'human' | null } | undefined {
+  const rec = writes.get(ptyId);
+  if (!rec?.accessMode) return undefined;
+  const lastWriter = rec.lastActor === 'agent' || rec.lastActor === 'human' ? rec.lastActor : null;
+  return { accessMode: rec.accessMode, lastWriter };
+}
 
 /** 성공한 쓰기 1건을 기록한다. ⛔ 거부·실패는 세지 않는다(자식이 «본» 것만 세야 수가 뜻을 갖는다). */
 export function noteExternalWrite(ptyId: string, actor: string, now = Date.now()): void {
   const prev = writes.get(ptyId);
   // 재삽입으로 **삽입 순서를 갱신**한다 — 아래 축출이 「가장 오래 안 쓰인 것」을 버리게.
   writes.delete(ptyId);
-  writes.set(ptyId, { count: (prev?.count ?? 0) + 1, lastAt: now, lastActor: actor });
+  writes.set(ptyId, { count: (prev?.count ?? 0) + 1, lastAt: now, lastActor: actor, ...(prev?.accessMode ? { accessMode: prev.accessMode } : {}) });
   while (writes.size > MAX_TRACKED_PTYS) {
     const oldest = writes.keys().next();
     if (oldest.done) break;
@@ -49,7 +67,7 @@ export function noteExternalWrite(ptyId: string, actor: string, now = Date.now()
  */
 export function externalWriteProvenance(ptyId: string, now = Date.now()): { externalWrites: number; externalWriteAgoMs: number; externalWriteActor: string } | undefined {
   const rec = writes.get(ptyId);
-  if (!rec) return undefined;
+  if (!rec || rec.lastActor === null) return undefined;
   return { externalWrites: rec.count, externalWriteAgoMs: Math.max(0, now - rec.lastAt), externalWriteActor: rec.lastActor };
 }
 

@@ -11,6 +11,8 @@ import { acquireLockAsync } from '../../src/storage/file-lock.js';
 
 export type ProgressIssue = {
   id: string; identifier: string; title: string; url: string; description: string; state: string;
+  /** Verified Linear team key; live writes fail closed unless this is DEMO. */
+  teamKey: string;
 };
 export type ProgressLink = { issue: ProgressIssue; cells: ChecklistItem[]; decisions: DecisionEntry[]; sources: Array<{ cellId: string; field: string }> };
 export type ProgressPreview = { identifier: string; body: string; sources: Array<{ cellId: string; field: string }> };
@@ -107,10 +109,10 @@ export function renderProgressPreview(link: ProgressLink, checklist: Checklist, 
   return { identifier: link.issue.identifier, body, sources: link.sources };
 }
 
-async function fetchTeamIssues(apiKey: string, teamKey: string): Promise<ProgressIssue[]> {
+async function fetchTeamIssues(apiKey: string, teamKey: string, fetchFn: typeof fetch = fetch): Promise<ProgressIssue[]> {
   const query = `query LinearProgressIssues($teamKey: String!, $after: String) {
     issues(filter: { team: { key: { eq: $teamKey } } }, first: 100, after: $after) {
-      nodes { id identifier title url description state { name } }
+      nodes { id identifier title url description state { name } team { key } }
       pageInfo { hasNextPage endCursor }
     }
   }`;
@@ -118,7 +120,7 @@ async function fetchTeamIssues(apiKey: string, teamKey: string): Promise<Progres
   const cursors = new Set<string>();
   let after: string | null = null;
   do {
-    const response = await fetch('https://api.linear.app/graphql', {
+    const response = await fetchFn('https://api.linear.app/graphql', {
       method: 'POST', headers: { Authorization: apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables: { teamKey, after } }),
     });
@@ -129,8 +131,10 @@ async function fetchTeamIssues(apiKey: string, teamKey: string): Promise<Progres
     for (const node of page.nodes) {
       if (typeof node.id !== 'string' || typeof node.identifier !== 'string' || typeof node.title !== 'string' || typeof node.url !== 'string') continue;
       const state = node.state && typeof node.state === 'object' ? (node.state as { name?: unknown }).name : undefined;
+      const team = node.team && typeof node.team === 'object' ? (node.team as { key?: unknown }).key : undefined;
       issues.push({ id: node.id, identifier: node.identifier, title: node.title, url: node.url,
-        description: typeof node.description === 'string' ? node.description : '', state: typeof state === 'string' ? state : 'unknown' });
+        description: typeof node.description === 'string' ? node.description : '', state: typeof state === 'string' ? state : 'unknown',
+        teamKey: typeof team === 'string' ? team : '' });
     }
     const info = page.pageInfo;
     if (info?.hasNextPage && (!info.endCursor || cursors.has(info.endCursor))) throw new Error(`Linear ${teamKey} cursor missing or repeated`);
@@ -140,11 +144,11 @@ async function fetchTeamIssues(apiKey: string, teamKey: string): Promise<Progres
   return issues;
 }
 
-async function fetchAllowlistedIssue(apiKey: string, identifier: string): Promise<ProgressIssue | null> {
+async function fetchAllowlistedIssue(apiKey: string, identifier: string, fetchFn: typeof fetch = fetch): Promise<ProgressIssue | null> {
   const query = `query LinearAllowlistedProgressIssue($identifier: String!) {
-    issue(id: $identifier) { id identifier title url description state { name } }
+    issue(id: $identifier) { id identifier title url description state { name } team { key } }
   }`;
-  const response = await fetch('https://api.linear.app/graphql', {
+  const response = await fetchFn('https://api.linear.app/graphql', {
     method: 'POST', headers: { Authorization: apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, variables: { identifier } }),
   });
@@ -154,11 +158,13 @@ async function fetchAllowlistedIssue(apiKey: string, identifier: string): Promis
   if (result.errors?.length) throw new Error(`Linear ${identifier} lookup failed`);
   if (!node || typeof node.id !== 'string' || typeof node.identifier !== 'string' || typeof node.title !== 'string' || typeof node.url !== 'string') return null;
   const state = node.state && typeof node.state === 'object' ? (node.state as { name?: unknown }).name : undefined;
+  const team = node.team && typeof node.team === 'object' ? (node.team as { key?: unknown }).key : undefined;
   return { id: node.id, identifier: node.identifier, title: node.title, url: node.url,
-    description: typeof node.description === 'string' ? node.description : '', state: typeof state === 'string' ? state : 'unknown' };
+    description: typeof node.description === 'string' ? node.description : '', state: typeof state === 'string' ? state : 'unknown',
+    teamKey: typeof team === 'string' ? team : '' };
 }
 
-async function countMarker(apiKey: string, issueId: string, marker: string): Promise<number> {
+async function countMarker(apiKey: string, issueId: string, marker: string, fetchFn: typeof fetch = fetch): Promise<number> {
   const query = `query LinearProgressComments($id: String!, $after: String) {
     issue(id: $id) { comments(first: 100, after: $after) { nodes { body } pageInfo { hasNextPage endCursor } } }
   }`;
@@ -166,7 +172,7 @@ async function countMarker(apiKey: string, issueId: string, marker: string): Pro
   let after: string | null = null;
   let count = 0;
   do {
-    const response = await fetch('https://api.linear.app/graphql', {
+    const response = await fetchFn('https://api.linear.app/graphql', {
       method: 'POST', headers: { Authorization: apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables: { id: issueId, after } }),
     });
@@ -184,10 +190,11 @@ async function countMarker(apiKey: string, issueId: string, marker: string): Pro
 }
 
 export async function runLinearProgressSync(options: {
-  version: string; now?: Date; root?: string; apply?: boolean;
+  version: string; now?: Date; root?: string; runId?: string; apply?: boolean;
   allowIssueIdentifiers?: readonly string[];
   checklist?: Checklist; issues?: readonly ProgressIssue[]; decisions?: readonly DecisionEntry[];
   getApiKey?: (id: string) => Promise<string | undefined>;
+  fetch?: typeof fetch;
   countMarker?: (issue: ProgressIssue, marker: string) => Promise<number>;
   postComment?: (issue: ProgressIssue, body: string) => Promise<void>;
   log?: (event: string, data: Record<string, unknown>) => void;
@@ -199,6 +206,7 @@ export async function runLinearProgressSync(options: {
   const decisions = options.decisions ?? new DecisionLedger({ stateDir: root }).list({ status: 'all' });
   const apiKey = (options.getApiKey ?? getSecretAsync)('connector.linear.apiKey');
   const resolvedKey = await apiKey;
+  const fetchFn = options.fetch ?? fetch;
   if (!resolvedKey) throw new Error('connector.linear.apiKey missing');
   const allowedIdentifiers = [...new Set(options.allowIssueIdentifiers ?? [])];
   const lookupFailures: Array<{ identifier: string; reason: string }> = [];
@@ -207,7 +215,7 @@ export async function runLinearProgressSync(options: {
   else if (options.apply) {
     const lookups = await Promise.all(allowedIdentifiers.map(async identifier => {
       try {
-        const issue = await fetchAllowlistedIssue(resolvedKey, identifier);
+        const issue = await fetchAllowlistedIssue(resolvedKey, identifier, fetchFn);
         if (!issue) lookupFailures.push({ identifier, reason: 'allowlisted issue not found' });
         return issue;
       } catch (error) {
@@ -216,7 +224,7 @@ export async function runLinearProgressSync(options: {
       }
     }));
     issues = lookups.filter((issue): issue is ProgressIssue => issue !== null);
-  } else issues = (await Promise.all(['ELA', 'DEMO'].map(key => fetchTeamIssues(resolvedKey, key)))).flat();
+  } else issues = await fetchTeamIssues(resolvedKey, 'DEMO', fetchFn);
   const links = resolveExplicitProgressLinks(issues, checklist, decisions);
   const previews = links.map(link => renderProgressPreview(link, checklist, day));
   const linkedIdentifiers = new Set(links.map(link => link.issue.identifier));
@@ -229,16 +237,21 @@ export async function runLinearProgressSync(options: {
   const unresolvedApproved = [...lookupFailures, ...missingApproved, ...unlinkedApproved];
   const result: ProgressSyncResult = { day, candidates: previews, posted: [], alreadyPresent: [], skipped: [], failures: unresolvedApproved };
   const log = (event: string, data: Record<string, unknown>) => {
-    const enriched = { day, ...data };
+    const enriched = { day, ...data, ...(options.runId ? { runId: options.runId } : {}) };
     if (options.log) options.log(event, enriched);
     else debug.log('loop.rhythm-daily.linear-progress', event, enriched);
   };
-  const check = options.countMarker ?? ((issue: ProgressIssue, marker: string) => countMarker(resolvedKey, issue.id, marker));
+  const check = options.countMarker ?? ((issue: ProgressIssue, marker: string) => countMarker(resolvedKey, issue.id, marker, fetchFn));
   const post = options.postComment ?? ((issue: ProgressIssue, body: string) => commentLinearIssue({ apiKey: resolvedKey, issueId: issue.id, body }));
   for (const failure of unresolvedApproved) log('approved-issue-unresolved', failure);
   for (const preview of previews) {
     const issue = links.find(link => link.issue.identifier === preview.identifier)!.issue;
     const marker = `<!-- elanous-linear-progress:${day}:${issue.identifier} -->`;
+    if (issue.teamKey !== 'DEMO') {
+      result.skipped.push(issue.identifier);
+      log('not-demo-team', { identifier: issue.identifier, teamKey: issue.teamKey || 'unknown', sources: preview.sources });
+      continue;
+    }
     let release: (() => void) | undefined;
     let stillHeld: (() => boolean) | undefined;
     try {

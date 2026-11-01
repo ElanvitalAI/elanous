@@ -32,7 +32,7 @@ import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir
 const config = (substrate?: 'local' | 'pod', podPool?: string): Pick<UserConfig, 'harness' | 'pod'> => ({ harness: { substrate, podPool } });
 
 describe('LAUNCH-POLICY-UNIV judgment line (injected config readers)', () => {
-  const ops = { llm: { codexQuotaPolicy: 'credits', codexAccountRotationThresholdPercentByAccount: { default: 97 }, fallbackChain: ['codex-rotate'] },
+  const ops = { llm: { provider: 'openrouter', codexQuotaPolicy: 'credits', codexAccountRotationThresholdPercentByAccount: { default: 97 }, fallbackChain: ['codex-rotate'] },
     harness: { podPool: 'pool-node-b@node-b:8' } } as unknown as UserConfig;
   test('test universe without policy → plan uses the ops policy, exactly one warning', () => {
     const warnings: string[] = [];
@@ -43,6 +43,7 @@ describe('LAUNCH-POLICY-UNIV judgment line (injected config readers)', () => {
     expect(selected.llm?.codexQuotaPolicy).toBe('credits');
     expect(selected.llm?.codexAccountRotationThresholdPercentByAccount).toEqual({ default: 97 });
     expect(selected.llm?.fallbackChain).toEqual(['codex-rotate']);
+    expect(selected.llm?.provider).toBe('openrouter');
     expect(selected.harness?.podPool).toBe('pool-node-b@node-b:8');
     expect(warnings).toHaveLength(1);
   });
@@ -70,7 +71,7 @@ test('missing derived launch policy uses operational quota, per-account caps, fa
   const operationalRoot = join(root, 'operational');
   const derivedRoot = join(root, 'derived');
   mkdirSync(operationalRoot);
-  const policy = { llm: { codexQuotaPolicy: 'credits', codexAccountRotationThresholdPercentByAccount: { team: 97 }, fallbackChain: ['codex-rotate'] }, harness: { podPool: 'pool-node-b@node-b:8' } };
+  const policy = { llm: { provider: 'openrouter', codexQuotaPolicy: 'credits', codexAccountRotationThresholdPercentByAccount: { team: 97 }, fallbackChain: ['codex-rotate'] }, harness: { podPool: 'pool-node-b@node-b:8' } };
   writeFileSync(join(operationalRoot, 'config.json'), JSON.stringify(policy));
   const warnings: string[] = [];
   try {
@@ -78,6 +79,7 @@ test('missing derived launch policy uses operational quota, per-account caps, fa
     expect(selected.llm?.codexQuotaPolicy).toBe('credits');
     expect(selected.llm?.codexAccountRotationThresholdPercentByAccount).toEqual({ team: 97 });
     expect(selected.llm?.fallbackChain).toEqual(['codex-rotate']);
+    expect(selected.llm?.provider).toBe('openrouter');
     expect(selected.harness?.podPool).toBe('pool-node-b@node-b:8');
     expect(resolvePodPoolSpec(undefined, {}, () => selected.harness?.podPool ?? selected.pod?.pool)).toBe('pool-node-b@node-b:8');
     const quota = resolveCodexQuotaPolicy(selected.llm).policy;

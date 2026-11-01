@@ -110,9 +110,35 @@ export interface ChannelAdapter {
   parseConfig?: (raw: Record<string, unknown>) => OutboundChannelConfig | undefined;
 }
 
-/** Existing bot receive paths can normalize an accepted event through the same
- * adapter contract before dispatching to their unchanged workflow/chat handlers. */
-export function receiveChannelEvent(type: string, payload: unknown): ChannelEnvelope | null | Promise<ChannelEnvelope | null> {
+/** Project adapter output onto the public envelope contract. Unknown keys and malformed optional fields are omitted; missing/non-string text or missing/empty/non-string kind rejects the event. Keep platform-specific data in the caller's raw tap instead. */
+function normalizeChannelEnvelope(envelope: ChannelEnvelope | null): ChannelEnvelope | null {
+  if (!envelope || typeof envelope !== 'object' || typeof envelope.text !== 'string'
+    || typeof envelope.kind !== 'string' || !envelope.kind) return null;
+  return {
+    text: envelope.text,
+    kind: envelope.kind,
+    ...(typeof envelope.channel === 'string' ? { channel: envelope.channel } : {}),
+    ...(typeof envelope.senderId === 'string' ? { senderId: envelope.senderId } : {}),
+    ...(typeof envelope.messageId === 'string' || typeof envelope.messageId === 'number' ? { messageId: envelope.messageId } : {}),
+    ...(typeof envelope.threadId === 'string' ? { threadId: envelope.threadId } : {}),
+    ...(typeof envelope.topicId === 'string' ? { topicId: envelope.topicId } : {}),
+    ...(envelope.persona && typeof envelope.persona.name === 'string'
+      ? { persona: { name: envelope.persona.name, ...(typeof envelope.persona.avatarUrl === 'string' ? { avatarUrl: envelope.persona.avatarUrl } : {}) } }
+      : {}),
+    ...(Array.isArray(envelope.attachments) ? { attachments: envelope.attachments
+      .filter(item => item && typeof item.url === 'string')
+      .map(item => ({ url: item.url, ...(typeof item.name === 'string' ? { name: item.name } : {}) })) } : {}),
+    ...(Array.isArray(envelope.buttons) ? { buttons: envelope.buttons
+      .filter(item => item && typeof item.label === 'string' && typeof item.value === 'string')
+      .map(item => ({ label: item.label, value: item.value })) } : {}),
+    ...(Array.isArray(envelope.choices) ? { choices: envelope.choices
+      .filter(item => item && typeof item.label === 'string' && typeof item.value === 'string')
+      .map(item => ({ label: item.label, value: item.value })) } : {}),
+  };
+}
+
+/** Existing bot receive paths normalize accepted events before their unchanged handlers. */
+export async function receiveChannelEvent(type: string, payload: unknown): Promise<ChannelEnvelope | null> {
   const adapter = outboundAdapters.get(type) ?? installedAdapters.get(type);
   if (!adapter?.capabilities.receive || !adapter.receive) return null;
   const recordOutcome = (outcome: 'accepted' | 'rejected' | 'error'): void => {
@@ -126,19 +152,13 @@ export function receiveChannelEvent(type: string, payload: unknown): ChannelEnve
     } catch { /* observation must not change channel receive behavior */ }
   };
   const recordResult = (envelope: ChannelEnvelope | null): ChannelEnvelope | null => {
-    recordOutcome(envelope ? 'accepted' : 'rejected');
-    return envelope;
+    const normalized = normalizeChannelEnvelope(envelope);
+    recordOutcome(normalized ? 'accepted' : 'rejected');
+    return normalized;
   };
 
   try {
-    const result = adapter.receive(payload);
-    if (result && typeof (result as Promise<ChannelEnvelope | null>).then === 'function') {
-      return Promise.resolve(result).then(recordResult, error => {
-        recordOutcome('error');
-        throw error;
-      });
-    }
-    return recordResult(result as ChannelEnvelope | null);
+    return recordResult(await adapter.receive(payload));
   } catch (error) {
     recordOutcome('error');
     throw error;

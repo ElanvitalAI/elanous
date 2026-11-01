@@ -103,6 +103,12 @@ describe('AUTHOR-REVIEWER-PRECHECK-WIRE', () => {
         reviewerPrecheckEnabled: true,
         reviewerPrecheck: async (document) => {
           calls += 1;
+          if (document.includes(`- [requested] ${askExcerpt}`)) {
+            return {
+              suggestions: [], fixes: [], remainingNeedsHuman: [], revisedDocument: document,
+              appliedFixes: [], unappliedItems: [],
+            };
+          }
           return {
             suggestions: ['tighten boundary'], fixes: ['판정선: 결과에 관측 가능한 증거가 있다.'],
             fixEvidence: [{ fix: '판정선: 결과에 관측 가능한 증거가 있다.', originalText: '- [requested] Verify the decision signal and the verbatim ask.', revisedText: '- [requested] Verify the decision signal and the verbatim ask.\n- [requested] 판정선: 결과에 관측 가능한 증거가 있다.' }],
@@ -112,7 +118,7 @@ describe('AUTHOR-REVIEWER-PRECHECK-WIRE', () => {
           };
         },
       }, { now: () => new Date('2026-10-29T00:01:00Z') });
-      expect(calls).toBe(1);
+      expect(calls).toBe(2);
       expect(on.authored.reviewerPrecheck?.appliedFixes).toEqual(['판정선: 결과에 관측 가능한 증거가 있다.']);
       expect(on.authored.document.split(`\n- [requested] ${askExcerpt}`).length - 1).toBe(1);
       expect((await Bun.file(on.path).text()).split(`\n- [requested] ${askExcerpt}`).length - 1).toBe(1);
@@ -268,6 +274,10 @@ describe('AUTHOR-REVIEWER-PRECHECK-WIRE', () => {
         ...deps,
         reviewerPrecheck: async (document) => {
           reviewerCalls.push(document);
+          const appliedMarker = '- [requested] 판정선: 기록 문서에 Wiring evidence marker가 있다.';
+          if (document.includes(appliedMarker)) {
+            return { suggestions: [], fixes: [], remainingNeedsHuman: [], revisedDocument: document, appliedFixes: [], unappliedItems: [] };
+          }
           const originalText = '- [requested] Verify the decision signal and the verbatim ask.';
           const revisedText = `${originalText}\n- [requested] 판정선: 기록 문서에 Wiring evidence marker가 있다.`;
           const revisedDocument = document.replace(originalText, revisedText);
@@ -292,7 +302,7 @@ describe('AUTHOR-REVIEWER-PRECHECK-WIRE', () => {
         const before = writes.length;
         const callsBefore = reviewerCalls.length;
         await runEntry(`${name}-${state}`);
-        expect(reviewerCalls.length).toBe(callsBefore + (enabled ? 1 : 0));
+        expect(reviewerCalls.length).toBe(callsBefore + (enabled ? 2 : 0));
         const authored = writes[before]?.authored;
         const disk = await Bun.file(writes[before]!.path).text();
         expect(authored?.reviewerPrecheck?.appliedFixes ?? []).toEqual(enabled ? ['판정선: 기록 문서에 Wiring evidence marker가 있다.'] : []);
