@@ -5170,6 +5170,118 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.46
+
+Source: https://docs.elanous.ai/releases/0-2-46/
+
+## 변경 (61)
+
+- docs(release): curate 0.2.45 release notes
+- fix(dispatch): 원격 역압 신호를 못 읽어도 발사 예산을 1로 깎지 않는다
+- fix: keep compact summaries out of cache instructions
+- fix: persist gate warm reuse evidence
+- fix(ux-sim): propagate state dir provenance to workers
+- fix(gate-0245): account for resources route
+- gate-0245: refresh graph engine map citations
+- gate-0245: isolate gate regression tests from live host state
+- gate-0245: reset previous test exit code
+- warm-0246: add two-slot standard caps for gcp1 aws1 aws2
+- HARD-RUNNER-REMOTE-HOST: route hard rehearsal to requested Pod host
+- 0.2.46: RELEASE-GATE-POD-RADIUS-REUSE shard receipts
+- feat(sidetab): 명시 등록한 원격 eln TUI 를 사이드탭에 · 전체 현황은 별도 조회
+- fix: persist request compaction across Codex tool rounds
+- gate-0245: stabilize flaky mock test environments
+- fix: persist live ACP compaction in session history
+- test: control research deadline without wall clock
+- perf: make launch request summary linear
+- test: exercise fake LLM provider boundary
+- feat: expose guardian resource snapshot in Nexus
+- fix(release): isolate stage mail in graph state root
+- fix: avoid false positives in tool guards
+- fix(orchestrator): keep heartbeat timestamps monotonic
+- RESEARCH-ANSWER-SOURCE-TRACE: preserve claim provenance in final answers
+- test: verify isolated intake briefing receipt without test flag
+- release: allow exact measured regression gate waivers
+- fix: scope review loop breaker to exact head
+- feat(tasks): aggregate repair tier model window
+- test: speed up agent mission handoff coverage
+- fix: resolve hand placeholders in trio missions
+- test(ux-sim): cover materialized heal reauthor flow
+- feat(release): validate cited version facts for public copy
+- docs(release): publish 0.2.45 notes
+- docs: note headless Codex login wait
+- Add host-scoped grid SSH broker
+- A3: recover browser demo from unavailable Aside sessions
+- test(ux-sim): simulate safe public copy publishing
+- RESOURCE-LEDGER-NEXUS-VIEW: show recent lease reclaims
+- fix(tui): persist compacted session history once
+- fix: normalize empty sidetab mission options
+- test: move full resource scan to integration lane
+- test: move nightly assignment workers out of the gate
+- fix(sidetab): handle Grok worktree trust prompt
+- test(steward): compare entrance decisions with graph shadow
+- feat(ux-sim): add Telegram video receipt device
+- CLI-LAZY-LOAD: defer heavy release, tasks, and PR paths
+- test: advance hold deadlines with fake clock
+- A1: preserve CLI universe in intake collectors
+-  test: restore control inbox mock after dashboard tests
+- feat: unify first setup consent
+- feat(ux-sim): add checkout acceleration matrix device
+- fix(task-agent): hold new hand launches over seat draft cap
+- feat: default launch door to enforce
+- fix(grid): isolate SSH control sockets and idle budgets
+- fix(plugins): record redacted wizard generation receipt
+- gate-0245: carry same-run formal gate receipts by diff radius
+- fix: isolate review finding fold semantics
+- ENTRANCE-WORKORDER-REPLAY-HASH: revision-scoped content fingerprint
+- feat(ux-sim): freeze seminar after three passes
+- version: 0.2.46-dev.0
+- release: 0.2.46 (1b7269470ac5)
+
+## 시험 (26)
+
+- gate-0245: fix agent-wake close assertion boundary
+- gate-0245: test(self-implement): align missing source config expectation
+- gate-0245: fix config fixture and exitCode restoration
+- gate-0245: restore cwd after graph notification test
+- test: pin condense retirement window
+- gate-0245: redact host identifiers in fixtures
+- gate-0245: isolate pod test fixtures
+- gate-0245: isolate pod pool CLI test environment
+- gate-0246: speed up nightly condense replay tests
+- test: isolate debug ring observations in release tests
+- test(ux-sim): cover grid S4 SSH saturation
+- gate-0245: avoid unread child output pipes
+- test: use fake devices for pod review budget acceptance
+- gate-0245: record pod-pool linux pod env failure
+- test: share dashboard boot timing child
+- gate-0247: isolate pod-pool cli test from host identity
+- test: fake dashboard ACP boot session
+- test: give nightly snapshot rollback case a load budget
+- test: run plugin CLI contracts in process
+- test: run graph approval CLI in process
+- test(release): use real timeout handles in stage mail tests
+- test: keep dev CLI rejection cases in process
+- Goal 47: mock heavy launch preflight IO
+- test: isolate gatePodPool config policy check
+- test: speed up control CLI suite
+- test(tui): cover selected sidetab preview switching
+
+## 문서 (5)
+
+- docs(marketing): align DEMO1104 research and highlight plans
+- docs: clarify personal output backup boundaries
+- [MK] docs(brand): 웹 테마 = Deepsea Blu 계열 · 0.2.45 정식 출시 — 브랜드 정본 이력
+- docs: 홈페이지 정체성 3층 결정 + CONDUCTOR 우산 연결
+- docs(readme): 공개 베타·10월 28일 문구를 정식 출시로 · Codex·Claude Code 지휘 문장
+
+
+## Known Issues
+
+Gate run 2cbfb687 reported 101 test regressions classified as test harness issues (launch door enforce default not reflected in fixtures, in-process exit code leak, new real SSH test); product paths unaffected; fixes tracked for 0.3.1.
+
+---
+
 # 0.2.45
 
 Source: https://docs.elanous.ai/releases/0-2-45/
