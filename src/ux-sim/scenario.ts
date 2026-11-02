@@ -10,12 +10,15 @@ import { LogStore, StoreSink, type LogStoreRow } from '../mss/logging/log-store.
 import { getTestStateRoot } from '../nexus/paths.js';
 import { simRenderLogFrame } from './render-frame.js';
 import { assessDraftInventory, buildDraftInventory } from './draft-inventory-builder.js';
+import { reviewerPrecheckFixtureDocument, runAuthorReviewerPrecheckDevice, type AuthorReviewerPrecheckDeviceResult, type AuthorReviewerPrecheckVariant } from './author-reviewer-precheck-device.js';
+import { runGraphRuntimeOverlayEventPathDevice, type GraphRuntimeOverlayEventPathResult } from './graph-runtime-overlay-event-path.js';
 
 export type ScenarioTrigger = {
   id: string;
-  type: 'codex.responses.fetch' | 'codex.responses.fetch-network-error' | 'ux.draft-inventory.evaluate';
+  type: 'codex.responses.fetch' | 'codex.responses.fetch-network-error' | 'ux.draft-inventory.evaluate' | 'ux.author-reviewer-precheck.evaluate' | 'ux.graph-runtime-overlay.evaluate';
   status?: number;
   count?: number;
+  variant?: AuthorReviewerPrecheckVariant;
 };
 
 export interface ScenarioV0 {
@@ -41,6 +44,24 @@ export interface ScenarioResult {
   screen: { pass: boolean; containsMissing: string[]; excludesFound: string[]; snapshot: string };
   logs: { pass: boolean; category: string; event: string; level: string | null; expectedLevel: string; levelMismatch: boolean; expectedCount: number; observedCount: number; matchedData: Record<string, unknown>; evidenceLine: string; dataMismatch: string[] };
   failureReasons: string[];
+  authorReviewerPrecheck?: AuthorReviewerPrecheckDeviceResult;
+  graphRuntimeOverlay?: GraphRuntimeOverlayEventPathResult;
+}
+
+/** Test-only fault injection for proving ScenarioV0 rejects corrupted device output and events. */
+export interface ScenarioV0TestOverrides {
+  runAuthorReviewerPrecheckDevice?: typeof runAuthorReviewerPrecheckDevice;
+  transformAuthorReviewerPrecheckEventData?: (data: Record<string, unknown>) => Record<string, unknown>;
+}
+
+type AuthorPrecheckCliFault = 'corrupt-revised-document' | 'missing-author-run-id' | 'wrong-author-run-id';
+
+function authorPrecheckCliFault(): AuthorPrecheckCliFault | null {
+  if (!getTestStateRoot()) return null;
+  const fault = process.env.ELANOUS_UX_SIM_TEST_FAULT;
+  return fault === 'corrupt-revised-document' || fault === 'missing-author-run-id' || fault === 'wrong-author-run-id'
+    ? fault
+    : null;
 }
 
 let previousScenarioTurn: Promise<void> = Promise.resolve();
@@ -88,13 +109,17 @@ export function parseScenarioV0(source: string): ScenarioV0 {
 
   if (!Array.isArray(value.triggers) || value.triggers.length !== 1) throw new Error('scenario.triggers must contain exactly one registered trigger');
   const trigger = record(value.triggers[0], 'scenario.triggers[0]');
-  exactKeys(trigger, ['id', 'type', 'status', 'count'], 'scenario.triggers[0]');
+  exactKeys(trigger, ['id', 'type', 'status', 'count', 'variant'], 'scenario.triggers[0]');
   const triggerId = requiredString(trigger.id, 'scenario.triggers[0].id');
-  if (trigger.type !== 'codex.responses.fetch' && trigger.type !== 'codex.responses.fetch-network-error' && trigger.type !== 'ux.draft-inventory.evaluate') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
+  if (trigger.type !== 'codex.responses.fetch' && trigger.type !== 'codex.responses.fetch-network-error' && trigger.type !== 'ux.draft-inventory.evaluate' && trigger.type !== 'ux.author-reviewer-precheck.evaluate' && trigger.type !== 'ux.graph-runtime-overlay.evaluate') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
   if (trigger.type === 'codex.responses.fetch' && (!Number.isInteger(trigger.status) || (trigger.status as number) < 400 || (trigger.status as number) > 499)) throw new Error('codex.responses.fetch.status must be an HTTP 4xx status');
   if ((trigger.type === 'codex.responses.fetch-network-error' || trigger.type === 'ux.draft-inventory.evaluate') && trigger.status !== undefined) throw new Error(`${trigger.type} does not accept status`);
   if (trigger.count !== undefined && (!Number.isInteger(trigger.count) || (trigger.count as number) < 1)) throw new Error('codex.responses.fetch.count must be a positive integer');
   if (trigger.type === 'ux.draft-inventory.evaluate' && trigger.count !== 200) throw new Error('ux.draft-inventory.evaluate.count must be 200');
+  if (trigger.type === 'ux.author-reviewer-precheck.evaluate' && trigger.variant !== 'applied' && trigger.variant !== 'rejected-unprovable') throw new Error('ux.author-reviewer-precheck.evaluate.variant must be applied or rejected-unprovable');
+  if (trigger.type !== 'ux.author-reviewer-precheck.evaluate' && trigger.variant !== undefined) throw new Error(`${String(trigger.type)} does not accept variant`);
+  if (trigger.type === 'ux.author-reviewer-precheck.evaluate' && (trigger.status !== undefined || trigger.count !== undefined)) throw new Error('ux.author-reviewer-precheck.evaluate does not accept status or count');
+  if (trigger.type === 'ux.graph-runtime-overlay.evaluate' && (trigger.status !== undefined || trigger.count !== undefined || trigger.variant !== undefined)) throw new Error('ux.graph-runtime-overlay.evaluate does not accept status, count, or variant');
 
   const expect = record(value.expect, 'scenario.expect');
   exactKeys(expect, ['screen', 'logs'], 'scenario.expect');
@@ -134,7 +159,7 @@ export function parseScenarioV0(source: string): ScenarioV0 {
     id,
     isolation: 'test',
     seed: value.seed as number,
-    triggers: [{ id: triggerId, type: trigger.type as ScenarioTrigger['type'], ...(trigger.status !== undefined ? { status: trigger.status as number } : {}), ...(trigger.count !== undefined ? { count: trigger.count as number } : {}) }],
+    triggers: [{ id: triggerId, type: trigger.type as ScenarioTrigger['type'], ...(trigger.status !== undefined ? { status: trigger.status as number } : {}), ...(trigger.count !== undefined ? { count: trigger.count as number } : {}), ...(trigger.variant !== undefined ? { variant: trigger.variant as AuthorReviewerPrecheckVariant } : {}) }],
     expect: {
       screen: {
         mode: 'widget',
@@ -177,6 +202,30 @@ function projectSubset(actual: unknown, expected: Record<string, unknown>): Reco
   return selected;
 }
 
+function resolveRunIdExpectation(value: unknown, runId: string): unknown {
+  if (value === '$runId') return runId;
+  if (Array.isArray(value)) return value.map((entry) => resolveRunIdExpectation(entry, runId));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, resolveRunIdExpectation(entry, runId)]));
+  }
+  return value;
+}
+
+function authorReviewerPrecheckMatches(result: AuthorReviewerPrecheckDeviceResult, variant: AuthorReviewerPrecheckVariant): boolean {
+  const exactSentence = 'The result has a measurable criterion and an observable source.';
+  const unsupportedSentence = 'Add an unsupported requirement absent from the original ask.';
+  const acceptance = '- The result has a measurable criterion.';
+  const applied = variant === 'applied';
+  const expectedDocument = applied
+    ? result.originalDocument.replace(acceptance, `${acceptance}\n- ${exactSentence}`)
+    : result.originalDocument;
+  return result.originalDocument === reviewerPrecheckFixtureDocument()
+    && result.status === (applied ? 'completed' : 'rejected-soft')
+    && result.revisedDocument === expectedDocument
+    && JSON.stringify(result.appliedFixes) === JSON.stringify(applied ? [exactSentence] : [])
+    && JSON.stringify(result.unappliedItems) === JSON.stringify(applied ? [] : [unsupportedSentence]);
+}
+
 function rowData(row: LogStoreRow): unknown {
   return row.data;
 }
@@ -212,7 +261,7 @@ export function resolveScenarioFilePath(filePath: string, repositoryRoot = REPOS
 }
 
 /** Execute the one registered scenario trigger. Only the provider network boundary is faked. */
-export async function runScenarioV0(scenario: ScenarioV0): Promise<ScenarioResult> {
+export async function runScenarioV0(scenario: ScenarioV0, testOverrides: ScenarioV0TestOverrides = {}): Promise<ScenarioResult> {
   if (!getTestStateRoot()) throw new Error('scenario runner requires --test isolated mode');
   scenario = parseScenarioV0(JSON.stringify(scenario));
   const turn = previousScenarioTurn;
@@ -220,13 +269,13 @@ export async function runScenarioV0(scenario: ScenarioV0): Promise<ScenarioResul
   previousScenarioTurn = new Promise<void>((resolveTurn) => { release = resolveTurn; });
   await turn;
   try {
-    return await runScenarioV0Exclusive(scenario);
+    return await runScenarioV0Exclusive(scenario, testOverrides);
   } finally {
     release();
   }
 }
 
-async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioResult> {
+async function runScenarioV0Exclusive(scenario: ScenarioV0, testOverrides: ScenarioV0TestOverrides): Promise<ScenarioResult> {
   const stateRoot = getTestStateRoot()!;
   assertNoSymlinkComponents(stateRoot);
   mkdirSync(stateRoot, { recursive: true });
@@ -251,7 +300,10 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
   const instance = `ux-sim:${scenario.id}:${runId}`;
   const store = new LogStore(logsPath, { instance });
   const storeSink = new StoreSink(store, instance, { installExitHandlers: false });
-  const expectedLog = scenario.expect.logs[0];
+  const expectedLog = {
+    ...scenario.expect.logs[0],
+    ...(scenario.expect.logs[0].data ? { data: resolveRunIdExpectation(scenario.expect.logs[0].data, runId) as Record<string, unknown> } : {}),
+  };
   const trigger = scenario.triggers[0];
   const sink: LogSink = {
     name: storeSink.name,
@@ -264,15 +316,30 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
           event: rec.event,
           data: { runId, scenarioId: scenario.id, deviceVerdict: data.deviceVerdict },
         });
-      } else if (rec.category === expectedLog?.category && rec.event === expectedLog.event) {
+      } else if (rec.category === expectedLog?.category && rec.event === expectedLog.event
+        && (trigger.type !== 'ux.graph-runtime-overlay.evaluate'
+          || (rec.data && typeof rec.data === 'object' && (rec.data as Record<string, unknown>).stage === 'runtime'))) {
         storeSink.emit({
           ts: rec.ts,
           category: rec.category,
           event: rec.event,
           level: rec.level,
           ...(expectedLog.data ? {
-            data: trigger.type === 'ux.draft-inventory.evaluate'
-              ? { runId, ...projectSubset(rec.data, expectedLog.data) }
+            data: trigger.type === 'ux.author-reviewer-precheck.evaluate'
+              ? projectSubset((() => {
+                const raw = rec.data && typeof rec.data === 'object' ? rec.data as Record<string, unknown> : {};
+                const transformed = testOverrides.transformAuthorReviewerPrecheckEventData?.(raw) ?? raw;
+                switch (authorPrecheckCliFault()) {
+                  case 'missing-author-run-id': {
+                    const { authorRunId: _omitted, ...withoutAuthorRunId } = transformed;
+                    return withoutAuthorRunId;
+                  }
+                  case 'wrong-author-run-id': return { ...transformed, authorRunId: 'wrong-run-id' };
+                  default: return transformed;
+                }
+              })(), expectedLog.data)
+              : trigger.type === 'ux.draft-inventory.evaluate'
+                ? { runId, ...projectSubset(rec.data, expectedLog.data) }
               : projectSubset(rec.data, expectedLog.data),
           } : {}),
         });
@@ -285,6 +352,8 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
   let fetchCount = 0;
   let triggerObserved = false;
   let screenLines: string[] = [];
+  let authorReviewerPrecheck: AuthorReviewerPrecheckDeviceResult | undefined;
+  let graphRuntimeOverlay: GraphRuntimeOverlayEventPathResult | undefined;
   if (trigger.type.startsWith('codex.')) {
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       fetchCount++;
@@ -317,6 +386,29 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
         && Object.values(result.byScenario).every((count) => count === 25)
         && result.mismatches.length === 0
         && result.protectedOrRunningClosed === 0;
+    } else if (trigger.type === 'ux.author-reviewer-precheck.evaluate') {
+      const runDevice = testOverrides.runAuthorReviewerPrecheckDevice ?? runAuthorReviewerPrecheckDevice;
+      const deviceResult = await runDevice(runId, trigger.variant!);
+      const result = authorPrecheckCliFault() === 'corrupt-revised-document'
+        ? { ...deviceResult, revisedDocument: `${deviceResult.revisedDocument}\ncorrupted` }
+        : deviceResult;
+      authorReviewerPrecheck = result;
+      const expectedStatus = trigger.variant === 'applied' ? 'completed' : 'rejected-soft';
+      screenLines = [
+        'Goal author reviewer precheck simulation',
+        `variant=${trigger.variant}`,
+        `status=${result.status}`,
+      ];
+      triggerObserved = result.status === expectedStatus && authorReviewerPrecheckMatches(result, trigger.variant!);
+    } else if (trigger.type === 'ux.graph-runtime-overlay.evaluate') {
+      graphRuntimeOverlay = await runGraphRuntimeOverlayEventPathDevice(stateRoot, runId, scenario.id);
+      screenLines = [
+        'Graph runtime overlay event stream simulation',
+        `status=${graphRuntimeOverlay.status}`,
+        `decisionObserved=${graphRuntimeOverlay.decisionObserved}`,
+        `overlayApplied=${graphRuntimeOverlay.overlayApplied}`,
+      ];
+      triggerObserved = graphRuntimeOverlay.status === 'done' && graphRuntimeOverlay.decisionObserved && graphRuntimeOverlay.overlayApplied;
     } else {
       try {
         for await (const _event of streamCodexResponsesEvents('https://chatgpt.com/backend-api/codex/responses', 'scenario-fake-token', {
@@ -337,7 +429,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
     const excludesFound = (scenario.expect.screen.snapshot.excludes ?? []).filter((fragment) => screenText.includes(fragment));
 
     storeSink.flush();
-    const expected = scenario.expect.logs[0];
+    const expected = expectedLog;
     const rows = store.query({ exactCategories: [expected.category], events: [expected.event], instances: [instance], limit: 1000 });
     const expectedCount = expected.count ?? 1;
     const levelMismatch = rows.some((row) => row.level !== expected.level);
@@ -348,7 +440,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
     const expectedTriggerCount = trigger.type.startsWith('codex.') ? trigger.count ?? 1 : 1;
     const observedTriggerCount = trigger.type.startsWith('codex.') ? fetchCount : triggerObserved ? 1 : 0;
     if (trigger.type.startsWith('codex.') && fetchCount !== expectedTriggerCount) failureReasons.push(`trigger-count-mismatch:expected-${expectedTriggerCount}-observed-${fetchCount}`);
-    if (!triggerObserved) failureReasons.push(trigger.type.startsWith('codex.') ? 'provider-error-not-observed' : 'draft-inventory-evaluation-failed');
+    if (!triggerObserved) failureReasons.push(trigger.type.startsWith('codex.') ? 'provider-error-not-observed' : trigger.type === 'ux.draft-inventory.evaluate' ? 'draft-inventory-evaluation-failed' : trigger.type === 'ux.graph-runtime-overlay.evaluate' ? 'graph-runtime-overlay-result-mismatch' : 'author-reviewer-precheck-result-mismatch');
     if (!screenPass) failureReasons.push('screen-snapshot-mismatch');
     if (rows.length === 0 && expectedCount > 0) failureReasons.push('expected-log-event-absent');
     else if (rows.length !== expectedCount) failureReasons.push(`log-event-count-mismatch:expected-${expectedCount}-observed-${rows.length}`);
@@ -391,8 +483,9 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
         dataMismatch,
       },
       failureReasons,
+      ...(authorReviewerPrecheck ? { authorReviewerPrecheck } : {}),
+      ...(graphRuntimeOverlay ? { graphRuntimeOverlay } : {}),
     };
-    const stateRoot = getTestStateRoot()!;
     const uxSimDir = join(stateRoot, 'ux-sim');
     const evidenceDir = join(uxSimDir, 'evidence');
     assertNoSymlinkComponents(evidenceDir);

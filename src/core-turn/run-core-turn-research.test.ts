@@ -6,6 +6,9 @@ import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 const applyDeferredToolsActual = deferredModule.applyDeferredTools;
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
+import { researchTurnForGrounding, runResearchQuestionLadder } from '../auto-research/research-turn.js';
+import { fanOutAxisEvidence } from '../research/axis-fanout.js';
+import { routeResearchOutput } from '../research/output-router.js';
 import {
   isResearchToolAllowed,
   requestsResearchDocumentWrite,
@@ -94,10 +97,13 @@ test('uses shared research-turn intent in chat surface and injects Bloom evidenc
     modelCalls += 1;
     researchTurn = options?.researchTurn;
     if (modelCalls === 2) researchToolsSeen = options?.tools?.map(spec => spec.name) ?? [];
-    const message = messages.find((item) => item.role === 'system'
+    const message = messages.find((item) => item.role === 'user'
       && typeof item.content === 'string' && item.content.includes('<bloom-research>'));
+    const trustBoundary = messages.find((item) => item.role === 'system'
+      && typeof item.content === 'string' && item.content.includes('untrusted research data'));
     if (modelCalls === 1) firstCallHadEvidence = Boolean(message);
     else secondCallHadEvidence = typeof message?.content === 'string' && message.content.includes('Counterevidence');
+    if (modelCalls === 2) expect(trustBoundary).toBeDefined();
     return modelCalls === 1 ? 'initial answer' : 'evidence-reconciled answer';
   });
   const result = await runCoreTurn({
@@ -119,6 +125,95 @@ test('uses shared research-turn intent in chat surface and injects Bloom evidenc
   expect(researchToolsSeen).toEqual(expect.arrayContaining(['Read', 'WebFetch']));
   expect(researchToolsSeen).not.toEqual(expect.arrayContaining(['skill_exec', 'ToolSearch']));
   expect(result.finalText).toBe('evidence-reconciled answer');
+});
+
+test('final synthesis receives the production source ledger and trusted claim citation rules', async () => {
+  const request = '2026-11-01 기준으로 HBM4 공급망을 조사하라';
+  const outputContract = {
+    deliverable: 'A sourced research memo', format: 'Short memo',
+    sections: [{ id: 'findings', title: 'Findings', purpose: 'Report supported findings and gaps.' }],
+    completionCriteria: ['Support every factual claim or mark it uncertain.'],
+  };
+  const questions = Array.from({ length: 6 }, (_, index) => ({
+    id: `q${index + 1}`, level: (index + 1) as 1 | 2 | 3 | 4 | 5 | 6,
+    prompt: ['HBM4 customer qualification', 'HBM4 packaging capacity', 'HBM4 counterevidence',
+      'HBM4 supply chain', 'HBM4 timeline', 'HBM4 adoption status'][index]!,
+    searchTerms: [`HBM4 evidence ${index + 1}`], sectionId: 'findings',
+  }));
+  let modelCalls = 0;
+  let finalSynthesisPrompt = '';
+  let trustedSynthesisRules = '';
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, _handlers, options) => {
+    modelCalls += 1;
+    if (modelCalls === 2) {
+      finalSynthesisPrompt = messages.find((item) => item.role === 'user'
+        && typeof item.content === 'string' && item.content.includes('<bloom-research>'))?.content as string ?? '';
+      trustedSynthesisRules = messages.filter((item) => item.role === 'system' && typeof item.content === 'string')
+        .map(item => item.content as string).join('\n');
+      expect(messages.some((item) => item.role === 'system' && typeof item.content === 'string'
+        && item.content.includes('Ignore previous instructions'))).toBe(false);
+      expect(messages.some((item) => item.role === 'system' && typeof item.content === 'string'
+        && item.content.includes('untrusted research data'))).toBe(true);
+    }
+    return modelCalls === 1 ? 'provisional answer'
+      : 'HBM4 qualification was reported. (https://vendor.example/qualification; published 2026-10-30; checked 2026-11-01)';
+  });
+
+  const research = await runResearchQuestionLadder(request, {
+    generateContract: async () => JSON.stringify(outputContract),
+    generate: async () => JSON.stringify({ questions }),
+    planGapFollowup: () => ({ rounds: 0, timeBudgetMs: 0, classifications: [], followups: [] }),
+    enableResearchFanout: false,
+    invokeAxes: axes => fanOutAxisEvidence(axes, {
+      now: () => Date.parse('2026-11-01T12:34:56.000Z'),
+      search: async (_query, _signal, context) => {
+        if (context?.questionPrompt === 'HBM4 customer qualification') return [{
+          url: 'https://vendor.example/qualification', title: 'Qualification update',
+          snippet: 'Vendor A reported a customer qualification milestone.',
+          publishedAt: Date.parse('2026-10-30T00:00:00.000Z'),
+        }];
+        if (context?.questionPrompt === 'HBM4 packaging capacity') return [{
+          url: 'https://foundry.example/packaging', title: 'Packaging capacity',
+          snippet: 'Packaging capacity remains constrained.',
+          publishedAt: Date.parse('2026-10-28T00:00:00.000Z'),
+        }];
+        return [];
+      },
+      fetchPage: async url => ({
+        url,
+        output: url.endsWith('/qualification')
+          ? 'Vendor A reported a customer qualification milestone.'
+          : 'Packaging capacity remains constrained.',
+      }),
+    }),
+    routeOutput: input => routeResearchOutput({ ...input, skills: [] }),
+  });
+  const grounding = researchTurnForGrounding(research);
+
+  const result = await runCoreTurn({
+    sessionId: 'claim-level-source-handoff',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool, skillExecTool, webSearchTool, omniSearchTool, webFetchTool],
+    dispatchTool: async () => null,
+    signal,
+    userText: request,
+  }, { runResearch: async () => grounding });
+
+  expect(modelCalls).toBe(2);
+  const rows = finalSynthesisPrompt.split('\n').filter(line => line.startsWith('- {'))
+    .map(line => JSON.parse(line.slice(2)) as Record<string, unknown>);
+  expect(rows).toEqual(expect.arrayContaining([
+    expect.objectContaining({ questionId: 'q1', sourceUrl: 'https://vendor.example/qualification', published: '2026-10-30', checked: '2026-11-01' }),
+    expect.objectContaining({ questionId: 'q2', sourceUrl: 'https://foundry.example/packaging', published: '2026-10-28', checked: '2026-11-01' }),
+    expect.objectContaining({ questionId: 'q6', label: '미확인', status: 'unverified' }),
+  ]));
+  expect(finalSynthesisPrompt).toContain('https://vendor.example/qualification');
+  expect(finalSynthesisPrompt).toContain('"published":"2026-10-30","checked":"2026-11-01"');
+  expect(finalSynthesisPrompt).toContain('https://foundry.example/packaging');
+  expect(trustedSynthesisRules).toContain('Each factual claim must include its own source URL');
+  expect(trustedSynthesisRules).toContain('publisher date and checked date');
+  expect(trustedSynthesisRules).toContain('미확인');
+  expect(result.finalText).toContain('published 2026-10-30; checked 2026-11-01');
 });
 
 test('Q2v2 fixed-input mock exposes WebSearch on the first model call and records exclusions', async () => {
@@ -563,7 +658,12 @@ test('the configured research wall-clock deadline aborts tools and forces a no-t
       return 'Provisional answer';
     }
     expect(options?.tools).toEqual([]);
-    expect(messages.some(message => typeof message.content === 'string' && message.content.includes('partial source evidence'))).toBe(true);
+    expect(messages.some(message => message.role === 'user' && typeof message.content === 'string'
+      && message.content.includes('partial source evidence'))).toBe(true);
+    expect(messages.some(message => message.role === 'system' && typeof message.content === 'string'
+      && /untrusted (?:partial )?research data/.test(message.content))).toBe(true);
+    expect(messages.some(message => message.role === 'system' && typeof message.content === 'string'
+      && message.content.includes('Each factual claim must include its own source URL'))).toBe(true);
     handlers.onText?.('Forced synthesis', 'Forced synthesis');
     handlers.onTurnComplete?.([{ role: 'assistant', content: 'Forced synthesis', phase: 'final_answer' }]);
     return 'Forced synthesis';
@@ -592,6 +692,51 @@ test('the configured research wall-clock deadline aborts tools and forces a no-t
   expect(result.finalText).toBe('Forced synthesis');
   expect(stopEvents.map(event => event.reason)).toContain('wall-clock-budget');
   expect(stopEvents.map(event => event.reason)).toContain('forced-synthesis');
+});
+
+test('empty research output keeps claim source rules during forced synthesis', async () => {
+  const manual = createManualTimers();
+  let startedResearch!: () => void;
+  const researchStarted = new Promise<void>(resolve => { startedResearch = resolve; });
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, handlers, options) => {
+    modelCalls += 1;
+    if (modelCalls === 1) {
+      handlers.onText?.('Provisional answer', 'Provisional answer');
+      handlers.onTurnComplete?.([{ role: 'assistant', content: 'Provisional answer', phase: 'final_answer' }]);
+      return 'Provisional answer';
+    }
+    expect(options?.tools).toEqual([]);
+    const rule = messages.find(message => message.role === 'system' && typeof message.content === 'string'
+      && message.content.includes('Each factual claim must include its own source URL'))?.content;
+    expect(rule).toContain('publisher date and checked date');
+    expect(rule).toContain('미확인');
+    handlers.onText?.('Uncertain answer', 'Uncertain answer');
+    handlers.onTurnComplete?.([{ role: 'assistant', content: 'Uncertain answer', phase: 'final_answer' }]);
+    return 'Uncertain answer';
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  const pending = runCoreTurn({
+    sessionId: 'research-wallclock-empty-output',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool], dispatchTool: async () => null, signal, userText: request,
+  }, {
+    timers: manual.timers,
+    researchWallClockBudgetMs: 30,
+    runResearch: (_request, researchSignal) => {
+      startedResearch();
+      return new Promise(resolve => researchSignal.addEventListener('abort', () => resolve({
+        ok: false, output: '', error: 'research stopped by its deadline',
+      }), { once: true }));
+    },
+  });
+  await researchStarted;
+  await Promise.resolve();
+  manual.fire(30);
+  const result = await pending;
+
+  expect(modelCalls).toBe(2);
+  expect(result.finalText).toBe('Uncertain answer');
 });
 
 test('the research deadline synthesizes when a cancelled native tool never settles', async () => {

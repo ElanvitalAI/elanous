@@ -178,6 +178,23 @@ describe('syncTestConfig — 파일 물질화 + 부속 복사', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('운영 config 가 아직 없는 첫 실행도 빈 안전 config 를 격리 우주에 물질화한다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-cfgsync-empty-'));
+    const src = join(dir, 'empty-home');
+    const testDir = join(dir, 'repo', '.elanous-test');
+    mkdirSync(src, { recursive: true });
+    try {
+      const r = syncTestConfig(testDir, src);
+      const saved = JSON.parse(readFileSync(r.testConfigPath, 'utf-8')) as Record<string, any>;
+      expect(saved.telegram).toEqual({ enabled: false });
+      expect(saved.discord).toEqual({ enabled: false });
+      expect(saved._testSecretsStripped).toBe(0);
+      expect(r.copied).toEqual([]);
+      expect(r.skippedMissing).toEqual([...TEST_SYNC_AUX_FILES]);
+      expect(r.telegramMode).toBe('disabled');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('CLI 사람용 한 줄에 실제 제거 건수를 알리고 비밀 값은 출력하지 않는다', () => {
     const dir = mkdtempSync(join(tmpdir(), 'elanous-cfgsync-cli-'));
     try {

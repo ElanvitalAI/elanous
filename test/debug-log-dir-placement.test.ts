@@ -1,5 +1,5 @@
 import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,10 @@ import { fileURLToPath } from 'node:url';
 setDefaultTimeout(60_000);
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const canWriteBesideSourceRoot = (() => {
+  try { accessSync(dirname(REPO_ROOT), constants.W_OK); return true; }
+  catch { return false; }
+})();
 const WORKING_DIR_MODULE = join(REPO_ROOT, 'src/session/working-dir.ts');
 const DEBUG_LOG_MODULE = join(REPO_ROOT, 'src/debug/log.ts');
 const BIN = join(REPO_ROOT, 'bin/elanous.mjs');
@@ -73,7 +77,7 @@ describe('debug log directory placement', () => {
     expect(existsSync(join(session, '.elanous', 'debug'))).toBe(false);
   });
 
-  test('puts an external sibling-prefix project under .elanous/debug without creating root log', () => {
+  test.skipIf(!canWriteBesideSourceRoot)('puts an external sibling-prefix project under .elanous/debug without creating root log', () => {
     const externalProject = join(
       dirname(REPO_ROOT),
       `${basename(REPO_ROOT)}-external-${process.pid}-${Date.now()}`,

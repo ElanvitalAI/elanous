@@ -373,7 +373,7 @@ export interface NextSidetabRequest {
   character?: 'shell' | 'elanous';
   mission?: string;
   parallelMission?: string;
-  agent?: 'codex' | 'claude';
+  agent?: 'codex' | 'claude' | 'grok';
   confirm?: boolean;
 }
 export interface NextSidetabCall { type: typeof NEXT_SIDETAB_CALL; callId: string; request: NextSidetabRequest }
@@ -386,7 +386,7 @@ export interface NextSidetabHostDeps {
   attach(row: SidetabRow): Promise<unknown>;
   detach(): unknown;
   spawn(character: 'shell' | 'elanous'): unknown;
-  runMission?(agent: 'codex' | 'claude', mission: string): Promise<unknown>;
+  runMission?(agent: 'codex' | 'claude' | 'grok', mission: string): Promise<unknown>;
   runMissionPair?(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
   kill(row: SidetabRow): unknown;
 }
@@ -397,16 +397,16 @@ export interface NextSidetabIpcProcess {
 
 export const nextSidetabToolSpec: LLMToolSpec = {
   name: NEXT_SIDETAB_TOOL_NAME,
-  description: 'Control the Next TUI side tab: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, run one visible Codex or Claude mission, or split one task into complementary graph branches that launch both visible agents concurrently. For a parallelMission, return both verified result files through the existing Codex + Claude pair-synthesis pipeline, with one comparison/adoption artifact and attribution table; do not create a second synthesis. Ask the user to confirm before calling kill with confirm=true.',
+  description: 'Control the Next TUI side tab: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, run one visible Codex, Claude, or Grok mission, or split one task into complementary graph branches that launch both visible agents concurrently. For a parallelMission, return both verified result files through the existing Codex + Claude pair-synthesis pipeline, with one comparison/adoption artifact and attribution table; do not create a second synthesis. Ask the user to confirm before calling kill with confirm=true.',
   parameters: {
     type: 'object',
     properties: {
       action: { type: 'string', enum: ['list', 'switch', 'attach', 'detach', 'new', 'mission', 'kill'] },
       target: { type: 'string', description: 'Optional exact or partial row id/label; required for targeted actions.' },
       character: { type: 'string', enum: ['shell', 'elanous'], description: 'Only used with action=new.' },
-      mission: { type: 'string', description: 'Mission text to type visibly into a new Codex or Claude side-tab PTY; the tool appends a result-file path and checks the completion marker.' },
+      mission: { type: 'string', description: 'Mission text to type visibly into a new Codex, Claude, or Grok side-tab PTY; the tool appends a result-file path and checks the completion marker.' },
       parallelMission: { type: 'string', description: 'Optional second mission. Starts the other agent concurrently and returns both verified result files together for synthesis.' },
-      agent: { type: 'string', enum: ['codex', 'claude'], description: 'Coding agent for action=mission; defaults to codex.' },
+      agent: { type: 'string', enum: ['codex', 'claude', 'grok'], description: 'Coding agent for action=mission; defaults to codex.' },
       confirm: { type: 'boolean', description: 'Must be true only after the user explicitly confirmed killing the selected PTY.' },
     },
     required: ['action'],
@@ -440,10 +440,11 @@ export function createNextSidetabHostHandler(deps: NextSidetabHostDeps): NextSid
       const mission = request.mission?.trim();
       if (!mission) return { error: 'mission 텍스트가 필요합니다' };
       if (!deps.runMission && !deps.runMissionPair) return { error: '사이드탭 미션 실행기가 연결되지 않았습니다' };
-      if (request.agent !== undefined && request.agent !== 'codex' && request.agent !== 'claude') return { error: 'agent는 codex 또는 claude여야 합니다' };
+      if (request.agent !== undefined && request.agent !== 'codex' && request.agent !== 'claude' && request.agent !== 'grok') return { error: 'agent는 codex, claude 또는 grok이어야 합니다' };
       const parallelMission = request.parallelMission?.trim();
       if (request.parallelMission !== undefined && !parallelMission) return { error: 'parallelMission 텍스트가 비었습니다' };
       if (parallelMission) {
+        if (request.agent === 'grok') return { error: 'parallelMission은 Codex/Claude pair에서만 지원합니다' };
         if (!deps.runMissionPair) return { error: 'Codex/Claude pair 실행기가 연결되지 않았습니다' };
         return deps.runMissionPair(request.agent ?? 'codex', mission, parallelMission);
       }

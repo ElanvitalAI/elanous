@@ -26,6 +26,41 @@ function matchDefaultPodSource(root: string): string {
 }
 
 describe('harness say/ask --substrate pod', () => {
+  test('release gate traffic and podTarget=0 route harness Pod work away from gate hosts to gcp1', () => {
+    let args: readonly string[] = [];
+    const result = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'gate-safe task' }, {
+      releaseGatePolicy: { traffic: { global: 'gate', podTarget: 0 }, gatePool: 'pool-node-b@node-b:4,pool-node-c@node-c:3',
+        taskPool: 'pool-node-b@node-b:46,pool-gcp1@gcp1:12', resolveHostIdentity: (host) => host.split('@').at(-1) ?? null },
+      run: (_cmd, argv) => { args = argv; return 0; },
+    });
+    expect(result).toBe(0);
+    expect(args).toContain('pool-gcp1@gcp1:12');
+    expect(args).not.toContain('pool-node-b@node-b:46');
+  });
+
+  test('release gate traffic blocks a Pod launch when filtering leaves no non-gate member', () => {
+    let launched = false;
+    const result = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'must not enter gate pool' }, {
+      releaseGatePolicy: { traffic: { global: 'gate', podTarget: 0 }, gatePool: 'pool-node-b@node-b:4', taskPool: 'pool-node-b@node-b:46',
+        resolveHostIdentity: (host) => host.split('@').at(-1) ?? null },
+      run: () => { launched = true; return 0; },
+    });
+    expect(result).toBe(2);
+    expect(launched).toBe(false);
+  });
+
+  test('unreadable traffic keeps the configured release gate hosts reserved', () => {
+    let args: readonly string[] = [];
+    const result = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'unknown traffic state' }, {
+      releaseGatePolicy: { traffic: null, gatePool: 'pool-node-b@node-b:4', taskPool: 'pool-node-b@node-b:46,pool-gcp1@gcp1:12',
+        resolveHostIdentity: (host) => host.split('@').at(-1) ?? null },
+      run: (_cmd, argv) => { args = argv; return 0; },
+    });
+    expect(result).toBe(0);
+    expect(args).toContain('pool-gcp1@gcp1:12');
+    expect(args).not.toContain('pool-node-b@node-b:46');
+  });
+
   test('same status 143 distinguishes requested parent forwarding from the local orchestrator signal', () => {
     const forwarded = { status: 143, parentSignalReceived: 'SIGTERM' as const, parentSignalReceivedAt: '2026-10-29T00:00:00.000Z', signalDelivery: 'requested' as const, orchestratorProcessSignal: null };
     const local = { status: 143, parentSignalReceived: null, parentSignalReceivedAt: null, signalDelivery: null, orchestratorProcessSignal: 'SIGTERM' as const };

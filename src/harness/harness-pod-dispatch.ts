@@ -28,6 +28,7 @@ import { oldDoorInternalEnv } from '../self-dev/old-door.js';
 import { selectPodMemoryTier } from './pod-memory-policy.js';
 import { preflightGoalDoneBoundary } from '../self-dev/dev-pipeline.js';
 import { forwardChildStderr } from '../surface/child-process.js';
+import { excludeGatePoolMembers, readTrafficDispatchSnapshot, releaseGateTrafficActive, resolveSshHostIdentity, type TrafficDispatchSnapshot } from '../task-orchestrator/surfaces/gate-pod-pool-policy.js';
 
 export interface HarnessPodDispatchInput {
   readonly entrance: 'cli-harness-ask' | 'cli-harness-say';
@@ -119,7 +120,10 @@ type PodDispatchExitObservation = {
   observedAt: string;
 };
 type PodDispatchRunResult = number | null | PodDispatchExitObservation;
-type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => PodDispatchRunResult; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn; onOutput?: (text: string) => void; recordRunLedgerEntry?: typeof appendRunLedgerEntry; nowMs?: number };
+type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => PodDispatchRunResult; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn; onOutput?: (text: string) => void; recordRunLedgerEntry?: typeof appendRunLedgerEntry; nowMs?: number;
+  /** Injected traffic/config snapshot for release-gate pool routing tests. */
+  releaseGatePolicy?: { traffic: TrafficDispatchSnapshot | null; gatePool?: string; taskPool?: string; localHost?: string;
+    resolveHostIdentity?: (host: string) => string | null } | null };
 
 export function classifyPodDispatchSignalSource(observation: Pick<PodDispatchExitObservation, 'parentSignalReceived' | 'signalDelivery' | 'orchestratorProcessSignal' | 'status'> & Partial<Pick<PodDispatchExitObservation, 'parentSignalLastReceived' | 'signalDeliveryFor'>>): 'parent-signal-forward-requested' | 'orchestrator-process-signaled' | 'unknown-143' | 'unknown-signal-exit' | 'non-signal-exit' {
   const lastSignal = observation.parentSignalLastReceived ?? observation.parentSignalReceived;
@@ -171,6 +175,38 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
   if (input.repairCommitOnly && (!/^pr:[1-9]\d*$/.test(input.source ?? '') || !/^[0-9a-f]{40}$/.test(input.repairCommitOnly) || input.autoMerge === true)) {
     debug.log('harness.substrate', 'repair-refused', { entrance: input.entrance, reason: 'requires pr source, 40-hex head, and no auto-merge' });
     return 2;
+  }
+  const gatePolicy: PodDispatchDeps['releaseGatePolicy'] = deps.releaseGatePolicy === undefined && (deps.run !== undefined || deps.spawnChild !== undefined) ? null
+    : deps.releaseGatePolicy === undefined ? (() => {
+    const traffic = readTrafficDispatchSnapshot(process.env);
+    if (traffic !== null && !releaseGateTrafficActive(traffic)) return null;
+    let gatePool: string | undefined;
+    let taskPool: string | undefined;
+    try {
+      // Keep the release config import out of ordinary harness launches.
+      const release = (require('../../scripts/release-loop/unattended-release.js') as typeof import('../../scripts/release-loop/unattended-release.js')).releaseLoopConfig();
+      gatePool = release.gatePodPool;
+      const userConfig = (require('../user-config.js') as typeof import('../user-config.js')).getUserConfig();
+      taskPool = userConfig.harness?.podPool;
+    } catch (error) {
+      debug.log('harness.substrate', 'release-gate-pool-config-unavailable', { reason: String(error) }, { level: 'error' });
+    }
+    return { traffic, gatePool, taskPool };
+  })() : deps.releaseGatePolicy;
+  if (gatePolicy && (gatePolicy.traffic === null || releaseGateTrafficActive(gatePolicy.traffic))) {
+    const taskPool = input.podPool ?? process.env.ELANOUS_POD_POOL ?? gatePolicy.taskPool;
+    const filtered = excludeGatePoolMembers(taskPool, gatePolicy.gatePool, gatePolicy.traffic, gatePolicy.localHost,
+      gatePolicy.resolveHostIdentity ?? resolveSshHostIdentity);
+    const gateHosts = 'gateHosts' in filtered ? filtered.gateHosts : [];
+    if (('reason' in filtered && filtered.reason) || !filtered.pool) {
+      const reason = ('reason' in filtered ? filtered.reason : undefined) ?? 'task-pod-pool-filter-produced-empty-pool';
+      debug.log('harness.substrate', 'release-gate-pool-dispatch-blocked', { reason, global: gatePolicy.traffic?.global ?? 'unknown', podTarget: gatePolicy.traffic?.podTarget ?? null, gateHosts }, { level: 'error' });
+      console.error(`[harness] release gate pool exclusivity: ${reason}`);
+      return 2;
+    }
+    input = { ...input, podPool: filtered.pool };
+    debug.log('harness.substrate', 'release-gate-pool-filtered', { global: gatePolicy.traffic?.global ?? 'unknown', podTarget: gatePolicy.traffic?.podTarget ?? null,
+      gateHosts, selectedPool: filtered.pool });
   }
   const env = { ...process.env, ...oldDoorInternalEnv('self-orchestrate') };
   // harness ask/say is the only Pod entry admitted to implicit graph growth.

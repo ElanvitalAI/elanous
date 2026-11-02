@@ -51,6 +51,24 @@ test('classifies Bloom 4/5 questions with no evidence envelope as missing gaps',
   }]);
 });
 
+test('turns a blank output-contract slot into a runnable follow-up even when one complete source exists', () => {
+  const input = {
+    request: 'Find the last 30-day DXY daily values and change',
+    questions: [{ id: 'q4', level: 4 as const, sectionId: 'dxy-range', prompt: 'Find last 30-day DXY daily values', searchTerms: ['DXY daily values'] }],
+    evidence: [evidence('q4', 'One publisher reports a daily DXY value.')],
+    blankSlots: [{ id: 'dxy-range', title: '30-day DXY range', purpose: 'Daily series, numeric change, source, and date.' }],
+    skills: [{ name: 'omni-crawl', description: 'Search public web documents and data', triggers: ['DXY daily values'], extractedTriggers: [], triggerSource: 'explicit' as const, autoTrigger: true, sideEffects: 'none' as const, cost: 'light' as const, composes: [], skillDir: '/', rootDir: '/' }],
+  } as Parameters<typeof planGapFollowup>[0];
+
+  const plan = planGapFollowup(input);
+
+  expect(plan.rounds).toBe(1);
+  expect(plan.followups).toHaveLength(1);
+  expect(plan.followups[0]).toMatchObject({ questionId: 'q4', skill: 'omni-crawl' });
+  expect(plan.followups[0]?.query).toContain('30-day DXY range');
+  expect(plan.followups[0]?.query).toContain('numeric change, source, and date');
+});
+
 test('keeps write-capable and unlisted skills as follow-up', () => {
   const skills = [
     { name: 'kr-flow', description: 'Korean bond supply', triggers: ['Korean bond supply'], extractedTriggers: [], triggerSource: 'explicit' as const, autoTrigger: true, sideEffects: 'write' as const, composes: [], skillDir: '/kr-flow', rootDir: '/' },

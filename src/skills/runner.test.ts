@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
@@ -38,12 +38,11 @@ const testProvider: LLMProvider = {
   async *chat() { yield 'ok'; },
 };
 
-mock.module('../llm.js', () => ({
-  ...llmActual,
-  getProvider: () => testProvider,
-  resolveDefaultProvider: () => testProvider,
-  isModelCompatible: () => true,
-  streamLLMWithTools: async (
+const skillRunnerSpies = [
+  spyOn(llmActual, 'getProvider').mockReturnValue(testProvider),
+  spyOn(llmActual, 'resolveDefaultProvider').mockReturnValue(testProvider),
+  spyOn(llmActual, 'isModelCompatible').mockReturnValue(true),
+  spyOn(llmActual, 'streamLLMWithTools').mockImplementation(async (
     _messages: LLMMessage[],
     handlers: StreamWithToolsHandlers,
     opts?: { signal?: AbortSignal },
@@ -63,8 +62,8 @@ mock.module('../llm.js', () => ({
       : TOOL_OUTPUT;
     handlers.onToolResult?.({ id: call.id, name: call.name, result });
     return 'ok';
-  },
-}));
+  }),
+];
 
 const { executeSkill, skillFoldRenderOpts } = await import('./runner.js');
 
@@ -74,6 +73,7 @@ const fileStateRoot = mkdtempSync(join(tmpdir(), 'runner-test-state-'));
 const fileStatePrev = process.env.ELANOUS_STATE_DIR;
 beforeAll(() => { process.env.ELANOUS_STATE_DIR = fileStateRoot; });
 afterAll(() => {
+  for (const spy of skillRunnerSpies) spy.mockRestore();
   if (fileStatePrev === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = fileStatePrev;
   rmSync(fileStateRoot, { recursive: true, force: true });

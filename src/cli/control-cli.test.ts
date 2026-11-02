@@ -28,7 +28,8 @@ test('doctor machine query distinguishes a reachable empty registry from an unre
   await expect(listMachineResources({ ...options, fetch: async () => { throw new Error('offline'); } })).rejects.toThrow('offline');
   await expect(listMachineResources({ ...options, fetch: async () => Response.json({ resources: 'bad' }) })).rejects.toThrow('invalid machine resource response');
   const isolated = root();
-  await expect(listMachineResources({ root: isolated })).rejects.toThrow('control query token unavailable');
+  // This assertion is about credentials, not a process-wide port override inherited from another test.
+  await expect(listMachineResources({ root: isolated, port: String(DEFAULT_CONTROL_PORT) })).rejects.toThrow('control query token unavailable');
   expect(existsSync(join(isolated, 'control', 'tokens.json'))).toBe(false);
 });
 
@@ -221,6 +222,8 @@ test('real CLI help reaches both registered command groups', async () => {
   expect(resources.code).toBe(0);
   expect(resources.stdout).toContain('where');
   expect(resources.stdout).toContain('list');
+  expect(resources.stdout).toContain('ledger');
+  expect(resources.stdout).toContain('reconcile');
 });
 
 test('control serve --host forwards a permitted host and rejects a public bind before startup', async () => {

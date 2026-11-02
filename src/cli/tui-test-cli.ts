@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
@@ -22,6 +22,8 @@ export interface TuiTestDeps {
   readonly now?: () => Date;
   readonly run?: (command: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv, timeoutMs?: number) => { status: number | null; stdout: string; stderr: string; error?: Error };
   readonly fetch?: typeof fetch;
+  readonly spawn?: typeof spawnElanous;
+  readonly killProcessGroup?: (pid: number) => void;
 }
 
 const runSync = (command: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv, timeoutMs = 5 * 60_000) => {
@@ -39,17 +41,98 @@ export function pwaBuildDecision(pwaDir: string, withPwaBuild = false): 'build' 
 }
 
 export function buildHeldTuiArgs(entry: string, testStateDir: string, readyTimeoutMs: number, cwd: string): string[] {
-  return [entry, '--test', 'dev', '--elanous', '--hold', '--json', '--isolated-root', testStateDir, '--ready-timeout-ms', String(readyTimeoutMs), '--cwd', cwd];
+  // `--isolated-root` is the dev child boundary. A global `--test` also
+  // assigns the launcher process that same root, which makes the child reject
+  // it as overlapping caller state before the held PTY can start.
+  return [entry, 'dev', '--elanous', '--hold', '--json', '--isolated-root', testStateDir, '--ready-timeout-ms', String(readyTimeoutMs), '--cwd', cwd];
 }
 
 export function buildHeldTuiLaunch(entry: string, testStateDir: string, readyTimeoutMs: number, cwd: string): { args: string[]; stateDir: string } {
-  return { args: buildHeldTuiArgs(entry, testStateDir, readyTimeoutMs, cwd).slice(1), stateDir: testStateDir };
+  // spawnElanous stamps its own caller state root into ELANOUS_STATE_DIR.
+  // Keep that launcher stamp separate from --isolated-root; using the same
+  // path makes the isolated-root guard reject its own child before PTY startup.
+  return {
+    args: buildHeldTuiArgs(entry, testStateDir, readyTimeoutMs, cwd).slice(1),
+    stateDir: join(cwd, '.elanous-test-launcher'),
+  };
 }
 
 export function parseReadyHeldPty(output: string): { id: string; runId: string } | undefined {
   const rows = JSON.parse(output) as Array<{ id: string; runId?: string; alive: boolean }>;
   const row = rows.find((item) => item.alive && !!item.runId);
   return row?.runId ? { id: row.id, runId: row.runId } : undefined;
+}
+
+export function buildHeldTuiRegistryArgs(entry: string, testStateDir: string): string[] {
+  // The held child is registered in the isolated TUI test universe. Keep both
+  // config and test state pointed at that root for list and control commands.
+  return [entry, '--config-dir', testStateDir, '--test-state-dir', testStateDir, 'pty', 'list', '--json'];
+}
+
+export function buildHeldTuiQuitArgs(entry: string, testStateDir: string, ptyId: string): string[] {
+  return [entry, '--config-dir', testStateDir, '--test-state-dir', testStateDir, 'pty', 'text', ptyId, '/quit', '--enter'];
+}
+
+function timeoutWithinDeadline(deadline: number, stage: string): number {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error(`shared readiness deadline elapsed before ${stage}`);
+  return Math.min(30_000, remaining);
+}
+
+function assertTestUniverseOnboardingReady(stateDir: string): void {
+  const config = JSON.parse(readFileSync(join(stateDir, 'config.json'), 'utf8')) as { onboarding?: { ready?: unknown } };
+  if (config.onboarding?.ready !== true) {
+    throw new Error(`isolated TUI test config lost onboarding.ready=true: ${join(stateDir, 'config.json')}`);
+  }
+}
+
+export function assertTestUniverseConfigMatches(stateDir: string, expectedConfig: string): void {
+  const configPath = join(stateDir, 'config.json');
+  const actualConfig = readFileSync(configPath, 'utf8');
+  if (actualConfig !== expectedConfig) {
+    let changedKeys = 'unknown';
+    try {
+      const expected = JSON.parse(expectedConfig) as Record<string, unknown>;
+      const actual = JSON.parse(actualConfig) as Record<string, unknown>;
+      changedKeys = [...new Set([...Object.keys(expected), ...Object.keys(actual)])]
+        .filter((key) => JSON.stringify(expected[key]) !== JSON.stringify(actual[key]))
+        .sort().join(', ') || 'format/ordering only';
+    } catch { /* report the path without exposing config contents */ }
+    throw new Error(`isolated TUI test config changed while the held TUI was starting (keys: ${changedKeys}): ${configPath}`);
+  }
+}
+
+function prepareTestUniverseConfig(stateDir: string): void {
+  const configPath = join(stateDir, 'config.json');
+  const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+    global?: Record<string, unknown>;
+    onboarding?: Record<string, unknown>;
+  };
+  const global = config.global ?? {};
+  const nexus = (global.nexus && typeof global.nexus === 'object' ? global.nexus : {}) as Record<string, unknown>;
+  const pwa = (nexus.pwa && typeof nexus.pwa === 'object' ? nexus.pwa : {}) as Record<string, unknown>;
+  config.global = { ...global, nexus: { ...nexus, pwa: { ...pwa, shareTailnet: 'disabled' } } };
+  config.onboarding = { ...config.onboarding, ready: true };
+  const tempPath = `${configPath}.tmp-${process.pid}`;
+  writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  renameSync(tempPath, configPath);
+}
+
+async function waitForTestUniverseConfigStable(stateDir: string, deadline: number): Promise<void> {
+  const configPath = join(stateDir, 'config.json');
+  let previous = readFileSync(configPath, 'utf8');
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    const current = readFileSync(configPath, 'utf8');
+    if (current !== previous) {
+      previous = current;
+      stableSince = Date.now();
+    } else if (Date.now() - stableSince >= 1_000) {
+      return;
+    }
+  }
+  throw new Error('isolated TUI test config did not remain stable after Nexus readiness');
 }
 
 function checkedRun(deps: TuiTestDeps, command: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv, timeoutMs?: number): string {
@@ -76,13 +159,12 @@ async function waitForNexus(logPath: string, child: ChildProcess, deadline: numb
   throw new Error(`isolated Nexus did not answer before the shared readiness deadline (${last})`);
 }
 
-function launchHeldTui(entry: string, cwd: string, env: NodeJS.ProcessEnv, stateDir: string, deadline: number): ChildProcess {
-  const logPath = join(stateDir, 'tui-test-held.log');
+function launchHeldTui(entry: string, cwd: string, env: NodeJS.ProcessEnv, launch: { args: string[]; stateDir: string }, logStateDir: string, spawn: typeof spawnElanous): ChildProcess {
+  const logPath = join(logStateDir, 'tui-test-held.log');
   const logFd = openSync(logPath, 'a', 0o600);
   let child: ChildProcess;
   try {
-    const launch = buildHeldTuiLaunch(entry, stateDir, Math.max(1, deadline - Date.now()), cwd);
-    child = spawnElanous(launch.args, {
+    child = spawn(launch.args, {
       bin: entry,
       stateDir: launch.stateDir,
       cwd, env, detached: true, stdio: ['ignore', logFd, logFd],
@@ -95,17 +177,19 @@ function launchHeldTui(entry: string, cwd: string, env: NodeJS.ProcessEnv, state
   return child;
 }
 
-async function waitForHeldTui(entry: string, cwd: string, env: NodeJS.ProcessEnv, stateDir: string, child: ChildProcess, deadline: number, deps: TuiTestDeps): Promise<{ id: string; runId: string }> {
-  const logPath = join(stateDir, 'tui-test-held.log');
+async function waitForHeldTui(entry: string, cwd: string, env: NodeJS.ProcessEnv, logStateDir: string, registryStateDir: string, child: ChildProcess, deadline: number, deps: TuiTestDeps): Promise<{ id: string; runId: string }> {
+  const logPath = join(logStateDir, 'tui-test-held.log');
   const startedAt = Date.now();
   let last = 'PTY registry has no row yet';
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
       const output = existsSync(logPath) ? readFileSync(logPath, 'utf8') : '';
-      throw new Error(`held TUI launcher exited before its PTY was registered (status=${child.exitCode}): ${output.slice(-1200)}`);
+      if (child.exitCode !== 0 || !/"held"\s*:\s*true/u.test(output)) {
+        throw new Error(`held TUI launcher exited before its PTY was registered (status=${child.exitCode}): ${output.slice(-1200)}`);
+      }
     }
     try {
-      const output = checkedRun(deps, 'bun', [entry, '--test-state-dir', stateDir, 'pty', 'list', '--json'], cwd, env, Math.min(15_000, Math.max(1, deadline - Date.now())));
+      const output = checkedRun(deps, 'bun', buildHeldTuiRegistryArgs(entry, registryStateDir), cwd, env, Math.min(15_000, Math.max(1, deadline - Date.now())));
       const held = parseReadyHeldPty(output);
       if (held) return held;
       last = 'PTY registry returned no alive held TUI';
@@ -145,20 +229,35 @@ export async function runTuiTestUniverse(options: { readyTimeoutMs?: number; wit
     pwaBuild = 'built';
   }
 
-  const entry = join(worktree, 'bin/elanous.mjs');
+  // The current CLI owns the detached launcher lifetime; Nexus and the TUI
+  // itself run the generated latest-main entry.
+  const launcherEntry = join(repoRoot, 'bin/elanous.mjs');
+  const targetEntry = join(worktree, 'bin/elanous.mjs');
+  const setupEntry = launcherEntry;
   const testStateDir = join(worktree, '.elanous-test');
   const testEnv = { ...process.env };
   delete testEnv.ELANOUS_STATE_DIR;
   delete testEnv.ELANOUS_CONFIG_DIR;
   delete testEnv.ELANOUS_NEXUS_HEADLESS;
-  checkedRun(deps, 'bun', [entry, 'config', 'sync-test', '--state-dir', testStateDir, '--json'], worktree, testEnv, 30_000);
-  checkedRun(deps, 'bun', [entry, '--config-dir', testStateDir, 'config', 'set', 'global.nexus.pwa.shareTailnet', 'disabled', '--no-backup'], worktree, testEnv, 30_000);
+  // Bun's test-runner control markers must not leak into the detached CLI / PTY
+  // children; otherwise nested `bun pty list` can join or wait on the test worker.
+  for (const key of Object.keys(testEnv)) {
+    if (key.startsWith('BUN_TEST')) delete testEnv[key];
+  }
+  // Sync with this command's implementation: the generated latest-main tree
+  // may not yet contain the empty-config bootstrap this one-command flow needs.
+  checkedRun(deps, 'bun', [setupEntry, 'config', 'sync-test', '--state-dir', testStateDir, '--json'], worktree, testEnv, 30_000);
+  // This disposable universe has no copied user onboarding state. Mark it
+  // ready so first-run web setup cannot return from the held child before its
+  // PTY remains available to the caller.
+  prepareTestUniverseConfig(testStateDir);
+  assertTestUniverseOnboardingReady(testStateDir);
   mkdirSync(testStateDir, { recursive: true });
   const nexusLogPath = join(testStateDir, 'tui-test-nexus.log');
   const nexusLogFd = openSync(nexusLogPath, 'a');
-  const nexusEntry = join(repoRoot, 'bin/elanous.mjs');
+  const nexusEntry = targetEntry;
   const nexusEnv = { ...testEnv, ELANOUS_CONFIG_DIR: testStateDir, ELANOUS_TOOL_CWD: worktree };
-  const nexusProcess = spawnElanous(['--test-state-dir', testStateDir, 'nexus', 'run', '--no-auto-build', '--no-watch', '--no-mcp', '--no-auth', '--http-host', '127.0.0.1', '--tool-cwd', worktree], {
+  const nexusProcess = (deps.spawn ?? spawnElanous)(['--test-state-dir', testStateDir, 'nexus', 'run', '--no-auto-build', '--no-watch', '--no-mcp', '--no-auth', '--http-host', '127.0.0.1', '--tool-cwd', worktree], {
     bin: nexusEntry,
     stateDir: testStateDir,
     cwd: worktree, env: nexusEnv, detached: true, stdio: ['ignore', nexusLogFd, nexusLogFd],
@@ -166,25 +265,58 @@ export async function runTuiTestUniverse(options: { readyTimeoutMs?: number; wit
   closeSync(nexusLogFd);
   nexusProcess.unref();
   const readinessDeadline = Date.now() + readyTimeoutMs;
+  const launcherStateDir = join(worktree, '.elanous-test-launcher');
+  let launcher: ChildProcess | undefined;
   try {
     const nexusUrl = await waitForNexus(nexusLogPath, nexusProcess, readinessDeadline, deps.fetch ?? fetch);
+    // Nexus may materialize config defaults while it starts. Restore the
+    // disposable test-only onboarding bit after Nexus is ready, before the TUI
+    // child reads its isolated config.
+    prepareTestUniverseConfig(testStateDir);
+    await waitForTestUniverseConfigStable(testStateDir, readinessDeadline);
+    assertTestUniverseOnboardingReady(testStateDir);
     const ptyReadyStartedAt = Date.now();
-    const launcher = launchHeldTui(entry, worktree, testEnv, testStateDir, readinessDeadline);
-    const held = await waitForHeldTui(entry, worktree, testEnv, testStateDir, launcher, readinessDeadline, deps);
+    const launch = buildHeldTuiLaunch(launcherEntry, testStateDir, Math.max(1, readinessDeadline - Date.now()), worktree);
+    const launcherEnv = { ...testEnv, ELANOUS_HOLD_TUI_REPO_ROOT: worktree };
+    launcher = launchHeldTui(launcherEntry, worktree, launcherEnv, launch, testStateDir, deps.spawn ?? spawnElanous);
+    const held = await waitForHeldTui(targetEntry, worktree, testEnv, testStateDir, testStateDir, launcher, readinessDeadline, deps);
+    // The generated TUI materializes defaults on first startup. Wait for that
+    // real child writer to finish before pinning the config used by this run.
+    // This makes startup normalization part of the serialized setup phase;
+    // subsequent writes through snapshot are treated as a race and fail closed.
+    await waitForTestUniverseConfigStable(testStateDir, readinessDeadline);
+    assertTestUniverseOnboardingReady(testStateDir);
+    const stableConfig = readFileSync(join(testStateDir, 'config.json'), 'utf8');
+    assertTestUniverseConfigMatches(testStateDir, stableConfig);
     const ptyId = held.id;
 
-    const isolatedArgs = ['--test-state-dir', testStateDir];
-    const ptyList = JSON.parse(checkedRun(deps, 'bun', [entry, ...isolatedArgs, 'pty', 'list', '--json'], worktree, testEnv, 30_000)) as Array<{ id: string; runId?: string; alive: boolean }>;
+    const registryArgs = buildHeldTuiRegistryArgs(targetEntry, testStateDir).slice(1);
+    const ptyListTimeout = timeoutWithinDeadline(readinessDeadline, 'final PTY registry verification');
+    const ptyList = JSON.parse(checkedRun(deps, 'bun', [targetEntry, ...registryArgs], worktree, testEnv, ptyListTimeout)) as Array<{ id: string; runId?: string; alive: boolean }>;
     const row = ptyList.find((item) => item.id === ptyId && item.alive);
     if (row?.runId !== held.runId) throw new Error(`held PTY ${ptyId} is absent or has a different runId in the same test universe`);
-    const snapshot = checkedRun(deps, 'bun', [entry, ...isolatedArgs, 'pty', 'snapshot', ptyId], worktree, testEnv, 30_000);
+    const snapshotTimeout = timeoutWithinDeadline(readinessDeadline, 'PTY snapshot');
+    const snapshot = checkedRun(deps, 'bun', [targetEntry, ...registryArgs.slice(0, 4), 'pty', 'snapshot', ptyId], worktree, testEnv, snapshotTimeout);
     const evidenceDir = join(testStateDir, 'evidence');
     const snapshotPath = join(evidenceDir, 'tui-test-snapshot.txt');
     mkdirSync(evidenceDir, { recursive: true });
     writeFileSync(snapshotPath, snapshot, 'utf8');
+    assertTestUniverseConfigMatches(testStateDir, stableConfig);
+    timeoutWithinDeadline(readinessDeadline, 'one-command result');
     return { worktree, ptyId, runId: row.runId, nexusUrl, nexusPid: nexusProcess.pid ?? -1, snapshotPath, readyTimeoutMs, waitedMs: Date.now() - ptyReadyStartedAt, pwaBuild };
   } catch (error) {
-    try { checkedRun(deps, 'bun', [entry, '--test-state-dir', testStateDir, 'nexus', 'stop'], worktree, testEnv, 15_000); } catch { /* preserve the primary readiness failure */ }
+    if (launcher?.pid !== undefined) {
+      try { (deps.killProcessGroup ?? ((pid) => process.kill(-pid, 'SIGTERM')))(launcher.pid); } catch { /* launcher group may already have exited */ }
+    }
+    try {
+      const ptyRows = JSON.parse(checkedRun(deps, 'bun', buildHeldTuiRegistryArgs(targetEntry, testStateDir), worktree, testEnv, 10_000)) as Array<{ id?: string; alive?: boolean }>;
+      for (const row of ptyRows) {
+        if (row.alive && row.id) {
+          try { checkedRun(deps, 'bun', buildHeldTuiQuitArgs(targetEntry, testStateDir, row.id), worktree, testEnv, 10_000); } catch { /* preserve the primary failure */ }
+        }
+      }
+    } catch { /* preserve the primary failure when the dedicated registry is unavailable */ }
+    try { checkedRun(deps, 'bun', [targetEntry, '--test-state-dir', testStateDir, 'nexus', 'stop'], worktree, testEnv, 15_000); } catch { /* preserve the primary readiness failure */ }
     throw error;
   }
 }

@@ -1,10 +1,15 @@
 import { expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
+import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { parseScenarioV0, resolveScenarioFilePath, runScenarioFile, runScenarioV0, writeScenarioEvidenceArtifact } from './scenario.js';
+import { reviewerPrecheckFixtureDocument, runAuthorReviewerPrecheckDevice } from './author-reviewer-precheck-device.js';
+import { runGraphRuntimeOverlayEventPathDevice } from './graph-runtime-overlay-event-path.js';
 
 async function withTestState<T>(run: () => Promise<T>): Promise<T> {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'ux-sim-test-state-'));
@@ -17,6 +22,58 @@ async function withTestState<T>(run: () => Promise<T>): Promise<T> {
     rmSync(root, { recursive: true, force: true });
   }
 }
+
+test('graph runtime overlay is dispatched through the production observer into isolated logs.db', { timeout: 30_000 }, async () => {
+  await withTestState(async () => {
+    const run = await runScenarioFile('scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml');
+    expect(run.pass).toBe(true);
+    expect(run.trigger).toMatchObject({ id: 'runtime-overlay-dispatch', type: 'ux.graph-runtime-overlay.evaluate', fetchCount: 1 });
+    expect(run.graphRuntimeOverlay).toEqual({ status: 'done', decisionObserved: true, overlayApplied: true });
+    expect(run.logs).toMatchObject({ pass: true, category: 'self-implement', event: 'graph-overlay-decision', expectedCount: 1, observedCount: 1,
+      matchedData: { runId: run.runId, stage: 'runtime', applied: ['ux-sim-event-stream-runtime-overlay'] } });
+    const store = new LogStore(join(getTestStateRoot()!, 'logs', 'logs.db'), { readonly: true });
+    try {
+      const rows = store.query({ exactCategories: ['self-implement'], events: ['graph-overlay-decision'], instances: [`ux-sim:${run.id}:${run.runId}`], limit: 10 });
+      expect(rows).toHaveLength(1);
+      expect(JSON.parse(rows[0]!.data!)).toMatchObject({ runId: run.runId, stage: 'runtime', applied: ['ux-sim-event-stream-runtime-overlay'] });
+    } finally { store.close(); }
+  });
+});
+
+test('graph runtime scenario fails if the production observer event is dropped before logs.db', { timeout: 30_000 }, async () => {
+  await withTestState(async () => {
+    const previousFault = process.env.ELANOUS_UX_SIM_TEST_FAULT;
+    process.env.ELANOUS_UX_SIM_TEST_FAULT = 'drop-runtime-graph-event';
+    try {
+      const run = await runScenarioFile('scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml');
+      expect(run.pass).toBe(false);
+      expect(run.graphRuntimeOverlay).toEqual({ status: 'failed', decisionObserved: false, overlayApplied: false });
+      expect(run.failureReasons).toContain('graph-runtime-overlay-result-mismatch');
+      expect(run.failureReasons).toContain('expected-log-event-absent');
+    } finally {
+      if (previousFault === undefined) delete process.env.ELANOUS_UX_SIM_TEST_FAULT;
+      else process.env.ELANOUS_UX_SIM_TEST_FAULT = previousFault;
+    }
+  });
+});
+
+test('parallel graph runtime workers keep the parent process state directory unchanged', { timeout: 30_000 }, async () => {
+  await withTestState(async () => {
+    const initialStateDir = process.env.ELANOUS_STATE_DIR;
+    const removeSink = debug.registerSink({ name: 'mockdev-parallel-worker-test', emit: () => {} });
+    try {
+      const [first, second] = await Promise.all([
+        runGraphRuntimeOverlayEventPathDevice(getTestStateRoot()!, randomUUID(), 'parallel-a'),
+        runGraphRuntimeOverlayEventPathDevice(getTestStateRoot()!, randomUUID(), 'parallel-b'),
+      ]);
+      expect(first).toEqual({ status: 'done', decisionObserved: true, overlayApplied: true });
+      expect(second).toEqual({ status: 'done', decisionObserved: true, overlayApplied: true });
+      expect(process.env.ELANOUS_STATE_DIR).toBe(initialStateDir);
+    } finally {
+      removeSink();
+    }
+  });
+});
 
 test('YAML scenario runs the real Codex 400 path, compares widget plus stored log event, and persists seeded evidence', async () => {
   const result = await withTestState(async () => {
@@ -73,6 +130,114 @@ test('UX-MS-09 scenario evaluates real draft triage and persists runId-scoped co
       expect(readFileSync(run.evidenceArtifact, 'utf8')).toContain(run.runId);
     } finally { store.close(); }
   });
+});
+
+test('reviewer-precheck ScenarioV0 uses the production validator with a fake model and runId-scoped applied/rejected events', async () => {
+  await withTestState(async () => {
+    const applied = await runScenarioFile('scenarios/ux-sim/author-reviewer-precheck-applied.yaml');
+    const rejected = await runScenarioFile('scenarios/ux-sim/author-reviewer-precheck-rejected-unprovable.yaml');
+    expect(applied.pass).toBe(true);
+    expect(rejected.pass).toBe(true);
+    expect(applied.runId).not.toBe(rejected.runId);
+    expect(applied.trigger.fetchCount).toBe(1);
+    expect(rejected.trigger.fetchCount).toBe(1);
+    const originalDocument = reviewerPrecheckFixtureDocument();
+    const exactAskSentence = 'The result has a measurable criterion and an observable source.';
+    const unsupportedSentence = 'Add an unsupported requirement absent from the original ask.';
+    expect(applied.authorReviewerPrecheck).toMatchObject({
+      originalDocument,
+      revisedDocument: originalDocument.replace('- The result has a measurable criterion.', `- The result has a measurable criterion.\n- ${exactAskSentence}`),
+      appliedFixes: [exactAskSentence],
+      unappliedItems: [],
+    });
+    expect(applied.authorReviewerPrecheck?.revisedDocument.split(exactAskSentence)).toHaveLength(3);
+    expect(rejected.authorReviewerPrecheck).toMatchObject({
+      originalDocument,
+      revisedDocument: originalDocument,
+      appliedFixes: [],
+      unappliedItems: [unsupportedSentence],
+    });
+    const store = new LogStore(join(getTestStateRoot()!, 'logs', 'logs.db'), { readonly: true });
+    try {
+      const appliedRows = store.queryByDataKeys({ exactCategories: ['author.reviewer-precheck'], runIds: [applied.runId] }).filter((row) => row.event === 'completed');
+      const rejectedRows = store.queryByDataKeys({ exactCategories: ['author.reviewer-precheck'], runIds: [rejected.runId] }).filter((row) => row.event === 'revision-rejected');
+      expect(appliedRows).toHaveLength(1);
+      expect(JSON.parse(appliedRows[0]!.data!)).toMatchObject({ runId: applied.runId, authorRunId: applied.runId, status: 'completed', appliedFixCount: 1, unappliedItemCount: 0 });
+      expect(rejectedRows).toHaveLength(1);
+      expect(JSON.parse(rejectedRows[0]!.data!)).toMatchObject({ runId: rejected.runId, authorRunId: rejected.runId, status: 'rejected-soft', appliedFixCount: 0, unappliedItemCount: 1 });
+      expect(readFileSync(applied.evidenceArtifact, 'utf8')).toContain(applied.runId);
+      expect(readFileSync(rejected.evidenceArtifact, 'utf8')).toContain(rejected.runId);
+    } finally { store.close(); }
+  });
+});
+
+test('reviewer-precheck trigger requires a registered acceptance variant', () => {
+  const base = parseScenarioV0(readFileSync('scenarios/ux-sim/author-reviewer-precheck-applied.yaml', 'utf8'));
+  base.triggers[0].variant = 'not-a-review-result' as never;
+  expect(() => parseScenarioV0(JSON.stringify(base))).toThrow('variant must be applied or rejected-unprovable');
+});
+
+test('both reviewer-precheck CLI scenarios fail when the returned revised document is corrupted', async () => {
+  for (const file of [
+    'scenarios/ux-sim/author-reviewer-precheck-applied.yaml',
+    'scenarios/ux-sim/author-reviewer-precheck-rejected-unprovable.yaml',
+  ]) {
+    const scenario = parseScenarioV0(readFileSync(file, 'utf8'));
+    const run = await withTestState(() => runScenarioV0(scenario, {
+      runAuthorReviewerPrecheckDevice: async (runId, variant) => {
+        const valid = await runAuthorReviewerPrecheckDevice(runId, variant);
+        return { ...valid, revisedDocument: `${valid.revisedDocument}\ncorrupted` };
+      },
+    }));
+    expect(run.pass).toBe(false);
+    expect(run.failureReasons).toContain('author-reviewer-precheck-result-mismatch');
+    expect(run.logs.pass).toBe(true);
+  }
+});
+
+test('real sim run CLI exits nonzero for corrupted reviewer documents and raw-event correlation', () => {
+  const repositoryRoot = realpathSync(join(import.meta.dir, '../..'));
+  const faultCases = [
+    { file: 'scenarios/ux-sim/author-reviewer-precheck-applied.yaml', fault: 'corrupt-revised-document', reason: 'author-reviewer-precheck-result-mismatch' },
+    { file: 'scenarios/ux-sim/author-reviewer-precheck-rejected-unprovable.yaml', fault: 'corrupt-revised-document', reason: 'author-reviewer-precheck-result-mismatch' },
+    { file: 'scenarios/ux-sim/author-reviewer-precheck-applied.yaml', fault: 'missing-author-run-id', reason: 'log-data-mismatch' },
+    { file: 'scenarios/ux-sim/author-reviewer-precheck-rejected-unprovable.yaml', fault: 'wrong-author-run-id', reason: 'log-data-mismatch' },
+  ] as const;
+  for (const { file, fault, reason } of faultCases) {
+    const stateRoot = mkdtempSync(join(realpathSync(tmpdir()), 'ux-sim-cli-precheck-'));
+    try {
+      const cli = spawnSync('bun', [
+        'bin/elanous.mjs', `--test=${stateRoot}`, 'sim', 'run', file,
+      ], {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+        timeout: 90_000,
+        env: { ...process.env, ELANOUS_UX_SIM_TEST_FAULT: fault },
+      });
+      expect({ file, error: cli.error?.message, stderr: cli.stderr }).toMatchObject({ error: undefined });
+      expect(cli.status).toBe(1);
+      expect(cli.stdout).toContain('"pass":false');
+      expect(cli.stdout).toContain(reason);
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  }
+}, 180_000);
+
+test('reviewer-precheck CLI scenarios reject missing or mismatched raw authorRunId', async () => {
+  const appliedScenario = parseScenarioV0(readFileSync('scenarios/ux-sim/author-reviewer-precheck-applied.yaml', 'utf8'));
+  const missingCorrelation = await withTestState(() => runScenarioV0(appliedScenario, {
+    transformAuthorReviewerPrecheckEventData: ({ authorRunId: _authorRunId, ...data }) => data,
+  }));
+  expect(missingCorrelation.pass).toBe(false);
+  expect(missingCorrelation.logs.dataMismatch).toContain('data.authorRunId: missing');
+
+  const rejectedScenario = parseScenarioV0(readFileSync('scenarios/ux-sim/author-reviewer-precheck-rejected-unprovable.yaml', 'utf8'));
+  const wrongCorrelation = await withTestState(() => runScenarioV0(rejectedScenario, {
+    transformAuthorReviewerPrecheckEventData: (data) => ({ ...data, authorRunId: 'wrong-run-id' }),
+  }));
+  expect(wrongCorrelation.pass).toBe(false);
+  expect(wrongCorrelation.logs.dataMismatch.some((mismatch) => mismatch.startsWith('data.authorRunId: expected '))).toBe(true);
 });
 
 test('repeated ScenarioV0 runs keep distinct evidence artifacts and correlated logs rows', async () => {
@@ -405,4 +570,13 @@ test('public runner enforces test mode and revalidates its registered trigger sc
   await withTestState(async () => {
     await expect(runScenarioV0(unregistered)).rejects.toThrow('unregistered scenario trigger');
   });
+});
+
+test('graph runtime overlay trigger rejects options the registered device does not consume', () => {
+  const base = parseScenarioV0(readFileSync('scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml', 'utf8'));
+  for (const field of ['status', 'count', 'variant']) {
+    const malformed = structuredClone(base) as unknown as { triggers: Array<Record<string, unknown>> };
+    malformed.triggers[0]![field] = field === 'status' ? 200 : field === 'count' ? 1 : 'applied';
+    expect(() => parseScenarioV0(JSON.stringify(malformed))).toThrow('ux.graph-runtime-overlay.evaluate does not accept');
+  }
 });

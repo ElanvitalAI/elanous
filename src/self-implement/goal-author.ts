@@ -270,6 +270,7 @@ export async function runGoalAuthorReviewerPrecheck(
   const prompt = [
     'Review this completed goal document before it is written. Return only JSON with string-array fields suggestions, fixes, remainingNeedsHuman, a fixEvidence array of { fix, originalText, revisedText }, and a revisedDocument string.',
     'Challenge each completion-boundary constraint instead of treating it as inherently necessary. 제약을 의심하라: 저작 문면의 세계와 구현의 세계에서 같은 제약인가? 카탈로그에 있는 목장치나 사건 주입으로 같은 동작을 관찰할 수 있는가? 실물 점검만 요구하는 경계라면 의도를 보존하는 목장치·주입 사건을 제안하라. Do not require a real-world inspection by default. Preserve a live check when the ask explicitly requires an external-system outcome.',
+    'Flag an unattainable completion boundary with a suggestion prefixed exactly `unattainable-completion:` when it requires unconditional real-world E5, a long live run, an external account, a future pinned/landed revision, or a person to perform manual work. Distinguish required conditions from optional choices, alternatives, and negated mentions. Preserve safe functional/code requirements in E4 and move only the unattainable condition plus any original live inspection to `<cell>-LIVE`. Propose an E4 mergeable completion line using a named mock-scenario-catalog device and an injected event. A real-world/live check must not gate the E4 completion.',
     ...(deps.mockScenarioCatalog?.trim() ? ['Reusable mock-device and event-injection catalog (reference only, not a completion gate):', deps.mockScenarioCatalog.trim()] : []),
     'Apply each necessary fix to revisedDocument exactly once while preserving the original ask, GoalId, RootIntent, GoalType, every existing criterion and scope boundary, and canonical section structure. Be strictly conservative: only append one complete sentence copied verbatim from the original ask to an existing acceptance-criteria or required-evidence line; never append a partial substring or clause, especially one inside a negation or condition, and do not delete or reword existing text, add new scope, or edit other sections. For every fixes item, include one fixEvidence object in the same order: fixes item and fix must both equal the exact complete sentence appended from the original ask; originalText and revisedText must be exact spans where revisedText starts with originalText and appends that sentence, and replaying every single replacement reproduces the complete revisedDocument with no other edits. If you cannot explain and ground every change this way, return no fixes and leave revisedDocument byte-for-byte unchanged. Keep optional suggestions separate; list unresolved decisions or evidence as remainingNeedsHuman.',
     ...(deps.reviewContext ? [
@@ -291,7 +292,27 @@ export async function runGoalAuthorReviewerPrecheck(
     onResolvedProvider: (resolvedProvider, resolvedModel) => { actualProvider = resolvedProvider; actualModel = resolvedModel; },
   });
   debug.log('author.reviewer-precheck', 'response', { provider: actualProvider, model: actualModel, responseChars: raw.length });
-  return parseGoalAuthorReviewerPrecheck(raw);
+  const result = parseGoalAuthorReviewerPrecheck(raw);
+  const values = inspectGoalDoneBoundary(document).values;
+  const entries = unattainableCompletionEntries(values);
+  const reasons = [...new Set(entries.flatMap((entry) => entry.reasons))];
+  const hasCompleteProposal = result.suggestions.some((suggestion) => suggestion.startsWith('unattainable-completion:')
+    && suggestion.includes('E4') && suggestion.includes('<칸>-LIVE') && suggestion.includes('사건 주입'));
+  if (!reasons.length || hasCompleteProposal) return result;
+  const targets = declaredTargetPaths(document);
+  const stage = selectGoalMockStage(document, targets);
+  const fallbackDevice = loadMockScenarioCatalog().devices.find((device) => device.id === 'product-devices');
+  const device = stage?.device ?? fallbackDevice;
+  const scenario = stage?.scenario;
+  const catalog = loadMockScenarioCatalog();
+  const scenarioId = scenario?.id ?? nextGoalScenarioId(catalog.scenarios.map((entry) => entry.id), targets);
+  const injection = scenario
+    ? `${scenario.id}: ${scenario.trigger}; 관측=${scenario.observe.join(' · ')}; 기대=${scenario.expected}`
+    : `${scenarioId} 신규 ScenarioV0 초안: 사건 입력 후보=${device?.inputs.join(' · ') ?? '카탈로그 입력'}; 관측 후보=${device?.observations.join(' · ') ?? '격리 시험 관측'}`;
+  return {
+    ...result,
+    suggestions: [...result.suggestions, `unattainable-completion: ${reasons.join(' · ')} 요구는 E4 완료선에서 제외한다. E4=${device?.name ?? 'mock device'} (${device?.id ?? 'catalog-device'}) · 사건 주입 ${injection}. 원래 요구 «${entries.map((entry) => `${entry.label}: ${entry.value}`).join(' · ')}»를 별도 <칸>-LIVE 후속에 보존한다.`],
+  };
 }
 
 export async function executeGoalAuthorReviewerPrecheck(
@@ -985,8 +1006,33 @@ export function validateGoalDoneEvidenceCommand(value: string): { command?: stri
   return { command };
 }
 
+/** Shared author/hand normalization for presentation added to a concrete evidence command. */
+export function normalizeGoalDoneEvidenceCommand(value: string): string | undefined {
+  let candidate = value.trim();
+  // Goal documents often wrap commands in Markdown and append a result hint. Accept only
+  // the two known result decorations; arbitrary prose remains invalid.
+  candidate = candidate.replace(/\s*·\s*typecheck\s+pass(?:ed)?\s*$/iu, '').trim();
+  candidate = candidate.replace(/\s*(?:→|->)\s*\d+\s*(?:pass(?:ed)?|fail(?:ure)?s?)\s*$/iu, '').trim();
+  candidate = candidate.replace(/^`([^`]+)`$/u, '$1').trim();
+  // An unrecognized result arrow is presentation text, not an argument to the command.
+  if (candidate.includes('→')) return undefined;
+  return validateGoalDoneEvidenceCommand(candidate).command;
+}
+
+export function normalizeGoalDoneBoundaryDocument(document: string): string {
+  let normalized = document;
+  for (const line of linesOutsideFencedCode(document).reverse()) {
+    const match = /^([ \t]*(?:[-*][ \t]*)?완료 경계 증거 명령[ \t]*:[ \t]*)(.*?)[ \t]*$/u.exec(line.text);
+    if (!match) continue;
+    const command = normalizeGoalDoneEvidenceCommand(match[2]!);
+    if (command) normalized = `${normalized.slice(0, line.start)}${match[1]}${command}${normalized.slice(line.start + line.text.length)}`;
+  }
+  return normalized;
+}
+
 function isGoalDoneEvidenceCommand(value: string): boolean {
-  if (GOAL_DONE_UNSUPPORTED_SHELL_OPERATOR.test(value)) return false;
+  // A result arrow not consumed by a recognized decoration is not command text.
+  if (value.includes('→') || GOAL_DONE_UNSUPPORTED_SHELL_OPERATOR.test(value)) return false;
   return validateGoalDoneEvidenceCommand(value).command !== undefined;
 }
 
@@ -1003,16 +1049,24 @@ function unwrapGoalDoneValue(value: string): string {
 }
 
 export function inspectGoalDoneBoundary(document: string): { values: Partial<Record<GoalDoneBoundaryLabel, string>>; missing: GoalDoneBoundaryLabel[] } {
+  document = normalizeGoalDoneBoundaryDocument(document);
   const values: Partial<Record<GoalDoneBoundaryLabel, string>> = {};
+  let invalidEvidenceLine = false;
   for (const line of linesOutsideFencedCode(document)) {
     const match = /^\s*(?:[-*]\s*)?(완료 경계 코드|완료 경계 실물|완료 경계 증거 명령)\s*:\s*(.*?)\s*$/.exec(line.text);
     if (!match) continue;
     const label = match[1] as GoalDoneBoundaryLabel;
     const value = match[2]?.trim() ?? '';
-    const inspected = unwrapGoalDoneValue(value);
-    if (!isGoalDonePlaceholder(value)
-      && (label !== '완료 경계 증거 명령' || isGoalDoneEvidenceCommand(inspected))) values[label] = value;
+    const inspected = label === '완료 경계 증거 명령'
+      ? normalizeGoalDoneEvidenceCommand(value) ?? unwrapGoalDoneValue(value)
+      : unwrapGoalDoneValue(value);
+    if (label === '완료 경계 증거 명령' && !isGoalDoneEvidenceCommand(inspected)) {
+      invalidEvidenceLine = true;
+      continue;
+    }
+    if (!isGoalDonePlaceholder(value)) values[label] = label === '완료 경계 증거 명령' ? inspected : value;
   }
+  if (invalidEvidenceLine) delete values['완료 경계 증거 명령'];
   return { values, missing: GOAL_DONE_BOUNDARY_LABELS.filter((label) => !values[label]) };
 }
 
@@ -1056,7 +1110,9 @@ function behaviorTokens(value: string): Set<string> {
 
 function matchingScenarioBehaviorCount(scenario: MockScenarioEntry, ask: string): number {
   const { values } = inspectGoalDoneBoundary(ask);
-  const requestedText = `${values['완료 경계 코드'] ?? ''} ${values['완료 경계 실물'] ?? ''}`
+  const boundaryText = values['완료 경계 실물'] ?? '';
+  const requestedBoundary = unattainableCompletionReasons(boundaryText).length ? '' : boundaryText;
+  const requestedText = `${values['완료 경계 코드'] ?? ''} ${requestedBoundary}`
     .replace(/(?:실물|실제)\s*(?:점검|검증|확인|테스트)\s*(?:으로|로)?/giu, '')
     .replace(/real[- ]world\s+(?:check|inspection|verification|test)/giu, '');
   const describedText = `${scenario.name} ${scenario.kind} ${scenario.trigger} ${scenario.observe.join(' ')} ${scenario.expected}`;
@@ -1120,6 +1176,91 @@ function isGenericRealWorldInspectionBoundary(boundary: string, ask: string): bo
   return asksForRealInspection && !namesExternalOutcome;
 }
 
+/** Completion-boundary claims that cannot be a mergeable E4 gate. Live evidence can be proposed as a separate FU. */
+function unattainableCompletionReasons(boundary: string): string[] {
+  const rules: ReadonlyArray<readonly [string, RegExp]> = [
+    ['unconditional real-world E5', /\bE5\b|실물\s*E5/iu],
+    ['long live run', /장시간\s*(?:실런|실행|실물|live|run)|long[- ](?:running|duration)\s+(?:live\s+)?run|\b\d+[- ]hour\s+live\s+run\b|\brun\s+live\s+for\s+\d+\s*(?:hours?|days?|weeks?)\b|soak\s+run/iu],
+    ['external account', /외부\s*계정|실제\s*계정|external\s+account|real\s+account/iu],
+    ['future pinned/landed revision', /미래\s*(?:판|PR|빌드|버전).{0,24}(?:핀|착지|고정|반영)|future.{0,24}(?:pin|land|merge)|(?:after|once)\s+PR\s+#?\d+\s+(?:lands|merges)/iu],
+    ['required human work', /사람\s*(?:손|이\s*직접)|수동\s*(?:작업|조작|확인|승인)|human\s+(?:hand|intervention|action)|manually\s+(?:run|check|approve|operate)/iu],
+  ];
+  const reasons = new Set<string>();
+  for (const clause of boundary.split(/(?<=[.!?;])|,|\n/u)) {
+    for (const [reason, pattern] of rules) {
+      const globalPattern = new RegExp(pattern.source, `${pattern.flags}g`);
+      for (const match of clause.matchAll(globalPattern)) {
+        if (match.index === undefined) continue;
+        const before = clause.slice(Math.max(0, match.index - 24), match.index);
+        const after = clause.slice(match.index + match[0].length, match.index + match[0].length + 32);
+        const positiveAfter = /^\s*(?:은|는|이|가)?\s*(?:필수|반드시|무조건|해야|끝나야|required|must|only)/iu.test(after);
+        const nearby = `${before}${match[0]}${after}`;
+        const optionalAfter = /^\s*(?:(?:은|는|이|가)\s*)?(?:is\s+|are\s+)?(?:optional|선택\s*(?:사항|가능)|선택적으로|필요시|필수\s*아니|not\s+required|no\s+need)/iu.test(after);
+        const optionalBefore = /(?:optional|선택\s*(?:사항|가능)|선택적으로)\s*$/iu.test(before);
+        const optionalAlternative = optionalAfter || optionalBefore
+          || (reason === 'unconditional real-world E5' && /(?:\bE[45]\b\s*(?:또는|혹은|or)\s*E[45]\b)/iu.test(nearby));
+        const directlyNegated = /(?:\bno|\bnot|\bwithout)\s*$/iu.test(before)
+          || (/(?:없이|않고)\s*$/iu.test(before) && !positiveAfter)
+          || /^\s*(?:(?:직접\s*)?(?:확인|검증|작업|조작)\s*)?(?:없이|필요\s*없|필수\s*아니|하지\s*않|안\s*(?:한다|필요|요구)|없음|금지|제외|불필요|not\s+required|must\s+not|no\s+need|avoid)/iu.test(after);
+        if (!directlyNegated && !optionalAlternative) reasons.add(reason);
+      }
+    }
+  }
+  return [...reasons];
+}
+
+function safeCompletionBoundaryValue(value: string): string {
+  const parts = completionBoundaryParts(value);
+  const safeParts = parts.map((part) => part.trim()).filter((part) => part && unattainableCompletionReasons(part).length === 0);
+  if (safeParts.length === parts.length) return value;
+  const recovered = parts.flatMap((part) => {
+    const trimmed = part.trim();
+    if (!trimmed) return [];
+    if (unattainableCompletionReasons(trimmed).length === 0) return [trimmed];
+    const toIndex = trimmed.search(/\s+(?:to|in order to)\s+/iu);
+    if (toIndex < 0) return [];
+    const suffix = trimmed.slice(toIndex).replace(/^\s+(?:to|in order to)\s+/iu, '').trim();
+    return suffix && unattainableCompletionReasons(suffix).length === 0 ? [suffix] : [];
+  });
+  return recovered.join('; ');
+}
+
+function completionBoundaryParts(value: string): string[] {
+  return value.split(/\s+(?:and|그리고|또한|및|이며|이고|after|once|when|whenever|if|while|but)\s+(?=\S)|[,;\n]+/iu);
+}
+
+function unattainableCompletionEntries(values: Partial<Record<GoalDoneBoundaryLabel, string>>): Array<{ label: GoalDoneBoundaryLabel; value: string; reasons: string[] }> {
+  return GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => {
+    const value = values[label];
+    if (!value) return [];
+    const reasons = unattainableCompletionReasons(value);
+    return reasons.length ? [{ label, value, reasons }] : [];
+  });
+}
+
+function e4CompletionBoundary(
+  targets: readonly string[],
+  stage: ReturnType<typeof selectGoalMockStage>,
+  requestedCode: string,
+  originalBoundary: string,
+): { boundary: string; splitProposal: string } {
+  const catalog = loadMockScenarioCatalog();
+  const device = stage?.device ?? catalog.devices.find((candidate) => candidate.id === 'product-devices') ?? catalog.devices[0];
+  const scenario = stage?.scenario;
+  const scenarioId = scenario?.id ?? nextGoalScenarioId(catalog.scenarios.map((entry) => entry.id), targets);
+  const observations = scenario?.observe.join(' · ') ?? device?.observations.join(' · ') ?? '격리 시험 관측';
+  const expected = scenario?.expected ?? `격리 시험에서 ${requestedCode}의 결과가 관측된다`;
+  const event = scenario
+    ? `사건 주입 ${scenario.id}: ${scenario.trigger}; 관측=${scenario.observe.join(' · ')}; 기대=${scenario.expected}`
+    : `새 사건 주입 초안 ${scenarioId} (ScenarioV0): trigger=격리 fixture에서 «${requestedCode}» 결과를 가르는 입력 사건을 재현한다; input=${device?.inputs[0] ?? '격리 입력'}에 해당 경계의 실패 조건을 설정한다; observe=${observations}; expected=${expected}; 이 후보는 아직 실행 불가하며 ScenarioV0 형식으로 카탈로그에 등록한 뒤 회귀시험으로 실행 가능성을 증명해야 한다`;
+  const deviceName = device ? `${device.name} (${device.id})` : 'mock-scenario-catalog 장치';
+  const boundary = scenario
+    ? `E4 완료선: 격리 시험에서 ${deviceName}로 «${requestedCode}»를 위한 사건을 주입하고 ${observations}을 관측한다. 기대=${expected}. ${event}.`
+    : `E4 후보 완료선 (ScenarioV0 등록 뒤 실행 가능): ${deviceName}로 «${requestedCode}»를 위한 사건을 구체화한다. ${event}.`;
+  const splitProposal = `- 분할 제안: <칸>-LIVE — 원래 불가 조건과 실물 확인을 보존: «${originalBoundary}». 이 후속 조건은 E4 완료조건으로 쓰지 않는다.`;
+  return { boundary, splitProposal };
+}
+
 export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: string): string[] {
   const { values } = inspectGoalDoneBoundary(ask);
   const explicitLines = GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => values[label] ? [`- ${label}: ${values[label]}`] : []);
@@ -1141,10 +1282,33 @@ export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: stri
   const evidenceCommand = shouldReplaceEvidence && testPath ? `bun test ${testPath}` : existingEvidence;
   const needsNewTest = plannedTestPath !== undefined && !existsSync(resolve(repositoryRoot, plannedTestPath));
   const mockStage = targets.length ? selectGoalMockStage(ask, targets) : undefined;
+  const requestedBoundary = values['완료 경계 실물'];
+  const unattainableEntries = unattainableCompletionEntries(values);
+  const unattainableReasons = [...new Set(unattainableEntries.flatMap((entry) => entry.reasons))];
+  const originalCode = values['완료 경계 코드'] ?? '요청 대상의 완료 경계';
+  const safeCode = safeCompletionBoundaryValue(originalCode);
+  const requestedCode = !safeCode
+    ? (mockStage?.scenario?.expected ?? '카탈로그 사건의 기대 결과를 확인한다')
+    : safeCode;
+  const liveFollowupEntries = [
+    ...unattainableEntries,
+    ...(requestedBoundary && !unattainableEntries.some((entry) => entry.label === '완료 경계 실물')
+      ? [{ label: '완료 경계 실물' as const, value: requestedBoundary, reasons: [] }]
+      : []),
+  ];
+  const e4 = unattainableReasons.length
+    ? e4CompletionBoundary(targets, mockStage, requestedCode, liveFollowupEntries.map((entry) => `${entry.label}: ${entry.value}`).join(' · '))
+    : undefined;
   const lines = GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => {
+    if (label === '완료 경계 증거 명령' && e4 && unattainableEntries.some((entry) => entry.label === label)) return [`- ${label}: ${testPath ? `bun test ${testPath}` : 'bun test'}`];
+    if (label === '완료 경계 코드' && e4 && unattainableEntries.some((entry) => entry.label === label)) return safeCode ? [`- ${label}: ${safeCode}`] : [];
+    if (e4 && unattainableEntries.some((entry) => entry.label === label) && label !== '완료 경계 실물') return [];
     if (label === '완료 경계 증거 명령' && evidenceCommand !== undefined) return [`- ${label}: ${evidenceCommand}`];
+    if (label === '완료 경계 실물' && e4) return [`- ${label}: ${e4.boundary}`];
     return values[label] ? [`- ${label}: ${values[label]}`] : [];
   });
+  if (e4 && !requestedBoundary) lines.push(`- 완료 경계 실물: ${e4.boundary}`);
+  if (e4) lines.push(e4.splitProposal);
   if (needsNewTest && plannedTestPath) lines.push(`- 신설: ${plannedTestPath}`);
   if (shouldReplaceEvidence && existingEvidence && /type-?check|tsc|typescript/iu.test(existingEvidence)) {
     lines.push(`- 증거 보충: ${existingEvidence} (타입검사는 보조 검증)`);
@@ -1161,7 +1325,7 @@ export function explicitGoalDoneBoundaryLines(ask: string, repositoryRoot?: stri
       lines.push(`- 시나리오 초안: 사건은 ${targets.join(' · ') || '요청 대상'}에 «${requestedCode}» 경계를 적용한 입력; 기대는 생산 경로에서 «${requestedObservation}»을 관측하고 bun test ${plannedTestPath ?? '<대상 시험 파일>'}로 GREEN을 확인하는 것이다. 자식은 기존 카탈로그 API·ScenarioV0 형식에 맞춰 요청 대상의 사건·기대를 구체화해 등록한다.`);
     }
     const realWorldBoundary = values['완료 경계 실물'];
-    if (realWorldBoundary && isGenericRealWorldInspectionBoundary(realWorldBoundary, ask) && mockStage?.pathMatched) {
+    if (!unattainableReasons.length && realWorldBoundary && isGenericRealWorldInspectionBoundary(realWorldBoundary, ask) && mockStage?.pathMatched) {
       const { device, scenario } = mockStage;
       if (scenario) {
         lines.push(`- 목장치 치환안: 완료 경계 실물의 일반 실물 점검을 ${device.id} (${device.name})로 대체 제안; 기존 사건 주입 ${scenario.id}: ${scenario.trigger}; 관측=${scenario.observe.join(' · ')}; 기대=${scenario.expected}`);
@@ -6320,7 +6484,7 @@ function acceptanceCriteria(
   return acceptance;
 }
 
-// ── SELF-REVIEW-PRELAUNCH — 발사 전 self-review 페이즈(다섯 검사 · 1회 재저작 · 잔여 needs-human) ─────────────
+// ── SELF-REVIEW-PRELAUNCH — 발사 전 self-review 페이즈(여섯 검사 · 1회 재저작 · 잔여 needs-human) ─────────────
 /**
  * ⭐ 저작물이 «발사 전에» 자기를 검열한다 — ask 밖 목표·칸 밖 경로·미래 가정·mock 무대 누락·
  *   main 에서 실행 불가능한 완료 경계 증거 명령을 lint·발사 흐름 «앞에서» 잡는다.
@@ -6329,7 +6493,7 @@ function acceptanceCriteria(
  * ⭐ 걸리면 «1회» 재저작한다: ① 상 조각 재분해 ⊕ ② 줄 제거 ⊕ ③ FU(후속 조각) 화.
  *   그 뒤에도 남으면 «해당 조각만» needs-human verdict 로 남긴다(author.self-review 관측).
  */
-export const GOAL_AUTHOR_SELF_REVIEW_CHECKS = ['slice-difficulty', 'ask-scope', 'future-assumption', 'mock-stage', 'evidence-command'] as const;
+export const GOAL_AUTHOR_SELF_REVIEW_CHECKS = ['slice-difficulty', 'ask-scope', 'future-assumption', 'mock-stage', 'evidence-command', 'unattainable-completion'] as const;
 export type GoalSelfReviewCheck = (typeof GOAL_AUTHOR_SELF_REVIEW_CHECKS)[number];
 export type GoalSelfReviewVerdict = 'pass' | 'fixed' | 'needs-human' | 'not-applicable';
 
@@ -6431,6 +6595,46 @@ function evidenceCommandSelfReviewItem(document: string, existsOnMain: ((reposit
     : { check: 'evidence-command', verdict: 'pass', judgment: 'main-runnable', detail: `증거 명령의 모든 경로 인자가 현재 main 에 있다: ${paths.join(' · ')}` };
 }
 
+/** Completion boundaries with an E5-only/live gate cannot define the mergeable E4 slice. */
+function unattainableCompletionSelfReviewItem(document: string): GoalSelfReviewItem {
+  const values = inspectGoalDoneBoundary(document).values;
+  const boundary = values['완료 경계 실물'] ?? '';
+  const entries = unattainableCompletionEntries(values);
+  if (!boundary && entries.length === 0) return { check: 'unattainable-completion', verdict: 'not-applicable', detail: '완료 경계 선언이 없어 E4/LIVE 분할 기준을 검사하지 않는다.' };
+  const reasons = [...new Set(entries.flatMap((entry) => entry.reasons))];
+  if (reasons.length) return {
+    check: 'unattainable-completion', verdict: 'needs-human', detail: `충족 불가 완료선 — ${reasons.join(' · ')}. E4 mock/event-injection 완료선과 <칸>-LIVE 후속으로 분리해야 한다.`,
+    slice: boundary, fix: 'E4 완료선을 카탈로그 장치·사건 주입으로 쓰고 원래 실물 확인을 <칸>-LIVE로 분리한다.',
+  };
+  if (!/^E4\b/iu.test(boundary)) return {
+    check: 'unattainable-completion', verdict: 'pass', detail: '알려진 충족 불가 완료선 패턴이 없다. 이 판정은 E4 목장치 실행 증거를 주장하지 않는다.', slice: boundary,
+  };
+  if (/\bE4\b.{0,16}(?:또는|혹은|or).{0,16}\bE5\b/iu.test(boundary) && /\bE5\b.{0,24}(?:선택\s*(?:사항|가능)|optional)/iu.test(boundary)) return {
+    check: 'unattainable-completion', verdict: 'pass', detail: 'E5가 선택 사항이고 E4가 허용된 대안이다. 이 판정은 E4 목장치 실행 증거를 주장하지 않는다.', slice: boundary,
+  };
+  const catalog = loadMockScenarioCatalog();
+  const device = catalog.devices.find((candidate) => boundary.includes(candidate.id) && boundary.includes(candidate.name));
+  const scenario = catalog.scenarios.find((candidate) => boundary.includes(candidate.id) && candidate.device === device?.id);
+  const scenarioDraft = boundary.match(/새 사건 주입 초안 ([A-Z0-9-]+) \(ScenarioV0\)/u)?.[1];
+  if (!scenario && scenarioDraft && device && ['trigger=', 'input=', 'observe=', 'expected='].every((field) => boundary.includes(field))) {
+    return {
+      check: 'unattainable-completion', verdict: 'needs-human',
+      detail: `구체화된 ScenarioV0 초안 ${scenarioDraft} — trigger·input·observe·expected를 적었으나 아직 카탈로그 등록 사건이 아니므로, E4 완료선으로 쓰기 전 등록 및 회귀시험이 필요하다.`,
+      slice: boundary,
+    };
+  }
+  const missing = [
+    ...(!device ? ['카탈로그 장치 이름·id'] : []),
+    ...(!scenario ? ['등록 사건 주입 id'] : []),
+    ...(scenario && !boundary.includes(scenario.trigger) ? ['사건 trigger'] : []),
+    ...(scenario && !scenario.observe.every((observation) => boundary.includes(observation)) ? ['사건 관측'] : []),
+    ...(scenario && !boundary.includes(scenario.expected) ? ['사건 기대 결과'] : []),
+  ];
+  return missing.length
+    ? { check: 'unattainable-completion', verdict: 'needs-human', detail: `E4를 목장치 증거로 확인할 수 없음 — ${missing.join(' · ')}`, slice: boundary }
+    : { check: 'unattainable-completion', verdict: 'pass', detail: `카탈로그 E4 확인 — ${device!.name} (${device!.id}) · ${scenario!.id} trigger·관측·기대 일치`, slice: boundary };
+}
+
 interface SelfReviewPass {
   readonly items: readonly GoalSelfReviewItem[];
   readonly removeCriterionLines: readonly string[];
@@ -6506,6 +6710,7 @@ function passGoalSelfReview(input: {
 
   items.push(mockStageSelfReviewItem(input.document));
   items.push(evidenceCommandSelfReviewItem(input.document, input.existsOnMain));
+  items.push(unattainableCompletionSelfReviewItem(input.document));
   return { items, removeCriterionLines, fuCriterionLines, fuStepLines, oversizeSteps };
 }
 

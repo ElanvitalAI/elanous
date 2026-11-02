@@ -66,8 +66,8 @@ test('context reads file input and previous outputs', () => {
   const dir = mkdtempSync(join(tmpdir(), 'release-context-'));
   try {
     const file = join(dir, 'context.json');
-    writeFileSync(file, JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: 'a'.repeat(40) } } }));
-    expect(readGraphContext({ ELANOUS_GRAPH_CONTEXT: file })).toMatchObject({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: 'a'.repeat(40) } } });
+    writeFileSync(file, JSON.stringify({ graphId: 'release-loop', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: 'a'.repeat(40) } } }));
+    expect(readGraphContext({ ELANOUS_GRAPH_CONTEXT: file })).toMatchObject({ graphId: 'release-loop', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: 'a'.repeat(40) } } });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

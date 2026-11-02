@@ -88,6 +88,8 @@ export interface WarmPodProviderOptions {
   prepareFlock?: WarmPrepareFlock | null | false;
   /** Gate file this pool serves, used to bind cold prepare legs to their 1-file gate measurement key. */
   pairingGateFile?: string;
+  /** Test-only correlation for isolated reconcile simulations. */
+  observationRunIdForTest?: string;
 }
 type WarmPodProviderRuntimeOverrides = Pick<WarmPodProviderOptions, 'controlUrl' | 'fetch' | 'kubectl' | 'prepareLockDirectory'>;
 export interface WarmPodProviderLoadOptions {
@@ -417,7 +419,11 @@ export class WarmPodProvider {
     if (!configured) return false;
     const key = `${configured.host}/${configured.spec.workerId}`;
     const inFlight = this.standingWorkers.get(key);
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      const ready = await inFlight;
+      if (!ready) onFailure?.({ stage: 'prepare', reason: 'decision-unavailable' });
+      return ready;
+    }
     const preparation = withPrepareLease(configured, this.options.prepareLockDirectory,
       () => this.prepareStandingWorker(configured, this.options.prepareAbortSignal, onFailure), this.options.prepareAbortSignal,
       this.prepareFlock)
@@ -452,7 +458,7 @@ export class WarmPodProvider {
           reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
       }
     }
-    if (!ok && decision) onFailure?.(decision);
+    if (!ok) onFailure?.(decision ?? { stage: 'prepare', reason: 'decision-unavailable' });
     const totalDurationMs = this.now() - startedAt;
     const gateFile = this.options.pairingGateFile;
     // An unset gate file skips the measurement row entirely instead of recording an unpaired one.
@@ -868,7 +874,13 @@ export class WarmPodProvider {
     let pod = uniqueHostPods[0];
     const preexisting = !!pod;
     outcome.preexisting = preexisting;
-    if (pod && !matches(pod)) return fail('pod-validation', 'candidate-pod-mismatch');
+    if (pod && !matches(pod)) {
+      const actualImage = pod.spec?.containers?.[0]?.image;
+      const actualMemory = pod.spec?.containers?.[0]?.resources?.limits?.memory;
+      const reason = actualImage !== spec.image ? 'image-pin-mismatch'
+        : actualMemory !== spec.memoryLimit ? 'profile-mismatch' : 'candidate-pod-mismatch';
+      return fail('pod-validation', reason);
+    }
     // Old generations still occupy memory even when their ledger rows are quarantined.
     // Count physical warm Pods on the pinned node before admitting a new one.
     const physical = listed.filter((row: any) => row?.metadata?.labels?.['elanous.kind'] === 'warm-worker'
@@ -880,11 +892,13 @@ export class WarmPodProvider {
         workerId: spec.workerId, reason: 'physical-quota', physical }, { level: 'warn' });
       return fail('pod-list', 'physical-quota');
     }
-    const readLedger = async (): Promise<any[] | null> => {
+    const readLedger = async (): Promise<any[] | { error: string } | null> => {
       try {
         const query = new URLSearchParams({ kind: 'pod-worker-lease', machine: host, name: spec.workerId });
         const ledger = await this.controlBounded(`/v1/resources?${query}`, credential, undefined,
           WARM_CONTROL_REQUEST_TIMEOUT_MS);
+        if (ledger.status === 403 && ledger.value?.error === 'machine-scope')
+          return { error: 'machine-token-scope-mismatch' };
         return ledger.status === 200 && Array.isArray(ledger.value?.resources)
           && ledger.value.resources.length <= 1 ? ledger.value.resources : null;
       } catch { return null; }
@@ -893,6 +907,7 @@ export class WarmPodProvider {
       // A worker ID already bound to another UID must not leave a newly created, unregistered Pod.
       const before = await readLedger();
       throwIfPrepareAborted(signal);
+      if (before && !Array.isArray(before)) return fail('lease-preflight', before.error);
       if (!before || before.length !== 0) return fail('lease-preflight', 'lease-unavailable');
       const createResult = kubectl(['create', '-f', '-', '-o', 'json'], JSON.stringify(manifest));
       if (createResult.status !== 0) {
@@ -925,6 +940,7 @@ export class WarmPodProvider {
     if (!isReady) return fail('pod-ready', 'ready-deadline-exceeded');
     // Re-read after create: a registration racing the preflight must fail before our POST.
     const rows = await readLedger();
+    if (rows && !Array.isArray(rows)) return fail('lease-registration', rows.error);
     if (!rows) return fail('lease-registration', 'lease-read-failed');
     const existing = rows[0];
     const leaseTtlMs = this.options.leaseTtlMs ?? 30 * 60_000;
@@ -952,6 +968,8 @@ export class WarmPodProvider {
         ttlMs: leaseTtlMs,
       });
     } catch { return fail('lease-registration', 'worker-registration-failed'); }
+    if (registered.status === 403 && registered.value?.error === 'machine-scope')
+      return fail('lease-registration', 'machine-token-scope-mismatch');
     if (!(registered.status === 200 && registered.value?.name === spec.workerId
       && registered.value?.attrs?.state === 'idle'
       && registered.value?.attrs?.podUid === uid
@@ -983,11 +1001,13 @@ export class WarmPodProvider {
       if (prepared) ready++;
       else {
         failed.push(candidate.spec.workerId);
-        debug.log('pod.warm.provider', 'prepare-refused', { reason: decision?.reason ?? 'prepare-refused',
-          host: candidate.host, slot: candidate.spec.workerId }, { level: 'warn' });
+        debug.log('pod.warm.provider', 'prepare-refused', { reason: decision?.reason ?? 'decision-unavailable',
+          host: candidate.host, slot: candidate.spec.workerId,
+          ...(this.options.observationRunIdForTest ? { runId: this.options.observationRunIdForTest } : {}) }, { level: 'warn' });
         debug.log('pod.warm', 'pool-reconcile-decision', { profile: this.profile,
           host: candidate.host, tier: candidate.tier, workerId: candidate.spec.workerId,
-          stage: decision?.stage ?? 'prepare', reason: decision?.reason ?? 'prepare-refused',
+          stage: decision?.stage ?? 'prepare', reason: decision?.reason ?? 'decision-unavailable',
+          ...(this.options.observationRunIdForTest ? { runId: this.options.observationRunIdForTest } : {}),
           ...(decision?.stderr ? { stderr: decision.stderr } : {}),
         }, { level: 'warn' });
       }
@@ -1021,7 +1041,9 @@ export class WarmPodProvider {
     const contextFailure = probeWarmPodContext(spec.kubectlContext, this.options.kubectl);
     if (contextFailure) { lastFallback = { command: null, transport: contextFailure }; continue; }
     let acquired: { status: number; value: any };
-    const acquisitionCredential = this.options.machineTokens?.[host] ?? this.options.memberToken;
+    // Lease selection is a consumer action. Keep its owner at member scope so
+    // finalize can release it; the machine token owns registration and sanitize.
+    const acquisitionCredential = this.options.memberToken;
     const acquisition = this.control('/v1/leases/pod-worker', acquisitionCredential, {
       machine: host, key: spec.key, runId: input.runId, attemptId: input.attemptId,
       ttlMs: this.options.leaseTtlMs ?? 30 * 60_000,
@@ -1337,13 +1359,17 @@ function currentProvider(): WarmPodProvider | null {
   catch { return null; }
   return configuredProvider;
 }
-export async function requestWarmPodReplay(input: WarmReplayInput): Promise<WarmReplayResult> {
-  const provider = currentProvider();
+export async function requestWarmPodReplay(input: WarmReplayInput,
+  providerOverrideForTest?: WarmPodProvider): Promise<WarmReplayResult> {
+  const provider = providerOverrideForTest ?? currentProvider();
   const result = provider ? await provider.request(input) : fallback('no-candidate');
   debug.log('pod.warm', 'request-selection', { runId: input.runId, attemptId: input.attemptId,
     cutSha: input.cutSha, selected: result.command !== null,
     workerId: result.command?.workerId ?? null, status: result.transport.status,
     reason: result.transport.reason });
+  if (result.command && result.transport.status === 'observed' && result.transport.reason === 'complete')
+    debug.log('pod.reuse', 'warm-worker-selected', { runId: input.runId,
+    attemptId: input.attemptId, workerId: result.command.workerId, podUid: result.command.podUid });
   return result;
 }
 export async function quarantineWarmPodReplay(command: WarmWorkerCommand, reason: string): Promise<void> {

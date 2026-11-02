@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { inspectReleaseGateHost, readGateHostResourcesForHost, reserveReleaseGateHosts } from './gate-host-reservation.js';
 import { podPoolHostLease, type PodPoolMember } from '../task-orchestrator/surfaces/pod-pool.js';
 
@@ -31,6 +31,17 @@ test('a dead owner is automatically released; corrupt evidence fails closed', ()
   writeFileSync(file, '{not-json');
   expect(inspectReleaseGateHost(state, 'node-b').status).toBe('unknown');
   expect(inspectReleaseGateHost(state, 'node-c').status).toBe('unknown');
+});
+
+test('read-only reservation inspection ignores dead claims without deleting them', () => {
+  const state = root();
+  reserveReleaseGateHosts(state, 'run-gate-read-only', ['node-b']);
+  const dir = join(state, 'release', 'gate-host-reservations');
+  const file = join(dir, readdirSync(dir).find(name => name.endsWith('.json'))!);
+  const claim = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({ ...claim, pid: 99999999, pidStartedAt: null }));
+  expect(inspectReleaseGateHost(state, 'node-b', { reclaimDead: false })).toEqual({ status: 'free' });
+  expect(readdirSync(dir).filter(name => name.endsWith('.json'))).toEqual([basename(file)]);
 });
 
 test('a missing reservation directory is unmeasured, not a free host', () => {
@@ -128,11 +139,13 @@ test('mock E3-E5 host probe emits raw measured-empty evidence while ignoring unr
   expect(report.argv[2]).toBe('test');
   expect(report.argv[3]).toBe('src/release-loop/gate-node.test.ts');
   expect(report.calls).toHaveLength(1);
-  expect(report.calls[0]).toContain('get');
-  expect(report.calls[0]).toContain('pods');
-  const contextIndex = report.calls[0]?.indexOf('--context') ?? -1;
+  const [call] = report.calls;
+  if (!call) throw new Error('host probe did not call kubectl');
+  expect(call).toContain('get');
+  expect(call).toContain('pods');
+  const contextIndex = call.indexOf('--context');
   expect(contextIndex).toBeGreaterThanOrEqual(0);
-  expect(report.calls[0]?.[contextIndex + 1]).toBe('e3-e5-sim-host');
+  expect(call[contextIndex + 1]).toBe('e3-e5-sim-host');
   const measuredEmpty = { status: 'measured', empty: true, reservations: 0, authoringLeases: 0, waitingJobs: 0, activeJobs: 0 };
   expect(report.reading).toEqual(measuredEmpty);
   expect(report.probe).toMatchObject({ category: 'release-loop.gate', event: 'host-resource-probe',

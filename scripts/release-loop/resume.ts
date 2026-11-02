@@ -129,6 +129,56 @@ export function gateUnmeasuredDetail(state: GraphRunState, index: number): strin
     + (stalled.length ? ` · stalled shards ${stalled.length} (${[...reasons].map(([reason, count]) => `${reason}×${count}`).join(', ')})` : '') + measured;
 }
 
+export interface GateWaiverCoverage {
+  eligible: boolean;
+  introducedIds: string[];
+  coveredIds: string[];
+  missingIds: string[];
+  reason?: string;
+}
+
+/** A measured gate waiver is allowed only for a complete regression verdict whose every introduced test ID was explicitly accepted. */
+export function releaseResumeGateWaiverCoverage(
+  state: GraphRunState,
+  acceptedRegressions: AcceptedRegression[],
+): GateWaiverCoverage {
+  const index = state.path.indexOf('gate');
+  const record = state.nodes[index];
+  const empty = { eligible: false, introducedIds: [], coveredIds: [], missingIds: [] };
+  if (!Array.isArray(acceptedRegressions) || acceptedRegressions.some((issue) => !issue || typeof issue.id !== 'string'
+    || !issue.id.trim() || typeof issue.note !== 'string' || !issue.note.trim())) {
+    return { ...empty, reason: 'accepted regressions must be an array of {id, note}' };
+  }
+  if (index < 0 || state.path.lastIndexOf('gate') !== index || record?.nodeId !== 'gate' || record.ok !== false || record.executed !== true) {
+    return { ...empty, reason: 'gate record must be the unique executed failure on the saved path' };
+  }
+  if (gateUnmeasuredDetail(state, index) !== undefined) {
+    return { ...empty, reason: 'gate verdict is unmeasured or incomplete' };
+  }
+  const result = lastJsonObject(record.output);
+  if (!result || result.outcome !== 'fail' || result.verdict !== 'fail' || !Array.isArray(result.introduced)
+    || result.introduced.length === 0 || result.introduced.some((id) => typeof id !== 'string' || !id.trim())
+    || new Set(result.introduced).size !== result.introduced.length
+    || typeof result.preexisting !== 'number' || !Number.isSafeInteger(result.preexisting) || result.preexisting < 0
+    || typeof result.knownEnv !== 'number' || !Number.isSafeInteger(result.knownEnv) || result.knownEnv < 0
+    || typeof result.durationMs !== 'number' || !Number.isFinite(result.durationMs) || result.durationMs < 0
+    || (result.error !== undefined && (typeof result.error !== 'string' || result.error.length > 0))
+    || (!Array.isArray(result.stalledShards) || result.stalledShards.length > 0)
+    || (!Array.isArray(result.stalledEnv) || result.stalledEnv.length > 0)
+    || (!Array.isArray(result.unmeasuredRecheckFiles) || result.unmeasuredRecheckFiles.length > 0)
+    || (!Array.isArray(result.unmeasuredErrors) || result.unmeasuredErrors.length > 0)
+    || (!Array.isArray(result.rcNonzeroNoFailures) || result.rcNonzeroNoFailures.length > 0)
+    || (typeof result.abortedShards !== 'number' || !Number.isSafeInteger(result.abortedShards) || result.abortedShards !== 0)) {
+    return { ...empty, reason: 'gate output is not a complete measured regression verdict' };
+  }
+  const introducedIds = [...result.introduced] as string[];
+  const accepted = new Set(acceptedRegressions.map((issue) => issue.id));
+  const coveredIds = introducedIds.filter((id) => accepted.has(id)).sort();
+  const missingIds = introducedIds.filter((id) => !accepted.has(id)).sort();
+  return { eligible: missingIds.length === 0, introducedIds, coveredIds, missingIds,
+    ...(missingIds.length ? { reason: 'accepted regressions omit introduced IDs: ' + missingIds.join(', ') } : {}) };
+}
+
 /** Only the recorded failure at the restart boundary may be waived. `--from` is never a waiver. */
 export function releaseResumeWaiver(
   state: GraphRunState,
@@ -143,23 +193,41 @@ export function releaseResumeWaiver(
   if (opts.from !== opts.waive) throw new Error('--from must name the waived node; --from alone does not waive a failure');
   const index = state.path.indexOf(opts.waive);
   const unique = index >= 0 && state.path.lastIndexOf(opts.waive) === index;
-  // RELEASE-WAIVE-UNMEASURED (OP 10-12): a gate cut before any verdict is the only gate that may be waived — a measured gate
-  // failure or an already-waived gate stays refused (fail-closed below), and the ledger records why it was unmeasured.
-  const unmeasured = opts.waive === 'gate' && unique ? gateUnmeasuredDetail(state, index) : undefined;
-  if (unmeasured !== undefined) {
-    return { nodeId: opts.waive, reason, unmeasured, acceptedRegressions: releaseResumeAcceptedRegressions(state,
-      [...(opts.acceptedRegressions ?? []), { id: `waive:${opts.waive}`, note: reason }]) };
-  }
   if (!unique || state.path.lastIndexOf(opts.waive) !== index || state.nodes[index]?.nodeId !== opts.waive || state.nodes[index]?.ok !== false ||
-    state.nodes[index]?.executed !== true || (opts.waive === 'gate' ? !failedAfterGate(state, index)
-      : !failedAfterTrafficRestore(state, index))) {
+    (opts.waive === 'gate'
+      ? gateUnmeasuredDetail(state, index) === undefined && (state.nodes[index]?.executed !== true || !failedAfterGate(state, index))
+      : state.nodes[index]?.executed !== true || !failedAfterTrafficRestore(state, index))) {
     throw new Error(`--waive ${opts.waive} requires the failed executable node on the saved path`);
   }
+  if (opts.waive === 'gate') {
+    const unmeasured = gateUnmeasuredDetail(state, index);
+    if (unmeasured !== undefined) {
+      return { nodeId: 'gate', reason, unmeasured,
+        acceptedRegressions: releaseResumeAcceptedRegressions(state,
+          [...(opts.acceptedRegressions ?? []), { id: 'waive:gate', note: reason }]) };
+    }
+    const result = lastJsonObject(state.nodes[index]?.output);
+    if (!result || result.outcome !== 'fail') {
+      throw new Error('cannot waive a safety, side-effect or approval node');
+    }
+    const coverage = releaseResumeGateWaiverCoverage(state, opts.acceptedRegressions ?? []);
+    if (!opts.acceptedRegressions?.length && coverage.introducedIds.length === 0) {
+      throw new Error('only an unmeasured gate — stopped, killed or sweep incomplete — may be waived');
+    }
+    if (coverage.introducedIds.length === 0) {
+      throw new Error(coverage.reason ?? 'gate output is not a complete measured regression verdict');
+    }
+    if (!/^[\x20-\x7e]+$/.test(reason) || (reason.match(/[.!?](?:\s|$)/g) ?? []).length !== 2) {
+      throw new Error('--waive gate --reason must be exactly two ASCII English sentences');
+    }
+    if (!coverage.eligible) throw new Error(coverage.reason ?? 'gate waiver is not eligible');
+    return { nodeId: 'gate', reason,
+      acceptedRegressions: releaseResumeAcceptedRegressions(state,
+        [...(opts.acceptedRegressions ?? []), { id: 'waive:gate', note: reason }]) };
+  }
   // Only user-visible, non-publication checks can become accepted regressions; build, safety and approval gates stay blocking.
-  // A measured gate failure (outcome fail / introduced > 0, or any error that is not an incomplete sweep) lands here too.
   if (!['mac-smoke', 'tui'].includes(opts.waive)) {
-    throw new Error(`--waive ${opts.waive} cannot waive a safety, side-effect or approval node`
-      + (opts.waive === 'gate' ? ' (only an unmeasured gate — stopped, killed or sweep incomplete — may be waived)' : ''));
+    throw new Error(`--waive ${opts.waive} cannot waive a safety, side-effect or approval node`);
   }
   return { nodeId: opts.waive, reason, acceptedRegressions: releaseResumeAcceptedRegressions(state,
     [...(opts.acceptedRegressions ?? []), { id: `waive:${opts.waive}`, note: reason }]) };

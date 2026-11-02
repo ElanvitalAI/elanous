@@ -50,6 +50,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/morning',
   '/ops/checklist',
   '/ops/release',
+  '/ops/resources',
   '/ops/seats',
   '/observatory',
   '/outputs',

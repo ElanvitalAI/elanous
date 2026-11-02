@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
-import type { GraphRunState } from '../../src/graph-runner/runner.js';
+import { lastJsonObject, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { join } from 'node:path';
 import { emitNodeResult, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
 
@@ -110,7 +110,12 @@ function recordedWaivers(context: GraphContext, accepted: Issue[]): Issue[] {
     const index = state.path.indexOf(node);
     const record = state.nodes[index];
     const waiver = record?.waiver;
-    return index >= 0 && index < visit - 1 && record?.nodeId === node && waiver !== undefined && waiver.reason === issue.note &&
+    const originalGate = node === 'gate' ? lastJsonObject(waiver?.original.output) : undefined;
+    const measuredIdsCovered = node !== 'gate' || originalGate?.outcome !== 'fail' ||
+      (Array.isArray(originalGate.introduced) && originalGate.introduced.length > 0
+        && originalGate.introduced.every((id) => typeof id === 'string' && accepted.some((candidate) => candidate.id === id)));
+    return index >= 0 && index < visit - 1 && record?.nodeId === node && waiver !== undefined && waiver.reason === issue.note
+      && measuredIdsCovered &&
       // The runner writes a waiver only over a failed executed node (releaseResumeWaiver); its exit may be 0 (outcome fail) or null (timeout).
       record.ok === true && record.executed === false &&
       context.outputs[node]?.verdict === 'waived' && context.outputs[node]?.reason === issue.note;

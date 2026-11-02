@@ -6,14 +6,20 @@ graph_id: explainer-line
 version: 1
 entry_node: script
 terminal_nodes: [delivered, needs-human, blocked, unobserved]
-# ⭐ 요청 동작 — 3분 영상: 이 라인이 만드는 영상 계획의 목표 총 길이는 180초다(지속 필드 target_seconds · 단위 초).
-target_seconds: 180
+# ⭐ mock E4 첫 조각 — 기존 그래프에서 최소 목표 길이 60초인 영상 파일을 만들고 QC에서 ffprobe로 길이를 실측한다.
+# Telegram 실물·확정 메모 자동 트리거·3막 사전 시작·렌더 자원지도는 별도 hold-first LIVE 셀에서 다룬다.
+target_seconds: 60
 nodes:
   - node_id: script
     kind: agent
     recipe: explainer-script
     max_visits: 3
-    contract: { inputs: [facts, sources], tools: read-only, outputs: [script_path] }
+    contract: { inputs: [briefing, facts, sources], tools: workspace-write, outputs: [script_path] }
+  - node_id: scene
+    kind: agent
+    recipe: explainer-scene
+    max_visits: 2
+    contract: { inputs: [script_path, facts, sources, chart_plan], tools: workspace-write, outputs: [scene_plan, chart_plan, evidence_captions] }
   - node_id: vo
     kind: agent
     recipe: explainer-vo
@@ -23,7 +29,7 @@ nodes:
     kind: agent
     recipe: explainer-build
     max_visits: 3
-    contract: { inputs: [script_path, vo_dir], tools: workspace-write, outputs: [hyperframes_project, timeline_path] }
+    contract: { inputs: [script_path, vo_dir, scene_plan, chart_plan, evidence_captions], tools: workspace-write, outputs: [hyperframes_project, timeline_path] }
   - node_id: render
     kind: gate
     recipe: hyperframes-render
@@ -34,6 +40,11 @@ nodes:
     recipe: explainer-qc
     max_visits: 2
     contract: { inputs: [hf_render_path, script_path], tools: read-and-run, outputs: [vo_match, loudness_lufs, true_peak_db] }
+  - node_id: deliver
+    kind: agent
+    recipe: explainer-deliver
+    max_visits: 1
+    contract: { inputs: [hf_render_path, briefing], tools: network-write, outputs: [delivery_mode, local_artifact_path, telegram_message_id] }
   - node_id: delivered
     kind: judge
     recipe: terminal-delivered
@@ -51,11 +62,13 @@ nodes:
     recipe: terminal-unobserved
     max_visits: 1
 edges:
-  - { from: script, on: outcome, map: { ok: vo, no-facts: needs-human, unmeasurable: unobserved } }
+  - { from: script, on: outcome, map: { ok: scene, no-facts: needs-human, collision: needs-human, unmeasurable: unobserved } }
+  - { from: scene, on: outcome, map: { ok: vo, no-facts: needs-human, unmeasurable: unobserved } }
   - { from: vo, on: outcome, map: { ok: build, no-key: needs-human, error: blocked, unmeasurable: unobserved } }
   - { from: build, on: outcome, map: { ok: render, bad-script: script, error: blocked, unmeasurable: unobserved } }
   # check/snapshot failures are layout faults → rebuild; a wrong-length render is a timing fault → rebuild too.
   - { from: render, on: outcome, map: { ok: qc, check-fail: build, render-mismatch: build, unmeasurable: unobserved } }
   # speech ≠ script → re-voice that line; loudness off → rebuild (mix lives in the composition); public release is a human call.
-  # narration past the target_seconds(180) plan is a timing fault → rebuild too.
-  - { from: qc, on: outcome, map: { pass: delivered, vo-mismatch: vo, loudness: build, too-long: build, public: needs-human, unmeasurable: unobserved } }
+  # narration past the target_seconds(60) plan is a timing fault → rebuild too.
+  - { from: qc, on: outcome, map: { pass: deliver, vo-mismatch: vo, loudness: build, too-short: build, too-long: build, public: needs-human, unmeasurable: unobserved } }
+  - { from: deliver, on: outcome, map: { ok: delivered, no-recipient: needs-human, error: blocked, unmeasurable: unobserved } }

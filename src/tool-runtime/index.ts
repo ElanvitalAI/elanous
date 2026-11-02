@@ -61,6 +61,7 @@ import { elanousSkillsListRuntime } from './elanous-skills-list-runtime.js';
 import { skillExecRuntime } from './skill-exec-runtime.js';
 import { elanousObsidianSearchRuntime } from './elanous-obsidian-search-runtime.js';
 import { elanousObsidianInfoRuntime } from './elanous-obsidian-info-runtime.js';
+import { elanousUxSimDevicesRuntime } from './elanous-ux-sim-devices-runtime.js';
 import { ELANOUS_ASANA_RUNTIMES } from './elanous-asana-runtimes.js';
 import { elanousLinearSecretaryRuntime } from './elanous-linear-secretary-runtime.js';
 import { elanousLinearIssueRuntime } from './elanous-linear-issue-runtime.js';
@@ -169,6 +170,7 @@ export function registerAllDefaultToolRuntimes(opts: RegisterAllDefaultToolRunti
   registerToolRuntime(skillExecRuntime);
   registerToolRuntime(elanousObsidianSearchRuntime);
   registerToolRuntime(elanousObsidianInfoRuntime);
+  registerToolRuntime(elanousUxSimDevicesRuntime);
   for (const rt of ELANOUS_ASANA_RUNTIMES) registerToolRuntime(rt);
   registerToolRuntime(elanousLinearSecretaryRuntime);
   registerToolRuntime(elanousLinearIssueRuntime);

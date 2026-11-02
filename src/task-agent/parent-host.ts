@@ -220,9 +220,41 @@ function remotePath(path: string): string {
 
 /** 원격 부모 인자 — HQ 병합 권한을 넘기지 않는다: `--merge-by-host` → `--no-auto-merge` ⊕ (있으면) `--pod-pool`. */
 export function remoteParentArgs(args: readonly string[], podPool?: string): string[] {
-  const out = args.map((arg) => arg === '--merge-by-host' ? '--no-auto-merge' : arg);
-  if (!out.includes('--no-auto-merge') && out[0] === 'harness') out.splice(2, 0, '--no-auto-merge');
-  if (podPool && !out.includes('--pod-pool')) out.splice(2, 0, '--pod-pool', podPool);
+  // The remote parent may create/review PRs, but HQ retains merge authority.
+  // Strip a caller's positive opt-in before adding the negative flag so argv
+  // ordering cannot accidentally re-enable auto-merge on the remote host.
+  const valueOptions = new Set([
+    '--config-dir', '--test-state-dir', '--base', '--target', '--correlation', '--seat', '--run-priority', '--goal-type', '--child-llm-provider',
+    '--child-llm-model', '--child-llm-effort', '--substrate', '--pod-pool', '--pod-memory', '--after', '--source',
+    '--repair-commit-only', '--bench', '--author-grade', '--move-id', '--goal-file', '--concurrency', '--resume',
+    '--max-tasks', '--supervise-rounds', '--pod-source', '--pod-account', '--pod-pass-env', '--bench-arms',
+  ]);
+  let separatorIndex = -1;
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i]!;
+    if (token === '--') { separatorIndex = i; break; }
+    if (!token.includes('=') && valueOptions.has(token) && i + 1 < args.length) i++;
+  }
+  const optionArgs = separatorIndex >= 0 ? args.slice(0, separatorIndex) : args;
+  const positionalArgs = separatorIndex >= 0 ? args.slice(separatorIndex) : [];
+  const out: string[] = [];
+  let hasNoAutoMergeOption = false;
+  let hasPodPoolOption = false;
+  for (let i = 0; i < optionArgs.length; i++) {
+    const token = optionArgs[i]!;
+    const equals = token.indexOf('=');
+    const optionName = equals >= 0 ? token.slice(0, equals) : token;
+    if (optionName === '--auto-merge' && (equals < 0 || token === '--auto-merge=true')) continue;
+    if (optionName === '--no-auto-merge' && equals < 0) hasNoAutoMergeOption = true;
+    if (optionName === '--merge-by-host' && equals < 0) hasNoAutoMergeOption = true;
+    if (optionName === '--pod-pool') hasPodPoolOption = true;
+    out.push(optionName === '--merge-by-host' && equals < 0 ? '--no-auto-merge' : token);
+    if (equals < 0 && valueOptions.has(optionName) && i + 1 < optionArgs.length) out.push(optionArgs[++i]!);
+  }
+  out.push(...positionalArgs);
+  const remoteParentCommand = out[0] === 'harness' || out[0] === 'self' && out[1] === 'orchestrate';
+  if (!hasNoAutoMergeOption && remoteParentCommand) out.splice(2, 0, '--no-auto-merge');
+  if (podPool && !hasPodPoolOption) out.splice(2, 0, '--pod-pool', podPool);
   return out;
 }
 
@@ -248,6 +280,17 @@ export function remoteLaunchScript(target: ParentHostConfig, args: readonly stri
     + `cd ${shellQuote(target.cwd)} || { echo "not-launched=cwd"; exit 3; }; `
     + `${envPart ? `env ${envPart} ` : ''}nohup ${argv} >> ${remotePath(log)} 2>&1 < /dev/null & p=$!; sleep 2; `
     + `if kill -0 "$p" 2>/dev/null; then echo "pid=$p"; else echo "not-launched=early-exit"; tail -3 ${remotePath(log)}; exit 4; fi`;
+}
+
+/** Attached counterpart for CLI orchestrators: the local CLI waits and relays the remote summary/exit status. */
+export function remoteAttachedParentScript(target: ParentHostConfig, args: readonly string[], env: Record<string, string>): string {
+  const elanous = target.elanous ?? DEFAULT_REMOTE_ELANOUS;
+  const configDir = target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR;
+  const envPart = [...Object.entries(env).filter(([key]) => key !== 'ELANOUS_STATE_DIR' && /^[A-Z_][A-Z0-9_]*$/.test(key)
+    && key !== 'ELANOUS_TA_PARENT_HOST').map(([key, value]) => `${key}=${key === 'XDG_CONFIG_HOME' || key === 'CODEX_HOME' || key === 'GH_CONFIG_DIR' ? remotePath(value) : shellQuote(value)}`),
+  `ELANOUS_STATE_DIR=${remotePath(configDir)}`, `ELANOUS_STATE_DIR_SOURCE=${REMOTE_STATE_DIR_SOURCE}`].join(' ');
+  const argv = [remotePath(elanous), '--config-dir', remotePath(configDir), ...remoteParentArgs(args, target.podPool).map(shellQuote)].join(' ');
+  return `cd ${shellQuote(target.cwd)} || exit 3; env ${envPart} ${argv}`;
 }
 
 /** ssh 실행기(시험 주입). */
@@ -453,7 +496,8 @@ export function launchRemoteParent(
   if ((effectiveChildProvider ?? argvProvider) === 'grok') {
     try { debug.log('task-agent.parent-host', 'grok-host-credential', { host: target.host, runId: env.ELANOUS_RUN_ID ?? 'unknown', source: 'host-device-auth' }); } catch { /* fail-soft */ }
   }
-  const result = ssh(target.host, remoteLaunchScript(target, launchArgs, env), 30_000);
+  const result = ssh(target.host, remoteLaunchScript(target, launchArgs,
+    { ...env, ELANOUS_RESOURCE_LANE: 'ta', ELANOUS_RESOURCE_HOST: target.host }), 30_000);
   const log = remoteParentLogPath(target, env.ELANOUS_RUN_ID ?? 'unknown');
   const pid = Number(/^pid=(\d+)$/m.exec(result.stdout)?.[1]);
   if (result.status === 0 && Number.isSafeInteger(pid) && pid > 0) return { pid, log };
@@ -463,6 +507,32 @@ export function launchRemoteParent(
     throw new RemoteParentNotLaunchedError(target.host, `${refused}${tail ? `: ${tail.slice(0, 160)}` : ''}`);
   }
   throw new Error(`원격 부모 발사 결과 불확실(${target.host} · rc=${result.status}) — 중복을 피해 로컬로 다시 띄우지 않는다 · 원격에서 ELANOUS_RUN_ID=${env.ELANOUS_RUN_ID ?? '?'} 를 확인: ${(result.stderr.trim().split('\n').pop() || '').slice(0, 160)}`);
+}
+
+/** Run a parent attached to SSH so its caller can supervise and return the real exit status. */
+export function runRemoteParentAttached(
+  target: ParentHostConfig,
+  args: readonly string[],
+  env: Record<string, string>,
+  ssh?: SshRunner,
+  effectiveChildProvider?: string,
+): number {
+  const argvProvider = childProviderFromArgs(args);
+  if (effectiveChildProvider && argvProvider && argvProvider !== effectiveChildProvider) {
+    throw new Error(`effective child provider mismatch (context=${effectiveChildProvider}, argv=${argvProvider})`);
+  }
+  const launchArgs = effectiveChildProvider && !argvProvider
+    ? [...args.slice(0, 2), '--child-llm-provider', effectiveChildProvider, ...args.slice(2)]
+    : args;
+  const result = ssh
+    ? ssh(target.host, remoteAttachedParentScript(target, launchArgs, env), Number.MAX_SAFE_INTEGER)
+    : (() => {
+      const child = spawnSync('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'ControlPath=none', target.host,
+        remoteAttachedParentScript(target, launchArgs, env)], { stdio: 'inherit' });
+      return { status: child.status, stdout: '', stderr: child.error?.message ?? '' };
+    })();
+  if (result.status === null) throw new Error(`원격 부모 SSH 종료 상태를 확인하지 못함(${target.host}): ${result.stderr.slice(-200)}`);
+  return result.status;
 }
 
 /** The provider selection travels as an argv pair or assignment; absent remains the existing Codex default. */

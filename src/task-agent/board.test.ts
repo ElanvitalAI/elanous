@@ -1,9 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Command } from 'commander';
 import { registerTasksCommands, type TasksCliDeps } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
@@ -164,8 +163,7 @@ describe('보드 일반형 — 프로젝트 › 목표 › 이정표 › 과제 
 
   test('task hand --goal/--milestone 은 카드에 싣고 보드로 읽힌다 · 안 주면 카드에 칸이 없다', async () => {
     const path = join(tempDir('task-board-hand-'), 'task-agent-actions.json');
-    const target = tempDir('task-board-target-');
-    execFileSync('git', ['init', '-q', target]);
+    const target = resolve(import.meta.dir, '../..'); // 기존 worktree 가 git fixture 역할을 하므로 새 .git 디렉터리 생성은 불필요하다.
     const { lines, code } = await cli(['task', 'hand', 'first', '--project', 'p1', '--target', target, '--completion', 'code-pr', '--goal', 'g1', '--milestone', 'm1', '--json'], { taskStatePath: path });
     expect(code ?? 0).toBe(0);
     const id = JSON.parse(lines[0]!).card.id as string;

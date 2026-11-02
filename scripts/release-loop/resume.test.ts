@@ -8,6 +8,7 @@ import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { resumeReleaseRun } from './resume-release.js';
+import { debug } from '../../src/debug/log.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
 import './resume-test-traffic.js';
 
@@ -89,7 +90,7 @@ if (process.argv[2] === 'rev-list') console.log('0');
     const deps = { root, graphPath, git, runBash };
     await expect(resumeReleaseRun({ runId: first.runId, from: 'docs' }, deps)).rejects.toThrow('not a node on the saved path');
     await expect(resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui' }, deps)).rejects.toThrow('supplied together');
-    await expect(resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'gate', reason: 'Help does not close' }, deps)).rejects.toThrow('--from must name');
+    await expect(resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'gate', reason: 'Known failures remain. Users may encounter these issues.' }, deps)).rejects.toThrow('--from must name');
     await expect(resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: 'Help does not close',
       acceptedRegressions: [{ id: 'R2', note: '' }] }, deps)).rejects.toThrow('acceptedRegressions must be an array');
     await expect(resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: 'Help does not close' },
@@ -251,6 +252,70 @@ if (process.argv[2] === 'rev-list') console.log('0');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+test('release resume waives only a fully measured gate with exact accepted IDs and publishes the waiver in known issues', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-waiver-'));
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const bin = join(root, 'bin');
+  const docsTree = join(root, 'docs-tree');
+  const notes = join(docsTree, 'release/public/docs/releases', `${VERSION}.md`);
+  const introducedId = 'scripts/release-loop/env-known-failures.test.ts > loads exactly the 172 seed identities and reasons without adding entries';
+  const reason = 'Known gate failures remain in this release. Users may encounter these issues during normal use.';
+  const seenKnownIssues: Array<Array<{ id: string; note: string }>> = [];
+  let gateRuns = 0;
+  const oldLevel = debug.status().level;
+  const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: { acceptedRegressions?: Array<{id:string;note:string}> } };
+    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+    if (ctx.nodeId === 'gate') {
+      gateRuns++;
+      return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail', verdict: 'fail', commit: SHA, introduced: [introducedId],
+        preexisting: 0, knownEnv: 0, durationMs: 1500, stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 0 }) + '\n', stderr: '' };
+    }
+    if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
+    if (ctx.nodeId === 'known-issues') {
+      seenKnownIssues.push(ctx.input.acceptedRegressions ?? []);
+      const child = spawnSync('bash', ['-c', body], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8',
+        env: { ...opts.env, PATH: `${bin}:${process.env.PATH}` } });
+      return { exitCode: child.status ?? 2, stdout: child.stdout, stderr: child.stderr };
+    }
+    return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
+  };
+  const git = (args: string[]) => args[0] === 'ls-remote' ? `${SHA}\trefs/heads/release/${VERSION}` : args[0] === 'rev-parse' ? SHA : '';
+  try {
+    mkdirSync(join(docsTree, 'release/public/docs/releases'), { recursive: true });
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'elanous'), `#!/usr/bin/env node
+console.log(JSON.stringify({ reply: JSON.stringify([{ id: '${introducedId}', bullet: 'The example capability may fail during use.' }]) }));
+`);
+    writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+if (process.argv[2] === 'rev-list') console.log('0');
+`);
+    chmodSync(join(bin, 'elanous'), 0o755);
+    chmodSync(join(bin, 'git'), 0o755);
+    writeFileSync(notes, '# Release\n');
+    const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
+    expect(first.status).toBe('failed');
+    expect(first.nodes.find((node) => node.nodeId === 'gate')).toMatchObject({ ok: false, executed: true });
+    const statePath = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
+    const before = readFileSync(statePath, 'utf8');
+    debug.setLevel('normal');
+    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate', waive: 'gate', reason,
+      acceptedRegressions: [{ id: 'another.test.ts > not enough', note: 'Another failure remains' }] }, { root, graphPath, git, runBash }))
+      .rejects.toThrow(introducedId);
+    expect(readFileSync(statePath, 'utf8')).toBe(before);
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'gate', waive: 'gate', reason,
+      acceptedRegressions: [{ id: introducedId, note: 'The example capability may fail during use.' }] }, { root, graphPath, git, runBash });
+    expect(resumed.state.status).toBe('done');
+    expect(resumed.state.path).toContain('publish');
+    expect(gateRuns).toBe(1);
+    expect(seenKnownIssues.at(-1)).toEqual([
+      { id: introducedId, note: 'The example capability may fail during use.' }, { id: 'waive:gate', note: reason },
+    ]);
+    expect(readFileSync(notes, 'utf8')).toContain('Known gate failures remain in this release.');
+    expect(readFileSync(notes, 'utf8')).toContain('The example capability may fail during use.');
+  } finally { debug.setLevel(oldLevel); rmSync(root, { recursive: true, force: true }); }
+}, 60_000);
 
 test('accepted regressions without a waiver are persisted and delivered to the graph and known-issues node', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-accepted-resume-'));
@@ -426,9 +491,20 @@ test('release resume CLI validates waiver JSON and pairing before opening a save
     expect((await invoke('--waive', 'tui', '--reason', 'Help does not close', '--accepted-regressions', '{}')).error).toContain('acceptedRegressions must be an array');
     expect((await invoke('--waive', 'tui')).error).toContain('supplied together');
     expect((await invoke('--waive', '', '--reason', 'Help does not close')).error).toContain('--waive must not be empty');
-    expect((await invoke('--accepted-regressions', '[]')).error).toContain('release run has no input');
-    expect((await invoke('--gate-pod-pool', 'pool-new')).error).toContain('release run has no input');
+    expect((await invoke('--accepted-regressions', '[]')).error).toContain('run identity mismatch');
+    expect((await invoke('--gate-pod-pool', 'pool-new')).error).toContain('run identity mismatch');
     expect((await invoke()).error).toContain('run identity mismatch');
+    process.exitCode = 0;
+    const waiveWithoutFrom = new Command();
+    registerReleaseCommands(waiveWithoutFrom);
+    await waiveWithoutFrom.parseAsync(['release', 'resume', '--run', 'missing', '--waive', 'gate', '--reason',
+      'Known failures remain. Users may encounter these issues.', '--accepted-regressions', '[]', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!).error).toContain('run identity mismatch');
+    const legacyTuiWithoutFrom = new Command();
+    registerReleaseCommands(legacyTuiWithoutFrom);
+    await legacyTuiWithoutFrom.parseAsync(['release', 'resume', '--run', 'missing', '--waive', 'tui', '--reason',
+      'Help does not close. Users may encounter this issue.', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!).error).toContain('--from is required unless --waive gate is used');
   } finally {
     process.stdout.write = write;
     process.exitCode = previousExit ?? 0;
@@ -471,6 +547,41 @@ test('release resume --gate-pod-pool updates the saved run input before re-runni
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 120_000);
 
+test('gate waiver requires a complete verdict and exact coverage of every introduced ID', () => {
+  const ids = ['src/a.test.ts > first failure', 'src/b.test.ts > second failure'];
+  const reason = 'Known gate failures remain in this release. Users may encounter these issues during normal use.';
+  const stateFor = (output: Record<string, unknown>, executed = true) => ({
+    path: ['version-release', 'gate', 'gate-triage', 'traffic-failed-restore', 'failed'],
+    nodes: [
+      { nodeId: 'version-release', ok: true, executed: true, exit: 0 },
+      { nodeId: 'gate', ok: false, executed, exit: 1, output: JSON.stringify(output) },
+      { nodeId: 'gate-triage', ok: true, executed: true, exit: 0 },
+      { nodeId: 'traffic-failed-restore', ok: true, executed: true, exit: 0 },
+      { nodeId: 'failed', ok: true, executed: false, exit: null },
+    ],
+    input: { version: VERSION }, statePath: '/tmp/release-gate-waive-test.json',
+  }) as GraphRunState;
+  const verdict = { outcome: 'fail', verdict: 'fail', introduced: ids, preexisting: 2, knownEnv: 0, durationMs: 12_000,
+    stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 0 };
+  expect(() => releaseResumeWaiver(stateFor(verdict), { from: 'gate', waive: 'gate', reason,
+    acceptedRegressions: [{ id: ids[0]!, note: 'Failure remains' }] })).toThrow(ids[1]!);
+  const unmeasured = { ...verdict, outcome: 'error', introduced: [], error: 'pod sweep incomplete', stalledShards: [{ reason: 'no-output' }] };
+  expect(releaseResumeWaiver(stateFor(unmeasured), { from: 'gate', waive: 'gate', reason,
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })?.unmeasured).toContain('sweep incomplete');
+  expect(() => releaseResumeWaiver(stateFor(verdict, false), { from: 'gate', waive: 'gate', reason,
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow(/failed executable node/);
+  const missingCompleteness = { ...verdict }; delete (missingCompleteness as Record<string, unknown>).rcNonzeroNoFailures;
+  expect(() => releaseResumeWaiver(stateFor(missingCompleteness), { from: 'gate', waive: 'gate', reason,
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow('complete measured regression verdict');
+  const malformedCompleteness = { ...verdict, unmeasuredErrors: 'none' };
+  expect(() => releaseResumeWaiver(stateFor(malformedCompleteness), { from: 'gate', waive: 'gate', reason,
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow('complete measured regression verdict');
+  const waived = releaseResumeWaiver(stateFor(verdict), { from: 'gate', waive: 'gate', reason,
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) });
+  expect(waived).toMatchObject({ nodeId: 'gate', reason, acceptedRegressions: [...ids.map((id) => ({ id, note: 'Failure remains' })),
+    { id: 'waive:gate', note: reason }] });
+});
+
 test('waiver rejects unrecorded nodes, unsafe side effects, invalid input and duplicate public issue IDs', () => {
   const state = { path: ['version-release', 'tui', 'failed'], nodes: [{ nodeId: 'version-release', ok: true, executed: true },
     { nodeId: 'tui', ok: false, executed: true }, { nodeId: 'failed', ok: true, executed: false }], input: { version: VERSION } } as GraphRunState;
@@ -490,7 +601,7 @@ test('waiver rejects unrecorded nodes, unsafe side effects, invalid input and du
   state.path[1] = 'publish'; state.nodes[1]!.nodeId = 'publish';
   expect(() => releaseResumeWaiver(state, { from: 'publish', waive: 'publish', reason: 'issue' })).toThrow('cannot waive a safety, side-effect');
   state.path[1] = 'gate'; state.nodes[1]!.nodeId = 'gate';
-  expect(() => releaseResumeWaiver(state, { from: 'gate', waive: 'gate', reason: 'issue' })).toThrow('cannot waive a safety');
+  expect(() => releaseResumeWaiver(state, { from: 'gate', waive: 'gate', reason: 'Known failure persists. Users may encounter it.' })).toThrow('cannot waive a safety, side-effect');
   state.path[1] = 'tui'; state.nodes[1]!.nodeId = 'tui';
   state.nodes[1]!.executed = false;
   expect(() => releaseResumeWaiver(state, { from: 'tui', waive: 'tui', reason: 'issue' })).toThrow('requires the failed executable node');

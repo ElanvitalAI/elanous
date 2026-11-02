@@ -1494,11 +1494,31 @@ async function walk(): Promise<number> {
     told[kv.slice(0, at)] = n;
   }
   if (Object.keys(told).length) state.told = told;
+  const telegramChatId = state.telegram_chat_id;
+  const telegramToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  if (graphId === 'explainer-line' && (typeof telegramChatId === 'string' || typeof telegramChatId === 'number') && telegramToken) {
+    state.sendTelegramVideo = async (file: string, briefing: unknown): Promise<string> => {
+      const form = new FormData();
+      form.set('chat_id', String(telegramChatId));
+      form.set('video', new Blob([readFileSync(file)], { type: 'video/mp4' }), 'briefing.mp4');
+      const title = briefing && typeof briefing === 'object' && 'title' in briefing
+        ? String((briefing as { title: unknown }).title)
+        : '60초 브리핑 영상';
+      form.set('caption', title);
+      const apiBase = (process.env.TELEGRAM_API_BASE ?? 'https://api.telegram.org').replace(/\/$/, '');
+      const response = await fetch(`${apiBase}/bot${telegramToken}/sendVideo`, { method: 'POST', body: form });
+      const payload = await response.json() as { ok?: boolean; result?: { message_id?: number | string }; description?: string };
+      if (!response.ok || payload.ok !== true || payload.result?.message_id === undefined) {
+        throw new Error(`Telegram sendVideo failed: ${payload.description ?? `HTTP ${response.status}`}`);
+      }
+      return String(payload.result.message_id);
+    };
+  }
   const workdir = opt('out') || join(tmpdir(), `walk-${graphId}-${Date.now()}`);
   mkdirSync(workdir, { recursive: true });
   const quiet = flag('json');
   if (!quiet) console.log(`\n🚶 ${spec.graph_id} (노드 ${spec.nodes.length}) · 작업 ${workdir}${Object.keys(told).length ? ` · 🗣️ 말해 준 사실 ${JSON.stringify(told)} (⛔ 실측 아님)` : ''}\n`);
-  const r = await walkLine({ spec: spec as GraphSpecLike, walker, state, workdir, onStep: (row) => { if (!quiet) console.log(formatStep(row)); } });
+  const r = await walkLine({ spec: spec as GraphSpecLike, walker, state, workdir, recipes: ALL_RECIPES, onStep: (row) => { if (!quiet) console.log(formatStep(row)); } });
   if (quiet) await writeStdoutJson(JSON.stringify({ graphId, decl, workdir, told, ...r }, null, 2) + '\n');
   else {
     console.log(`\n═══ 종단 ${r.terminal ?? '(없음)'} · stop ${r.stopReason} · 걸음 ${r.steps} ═══\n   ${r.path}`);

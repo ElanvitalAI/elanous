@@ -29,7 +29,7 @@ import { join } from 'node:path';
 import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, resolveCodexAccount, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
 import { decodeJWTPayload } from './jwt.js';
-import { authStorePath, isUnderTestRunner } from './store.js';
+import { authStorePath, isUnderTestRunner, readCodexMirrorTokens } from './store.js';
 import { codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { platform, release, arch } from 'node:os';
 import {
@@ -428,10 +428,26 @@ function remainingSeconds(state: ProviderAuthState | null): number | null {
   return Math.round((exp - Date.now()) / 1000);
 }
 
+function hasLocalCodexLogin(): boolean {
+  try {
+    const account = resolveCodexAccount(process.env, { storedHome: (key) => loadTokens(key)?.codexHome });
+    if (loadTokens(account.storeKey)) return true;
+    const home = effectiveCodexHome(account, null, process.env).home;
+    return Boolean(home && readCodexMirrorTokens(join(home, 'auth.json')));
+  } catch {
+    return false;
+  }
+}
+
 export async function loadFreshCodexAuthState(
   opts: { fetchImpl?: typeof fetch; mirrorCodex?: boolean; ownerMirrorPath?: string } = {},
 ): Promise<ProviderAuthState | null> {
   let tokenOwnerHost = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && isUnderTestRunner();
+  if (!tokenOwnerHost && process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && hasLocalCodexLogin()) {
+    // A standalone machine with a user's own Codex login is an owner. Seats and Pods
+    // stay mirror-only because their access-only environment is an explicit fence.
+    tokenOwnerHost = true;
+  }
   if (!tokenOwnerHost && process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && isCodexTokenOwnerHost()) {
     const { hqFenceDecision } = await import('../hq/hq.js');
     tokenOwnerHost = hqFenceDecision('ledger-cli').run;

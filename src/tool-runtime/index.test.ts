@@ -14,7 +14,7 @@ import {
   setMcpProxyBootstrapOptsForTest,
   _resetMcpProxyBootstrapForTest,
 } from './mcp-proxy-bootstrap.js';
-import { _resetToolRuntimeRegistryForTest, dispatchToolByName, listToolRuntimes } from './registry.js';
+import { _resetToolRuntimeRegistryForTest, dispatchToolByName, getToolRuntime, listToolRuntimes } from './registry.js';
 
 const ctx = { surface: 'tui' as const };
 
@@ -140,4 +140,19 @@ describe('registerAllDefaultToolRuntimes — 생산 진입점 배선', () => {
     expect(starts).toEqual([]);
     expect(listToolRuntimes('tui').map((rt) => rt.id)).toContain('aside.repl');
   });
+});
+
+
+test('Nexus catalog tool is wired through the default MCP runtime registry', async () => {
+  setMcpProxyBootstrapOptsForTest({
+    servers: [],
+    handshakeTimeoutMs: 0,
+    createClient: () => fakeClient([]),
+  });
+  registerAllDefaultToolRuntimes({ mcpLazyBoot: true });
+  const runtime = getToolRuntime('elanous_ux_sim_devices');
+  expect(runtime).toBeDefined();
+  expect(listToolRuntimes('mcp').map((entry) => entry.id)).toContain('elanous_ux_sim_devices');
+  const result = await dispatchToolByName('elanous_ux_sim_devices', {}, { surface: 'mcp' });
+  expect(result.output).toContain('Mock/test catalog v2:');
 });

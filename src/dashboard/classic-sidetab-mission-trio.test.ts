@@ -44,7 +44,7 @@ test('two completed hands write one synthesis record with attribution rows and n
     expect(contents).toContain('## 채택 결과\n_최종 채택문은 알림을 받은 부모 응답에서 작성한다.');
     expect(contents).toContain('## 채택 근거\n_후보별 상태와 원문은 위 표에 기록했다.');
     const resultFiles = readdirSync(join(cwd, '.elanous', 'mission-results'));
-    expect(resultFiles).toEqual([synthesisPath.split('/').at(-1)]);
+    expect(resultFiles).toEqual([synthesisPath.split('/').at(-1)!]);
     const payload = JSON.parse(notification.output) as { artifacts: string[]; body: string };
     expect(payload.artifacts).toEqual([synthesisPath]);
     expect(payload.body).toContain(`Synthesis record: ${synthesisPath}`);
@@ -297,6 +297,9 @@ test('sidetab mission tool opts into one same-goal three-hand comparison and rej
   expect(seen).toEqual(['same task']);
   const emptyParallel = await tool.dispatch({ agent: 'codex', mission: 'same task', parallelMission: '', withGrok: true });
   expect(emptyParallel.status).toBe('running');
+  const duplicatedParallel = await tool.dispatch({ agent: 'codex', mission: 'same task', parallelMission: 'same task', withGrok: true });
+  expect(duplicatedParallel).toMatchObject({ status: 'running', id: 'codex-1' });
+  expect(duplicatedParallel.body).toContain('Three-hand comparison started');
   const emptyLinearIssue = await tool.dispatch({ agent: 'codex', mission: 'same task', linearIssueId: '', withGrok: true });
   expect(emptyLinearIssue.status).toBe('running');
   expect(emptyLinearIssue.body).not.toContain('Linked Linear');
@@ -308,7 +311,7 @@ test('sidetab mission tool opts into one same-goal three-hand comparison and rej
   expect(linkedLinearIssue.status).toBe('running');
   expect(linkedLinearIssue.body).toContain('Linked Linear progress is not synchronized');
   expect(linkedIssueIds.at(-1)).toBe('DEMO-123');
-  expect(seen).toEqual(['same task', 'same task', 'same task', 'same task']);
+  expect(seen).toEqual(['same task', 'same task', 'same task', 'same task', 'same task']);
   const rejected = await tool.dispatch({ agent: 'codex', mission: 'primary', parallelMission: 'different', withGrok: true });
   expect(rejected).toMatchObject({ status: 'error' });
   expect(rejected.body).toContain('omit parallelMission');

@@ -1,11 +1,16 @@
-import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { afterEach, expect, jest, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildErrorReport, ERROR_REPORT_URL, hash12, installId, reportError, retryPendingErrorReport, scrubText, stripStackPaths, type ErrorReportDeps } from './report.js';
+import { buildErrorReport, captureFatal, ERROR_REPORT_URL, flushCrashQueue, hash12, installId, reportError, retryPendingErrorReport, scrubText, stripStackPaths, type ErrorReportDeps } from './report.js';
 
 const dirs: string[] = [];
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+let fakeTimersActive = false;
+afterEach(() => {
+  if (fakeTimersActive) { jest.clearAllTimers(); jest.useRealTimers(); fakeTimersActive = false; }
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 const dir = () => { const d = mkdtempSync(join(tmpdir(), 'er1-')); dirs.push(d); return d; };
 
 function deps(over: Partial<ErrorReportDeps> & { calls?: Array<{ url: string; body: Record<string, unknown> }> } = {}): ErrorReportDeps {
@@ -118,6 +123,141 @@ test('a failed send keeps exactly one copy and retries it at most once a day, th
   now += 24 * 60 * 60_000 + 1;
   expect(await retryPendingErrorReport(ds)).toEqual({ sent: true, reportId: 'er_LATER' });
   expect(existsSync(pending)).toBe(false);
+});
+
+test('FATAL-REPORT-AUTO: crash records flush once through ER1 with secrets scrubbed; no consent never sends', async () => {
+  const d = dir();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const ds = deps({ calls, configDir: () => d });
+  captureFatal(new Error('fatal token=testing-secret-123456'), { surface: 'cli', ...ds });
+  const localRecords = readdirSync(join(d, 'crash'));
+  expect(localRecords).toHaveLength(1);
+  expect(readFileSync(join(d, 'crash', localRecords[0]!), 'utf8')).not.toContain('testing-secret-123456');
+  const [firstFlush, concurrentFlush] = await Promise.all([flushCrashQueue(ds), flushCrashQueue(ds)]);
+  expect(firstFlush).toMatchObject({ sent: 1, skipped: 0 });
+  expect(concurrentFlush).toEqual(firstFlush);
+  expect(calls).toHaveLength(1);
+  expect(JSON.stringify(calls[0]!.body)).not.toContain('testing-secret-123456');
+  expect(await flushCrashQueue(ds)).toMatchObject({ sent: 0 });
+
+  const bounded = dir();
+  for (let i = 0; i < 22; i++) captureFatal(new Error(`fatal-${i}`), { surface: 'cli', configDir: () => bounded, settings: () => ({ enabled: true, identity: false, consented: true }), enabledByEnvironment: () => true });
+  expect(readdirSync(join(bounded, 'crash'))).toHaveLength(20);
+
+  const declined = dir();
+  captureFatal(new Error('declined fatal token=declined-secret-123456'), {
+    surface: 'cli',
+    configDir: () => declined,
+    settings: () => ({ enabled: true, identity: false, consented: false }),
+    enabledByEnvironment: () => true,
+  });
+  expect(await flushCrashQueue({ ...ds, configDir: () => declined, settings: () => ({ enabled: true, identity: false, consented: false }) })).toMatchObject({ sent: 0, skipped: 1 });
+  expect(calls).toHaveLength(1);
+});
+
+test('FATAL-REPORT-AUTO: an actual fatal child exit is delivered once on the next startup', async () => {
+  const d = dir();
+  writeFileSync(join(d, 'config.json'), JSON.stringify({ errorReports: { enabled: true, noticeShown: true } }), { mode: 0o600 });
+  const configUrl = new URL('../elanous-config-dir.ts', import.meta.url).href;
+  const reportUrl = new URL('./report.ts', import.meta.url).href;
+  const child = `delete process.env.BUN_TEST; process.env.NODE_ENV='production'; const c=await import(${JSON.stringify(configUrl)}); c.setElanousConfigDir(process.env.FATAL_TEST_CONFIG); const r=await import(${JSON.stringify(reportUrl)}); r.installFatalErrorHandlers('cli'); setTimeout(()=>{throw new Error('token=child-secret-123456');},0);`;
+  const exited = spawnSync(process.execPath, ['-e', child], { encoding: 'utf8', env: { ...process.env, FATAL_TEST_CONFIG: d, NODE_ENV: 'production' } });
+  expect(exited.status).toBe(1);
+  expect(exited.stderr).toContain('child-secret-123456'); // fatal hook records without suppressing Bun's original diagnostic.
+  const files = readdirSync(join(d, 'crash')).filter((name) => name.endsWith('.json'));
+  expect(files).toHaveLength(1);
+  expect(readFileSync(join(d, 'crash', files[0]!), 'utf8')).not.toContain('child-secret-123456');
+
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  expect(await flushCrashQueue(deps({ calls, configDir: () => d }))).toMatchObject({ sent: 1, skipped: 0 });
+  expect(calls).toHaveLength(1);
+  expect(JSON.stringify(calls[0]!.body)).not.toContain('child-secret-123456');
+  expect(await flushCrashQueue(deps({ calls, configDir: () => d }))).toMatchObject({ sent: 0 });
+  expect(calls).toHaveLength(1);
+});
+
+test('FATAL-REPORT-AUTO: the production CLI crash then restart uses its config, notifies once, and honors revoked identity consent', () => {
+  const runCliRestart = (configDir: string, sentFile: string) => {
+    const binUrl = new URL('../../bin/elanous.mjs', import.meta.url).href;
+    const child = `delete process.env.BUN_TEST; process.env.NODE_ENV='production'; process.env.ELANOUS_FAST_ROUTER='0';
+      globalThis.fetch=async (_url, init)=>{ const fs=await import('node:fs'); fs.writeFileSync(process.env.FATAL_SENT_FILE, String(init.body)); return Response.json({reportId:'er_FAKE'}, {status:202}); };
+      process.argv=[process.execPath, new URL(${JSON.stringify(binUrl)}).pathname, '--config-dir', process.env.FATAL_TEST_CONFIG, '--help']; await import(${JSON.stringify(binUrl)});`;
+    return spawnSync(process.execPath, ['-e', child], { encoding: 'utf8', env: { ...process.env, FATAL_TEST_CONFIG: configDir, FATAL_SENT_FILE: sentFile, NODE_ENV: 'production', BUN_TEST: '' } });
+  };
+
+  const consentedDir = dir();
+  const configFile = join(consentedDir, 'config.json');
+  writeFileSync(configFile, JSON.stringify({ errorReports: { enabled: true, noticeShown: true, identity: true, email: 'old@example.com' } }), { mode: 0o600 });
+  const binUrl = new URL('../../bin/elanous.mjs', import.meta.url).href;
+  const fatalChild = `delete process.env.BUN_TEST; process.env.NODE_ENV='production'; process.env.ELANOUS_FAST_ROUTER='0';
+    process.argv=[process.execPath, new URL(${JSON.stringify(binUrl)}).pathname, '--config-dir', process.env.FATAL_TEST_CONFIG, 'where', '--json'];
+    await import(${JSON.stringify(binUrl)}); setTimeout(()=>{throw new Error('token=production-child-secret-123456');},250);`;
+  const crashed = spawnSync(process.execPath, ['-e', fatalChild], { encoding: 'utf8', env: { ...process.env, FATAL_TEST_CONFIG: consentedDir, NODE_ENV: 'production', BUN_TEST: '' } });
+  expect(crashed.status).toBe(1);
+  expect(crashed.stderr).toContain('production-child-secret-123456');
+  const crashFiles = readdirSync(join(consentedDir, 'crash')).filter((name) => name.endsWith('.json'));
+  expect(crashFiles).toHaveLength(1);
+  expect(readFileSync(join(consentedDir, 'crash', crashFiles[0]!), 'utf8')).not.toContain('production-child-secret-123456');
+  // The report was captured while identity sharing was enabled. Revoke it before next startup.
+  writeFileSync(configFile, JSON.stringify({ errorReports: { enabled: true, noticeShown: true, identity: false, email: 'old@example.com' } }), { mode: 0o600 });
+  const sentFile = join(consentedDir, 'fake-receiver.json');
+  const restarted = runCliRestart(consentedDir, sentFile);
+  expect(restarted.status).toBe(0);
+  expect(restarted.stderr).toContain('이전 실행의 치명 오류 보고 1건을 전송했습니다.');
+  const sent = JSON.parse(readFileSync(sentFile, 'utf8')) as { who: { email?: string }; message: string };
+  expect(sent.who.email).toBeUndefined();
+  expect(sent.message).toContain('Error:');
+  expect(sent.message).not.toContain('production-child-secret-123456');
+
+  const declinedDir = dir();
+  writeFileSync(join(declinedDir, 'config.json'), JSON.stringify({ errorReports: { enabled: true, noticeShown: false, identity: false } }), { mode: 0o600 });
+  captureFatal(new Error('declined crash'), { surface: 'cli', configDir: () => declinedDir, settings: () => ({ enabled: true, identity: true, consented: true, email: 'private@example.com' }), enabledByEnvironment: () => true });
+  const declinedSentFile = join(declinedDir, 'fake-receiver.json');
+  const declined = runCliRestart(declinedDir, declinedSentFile);
+  expect(declined.status).toBe(0);
+  expect(declined.stderr).toContain('동의가 없어 전송하지 않았습니다.');
+  expect(existsSync(declinedSentFile)).toBe(false);
+}, 60_000);
+
+test('FATAL-REPORT-AUTO: crash spool expires records older than seven days', async () => {
+  const d = dir();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const base = 1_800_000_000_000;
+  const configDir = () => d;
+  const settings = () => ({ enabled: true, identity: false, consented: true });
+  captureFatal(new Error('old crash'), { surface: 'cli', configDir, settings, now: () => base, enabledByEnvironment: () => true });
+  const result = await flushCrashQueue(deps({ calls, configDir, now: () => base + 8 * 24 * 60 * 60_000 }));
+  expect(result).toMatchObject({ sent: 0, skipped: 0 });
+  expect(readdirSync(join(d, 'crash'))).toHaveLength(0);
+
+  captureFatal(new Error('fresh crash'), { surface: 'cli', configDir, settings, now: () => base + 8 * 24 * 60 * 60_000, enabledByEnvironment: () => true });
+  const freshResult = await flushCrashQueue(deps({ calls, configDir, now: () => base + 8 * 24 * 60 * 60_000 }));
+  expect(freshResult).toMatchObject({ sent: 1, skipped: 0 });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.body.message).toContain('fresh crash');
+  expect(readdirSync(join(d, 'crash'))).toHaveLength(0);
+});
+
+test('FATAL-REPORT-AUTO: a failed crash send retries after connectivity recovers in the same process', async () => {
+  jest.useFakeTimers({ now: 1_800_000_000_000 });
+  fakeTimersActive = true;
+  const d = dir();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  let online = false;
+  const ds = deps({ configDir: () => d,
+    fetchImpl: (async (url: string, init: RequestInit) => {
+      calls.push({ url, body: JSON.parse(String(init.body)) });
+      return online ? Response.json({ reportId: 'er_RECOVERED' }, { status: 202 }) : new Response('offline', { status: 503 });
+    }) as unknown as typeof fetch,
+  });
+  captureFatal(new Error('temporary offline'), { surface: 'cli', ...ds });
+  expect(await flushCrashQueue(ds)).toMatchObject({ sent: 0, skipped: 0 });
+  expect(calls).toHaveLength(1);
+  online = true;
+  jest.advanceTimersByTime(60_000);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  expect(calls).toHaveLength(2);
+  expect(readdirSync(join(d, 'crash'))).toHaveLength(0);
 });
 
 test('first-run notice line names identity fields only when identity reporting is on', async () => {

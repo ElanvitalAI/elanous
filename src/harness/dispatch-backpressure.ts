@@ -5,8 +5,8 @@ import { homedir } from 'node:os';
 import { logsDbPath, LogStore, type LogStoreRow, type LogQuery } from '../mss/logging/log-store.js';
 import { getUserConfig } from '../user-config.js';
 import { harnessQueuePath } from './harness-queue.js';
-import { leaseKubectl, measurePoolLease, recommendConcurrency } from '../task-orchestrator/surfaces/pod-lease.js';
-import { parsePodPool, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
+import { leaseKubectl, measurePoolLease, recommendConcurrency, type PodLeaseMember } from '../task-orchestrator/surfaces/pod-lease.js';
+import { parsePodPool, resolvePodPoolSpec, type PodPoolMember, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { defaultSshRunner, resolveParentHosts, type SshRunner } from '../task-agent/parent-host.js';
 import { debug } from '../debug/log.js';
@@ -37,11 +37,12 @@ export interface BackpressureSignals {
   podRecommended: BackpressureSignal;
   staleParents: BackpressureSignal;
   /**
-   * Parts that could not be measured while the signal's number is still a measured lower bound (e.g. the remote
-   * half of admitWaiting after an ssh failure, local half counted). Each part is an unknown (cap 1); the number
-   * still applies so measured saturation keeps winning.
+   * Parts that could not be measured while the signal's number is still a measured lower bound. The missing part
+   * remains visible in reasons; uncertainty here does not throttle the launch budget.
    */
   unmeasured?: string[];
+  /** Host-scoped remote observation failures; diagnostic only, never a budget cap. */
+  remoteReasons?: string[];
 }
 
 const constants = { BUILD_STOP, BUILD_SLOW, QUEUE_STOP, QUEUE_SLOW, UNKNOWN_CAP };
@@ -61,10 +62,12 @@ export function decideBackpressure(input: BackpressureSignals, { maxPerCycle = 6
   };
   const unmeasured = Array.isArray(input.unmeasured) ? input.unmeasured.filter((part): part is string => typeof part === 'string' && part.length > 0) : [];
   if (unmeasured.length) signals.unmeasured = unmeasured;
-  const reasons: string[] = [];
+  const remoteReasons = Array.isArray(input.remoteReasons) ? input.remoteReasons.filter((x): x is string => typeof x === 'string' && x.length > 0) : [];
+  if (remoteReasons.length) signals.remoteReasons = remoteReasons;
+  const reasons: string[] = [...remoteReasons];
   let budget = max;
   const unknown = (name: string, value: BackpressureSignal) => {
-    if (value === 'unknown') { reasons.push(`unknown:${name}`); budget = Math.min(budget, UNKNOWN_CAP); }
+    if (value === 'unknown') { reasons.push(`unknown:${name}`); if (!name.endsWith('.remote') && name !== 'podRecommended') budget = Math.min(budget, UNKNOWN_CAP); }
   };
   for (const [name, value] of [
     ['queueDepth', signals.queueDepth], ['admitWaiting', signals.admitWaiting],
@@ -116,6 +119,7 @@ export interface BackpressureReadDeps {
   now?: () => number;
   queue?: () => unknown;
   podRecommended?: () => number | null;
+  podPool?: () => string | null;
   logs?: (query: LogQuery) => readonly AdmissionRow[];
   ps?: () => string;
   currentVersion?: () => string;
@@ -127,19 +131,73 @@ function readQueue(): unknown {
   return JSON.parse(readFileSync(harnessQueuePath(), 'utf8'));
 }
 
-/** Same pool, usage and recommendation inputs as pod lease status; DNS is deliberately skipped (no disposable Pod). */
-function readPodRecommendation(): number | null {
+export function quoteRemoteKubectlArg(value: string): string {
+  return "'" + value.replaceAll("'", "'\"'\"'") + "'";
+}
+
+function readPodPoolMembers(deps: BackpressureReadDeps): PodPoolMember[] {
   const config = getUserConfig();
-  const spec = resolvePodPoolSpec(undefined, process.env, () => config.harness?.podPool ?? config.pod?.pool);
+  const spec = deps.podPool?.() ?? resolvePodPoolSpec(undefined, process.env, () => config.harness?.podPool ?? config.pod?.pool);
   const current = spec ? null : leaseKubectl(['config', 'current-context']);
   const context = spec ?? (current?.status === 0 ? current.stdout.trim() : '');
-  if (!context) return null;
-  const members = parsePodPool(context);
-  const measure = measurePoolLease(members, { measureUsage: true, skipDnsProbe: true });
+  return context ? parsePodPool(context) : [];
+}
+
+/** Same lease/admission path as the pool, with each remote member measured on its sshHost. */
+function readPodRecommendation(deps: BackpressureReadDeps, remoteReasons: string[], unmeasured: string[],
+  members: readonly PodPoolMember[]): number | null {
+  if (!members.length) return null;
+  const config = getUserConfig();
+  const ssh = deps.ssh ?? defaultSshRunner;
+  const measured: PodLeaseMember[] = [];
+  let remoteFailure = false;
+  for (const member of members) {
+    const kubectl: PoolKubectl = member.sshHost
+      ? (args, input) => {
+          const result = ssh(member.sshHost!, 'kubectl ' + args.map(quoteRemoteKubectlArg).join(' '), 20_000, input);
+          return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+        }
+      : leaseKubectl;
+    const row = measurePoolLease([member], { kubectl, measureUsage: true, skipDnsProbe: true }).members[0]!;
+    const complete = row.running !== null && row.pending !== null && row.unleasedRunning !== null
+      && row.allocatableMemoryBytes !== null && row.memoryLimitBytes !== null
+      && row.allocatableCpuMillicores !== null && row.availableMemoryByNodeBytes !== null;
+    const failure = row.reason ?? (complete ? null : row.usageReason ?? 'measurement incomplete');
+    if (complete) measured.push(row);
+    else {
+      remoteFailure ||= !!member.sshHost;
+      if (member.sshHost) {
+        const detail = failure ?? 'measurement incomplete';
+        const category = /fake-ssh|ssh:|ssh |timed? ?out|no route/i.test(detail) ? 'measurement-unavailable'
+          : /cluster pods:/i.test(detail) ? 'pod-list-unavailable'
+          : /cluster jobs:/i.test(detail) ? 'job-list-unavailable'
+          : /cluster nodes:/i.test(detail) ? 'node-list-unavailable'
+          : /top (?:pods|nodes)/i.test(detail) ? 'usage-unavailable'
+          : /unavailable|connection/i.test(detail) ? 'measurement-unavailable'
+          : 'measurement-incomplete';
+        remoteReasons.push('pod-pool:' + member.sshHost + ':' + category);
+        if (/dns|no such host|could not resolve|name or service not known|server misbehaving/i.test(detail))
+          remoteReasons.push('pod-pool:' + member.sshHost + ':dns-unavailable');
+        if (!unmeasured.includes('podRecommended.remote')) unmeasured.push('podRecommended.remote');
+      } else {
+        remoteReasons.push('pod-pool:' + member.context + ':measurement-unavailable');
+      }
+    }
+    try {
+      debug.log('traffic.backpressure', 'pod-pool-member-measurement', {
+        context: member.context, host: member.sshHost ?? 'local', measured: complete,
+        reason: complete ? null : failure, running: row.running, pending: row.pending, capacity: member.capacity,
+      });
+    } catch { /* observation never changes admission */ }
+  }
   let accounts = -1;
   try { accounts = listCodexAccountsInStore().length; } catch { /* Accounts are only observed, not a limit. */ }
-  const direct = recommendConcurrency(measure, { capacity: members.reduce((sum, member) => sum + member.capacity, 0),
-    accounts, perAccount: config.pod?.lease?.perAccount ?? 4 }).recommended;
+  const direct = measured.length ? recommendConcurrency({ members: measured }, {
+    capacity: measured.reduce((sum, member) => sum + member.capacity, 0),
+    accounts, perAccount: config.pod?.lease?.perAccount ?? 4,
+  }).recommended : null;
+  if (remoteFailure && !measured.length && !unmeasured.includes('podRecommended.remote'))
+    unmeasured.push('podRecommended.remote');
   return narrowPodRecommendationFromSupply(direct, members, supplyReader().loadLiveSupplySnapshot());
 }
 
@@ -253,14 +311,20 @@ function readRemote(host: { host: string; elanous?: string }, ssh: SshRunner): {
   if (!ps.trim()) throw new Error('remote ps unavailable');
   const rows: AdmissionRow[] = [];
   for (const line of logs.split('\n').filter(Boolean)) {
-    const row = JSON.parse(line) as Record<string, unknown>;
-    if (row._meta && typeof row._meta === 'object' && (row._meta as { limitReached?: boolean }).limitReached === true) throw new Error('remote logs truncated');
-    if (row._meta) continue;
-    if (row.event !== 'admit-by-usage' || row.category !== 'pod-lease') throw new Error('remote logs invalid row');
+    let row: Record<string, unknown>;
+    try { row = JSON.parse(line) as Record<string, unknown>; }
+    catch { rows.push({ ts_ms: Number.NaN, data: '{invalid remote log row' }); continue; }
+    if (row._meta) {
+      if (typeof row._meta === 'object' && (row._meta as { limitReached?: boolean }).limitReached === true)
+        rows.push({ ts_ms: Number.NaN, data: '{remote log limit reached' });
+      continue;
+    }
+    if (row.event !== 'admit-by-usage' || row.category !== 'pod-lease') {
+      rows.push({ ts_ms: Number.NaN, data: '{invalid remote log shape' }); continue;
+    }
     const ms = typeof row.ts_ms === 'number' ? row.ts_ms : Date.parse(String(row.ts ?? ''));
     rows.push({ ts_ms: ms, data: typeof row.data === 'string' ? row.data : JSON.stringify(row.data ?? null) });
   }
-  if (rows.length >= LOG_LIMIT) throw new Error('remote logs truncated');
   return { rows, ps };
 }
 
@@ -274,7 +338,15 @@ export function readBackpressureSignals(deps: BackpressureReadDeps = {}): Backpr
   const queueDepth = Array.isArray(queue) && queue.every((row) => row && typeof row === 'object'
     && ['queued', 'launching', 'launched', 'finished'].includes(row.status))
     ? queue.filter((row) => row.status === 'queued' || row.status === 'launching').length : 'unknown';
-  const podRecommended = valid(attempt(() => (deps.podRecommended ?? readPodRecommendation)(), null));
+  const remoteReasons: string[] = [];
+  const unmeasured: string[] = [];
+  let podPoolMembers: PodPoolMember[] = [];
+  if (!deps.podRecommended) {
+    try { podPoolMembers = readPodPoolMembers(deps); }
+    catch { remoteReasons.push('pod-pool:configuration-unavailable'); unmeasured.push('podRecommended.remote'); }
+  }
+  const podRecommended = valid(attempt(() => deps.podRecommended ? deps.podRecommended()
+    : readPodRecommendation(deps, remoteReasons, unmeasured, podPoolMembers), null));
   const local = attempt(() => admissionCounts((deps.logs ?? readLocalAdmission)(query), now), { waiting: 'unknown', starved: 'unknown' } as ReturnType<typeof admissionCounts>);
   const localPs = attempt(() => (deps.ps ?? processOutput)(), null);
   const localBuilds = typeof localPs === 'string' ? countBuilds(localPs) : 'unknown';
@@ -283,27 +355,36 @@ export function readBackpressureSignals(deps: BackpressureReadDeps = {}): Backpr
   // `null` = no parent host configured (remote share is 0, not unknown); a failed config/host read is unknown.
   const configured = attempt<{ host: string; elanous?: string } | readonly { host: string; elanous?: string }[] | null | 'unknown'>(
     () => (deps.parentHost ?? (() => resolveParentHosts(getUserConfig().taskAgent?.parentHost)))(), 'unknown');
-  const hosts = configured === 'unknown' || configured === null ? [] : Array.isArray(configured) ? configured : [configured as { host: string; elanous?: string }];
+  const configuredHosts = configured === 'unknown' || configured === null ? [] : Array.isArray(configured) ? configured : [configured as { host: string; elanous?: string }];
+  const hostByName = new Map(configuredHosts.map(host => [host.host, host]));
+  for (const member of podPoolMembers) if (member.sshHost && !hostByName.has(member.sshHost))
+    hostByName.set(member.sshHost, { host: member.sshHost });
+  const hosts = [...hostByName.values()];
   let waiting = 0, starved = 0, builds = 0;
   let measuredHosts = 0;
+  let observedHosts = 0;
   let missingRemote = configured === 'unknown';
+  let missingRemoteBuilds = configured === 'unknown';
+  if (configured === 'unknown') remoteReasons.push('remote-parent:configuration-unavailable');
   for (const host of hosts) {
     try {
       const observed = readRemote(host, deps.ssh ?? defaultSshRunner);
+      observedHosts++;
       const counts = admissionCounts(observed.rows, now);
-      if (counts.waiting === 'unknown' || counts.starved === 'unknown') missingRemote = true;
+      if (counts.waiting === 'unknown' || counts.starved === 'unknown') {
+        missingRemote = true; remoteReasons.push('remote-parent:' + host.host + ':admission-unavailable');
+      }
       else { waiting += counts.waiting; starved += counts.starved; measuredHosts++; }
       builds += countBuilds(observed.ps);
-    } catch { missingRemote = true; }
+    } catch { missingRemote = true; missingRemoteBuilds = true; remoteReasons.push('remote-parent:' + host.host + ':observation-unavailable'); }
   }
   const remote: ReturnType<typeof admissionCounts> = missingRemote && measuredHosts === 0
     ? { waiting: 'unknown', starved: 'unknown' } : { waiting, starved };
-  const remoteBuilds: BackpressureSignal = missingRemote ? 'unknown' : builds;
+  const remoteBuilds: BackpressureSignal = missingRemoteBuilds && observedHosts === 0 ? 'unknown' : builds;
   // One measured half is a lower bound on the total: keep it (so a measured local starvation still stops launches)
-  // and name the missing half in `unmeasured` (so the unknown cap still applies).
-  const unmeasured: string[] = [];
+  // and name the missing half in `unmeasured` (diagnostic only; unknown remote data does not cap launches).
   const add = (name: string, a: BackpressureSignal, b: BackpressureSignal): BackpressureSignal => {
-    if (configured === null || (Array.isArray(configured) && configured.length === 0)) return a; // no remote half exists
+    if (hosts.length === 0 && configured !== 'unknown') return a; // no remote half exists
     if (a === 'unknown' && b === 'unknown') return 'unknown';
     if (a === 'unknown') { unmeasured.push(`${name}.local`); return b; }
     if (b === 'unknown') { unmeasured.push(`${name}.remote`); return a; }
@@ -312,9 +393,10 @@ export function readBackpressureSignals(deps: BackpressureReadDeps = {}): Backpr
   const admitWaiting = add('admitWaiting', local.waiting, remote.waiting);
   const admitStarvedOver30m = add('admitStarvedOver30m', local.starved, remote.starved);
   if (missingRemote && hosts.length) {
+    if (missingRemoteBuilds && observedHosts > 0) unmeasured.push('dockerBuilds.remote');
     if (!unmeasured.includes('admitWaiting.remote')) unmeasured.push('admitWaiting.remote');
     if (!unmeasured.includes('admitStarvedOver30m.remote')) unmeasured.push('admitStarvedOver30m.remote');
   }
   return { queueDepth, podRecommended, admitWaiting, admitStarvedOver30m,
-    dockerBuilds: { local: localBuilds, remote: remoteBuilds }, staleParents, ...(unmeasured.length ? { unmeasured } : {}) };
+    dockerBuilds: { local: localBuilds, remote: remoteBuilds }, staleParents, ...(unmeasured.length ? { unmeasured } : {}), ...(remoteReasons.length ? { remoteReasons } : {}) };
 }

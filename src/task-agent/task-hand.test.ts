@@ -275,6 +275,17 @@ test('알 수 없는 증거 명령 접미는 정규 명령으로 추측하지 �
   expect(readTaskCard('ta-20261025-evidence-unknown', path)).toBeUndefined();
 });
 
+test('중복 증거 명령 중 하나라도 위험한 연산자면 goal author와 hand가 함께 거부한다', async () => {
+  const path = statePath();
+  let launches = 0;
+  const text = `${liveGoal('ship it')}\n완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts; rm -rf target`;
+  await expect(handTask({ id: 'ta-20261101-evidence-duplicate-unsafe', text, live: true,
+    preflightGoalDoneBoundary: true, statePath: path, launcher: () => { launches++; } }))
+    .rejects.toThrow('goal-revision-required');
+  expect(launches).toBe(0);
+  expect(readTaskCard('ta-20261101-evidence-duplicate-unsafe', path)).toBeUndefined();
+});
+
 test('live hand 골 첫 줄은 «대상 경로:» 뒤 경로 목록만 받는다 — 괄호·줄번호·덧말은 이유를 붙여 카드 기록·launcher 호출 전에 거부한다', async () => {
   const plainPath = statePath();
   let plainLaunches = 0;
@@ -1739,8 +1750,9 @@ test('COORD-ENTRANCE-FOLD: 중첩 cwd의 실제 tasks hand 진입은 주입 없�
   const order = buildWorkOrder({ cellId: 'COORD-NESTED-CWD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts' });
   writeFileSync(orderFile, `${JSON.stringify(order)}\n`);
   const modulePath = join(import.meta.dir, '../cli/tasks-cli.ts');
+  const commanderModule = import.meta.resolve('commander');
   const script = `
-    import { Command } from 'commander';
+    const { Command } = await import(process.env.COMMANDER_MODULE);
     const { registerTasksCommands } = await import(process.env.TASKS_CLI_MODULE);
     const program = new Command().name('elanous').exitOverride();
     registerTasksCommands(program, {
@@ -1750,7 +1762,7 @@ test('COORD-ENTRANCE-FOLD: 중첩 cwd의 실제 tasks hand 진입은 주입 없�
     });
     await program.parseAsync(['node', 'elanous', 'tasks', 'hand', process.env.ORDER_FILE, '--seat', 'UX', '--live', '--json']);
   `;
-  const env = { ...process.env, TASKS_CLI_MODULE: modulePath, TASK_STATE_PATH: state, ORDER_FILE: orderFile,
+  const env = { ...process.env, TASKS_CLI_MODULE: modulePath, COMMANDER_MODULE: commanderModule, TASK_STATE_PATH: state, ORDER_FILE: orderFile,
     ELANOUS_SEAT: 'builder-4', ELANOUS_STATE_DIR: stateDir };
   delete env.AI_AGENT;
   delete env.ELANOUS_CONFIG_DIR;

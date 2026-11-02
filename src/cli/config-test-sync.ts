@@ -169,7 +169,12 @@ function atomicWriteJson(path: string, value: unknown): void {
  *  데몬/오버레이 무관. 반환 = 요약(호출측이 출력). */
 export function syncTestConfig(testDir: string, srcDir: string = prodConfigDir()): TestSyncResult {
   const srcPath = join(srcDir, 'config.json');
-  const raw = JSON.parse(readFileSync(srcPath, 'utf-8')) as Record<string, unknown>;
+  // A clean machine may not have made its first user-config write yet. The
+  // isolated test universe still needs a test-safe config, so materialize the
+  // same empty baseline that the normal config reader uses for a missing file.
+  const raw = existsSync(srcPath)
+    ? JSON.parse(readFileSync(srcPath, 'utf-8')) as Record<string, unknown>
+    : {};
   const transformed = buildTestSafeRawConfig(raw); // 운영 비밀을 제거한 뒤에만 사본을 저장한다.
   transformed._testSyncedFrom = srcPath;
   transformed._testSyncedAt = new Date().toISOString();

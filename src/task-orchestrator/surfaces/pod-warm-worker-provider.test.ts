@@ -1424,7 +1424,8 @@ test('provider retains the lease through gate comparison, then releases and mach
   ]);
   await provider.finalize(result.command!);
   expect(calls).toHaveLength(3);
-  expect(calls[0]!.token).toBe(`Bearer ${'2'.repeat(64)}`);
+  expect(calls[0]!.token).toBe(`Bearer ${'1'.repeat(64)}`);
+  expect(calls[1]!.token).toBe(`Bearer ${'1'.repeat(64)}`);
   expect(calls[2]!.token).toBe(`Bearer ${'2'.repeat(64)}`);
   expect(calls[1]!.body).toMatchObject({ leaseId: 'lease-1', generation: 1 });
 });

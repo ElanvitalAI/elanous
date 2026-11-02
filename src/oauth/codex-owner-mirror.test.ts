@@ -15,6 +15,10 @@ const oldEnv = {
   runId: process.env.ELANOUS_RUN_ID,
   accessOnly: process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY,
   remoteMirrorPath: process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH,
+  codexHome: process.env.CODEX_HOME,
+  bunTest: process.env.BUN_TEST,
+  testRunner: process.env.ELANOUS_TEST_RUNNER,
+  nodeEnv: process.env.NODE_ENV,
 };
 const roots: string[] = [];
 const fixture = () => {
@@ -46,6 +50,10 @@ afterEach(() => {
   else process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = oldEnv.accessOnly;
   if (oldEnv.remoteMirrorPath === undefined) delete process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH;
   else process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = oldEnv.remoteMirrorPath;
+  for (const [key, value] of Object.entries({ CODEX_HOME: oldEnv.codexHome, BUN_TEST: oldEnv.bunTest,
+    ELANOUS_TEST_RUNNER: oldEnv.testRunner, NODE_ENV: oldEnv.nodeEnv })) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -53,6 +61,44 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
   test('default owner mirror path follows the resolved state root', () => {
     const { path } = fixture();
     expect(codexOwnerMirrorAuthPath()).toBe(path);
+  });
+
+  test('a standalone machine uses its valid local Codex login without an owner mirror', async () => {
+    const { root } = fixture();
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    delete process.env.BUN_TEST;
+    delete process.env.ELANOUS_TEST_RUNNER;
+    process.env.NODE_ENV = 'production';
+    const home = join(root, 'codex-home');
+    mkdirSync(home, { recursive: true });
+    process.env.CODEX_HOME = home;
+    const expiresAt = Math.floor(Date.now() / 1000 + 3600) * 1000;
+    const accessToken = jwt(expiresAt / 1000);
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: accessToken, refresh_token: 'local-refresh-token', account_id: 'local-account' },
+    }));
+
+    const state = await loadFreshCodexAuthState({
+      fetchImpl: (async () => { throw new Error('local unexpired login must not refresh'); }) as unknown as typeof fetch,
+    });
+
+    expect(state?.tokens.accessToken).toBe(accessToken);
+    expect(state?.tokens.refreshToken).toBe('local-refresh-token');
+  });
+
+  test('access-only seats still require the owner mirror even when a local Codex file exists', async () => {
+    const { root } = fixture();
+    const home = join(root, 'codex-home');
+    mkdirSync(home, { recursive: true });
+    process.env.CODEX_HOME = home;
+    const expiresAt = Math.floor(Date.now() / 1000 + 3600) * 1000;
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: jwt(expiresAt / 1000), refresh_token: 'local-refresh-token', account_id: 'local-account' },
+    }));
+
+    await expect(loadFreshCodexAuthState()).rejects.toThrow('reason=missing-file');
   });
 
   test('remote child uses the parent-installed mirror when its isolated state root differs', async () => {

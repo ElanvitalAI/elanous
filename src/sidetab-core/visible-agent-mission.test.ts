@@ -167,7 +167,7 @@ test('Codex prompt is ready even when a dismissed update banner remains in the s
 });
 
 test('startup timeout error never includes arbitrary PTY frame contents', async () => {
-  const privateFrame = 'Update available · account token abc123 · \u001b[32mPASSWORD\u001b[0m="correct horse battery staple" · API_TOKEN="another multi word secret" · Authorization: Bearer "bearer phrase secret"';
+  const privateFrame = 'Update available · account token abc123 · ghp_faketoken1234567890 · ghp-faketoken1234567890 · \u001b[32mPASSWORD\u001b[0m="correct horse battery staple" · API_TOKEN="another multi word secret" · Authorization: Bearer "bearer phrase secret"';
   const result = await runVisibleAgentMission({
     agent: 'claude', pty: { snapshot: () => privateFrame, write: () => {}, isAlive: () => true },
     mission: 'Write a note.', outputPath: '/tmp/startup-timeout.md', handleTrust: () => false,
@@ -180,6 +180,8 @@ test('startup timeout error never includes arbitrary PTY frame contents', async 
   expect(result.failureScreen).not.toContain('correct horse battery staple');
   expect(result.failureScreen).not.toContain('another multi word secret');
   expect(result.failureScreen).not.toContain('bearer phrase secret');
+  expect(result.failureScreen).not.toContain('ghp_faketoken1234567890');
+  expect(result.failureScreen).not.toContain('ghp-faketoken1234567890');
   expect(result.failureScreen).toContain('PASSWORD=[redacted credential]');
 });
 
@@ -572,6 +574,98 @@ test('SIDETAB-MARKER-BACKGROUND-DETECT: three-act single-hand restart order pres
     completed.push(agent);
   }
   expect(completed).toEqual(['codex', 'claude', 'codex']);
+});
+
+test('SIDETAB-CHILD-PTY-INPUT-VISIBILITY: readiness and input failures return stage plus first and final screen tails without failing a successful candidate', async () => {
+  const mission = 'Read package.json and report only package name/version.';
+  const agents = ['claude', 'codex', 'grok'] as const;
+  const records: Array<{ agent: typeof agents[number]; submitted: string; path: string; exitCode: number | null; ok: boolean; failureStage?: string }> = [];
+  const files = new Map<string, string>();
+  for (const agent of agents) {
+    const outputPath = `/tmp/${agent}-input-visibility.md`;
+    let screen = agent === 'grok'
+      ? '  │ ❯                                                                        │\n'
+      : '\n› Ask Codex to do anything\n';
+    let submitted = '';
+    let enters = 0;
+    let alive = true;
+    let code: number | null = null;
+    let markerPath = '';
+    let markerText = '';
+    const result = await runVisibleAgentMission({
+      agent,
+      pty: {
+        snapshot: () => screen,
+        write: bytes => {
+          if (bytes === '\r') {
+            enters += 1;
+            submitted ||= screen;
+            if (agent === 'claude') {
+              alive = false;
+              code = 1;
+              screen = 'Mission text was not visible in the agent PTY before submission\n';
+              return true;
+            }
+            if (enters === 1) files.set(outputPath, `# ${agent} package name elanous version 0.2.45\n`);
+            else if (markerPath && markerText) files.set(markerPath, `${markerText}\n`);
+            screen = agent === 'grok' ? '  │ ❯                                                                        │\n' : '\n› Ask Codex to do anything\n';
+            return true;
+          }
+          if (agent === 'claude') {
+            alive = false;
+            code = 1;
+            screen = 'Mission text was not visible in the agent PTY before submission\n';
+            return true;
+          }
+          screen += bytes;
+          if (bytes.startsWith('Say M-')) {
+            markerText = bytes.match(/M-[a-f0-9]{12}/)?.[0] ?? '';
+            markerPath = bytes.match(/exact file path (\S+?)\.$/)?.[1] ?? '';
+          }
+          return true;
+        },
+        isAlive: () => alive,
+        exitCode: () => code,
+      },
+      mission,
+      outputPath,
+      handleTrust: () => false,
+      readFile: path => {
+        const body = files.get(path);
+        if (body !== undefined) return body;
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      },
+      sleep: async () => { await new Promise(resolve => setTimeout(resolve, 2)); },
+      pollMs: 1,
+      visibilityTimeoutMs: 8,
+      completionTimeoutMs: 30,
+    });
+    records.push({ agent, submitted, path: result.path, exitCode: result.exitCode ?? null, ok: result.ok, ...(result.failureStage ? { failureStage: result.failureStage } : {}) });
+    if (agent === 'claude') {
+      expect(result).toMatchObject({
+        ok: false,
+        promptReady: true,
+        missionVisible: false,
+        missionTyped: true,
+        missionSubmitted: false,
+        failureStage: 'mission-visibility',
+        exitCode: 1,
+      });
+      expect(result.initialScreen).toContain('›');
+      expect(result.failureScreen).toContain('Mission text was not visible');
+      expect(result.error).toContain('not visible');
+    } else {
+      expect(result.ok).toBe(true);
+      expect(result.failureStage).toBeUndefined();
+      expect(result.path).toBe(outputPath);
+      expect(result.content).toContain(agent);
+      expect(result.exitCode).toBeNull();
+      expect(submitted).toContain(mission);
+    }
+  }
+  expect(records.map(record => record.agent)).toEqual(['claude', 'codex', 'grok']);
+  expect(records.filter(record => record.ok).map(record => record.agent)).toEqual(['codex', 'grok']);
+  expect(records.find(record => record.agent === 'claude')?.failureStage).toBe('mission-visibility');
 });
 
 test('does not submit a mission that is not visible in the PTY', async () => {

@@ -6,6 +6,7 @@ import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { runReleaseSimRigIfFile, runReleaseSimRigScenario } from './release-sim-rig.js';
 import { resolveScenarioFilePath } from './scenario.js';
 
+
 test('release simulation runs the real release graph with injected node outcomes in isolated test state', async () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'release-sim-rig-test-'));
   const previous = getTestStateRoot();

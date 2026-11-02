@@ -1,0 +1,19 @@
+world: night-train
+seed: 42
+devices:
+  - fake-clock
+events:
+  - at: +5m
+    id: dead-pid-lock
+steps:
+  - inject:
+      id: dead-pid-lock
+      version: 0.2.45
+  - observe: release-readiness
+expect:
+  livePidLock:
+    ready: false
+    reason: already-running
+  deadPidLock:
+    ready: true
+    reason: ready

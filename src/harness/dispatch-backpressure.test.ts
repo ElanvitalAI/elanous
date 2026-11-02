@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { BUILD_SLOW, BUILD_STOP, QUEUE_SLOW, QUEUE_STOP, UNKNOWN_CAP, decideBackpressure, readBackpressureSignals, type BackpressureSignals, type BackpressureReadDeps } from './dispatch-backpressure.js';
+import { BUILD_SLOW, BUILD_STOP, QUEUE_SLOW, QUEUE_STOP, UNKNOWN_CAP, decideBackpressure, quoteRemoteKubectlArg, readBackpressureSignals, type BackpressureSignals, type BackpressureReadDeps } from './dispatch-backpressure.js';
 import { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { installHarnessCliCommand } from './harness-cli-command.js';
 import { renderLogJsonLine, limitReachedJsonMeta } from '../cli/logs-cli.js';
+import { createFakeKubectl } from '../ux-sim/fake-kubectl.js';
+import { createFakeSsh } from '../ux-sim/fake-ssh.js';
+import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 
 const NOW = Date.parse('2026-10-10T00:00:00Z');
 const admission = (minutesAgo: number, runId: string, recommended: number) => ({
@@ -29,6 +32,16 @@ describe('dispatch backpressure decision', () => {
     expect(result.reasons.filter((reason) => reason.startsWith('stale-parents:'))).toHaveLength(0);
     expect(result.launchBudget).toBe(decideBackpressure({ ...roomy(), staleParents: 0 }, { maxPerCycle: 6 }).launchBudget);
   });
+  test('unknown remote observations remain visible but do not cap an otherwise clear launch budget', () => {
+    const input: BackpressureSignals = { queueDepth: 0, admitWaiting: 0, admitStarvedOver30m: 0,
+      dockerBuilds: { local: 0, remote: 'unknown' }, podRecommended: 'unknown', staleParents: 0,
+      unmeasured: ['admitWaiting.remote', 'admitStarvedOver30m.remote'] };
+    const result = decideBackpressure(input, { maxPerCycle: 4 });
+    expect(result.launchBudget).toBe(4);
+    expect(result.reasons).toEqual(expect.arrayContaining(['unknown:dockerBuilds.remote', 'unknown:podRecommended',
+      'unknown:admitWaiting.remote', 'unknown:admitStarvedOver30m.remote']));
+  });
+
   test('three parents from other installed versions appear under the renamed observational reason only', () => {
     const signals = readBackpressureSignals(observed({ ps: () => [
       'bun /home/u/.local/share/elanous/versions/old-a/bin/elanous.mjs harness say a',
@@ -89,6 +102,10 @@ describe('dispatch backpressure decision', () => {
 });
 
 describe('read-only backpressure signals', () => {
+  test('pod pool shell arguments reject quote characters before remote execution', () => {
+    expect(() => parsePodPool("pool'bad@node-b:2")).toThrow();
+    expect(quoteRemoteKubectlArg("pool'bad")).toBe("'pool'\"'\"'bad'");
+  });
   test('queue states, builds, current link version and no remote host', () => {
     const signals = readBackpressureSignals(observed({ ps: () => [
       'bun /home/u/.local/share/elanous/versions/old-v/bin/elanous.mjs harness say x',
@@ -133,6 +150,64 @@ describe('read-only backpressure signals', () => {
     ].join('\n') }));
     expect(signals.dockerBuilds.local).toBe(2);
   });
+  test('remote Pod-pool kubectl uses each sshHost and keeps healthy measurements when siblings fail', () => {
+    const good = createFakeKubectl({ context: 'pool-gcp1', node: 'node-gcp1' });
+    const dnsFail = createFakeKubectl({ context: 'pool-node-b', node: 'node-node-b',
+      failGetPods: 'Unable to connect: dial tcp: lookup api.node-b: no such host' });
+    const sshDevice = createFakeSsh({ hosts: {
+      gcp1: { activeSessions: 0, maxStartups: 4 }, ["host-a"]: { activeSessions: 0, maxStartups: 4 },
+    } });
+    const devices = { gcp1: good, ["host-a"]: dnsFail };
+    const ssh: NonNullable<BackpressureReadDeps['ssh']> = (host, script, timeout, input) => {
+      const fakeHost = host === 'gcp1' ? host : 'host-a';
+      const transport = sshDevice.ssh(fakeHost, script, timeout);
+      if (transport.rc !== 0) return { status: transport.rc, stdout: '', stderr: transport.output };
+      if (!script.startsWith('kubectl ')) return { status: 0, stdout: `{"_meta":"opened-stores"}\n__ELANOUS_BACKPRESSURE_PS__\nPID COMMAND\n`, stderr: '' };
+      const args = script.match(/'([^']*)'/gu)?.map(arg => arg.slice(1, -1)) ?? [];
+      const result = devices[fakeHost as keyof typeof devices].kubectl(args, input);
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+    };
+    const priorPool = process.env.ELANOUS_POD_POOL;
+    process.env.ELANOUS_POD_POOL = 'pool-node-b@node-b:2,pool-gcp1@gcp1:3';
+    let signals: BackpressureSignals;
+    try { signals = readBackpressureSignals(observed({ podRecommended: undefined, parentHost: () => null, ssh })); }
+    finally {
+      if (priorPool === undefined) delete process.env.ELANOUS_POD_POOL;
+      else process.env.ELANOUS_POD_POOL = priorPool;
+    }
+    expect(signals.podRecommended).toBeGreaterThan(0);
+    expect(signals.remoteReasons).toEqual(expect.arrayContaining([
+      'pod-pool:node-b:pod-list-unavailable', 'pod-pool:node-b:dns-unavailable',
+    ]));
+    expect(signals.unmeasured).toContain('podRecommended.remote');
+    expect(sshDevice.calls.map(call => call.host)).toContain('gcp1');
+    expect(sshDevice.calls.map(call => call.host)).toContain('host-a');
+    expect(sshDevice.calls.some(call => call.host === 'gcp1' && call.script.includes('logs --event admit-by-usage'))).toBe(true);
+    expect(good.calls.some(call => call.includes('get') && call.includes('nodes'))).toBe(true);
+    expect(dnsFail.calls.some(call => call.includes('get') && call.includes('pods'))).toBe(true);
+  });
+
+  test('an unavailable Pod-pool ssh host gets its own reason while a measured sibling stays usable', () => {
+    const good = createFakeKubectl({ context: 'pool-gcp1', node: 'node-gcp1' });
+    const sshDevice = createFakeSsh({ hosts: { gcp1: { activeSessions: 0, maxStartups: 4 } } });
+    const ssh: NonNullable<BackpressureReadDeps['ssh']> = (host, script, timeout, input) => {
+      const fakeHost = host === 'gcp1' ? host : 'host-a';
+      const transport = sshDevice.ssh(fakeHost, script, timeout);
+      if (transport.rc !== 0) return { status: transport.rc, stdout: '', stderr: transport.output };
+      if (!script.startsWith('kubectl ')) return { status: 0, stdout: `{"_meta":"opened-stores"}\n__ELANOUS_BACKPRESSURE_PS__\nPID COMMAND\n`, stderr: '' };
+      const args = script.match(/'([^']*)'/gu)?.map(arg => arg.slice(1, -1)) ?? [];
+      const result = good.kubectl(args, input);
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+    };
+    const signals = readBackpressureSignals(observed({ podRecommended: undefined,
+      podPool: () => 'pool-node-b@node-b:2,pool-gcp1@gcp1:3', ssh }));
+    expect(signals.podRecommended).toBeGreaterThan(0);
+    expect(signals.remoteReasons).toContain('pod-pool:node-b:measurement-unavailable');
+    expect(signals.unmeasured).toContain('podRecommended.remote');
+    expect(sshDevice.calls.some(call => call.host === 'host-a')).toBe(true);
+    expect(sshDevice.calls.some(call => call.host === 'gcp1')).toBe(true);
+  });
+
   test('remote logs and ps ride one ssh with timeout; errors and saturated logs remain unknown', () => {
     const calls: unknown[] = [];
     const remote = observed({ parentHost: () => ({ host: 'node-b' }), ssh: (host, script, timeout) => {
@@ -151,7 +226,9 @@ describe('read-only backpressure signals', () => {
       const failed = readBackpressureSignals(observed({ parentHost: () => ({ host: 'node-b' }), ssh: () =>
         output === null ? { status: null, stdout: '', stderr: 'timeout' } : { status: 0, stdout: output, stderr: '' } }));
       expect(failed.unmeasured).toContain('admitWaiting.remote');
-      expect(failed.dockerBuilds.remote).toBe('unknown');
+      expect(failed.remoteReasons).toContain(output === null
+        ? 'remote-parent:node-b:observation-unavailable' : 'remote-parent:node-b:admission-unavailable');
+      expect(failed.dockerBuilds.remote).toBe(output === null ? 'unknown' : 0);
     }
   });
   test('multiple remote hosts aggregate measured signals and retain unknown partials', () => {
@@ -167,7 +244,9 @@ describe('read-only backpressure signals', () => {
     const partial = read(true);
     expect(partial.admitWaiting).toBe(1);
     expect(partial.unmeasured).toContain('admitWaiting.remote');
-    expect(partial.dockerBuilds.remote).toBe('unknown');
+    expect(partial.dockerBuilds.remote).toBe(1);
+    expect(partial.unmeasured).toContain('dockerBuilds.remote');
+    expect(partial.remoteReasons).toContain('remote-parent:node-c:observation-unavailable');
   });
   test('remote output in the real `elanous logs --json` line format parses', () => {
     const real = (minutesAgo: number, runId: string, recommended: number, id: number) => renderLogJsonLine({
@@ -199,8 +278,8 @@ describe('read-only backpressure signals', () => {
     expect(verdict.launchBudget).toBe(0);
     expect(verdict.reasons).toEqual(expect.arrayContaining(['admit-starved', 'unknown:admitWaiting.remote',
       'unknown:admitStarvedOver30m.remote', 'unknown:dockerBuilds.remote']));
-    // Only a lower bound on waits: still capped at 1 by the unknown half.
-    expect(decideBackpressure({ ...roomy(), admitWaiting: 1, podRecommended: 10, unmeasured: ['admitWaiting.remote'] }).launchBudget).toBe(1);
+    // Keep the measured lower bound; a missing remote half is diagnostic, not a budget cap.
+    expect(decideBackpressure({ ...roomy(), admitWaiting: 1, podRecommended: 10, unmeasured: ['admitWaiting.remote'] }).launchBudget).toBe(6);
   });
   test('a measured 0 half is kept with the missing half named; a failed host read is unknown, not exit 1', () => {
     const zeroLocal = readBackpressureSignals(observed({ parentHost: () => ({ host: 'node-b' }),
@@ -211,7 +290,8 @@ describe('read-only backpressure signals', () => {
     const hostFail = readBackpressureSignals(observed({ parentHost: () => { throw Error('config unreadable'); } }));
     expect(hostFail.dockerBuilds.remote).toBe('unknown');
     expect(hostFail.unmeasured).toEqual(['admitWaiting.remote', 'admitStarvedOver30m.remote']);
-    expect(decideBackpressure(hostFail).launchBudget).toBeLessThanOrEqual(1);
+    expect(hostFail.remoteReasons).toContain('remote-parent:configuration-unavailable');
+    expect(decideBackpressure(hostFail).launchBudget).toBe(3);
   });
   test('failed individual probes do not manufacture zero', () => {
     const fail = () => { throw Error('unavailable'); };
@@ -232,7 +312,7 @@ describe('harness queue backpressure CLI', () => {
     debug.log = ((category: string, event: string, data?: unknown) => {
       if (category === 'traffic.backpressure') verdicts.push({ category, event, data });
     }) as typeof debug.log;
-    process.exitCode = undefined;
+    process.exitCode = 0;
     try {
       await program.parseAsync(['harness', 'queue', 'backpressure', ...args], { from: 'user' });
       return { lines, errors, verdicts, exitCode: process.exitCode };
@@ -246,11 +326,12 @@ describe('harness queue backpressure CLI', () => {
       logs: () => Array.from({ length: 1000 }, () => admission(1, 'run-x', 0)),
       ps: () => 'docker ps\n', queue: () => [], podRecommended: () => 10 }));
     expect(outcome.lines).toHaveLength(1);
+    expect(process.exitCode).toBe(0);
     expect(JSON.parse(outcome.lines[0]!)).toMatchObject({ launchBudget: 1 });
     expect(outcome.lines[0]).toContain('unknown:');
     expect(outcome.lines[0]).not.toContain('NaN');
     expect(outcome.verdicts).toEqual([expect.objectContaining({ category: 'traffic.backpressure', event: 'verdict' })]);
-    expect(outcome.exitCode).toBeUndefined();
+    expect(outcome.exitCode === undefined || outcome.exitCode === 0).toBe(true);
   }, 30_000);
   test('CLI reports approval starvation and recommends restarting an installed parent after version changes', async () => {
     const deps = observed({ queue: () => [], ps: () =>

@@ -1,11 +1,11 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { handTask } from '../task-agent/task-hand.js';
 import { installHarnessCliCommand } from './harness-cli-command.js';
-import { LAUNCH_DOOR_RECEIPT_ENV, launchRequestId, openLaunchRequestDoor } from '../execution-loop/launch-gate.js';
+import { LAUNCH_DOOR_RECEIPT_ENV, launchRequestId, openLaunchRequestDoor, summarizeLaunchRequestRows } from '../execution-loop/launch-gate.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 // LAUNCH-SINGLE-DOOR-1C — 발사 요청의 단일 문: append 전용 요청 원장 ⊕ requestId 단위 단일 소비 영수증.
@@ -43,6 +43,54 @@ test('LAUNCH-SINGLE-DOOR-1C: append 요청 원장 — 소비 영수증은 reques
   expect(door.rows(otherId).map((row) => row.event)).toEqual(['requested', 'consumed']);
 });
 
+test('LAUNCH-SINGLE-DOOR-1C: 요청 맥락과 누적·미소비·재시도 통계를 원장에서 읽는다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'launch-door-summary-'));
+  dirs.push(root);
+  const door = openLaunchRequestDoor({ root, source: 'dispatcher' });
+  const pendingId = door.requestId('대기 요청', { seat: 'TC', cell: 'LAUNCH-SINGLE-DOOR-1C', originalRef: 'card-1', reason: 'awaiting-permission' });
+  const consumedId = door.requestId('소비 요청', { seat: 'OP', originalRef: 'goal-2' });
+  door.consume(consumedId);
+  door.requestId('소비 요청', { seat: 'OP', originalRef: 'goal-2' });
+  door.consume(consumedId);
+  door.fail(consumedId, 'spawn refused');
+  expect(door.rows(pendingId)[0]).toMatchObject({ event: 'requested', seat: 'TC', cell: 'LAUNCH-SINGLE-DOOR-1C', originalRef: 'card-1', reason: 'awaiting-permission' });
+  door.fail(consumedId, 'repeat failure');
+  expect(summarizeLaunchRequestRows(door.rows())).toEqual({ requests: 3, uniqueRequests: 2, unconsumed: 1, consumed: 1, retries: 1, failed: 1, refused: 1, doorUnavailable: 0 });
+});
+
+test('harness launch-requests reports isolated request counts as JSON', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'launch-door-cli-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  const door = openLaunchRequestDoor({ root });
+  door.requestId('미소비 request');
+  const output: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation((line: string) => { output.push(line); });
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', say: async () => {} });
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'launch-requests', '--json']);
+    expect(JSON.parse(output.at(-1)!)).toEqual({ requests: 1, uniqueRequests: 1, unconsumed: 1, consumed: 0, retries: 0, failed: 0, refused: 0, doorUnavailable: 0 });
+  } finally { log.mockRestore(); }
+});
+
+test('harness launch-requests fails instead of reporting zero when the ledger cannot be read', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'launch-door-cli-unreadable-'));
+  dirs.push(root);
+  setElanousConfigDir(root);
+  writeFileSync(join(root, 'launch-requests'), 'not a directory');
+  const errors: string[] = [];
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
+  const priorExitCode = process.exitCode;
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', say: async () => {} });
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'launch-requests', '--json']);
+    expect(process.exitCode).toBe(1);
+    expect(errors.join('\n')).toContain('❌ launch-requests:');
+  } finally { error.mockRestore(); process.exitCode = priorExitCode ?? 0; }
+});
+
 test('TASK-HAND-RETRY: 같은 카드 문면은 하루 뒤 새 넘김 시도로 다시 발사된다', async () => {
   const root = mkdtempSync(join(tmpdir(), 'launch-door-hand-'));
   dirs.push(root);
@@ -71,6 +119,14 @@ test('TASK-HAND-RETRY: 같은 카드 문면은 하루 뒤 새 넘김 시도로 �
   expect(new Set(requests.map((row) => row.requestId)).size).toBe(2);
   expect(rows.filter((row) => row.event === 'consumed')).toHaveLength(2);
   expect(rows.some((row) => row.event === 'refused-duplicate')).toBe(false);
+  const output: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation((line: string) => { output.push(line); });
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', say: async () => {} });
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'launch-requests', '--json']);
+    expect(JSON.parse(output.at(-1)!).retries).toBe(1);
+  } finally { log.mockRestore(); }
 });
 
 test('TASK-HAND-RETRY: 실패한 넘김은 새 시도 키로 재발사할 수 있다', async () => {

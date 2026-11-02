@@ -14,17 +14,20 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createPendingQuestion, writePendingQuestion } from '../ask-user-question/pending-questions.js';
 import { registerDecisionsCommands } from './decisions-cli.js';
+import { openMsgStore } from '../msg/msg-store.js';
 
 const root = () => mkdtempSync(join(tmpdir(), 'decisions-cli-'));
+const judgmentArgs = ['--pending-question', '근거: 시험 자료\n무엇이 바뀌나: 선택한 경로가 적용됨\n기본값 시 결과: 현재 경로 유지'] as const;
+const withJudgment = (args: string[]) => args[0] === 'raise' && !args.includes('--pending-question') ? [...args, ...judgmentArgs] : args;
 
 test('seat-loop CLI raise retains full judgment material, Q/A and recommendation and refuses unjustified omission', () => {
   const stateDir = root();
   const lines: string[] = [];
   const program = new Command();
   registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const base = ['raise', '--agent', 'seat-loop', '--title', '반복 정지', '--category', 'other', '--s', '칸 반복', '--c', '착지 없음',
-    '--q', '계속할까?', '--a', '멈춘다', '--pending-question', '무엇: 칸 반복\n지금까지: 3회\n지금 상태 재측: yellow\n그냥 두면: 중복\n근거: 원장',
+    '--q', '계속할까?', '--a', '멈춘다', '--pending-question', '무엇: 칸 반복\n근거: 원장\n무엇이 바뀌나: 선택한 경로가 적용됨\n기본값 시 결과: 멈춘 상태 유지\n지금까지: 3회\n지금 상태 재측: yellow\n그냥 두면: 중복',
     '--option', 'a=재개:재시도', '--option', 'b=정지:중단', '--json'];
   try {
     expect(() => run(...base, '--skip-recommend', '모르겠다')).toThrow('seat-loop recommendation may only be skipped');
@@ -52,7 +55,7 @@ test('CLI records delegated decisions and the owner reads overnight seat report 
   const lines: string[] = [];
   const program = new Command();
   registerDecisionsCommands(program, { stateDir, now: () => new Date('2026-10-04T23:00:00Z'), resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   try {
     const first = JSON.parse(run('record-seat', '--seat', 'OP', '--title', '예산 막힘', '--decision', '크레딧으로 풀기',
       '--delegation', '운영 위임', '--ref', 'coord#1', '--json'));
@@ -91,9 +94,9 @@ test('CLI cross-check, shadow warning, strict config and alternative validation'
   registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
   expect(program.commands.find(command => command.name() === 'decisions')!.commands.find(command => command.name() === 'raise')!
     .options.find(option => option.long === '--no-xcheck')!.negate).toBe(false);
-  const flags = ['raise', '--agent', 'MK', '--title', '피치', '--category', 'scope', '--s', '상황', '--c', '문제', '--q', '질문', '--a', '제안',
+  const flags = ['raise', '--agent', 'OP', '--title', '피치', '--category', 'scope', '--s', '상황', '--c', '문제', '--q', '질문', '--a', '제안', ...judgmentArgs,
     '--option', 'a=승인:배포', '--option', 'b=보류:일정 지연', '--recommend', 'a', '--why', '근거', '--json'];
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]; };
   try {
     writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: false } }));
     resetUserConfig();
@@ -128,7 +131,7 @@ test('CLI cross-check, shadow warning, strict config and alternative validation'
 
 test('actual CLI parses checked, explicitly skipped, absent and conflicting cross-check flags', () => {
   const stateDir = root();
-  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'MK',
+  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'OP', ...judgmentArgs,
     '--title', 'Pitch', '--category', 'scope', '--s', 'Situation', '--c', 'Complication', '--option', 'a=Go:Proceed',
     '--option', 'b=Wait:Delay', '--recommend', 'a', '--why', 'Ready', '--json', ...args],
   { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
@@ -171,7 +174,7 @@ test('isolated decisions CLI skips adjudication and records the write target', (
   try {
     setElanousConfigDir(stateDir);
     registerDecisionsCommands(cli, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
-    cli.parse(['decisions', ...raise, '--hq-override'], { from: 'user' });
+    cli.parse(['decisions', ...withJudgment(raise), '--hq-override'], { from: 'user' });
     const entry = JSON.parse(lines.at(-1)!);
     cli.parse(['decisions', 'decide', entry.id, 'a', '--json'], { from: 'user' });
     expect(JSON.parse(lines.at(-1)!).choice).toBe('a');
@@ -199,18 +202,101 @@ test('decision ledger outside the instance universe retains the HQ fence and obs
     registerDecisionsCommands(cli, { stateDir: outsideRoot, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
     expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
     process.exitCode = 0;
-    cli.parse(['decisions', ...raise], { from: 'user' });
+    cli.parse(['decisions', ...withJudgment(raise)], { from: 'user' });
     expect(process.exitCode).toBe(4);
     expect(lines).toEqual([]);
     expect(errors.at(-1)).toContain('본부는 node-b gen 2');
     expect(() => readFileSync(join(outsideRoot, 'decisions', 'decisions.jsonl'))).toThrow();
-    cli.parse(['decisions', ...raise, '--hq-override'], { from: 'user' });
+    cli.parse(['decisions', ...withJudgment(raise), '--hq-override'], { from: 'user' });
     expect(process.exitCode).toBe(4);
     expect(JSON.parse(lines.at(-1)!).status).toBe('open');
     expect(events).toContain('cli-override');
     expect(errors.some(line => line.includes('hq override: decisions raise'))).toBe(true);
     expect(effectiveInstanceRoot()).toBe(instanceRoot);
   } finally { process.exitCode = before ?? 0; error.mockRestore(); resetElanousConfigDir(); rmSync(instanceRoot, { recursive: true, force: true }); rmSync(outsideRoot, { recursive: true, force: true }); }
+});
+
+test('raise requires all judgment fields and routes seat proposals to the OP inbox', () => {
+  const stateDir = root();
+  const lines: string[] = [];
+  const errors: string[] = [];
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
+  const cli = new Command();
+  registerDecisionsCommands(cli, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  const base = ['raise', '--agent', 'UX', '--title', 'Recommend a path', '--category', 'scope', '--s', 'Situation', '--c', 'Complication',
+    '--q', 'Which path?', '--a', 'Use path A', '--option', 'a=Proceed:Apply', '--option', 'b=Wait:Pause', '--recommend', 'a', '--why', 'Safer', '--json'];
+  const oldSeat = process.env.ELANOUS_SEAT;
+  try {
+    delete process.env.ELANOUS_SEAT;
+    expect(() => cli.parse(['decisions', ...base], { from: 'user' })).toThrow('--pending-question required');
+    expect(() => cli.parse(['decisions', ...base, '--pending-question', '   '], { from: 'user' })).toThrow('--pending-question required');
+    expect(() => cli.parse(['decisions', ...base, '--pending-question', '근거: test'], { from: 'user' }))
+      .toThrow('--pending-question missing: 무엇이 바뀌나·기본값 시 결과');
+    expect(() => cli.parse(['decisions', ...base, '--pending-question', '근거:  \n무엇이 바뀌나: 변경됨\n기본값 시 결과: 현 상태 유지'], { from: 'user' }))
+      .toThrow('--pending-question missing: 근거');
+    expect(() => readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8')).toThrow();
+
+    process.env.ELANOUS_SEAT = 'UX';
+    const judgment = ['--pending-question', '근거: 시험 자료\n무엇이 바뀌나: 적용 경로가 변경됨\n기본값 시 결과: 현 경로 유지'];
+    const badRecommendation = [...base];
+    badRecommendation[badRecommendation.indexOf('--recommend') + 1] = 'missing';
+    expect(() => cli.parse(['decisions', ...badRecommendation, ...judgment], { from: 'user' })).toThrow('recommended option not found');
+    expect(() => readFileSync(join(stateDir, 'msg', 'messages.db'), 'utf8')).toThrow();
+    cli.parse(['decisions', ...base, ...judgment, '--xcheck', 'TC:근거 경로 확인', '--alternative', 'b', '--dissent', 'MK:표현 보완 필요',
+      '--resume-question', 'auq:q1:abcde', '--run', 'run-x', '--due', '2099-10-01T01:00:00Z', '--track', 'UX', '--session', 'session-x'], { from: 'user' });
+    const routed = JSON.parse(lines.at(-1)!);
+    expect(routed).toMatchObject({ routedTo: 'OP' });
+    const store = openMsgStore(join(stateDir, 'msg', 'messages.db'));
+    try {
+      const messages = store.list('OP');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ from: 'UX', to: 'OP', kind: 'question' });
+      expect(messages[0]!.body).toContain('대표 결정 제안: Recommend a path');
+      expect(messages[0]!.body).toContain('기본값 시 결과: 현 경로 유지');
+      expect(messages[0]!.body).toContain('교차 확인: TC — 근거 경로 확인');
+      expect(messages[0]!.body).toContain('대안: b');
+      expect(messages[0]!.body).toContain('이견: MK:표현 보완 필요');
+      expect(messages[0]!.body).toContain('재개 연결: questionId=auq:q1:abcde · runId=run-x');
+      expect(messages[0]!.body).toContain('후속 처리: OP 결정 카드에 --resume-question auq:q1:abcde --run run-x를 전달해 대기 런에 답을 기록');
+      expect(messages[0]!.body).toContain('기한: 2099-10-01T01:00:00.000Z');
+      expect(messages[0]!.body).toContain('발신 맥락: track=UX · session=session-x');
+    } finally { store.close(); }
+    expect(errors).toContain('한국어 문면 경고 — 대표 카드의 판단 재료와 선택지 문구를 한국어로 작성하세요.');
+    expect(() => readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8')).toThrow();
+
+    const mostlyKorean = [...base];
+    for (const [flag, value] of [['--title', '경로 결정'], ['--s', '요청이 올라왔다'], ['--c', '경로 선택이 필요하다'],
+      ['--q', '어느 쪽으로 갈까?'], ['--a', '진행 전 확인한다'], ['--why', '운영 근거 확인']]) {
+      mostlyKorean[mostlyKorean.indexOf(flag) + 1] = value;
+    }
+    const optionIndices = mostlyKorean.map((arg, index) => arg === '--option' ? index : -1).filter(index => index >= 0);
+    mostlyKorean[optionIndices[0]! + 1] = 'a=진행:범위가 넓어진다';
+    mostlyKorean[optionIndices[1]! + 1] = 'b=보류:현 범위를 유지한다';
+    errors.length = 0;
+    cli.parse(['decisions', ...mostlyKorean, ...judgment, '--xcheck', 'TC:Evidence is missing', '--dissent', 'This is dissent'], { from: 'user' });
+    expect(errors).toContain('한국어 문면 경고 — 대표 카드의 판단 재료와 선택지 문구를 한국어로 작성하세요.');
+    errors.length = 0;
+    cli.parse(['decisions', ...mostlyKorean, ...judgment], { from: 'user' });
+    expect(errors).toContain('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
+    const routedStore = openMsgStore(join(stateDir, 'msg', 'messages.db'));
+    try {
+      expect(routedStore.list('OP')[1]!.body).toContain('교차 확인: TC — Evidence is missing');
+      expect(routedStore.list('OP')[1]!.body).not.toContain('교차 확인: 미제공');
+      expect(routedStore.list('OP')[1]!.body).not.toContain('교차 확인 생략 이유: missing');
+    } finally { routedStore.close(); }
+    errors.length = 0;
+    cli.parse(['decisions', ...mostlyKorean, ...judgment, '--no-xcheck', 'No evidence available'], { from: 'user' });
+    expect(errors).toContain('한국어 문면 경고 — 대표 카드의 판단 재료와 선택지 문구를 한국어로 작성하세요.');
+    expect(errors).not.toContain('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
+    const explicitSkipStore = openMsgStore(join(stateDir, 'msg', 'messages.db'));
+    try { expect(explicitSkipStore.list('OP')[3]!.body).toContain('교차 확인 생략 이유: No evidence available'); }
+    finally { explicitSkipStore.close(); }
+  } finally {
+    if (oldSeat === undefined) delete process.env.ELANOUS_SEAT;
+    else process.env.ELANOUS_SEAT = oldSeat;
+    error.mockRestore();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test('decisions CLI fences raise/decide at generation, permits observed override and pre-lease bootstrap without altering reads', () => {
@@ -226,7 +312,7 @@ test('decisions CLI fences raise/decide at generation, permits observed override
   console.error = (line: string) => { errors.push(line); };
   const cli = new Command();
   registerDecisionsCommands(cli, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot: join(stateDir, 'missing') }, { log: (s) => lines.push(s) }, hq);
-  const run = (...args: string[]) => { lines.length = 0; cli.parse(['decisions', ...args], { from: 'user' }); return lines[0]; };
+  const run = (...args: string[]) => { lines.length = 0; cli.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]; };
   const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
   try {
     process.exitCode = 0;
@@ -257,7 +343,7 @@ test('decisions CLI fences raise/decide at generation, permits observed override
 test('actual isolated decisions CLI writes despite a foreign lease without override', () => {
   const stateDir = root();
   const store = fileLeaseStore(join(stateDir, 'hq', 'lease.json'), () => 100);
-  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', ...args],
+  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', ...withJudgment(args)],
     { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
   const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.',
     '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
@@ -278,7 +364,7 @@ test('CLI raises, filters, shows and records human/AUTO decisions; validation er
   const lines: string[] = [];
   const program = new Command();
   registerDecisionsCommands(program, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot: join(stateDir, 'missing') }, { log: s => lines.push(s) });
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const raise = ['raise', '--agent', 'codex', '--title', 'Publish?', '--category', 'publish', '--s', 'Draft exists.', '--c', 'Decision needed.', '--option', 'a=Publish:Public', '--option', 'b=Hold:Private', '--skip-recommend', 'Research takes time', '--json'];
   const entry = JSON.parse(run(...raise));
   expect(entry.id).toMatch(/^D-\d{8}-01$/);
@@ -299,7 +385,7 @@ test('CLI resume flags round-trip and decide invokes the injected writer; run al
   const program = new Command();
   registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }),
     writeAnswer: answer => { calls.push(answer); } }, { log: value => lines.push(value) });
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const flags = ['raise', '--agent', 'codex', '--title', 'Publish?', '--category', 'publish', '--s', 'Draft.', '--c', 'Decision.',
     '--option', 'a=Publish:Public', '--option', 'b=Hold:Private', '--skip-recommend', 'Unknown', '--json'];
   expect(() => run(...flags, '--run', 'run-x')).toThrow('decisions: --run requires --resume-question');
@@ -324,7 +410,7 @@ test('CLI reports durable decision with failed delivery and can retry only the a
   const program = new Command();
   registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }),
     writeAnswer: answer => { if (!available) throw new Error('temporary'); calls.push(answer); } }, { log: value => lines.push(value) });
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const entry = JSON.parse(run('raise', '--agent', 'codex', '--title', 'Publish?', '--category', 'publish', '--s', 'Draft.', '--c', 'Decision.',
     '--option', 'a=Publish:Public', '--option', 'b=Hold:Private', '--skip-recommend', 'Unknown', '--resume-question', 'auq:q1:abcde', '--json'));
   writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'scope_choice', header: 'Scope', question: 'Choose.', options: [
@@ -351,7 +437,7 @@ test('unknown actor is never silently attributed to elanous; historical options 
   const lines: string[] = [];
   const program = new Command();
   registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: '0.2.5', dev: '0.2.6-dev.0', codename: null }) }, { log: s => lines.push(s) });
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const oldAgent = process.env.AI_AGENT;
   try {
     delete process.env.AI_AGENT;
@@ -370,7 +456,7 @@ test('unknown actor is never silently attributed to elanous; historical options 
 
 test('actual CLI child reads an item raised in an isolated state directory', () => {
   const stateDir = root();
-  const raise = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'codex', '--title', 'CLI child decision', '--category', 'scope', '--s', 'Scope requested.', '--c', 'Choice required.', '--option', 'a=Accept:Expands scope', '--option', 'b=Decline:Keeps scope', '--skip-recommend', 'Needs investigation', '--resume-question', 'auq:q1:abcde', '--run', 'run-x', '--json'], {
+  const raise = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'codex', '--title', 'CLI child decision', '--category', 'scope', '--s', 'Scope requested.', '--c', 'Choice required.', '--option', 'a=Accept:Expands scope', '--option', 'b=Decline:Keeps scope', '--skip-recommend', 'Needs investigation', '--pending-question', '근거: 요청 문서\n무엇이 바뀌나: 승인 시 범위 확장\n기본값 시 결과: 현재 범위 유지', '--resume-question', 'auq:q1:abcde', '--run', 'run-x', '--json'], {
     cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
   });
   expect(raise.status, raise.stderr.slice(0, 500)).toBe(0);
@@ -391,7 +477,7 @@ test('actual CLI child reads an item raised in an isolated state directory', () 
   });
   expect(result.status, result.stderr.slice(0, 500)).toBe(0);
   expect(JSON.parse(result.stdout.trim()).map((entry: { id: string }) => entry.id)).toContain(id);
-  const failedRaise = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'codex', '--title', 'Late question', '--category', 'scope', '--s', 'Draft.', '--c', 'Choice.', '--option', 'a=Accept:Proceed', '--option', 'b=Decline:Wait', '--skip-recommend', 'Unknown', '--resume-question', 'auq:lateq:abcde', '--json'], {
+  const failedRaise = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'codex', '--title', 'Late question', '--category', 'scope', '--s', 'Draft.', '--c', 'Choice.', '--option', 'a=Accept:Proceed', '--option', 'b=Decline:Wait', '--skip-recommend', 'Unknown', '--pending-question', '근거: 질문 원장\n무엇이 바뀌나: 답 전달 시 재개\n기본값 시 결과: 보류 유지', '--resume-question', 'auq:lateq:abcde', '--json'], {
     cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
   });
   expect(failedRaise.status, failedRaise.stderr.slice(0, 500)).toBe(0);
@@ -445,7 +531,7 @@ test('CLI decide with no pending question at all reports the failed delivery and
   const lines: string[] = [];
   const program = new Command();
   registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: value => lines.push(value) });
-  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...args], { from: 'user' }); return lines[0]!; };
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const entry = JSON.parse(run('raise', '--agent', 'codex', '--title', 'Scope?', '--category', 'scope', '--s', 'S.', '--c', 'C.',
     '--option', 'a=Small:Less', '--option', 'b=Large:More', '--recommend', 'a', '--why', 'safer', '--resume-question', 'auq:qmissing:abcde', '--run', 'run-x', '--json'));
   const exitBefore = process.exitCode;

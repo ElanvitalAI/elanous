@@ -1,4 +1,4 @@
-import { setDefaultTimeout, afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
 import { registerOpsCommands } from './cli/ops-cli.js';
@@ -15,7 +15,7 @@ import { spawnRealCliBytes, type RealCliSpawnBytesResult } from './testing/real-
 import { basename, join, resolve } from 'node:path';
 import { activeSessionIdForContinue, latestNextTuiSessionIdForContinue, latestRootSessionIdForContinue, latestSessionIdForContinue, type ContinueSessionLookup } from './index.js';
 import { resolveLatestSessionId } from './session/session-start.js';
-import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, readSelfOrchestrateGoals, setCodexAccountLogSinkModuleForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
+import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, readSelfOrchestrateGoals, setCodexAccountLogSinkModuleForTesting, setSelfOrchestratePodPoolFilterForTesting, setSelfOrchestrateRemoteParentForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
 import { selectFabricDecomposer } from './self-dev/self-orchestrate-runtime.js';
 import { exitTuiRun, planTuiRestartArgv, runTuiSelfRestartOnStaleBuild } from './index.js';
 import { claimTuiOwnedSession, decideTuiRestartSession, getTuiOwnedSession, requestTuiSelfRestart, takeTuiSelfRestartRequest } from './capture/tui-self-report.js';
@@ -3129,12 +3129,12 @@ describe('self orchestrate CLI help tiers', () => {
     '--goal-file',
     // 2026-10-05 PODPROVIDER — the harness child LLM choice reaches the Pod orchestrator (`--help-all` only).
     '--child-llm-provider', '--child-llm-model', '--child-llm-effort',
-    '--repair-commit-only',
+    '--repair-commit-only', '--parent-host-worker',
   ]);
 
   test('option contract set itself does not silently shrink', () => {
     // ⛔ 위 집합을 줄이면 `toEqual` 이 여전히 통과하므로 계약이 «조용히» 좁아진다. 수를 못 박는다.
-    expect(existingOptionNames.size).toBe(28);
+    expect(existingOptionNames.size).toBe(29);
   });
 
   async function help(...args: string[]): Promise<string> {
@@ -3918,6 +3918,217 @@ describe('self gate explicit remote CLI wiring', () => {
 
 describe('file-backed self CLI entrances', () => {
   asHarnessInternalCaller();
+  test('self orchestrate CLI passes inline argv to remote parent and preserves its exit code', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: Array<{ args: string[]; substrate: string | undefined }> = [];
+    const { program } = await import('./index.js');
+    setSelfOrchestrateRemoteParentForTesting(async (args, context) => {
+      seen.push({ args, substrate: context.substrate });
+      return { dispatched: true, exitCode: 7, host: 'gcp1' };
+    });
+    try {
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', 'inline goal', '--substrate', 'pod'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([{ args: ['self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--parent-host-worker', '--no-auto-merge'], substrate: 'pod' }]);
+      expect(process.exitCode).toBe(7);
+    } finally {
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate filters an explicit gate-host pod pool before remote parent dispatch', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: string[][] = [];
+    setSelfOrchestratePodPoolFilterForTesting(async (pool) => {
+      expect(pool).toBe('pool-node-b@node-b:4,pool-gcp1@gcp1:12');
+      return { pool: 'pool-gcp1@gcp1:12' };
+    });
+    setSelfOrchestrateRemoteParentForTesting(async (args) => {
+      seen.push(args);
+      return { dispatched: true, exitCode: 0, host: 'gcp1' };
+    });
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', 'inline goal', '--substrate', 'pod',
+        '--pod-pool', 'pool-gcp1@gcp1:12', '--pod-pool', 'pool-node-b@node-b:4,pool-gcp1@gcp1:12'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([['self', 'orchestrate', 'inline goal', '--substrate', 'pod',
+        '--pod-pool', 'pool-gcp1@gcp1:12', '--pod-pool', 'pool-gcp1@gcp1:12', '--parent-host-worker', '--no-auto-merge']]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      setSelfOrchestratePodPoolFilterForTesting(undefined);
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate rejects explicit auto-merge when it would dispatch a remote Pod parent', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const ui = await import('./ui.js');
+    const error = spyOn(ui, 'error').mockImplementation(() => {});
+    const remote = mock(async () => ({ dispatched: true as const, exitCode: 0, host: 'gcp1' }));
+    setSelfOrchestrateRemoteParentForTesting(remote);
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--auto-merge'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(remote).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith('--auto-merge cannot be combined with remote Pod parent dispatch; omit --auto-merge');
+      expect(process.exitCode).toBe(2);
+    } finally {
+      error.mockRestore();
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate places remote safety flags before the option terminator', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: string[][] = [];
+    setSelfOrchestrateRemoteParentForTesting(async (args) => {
+      seen.push(args);
+      return { dispatched: true, exitCode: 0, host: 'gcp1' };
+    });
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', '--substrate', 'pod', '--', 'inline goal'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([['self', 'orchestrate', '--substrate', 'pod', '--parent-host-worker', '--no-auto-merge', '--', 'inline goal']]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate preserves option-looking values when adding remote safety flags', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: string[][] = [];
+    setSelfOrchestrateRemoteParentForTesting(async (args) => {
+      seen.push(args);
+      return { dispatched: true, exitCode: 0, host: 'gcp1' };
+    });
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--base', '--no-auto-merge'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([['self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--base', '--no-auto-merge', '--parent-host-worker', '--no-auto-merge']]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate rewrites only actual pod-pool options when an option value looks like one', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: string[][] = [];
+    setSelfOrchestratePodPoolFilterForTesting(async (pool) => {
+      expect(pool).toBe('pool-node-b@node-b:4,pool-gcp1@gcp1:12');
+      return { pool: 'pool-gcp1@gcp1:12' };
+    });
+    setSelfOrchestrateRemoteParentForTesting(async (args) => {
+      seen.push(args);
+      return { dispatched: true, exitCode: 0, host: 'gcp1' };
+    });
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--base', '--pod-pool', '--pod-pool', 'pool-node-b@node-b:4,pool-gcp1@gcp1:12'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([['self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--base', '--pod-pool', '--pod-pool', 'pool-gcp1@gcp1:12', '--parent-host-worker', '--no-auto-merge']]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      setSelfOrchestratePodPoolFilterForTesting(undefined);
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate inserts remote safety flags after option values equal to the terminator', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: string[][] = [];
+    setSelfOrchestrateRemoteParentForTesting(async (args) => {
+      seen.push(args);
+      return { dispatched: true, exitCode: 0, host: 'gcp1' };
+    });
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', 'inline goal', '--base', '--', '--substrate', 'pod'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([['self', 'orchestrate', 'inline goal', '--base', '--', '--substrate', 'pod', '--parent-host-worker', '--no-auto-merge']]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate does not mistake an option-looking value for an isolated-instance flag', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: string[][] = [];
+    setSelfOrchestrateRemoteParentForTesting(async (args) => {
+      seen.push(args);
+      return { dispatched: true, exitCode: 0, host: 'gcp1' };
+    });
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--base', '--test'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([['self', 'orchestrate', 'inline goal', '--substrate', 'pod', '--base', '--test', '--parent-host-worker', '--no-auto-merge']]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
+  test('self orchestrate does not read option-looking positional goal text as a goal file', async () => {
+    const previousArgv = process.argv;
+    const previousExitCode = process.exitCode;
+    const seen: string[][] = [];
+    setSelfOrchestrateRemoteParentForTesting(async (args) => {
+      seen.push(args);
+      return { dispatched: true, exitCode: 0, host: 'gcp1' };
+    });
+    try {
+      const { program } = await import('./index.js');
+      process.argv = ['node', 'elanous', 'self', 'orchestrate', '--substrate', 'pod', '--', '--goal-file', 'missing', '--test'];
+      process.exitCode = 0;
+      await program.parseAsync(process.argv);
+      expect(seen).toEqual([['self', 'orchestrate', '--substrate', 'pod', '--parent-host-worker', '--no-auto-merge', '--', '--goal-file', 'missing', '--test']]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      setSelfOrchestrateRemoteParentForTesting(undefined);
+      process.argv = previousArgv;
+      process.exitCode = previousExitCode ?? 0;
+    }
+  });
+
   test('self implement CLI reads --feature-file and passes its contents to the implementation core', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'implement-feature-cli-'));
     const featurePath = join(dir, 'feature.md');
@@ -4347,6 +4558,7 @@ describe('harness orchestrate canonical entrance capability', () => {
     // 🎯 골 조회 — `harness goal <pr|runId>`(GOAL-LIFE1B #23800).
     'goal',
     'incidents',
+    'launch-requests',
     'map',
     'mission',
     'orchestrate',

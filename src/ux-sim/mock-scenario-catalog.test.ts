@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { expect, test } from 'bun:test';
 import { podChildResultScenario, renderPodChildResult } from './fault-pod-child-result.js';
@@ -9,7 +9,7 @@ import { podCodex503Scenario, simPodCodex503 } from './fault-pod-codex-503.js';
 import { createFakeKubectl } from './fake-kubectl.js';
 import { measurePoolLease, recommendConcurrency } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
-import { loadMockScenarioCatalog, parseMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioDevices, renderMockScenarioList } from './mock-scenario-catalog.js';
+import { loadMockScenarioCatalog, parseMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioDeviceMarkdownTable, renderMockScenarioDevices, renderMockScenarioList } from './mock-scenario-catalog.js';
 
 const REPO = resolve(import.meta.dir, '../..');
 const catalog = loadMockScenarioCatalog();
@@ -18,9 +18,11 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
   expect(parseMockScenarioCatalog(catalog)).toEqual(catalog);
   expect(catalog.scenarios.map((scenario) => scenario.id)).toEqual([
     'UX-MS-01', 'UX-MS-02', 'RELEASE-GRAPH-PREPUB-FANOUT', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
-    'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11',
+    'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11', 'UX-MS-12', 'NIGHT-TRAIN-DEAD-PID-LOCK',
+    'AUTHOR-PRECHECK-APPLIED', 'AUTHOR-PRECHECK-REJECTED-UNPROVABLE',
   ]);
   expect(catalog.runEvidence.scope).toContain('ScenarioV0 YAML runs only');
+  expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107']);
 
   const implementation = new Set(catalog.devices.flatMap((device) => device.implementation));
   for (const path of implementation) expect(existsSync(join(REPO, path))).toBe(true);
@@ -29,11 +31,11 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
     for (const path of [...scenario.implementation, ...scenario.tests]) expect(existsSync(join(REPO, path))).toBe(true);
   }
 
-  expect(catalog.candidateAudit.sourceRows).toBe(35);
-  expect(catalog.candidateAudit.existingPaths).toBe(34);
+  expect(catalog.candidateAudit.sourceRows).toBe(36);
+  expect(catalog.candidateAudit.existingPaths).toBe(35);
   expect(catalog.candidateAudit.excludedPaths).toBe(catalog.candidateAudit.candidates.filter((candidate) => candidate.disposition === 'excluded').length);
-  expect(catalog.candidateAudit.candidates).toHaveLength(34);
-  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(34);
+  expect(catalog.candidateAudit.candidates).toHaveLength(35);
+  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(35);
   expect(catalog.candidateAudit.sourceExclusions).toHaveLength(1);
   expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
   expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
@@ -47,7 +49,7 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
     }
     for (const scenarioId of candidate.scenarioIds ?? []) {
       const scenario = catalog.scenarios.find((entry) => entry.id === scenarioId)!;
-      expect(scenario.device).toBe(candidate.deviceId);
+      expect(scenario.device).toBe(candidate.deviceId!);
       expect([...scenario.implementation, ...scenario.tests]).toContain(candidate.path);
     }
   }
@@ -58,12 +60,33 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
     expect(existsSync(join(REPO, path))).toBe(true);
   }
   expect(catalog.devices.every((device) => device.entryCommands.length > 0 && ['yes', 'no', 'conditional', 'runner-dependent'].includes(device.logsRecorded))).toBe(true);
+  expect(catalog.devices.find((device) => device.id === 'research-decision-chain')?.eventNames).toEqual([
+    'research.lens/second-order-applied', 'research.lens/second-order-skipped',
+  ]);
+  expect(catalog.devices.find((device) => device.id === 'research-decision-chain')?.implementation).toContain('src/ux-sim/research-decision-chain.ts');
+  expect(catalog.candidateAudit.candidates.some((candidate) => candidate.path.includes('research-decision-chain'))).toBe(false);
 
   const unindexed = readdirSync(import.meta.dir)
     .filter((file) => file.endsWith('.ts') && !file.endsWith('.test.ts'))
     .map((file) => `src/ux-sim/${file}`)
     .filter((path) => !implementation.has(path));
   expect(unindexed).toEqual([]);
+});
+
+test('world event registry rejects duplicate IDs and missing descriptions', () => {
+  const duplicate = structuredClone(catalog);
+  duplicate.worldEvents[1]!.id = duplicate.worldEvents[0]!.id;
+  expect(() => parseMockScenarioCatalog(duplicate)).toThrow('worldEvents contains duplicate id');
+
+  const emptyDescription = structuredClone(catalog);
+  emptyDescription.worldEvents[0]!.description = '';
+  expect(() => parseMockScenarioCatalog(emptyDescription)).toThrow('worldEvents[0].description');
+});
+
+test('version 2 catalogs without the optional world event registry remain readable', () => {
+  const legacy = structuredClone(catalog) as unknown as Record<string, unknown>;
+  delete legacy.worldEvents;
+  expect(parseMockScenarioCatalog(legacy).worldEvents).toEqual([]);
 });
 
 test('read-only device registry prints entry, logs, event, recent-use, and omission metadata', () => {
@@ -74,6 +97,25 @@ test('read-only device registry prints entry, logs, event, recent-use, and omiss
   expect(output).toContain('events=(none recorded)');
   expect(output).toContain('recent=(not recorded)');
   expect(output).toContain('omission check: required=2 missing=0');
+});
+
+test('generated manual catalog block matches the canonical JSON in memory', () => {
+  const manual = readFileSync(join(REPO, 'docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md'), 'utf8');
+  const begin = '<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->';
+  const end = '<!-- END GENERATED MOCK DEVICE CATALOG -->';
+  const startAt = manual.indexOf(begin);
+  const endAt = manual.indexOf(end);
+  expect(startAt).toBeGreaterThanOrEqual(0);
+  expect(endAt).toBeGreaterThan(startAt);
+  const actual = manual.slice(startAt, endAt + end.length);
+  const expected = [
+    begin,
+    '> 이 표는 `src/ux-sim/mock-scenario-catalog.json`에서 생성한다. 갱신: `bun scripts/generate-ux-sim-device-manual.ts`.',
+    '',
+    ...renderMockScenarioDeviceMarkdownTable(catalog),
+    end,
+  ].join('\n');
+  expect(actual).toBe(expected);
 });
 
 test('recent-use receipt is parsed and rendered when an observed run exists', () => {
@@ -201,7 +243,7 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
 
 test('list and show render registered scenarios and unknown ids fail closed', () => {
   expect(renderMockScenarioList(catalog).join('\n')).toContain('UX-MS-01\treport-deficit');
-  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 34/35');
+  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 35/36');
   expect(renderMockScenarioDetails(catalog, 'UX-MS-11').join('\n')).toContain('request-shape 400');
   expect(() => renderMockScenarioDetails(catalog, 'UX-MS-99')).toThrow('unknown mock scenario id');
 });
@@ -212,7 +254,8 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(list.stdout).toContain('UX-MS-01');
   expect(list.stdout).toContain('UX-MS-07');
   expect(list.stdout).toContain('UX-MS-11');
-  expect(list.stdout).toContain('후보 감사 34/35');
+  expect(list.stdout).toContain('UX-MS-12');
+  expect(list.stdout).toContain('후보 감사 35/36');
 
   const show = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-11'], { cwd: REPO, encoding: 'utf8' });
   expect(show.status).toBe(0);
@@ -228,3 +271,17 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(unknown.status).toBe(2);
   expect(unknown.stderr).toContain('unknown mock scenario id');
 }, 15000);
+
+test('eln sim devices --json exposes the full catalog through the CLI entry point', () => {
+  const result = spawnSync('bun', ['bin/elanous.mjs', '--test', 'sim', 'devices', '--json'], {
+    cwd: REPO,
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  expect(result.status, result.stderr).toBe(0);
+  const payload = JSON.parse(result.stdout) as typeof catalog;
+  expect(payload).toEqual(catalog);
+  expect(payload.devices.map((device) => device.id)).toEqual(catalog.devices.map((device) => device.id));
+  expect(payload.scenarios).toEqual(catalog.scenarios);
+  expect(payload.runEvidence).toEqual(catalog.runEvidence);
+}, 35000);

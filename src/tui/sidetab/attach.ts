@@ -1,26 +1,26 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { resolveBackendSpawn, claudeBackend, codexBackend } from '../../agent-mission/driver.js';
+import { resolveBackendSpawn, claudeBackend, codexBackend, grokBackend } from '../../agent-mission/driver.js';
 import { DisplayCoordinator } from '../../display/coordinator.js';
 import { createDisplayEventBus } from '../../display/events.js';
 import { createTerminalModalRouter } from '../../terminal/terminal-modal-router.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { TerminalSessionRegistry, type TerminalSession } from '../../terminal/session-registry.js';
 import { requestRemotePtyControl } from '../../pty-shell/pty-control-ipc.js';
-import { runVisibleAgentMission, type VisibleMissionPty, type VisibleMissionResult } from '../../sidetab-core/visible-agent-mission.js';
+import { runVisibleAgentMission, type VisibleAgentCli, type VisibleMissionPty, type VisibleMissionResult } from '../../sidetab-core/visible-agent-mission.js';
 import { runVisibleAgentMissionPair } from '../../sidetab-core/visible-agent-mission-pair.js';
 import type { Key } from '../../tui.js';
 import type { SidetabRow } from './list.js';
 import { createHerdrSidetabPortal, herdrPaneIdFromSidetabRow, type HerdrSidetabPortal } from './herdr-portal.js';
 
-export type SidetabCharacter = 'shell' | 'elanous' | 'codex' | 'claude';
+export type SidetabCharacter = 'shell' | 'elanous' | VisibleAgentCli;
 
 export interface SidetabAttachmentController {
   attach(row: SidetabRow): boolean;
   select(row: SidetabRow): boolean;
   showMain(): void;
   spawn(character: SidetabCharacter): boolean;
-  runMission(agent: 'codex' | 'claude', mission: string): Promise<Awaited<ReturnType<typeof runVisibleAgentMission>>>;
+  runMission(agent: VisibleAgentCli, mission: string): Promise<Awaited<ReturnType<typeof runVisibleAgentMission>>>;
   runMissionPair(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
   kill(row: SidetabRow): boolean;
   handleKey(key: Key): boolean;
@@ -31,14 +31,14 @@ export interface SidetabAttachmentController {
 }
 
 export interface AgentCliDetection {
-  agent: 'codex' | 'claude';
+  agent: VisibleAgentCli;
   installed: boolean;
   version: string | null;
   login: 'ready' | 'needed' | 'unknown';
   message: string;
 }
 
-export function sidetabMissionFailureLog(agent: 'codex' | 'claude', result: VisibleMissionResult): {
+export function sidetabMissionFailureLog(agent: VisibleAgentCli, result: VisibleMissionResult): {
   event: 'startup-screen-failed' | 'mission-failed';
   data: Record<string, unknown>;
 } | undefined {
@@ -54,6 +54,18 @@ export function sidetabMissionFailureLog(agent: 'codex' | 'claude', result: Visi
   };
 }
 
+/** Adapt a live registry session so mission results can report its real process exit code. */
+export function visibleMissionPtyForTerminalSession(session: TerminalSession): VisibleMissionPty {
+  const modal = session.modal;
+  if (!modal) throw new Error('Cannot run a visible mission without an attached terminal modal');
+  return {
+    snapshot: () => modal.snapshot(),
+    write: (bytes) => modal.write(bytes),
+    isAlive: () => modal.isAlive(),
+    exitCode: () => session.exitCode,
+  };
+}
+
 export function createSidetabAttachmentController(deps: {
   drawBase(): void;
   termSize(): { cols: number; rows: number };
@@ -62,11 +74,13 @@ export function createSidetabAttachmentController(deps: {
   logEvent?(category: string, event: string, data: Record<string, unknown>): void;
   herdrPortal?: HerdrSidetabPortal;
   /** Owned by OPT; a missing detector keeps the hook inert until its API lands. */
-  detectAgentCli?(agent: 'codex' | 'claude'): Promise<AgentCliDetection>;
+  detectAgentCli?(agent: VisibleAgentCli): Promise<AgentCliDetection>;
   /** Test seam for exercising the visible mission path without launching an external CLI. */
-  createVisibleMissionPty?(agent: 'codex' | 'claude'): { pty: VisibleMissionPty; cwd: string };
+  createVisibleMissionPty?(agent: VisibleAgentCli): { pty: VisibleMissionPty; cwd: string };
   /** Runner seam keeps the controller path testable with short deterministic mission timeouts. */
   visibleMissionRunner?: typeof runVisibleAgentMission;
+  /** Test seam for exercising real session-exit propagation through the controller. */
+  terminalRegistry?: TerminalSessionRegistry;
 }): SidetabAttachmentController {
   const eventBus = createDisplayEventBus();
   const coordinator = new DisplayCoordinator({
@@ -74,7 +88,70 @@ export function createSidetabAttachmentController(deps: {
     onRender: () => deps.drawBase(),
     writeOverlay: (ansi) => { try { process.stdout.write(ansi); } catch { /* TUI closed */ } },
   });
-  const registry = new TerminalSessionRegistry({ coordinator, eventBus });
+  const registry = deps.terminalRegistry ?? new TerminalSessionRegistry({ coordinator, eventBus });
+  const missionExitObservations = new Map<string, {
+    agent: VisibleAgentCli;
+    category: 'agent-mission.sidetab' | 'agent-mission.sidetab-pair';
+    result?: VisibleMissionResult;
+    exitCode?: number | null;
+    exitLogged?: boolean;
+  }>();
+  let controllerClosed = false;
+  let unsubscribeMissionExits = () => {};
+  const maybeUnsubscribeMissionExits = () => {
+    if (controllerClosed && missionExitObservations.size === 0) unsubscribeMissionExits();
+  };
+  const trackMissionSession = (
+    session: TerminalSession,
+    agent: VisibleAgentCli,
+    category: 'agent-mission.sidetab' | 'agent-mission.sidetab-pair',
+  ) => {
+    const observation: { agent: VisibleAgentCli; category: 'agent-mission.sidetab' | 'agent-mission.sidetab-pair'; result?: VisibleMissionResult; exitCode?: number | null; exitLogged?: boolean } = { agent, category };
+    if (session.state === 'exited') {
+      observation.exitCode = session.exitCode;
+      observation.exitLogged = true;
+      deps.logEvent?.(category, 'pty-exit', { agent, exitCode: session.exitCode });
+    }
+    missionExitObservations.set(session.id, observation);
+    return observation;
+  };
+  const trackMissionResult = (session: TerminalSession, result: VisibleMissionResult) => {
+    const observation = missionExitObservations.get(session.id);
+    if (!observation) {
+      if (session.state === 'exited') result.exitCode = session.exitCode;
+      return;
+    }
+    observation.result = result;
+    if (observation.exitCode !== undefined) {
+      result.exitCode = observation.exitCode;
+      missionExitObservations.delete(session.id);
+    } else if (session.state === 'exited') {
+      result.exitCode = session.exitCode;
+      missionExitObservations.delete(session.id);
+    }
+    maybeUnsubscribeMissionExits();
+  };
+  unsubscribeMissionExits = registry.subscribe((event) => {
+    if (event.type !== 'exited') return;
+    const observation = missionExitObservations.get(event.session.id);
+    if (!observation) return;
+    observation.exitCode = event.session.exitCode;
+    if (observation.result) {
+      observation.result.exitCode = event.session.exitCode;
+    }
+    if (!observation.exitLogged) {
+      observation.exitLogged = true;
+      deps.logEvent?.(observation.category, 'pty-exit', {
+        agent: observation.agent,
+        exitCode: event.session.exitCode,
+      });
+    }
+    // Exit observations must not pin the registry subscriber when spawning a
+    // mission failed before a result could be returned. A late runner result
+    // can still read the authoritative exit status from the exited session.
+    missionExitObservations.delete(event.session.id);
+    maybeUnsubscribeMissionExits();
+  });
   const modalRouter = createTerminalModalRouter();
   let attachedSessionId: string | null = null;
   let detachPrefixPending = false;
@@ -212,7 +289,7 @@ export function createSidetabAttachmentController(deps: {
     }
     const id = `next-sidetab-${randomUUID()}`;
     const cwd = getSessionCwd();
-    const title = character === 'claude' ? 'claude-code' : character;
+    const title = character === 'claude' ? 'claude-code' : character === 'grok' ? 'grok-build' : character;
     const common = {
       id,
       title,
@@ -224,15 +301,15 @@ export function createSidetabAttachmentController(deps: {
       registryPurpose: `next-tui-sidetab:${id}`,
       registrySeat: process.env.COORD_ID?.trim() || 'unknown',
       kind: character === 'shell' ? 'shell' as const : 'coding-agent' as const,
-      ...(character === 'claude' ? { agentBrand: 'claude-code' as const } : character === 'codex' ? { agentBrand: 'codex' as const } : {}),
+      ...(character === 'claude' ? { agentBrand: 'claude-code' as const } : character === 'codex' || character === 'grok' ? { agentBrand: character } : {}),
     };
     try {
       let command: string | undefined;
       let env: Record<string, string> | undefined;
       let unsetEnv: string[] | undefined;
       if (character === 'elanous') command = 'elanous --tui next';
-      if (character === 'codex' || character === 'claude') {
-        const backend = character === 'codex' ? codexBackend : claudeBackend;
+      if (character === 'codex' || character === 'claude' || character === 'grok') {
+        const backend = visibleAgentBackend(character);
         const spec = resolveBackendSpawn(backend, process.env);
         command = [spec.cmd, ...spec.args].map(shellQuote).join(' ');
         env = spec.env;
@@ -316,6 +393,7 @@ export function createSidetabAttachmentController(deps: {
       const injectedMissionPty = deps.createVisibleMissionPty?.(agent);
       let modal: VisibleMissionPty;
       let cwd: string;
+      let missionSession: TerminalSession | undefined;
       if (injectedMissionPty) {
         modal = injectedMissionPty.pty;
         cwd = injectedMissionPty.cwd;
@@ -325,11 +403,13 @@ export function createSidetabAttachmentController(deps: {
         if (!spawned || !session?.modal) {
           return { ok: false, path: '', promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, error: `${agent} side-tab PTY could not start` };
         }
-        modal = session.modal;
+        missionSession = session;
+        trackMissionSession(session, agent, 'agent-mission.sidetab');
+        modal = visibleMissionPtyForTerminalSession(session);
         cwd = session.cwd;
       }
       const outputPath = join(cwd, '.elanous', 'mission-results', `sidetab-${Date.now()}.md`);
-      const backend = agent === 'codex' ? codexBackend : claudeBackend;
+      const backend = visibleAgentBackend(agent);
       const result = await (deps.visibleMissionRunner ?? runVisibleAgentMission)({
         pty: modal,
         agent,
@@ -338,6 +418,7 @@ export function createSidetabAttachmentController(deps: {
         onStartupScreen: (screen) => deps.logEvent?.('agent-mission.sidetab', 'startup-screen', { agent, screen }),
         handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
       });
+      if (missionSession) trackMissionResult(missionSession, result);
       const failureLog = sidetabMissionFailureLog(agent, result);
       if (failureLog) deps.logEvent?.('agent-mission.sidetab', failureLog.event, failureLog.data);
       showMain();
@@ -379,11 +460,13 @@ export function createSidetabAttachmentController(deps: {
           const session = lastSpawnedSession as TerminalSession | null;
           if (!didSpawn || !session) return null;
           sessions.set(member, session);
+          trackMissionSession(session, member, 'agent-mission.sidetab-pair');
           workspaces.set(member, session.cwd);
           const pty: VisibleMissionPty = {
             snapshot: () => session.preview.renderForLLM(),
             write: (bytes) => session.preview.write(bytes),
             isAlive: () => session.preview.isAlive,
+            exitCode: () => session.exitCode,
           };
           ptySessions.set(pty, session);
           return pty;
@@ -400,6 +483,8 @@ export function createSidetabAttachmentController(deps: {
             onStartupScreen: (screen) => deps.logEvent?.('agent-mission.sidetab-pair', 'startup-screen', { agent: member, screen }),
             handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
           });
+          const session = sessions.get(member);
+          if (session) trackMissionResult(session, result);
           const failureLog = sidetabMissionFailureLog(member, result);
           if (failureLog) deps.logEvent?.('agent-mission.sidetab-pair', failureLog.event, failureLog.data);
           return result;
@@ -571,10 +656,13 @@ export function createSidetabAttachmentController(deps: {
     hasRemoteView: () => remotePtyId !== null || herdrPaneId !== null,
     refresh: () => coordinator.requestRenderNow({ force: true }),
     close() {
+      if (controllerClosed) return;
+      controllerClosed = true;
       stopRemote();
       stopHerdr();
       modalRouter.close();
       for (const session of registry.list()) registry.kill(session.id);
+      maybeUnsubscribeMissionExits();
     },
   };
 
@@ -589,4 +677,10 @@ export function createSidetabAttachmentController(deps: {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function visibleAgentBackend(agent: VisibleAgentCli) {
+  if (agent === 'codex') return codexBackend;
+  if (agent === 'claude') return claudeBackend;
+  return grokBackend;
 }

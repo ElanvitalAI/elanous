@@ -264,7 +264,10 @@ describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선�
   test('대시보드 종료(closeDashboardTui)가 «자기» 구독을 푼다', () => {
     const at = src.indexOf('const closeDashboardTui = (): void => {');
     expect(at).toBeGreaterThan(0);
-    expect(src.slice(at, src.indexOf('};', at))).toContain('disposeDashboardAgentWake();');
+    // #33697 added an inline disposer reset; bound this body by the next top-level declaration.
+    const next = src.indexOf('  const exitDashboardTui = (): void => {', at);
+    expect(next).toBeGreaterThan(at);
+    expect(src.slice(at, next)).toContain('disposeDashboardAgentWake();');
     expect(src).toContain('disposeDashboardAgentWake = () => agentWake.dispose();');
     // 종료 정리는 모듈의 리스너 하나 — 대시보드가 재진입마다 beforeExit 를 더하지 않는다.
     expect(src).not.toContain("process.once('beforeExit', () => agentWake.dispose());");

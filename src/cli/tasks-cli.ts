@@ -22,6 +22,7 @@ import { ambiguousGreenSweepPrs, applyGreenSweepDecisions, decideGreenSweep, gre
 import { mapInventory, renderMapReduceTable, type MapInventory, type MapItem, type MapPorts } from '../task-agent/map-reduce.js';
 import type { MapRecipe, MapRunRow } from '../task-agent/map-run-ledger.js';
 import { createMapHostLauncher, type HostMapItem } from '../task-agent/map-host-adapter.js';
+import { excludeGatePoolHosts, readTrafficDispatchSnapshot, releaseGateTrafficActive, resolveSshHostIdentity, type TrafficDispatchSnapshot } from '../task-orchestrator/surfaces/gate-pod-pool-policy.js';
 import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
 import type { PluginWizardDeps } from '../graph-wizard/mission-compose.js';
 import type { TaskPluginWizardHostPorts } from './task-plugin-wizard-host.js';
@@ -220,6 +221,8 @@ export interface DefaultTaskLauncherDeps {
   ownerCodexLeaseHolder?: () => boolean;
   /** 원격 → 로컬 되돌림 알림(시험 주입). 기본 = stderr 한 줄. */
   notice?: (line: string) => void;
+  /** Release gate snapshot/config seam; production reads traffic.json and release.loop.gatePodPool. */
+  releaseGatePolicy?: { traffic: TrafficDispatchSnapshot | null; gatePool?: string; resolveHostIdentity?: (host: string) => string | null } | null;
 }
 
 class NoEligibleOwnerCodexAccountError extends Error {}
@@ -240,7 +243,8 @@ export function podParentLaunchSelectors(contextEnv: Record<string, string>, inh
  * HARNESS-PARENT-ON-MSB1 — 켜져 있고 발사 전 점검이 통과하면 원격(ssh)에서 부모를 띄운다(PR 까지만 · 병합은 HQ).
  * 막히면 null — 호출부가 종전 로컬 발사로 간다(관측: task-agent parent-host-fallback).
  */
-async function tryRemoteParent(args: string[], cwd: string | undefined, context: TaskLaunchContext, deps: DefaultTaskLauncherDeps): Promise<TaskLaunchReceipt | null> {
+async function tryRemoteParent(args: string[], cwd: string | undefined, context: TaskLaunchContext, deps: DefaultTaskLauncherDeps,
+  attached = false): Promise<(TaskLaunchReceipt & { exitCode?: number }) | { blocked: true; reason: string } | null> {
   const parentHostModule = await import('../task-agent/parent-host.js');
   let configured: import('../task-agent/parent-host.js').ParentHostSetting | null | undefined = deps.parentHost;
   if (configured === undefined) {
@@ -248,11 +252,40 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     try { configured = getUserConfig().taskAgent?.parentHost; } catch { configured = undefined; }
   }
   const multi = Array.isArray(configured);
-  const targets = configured === null ? [] : parentHostModule.resolveParentHosts(configured, deps.parentHost === undefined ? process.env : { ...process.env, ELANOUS_TA_PARENT_HOST: undefined });
+  let targets = configured === null ? [] : parentHostModule.resolveParentHosts(configured, deps.parentHost === undefined ? process.env : { ...process.env, ELANOUS_TA_PARENT_HOST: undefined });
+  // An explicit opt-out (or no configured parent host) keeps the existing local-launch path.
+  // Gate-pool exclusivity only applies once a remote parent target actually exists to filter.
   if (!targets.length) return null;
-  const providerFromArgs = args.find((arg) => arg.startsWith('--child-llm-provider='))?.slice('--child-llm-provider='.length)
-    ?? (args.includes('--child-llm-provider') ? args[args.indexOf('--child-llm-provider') + 1] : undefined);
-  const effectiveChildProvider = context.effectiveChildProvider ?? providerFromArgs;
+  const releaseGatePolicy: DefaultTaskLauncherDeps['releaseGatePolicy'] = deps.releaseGatePolicy === undefined && deps.parentHost !== undefined ? null
+    : deps.releaseGatePolicy === undefined ? (() => {
+    const traffic = readTrafficDispatchSnapshot(process.env);
+    if (traffic !== null && !releaseGateTrafficActive(traffic)) return null;
+    let gatePool: string | undefined;
+    try { gatePool = (require('../../scripts/release-loop/unattended-release.js') as typeof import('../../scripts/release-loop/unattended-release.js')).releaseLoopConfig().gatePodPool; }
+    catch (error) { try { debug.log('task-agent.parent-host', 'release-gate-pool-config-unavailable', { reason: String(error) }, { level: 'error' }); } catch { /* fail-soft */ } }
+    return { traffic, gatePool };
+  })() : deps.releaseGatePolicy;
+  const gateTraffic = releaseGatePolicy?.traffic ?? null;
+  const gateExclusive = releaseGatePolicy !== null && (gateTraffic === null || releaseGateTrafficActive(gateTraffic));
+  if (gateExclusive) {
+    const filtered = excludeGatePoolHosts(targets, releaseGatePolicy?.gatePool, gateTraffic, undefined,
+      releaseGatePolicy?.resolveHostIdentity ?? resolveSshHostIdentity);
+    const gateHosts = 'gateHosts' in filtered ? filtered.gateHosts : [];
+    if ('reason' in filtered && filtered.reason) {
+      const reason = filtered.reason;
+      try { debug.log('task-agent.parent-host', 'release-gate-parent-dispatch-blocked', { runId: context.runId, reason, gateHosts }, { level: 'error' }); } catch { /* fail-soft */ }
+      return { blocked: true, reason };
+    }
+    targets = filtered.targets;
+    try { debug.log('task-agent.parent-host', 'release-gate-parent-hosts-filtered', { runId: context.runId,
+      global: gateTraffic?.global ?? 'unknown', podTarget: gateTraffic?.podTarget ?? null, gateHosts,
+      eligibleHosts: targets.map(({ host }) => host) }); } catch { /* fail-soft */ }
+  }
+  if (!targets.length) return gateExclusive ? { blocked: true, reason: 'no-parent-host-outside-release-gate-pool' } : null;
+  // The CLI boundary and task-hand have already parsed the effective provider into context.
+  // Serialized argv can contain option-looking goal text or values after `--`; never infer
+  // credential/preflight policy from that untrusted representation.
+  const effectiveChildProvider = context.effectiveChildProvider;
   const notice = deps.notice ?? ((line: string) => { try { process.stderr.write(`${line}\n`); } catch { /* ignore */ } });
   const provisionRequests = new Set<string>();
   const provision = (host: string, reason: string): void => {
@@ -267,7 +300,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     // grok-credential-* 은 호스트가 스스로 보고한 자체 자격 상태다 — 무효면 OP 재로그인 요청이 나간다.
     const provisionGaps = ['grok-cli-missing', 'codex-cli-missing', 'grok-credential-missing', 'grok-credential-expiring', 'grok-credential-expired', 'codex-access-mirror-unavailable'];
     const missing = gaps.every((gap) => provisionGaps.includes(gap)) ? gaps : [];
-    notice(`[parent-host] ${target.host} 로 못 띄움 — ${missing.length ? '공급자 준비 뒤 재시도' : multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
+    notice(`[parent-host] ${target.host} 로 못 띄움 — ${missing.length ? '공급자 준비 뒤 재시도' : gateExclusive ? '다음 호스트 또는 gate 전용 풀 때문에 발사 차단' : multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
     for (const gap of missing) provision(target.host, gap);
   };
   type OwnerMirror = { elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number; mirrors?: Array<{ elanousAuth: string; codexAuth: string; account: string; usedPercent?: number; thresholdPercent: number; expiresAt: number }> };
@@ -475,6 +508,12 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
         if (mirrors) remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNTS = JSON.stringify(mirrors.map(({ account, usedPercent, thresholdPercent, expiresAt }) => ({ account, usedPercent: usedPercent ?? null, thresholdPercent, expiresAt })));
         remoteEnv.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
       }
+      if (attached) {
+        const exitCode = parentHostModule.runRemoteParentAttached(target, args, remoteEnv, deps.ssh, effectiveChildProvider);
+        recordHostRanking(target.host);
+        try { debug.log('task-agent', 'parent-host-attached-completed', { host: target.host, runId: context.runId, exitCode }); } catch { /* fail-soft */ }
+        return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}) }, exitCode };
+      }
       const launched = parentHostModule.launchRemoteParent(target, args, remoteEnv, deps.ssh, effectiveChildProvider);
       recordHostRanking(target.host);
       try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
@@ -489,7 +528,16 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   }
   recordHostRanking(null);
   if (provisionRequests.size > 0) throw new Error(`parent-host-provision-pending: ${[...provisionRequests].join(', ')}; no child provider host launched`);
-  return null;
+  return gateExclusive ? { blocked: true, reason: 'all-non-gate-parent-hosts-unavailable' } : null;
+}
+
+/** Run an orchestrator parent through task hand's host selection, preflight, and credential policy. */
+export async function runRemoteTaskParent(args: string[], context: TaskLaunchContext,
+  deps: DefaultTaskLauncherDeps = {}): Promise<{ dispatched: false } | { dispatched: true; exitCode: number; host: string } | { dispatched: false; blocked: true; reason: string }> {
+  const receipt = await tryRemoteParent(args, undefined, context, deps, true);
+  if (receipt && 'blocked' in receipt) return { dispatched: false, blocked: true, reason: receipt.reason };
+  if (!receipt) return { dispatched: false };
+  return { dispatched: true, exitCode: receipt.exitCode ?? 0, host: receipt.parentHost?.host ?? 'unknown' };
 }
 
 /** Advisory lines may precede the actual fatal error. Keep the full stderr as evidence. */
@@ -509,6 +557,7 @@ export async function defaultTaskLauncher(args: string[], cwd?: string, context?
   if (context) context = (await import('../harness/launch-utterance-ledger.js')).withHandLaunchPairContext(args, context); // LAUNCH-UTTERANCE-LEDGER hand→say pair env
   if (context) {
     const remote = await tryRemoteParent(args, cwd, context, deps);
+    if (remote && 'blocked' in remote) throw new Error(`release gate parent-host dispatch blocked: ${remote.reason}`);
     if (remote) return remote;
   }
   // ⛔ R7(2026-10-16): 시험 안에서 실 `elanous harness say` 를 띄우는 것은 명시 허용 없이 거부한다(가짜 spawn 주입은 통과).
@@ -2629,7 +2678,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           checklist = matches[0];
         }
         const number = Number(value);
-        const origin = execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: process.cwd(), encoding: 'utf8' }).trim().replace(/\.git\/?$/, '');
+        const origin = (deps.handOriginRepo?.() ?? execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: process.cwd(), encoding: 'utf8' }).trim()).replace(/\.git\/?$/, '');
         const repo = origin.match(/^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)([^/\s]+\/[^/\s]+)\/?$/)?.[1];
         if (!repo) throw new Error(`현재 worktree origin이 GitHub 저장소가 아니다: ${origin}`);
         const view = (deps.adoptPrView ?? ((pr: number, cwd: string) => JSON.parse(execFileSync('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,url,state,baseRefName,headRefOid'], { cwd, encoding: 'utf8' }))))(number, process.cwd());

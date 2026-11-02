@@ -19,6 +19,7 @@ test('harness say live launch gate rejects a same-goal active run and observes a
   const root = mkdtempSync(join(tmpdir(), 'harness-launch-gate-'));
   const home = join(root, 'home');
   const state = join(root, 'instance', '.elanous-test');
+  const cli = join(repo, 'bin/elanous.mjs');
   const sentence = `live launch gate ${randomUUID()}`;
   const goalId = launchRequestId(sentence);
   const runId = `run-${randomUUID()}`;
@@ -40,8 +41,8 @@ test('harness say live launch gate rejects a same-goal active run and observes a
     db = undefined;
 
     const childEnv = { PATH: process.env.PATH ?? '', HOME: home, XDG_CONFIG_HOME: join(home, '.config'), NODE_ENV: 'test', ELANOUS_LAUNCH_GATE_LIVE: '1' };
-    const execute = (flags: string[] = []) => spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${state}`, 'harness', 'say', sentence, '--child-llm-provider', 'anthropic', ...flags], {
-      cwd: repo, env: childEnv, encoding: 'utf8', timeout: 90_000,
+    const execute = (flags: string[] = []) => spawnSync(process.execPath, [cli, `--test=${state}`, 'harness', 'say', sentence, '--child-llm-provider', 'anthropic', ...flags], {
+      cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000,
     });
     const blocked = execute();
     expect(blocked.error).toBeUndefined();
@@ -51,9 +52,9 @@ test('harness say live launch gate rejects a same-goal active run and observes a
     ]);
     expect(blocked.stderr).not.toContain('active runs unknown');
     const unmeasured = spawnSync(process.execPath, [
-      'bin/elanous.mjs', `--test=${state}`, 'harness', 'say', `empty home ${randomUUID()}`,
+      cli, `--test=${state}`, 'harness', 'say', `empty home ${randomUUID()}`,
       '--child-llm-provider', 'openai-codex', '--source', 'local-only',
-    ], { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 90_000 });
+    ], { cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000 });
     expect(unmeasured.error).toBeUndefined();
     expect(unmeasured.status).toBe(2);
     expect(unmeasured.stderr.split('\n').filter((line) => line.includes('usage unmeasured'))).toEqual([
@@ -61,7 +62,7 @@ test('harness say live launch gate rejects a same-goal active run and observes a
     ]);
     expect(unmeasured.stderr).toContain('`--source` 는 `--substrate pod` 와 함께');
     expect(unmeasured.stderr).not.toContain('❌ launch gate:');
-    const eventsAfterUnmeasured = readFileSync(join(repo, 'log', 'latest'), 'utf8').split('\n').flatMap((line) => {
+    const eventsAfterUnmeasured = readFileSync(join(root, '.elanous', 'debug', 'latest'), 'utf8').split('\n').flatMap((line) => {
       try { return [JSON.parse(line) as { category: string; event: string; data: Record<string, unknown> }]; }
       catch { return []; }
     });
@@ -81,9 +82,9 @@ test('harness say live launch gate rejects a same-goal active run and observes a
       else process.env.ELANOUS_STATE_DIR = previousStateDir;
     }
     const budgetBlocked = spawnSync(process.execPath, [
-      'bin/elanous.mjs', `--test=${state}`, 'harness', 'say', sentence,
+      cli, `--test=${state}`, 'harness', 'say', sentence,
       '--child-llm-provider', 'openai-codex', '--force-gate', '--source', 'local-only',
-    ], { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 90_000 });
+    ], { cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000 });
     expect(budgetBlocked.error).toBeUndefined();
     expect(budgetBlocked.status).toBe(3);
     expect(budgetBlocked.stderr.split('\n').filter((line) => line.includes('❌ launch gate:'))).toEqual([
@@ -99,7 +100,7 @@ test('harness say live launch gate rejects a same-goal active run and observes a
     expect(forced.stderr).toContain('`--source` 는 `--substrate pod` 와 함께');
     expect(forced.stderr).not.toContain('❌ launch gate:');
     expect(forced.status).toBe(2);
-    const events = readFileSync(join(repo, 'log', 'latest'), 'utf8').split('\n').flatMap((line) => {
+    const events = readFileSync(join(root, '.elanous', 'debug', 'latest'), 'utf8').split('\n').flatMap((line) => {
       try { return [JSON.parse(line) as { category: string; event: string; data: Record<string, unknown> }]; }
       catch { return []; }
     });

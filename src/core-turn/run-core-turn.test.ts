@@ -325,6 +325,30 @@ describe('runCoreTurn surface input isolation', () => {
     expect(dateLines).toBe(1);
   });
 
+  test('preserves a research source URL when synthesis omits citations', async () => {
+    spyOn(surfaceModule, 'resolveSessionSurfaceProfile').mockReturnValue({
+      id: 'research/agent', domain: 'research', selectionReason: 'test',
+      baselineContexts: [], defaultFamilies: [], conditionalFamilies: [],
+    } as unknown as ReturnType<typeof surfaceModule.resolveSessionSurfaceProfile>);
+    spyOn(llmModule, 'streamLLMWithTools').mockResolvedValue('HBM4 공급 현황은 공개 자료에서 확인할 수 있습니다.');
+    const prompt = '최신 HBM4 공급 현황을 조사해줘';
+    const result = await runCoreTurn({
+      sessionId: 'research-citation-preserved',
+      messages: [{ role: 'user', content: prompt }],
+      tools: [tool],
+      dispatchTool: async () => null,
+      signal,
+      userText: prompt,
+    }, { runResearch: async () => ({
+      ok: true,
+      sourceUrls: ['https://example.org/hbm4/1'],
+      output: `## Evidence\n${Array.from({ length: 65 }, (_, index) =>
+        `- [complete] web-search · https://example.org/hbm4/${index + 1} · published 2026-10-30: 공급 현황`).join('\n')}`,
+    }) });
+
+    expect(result.finalText).toContain('https://example.org/hbm4/1');
+  });
+
   test('emits capability.resolve/tool-tier-split from the real turn entry', async () => {
     const records: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
     spyOn(debug, 'log').mockImplementation((category, event, data) => {

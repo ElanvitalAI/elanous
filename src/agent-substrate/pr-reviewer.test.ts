@@ -137,6 +137,8 @@ describe('REVIEW-ROUND-REAUTHOR — r3+ 분류 그림자', () => {
         { class: 'code-defect', finding: 'finding-b' },
       ], unclassified: [] });
       expect(result.mustFix).toEqual(['finding-a', 'finding-b']);
+      expect(result).not.toHaveProperty('referencedFilesOpened');
+      expect(result).not.toHaveProperty('referencedFilesRead');
     } finally {
       if (originalLimit === undefined) delete process.env.ELANOUS_PR_REVIEW_DIFF_CHARS;
       else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = originalLimit;

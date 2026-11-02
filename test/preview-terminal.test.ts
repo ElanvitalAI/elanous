@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import {
   PreviewTerminal,
@@ -154,13 +155,16 @@ describe('PreviewTerminal', () => {
   // 안 읽은 줄에 SZ 가 영영 안 찍혔다). ⓐ 프로필을 안 읽는 셸 ⓑ 메아리가 아니라 «셸의 출력»을 기다린다
   // (`RE""ADY` 는 메아리엔 따옴표째 보이고 출력에만 `READY` 로 붙는다) ⓒ 고정 sleep 0 · 상한은 넉넉히.
   test.skipIf(!hasNodePtyBinding)('resize reaches the kernel PTY — the shell sees the new size (stty size)', async () => {
+    const shellDir = mkdtempSync(join(tmpdir(), 'preview-terminal-slow-shell-'));
+    const rcFile = join(shellDir, 'bashrc');
+    writeFileSync(rcFile, "sleep 0.3\nPS1='__ELANOUS_TEST_PROMPT__# '\n");
     const session = new PreviewTerminal({
       cols: 80,
       rows: 10,
       cwd: process.cwd(),
       shell: '/bin/bash',
-      shellArgs: ['--noprofile', '--norc', '-i'],
-      env: { ...process.env, PS1: '$ ', BASH_ENV: '', ENV: '' } as Record<string, string>,
+      shellArgs: ['--noprofile', '--rcfile', rcFile, '-i'],
+      env: { ...process.env, BASH_ENV: '', ENV: '', PROMPT_COMMAND: '' } as Record<string, string>,
     });
     const waitForRender = async (pred: (s: string) => boolean, ms: number): Promise<string> => {
       const until = Date.now() + ms;
@@ -173,6 +177,10 @@ describe('PreviewTerminal', () => {
     };
     try {
       session.start();
+      // The PTY can echo input before the interactive shell has started reading it.
+      // Wait for the controlled PS1 prompt first so slow CI hosts do not lose the readiness probe.
+      const prompt = await waitForRender(s => /__ELANOUS_TEST_PROMPT__# *$/m.test(s), 60_000);
+      expect(prompt).toMatch(/__ELANOUS_TEST_PROMPT__# *$/m);
       // node-pty 의 fd 는 «뜬 직후»엔 아직 살아 있다 — 셸이 한 줄을 «실행한» 뒤(실사용과 같은 때)에 바꾼다.
       session.write('echo RE""ADY\r');
       const ready = await waitForRender(s => /^READY\s*$/m.test(s), 60_000);
@@ -183,8 +191,9 @@ describe('PreviewTerminal', () => {
       expect(snapshot).toContain('SZ=21 117');
     } finally {
       session.stop();
+      rmSync(shellDir, { recursive: true, force: true });
     }
-  }, 130_000);
+  }, 190_000);
 
   test.skipIf(!hasNodePtyBinding)('stop is idempotent', () => {
     const session = new PreviewTerminal({

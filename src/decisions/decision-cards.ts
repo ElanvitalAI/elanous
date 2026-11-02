@@ -81,7 +81,12 @@ export function renderCard(e: DecisionEntry, extra: { note?: string; confirm?: s
       { label: '취소', data: `${DECISION_DATA_PREFIX}${e.id}:-` },
     ]] };
   }
-  const choices = e.options.map((o) => ({ label: Array.from(`${o.key.toUpperCase()}) ${o.label}`).slice(0, 60).join(''), data: `${DECISION_DATA_PREFIX}${e.id}:${o.key}` }));
+  const recommendedKey = 'option' in e.recommendation ? e.recommendation.option : undefined;
+  const choices = e.options.map((o) => {
+    const suffix = o.key === recommendedKey ? ' (권고)' : '';
+    const label = Array.from(`${o.key.toUpperCase()}) ${o.label}`).slice(0, 60 - Array.from(suffix).length).join('') + suffix;
+    return { label, data: `${DECISION_DATA_PREFIX}${e.id}:${o.key}` };
+  });
   const rows: CardButton[][] = [];
   for (let i = 0; i < choices.length; i += 2) rows.push(choices.slice(i, i + 2));
   rows.push([{ label: '📝 메모 달기', data: `${DECISION_DATA_PREFIX}${e.id}:memo` }]);

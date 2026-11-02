@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { RunResult } from './ffmpeg.js';
 import { UNOBSERVED, type Recipe, type RecipeCtx, type RecipeResult } from './types.js';
@@ -83,10 +83,101 @@ function keys(script: unknown): string[] | null {
   ];
 }
 
+type ExplainerChart = { factId: string; kind: 'bar' | 'line'; title: string; points: { label: string; value: number }[] };
+
+function chartsFrom(value: unknown, facts: readonly unknown[]): ExplainerChart[] | null {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) return null;
+  const factIds = new Set(facts.flatMap((fact) => fact && typeof fact === 'object' &&
+    typeof (fact as { id?: unknown }).id === 'string' ? [(fact as { id: string }).id] : []));
+  const charts: ExplainerChart[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== 'object') return null;
+    const row = item as { factId?: unknown; kind?: unknown; title?: unknown; points?: unknown };
+    if (typeof row.factId !== 'string' || !factIds.has(row.factId) || seen.has(row.factId) ||
+        (row.kind !== 'bar' && row.kind !== 'line') || typeof row.title !== 'string' || !row.title.trim() ||
+        !Array.isArray(row.points) || row.points.length < 2 || row.points.length > 8) return null;
+    const points: ExplainerChart['points'] = [];
+    for (const point of row.points) {
+      if (!point || typeof point !== 'object') return null;
+      const p = point as { label?: unknown; value?: unknown };
+      if (typeof p.label !== 'string' || !p.label.trim() || typeof p.value !== 'number' || !Number.isFinite(p.value)) return null;
+      points.push({ label: p.label.trim(), value: p.value });
+    }
+    seen.add(row.factId);
+    charts.push({ factId: row.factId, kind: row.kind, title: row.title.trim(), points });
+  }
+  return charts;
+}
+
+function sourceCaptions(value: unknown): Map<string, { label: string; url: string }> {
+  if (!Array.isArray(value)) return new Map();
+  return new Map(value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const row = item as { id?: unknown; label?: unknown; url?: unknown };
+    return typeof row.id === 'string' && typeof row.label === 'string' && typeof row.url === 'string'
+      ? [[row.id, { label: row.label, url: row.url }] as const] : [];
+  }));
+}
+
 export function explainerScript(): Recipe {
   return async (ctx) => {
-    const path = scriptPath(ctx);
-    if (!path) return finish(ctx, 'script', { outcome: 'no-facts', note: 'script_path 가 state 에 없다 — 대본 저작이 필요하다' });
+    let path = scriptPath(ctx);
+    if (!path) {
+      try { mkdirSync(ctx.workdir, { recursive: true }); }
+      catch (error) { return finish(ctx, 'script', { outcome: UNOBSERVED, note: `대본 작업 디렉터리를 만들지 못했다: ${String(error)}` }); }
+      path = resolve(ctx.workdir, 'script.json');
+      if (!safeOutput(ctx.workdir, path)) return finish(ctx, 'script', { outcome: UNOBSERVED, note: '생성 대본 경로가 workdir 밖을 가리킨다' });
+      if (existsSync(path)) return finish(ctx, 'script', { outcome: 'collision', note: `기존 대본을 덮어쓰지 않았다: ${path} — script_path 로 지정하거나 파일을 옮겨라` });
+      const briefing = ctx.state.briefing;
+      const facts = ctx.state.facts;
+      const sources = ctx.state.sources;
+      if (!briefing || typeof briefing !== 'object' ||
+          (briefing as { confirmed?: unknown }).confirmed !== true ||
+          !Array.isArray(facts) || facts.length === 0 ||
+          !Array.isArray(sources) || sources.length === 0) {
+        return finish(ctx, 'script', { outcome: 'no-facts', note: '확정 브리핑·사실·출처가 없고 script_path 도 없다' });
+      }
+      const sourceById = new Map(sources.flatMap((source) => {
+        if (!source || typeof source !== 'object') return [];
+        const row = source as { id?: unknown; label?: unknown; url?: unknown };
+        return typeof row.id === 'string' && typeof row.label === 'string' && typeof row.url === 'string'
+          ? [[row.id, { label: row.label, url: row.url }] as const] : [];
+      }));
+      const preparedFacts = facts.flatMap((fact, index) => {
+        if (!fact || typeof fact !== 'object') return [];
+        const row = fact as { id?: unknown; title?: unknown; text?: unknown; sourceId?: unknown };
+        const source = typeof row.sourceId === 'string' ? sourceById.get(row.sourceId) : undefined;
+        if (typeof row.text !== 'string' || !row.text.trim() || !source) return [];
+        return [{ factId: typeof row.id === 'string' ? row.id : undefined,
+          sourceId: typeof row.sourceId === 'string' ? row.sourceId : undefined,
+          title: typeof row.title === 'string' && row.title.trim() ? row.title.trim() : `근거 ${index + 1}`,
+          text: row.text.trim(), source }];
+      });
+      if (preparedFacts.length !== facts.length) {
+        return finish(ctx, 'script', { outcome: 'no-facts', note: '각 사실에 읽을 수 있는 문장과 출처 id·label·url 연결이 필요하다' });
+      }
+      const memo = briefing as { title?: unknown; summary?: unknown };
+      const title = typeof memo.title === 'string' && memo.title.trim() ? memo.title.trim() : '확정 브리핑';
+      const summary = typeof memo.summary === 'string' && memo.summary.trim() ? memo.summary.trim() : `${title}의 확인된 근거를 정리합니다.`;
+      const generated = {
+        title,
+        intro: { beats: [{ vo: `${title}. 확인된 근거 ${preparedFacts.length}가지를 정리합니다.`, cap: `${title}: ${preparedFacts.length}가지 확인된 근거` }] },
+        chapters: preparedFacts.map((fact) => ({
+          factId: fact.factId,
+          sourceId: fact.sourceId,
+          title: fact.title,
+          sub: `출처: ${fact.source.label}`,
+          diagram: 'nodes',
+          beats: [{ vo: fact.text, cap: fact.text }],
+        })),
+        outro: { beats: [{ vo: summary, cap: summary }] },
+      };
+      try {
+        writeFileSync(path, JSON.stringify(generated, null, 2));
+      } catch (e) { return finish(ctx, 'script', { outcome: UNOBSERVED, note: `확정 브리핑 대본을 저장하지 못했다: ${String(e)}` }); }
+    }
     if (!existsSync(path)) return finish(ctx, 'script', { outcome: 'no-facts', note: `대본이 없다: ${path}` });
     let script: unknown;
     try { script = JSON.parse(readFileSync(path, 'utf8')); }
@@ -158,15 +249,58 @@ export function explainerBuild(deps: ExplainerDeps = {}): Recipe {
     const project = dirname(path);
     const hf = resolve(project, 'hf');
     const timeline = resolve(project, 'timeline.json');
+    let buildInputPath = '';
     try {
       mkdirSync(ctx.workdir, { recursive: true });
+      buildInputPath = resolve(mkdtempSync(join(ctx.workdir, '.explainer-build-')), 'script.json');
       if (![hf, resolve(hf, 'assets'), resolve(hf, 'assets/fonts'), resolve(hf, 'assets/vo'), timeline].every((p) => safeOutput(project, p))
-        || !safeOutput(ctx.workdir, resolve(ctx.workdir, 'explainer-cache'))) {
+        || !safeOutput(ctx.workdir, resolve(ctx.workdir, 'explainer-cache'))
+        || !safeOutput(ctx.workdir, buildInputPath)) {
         return finish(ctx, 'build', { outcome: UNOBSERVED, note: '빌드 출력/캐시가 허용된 폴더 밖을 가리킨다' });
       }
     } catch (e) { return finish(ctx, 'build', { outcome: UNOBSERVED, note: `빌드 경로 확인 실패: ${String(e)}` }); }
+    try {
+      const script = JSON.parse(readFileSync(path, 'utf8')) as { chapters?: unknown };
+      if (!Array.isArray(script.chapters)) throw new Error('chapters 배열이 없다');
+      const scenePlan = ctx.state.scene_plan;
+      const facts = Array.isArray(ctx.state.facts) ? ctx.state.facts : [];
+      const chartPlan = chartsFrom(ctx.state.chart_plan, facts);
+      if (chartPlan === null) return finish(ctx, 'build', { outcome: 'bad-script', note: 'chart_plan 은 사실 id에 연결된 2~8개 점의 bar/line 차트여야 한다' });
+      const charts = new Map(chartPlan.map((chart) => [chart.factId, chart]));
+      const captions = sourceCaptions(ctx.state.evidence_captions);
+      const scenes = Array.isArray(scenePlan) && scenePlan.length === script.chapters.length ? scenePlan : script.chapters;
+      const chapters = script.chapters.map((base, index) => {
+        const original = base && typeof base === 'object' ? base as Record<string, unknown> : {};
+        const scene = scenes[index] && typeof scenes[index] === 'object' ? scenes[index] as Record<string, unknown> : original;
+        const factId = typeof scene.factId === 'string' ? scene.factId : typeof original.factId === 'string' ? original.factId : '';
+        const sourceId = typeof scene.sourceId === 'string' ? scene.sourceId : typeof original.sourceId === 'string' ? original.sourceId : '';
+        const chart = charts.get(factId);
+        const source = captions.get(sourceId);
+        const rawBeats = Array.isArray(scene.beats) ? scene.beats : original.beats;
+        const beats = Array.isArray(rawBeats) ? rawBeats.map((beat) => {
+          if (!source || !beat || typeof beat !== 'object') return beat;
+          const row = beat as Record<string, unknown>;
+          const citation = ` · Source: ${source.label}`;
+          return typeof row.cap === 'string' && !row.cap.includes(citation) ? { ...row, cap: `${row.cap}${citation}` } : beat;
+        }) : rawBeats;
+        return {
+          ...original,
+          ...scene,
+          diagram: chart ? 'chart' : scene.diagram === 'chart' ? 'nodes' : scene.diagram,
+          ...(chart ? { chart } : {}),
+          ...(source ? { sub: `출처: ${source.label}`, sourceUrl: source.url } : {}),
+          ...(beats === undefined ? {} : { beats }),
+        };
+      });
+      const targetSeconds = loadExplainerLine(deps.declarationPath).targetSeconds;
+      writeFileSync(buildInputPath, JSON.stringify({
+        ...script,
+        chapters,
+        ...(targetSeconds === null ? {} : { target_seconds: targetSeconds }),
+      }, null, 2));
+    } catch (e) { return finish(ctx, 'build', { outcome: 'bad-script', note: `장면·차트·근거 자막을 대본에 연결하지 못했다: ${String(e)}` }); }
     let r: RunResult;
-    try { r = runner(deps, ctx)('node', [engine, path], ENGINE_MS, project); }
+    try { r = runner(deps, ctx)('node', [engine, buildInputPath, project], ENGINE_MS, project); }
     catch (e) { return finish(ctx, 'build', { outcome: UNOBSERVED, note: `node build.mjs 를 못 불렀다: ${String(e)}` }); }
     if (unavailable(r)) return finish(ctx, 'build', { outcome: UNOBSERVED, note: `node build.mjs 를 못 불렀다(code=${r.code} signal=${r.signal}): ${r.err}` });
     if (!r.ok) {
@@ -201,13 +335,42 @@ export function explainerQc(deps: ExplainerDeps = {}): Recipe {
       const loudness = Number(j.input_i);
       const peak = Number(j.input_tp);
       if (j.input_i == null || j.input_tp == null || !Number.isFinite(loudness) || !Number.isFinite(peak)) throw new Error('통합 음량/트루 피크가 비수다');
-      const produced = { loudness_lufs: loudness, true_peak_db: peak };
+      const produced: Record<string, number> = { loudness_lufs: loudness, true_peak_db: peak };
       let outcome = loudness >= -16 && loudness <= -12 && peak <= -1 ? 'pass' : 'loudness';
-      // ⭐ «3분 영상» — qc 생산 경로에서 loadExplainerLine 으로 선언의 target_seconds(180)를 소비한다.
+      const plan = loadExplainerLine(deps.declarationPath);
+      if (outcome === 'pass' && plan.targetSeconds !== null) {
+        let probe: RunResult;
+        try {
+          probe = runner(deps, ctx)('ffprobe', ['-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', resolve(path)], QC_MS, ctx.workdir);
+        } catch (e) { return finish(ctx, 'qc', { outcome: UNOBSERVED, note: `ffprobe 길이 측정을 못 불렀다: ${String(e)}` }); }
+        if (!probe.ok || unavailable(probe)) {
+          return finish(ctx, 'qc', { outcome: UNOBSERVED, note: `ffprobe 길이 측정 실패(code=${probe.code} signal=${probe.signal}): ${probe.err.slice(0, 240)}` });
+        }
+        let duration = Number(probe.out.trim());
+        if (!Number.isFinite(duration)) {
+          try {
+            const parsed = JSON.parse(probe.out) as { format?: { duration?: unknown } };
+            duration = Number(parsed.format?.duration);
+          } catch { /* parsed below as an unmeasurable duration */ }
+        }
+        if (!Number.isFinite(duration) || duration <= 0) {
+          return finish(ctx, 'qc', { outcome: UNOBSERVED, note: `ffprobe 길이를 읽지 못했다: ${probe.out.slice(0, 120)}` });
+        }
+        produced.measured_duration_seconds = duration;
+        if (duration < plan.targetSeconds - 0.1) {
+          return finish(ctx, 'qc', { outcome: 'too-short', produced,
+            note: `실측 영상 ${duration.toFixed(3)}초가 선언 목표 ${plan.targetSeconds}초보다 짧다 — build 로 재구성한다` });
+        }
+        if (duration > plan.targetSeconds + 0.1) {
+          return finish(ctx, 'qc', { outcome: 'too-long', produced,
+            note: `실측 영상 ${duration.toFixed(3)}초가 선언 목표 ${plan.targetSeconds}초를 넘는다 — build 로 재구성한다` });
+        }
+      }
+      // ⭐ 브리핑 길이 — qc 생산 경로에서 loadExplainerLine 으로 선언의 target_seconds 를 소비한다.
       // 내레이션이 목표 총 길이를 넘으면 too-long → build(재구성). narration_seconds 를 못 쟀으면 건너뛴다(기존 동작 보존).
       const narrationSeconds = ctx.state.narration_seconds;
       if (outcome === 'pass' && typeof narrationSeconds === 'number' && Number.isFinite(narrationSeconds)) {
-        const plan = loadExplainerLine(deps.declarationPath);
         if (plan.targetSeconds !== null && narrationSeconds > plan.targetSeconds) {
           return finish(ctx, 'qc', {
             outcome: 'too-long', produced,
@@ -220,14 +383,78 @@ export function explainerQc(deps: ExplainerDeps = {}): Recipe {
   };
 }
 
+export function explainerScene(): Recipe {
+  return async (ctx) => {
+    const path = scriptPath(ctx);
+    if (!path || !existsSync(path)) return finish(ctx, 'scene', { outcome: UNOBSERVED, note: 'script_path 를 못 읽는다' });
+    try {
+      const script = JSON.parse(readFileSync(path, 'utf8')) as { chapters?: unknown[] };
+      const facts = ctx.state.facts;
+      const sources = ctx.state.sources;
+      if (!script.chapters?.length) {
+        return finish(ctx, 'scene', { outcome: 'no-facts', note: '장면 챕터가 없다' });
+      }
+      if (!Array.isArray(facts) || facts.length === 0 || !Array.isArray(sources) || sources.length === 0) {
+        const hasChartPlan = Object.prototype.hasOwnProperty.call(ctx.state, 'chart_plan');
+        if (hasChartPlan && (!Array.isArray(ctx.state.chart_plan) || ctx.state.chart_plan.length > 0)) {
+          return finish(ctx, 'scene', { outcome: 'no-facts', note: 'chart_plan 을 연결하려면 facts 와 sources 가 필요하다' });
+        }
+        return finish(ctx, 'scene', { outcome: 'ok', produced: {
+          scene_plan: script.chapters,
+          chart_plan: [],
+          evidence_captions: [],
+        }, note: '기존 script_path 대본을 보존해 장면 계획에 사용했다; 근거 연결 차트는 생략했다' });
+      }
+      const chartPlan = chartsFrom(ctx.state.chart_plan, facts);
+      if (chartPlan === null) return finish(ctx, 'scene', { outcome: 'no-facts', note: 'chart_plan 은 사실 id에 연결된 2~8개 점의 bar/line 차트여야 한다' });
+      const charts = new Map(chartPlan.map((chart) => [chart.factId, chart]));
+      const scenePlan = script.chapters.map((chapter) => {
+        const row = chapter && typeof chapter === 'object' ? chapter as Record<string, unknown> : {};
+        const chart = typeof row.factId === 'string' ? charts.get(row.factId) : undefined;
+        return { ...row, ...(chart ? { chart, diagram: 'chart' } : {}) };
+      });
+      return finish(ctx, 'scene', { outcome: 'ok', produced: {
+        scene_plan: scenePlan,
+        chart_plan: chartPlan,
+        evidence_captions: sources,
+      } });
+    } catch (error) { return finish(ctx, 'scene', { outcome: UNOBSERVED, note: `장면 계획을 읽지 못했다: ${String(error)}` }); }
+  };
+}
+
+export function explainerDeliver(): Recipe {
+  return async (ctx) => {
+    const video = ctx.state.hf_render_path;
+    const send = ctx.state.sendTelegramVideo;
+    if (typeof video !== 'string' || !existsSync(video)) return finish(ctx, 'deliver', { outcome: UNOBSERVED, note: '렌더 영상 파일이 없다' });
+    if (typeof send !== 'function') {
+      const chatId = ctx.state.telegram_chat_id;
+      if ((typeof chatId === 'string' && chatId.trim().length > 0) || (typeof chatId === 'number' && Number.isFinite(chatId))) {
+        return finish(ctx, 'deliver', { outcome: 'no-recipient', note: 'Telegram chat_id 가 지정됐지만 전달 callback이 없다; token·전달 설정을 확인하라' });
+      }
+      return finish(ctx, 'deliver', {
+        outcome: 'ok', produced: { delivery_mode: 'local-artifact', local_artifact_path: video },
+        note: '텔레그램 전달 요청이 없어 로컬 산출물만 보존했다; Telegram 도착은 주장하지 않는다',
+      });
+    }
+    try {
+      const messageId = await (send as (file: string, briefing: unknown) => Promise<string | number | null>)(video, ctx.state.briefing);
+      if (messageId === null) return finish(ctx, 'deliver', { outcome: 'error', note: '텔레그램이 영상 전달을 확인하지 않았다' });
+      return finish(ctx, 'deliver', { outcome: 'ok', produced: { delivery_mode: 'telegram', telegram_message_id: messageId } });
+    } catch (error) { return finish(ctx, 'deliver', { outcome: 'error', note: `텔레그램 전달 실패: ${String(error)}` }); }
+  };
+}
+
 export const EXPLAINER: Readonly<Record<string, Recipe>> = {
   'explainer-script': explainerScript(),
+  'explainer-scene': explainerScene(),
+  'explainer-deliver': explainerDeliver(),
   'explainer-vo': explainerVo(),
   'explainer-build': explainerBuild(),
   'explainer-qc': explainerQc(),
 };
 
-/** ⭐ «3분 영상» — explainer-line 선언이 이 라인의 영상 계획에 건 목표 총 길이(초). */
+/** ⭐ explainer-line 선언이 이 라인의 영상 계획에 건 목표 총 길이(초). */
 export interface ExplainerLinePlan {
   /** 지속 필드 `target_seconds`(초). 선언에 없으면 이 라인은 목표 총 길이를 정하지 않았다(null). */
   readonly targetSeconds: number | null;

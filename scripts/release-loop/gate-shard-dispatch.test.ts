@@ -1,5 +1,36 @@
 import { expect, test } from 'bun:test';
-import { summarizeGateProgress } from './gate-shard-dispatch.js';
+import { planGateReceiptRadius, planGateShardDispatch, summarizeGateProgress, type GateShardReceipt } from './gate-shard-dispatch.js';
+
+test('receipt baseline radius proof reaches dispatch and rejects mixed receipt heads', () => {
+  const priorCommit = 'a'.repeat(40), currentCommit = 'b'.repeat(40), base40 = 'c'.repeat(40);
+  const fingerprint = 'd'.repeat(64), imageDigest = `sha256:${'e'.repeat(64)}`;
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint };
+  const tests = ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'];
+  const receipts: GateShardReceipt[] = tests.map((file, index) => ({
+    id: `pod-${index}`, files: [file], version: '1.0.1', head40: priorCommit, base40,
+    graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1',
+    recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
+    host: 'aws2', envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity,
+    executions: [{ branch: '', attemptId: `attempt-${index}`, host: 'aws2', imageDigest, runtimeIdentity }],
+    status: 'complete', failureIds: [], errorIds: [], evidencePath: `pod-${index}.result.json`,
+    evidenceSha256: 'f'.repeat(64), measuredAt: '2026-11-02T00:00:00.000Z', attempt: 1,
+  }));
+  const radius = planGateReceiptRadius({ receipts, tests, selectedFiles: ['src/a.test.ts'], priorCommit });
+  expect(radius).toMatchObject({ invalidatedShardIds: ['pod-0'], unchangedShardIds: ['pod-1', 'pod-2'] });
+  const proof = radius!;
+  const actions = planGateShardDispatch({
+    head40: currentCommit, base40, shards: proof.shards, receipts,
+    invalidatedShardIds: proof.invalidatedShardIds, radiusUnchangedShardIds: proof.unchangedShardIds,
+    hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }],
+    graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json',
+    recipeTimeoutMs: 14400000, environmentIdentity: { imageDigest, ...runtimeIdentity },
+  });
+  expect(actions.map(({ shardId, kind }) => [shardId, kind])).toEqual([
+    ['pod-0', 'run'], ['pod-1', 'reuse'], ['pod-2', 'reuse'],
+  ]);
+  expect(planGateReceiptRadius({ receipts: receipts.map((row, i) => i === 2 ? { ...row, head40: '9'.repeat(40) } : row),
+    tests, selectedFiles: ['src/a.test.ts'], priorCommit })).toBeNull();
+});
 
 test('gate progress summary counts settled serial groups and records the active host group duration', () => {
   expect(summarizeGateProgress({ executor: 'host', nowMs: 65_000, groups: [

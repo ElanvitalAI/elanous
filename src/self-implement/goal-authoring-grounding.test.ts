@@ -180,20 +180,23 @@ describe('groundGoalAuthoringContext', () => {
   });
 
   test('reserves one complete topology line without displacing existing evidence and rejects cwd escapes', async () => {
-    const repositoryRoot = mkdtempSync(join(process.cwd(), 'goal-authoring-budget-'));
+    const temporaryParent = mkdtempSync(join(tmpdir(), 'goal-authoring-budget-'));
+    const repositoryRoot = join(temporaryParent, 'repository');
+    mkdirSync(repositoryRoot);
     const repositoryPaths = Array.from({ length: 30 }, (_, index) => {
       const path = join(repositoryRoot, `verified-repository-topology-${index}-${'x'.repeat(48)}.ts`);
       writeFileSync(path, 'verified');
       return path;
     });
     const outsideName = `goal-authoring-outside-${Date.now()}.ts`;
-    const outsidePath = join(process.cwd(), '..', outsideName);
+    const outsidePath = join(temporaryParent, outsideName);
     writeFileSync(outsidePath, 'outside');
     try {
       const result = await groundGoalAuthoringContext('이 저장소의 src/self-implement 코드를 수정한다.', {
         recallMemory: async () => '- [memory: preserved before many repository paths]',
         localReferences: () => '참조 소스\n- /refs/openclaw',
         externalResearch: async () => [{ source: 'omni', summary: 'supplemental evidence remains available' }],
+        repositoryRoot,
         repositoryGrounding: async () => ({ ...facts, grounded: true, files: [...repositoryPaths, `../${outsideName}`] }),
       });
       const text = result.documentLines.join('\n');
@@ -208,8 +211,7 @@ describe('groundGoalAuthoringContext', () => {
       expect(topologyLines.join('\n')).not.toContain(`../${outsideName}`);
       expect(topologyLines.join('\n')).not.toContain(outsideName);
     } finally {
-      rmSync(repositoryRoot, { recursive: true, force: true });
-      rmSync(outsidePath, { force: true });
+      rmSync(temporaryParent, { recursive: true, force: true });
     }
   });
 

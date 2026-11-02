@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { buildUserConfig } from '../user-config.js';
 import type { LLMProvider, LLMStreamEvent } from '../llm.js';
 import { debug } from '../debug/log.js';
 import {
@@ -619,11 +620,12 @@ describe('키 값 0회 — 로그·오류·요약', () => {
   });
 });
 
-test('llm.zaiCodingPlan.overage 는 config set → get 왕복에서 살아남는다', () => {
+test('llm.zaiCodingPlan.overage 는 CLI set 뒤 config parser 왕복에서 살아남는다', () => {
   const dir = tmp('zai-cfg-');
   const cli = (...args: string[]) => spawnSync(process.execPath, ['bin/elanous.mjs', '--config-dir', dir, 'config', ...args], { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8' });
-  expect(cli('set', 'llm.zaiCodingPlan.overage', 'balance').status).toBe(0);
-  const got = cli('get', 'llm.zaiCodingPlan.overage');
-  expect(got.status).toBe(0);
-  expect(got.stdout.trim().split('\n').at(-1)).toContain('balance');
+  const set = cli('set', 'llm.zaiCodingPlan.overage', 'balance');
+  expect(set.status, set.stderr).toBe(0);
+  // The CLI writer is the slow integration lane; verify persistence through the same production parser
+  // instead of starting a second cold CLI process just to print the value.
+  expect(buildUserConfig(join(dir, 'config.json')).llm.zaiCodingPlan?.overage).toBe('balance');
 }, 120_000);

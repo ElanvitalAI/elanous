@@ -42,7 +42,7 @@ import { debug } from '../debug/log.js';
 import { installHarnessSalvageCommand, installHarnessSalvageRetentionCommand } from './harness-salvage-cli.js';
 import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
-import { LAUNCH_DOOR_RECEIPT_ENV, harnessLaunchBudgetDecision, launchRequestId, openLaunchRequestDoor, preLaunchGate, resolveLaunchBudget, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
+import { LAUNCH_DOOR_RECEIPT_ENV, decideLaunchDoor, harnessLaunchBudgetDecision, launchRequestId, openLaunchRequestDoor, preLaunchGate, resolveLaunchBudget, resolveLaunchDoorEnv, summarizeLaunchRequestRows, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
 import { PR_LABELS } from '../github/pr-labels.js';
 import { ghAutomationEnv } from '../autopilot/pr-manager.js';
 import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
@@ -57,7 +57,7 @@ import { addHarnessQueue, HarnessQueueDuplicateError, harnessQueueReceiptPath, l
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
 import { decideBackpressure, readBackpressureSignals, type BackpressureReadDeps } from './dispatch-backpressure.js';
 import { DISPATCH_SHADOW_COMPARE_ENV, recordDispatchShadowCompareFromEnv } from './dispatch-shadow-compare.js';
-import { parseDoorSince, queryLaunchDoors, renderLaunchDoors, type DoorTable } from './launch-stamp.js';
+import { parseDoorSince, queryLaunchDoors, renderLaunchDoors, resolveLaunchStamp, type DoorTable } from './launch-stamp.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { podChildProviderRefusal } from '../task-orchestrator/surfaces/pod-child-providers.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
@@ -1185,6 +1185,21 @@ async function dispatchHarnessAskSay(
       } catch { /* The launch handler owns file-read errors. */ }
     }
     goalId ??= launchRequestId(identity);
+    const doorEnv = resolveLaunchDoorEnv();
+    const doorStamp = resolveLaunchStamp({ entrance: dryRunPreview.entrance, seat: stampedSeat });
+    const doorDecision = decideLaunchDoor(doorStamp, doorEnv);
+    try { debug.log('execution-loop.launch-door', 'decision', {
+      goalId, mode: doorEnv.mode, modeSource: doorEnv.modeSource, entrance: doorStamp.entrance,
+      viaQueue: doorStamp.viaQueue, permission: doorEnv.permission, signal: doorEnv.signal,
+      allowed: doorDecision.allowed, wouldReject: doorEnv.mode === 'shadow' && !doorDecision.allowed, reason: doorDecision.reason,
+    }); } catch { /* Observation cannot change the launch result. */ }
+    // Enforce at the outer boundary before duplicate/budget checks or 1C receipt consumption.
+    // An unauthorized attempt must not consume a request that can be retried after authorization.
+    if (doorEnv.mode === 'enforce' && !doorDecision.allowed) {
+      console.error(`❌ launch door: blocked — ${doorDecision.reason} (${doorStamp.entrance})`);
+      process.exitCode = 3;
+      return;
+    }
     // Under bun test with no injected gate deps, skip the live reads (≈5 s of codex rotation + run scans) —
     // CLI wiring tests time out on them. Gate tests inject deps or opt in with ELANOUS_LAUNCH_GATE_LIVE=1.
     if (process.env.NODE_ENV === 'test' && Object.keys(gate).length === 0 && process.env.ELANOUS_LAUNCH_GATE_LIVE !== '1') {
@@ -1201,7 +1216,13 @@ async function dispatchHarnessAskSay(
     const launchDoor = gate.launchDoor ?? (process.env.NODE_ENV === 'test' ? undefined : openLaunchRequestDoor({ source: dryRunPreview.entrance }));
     // A hand parent already consumed a card/attempt-scoped request id. Reuse that id here;
     // direct harness requests still derive their stable id from the authored ask.
-    const launchDoorRequestId = inheritedLaunchDoorReceipt ?? launchDoor?.requestId(identity);
+    const launchSeat = opts.seat ?? process.env.ELANOUS_HARNESS_SEAT;
+    const launchDoorRequestId = inheritedLaunchDoorReceipt ?? launchDoor?.requestId(identity, {
+      ...(launchSeat ? { seat: launchSeat } : {}),
+      ...(process.env.ELANOUS_POD_SLOT_ID ? { cell: process.env.ELANOUS_POD_SLOT_ID } : {}),
+      originalRef: goalId,
+      reason: `entry=${dryRunPreview.entrance}`,
+    });
     const decision = await withJourneyNode('launch-gate', journey, async () => {
       const { budget, budgetSource, snapshotAgeSec } = await resolveLaunchBudget({
         provider: opts.childLlmProvider,
@@ -3798,6 +3819,18 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
       }
       if (opts.json) console.log(JSON.stringify(table));
       else console.log(renderLaunchDoors(table));
+    });
+  harnessCmd.command('launch-requests').description('발사 요청 원장의 누적·미소비·재시도·실패를 읽는다')
+    .option('--json', '구조화 출력')
+    .action((opts: { json?: boolean }) => {
+      try {
+        const summary = summarizeLaunchRequestRows(openLaunchRequestDoor().rows());
+        if (opts.json) console.log(JSON.stringify(summary));
+        else console.log(`요청 ${summary.requests} · 고유 ${summary.uniqueRequests} · 미소비 ${summary.unconsumed} · 소비 ${summary.consumed} · 재시도 ${summary.retries} · 실패 ${summary.failed} · 거절 ${summary.refused}`);
+      } catch (error) {
+        console.error(`❌ launch-requests: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
     });
   harnessCmd.command('incidents').description('최근 하니스 Pod 종료 사고 원장을 읽는다')
     .option('--since <minutes>', '최근 몇 분의 종료를 볼지 (기본 15분)', '15')

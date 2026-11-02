@@ -86,6 +86,7 @@ import {
   isTemplateCapabilityPreviewPath,
   type DevicesRouteOpts,
 } from './devices.js';
+import { handleUxSimDevices, isUxSimDevicesPath } from './ux-sim-devices.js';
 import {
   handleMissionsTest,
   isMissionsTestPath,
@@ -1475,6 +1476,13 @@ export async function routeRequest(
   if (isDevicesPath(pathname)) {
     if (!opts.devices) return jsonResponse({ error: 'devices-not-wired' }, 503);
     return handleDevices(req, opts.devices);
+  }
+
+  // Mock/test devices are a catalog reference, separate from the live fleet at /v1/devices.
+  if (isUxSimDevicesPath(pathname)) {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleUxSimDevices(req);
   }
 
   // Same owner auth as the neighbouring GETs (short-lived owner tokens · same-origin PWA); #23932 compared the admin

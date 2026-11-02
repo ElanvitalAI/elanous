@@ -2,10 +2,11 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { format } from 'node:util';
 import { loadFreshCodexAuthState, loginWithCodex } from '../oauth/codex.js';
 import { loadTokens } from '../oauth/store.js';
 import { serviceKeyStatus, verifyServiceKey, type ServiceKeyVerification } from '../setup/service-keys.js';
-import { importServiceKeys } from '../cli/setup-keys.js';
+import { importServiceKeys, runFirstRunProviderSetup } from '../cli/setup-keys.js';
 import type { UserConfig } from '../user-config.js';
 import {
   createFakeCodexDeviceOAuth,
@@ -153,6 +154,194 @@ test('first-run key import persists only verified keys and never exposes the sec
     }
   }
 }, 30_000);
+
+test('first-run API-key choice never calls the actual OAuth module entrypoint', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ux-oauth-entrypoint-spy-'));
+  try {
+    const repoRoot = join(import.meta.dir, '../..');
+    const child = Bun.spawnSync([process.execPath, '--eval', [
+      "import { spyOn } from 'bun:test';",
+      "const oauth = await import('./src/oauth/codex.ts');",
+      'let networkCalls = 0;',
+      'let verifierCalls = 0;',
+      "globalThis.fetch = (async () => { networkCalls += 1; throw new Error('network disabled'); }) as typeof fetch;",
+      'const oauthSpy = spyOn(oauth, \'loginWithCodex\').mockImplementation(async () => undefined as never);',
+      'await oauth.loginWithCodex();',
+      "if (oauthSpy.mock.calls.length !== 1) throw new Error('OAuth spy positive control failed');",
+      'oauthSpy.mockClear();',
+      "const { runFirstRunProviderSetup } = await import('./src/cli/setup-keys.ts');",
+      "const env: Record<string, string | undefined> = {};",
+      "const result = await runFirstRunProviderSetup({ ask: async prompt => prompt === '선택: ' ? '2' : '1', askSecret: async prompt => prompt.includes('EXA_API_KEY') ? 'synthetic-exa-key' : '', print: () => {} }, {",
+      "  config: { llm: { provider: 'openai' } }, env, cacheDir: process.env.HOME + '/cache',",
+      '  loginWithCodex: oauth.loginWithCodex, verifier: async input => { verifierCalls += 1; if (input.provider !== \'exa\' || input.apiKey !== \'synthetic-exa-key\') throw new Error(\'unexpected verifier input\'); return { success: true, verification: \'verified\' }; },',
+      '});',
+      "if (result !== null) throw new Error(`non-LLM Exa key setup unexpectedly selected a default LLM provider: ${String(result)}`);",
+      "if (verifierCalls !== 1 || env.EXA_API_KEY !== 'synthetic-exa-key') throw new Error('successful API-key verification/storage path was not exercised');",
+      "if (oauthSpy.mock.calls.length !== 0) throw new Error(`OAuth entrypoint calls: ${oauthSpy.mock.calls.length}`);",
+      "if (networkCalls !== 0) throw new Error(`network calls: ${networkCalls}`);",
+      "process.stdout.write('api-key-setup=verified-exa no-default-llm oauth-entrypoint-calls=0 network-calls=0\\n');",
+    ].join('\n')], {
+      cwd: repoRoot,
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: root,
+        XDG_CONFIG_HOME: join(root, 'xdg'),
+        ELANOUS_SUPPRESS_XDG_WARNING: '1',
+        CODEX_HOME: join(root, 'codex'),
+      },
+      timeout: 10_000,
+    });
+    const stdout = Buffer.from(child.stdout).toString('utf8');
+    const stderr = Buffer.from(child.stderr).toString('utf8');
+    expect(child.exitCode, `child stdout:\n${stdout}\nchild stderr:\n${stderr}`).toBe(0);
+    expect(stdout).toContain('api-key-setup=verified-exa no-default-llm oauth-entrypoint-calls=0 network-calls=0');
+    expect(stderr).toBe('');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('synthetic canary inputs never reach the key verifier or emitted output', async () => {
+  const allowedSecret = 'synthetic-allowed-api-key';
+  const canary = 'synthetic-canary-provider-url-secret';
+  const verifierInputs: Array<{ provider: string; apiKey: string }> = [];
+  const printed: string[] = [];
+  const consoleOutput: string[] = [];
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const cacheDir = mkdtempSync(join(tmpdir(), 'ux-service-key-canary-'));
+  isolatedRoots.push(cacheDir);
+  const originalFetch = globalThis.fetch;
+  const originalConsoleMethods = {
+    log: console.log,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+    debug: console.debug,
+    trace: console.trace,
+  };
+  const originalStdoutWrite = process.stdout.write;
+  const originalStderrWrite = process.stderr.write;
+  const expectNoCanaryOutput = () => {
+    expect(printed.join('\n')).not.toContain(canary);
+    expect(consoleOutput.join('\n')).not.toContain(canary);
+    expect(stdoutChunks.join('')).not.toContain(canary);
+    expect(stderrChunks.join('')).not.toContain(canary);
+  };
+  const captureWrite = (chunks: string[]) => (chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): true => {
+    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString(typeof encoding === 'string' ? encoding : 'utf8'));
+    const done = typeof encoding === 'function' ? encoding : callback;
+    done?.(null);
+    return true;
+  };
+  for (const method of Object.keys(originalConsoleMethods) as Array<keyof typeof originalConsoleMethods>) {
+    console[method] = (...args: unknown[]) => { consoleOutput.push(format(...args)); };
+  }
+  process.stdout.write = captureWrite(stdoutChunks) as typeof process.stdout.write;
+  process.stderr.write = captureWrite(stderrChunks) as typeof process.stderr.write;
+  let outboundRequests = 0;
+  // OAuth observation is scoped to the actual dependency-injection seam. The
+  // fetch spy below independently catches any network-backed OAuth entrypoint.
+  let injectedOAuthHookCalls = 0;
+  globalThis.fetch = (async () => {
+    outboundRequests += 1;
+    throw new Error('network access forbidden in synthetic canary test');
+  }) as typeof fetch;
+  try {
+    console.log({ canary });
+    expect(consoleOutput.join('\n')).toContain(canary);
+    expect(() => expectNoCanaryOutput()).toThrow();
+    consoleOutput.length = 0;
+
+    process.stdout.write(canary.slice(0, 12));
+    process.stdout.write(canary.slice(12));
+    expect(stdoutChunks.join('')).toContain(canary);
+    expect(() => expectNoCanaryOutput()).toThrow();
+    stdoutChunks.length = 0;
+
+    process.stderr.write(canary);
+    expect(stderrChunks.join('')).toContain(canary);
+    expect(() => expectNoCanaryOutput()).toThrow();
+    stderrChunks.length = 0;
+
+    const imported = await importServiceKeys(
+      new Map([
+        ['OPENAI_API_KEY', allowedSecret],
+        ['CANARY_PROVIDER_URL', canary],
+      ]),
+      { print: message => printed.push(message) },
+      {
+        config: { llm: { provider: 'openai' } } as unknown as UserConfig,
+        env: { CANARY_PROVIDER_URL: canary },
+        cacheDir,
+        verifier: async input => {
+          verifierInputs.push(input);
+          return { success: true, verification: 'verified' };
+        },
+        loginWithCodex: async () => {
+          injectedOAuthHookCalls += 1;
+          throw new Error('OAuth must not be invoked by key import');
+        },
+      },
+    );
+
+    expect(verifierInputs).toEqual([{ provider: 'openai-api', apiKey: allowedSecret }]);
+    expect(imported.stored).toEqual(['OPENAI_API_KEY']);
+    expect(imported.rejected).toEqual(['CANARY_PROVIDER_URL']);
+    expect(imported.unverified).toEqual([]);
+    expect(JSON.stringify(verifierInputs)).not.toContain(canary);
+    expect(JSON.stringify(imported)).not.toContain(canary);
+    expectNoCanaryOutput();
+    expect(outboundRequests).toBe(0);
+    expect(injectedOAuthHookCalls).toBe(0);
+
+    const firstRunSecret = 'synthetic-first-run-exa-key';
+    const firstRunVerifierInputs: Array<{ provider: string; apiKey: string }> = [];
+    const firstRunCacheDir = mkdtempSync(join(tmpdir(), 'ux-service-key-first-run-'));
+    isolatedRoots.push(firstRunCacheDir);
+    await runFirstRunProviderSetup({
+      ask: async prompt => prompt === '선택: ' ? '2' : '',
+      askSecret: async prompt => prompt.includes('EXA_API_KEY') ? firstRunSecret : '',
+      print: message => printed.push(message),
+    }, {
+      config: { llm: { provider: 'openai' } } as unknown as UserConfig,
+      env: { CANARY_PROVIDER_URL: canary },
+      cacheDir: firstRunCacheDir,
+      verifier: async input => {
+        firstRunVerifierInputs.push(input);
+        return { success: true, verification: 'verified' };
+      },
+      loginWithCodex: async () => {
+        injectedOAuthHookCalls += 1;
+        throw new Error('OAuth must not be invoked by API-key setup');
+      },
+    });
+    expect(firstRunVerifierInputs).toEqual([{ provider: 'exa', apiKey: firstRunSecret }]);
+    expect(injectedOAuthHookCalls).toBe(0);
+    expect(outboundRequests).toBe(0);
+    expectNoCanaryOutput();
+
+    let oauthHookPositiveControl = 0;
+    const oauthControl = await runFirstRunProviderSetup({
+      ask: async () => '1',
+      print: () => {},
+    }, {
+      config: { llm: { provider: 'openai' } } as unknown as UserConfig,
+      loginWithCodex: async () => {
+        oauthHookPositiveControl += 1;
+        throw new Error('synthetic positive control');
+      },
+    });
+    expect(oauthHookPositiveControl).toBe(1);
+    expect(oauthControl).toBeNull();
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+    Object.assign(console, originalConsoleMethods);
+  }
+  console.log(`[service-key-canary] verifier-calls=${verifierInputs.length} canary-forwarded=0 canary-output=0 outbound-requests=${outboundRequests} injected-oauth-hook-calls=${injectedOAuthHookCalls}`);
+});
 
 test('fake device OAuth completes production login and refreshes an expired access token without exposing secrets', async () => {
   const root = useIsolatedAuthStore();

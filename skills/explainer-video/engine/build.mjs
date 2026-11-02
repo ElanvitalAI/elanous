@@ -14,7 +14,9 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const scriptPath = resolve(process.argv[2] ?? "script.json");
-const proj = dirname(scriptPath);
+// The recipe may provide an enriched build-only script outside the source project.
+// Keep source assets and generated output rooted at the original project.
+const proj = resolve(process.argv[3] ?? dirname(scriptPath));
 const S = JSON.parse(readFileSync(scriptPath, "utf8"));
 const out = join(proj, "hf");
 const W = 1920, H = 1080, FPS = 30;
@@ -32,6 +34,9 @@ const mark = (size, blade = C.ink, dot = C.red, cls = "") =>
 const vo = (key) => JSON.parse(readFileSync(join(proj, "source", "vo", `${key}.json`), "utf8"));
 const speech = (key) => vo(key).alignment.character_end_times_seconds.at(-1);
 const GAP = 0.45, CH_TAIL = 0.8, CARD = 1.8, INTRO_LEAD = 0.5, INTRO_TAIL = 1.6, CTA = 4.5;
+const targetSeconds = typeof S.target_seconds === "number" && Number.isFinite(S.target_seconds) && S.target_seconds > 0
+  ? S.target_seconds
+  : null;
 
 let t = 0;
 const segs = []; // {kind, ...}
@@ -55,7 +60,8 @@ S.chapters.forEach((ch, ci) => {
 });
 const outro = { kind: "outro", start: t, beats: beatsOf(S.outro.beats, "o", CH_TAIL) };
 outro.dur = t - outro.start; segs.push(outro);
-const cta = { kind: "cta", start: t, dur: CTA }; t += CTA; segs.push(cta);
+const ctaDuration = targetSeconds === null ? CTA : Math.max(CTA, targetSeconds - t);
+const cta = { kind: "cta", start: t, dur: ctaDuration }; t += ctaDuration; segs.push(cta);
 const TOTAL = +t.toFixed(3);
 
 // ── helpers ─────────────────────────────────────────────────────────────────────
@@ -154,6 +160,36 @@ const DIAGRAMS = {
     draw(`.${p}a3 path`, b(2) + 0.2, 0.4);
     rise(`.${p}form`, b(2) + 0.5);
     rise(`.${p}fd`, b(2) + 1.1, 0.35);
+    return html;
+  },
+  chart(seg, p) {
+    const chart = seg.ch.chart;
+    if (!chart || !['bar', 'line'].includes(chart.kind) || !Array.isArray(chart.points) || chart.points.length < 2) {
+      return `<div class="panel" role="img" aria-label="차트 데이터가 없습니다" style="left:80px;top:220px;width:800px;height:220px"><div class="lbl">차트 데이터가 없습니다</div></div>`;
+    }
+    const points = chart.points;
+    const min = Math.min(0, ...points.map((point) => point.value));
+    const max = Math.max(0, ...points.map((point) => point.value));
+    const span = max - min || 1;
+    const left = 120, top = 175, width = 720, height = 390;
+    const y = (value) => top + ((max - value) / span) * height;
+    const zero = y(0);
+    const step = width / points.length;
+    const coords = points.map((point, index) => ({ x: left + step * (index + 0.5), y: y(point.value), point }));
+    const marks = chart.kind === 'bar'
+      ? coords.map(({ x, y: py, point }) => {
+          const w = Math.min(92, step * 0.58), h = Math.abs(zero - py);
+          return `<rect x="${(x - w / 2).toFixed(1)}" y="${Math.min(zero, py).toFixed(1)}" width="${w.toFixed(1)}" height="${Math.max(h, 2).toFixed(1)}" rx="8" fill="${C.red}"/><text x="${x.toFixed(1)}" y="${(Math.min(zero, py) - 14).toFixed(1)}" text-anchor="middle" class="chartValue">${esc(String(point.value))}</text>`;
+        }).join('')
+      : `<polyline points="${coords.map(({ x, y: py }) => `${x.toFixed(1)},${py.toFixed(1)}`).join(' ')}" fill="none" stroke="${C.red}" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>` +
+        coords.map(({ x, y: py, point }) => `<circle cx="${x.toFixed(1)}" cy="${py.toFixed(1)}" r="13" fill="${C.red}"/><text x="${x.toFixed(1)}" y="${(py - 20).toFixed(1)}" text-anchor="middle" class="chartValue">${esc(String(point.value))}</text>`).join('');
+    const labels = coords.map(({ x, point }) => `<text x="${x.toFixed(1)}" y="${(top + height + 48).toFixed(1)}" text-anchor="middle" class="chartLabel">${esc(String(point.label))}</text>`).join('');
+    const html = `<svg class="${p}chart" role="img" aria-label="${esc(String(chart.title))}" data-chart-kind="${chart.kind}" width="960" height="760" viewBox="0 0 960 760">
+      <text x="480" y="90" text-anchor="middle" class="chartTitle">${esc(String(chart.title))}</text>
+      <path d="M${left} ${zero.toFixed(1)} H${left + width}" stroke="${C.line}" stroke-width="3"/>
+      ${marks}${labels}
+    </svg>`;
+    rise(`.${p}chart`, B(seg, 0) + 0.3);
     return html;
   },
   keys(seg, p) {
@@ -324,6 +360,7 @@ body{background:${C.deep}}
 .num .of{font-size:52px;color:${C.red};-webkit-text-stroke:0;margin-left:10px;letter-spacing:0}
 .title{margin-top:36px;font-weight:800;font-size:62px;line-height:1.15;letter-spacing:-0.02em;text-wrap:balance}
 .sub{margin-top:16px;font-weight:500;font-size:30px;color:${C.muted}}
+.chartTitle{fill:${C.ink};font:700 40px system-ui,sans-serif}.chartLabel{fill:${C.ink};font:600 26px system-ui,sans-serif}.chartValue{fill:${C.ink};font:600 22px system-ui,sans-serif}
 .rule{display:block;margin-top:34px;width:84px;height:6px;background:${C.red};transform-origin:0 50%}
 .capwrap{position:absolute;left:1150px;top:800px;width:700px}
 .cap{font-weight:700;font-size:38px;line-height:1.35;letter-spacing:-0.01em}

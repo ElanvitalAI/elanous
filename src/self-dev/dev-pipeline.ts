@@ -16,6 +16,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
 import { benchArmBranchForBase } from '../bench/bench.js';
 import { readFileSync } from 'node:fs';
 import { dispatchTask, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
@@ -46,7 +47,7 @@ import { getUserConfig, resolveRoleLlm, type RoleLlmSource } from '../user-confi
 import { applyGlmCredentialFallback, GlmChildCredentialError } from './glm-credential-guard.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, getProviderForConfig, inferProviderFromModel } from '../llm.js';
-import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
+import { noUsableReviewProviderError, planReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
 import { loadLlmPolicy, resolveSubscriptionReviewer } from '../policy/llm-policy.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
@@ -55,6 +56,8 @@ import { decideNonGitInit } from '../self-implement/non-git-consent.js';
 import { createInterface } from 'node:readline/promises';
 import type { ChildLlmSelection } from '../agent/run-context.js';
 import type { SurfaceUx } from '../agent/surface-ux/types.js';
+import { beginResourceLease, endResourceLease, heartbeatResourceLease } from '../resource-ledger/resource-ledger.js';
+import { startLeaseHeartbeat } from '../resource-ledger/lease-automation.js';
 
 /** parallel dispatch 실행 시 orchestrateSelfDev 에 넘길 런타임 서플라이(goals/concurrency 제외 — 그건 spec.parallel).
  *  spawn·checkpoint·onSnapshot·onEvent·resumeFrom·teardown 등 감독/영속 콜백. CLI seam 이 구성해 주입. */
@@ -1141,13 +1144,20 @@ export async function buildDefaultSelfImplementSeams(
     const normalizedModel = isGlm53
       ? 'openrouter/z-ai/glm-5.3'
       : configuredProvider === 'openrouter' && !model.startsWith('openrouter/') ? `openrouter/${model}` : model;
-    const routeProvider = normalizedModel === 'openrouter/z-ai/glm-5.3' ? 'openrouter' : configuredProvider;
+    const inferredProvider = inferProviderFromModel(normalizedModel);
+    // Pod review is Codex-only. Model-only `getProvider('gpt-6…')` preserves the
+    // historical OpenAI Chat Completions route, so pin this model family to the
+    // Codex subscription provider when constructing the Pod attempt.
+    const routeProvider = normalizedModel === 'openrouter/z-ai/glm-5.3'
+      ? 'openrouter'
+      : configuredProvider ?? (process.env.ELANOUS_SUBSTRATE === 'pod' && inferredProvider === 'openai-codex'
+        ? 'openai-codex' : undefined);
     let provider: ReturnType<typeof getProvider> | undefined;
     try {
       if (routeProvider) {
         const config = getUserConfig();
         provider = getProviderForConfig({ ...config, llm: { ...config.llm, provider: routeProvider as typeof config.llm.provider } }, normalizedModel);
-      } else if (inferProviderFromModel(normalizedModel)) {
+      } else if (inferredProvider) {
         provider = getProvider(normalizedModel);
       }
     } catch {
@@ -1157,14 +1167,24 @@ export async function buildDefaultSelfImplementSeams(
   };
   const primaryProviderIsPinned = reviewRole.source === 'flag' || reviewRole.source === 'config-role'
     || reviewRole.source === 'environment';
-  const configuredPrimaryProvider = primaryProviderIsPinned ? reviewRole.provider : undefined;
+  const configuredPrimaryProvider = primaryProviderIsPinned || process.env.ELANOUS_SUBSTRATE === 'pod'
+    ? reviewRole.provider : undefined;
   const primaryReviewAttempt = reviewAttemptForModel(reviewModel, 'primary', configuredPrimaryProvider);
-  const reviewAttempts = buildReviewProviderAttempts(
+  const reviewPlan = planReviewProviderAttempts(
     primaryReviewAttempt,
     [...reviewFallbackModels, defaultReviewFallbackModel(primaryReviewAttempt.provider?.name)]
       .map((model) => reviewAttemptForModel(model, model)),
-  ).slice(0, 2);
+    process.env.ELANOUS_SUBSTRATE === 'pod'
+      ? { skipUnavailableProviders: true, allowedProviderNames: ['openai-codex'] }
+      : {},
+  );
+  const reviewAttempts = reviewPlan.attempts;
   const defaultApiReview = async (prompt: string): Promise<string> => {
+    if (reviewAttempts.length === 0) {
+      const error = noUsableReviewProviderError(reviewPlan.skipped);
+      try { debug.log('self-dev.review-fallback', 'no-usable-provider', { candidates: reviewPlan.skipped }); } catch { /* fail-soft */ }
+      throw error;
+    }
     const r = await runReviewWithFallback(
       reviewAttempts,
       (attempt, observeResolvedProvider) => streamLLM([{ role: 'user', content: prompt }], () => {}, {
@@ -1177,6 +1197,22 @@ export async function buildDefaultSelfImplementSeams(
         onResolvedProvider: (provider) => observeResolvedProvider(provider),
       }),
       (event, data) => { try { debug.log('self-dev.review-fallback', event, { ...data }); } catch { /* fail-soft */ } },
+      {
+        ...(process.env.ELANOUS_SUBSTRATE === 'pod' ? { skipUnavailable: (attempt: (typeof reviewAttempts)[number]) => {
+          if (!attempt.provider) return undefined;
+          try {
+            return attempt.provider.available() ? undefined : {
+              label: attempt.label, model: attempt.model, provider: attempt.provider.name, why: 'no-credential' as const,
+            };
+          } catch {
+            return {
+              label: attempt.label, model: attempt.model, provider: attempt.provider.name, why: 'availability-check-failed' as const,
+            };
+          }
+        } } : {}),
+        preSkipped: reviewPlan.skipped,
+        maxCalls: 2,
+      },
     );
     return r.text;
   };
@@ -1907,11 +1943,36 @@ export async function runDevPipeline(spec: DevPipelineSpec, deps: DevPipelineDep
     emitted = true;   // 시도는 한 번(성공·실패 무관) ⇒ 중복도 없고 원래 오류도 안 가린다
   };
 
+  const resourceFp = spec.runId ? `fp_${createHash('sha256').update(spec.runId).digest('hex').slice(0, 26)}` : undefined;
+  const requestedLane = process.env.ELANOUS_RESOURCE_LANE;
+  const resourceLane = requestedLane === 'gate' || requestedLane === 'train' || requestedLane === 'ta'
+    || requestedLane === 'warm' || requestedLane === 'bench' || requestedLane === 'hand' ? requestedLane : 'unknown';
+  let resourceLeaseStarted = false;
+  let cancelResourceHeartbeat: (() => void) | undefined;
+  if (resourceFp) {
+    try {
+      const resourceHost = process.env.ELANOUS_RESOURCE_HOST || hostname();
+      beginResourceLease({ fp: resourceFp, host: resourceHost, lane: resourceLane, resources: {}, mission: {}, ttlMs: 120_000 });
+      resourceLeaseStarted = true;
+      heartbeatResourceLease(resourceFp, undefined);
+      try { appendRunLedgerEntry({ runId: spec.runId!, event: 'resource-lease', data: { fp: resourceFp, host: resourceHost, lane: resourceLane } }); }
+      catch { /* resource linkage is observation and must not fail execution */ }
+      cancelResourceHeartbeat = startLeaseHeartbeat({ leaseId: resourceFp, ttlMs: 120_000,
+        heartbeat: id => heartbeatResourceLease(id, undefined),
+        onError: (id, error) => { try { debug.log('resource-ledger', 'lease-heartbeat-failed', { fp: id, error: String(error) }, { level: 'warn' }); } catch { /* observation is fail-soft */ } },
+      });
+    } catch { /* resource observation must never prevent a run */ }
+  }
   try {
     // ⛔ 조회도 `try` **안**이다 — 주입된 관측기가 던져도 행은 남아야 한다(무인 리뷰).
     gitResidue = spec.gitResidueSnapshot?.observation ?? await (deps.observeGitResidue ?? observeGitResidue)(gitResiduePath);
     return await runDevPipelineDispatch(spec, deps, seen, emitPlanRow);
   } finally {
+    cancelResourceHeartbeat?.();
+    if (resourceLeaseStarted && resourceFp) {
+      try { endResourceLease(resourceFp, 'runDevPipeline finished', process.env.ELANOUS_HARNESS_SEAT ?? 'unknown'); }
+      catch { /* resource observation must never prevent a run */ }
+    }
     await emitPlanRow();   // 앞 단계가 던졌을 때만 실제로 찍힌다(단회 가드)
   }
 }

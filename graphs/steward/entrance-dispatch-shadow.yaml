@@ -1,0 +1,23 @@
+graph_id: steward-entrance-dispatch-shadow
+loop:
+  title: TA 디스패처 그림자 판정
+  trigger:
+    cron: '*/5 * * * *'
+version: 1
+entry_node: entrance-dispatch-shadow
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: entrance-dispatch-shadow
+    kind: agent
+    recipe: cmd:steward-entrance-dispatch-shadow
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: entrance-dispatch-shadow
+    on: outcome
+    map: { ok: done, fail: failed }

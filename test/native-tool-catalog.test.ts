@@ -327,10 +327,11 @@ describe('nativeToolCatalog — metadata invariants', () => {
 
     // Nine seat-message/checklist tools are skill+tui only. Keep the exact
     // distribution so a new host exposure (notably MCP/chat) fails here.
-    expect(nativeToolCatalog).toHaveLength(198);
+    // elanous_ux_sim_devices adds one intentionally MCP-only read-only catalog entry.
+    expect(nativeToolCatalog).toHaveLength(199);
     expect([...distribution.entries()].sort()).toEqual([
       // CTX2 #23185 — context_now(맥락 한 문 · READ-ONLY 자기관측)가 MCP 에 더해졌다.
-      ['mcp', 21],
+      ['mcp', 22],
       ['skill', 33],
       ['skill,tui', 99],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).

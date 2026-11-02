@@ -7,6 +7,8 @@ export interface VisibleMissionPty {
   /** A false result means the PTY input handle rejected the write. */
   write(bytes: string): boolean | number | void;
   isAlive(): boolean;
+  /** Child process exit status once the PTY has stopped. Undefined while it is still running. */
+  exitCode?(): number | null;
 }
 
 export interface VisibleMissionResult {
@@ -20,6 +22,8 @@ export interface VisibleMissionResult {
   missionTyped?: boolean;
   /** Enter was accepted only after the complete mission became visible. */
   missionSubmitted?: boolean;
+  /** Child PTY exit status recorded after the mission was submitted, or when it died earlier. */
+  exitCode?: number | null;
   promptReturned: boolean;
   completionMarker: boolean;
   /** Bounded first PTY frame, retained to diagnose startup screens that intercepted input. */
@@ -30,7 +34,7 @@ export interface VisibleMissionResult {
   error?: string;
 }
 
-export type VisibleAgentCli = 'codex' | 'claude';
+export type VisibleAgentCli = 'codex' | 'claude' | 'grok';
 export type AgentStartupScreen = 'codex-update-choice' | 'claude-update-choice' | 'claude-login' | 'claude-workspace-trust';
 
 export interface VisibleMissionDeps {
@@ -106,12 +110,21 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   let codexUpdateSkipSent = false;
   let startupScreenReported = false;
   let lastObservedScreen = '';
+  let exitCode: number | null | undefined;
   const completionDeadline = Date.now() + (deps.completionTimeoutMs ?? 300_000);
   const stageDeadline = (timeoutMs: number): number => Math.min(completionDeadline, Date.now() + timeoutMs);
   const snapshot = (): string => { lastObservedScreen = deps.pty.snapshot(); return lastObservedScreen; };
   const safeSnapshot = (): string => { try { return snapshot(); } catch { return lastObservedScreen; } };
+  const recordExit = (): number | null | undefined => {
+    try {
+      const code = deps.pty.exitCode?.();
+      if (code !== undefined && code !== null) exitCode = code;
+      else if (exitCode === undefined && code !== undefined) exitCode = code;
+    } catch { /* a detached PTY may no longer expose its exit status */ }
+    return exitCode;
+  };
   const failure = (result: Omit<VisibleMissionResult, 'ok' | 'failureStage' | 'failureScreen'>, stage: NonNullable<VisibleMissionResult['failureStage']>, screen = safeSnapshot()): VisibleMissionResult => ({
-    ...result, missionTyped, missionSubmitted, ok: false, failureStage: stage, failureScreen: screenTail(screen),
+    ...result, missionTyped, missionSubmitted, ...(recordExit() !== undefined ? { exitCode: recordExit() } : {}), ok: false, failureStage: stage, failureScreen: screenTail(screen),
   });
   const observeStartupScreen = (screen: string): AgentStartupScreen | undefined => {
     const detected = classifyAgentStartupScreen(deps.agent, screen);
@@ -137,6 +150,7 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     if (!deps.pty.isAlive()) {
       // The process may exit before the first poll; its final frame can still
       // identify the startup screen that prevented the prompt from appearing.
+      recordExit();
       try {
         lastScreen = snapshot();
         initialScreen ??= redactSensitive(stripAnsi(lastScreen)).slice(-1_200);
@@ -199,8 +213,10 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   const visibleMissionTail = Array.from(mission).slice(-24).join('');
   const visibilityDeadline = stageDeadline(deps.visibilityTimeoutMs ?? safetyCapMs);
   while (Date.now() < visibilityDeadline) {
+    if (!deps.pty.isAlive()) recordExit();
     const visibleText = normalizeVisibleText(snapshot());
     if (visibleText.includes(normalizeVisibleText(visibleMissionTail))) { missionVisible = true; break; }
+    if (!deps.pty.isAlive()) break;
     await sleep(Math.min(pollMs || 25, Math.max(1, visibilityDeadline - Date.now())));
   }
   if (!missionVisible) {
@@ -213,7 +229,7 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
 
   let resultFileObserved = false;
   while (Date.now() < completionDeadline) {
-    if (!deps.pty.isAlive()) break;
+    if (!deps.pty.isAlive()) { recordExit(); break; }
     lastScreen = snapshot();
     if (deps.handleTrust(lastScreen, bytes => deps.pty.write(bytes))) {
       await sleep(500);
@@ -272,7 +288,7 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     try {
       if (readFile(completionMarkerPath).trim() === completionMarkerText) { completionMarker = true; break; }
     } catch { /* the agent has not written the completion marker file yet */ }
-    if (!deps.pty.isAlive()) break;
+    if (!deps.pty.isAlive()) { recordExit(); break; }
     try {
       if (screenShowsCompletionMarker(snapshot(), completionMarkerText)) { completionMarker = true; break; }
     } catch { /* detached PTYs may no longer expose a screen snapshot */ }
@@ -281,7 +297,8 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   if (!completionMarker) {
     return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Agent did not show its completion marker before the timeout' }, 'marker-completion');
   }
-  return { ok: true, path: deps.outputPath, content, firstLine, promptReady, missionVisible, missionTyped, missionSubmitted, promptReturned, completionMarker, initialScreen, ...(startupScreen ? { startupScreen } : {}) };
+  recordExit();
+  return { ok: true, path: deps.outputPath, content, firstLine, promptReady, missionVisible, missionTyped, missionSubmitted, ...(exitCode !== undefined ? { exitCode } : {}), promptReturned, completionMarker, initialScreen, ...(startupScreen ? { startupScreen } : {}) };
   } catch (error) {
     return failure({ path: deps.outputPath, promptReady, missionVisible, promptReturned, completionMarker, ...(initialScreen ? { initialScreen } : {}), ...(startupScreen ? { startupScreen } : {}), error: error instanceof Error ? error.message : String(error) }, 'pty-error');
   }
@@ -301,7 +318,7 @@ function redactSensitive(screen: string): string {
     .replace(/(authorization\s*:\s*(?:basic|bearer|token|apikey|api[- ]key)\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|\S+)/gi, '$1[redacted]')
     .replace(/((?:[A-Z0-9_]*(?:api[_-]?key|api[_-]?token|access[_-]?key|secret|password|credential|auth[_-]?token|refresh[_-]?token)))\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]*)/gi, '$1=[redacted credential]')
     .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
-    .replace(/(?:sk|xai|gsk|gh[pousr])-[A-Za-z0-9_-]{8,}/g, '[redacted credential]')
+    .replace(/(?:sk|xai|gsk|gh[pousr])[-_][A-Za-z0-9_-]{8,}/g, '[redacted credential]')
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted email]')
     .replace(/(account[-_ ]+token)\s*[:=]?\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi, '$1=[redacted credential]');
 }

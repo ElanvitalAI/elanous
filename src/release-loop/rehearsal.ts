@@ -15,7 +15,9 @@ import { LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcResult } from './light-r
 import { planRehearsalShards, type RehearsalShardPlan, type RehearsalShardPlanDeps } from './rehearsal-shard-plan.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
-import { hardRehearsalGateArgs } from '../../scripts/release-loop/gate-radius-live.js';
+import { hardRehearsalGateArgs, hardRehearsalGateVersion } from '../../scripts/release-loop/gate-radius-live.js';
+import { gateSourcePins } from '../../scripts/release-loop/gate-baseline-receipt.js';
+import { preflightGateExecutionIdentity, type GatePodExecutionIdentity } from '../../scripts/release-loop/gate-radius-live.js';
 
 export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
 export type RehearsalOutcome = 'ok' | 'regression' | 'unmeasured' | 'error' | 'no-checkout' | 'checkout-dirty' | 'superseded' | 'interrupted';
@@ -26,6 +28,7 @@ export interface HardGateResult {
   introduced: string[];
   preexisting: number;
   error?: string;
+  receiptRecord?: { available: boolean; reason?: string };
 }
 export type RehearsalPlan =
   | { status: 'no-schedule' }
@@ -114,7 +117,10 @@ export interface RehearsalDeps {
   now?: () => Date;
   schedules?: (root: string) => ReleaseSchedule[];
   lightRc?: (version: string, checkout: string, selection: { shards?: number; remote?: string }) => Promise<LightRcResult>;
-  hardGate?: (version: string, checkout: string, sha: string, ledgerRoot: string, runId: string) => Promise<HardGateResult>;
+  hardGate?: (version: string, checkout: string, sha: string, ledgerRoot: string, runId: string, remote?: string) => Promise<HardGateResult>;
+  hardGateGraphPins?: (checkout: string, commit: string) => { graphSha: string; recipeSha: string } | null;
+  hardGateIdentity?: (pool: string, env: NodeJS.ProcessEnv, commit?: string) => GatePodExecutionIdentity | null;
+  hardGateSpawn?: typeof spawnHardRehearsalGate;
   shardPlan?: typeof planRehearsalShards;
   shardPlanDeps?: RehearsalShardPlanDeps;
   notify?: (text: string) => void | boolean | Promise<void | boolean>;
@@ -234,23 +240,87 @@ function parseHardRehearsalGateResult(run: ReturnType<typeof spawnSync>, logPath
   throw new Error(`hard rehearsal gate rc=${run.status ?? 'spawn'} disagrees with outcome=${result.outcome}`);
 }
 
-/** The hard rehearsal uses the release gate itself, pinned to the fetched main SHA and node-b Pod member. */
-async function runHardGate(version: string, checkout: string, sha: string, ledgerRoot: string, runId: string): Promise<HardGateResult> {
+/** The hard rehearsal runs the release gate remotely and confirms its structured receipt was persisted. */
+function hardGateReceiptRecordMismatch(input: {
+  version: string;
+  head40: string;
+  gateCommit?: unknown;
+  receipt?: { valid?: unknown; reason?: unknown; version?: unknown; commit?: unknown; head40?: unknown;
+    graphSha?: unknown; recipeSha?: unknown; envFingerprint?: unknown; imageDigest?: unknown; executionIdentity?: unknown };
+  graphPins: { graphSha: string; recipeSha: string } | null;
+  expectedIdentity?: GatePodExecutionIdentity | null;
+}): string | null {
+  const { receipt, graphPins, version, head40 } = input;
+  if (!receipt) return 'release gate baseline receipt absent';
+  if (!graphPins) return 'receipt graph/recipe source pins unavailable';
+  if (input.gateCommit !== head40 || receipt.commit !== head40 || receipt.head40 !== head40)
+    return 'receipt baseline head differs from rehearsal head';
+  if (receipt.valid !== true) return `release gate receipt invalid: ${String(receipt.reason ?? 'unknown')}`;
+  if (receipt.version !== version) return 'receipt release version absent or mismatched';
+  if (receipt.graphSha !== graphPins.graphSha || receipt.recipeSha !== graphPins.recipeSha)
+    return 'receipt graph/recipe source pins differ from recorded commit';
+  if (typeof receipt.imageDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/i.test(receipt.imageDigest))
+    return 'receipt image digest absent or invalid';
+  const runtime = receipt.executionIdentity as { bunVersion?: unknown; platform?: unknown; architecture?: unknown; envFingerprint?: unknown } | undefined;
+  if (!runtime || typeof runtime.bunVersion !== 'string' || typeof runtime.platform !== 'string'
+    || typeof runtime.architecture !== 'string' || typeof runtime.envFingerprint !== 'string'
+    || !/^[a-f0-9]{64}$/i.test(runtime.envFingerprint)
+    || receipt.envFingerprint !== runtime.envFingerprint) return 'receipt runtime or environment fingerprint absent';
+  if (input.expectedIdentity === null) return 'selected gate execution identity unavailable';
+  if (input.expectedIdentity) {
+    const expected = input.expectedIdentity;
+    for (const field of ['imageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const) {
+      const actual = field === 'imageDigest' ? receipt.imageDigest : field === 'envFingerprint' ? receipt.envFingerprint : runtime[field];
+      if (actual !== expected[field]) return `receipt environment-${field}-mismatch`;
+    }
+  }
+  return null;
+}
+
+async function runHardGate(version: string, checkout: string, sha: string, ledgerRoot: string, runId: string,
+  remote?: string, graphProbe: NonNullable<RehearsalDeps['hardGateGraphPins']> = gateSourcePins,
+  identityProbe: NonNullable<RehearsalDeps['hardGateIdentity']> = preflightGateExecutionIdentity,
+  gateSpawn: NonNullable<RehearsalDeps['hardGateSpawn']> = spawnHardRehearsalGate): Promise<HardGateResult> {
   const configuredPool = releaseLoopConfig().gatePodPool;
   if (!configuredPool) throw new Error('hard rehearsal requires release.loop.gatePodPool');
+  const targetHost = remote ?? 'node-b';
   const members = parsePodPool(configuredPool);
-  const gateMember = members.find(member => member.sshHost === 'node-b');
-  if (!gateMember) throw new Error('hard rehearsal requires a live node-b Pod member');
+  const gateMember = members.find(member => member.sshHost === targetHost);
+  if (!gateMember) throw new Error(`hard rehearsal requires a configured Pod member for --remote ${targetHost}`);
   const pool = configuredPool.split(',').map(part => part.trim())
     .find(part => part.split(/[#:]/, 1)[0] === `${gateMember.context}@${gateMember.sshHost}`);
-  if (!pool) throw new Error('hard rehearsal cannot isolate the node-b Pod member');
+  if (!pool) throw new Error(`hard rehearsal cannot isolate the ${targetHost} Pod member`);
   const previous = latestPublishedPreviousVersion(version, ledgerRoot);
   const logPath = join(ledgerRoot, 'release', version, 'rehearsal', `${runId}.log`);
   mkdirSync(dirname(logPath), { recursive: true });
-  return spawnHardRehearsalGate({
+  let graphPins: { graphSha: string; recipeSha: string } | null = null;
+  let expectedIdentity: GatePodExecutionIdentity | null = null;
+  let identityProbeError: string | undefined;
+  try { expectedIdentity = identityProbe(pool, process.env, sha); if (!expectedIdentity) identityProbeError = 'selected gate execution identity unavailable'; }
+  catch (error) { identityProbeError = oneLine(error instanceof Error ? error.message : String(error)); }
+  let graphProbeError: string | undefined;
+  try { graphPins = graphProbe(checkout, sha); }
+  catch (error) { graphProbeError = oneLine(error instanceof Error ? error.message : String(error)); }
+  const gateVersion = hardRehearsalGateVersion(version, runId);
+  const result = gateSpawn({
     binary: 'bun', args: hardRehearsalGateArgs(version, runId, sha, previous, pool),
     checkout, ledgerRoot, logPath, timeoutMs: 4 * 60 * 60_000, sha,
   });
+  let reason: string | undefined;
+  try {
+    const verdict = JSON.parse(readFileSync(join(ledgerRoot, 'release', gateVersion, 'gate-verdict.json'), 'utf8')) as {
+      commit?: unknown; baselineReceipt?: Parameters<typeof hardGateReceiptRecordMismatch>[0]['receipt'];
+    };
+    reason = [graphProbeError ? `receipt source pins could not be read: ${graphProbeError}` : undefined,
+      identityProbeError ? `receipt identity preflight failed: ${identityProbeError}` : undefined,
+      hardGateReceiptRecordMismatch({ version: gateVersion, head40: sha, gateCommit: verdict.commit,
+        receipt: verdict.baselineReceipt, graphPins, expectedIdentity }) ?? undefined].filter(Boolean).join(' · ') || undefined;
+  } catch (error) {
+    reason = [graphProbeError ? `receipt source pins could not be read: ${graphProbeError}` : undefined,
+      identityProbeError ? `receipt identity preflight failed: ${identityProbeError}` : undefined,
+      `gate receipt readback failed: ${oneLine(error instanceof Error ? error.message : String(error))}`].filter(Boolean).join(' · ');
+  }
+  return { ...result, receiptRecord: reason ? { available: false, reason } : { available: true } };
 }
 
 function oneLine(text: string): string { return text.replace(/\s+/g, ' ').trim(); }
@@ -490,11 +560,14 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               ...(leakDetail ? { detail: leakDetail } : {}) };
             if (leakStatus !== 0) throw new Error(`public export leak-check failed (rc=${leakStatus ?? 'spawn'})${leakDetail ? ` · ${leakDetail}` : ''}`);
             if (plan.run === 'hard-5h' || plan.run === 'hard-mid') {
-              stamp.selection = { shards: 12, remote: 'node-b' };
+              const targetHost = opts.remote ?? 'node-b';
+              stamp.selection = { shards: 12, remote: targetHost };
               const hardGateRunId = stamp.hardGateRunId;
               const hardGateLog = stamp.hardGateLog;
               if (!hardGateRunId || !hardGateLog) throw new Error('hard rehearsal claim has no evidence identity');
-              const hard = await (deps.hardGate ?? runHardGate)(plan.version, checkout, stamp.sha, root, hardGateRunId);
+              const hard = await (deps.hardGate ?? ((version, cwd, sha, ledger, id, host) =>
+                runHardGate(version, cwd, sha, ledger, id, host, deps.hardGateGraphPins, deps.hardGateIdentity, deps.hardGateSpawn)))
+                (plan.version, checkout, stamp.sha, root, hardGateRunId, targetHost);
               stamp.hardGate = hard;
               if (!existsSync(hardGateLog)) writeFileSync(hardGateLog, `${JSON.stringify(hard)}\n`, { flag: 'wx', mode: 0o600 });
               if (hard.outcome !== 'error' && (hard.commit !== stamp.sha || hard.executor !== 'pod' || !Array.isArray(hard.introduced)))
@@ -507,7 +580,9 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               const introducedCount: number | null = stamp.outcome === 'unmeasured' || stamp.outcome === 'error' ? null : hard.introduced.length;
               const preexistingCount: number | null = introducedCount === null ? null : hard.preexisting;
               const totalFailures: number | null = introducedCount === null || preexistingCount === null ? null : introducedCount + preexistingCount;
-              stamp.summary = oneLine(`hard gate ${hard.outcome} · introduced ${introducedCount ?? 'UNKNOWN'} · preexisting ${preexistingCount ?? 'UNKNOWN'} · total failures ${totalFailures ?? 'UNKNOWN'} · 원격 Pod · 12 shards · runId ${hardGateRunId} · evidence ${hardGateLog}${cause ? ` · ${cause}` : ''}`);
+              const receiptStatus = hard.receiptRecord?.available === false
+                ? ` · 영수증 재사용 불가: 기록 검증 실패: ${hard.receiptRecord.reason ?? 'record incomplete'}` : '';
+              stamp.summary = oneLine(`hard gate ${hard.outcome} · introduced ${introducedCount ?? 'UNKNOWN'} · preexisting ${preexistingCount ?? 'UNKNOWN'} · total failures ${totalFailures ?? 'UNKNOWN'} · 원격 Pod ${targetHost} · 12 shards · runId ${hardGateRunId} · evidence ${hardGateLog}${cause ? ` · ${cause}` : ''}${receiptStatus}`);
             } else {
             const shardPlan = opts.shards === undefined ? (deps.shardPlan ?? planRehearsalShards)(plan.version, root, checkout, { ...deps.shardPlanDeps, remoteGate: true }) : undefined;
             if (shardPlan) stamp.shardPlan = shardPlan;

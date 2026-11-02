@@ -1,0 +1,13 @@
+world: night-train
+seed: 42
+clock: { start: "2026-11-01T18:00:00+09:00", speed: 600 }
+hosts:
+  - { name: node-b, arch: arm64, cpu: 32, pools: [gate, train], egress: false }
+  - { name: gcp2, arch: amd64, cpu: 8, pools: [gate], egress: false }
+providers:
+  codex: { accounts: [default:61%, team:1%, third:0%] }
+  claude: { quota: exhausted }
+github: { repo: fixture-small, openPRs: 2 }
+seats: [OP, TC, OPT]
+events:
+  - { at: "+5m", id: dead-pid-lock }

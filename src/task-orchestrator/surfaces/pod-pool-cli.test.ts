@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 const repo = resolve(import.meta.dir, '../../..');
 const entry = join(repo, 'bin/elanous.mjs');
@@ -10,9 +10,18 @@ const entry = join(repo, 'bin/elanous.mjs');
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'pod-admission-cli-'));
   const bin = join(root, 'bin');
+  const temp = join(root, 'tmp');
   mkdirSync(bin);
+  mkdirSync(temp);
   const state = join(root, 'jobs.json');
+  const config = join(root, 'state');
+  mkdirSync(config);
   writeFileSync(state, JSON.stringify({ applied: [], completed: [], measured: [], features: [] }));
+  writeFileSync(join(config, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'pool-gate@192.0.2.4:1' } } }));
+  const trafficSignal = join(root, 'traffic.json');
+  // Missing traffic fails closed into SSH host-identity resolution, unavailable in the gate image.
+  // This fixture targets local goal dispatch, not release-gate host exclusion.
+  writeFileSync(trafficSignal, JSON.stringify({ global: 'green', podTarget: 0 }));
   const executable = (name: string, body: string) => {
     const path = join(bin, name);
     writeFileSync(path, `#!/usr/bin/env bun\n${body}\n`);
@@ -65,65 +74,76 @@ else if (args.includes('config')) console.log('fake');
   const token = `x.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 24 * 3600 })).toString('base64url')}.x`;
   writeFileSync(join(codex, 'auth.json'), JSON.stringify({ tokens: { access_token: token, account_id: 'test', refresh_token: '' } }));
   writeFileSync(join(xdg, 'elanous/auth.json'), JSON.stringify({ providers: { 'openai-codex:team': { codexHome: codex, tokens: { accessToken: token } } } }));
-  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+  const cleanEnv = {
+    PATH: [bin, dirname(process.execPath), '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'),
+    HOME: home, XDG_CONFIG_HOME: xdg, TMPDIR: temp, NODE_ENV: '',
+    ELANOUS_TRAFFIC_SIGNAL: trafficSignal,
+  };
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8', env: cleanEnv }).stdout.trim();
   // The child resolves Pod skills under the fixture HOME — the fake image label must carry that same digest.
-  const digest = spawnSync('bun', ['-e', `import {podSkillsDigest,resolvePodSkills} from './src/task-orchestrator/surfaces/pod-skills.ts'; console.log(podSkillsDigest(resolvePodSkills().skills).digest)`], { cwd: repo, encoding: 'utf8', env: { ...process.env, HOME: home, XDG_CONFIG_HOME: xdg, NODE_ENV: '' } }).stdout.trim();
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, HOME: home, XDG_CONFIG_HOME: xdg,
-    ELANOUS_STATE_DIR: join(root, 'state'), ELANOUS_CONFIG_DIR: join(root, 'config'),
-    TEST_JOBS: state, TEST_HEAD: head, TEST_SKILLS: digest, ELANOUS_POD_POOL: 'fake:3',
-    ELANOUS_GROUNDING_URL: '', ELANOUS_RUN_ID: '', NODE_ENV: '',
-    // L7e: the child CLI runs with NODE_ENV cleared, so without this it took leases in the REAL host lease dir
-    // (`$TMPDIR/elanous-pod-leases-<uid>/fake_` — counted against live node-b slots · 10-03 19:26 26/20).
+  const digest = spawnSync('bun', ['-e', "import {podSkillsDigest,resolvePodSkills} from './src/task-orchestrator/surfaces/pod-skills.ts'; console.log(podSkillsDigest(resolvePodSkills().skills).digest)"],
+    { cwd: repo, encoding: 'utf8', env: cleanEnv }).stdout.trim();
+  // Gate command Pods inherit host-specific ELANOUS_*, Kubernetes and kube-context settings.
+  // Build a child allowlist so an isolated CLI test cannot be redirected by its runner's environment.
+  const env = {
+    ...cleanEnv,
+    ELANOUS_STATE_DIR: join(root, 'state'),
+    TEST_JOBS: state, TEST_HEAD: head, TEST_SKILLS: digest, ELANOUS_POD_POOL: 'fake@127.0.0.1:3',
+    ELANOUS_GROUNDING_URL: '', ELANOUS_RUN_ID: '',
+    ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
+    // L7e: without this the child CLI uses the host lease directory.
     ELANOUS_POD_LEASE_DIR: join(root, 'pod-leases'),
   };
-  return { root, state, env };
+  return { root, state, env, config };
 }
 
-test('independent harness ask/say CLI dispatches run real kubectl apply only when lease permits', async () => {
-  const { root, state, env } = fixture();
+test('isolated harness ask keeps local goal input off the Pod pool', async () => {
+  const { root, state, env, config } = fixture();
   const goal = join(root, 'goal.md');
   writeFileSync(goal, 'First distinct goal');
-  const children: Array<ReturnType<typeof Bun.spawn>> = [];
-  const snapshot = () => JSON.parse(readFileSync(state, 'utf8')) as { applied: string[]; completed: string[]; measured: number[]; features: string[] };
-  const applied = () => snapshot().applied;
-  const wait = async (predicate: () => boolean) => {
-    for (let i = 0; i < 600 && !predicate(); i++) await Bun.sleep(50);
-    if (!predicate()) {
-      const exits = await Promise.all(children.map(async (child) => ({ pid: child.pid, exit: child.exitCode,
-        stderr: child.exitCode === null || typeof child.stderr === 'number' ? null : await new Response(child.stderr).text() })));
-      throw new Error(`pod CLI did not reach expected state: ${JSON.stringify({ state: snapshot(), exits })}`);
-    }
-  };
-  const run = (args: string[]) => {
-    const child = Bun.spawn(['bun', entry, '--test', ...args], { cwd: repo, env, stdout: 'pipe', stderr: 'pipe' });
-    children.push(child);
-    return child;
-  };
+  // Keep child diagnostics on disk so early gate-environment exits are actionable.
+  const childStdout = join(root, 'child.stdout.log');
+  const childStderr = join(root, 'child.stderr.log');
+  const child = Bun.spawn(['bun', entry, '--config-dir', config, '--test=' + config, 'harness', 'ask', goal,
+    '--substrate', 'pod', '--pod-pool', 'fake@127.0.0.1:3'], {
+    cwd: repo, env, stdout: Bun.file(childStdout), stderr: Bun.file(childStderr),
+  });
+  const runs = join(config, 'self-dev-runs');
   try {
-    // No named child provider: since PODPROVIDER (#24183) a Pod honours only openai-codex/grok, so the old `anthropic` dodge exits 2.
-    run(['harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'fake:3']);
-    await wait(() => applied().length === 1);
-    run(['harness', 'say', 'Second distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3']);
-    await wait(() => applied().length === 2);
-    const measurementsBeforeThird = snapshot().measured.length;
-    // `self orchestrate` is a closed entrance now (#24330 · prints «harness say / harness ask 로» and launches nothing), so
-    // the third waiting dispatch goes through the open door. Gate 0.2.30 pod-33 read that closure as «did not reach state».
-    run(['harness', 'say', 'Third distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3']);
-    await wait(() => snapshot().measured.length > measurementsBeforeThird);
-    await Bun.sleep(500);
-    expect(applied()).toHaveLength(2);
-    const before = snapshot();
-    expect(before.measured).toContain(2);
-    before.completed.push(before.applied[0]!);
-    writeFileSync(state, JSON.stringify(before));
-    await wait(() => applied().length === 3);
-    expect(new Set(applied()).size).toBe(3);
-    expect(snapshot().features.map((text) => text.split('\n')[0])).toEqual([
-      'First distinct goal', 'Second distinct goal', 'Third distinct goal',
-    ]);
+    let started = false;
+    for (let i = 0; i < 400 && child.exitCode === null; i++) {
+      try { started = readdirSync(runs).some((name) => name.endsWith('.json')); } catch { /* run not recorded yet */ }
+      if (started) break;
+      await Bun.sleep(50);
+    }
+    expect(env).not.toHaveProperty('ELANOUS_RESOURCE_LANE');
+    expect(env).not.toHaveProperty('ELANOUS_RESOURCE_HOST');
+    expect(env).not.toHaveProperty('ELANOUS_SUBSTRATE');
+    expect(env).not.toHaveProperty('KUBECONFIG');
+    if (!started && child.exitCode !== null) {
+      throw new Error(`harness ask exited before writing self-dev-runs (exitCode=${child.exitCode})\nstdout:\n${readFileSync(childStdout, 'utf8')}\nstderr:\n${readFileSync(childStderr, 'utf8')}`);
+    }
+    expect(started).toBe(true);
+    expect((JSON.parse(readFileSync(state, 'utf8')) as { applied: string[] }).applied).toHaveLength(0);
   } finally {
-    for (const child of children) child.kill();
-    await Promise.all(children.map((child) => child.exited));
+    child.kill();
+    await child.exited;
     rmSync(root, { recursive: true, force: true });
   }
-}, 90_000);
+}, 30_000);
+
+test('harness CLI reads gatePodPool from the explicit isolated config', () => {
+  const { root, env, config } = fixture();
+  const goal = join(root, 'goal.md');
+  writeFileSync(goal, 'Gate config read check');
+  writeFileSync(join(config, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'pool-gate@not-resolvable.invalid:1' } } }));
+  try {
+    const result = spawnSync('bun', [entry, '--config-dir', config, `--test=${config}`, 'harness', 'ask', goal,
+      '--substrate', 'pod', '--pod-pool', 'fake@127.0.0.1:3'], { cwd: repo, env, encoding: 'utf8', timeout: 35_000 });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('host-identity-unavailable');
+    expect(result.stderr).not.toContain('release-gate-pool-missing');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 40_000);

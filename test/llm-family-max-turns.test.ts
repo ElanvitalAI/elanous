@@ -12,9 +12,6 @@ import {
   familyMaxTurnsKey,
   NAMED_MAX_TURNS_FAMILIES,
   resolveFamilyMaxTurns,
-  streamLLMWithTools,
-  type LLMProvider,
-  type LLMStreamEvent,
 } from '../src/llm.js';
 import {
   buildUserConfig,
@@ -35,20 +32,6 @@ function isolateBudget(
       maxTurns,
     },
   }));
-}
-
-function scriptedProvider(turns: LLMStreamEvent[][], onCall: () => void): LLMProvider {
-  let call = 0;
-  return {
-    name: 'openai-codex',
-    defaultModel: 'gpt-6-astra',
-    available: () => true,
-    async *streamChat() {
-      onCall();
-      for (const event of turns[call++] ?? []) yield event;
-    },
-    async *chat() {},
-  };
 }
 
 beforeEach(() => {
@@ -122,32 +105,61 @@ describe('resolveFamilyMaxTurns — quality defaults (no override)', () => {
 });
 
 describe('streamLLMWithTools — openai-codex provider budget wiring', () => {
-  test('gpt-6-astra uses the codex override through the in-scope provider name', async () => {
-    isolateBudget({ codex: 3, default: 1 }, 'quality');
-    const turns: LLMStreamEvent[][] = Array.from({ length: 4 }, (_, index) => [
-      { type: 'tool_call', id: `turn-${index}`, name: 'Bash', args: { command: `echo ${index}` } },
-    ]);
-    let providerCalls = 0;
-    let dispatchedCalls = 0;
+  test('gpt-6-astra uses the codex override through the in-scope provider name', () => {
+    // mock.module('./llm.js') in an unrelated test file can replace this module
+    // for the remainder of Bun's shared test process. Run this integration seam
+    // in a child so its result depends only on the real provider loop and fake
+    // provider below, not on suite order or other tests' module registry.
+    const home = mkdtempSync(join(tmpdir(), 'llm-family-max-turns-home-'));
+    try {
+      const script = `
+        import { streamLLMWithTools } from './src/llm.ts';
+        import { setUserConfigOverlay } from './src/user-config.ts';
 
-    await streamLLMWithTools(
-      [{ role: 'user', content: 'q' }],
-      {
-        onText: () => {},
-        dispatchTool: async () => {
-          dispatchedCalls += 1;
-          return 'r';
-        },
-      },
-      {
-        provider: scriptedProvider(turns, () => { providerCalls += 1; }),
-        model: 'gpt-6-astra',
-        tools: [{ name: 'Bash', description: 'd', parameters: { type: 'object' } }],
-      },
-    );
-
-    expect(providerCalls).toBe(3);
-    expect(dispatchedCalls).toBe(3);
+        let providerCalls = 0;
+        let dispatchedCalls = 0;
+        const turns = Array.from({ length: 4 }, (_, index) => [{
+          type: 'tool_call', id: 'turn-' + index, name: 'Bash', args: { command: 'echo ' + index },
+        }]);
+        const provider = {
+          name: 'openai-codex',
+          defaultModel: 'gpt-6-astra',
+          available: () => true,
+          async *streamChat() {
+            providerCalls += 1;
+            for (const event of turns[providerCalls - 1] ?? []) yield event;
+          },
+          async *chat() {},
+        };
+        setUserConfigOverlay((cfg) => ({
+          ...cfg,
+          llm: { ...cfg.llm, answerPriority: 'quality', maxTurns: { codex: 3, default: 1 } },
+        }));
+        await streamLLMWithTools([{ role: 'user', content: 'q' }], {
+          onText: () => {},
+          dispatchTool: async () => { dispatchedCalls += 1; return 'r'; },
+        }, {
+          provider,
+          model: 'gpt-6-astra',
+          tools: [{ name: 'Bash', description: 'd', parameters: { type: 'object' } }],
+        });
+        console.log(JSON.stringify({ providerCalls, dispatchedCalls }));
+      `;
+      const result = Bun.spawnSync([process.execPath, '-e', script], {
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH ?? '', HOME: home, NODE_ENV: 'test' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 15_000,
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`isolated provider loop failed (${result.exitCode}): ${result.stderr.toString()}`);
+      }
+      const output = result.stdout.toString().trim().split('\n').at(-1);
+      expect(JSON.parse(output ?? 'null')).toEqual({ providerCalls: 3, dispatchedCalls: 3 });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

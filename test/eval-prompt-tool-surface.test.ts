@@ -47,6 +47,15 @@ describe('elanous repro tool surface selection', () => {
       .toEqual(LEGACY_CLI_TOOLS);
   });
 
+  test('Nexus mock-device catalog remains MCP-only across eval prompt surfaces', () => {
+    const entry = nativeToolCatalog.find((tool) => tool.id === 'elanous_ux_sim_devices');
+    expect(entry?.host).toEqual(['mcp']);
+    for (const surface of ['cli', 'chat', 'webterm'] as const) {
+      expect(buildEvalPromptToolSurface(surface, 'claude', cfg).specs.map((tool) => tool.name))
+        .not.toContain('ElanousUxSimDevices');
+    }
+  });
+
   test('chat selects daemon chat specs and dispatcher', async () => {
     const selected = buildEvalPromptToolSurface('chat', 'claude', cfg);
     expect(selected.specs.map((tool) => tool.name)).toContain('schedule_manage');

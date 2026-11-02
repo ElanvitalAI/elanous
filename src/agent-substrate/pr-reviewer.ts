@@ -192,6 +192,8 @@ export interface ReviewInput {
   workingMemory?: string;
   /** Separate human-provided review context; preserve caller order and do not append to phaseIntent. */
   reviewerContext?: ReviewerContextItem[];
+  /** Files the caller already opened at the pinned PR head while building reviewer context. */
+  referencedFilesAlreadyOpened?: number;
   /** Optional observation join keys for the reviewer-context budget; runId alone is shared by child spaces. */
   reviewContext?: { runId?: string; round?: number };
   /** ⭐ diff 가 **무엇인지** 리뷰어에게 알린다(S2·2026-07-30). 규칙 (7) SCOPE CREEP 은
@@ -1175,6 +1177,10 @@ export async function reviewPullRequest(
       observeReauthorClassification(input, folded);
       return {
         ...folded,
+        ...(typeof input.referencedFilesAlreadyOpened === 'number' ? {
+          referencedFilesOpened: input.referencedFilesAlreadyOpened > 0,
+          referencedFilesRead: input.referencedFilesAlreadyOpened,
+        } : {}),
         diffBudget: {
           // ⭐ 「전부 봤나」가 truncated 의 «정의»다 — 상한에 걸렸거나 초대형 파일이 있으면 여전히 true.
           truncated: !plan.coversAll,
@@ -1219,9 +1225,9 @@ export async function reviewPullRequest(
           omittedItems: reviewerContextBudget.omittedItems,
         },
       } : {}),
-      ...(input.readReferencedFile ? {
-        referencedFilesOpened: referencedContext.count > 0,
-        referencedFilesRead: referencedContext.count,
+      ...(input.readReferencedFile || input.referencedFilesAlreadyOpened ? {
+        referencedFilesOpened: referencedContext.count + (input.referencedFilesAlreadyOpened ?? 0) > 0,
+        referencedFilesRead: referencedContext.count + (input.referencedFilesAlreadyOpened ?? 0),
       } : {}),
     }; // 실제 리뷰 완료(fail-soft pass 와 구분).
   } catch (error) {

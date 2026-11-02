@@ -1,10 +1,14 @@
 import { expect, test, spyOn } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { budgetGate, placementGate, relationGate, memoryGate } from '../execution-loop/gates.js';
 import type { DispatchTaskInput } from '../execution-loop/dispatch-task.js';
 import type { SelfImplementResult, SelfImplementSeams } from '../self-implement/orchestrator.js';
 import { runDevPipeline, type DevPipelineDeps, type DevPipelineSpec } from './dev-pipeline.js';
+import { activeResourceLeases, readResourceLedger, resourceLedgerPath } from '../resource-ledger/resource-ledger.js';
 
 const base: DevPipelineSpec = { input: { text: 'Implement feature' }, humanReadableOutput: false };
 
@@ -45,6 +49,34 @@ test('dispatch decision is made after planning, exactly once before the original
   await expect(runDevPipeline({ ...base, input: { text: 'x' }, entrance: 'unregistered' as DevPipelineSpec['entrance'] }, deps))
     .rejects.toThrow(/알 수 없는 입구 id/);
   expect(calls).toHaveLength(0);
+});
+
+test('runDevPipeline records its run lease create, heartbeat, and terminal end events', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'dev-pipeline-resource-lease-'));
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = stateDir;
+  try {
+    let dispatchStarted!: () => void;
+    let finishDispatch!: () => void;
+    const started = new Promise<void>(resolve => { dispatchStarted = resolve; });
+    const finish = new Promise<void>(resolve => { finishDispatch = resolve; });
+    const deps = fakeDeps([]);
+    deps.dispatchTask = async () => { dispatchStarted(); await finish; return { cardId: 'card-resource', decisions: {} as never, mode: 'observe' }; };
+    const run = runDevPipeline({ ...base, runId: 'run-resource-ledger-test' }, deps);
+    await started;
+    const fp = `fp_${(await import('node:crypto')).createHash('sha256').update('run-resource-ledger-test').digest('hex').slice(0, 26)}`;
+    expect(activeResourceLeases(readResourceLedger(resourceLedgerPath(stateDir)))).toHaveLength(1);
+    expect(readResourceLedger(resourceLedgerPath(stateDir)).map(row => row.event)).toEqual(['lease-created', 'lease-heartbeat']);
+    finishDispatch();
+    await run;
+    expect(activeResourceLeases(readResourceLedger(resourceLedgerPath(stateDir)))).toEqual([]);
+    expect(readResourceLedger(resourceLedgerPath(stateDir))[0]).toMatchObject({ event: 'lease-created', lease: { fp, lane: 'unknown' } });
+    expect(readResourceLedger(resourceLedgerPath(stateDir))[2]).toMatchObject({ event: 'lease-ended', id: fp });
+  } finally {
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test('only the enumerated skip conditions omit the observation; other interactive and relaunch:false runs still dispatch', async () => {

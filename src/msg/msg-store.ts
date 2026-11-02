@@ -220,11 +220,14 @@ export class MsgStore {
 
   /** Append once for a coordination comment, task failure, or decided notification. */
   appendWithProvenance(input: MessageEnvelope, provenanceKey: string): Message {
-    if (typeof provenanceKey !== 'string' || !/^(?:coord|ta-failure|decision):[^:]+:[^:]+$/.test(provenanceKey)) {
+    if (typeof provenanceKey !== 'string' || !/^(?:coord|ta-failure|decision):[^:]+:[^:]+$/.test(provenanceKey) &&
+        !/^release-stage:[^:]+:event$/.test(provenanceKey)) {
       throw new Error('invalid message provenance key');
     }
     const msg = validateMessageEnvelope(input);
-    if (provenanceKey.split(':')[2] !== msg.to) throw new Error('provenance recipient does not match message recipient');
+    if (!provenanceKey.startsWith('release-stage:') && provenanceKey.split(':')[2] !== msg.to) {
+      throw new Error('provenance recipient does not match message recipient');
+    }
     return this.db.transaction(() => {
       const existing = this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.reply_to, m.created_at
         FROM msg_provenance p JOIN msg_messages m ON m.id = p.message_id WHERE p.provenance_key = ?`)

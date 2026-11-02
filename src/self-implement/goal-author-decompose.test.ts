@@ -426,6 +426,34 @@ describe('TIER-SIZED-DECOMPOSE fake-LLM L2', () => {
     } finally { log.mockRestore(); }
   });
 
+  test('mock size judgment targets only high slices and asks to preserve the fitting low slice', async () => {
+    useRealDecompose = true;
+    captureStreamLlm = true;
+    scriptedLlmReplies.push(
+      proposal(['oversized feature', 'already-small test']),
+      sizes([{ files: 6, actions: 3, newFiles: 3, tier: 'high' },
+        { files: 2, actions: 1, newFiles: 0, tier: 'low' }]),
+      proposal(['feature part A', 'feature part B', 'already-small test']),
+      sizes([{ files: 3, actions: 2, newFiles: 1, tier: 'medium' },
+        { files: 2, actions: 1, newFiles: 0, tier: 'low' },
+        { files: 2, actions: 1, newFiles: 0, tier: 'low' }]),
+    );
+
+    const result = await decomposeToTierSizedSlices('implement feature with focused test');
+
+    expect(result).toEqual({ ok: true, redecomposed: 1, slices: [
+      { goal: 'feature part A', files: 3, behaviours: 2, newFiles: 1, tier: '중' },
+      { goal: 'feature part B', files: 2, behaviours: 1, newFiles: 0, tier: '하' },
+      { goal: 'already-small test', files: 2, behaviours: 1, newFiles: 0, tier: '하' },
+    ] });
+    expect(streamLlmCalls).toHaveLength(2);
+    const resplitPrompt = JSON.stringify(streamLlmCalls[1]?.messages);
+    expect(resplitPrompt).toContain('OVERSIZED_INDEXES_JSON: [0]');
+    expect(resplitPrompt).toContain('preserve fitting slices');
+    expect(resplitPrompt).toContain('already-small test');
+    expect(scriptedLlmReplies).toHaveLength(0);
+  });
+
   test('a high slice surviving two bounded resplits is marked unavoidable with size telemetry', async () => {
     useRealDecompose = true;
     scriptedLlmReplies.push(

@@ -8,6 +8,21 @@ import { gateChangedFiles } from '../../self-implement/seams.js';
 import { packSourceBundle } from './pod-source-bundle.js';
 import { podSourceScript, PodSourceShaFormatError, type PodSource } from './pod-source-receive.js';
 
+const TEST_SYSTEM_PATH = process.env.PATH ?? '/usr/bin:/bin';
+
+function isolatedGitTestEnv(home: string, path = TEST_SYSTEM_PATH): NodeJS.ProcessEnv {
+  const gitConfig = join(home, 'empty.gitconfig');
+  writeFileSync(gitConfig, '');
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: path, HOME: home };
+  for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
+  env.GIT_CONFIG_GLOBAL = gitConfig;
+  env.GIT_CONFIG_NOSYSTEM = '1';
+  env.GIT_TERMINAL_PROMPT = '0';
+  delete env.BASH_ENV;
+  delete env.ENV;
+  return env;
+}
+
 function makeBaseShaFallbackFixture(root: string, options: { originHasBase: boolean; withMirror: boolean }) {
   const work = join(root, 'origin-work');
   const origin = join(root, 'origin.git');
@@ -698,13 +713,14 @@ describe('podSourceScript', () => {
       const bytes = readFileSync(bundlePath);
       const sha256 = createHash('sha256').update(bytes).digest('hex');
       const source: PodSource = { kind: 'bundle', bundlePath, sha256, sizeBytes: statSync(bundlePath).size, headCommit };
+      const env = isolatedGitTestEnv(root);
       const script = podSourceScript(source, 'https://github.com/o/r');
       const good = join(work, 'good');
       execFileSync('mkdir', ['-p', join(good, 'tmp')]);
       const staged = script.replaceAll('/tmp/', `${good}/tmp/`);
       writeFileSync(join(good, 'run.sh'), `cp ${bundlePath} ${good}/tmp/source.bundle\ntouch ${good}/tmp/source.ready\n${staged}\n`);
-      const ok = Bun.spawnSync(['bash', join(good, 'run.sh')], { cwd: good });
-      expect(ok.exitCode).toBe(0);
+      const ok = Bun.spawnSync(['bash', join(good, 'run.sh')], { cwd: good, env });
+      expect(ok.exitCode, `${ok.stdout.toString()}\n${ok.stderr.toString()}`).toBe(0);
       expect(ok.stdout.toString()).toContain(`ELANOUS_POD_SOURCE bundle ${headCommit}`);
       expect(execFileSync('git', ['-C', join(good, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(headCommit);
 
@@ -713,8 +729,8 @@ describe('podSourceScript', () => {
       const flipped = `${sha256.slice(0, -1)}${sha256.endsWith('a') ? 'b' : 'a'}`;
       const mismatch = podSourceScript({ ...source, sha256: flipped }, 'https://github.com/o/r').replaceAll('/tmp/', `${bad}/tmp/`);
       writeFileSync(join(bad, 'run.sh'), `cp ${bundlePath} ${bad}/tmp/source.bundle\ntouch ${bad}/tmp/source.ready\n${mismatch}\n`);
-      const fail = Bun.spawnSync(['bash', join(bad, 'run.sh')], { cwd: bad });
-      expect(fail.exitCode).toBe(3);
+      const fail = Bun.spawnSync(['bash', join(bad, 'run.sh')], { cwd: bad, env });
+      expect(fail.exitCode, `${fail.stdout.toString()}\n${fail.stderr.toString()}`).toBe(3);
       expect(fail.stdout.toString()).toContain('ELANOUS_POD_SOURCE_MISMATCH');
       expect(fail.stdout.toString()).not.toContain('ELANOUS_POD_SOURCE bundle');
       let repoExists = true;
@@ -751,7 +767,7 @@ describe('podSourceScript', () => {
       writeFileSync(join(fakeBin, 'bun'), `#!/bin/sh\necho called >> '${bunCalls}'\nexit 0\n`);
       chmodSync(join(fakeBin, 'date'), 0o755);
       chmodSync(join(fakeBin, 'bun'), 0o755);
-      const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}` };
+      const env = isolatedGitTestEnv(root, `${fakeBin}:${TEST_SYSTEM_PATH}`);
 
       const origin = join(root, 'origin');
       const mirror = join(root, 'mirror.git');
@@ -846,7 +862,7 @@ describe('podSourceScript', () => {
       execFileSync('git', ['-C', mirror, 'fetch', '-q', origin, '+refs/heads/main:refs/heads/main']);
       setClock(1);
       const third = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'min-sync', baseSha: base3, previousHead: base2, lockHash: lockHash2 }, 'https://github.com/unused/repo', mirror)}`], { cwd: warm, env });
-      expect(third.exitCode, third.stderr.toString()).toBe(0);
+      expect(third.exitCode, `${third.stdout.toString()}\n${third.stderr.toString()}`).toBe(0);
       expect(existsSync(bunCalls)).toBe(true);
       expect(readFileSync(join(repo, 'node_modules', '.elanous-installed-lock-hash'), 'utf8').trim()).toBe(lockHash2);
       const thirdIo = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(third.stdout.toString())?.[1];

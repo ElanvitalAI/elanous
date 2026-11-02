@@ -1908,7 +1908,13 @@ export function messagesToResponsesInput(
         if (textBuf) input.push({ role: 'developer', content: [{ type: 'input_text', text: textBuf }] });
         continue;
       }
-      if (stablePrefix && m.cacheVolatile) {
+      // Compaction summaries can be the first retained history item and are
+      // persisted without LLMMessage metadata. Treat the stable XML marker as
+      // volatile too, so changing summary text never rewrites `instructions`.
+      const compactedSummary = typeof m.content === 'string'
+        && m.content.startsWith('<context_summary>\n')
+        && m.content.endsWith('\n</context_summary>');
+      if (stablePrefix && (m.cacheVolatile || compactedSummary)) {
         if (textBuf) volatileSys.push(textBuf);
         continue;
       }
@@ -2040,6 +2046,27 @@ export function codexSessionCacheKey(
   const source = s ? 'session' : 'run';
   if (raw.length <= 64 && /^[A-Za-z0-9._:-]+$/.test(raw)) return { key: raw, source, hashed: false };
   return { key: `elanous-${createHash('sha256').update(raw).digest('hex').slice(0, 32)}`, source, hashed: true };
+}
+
+/** Route a session to a stable cache bucket for one model/tool stage.
+ * The Responses prompt cache is model-scoped and tool definitions are part
+ * of the prompt. Keeping their canonical signature in the routing key avoids
+ * sending intentionally different tool stages to the same affinity bucket. */
+export function codexStagePromptCacheKey(
+  sessionKey: string,
+  model: string,
+  tools: unknown[] | undefined,
+): string {
+  const signature = JSON.stringify({ model, tools: canonicalCodexValue(tools ?? []) });
+  return `elanous-${createHash('sha256').update(`${sessionKey}::${signature}`).digest('hex').slice(0, 32)}`;
+}
+
+function canonicalCodexValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalCodexValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([key, child]) => [key, canonicalCodexValue(child)]));
 }
 
 /** Short content hash for request-stability observation (logs only). */
@@ -2331,7 +2358,9 @@ function buildCodexResponsesWireBody(
   sessionCacheKey?: string,
 ): Record<string, unknown> {
   const cacheKey = promptCache
-    ? (sessionCacheKey ?? computePromptCacheKey(body.model, body.instructions))
+    ? (sessionCacheKey
+      ? codexStagePromptCacheKey(sessionCacheKey, body.model, body.tools)
+      : computePromptCacheKey(body.model, body.instructions))
     : undefined;
   return {
     ...body,
@@ -2444,8 +2473,10 @@ export async function* streamCodexResponsesEvents(
       toolChoice: body.tool_choice ?? null,
       promptCacheKey: extra.promptCache === false
         ? null
-        : (sessionAffinity?.key ?? computePromptCacheKey(body.model, body.instructions)).slice(0, 24),
-      cacheKeySource: extra.promptCache === false ? 'off' : (sessionAffinity?.source ?? 'instructions-prefix'),
+        : (sessionAffinity
+          ? codexStagePromptCacheKey(sessionAffinity.key, body.model, body.tools)
+          : computePromptCacheKey(body.model, body.instructions)).slice(0, 24),
+      cacheKeySource: extra.promptCache === false ? 'off' : (sessionAffinity ? `${sessionAffinity.source}-model-tools` : 'instructions-prefix'),
       sessionHeader: sessionAffinity !== null,
       tools: observeRequestTools(body.tools),
       instructions: body.instructions.slice(0, 200),
@@ -2479,6 +2510,12 @@ export async function* streamCodexResponsesEvents(
   debug.log('llm.request', 'request-size', {
     provider: 'openai-codex',
     requestChars: wireJson.length,
+    // TUI-PROMPT-CACHE-PREFIX — hash the exact serialized body that is
+    // handed to fetch (including any preflight serialization), without
+    // persisting prompt text. This lets two mock turns compare the actual
+    // byte prefix rather than infer it from per-field character counts.
+    requestBytes: Buffer.byteLength(wireJson, 'utf8'),
+    requestSha256: createHash('sha256').update(wireJson).digest('hex'),
     store: body.store === true,
     previousResponseId: body.previousResponseId ? `${body.previousResponseId.slice(0, 12)}…` : null,
   });
@@ -2800,7 +2837,17 @@ export function toCodexResponsesTools(
       ...(opts.background ? { background: opts.background } : {}),
     });
   }
-  return out.length > 0 ? out : undefined;
+  if (out.length === 0) return undefined;
+  // Tool declaration order is semantically irrelevant to Responses, but it
+  // changes serialized prompt bytes. Canonicalize nested schema keys and sort
+  // declarations so callers with the same tool set produce identical bytes.
+  return out.map(canonicalCodexValue).sort((a, b) => {
+    const left = a as Record<string, unknown>;
+    const right = b as Record<string, unknown>;
+    const leftKey = `${left.type ?? ''}:${left.name ?? ''}`;
+    const rightKey = `${right.type ?? ''}:${right.name ?? ''}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
 }
 
 /** Translate plugin LLMToolSpec → OpenAI wire format. */
@@ -4676,12 +4723,12 @@ function remainingFallbackProviderNames(
 
 /** 폴백 후보를 고르는 «그 순간»에 빠진 칸과 이유를 남긴다 — `provider-fallback-exhausted` 가
  *  「무엇을 봤고 왜 아무도 안 남았나」를 혼자 말하지 못하던 결손(2026-10-14 TUI 실측) 수리. */
-function explainAndLogFallbackCandidates(
+function explainAndLogFallbackCandidatesDetails(
   attemptedProviders: ReadonlySet<string>,
   opts: LLMOpts & { provider?: LLMProvider },
   context: { failedProvider: string; turn?: number },
   chain?: readonly string[],
-): string[] {
+): { candidates: string[]; skipped: FallbackCandidateSkip[] } {
   const { candidates, skipped } = explainFallbackCandidates(attemptedProviders, opts, chain);
   debug.log('llm.router', 'fallback-candidates', {
     ...(context.turn !== undefined ? { turn: context.turn } : {}),
@@ -4689,7 +4736,26 @@ function explainAndLogFallbackCandidates(
     candidates,
     skipped,
   });
-  return candidates;
+  return { candidates, skipped };
+}
+
+function explainAndLogFallbackCandidates(
+  attemptedProviders: ReadonlySet<string>,
+  opts: LLMOpts & { provider?: LLMProvider },
+  context: { failedProvider: string; turn?: number },
+  chain?: readonly string[],
+): string[] {
+  return explainAndLogFallbackCandidatesDetails(attemptedProviders, opts, context, chain).candidates;
+}
+
+function podNoUsableProviderReason(
+  action: 'stop' | 'exhaust',
+  skipped: readonly FallbackCandidateSkip[],
+): string | undefined {
+  if (process.env.ELANOUS_SUBSTRATE !== 'pod' || action !== 'exhaust'
+    || skipped.length === 0) return undefined;
+  const reasons = skipped.map((candidate) => `${candidate.step}${candidate.provider ? `(${candidate.provider})` : ''}=${candidate.reason}`);
+  return `no-usable-provider: ${reasons.join(', ')}`;
 }
 
 /** 스트림 중 끊김 재시도 상한 — codex `DEFAULT_STREAM_MAX_RETRIES`(5) 와 같은 값. */
@@ -4745,7 +4811,8 @@ function terminalFallbackVerdict(
   attempts: readonly ProviderFallbackAttempt[],
   reason: string,
 ): ProviderFallbackTerminalVerdict {
-  if (verdict.action === 'stop' || verdict.action === 'exhaust') return verdict;
+  const unavailablePodChain = reason.startsWith('no-usable-provider:');
+  if (!unavailablePodChain && (verdict.action === 'stop' || verdict.action === 'exhaust')) return verdict;
   return { action: 'exhaust', category: verdict.category, attempts, reason };
 }
 
@@ -4767,6 +4834,13 @@ function firstAvailableFallbackProvider(attempted: ReadonlySet<string>, opts: LL
     if (candidate?.available()) return candidate;
   }
   return undefined;
+}
+
+/** Codex overload failover can enumerate a Pod credential just before it disappears.
+ *  Recheck at the actual handoff boundary in Pods; the host path keeps its existing behavior. */
+function overloadFallbackStillAvailable(failedProvider: string, candidate: LLMProvider): boolean {
+  if (failedProvider === 'openai-codex' && process.env.ELANOUS_SUBSTRATE !== 'pod') return true;
+  return candidate.available();
 }
 
 function finalizeStreamingProviderModel(provider: LLMProvider, model: string): { provider: LLMProvider; model: string } {
@@ -5209,7 +5283,7 @@ export async function streamLLM(
         ? firstAvailableFallbackProvider(attemptedProviders, opts)
         : providerByName('grok');
       if (switched && !attemptedProviders.has(switched.name)
-        && (activeProvider.name === 'openai-codex' || switched.available()) && full.length === 0) {
+        && overloadFallbackStillAvailable(activeProvider.name, switched) && full.length === 0) {
         debug.log('llm.router', 'overload-failover', {
           blockedProvider: activeProvider.name,
           fallbackProvider: switched.name,
@@ -5237,11 +5311,11 @@ export async function streamLLM(
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'error', kind: 'streamLLM', durationMs: Date.now() - started });
       throw err;
     }
-    const remaining = explainAndLogFallbackCandidates(attemptedProviders, opts, { failedProvider: activeProvider.name });
+    const fallbackPlan = explainAndLogFallbackCandidatesDetails(attemptedProviders, opts, { failedProvider: activeProvider.name });
     const verdict = decideProviderFallback({
       err,
       failedProvider: activeProvider.name,
-      remainingProviders: remaining,
+      remainingProviders: fallbackPlan.candidates,
       attempted: blockedProviders,
     });
     blockedProviders = [...verdict.attempts];
@@ -5261,7 +5335,10 @@ export async function streamLLM(
       attemptedProviders.add(activeProvider.name);
       continue;
     }
-    if (verdict.action === 'stop') {
+    const noUsableProviderReason = podNoUsableProviderReason(
+      verdict.action === 'exhaust' ? 'exhaust' : 'stop', fallbackPlan.skipped,
+    );
+    if (verdict.action === 'stop' && !noUsableProviderReason) {
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'error', kind: 'streamLLM', durationMs: Date.now() - started });
       debug.log('llm.router', 'provider-fallback-stop', {
         blockedProviders,
@@ -5270,7 +5347,8 @@ export async function streamLLM(
       }, { level: 'error' });
       throw err;
     }
-    const terminal = terminalFallbackVerdict(verdict, blockedProviders, 'fallback candidates exhausted');
+    const terminal = terminalFallbackVerdict(verdict, blockedProviders,
+      noUsableProviderReason ?? 'fallback candidates exhausted');
     const screenError = formatProviderFallbackOutput(terminal);
     const finalText = full.length > 0 ? `${full}\n\n${screenError}` : screenError;
     const finalDelta = finalText.slice(full.length);
@@ -9454,7 +9532,7 @@ export async function streamLLMWithTools(
             ? firstAvailableFallbackProvider(attemptedProviders, opts)
             : providerByName('grok');
           if (switched && !attemptedProviders.has(switched.name)
-            && (activeProvider.name === 'openai-codex' || switched.available()) && evCount === 0) {
+            && overloadFallbackStillAvailable(activeProvider.name, switched) && evCount === 0) {
             (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, 'overload-failover', Date.now());
             debug.log('llm.router', 'overload-failover', {
               turn,
@@ -9511,13 +9589,13 @@ export async function streamLLMWithTools(
             turn, failedProvider: activeProvider.name, candidates: [], skipped: [], outputEmitted: true, evCount, pendingCalls: pendingCalls.length,
           });
         }
-        const remaining = evCount === 0
-          ? explainAndLogFallbackCandidates(attemptedProviders, opts, { failedProvider: activeProvider.name, turn })
-          : [];
+        const fallbackPlan = evCount === 0
+          ? explainAndLogFallbackCandidatesDetails(attemptedProviders, opts, { failedProvider: activeProvider.name, turn })
+          : { candidates: [], skipped: [] };
         const verdict = decideProviderFallback({
           err,
           failedProvider: activeProvider.name,
-          remainingProviders: remaining,
+          remainingProviders: fallbackPlan.candidates,
           attempted: blockedProviders,
         });
         (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, verdict.category, Date.now());
@@ -9527,7 +9605,8 @@ export async function streamLLMWithTools(
           const terminal = terminalFallbackVerdict(
             verdict,
             blockedProviders,
-            verdict.action === 'stop' ? verdict.reason : 'fallback candidates exhausted',
+            podNoUsableProviderReason(verdict.action === 'exhaust' ? 'exhaust' : 'stop', fallbackPlan.skipped)
+              ?? (verdict.action === 'stop' ? verdict.reason : 'fallback candidates exhausted'),
           );
           debug.log('llm.router', terminal.action === 'exhaust' ? 'provider-fallback-exhausted' : 'provider-fallback-stop', {
             blockedProviders,

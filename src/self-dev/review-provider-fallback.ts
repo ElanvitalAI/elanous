@@ -246,9 +246,9 @@ export function classifyReviewProviderFailure(message: string): ReviewFailureRea
   const m = message.toLowerCase();
   // Credential absence is provider-local: move to the next configured provider, then let the caller
   // preserve its current artifact if every configured provider is keyless.
-  if ((m.includes('unavailable') && /(api\s*key|credentials?)/.test(m))
-    || /configure\s+(?:an?\s+)?api\s*key/.test(m)
-    || /(?:missing|no)\s+(?:provider\s+)?(?:api\s*)?key\b/.test(m)
+  if ((m.includes('unavailable') && /(api[\s_-]*key|credentials?)/.test(m))
+    || /configure\s+(?:an?\s+)?api[\s_-]*key/.test(m)
+    || /(?:missing|no)\s+(?:provider\s+)?(?:api[\s_-]*)?key\b/.test(m)
     || /credentials?\s+(?:are\s+)?unavailable/.test(m)) return 'credentials-unavailable';
   // ⭐ 실물 문면을 먼저 둔다 — `#10069` 가 낸 그 문장이다.
   if (m.includes('overloaded') || m.includes('server_overloaded')) return 'overloaded';
@@ -272,6 +272,18 @@ export interface ReviewProviderAttempt {
   readonly label: string;
 }
 
+export interface ReviewProviderCandidateSkip {
+  readonly label: string;
+  readonly model: string;
+  readonly provider?: string;
+  readonly why: 'model-unknown' | 'provider-mismatch' | 'provider-unresolved' | 'provider-not-allowed' | 'no-credential' | 'availability-check-failed';
+}
+
+export interface ReviewProviderAttemptPlan {
+  readonly attempts: ReviewProviderAttempt[];
+  readonly skipped: ReviewProviderCandidateSkip[];
+}
+
 /**
  * ⛔⭐⭐⭐ **시도 순서는 «순수»하게 정한다** — 실제 호출은 호출자가 한다(테스트 가능성).
  *
@@ -286,13 +298,54 @@ export function buildReviewProviderAttempts(
   primary: ReviewProviderAttempt,
   fallbacks: readonly ReviewProviderAttempt[],
 ): ReviewProviderAttempt[] {
+  return planReviewProviderAttempts(primary, fallbacks).attempts;
+}
+
+/** Resolve the review chain and, in Pod-only mode, remove providers with no usable local credentials. */
+export function planReviewProviderAttempts(
+  primary: ReviewProviderAttempt,
+  fallbacks: readonly ReviewProviderAttempt[],
+  options: { skipUnavailableProviders?: boolean; allowedProviderNames?: readonly string[]; isAvailable?: (provider: LLMProvider) => boolean } = {},
+): ReviewProviderAttemptPlan {
   const model = resolveReviewModelAlias(primary.model);
   const inferred = inferProviderFromModel(model);
   const supported = Boolean(inferred && (inferred !== 'local' || model.startsWith('local:') || model.startsWith('local-llm:')));
   let selectedProvider: LLMProvider | undefined;
+  let primaryWhy: ReviewProviderCandidateSkip['why'] | undefined;
   if (supported) {
-    const provider = getProvider(model);
+    // Keep an explicitly routed provider when it agrees with the model family.
+    // `getProvider('gpt-6…')` intentionally preserves the legacy OpenAI API route,
+    // while Pod reviews pin the same model family to the Codex subscription.
+    const provider = primary.provider?.name === inferred ? primary.provider : getProvider(model);
     if (!primary.provider || primary.provider.name === provider.name) selectedProvider = primary.provider ?? provider;
+    else primaryWhy = 'provider-mismatch';
+  } else {
+    primaryWhy = 'model-unknown';
+  }
+  const skipped: ReviewProviderCandidateSkip[] = [];
+  const allowedProviders = options.allowedProviderNames ? new Set(options.allowedProviderNames) : undefined;
+  if (selectedProvider && allowedProviders && !allowedProviders.has(selectedProvider.name)) {
+    skipped.push({ label: primary.label, model, provider: selectedProvider.name, why: 'provider-not-allowed' });
+    primaryWhy = 'provider-not-allowed';
+    selectedProvider = undefined;
+  }
+  const isAvailable = options.isAvailable ?? ((provider: LLMProvider) => provider.available());
+  const isPodCredentialUnavailable = (attempt: ReviewProviderAttempt, provider: LLMProvider): boolean => {
+    if (!options.skipUnavailableProviders) return false;
+    try {
+      if (isAvailable(provider)) return false;
+      skipped.push({ label: attempt.label, model: attempt.model, provider: provider.name, why: 'no-credential' });
+      if (attempt === primary) primaryWhy = 'no-credential';
+      return true;
+    } catch {
+      skipped.push({ label: attempt.label, model: attempt.model, provider: provider.name, why: 'availability-check-failed' });
+      if (attempt === primary) primaryWhy = 'availability-check-failed';
+      return true;
+    }
+  };
+  if (selectedProvider && isPodCredentialUnavailable(primary, selectedProvider)) selectedProvider = undefined;
+  if (!selectedProvider && options.skipUnavailableProviders && !skipped.some((candidate) => candidate.label === primary.label)) {
+    skipped.push({ label: primary.label, model: primary.model, ...(primary.provider ? { provider: primary.provider.name } : {}), why: primaryWhy ?? 'provider-unresolved' });
   }
   if (!selectedProvider) {
     // A malformed/ambiguous configured primary is diagnostic, not fatal: the configured/default
@@ -302,6 +355,7 @@ export function buildReviewProviderAttempts(
       debug.log('review.fallback', 'primary-unresolved', {
         model: primary.model,
         configuredProvider: primary.provider?.name ?? null,
+        why: primaryWhy ?? 'provider-unresolved',
       }, { level: 'warn' });
     } catch { /* fail-soft */ }
   }
@@ -310,8 +364,9 @@ export function buildReviewProviderAttempts(
     model,
     ...(selectedProvider ? { provider: selectedProvider } : { provider: undefined }),
   };
-  const out: ReviewProviderAttempt[] = [normalizedPrimary];
-  const seen = new Set(selectedProvider ? [model] : []);
+  const out: ReviewProviderAttempt[] = selectedProvider || !options.skipUnavailableProviders ? [normalizedPrimary] : [];
+  const primaryWasUnavailable = primaryWhy === 'no-credential' || primaryWhy === 'availability-check-failed';
+  const seen = new Set(selectedProvider || primaryWasUnavailable || primaryWhy === 'provider-not-allowed' ? [model] : []);
   for (const f of fallbacks) {
     if (!f.model.trim()) continue;
     const fallbackModel = resolveReviewModelAlias(f.model);
@@ -320,17 +375,30 @@ export function buildReviewProviderAttempts(
     if (!fallbackInference || (fallbackInference === 'local' && !fallbackModel.startsWith('local:') && !fallbackModel.startsWith('local-llm:'))) {
       throw new Error(`review fallback: ambiguous or unsupported fallback model "${f.model}"`);
     }
-    const fallbackProvider = getProvider(fallbackModel);
+    const fallbackProvider = f.provider?.name === fallbackInference ? f.provider : getProvider(fallbackModel);
     if (f.provider && f.provider.name !== fallbackProvider.name) {
       throw new Error(`review fallback: unsupported provider "${f.provider.name}" for model "${fallbackModel}"`);
     }
     if (normalizedPrimary.provider && (f.provider ?? fallbackProvider).name === normalizedPrimary.provider.name) continue;
     seen.add(fallbackModel);
     const selectedFallbackProvider = f.provider ?? fallbackProvider;
-    out.push(f.model === fallbackModel && f.provider === selectedFallbackProvider
-      ? f : { ...f, model: fallbackModel, provider: selectedFallbackProvider });
+    if (allowedProviders && !allowedProviders.has(selectedFallbackProvider.name)) {
+      skipped.push({ label: f.label, model: fallbackModel, provider: selectedFallbackProvider.name, why: 'provider-not-allowed' });
+      seen.add(fallbackModel);
+      continue;
+    }
+    const normalizedFallback = f.model === fallbackModel && f.provider === selectedFallbackProvider
+      ? f : { ...f, model: fallbackModel, provider: selectedFallbackProvider };
+    if (!isPodCredentialUnavailable(normalizedFallback, selectedFallbackProvider)) out.push(normalizedFallback);
   }
-  return out;
+  return { attempts: out, skipped };
+}
+
+export function noUsableReviewProviderError(skipped: readonly ReviewProviderCandidateSkip[]): Error {
+  const reasons = skipped.length
+    ? skipped.map((candidate) => `${candidate.provider ?? 'unknown'}(${candidate.model})=${candidate.why}`).join(', ')
+    : 'no candidates configured';
+  return new Error(`no-usable-provider: ${reasons}`);
 }
 
 /** A distinct provider is available even when the optional config list is empty. */
@@ -367,10 +435,19 @@ export async function runReviewWithFallback(
   attempts: readonly ReviewProviderAttempt[],
   call: (attempt: ReviewProviderAttempt, observeResolvedProvider: (provider?: string) => void) => Promise<string>,
   observe: (event: 'attempt' | 'resolved' | 'completed' | 'fallback' | 'exhausted', data: ReviewFallbackObservation) => void = () => {},
+  options: {
+    skipUnavailable?: (attempt: ReviewProviderAttempt) => ReviewProviderCandidateSkip | undefined;
+    /** Candidates excluded during planning still belong in an all-unavailable diagnostic. */
+    preSkipped?: readonly ReviewProviderCandidateSkip[];
+    /** Maximum real provider calls; an availability skip does not spend this budget. */
+    maxCalls?: number;
+  } = {},
 ): Promise<{ text: string; used: ReviewProviderAttempt; attemptIndex: number }> {
   if (attempts.length === 0) throw new Error('review fallback: no attempts configured');
   let lastError: unknown;
   let lastReason: ReviewFailureReason | undefined;
+  const unavailableAtCall: ReviewProviderCandidateSkip[] = [];
+  let providerCalls = 0;
   for (let i = 0; i < attempts.length; i++) {
     const attempt = attempts[i]!;
     const base: ReviewFallbackObservation = {
@@ -379,6 +456,23 @@ export async function runReviewWithFallback(
       ...(lastReason ? { afterReason: lastReason } : {}),
     };
     try { observe('attempt', base); } catch { /* fail-soft */ }
+    let unavailable: ReviewProviderCandidateSkip | undefined;
+    try { unavailable = options.skipUnavailable?.(attempt); }
+    catch {
+      unavailable = { label: attempt.label, model: attempt.model,
+        ...(attempt.provider ? { provider: attempt.provider.name } : {}), why: 'availability-check-failed' };
+    }
+    if (unavailable) {
+      unavailableAtCall.push(unavailable);
+      lastReason = 'credentials-unavailable';
+      const errorMessage = `review provider credentials unavailable: ${unavailable.provider ?? unavailable.label}=${unavailable.why}`;
+      // An availability skip is not a provider call failure. Keep the last real call error so a
+      // later unavailable candidate cannot hide the diagnostic from the provider that was tried.
+      const isLast = i === attempts.length - 1;
+      try { observe(isLast ? 'exhausted' : 'fallback', { ...base, afterReason: lastReason, errorMessage }); } catch { /* fail-soft */ }
+      continue;
+    }
+    if (options.maxCalls !== undefined && providerCalls >= options.maxCalls) break;
     if (!attempt.provider) {
       const reason: ReviewFailureReason = 'unknown-model-provider';
       lastReason = reason;
@@ -387,6 +481,7 @@ export async function runReviewWithFallback(
       try { observe(isLast ? 'exhausted' : 'fallback', { ...base, afterReason: reason, errorMessage }); } catch { /* fail-soft */ }
       continue;
     }
+    providerCalls++;
     let resolvedProvider: string | undefined;
     try {
       const text = await call(attempt, (provider) => { resolvedProvider = provider; });
@@ -412,6 +507,9 @@ export async function runReviewWithFallback(
       const isLast = i === attempts.length - 1;
       try { observe(isLast ? 'exhausted' : 'fallback', { ...base, ...resolved, afterReason: reason, errorMessage }); } catch { /* fail-soft */ }
     }
+  }
+  if (unavailableAtCall.length === attempts.length) {
+    throw noUsableReviewProviderError([...(options.preSkipped ?? []), ...unavailableAtCall]);
   }
   if (lastError) throw lastError;
   throw new Error('review fallback: no attempts with an inferred provider');

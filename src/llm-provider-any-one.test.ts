@@ -158,13 +158,21 @@ test('source wiring: both self-orchestrate launch checks pass the configured pro
 });
 
 test('OpenRouter-only TUI, research, and mock Pod child keep the configured provider', async () => {
-  const envKeys = [
+  const envKeys = ['HOME', 'ELANOUS_CONFIG_DIR', 'ELANOUS_STATE_DIR', 'ELANOUS_STATE_DIR_SOURCE', 'ELANOUS_SESSION_ROOT', 'XDG_CONFIG_HOME',
     'ELANOUS_LLM_PROVIDER', 'ELANOUS_LLM_MODEL', 'OPENAI_API_KEY', 'XAI_API_KEY', 'GROK_API_KEY',
-    'ZAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY',
-  ] as const;
+    'ZAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY'] as const;
   const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  const savedConfigDir = getElanousConfigDirOverride();
+  const isolatedHome = mkdtempSync(join(tmpdir(), 'llm-provider-any-one-openrouter-'));
   try {
-    for (const key of envKeys) delete process.env[key];
+    process.env.HOME = isolatedHome;
+    process.env.ELANOUS_CONFIG_DIR = isolatedHome;
+    process.env.ELANOUS_STATE_DIR = isolatedHome;
+    process.env.ELANOUS_STATE_DIR_SOURCE = 'test';
+    process.env.ELANOUS_SESSION_ROOT = isolatedHome;
+    process.env.XDG_CONFIG_HOME = join(isolatedHome, 'xdg');
+    setElanousConfigDir(isolatedHome);
+    for (const key of envKeys.slice(6)) delete process.env[key];
     const model = 'openrouter/z-ai/glm-5.3';
     setUserConfigOverlay((base) => ({
       ...base,
@@ -267,11 +275,14 @@ test('OpenRouter-only TUI, research, and mock Pod child keep the configured prov
       ? preparation : 'Mock OpenRouter answer');
   } finally {
     setUserConfigOverlay(null);
+    if (savedConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(savedConfigDir);
     for (const key of envKeys) {
       const value = saved[key];
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    rmSync(isolatedHome, { recursive: true, force: true });
   }
 }, 20_000);
 

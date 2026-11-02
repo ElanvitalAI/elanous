@@ -49,8 +49,19 @@ test('30-second pitch leads the card in SCQA, recommendation, alternative, cross
   const pitch = text.split('\n').slice(3, 12);
   expect(pitch).toEqual(['S: 상황', 'C: 문제', 'Q: 질문', 'A: 제안', '권고: 스스로 안 — 대표 지시와 맞다',
     '대안: 팩트 안 — 내일 반영', '교차 확인: TC ✓ 키 경로 영향 없음', '이견: UX: 화면 문구 미정', '기한: 10. 2. 17:00 KST']);
-  expect(renderCard(entry).buttons).toEqual([[{ label: 'A) 스스로 안', data: `dec:${entry.id}:a` }, { label: 'B) 팩트 안', data: `dec:${entry.id}:b` }],
+  expect(renderCard(entry).buttons).toEqual([[{ label: 'A) 스스로 안 (권고)', data: `dec:${entry.id}:a` }, { label: 'B) 팩트 안', data: `dec:${entry.id}:b` }],
     [{ label: '📝 메모 달기', data: `dec:${entry.id}:memo` }]]);
+});
+
+test('recommended button keeps its suffix within the 60-code-point limit for non-BMP labels', () => {
+  const ledger = ledgerAt();
+  const entry = ledger.raise(base({ options: [
+    { key: 'a', label: '🙂'.repeat(80), consequence: '진행' },
+    { key: 'b', label: '보류', consequence: '대기' },
+  ] }));
+  const label = renderCard(entry).buttons[0]![0]!.label;
+  expect(Array.from(label).length).toBeLessThanOrEqual(60);
+  expect(label.endsWith(' (권고)')).toBe(true);
 });
 
 describe('DEC-TG decision cards', () => {

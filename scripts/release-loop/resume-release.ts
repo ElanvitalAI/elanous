@@ -11,11 +11,12 @@ import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/res
 import { acquireLockAsync } from '../../src/storage/file-lock.js';
 import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
+import { readGateShards } from '../../src/release-loop/gate-shards.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, planPartialRegate, planSameCommitRecheck, planStalledShardRecheck, testFileOfId, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
-import { gateAssignableTestsAtCommit, gateEnvFingerprint } from './gate-baseline-receipt.js';
-import { readGateShardManifest, readGateShardResult } from './gate-shard-receipts.js';
+import { gateAssignableTestsAtCommit, gateEnvFingerprint, gateShardRecipeIdentityAtCommit, gateSourcePins } from './gate-baseline-receipt.js';
+import { inspectGateShardReceipts, readGateShardManifest, readGateShardResult } from './gate-shard-receipts.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
@@ -52,6 +53,8 @@ export interface ResumeReleaseDeps {
   closureTree?: (commit: string) => ClosureTree;
   /** Test seam for the pinned Pod gate selection; production reads the selected test universe at the cut commit. */
   gateTestsAtCommit?: (commit: string) => string[] | null;
+  gateGraphPinsAtCommit?: (commit: string) => { graphSha: string; recipeSha: string } | null;
+  gateShardRecipeAtCommit?: (commit: string) => { graphEntry: string; recipeCommand: string; recipeTimeoutMs: number } | null;
   /** Source observation before the first resumed node. */
   onSource?: (line: string) => void;
   /** Test seam; production resolves this from ELANOUS_RELEASE_TRAFFIC_FILE / release.loop.trafficFile. */
@@ -584,7 +587,35 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     .find((dir) => existsSync(dir));
   const savedInput = saved.input as { gateExecutor?: unknown; gatePodPool?: unknown };
   const podGate = (opts.gateExecutor ?? savedInput.gateExecutor ?? (savedInput.gatePodPool ? 'pod' : undefined)) === 'pod';
-  const priorShards = priorCutLogs ? collectExecutedPodShardImages(priorCutLogs, tip.from) : undefined;
+  const formalReceiptDir = priorCutLogs ? join(priorCutLogs, 'receipts') : undefined;
+  const hasFormalReceipts = !!formalReceiptDir && existsSync(formalReceiptDir)
+    && readdirSync(formalReceiptDir).some((name) => name.endsWith('.receipt.json'));
+  let priorShards: Array<{ imageDigest: string | null }> | undefined;
+  if (hasFormalReceipts) {
+    const cutoffRecord = saved.nodes.find((node) => node.nodeId === 'cutoff');
+    const cutoffOutput = cutoffRecord ? lastJsonObject(cutoffRecord.output) as Record<string, unknown> | undefined : undefined;
+    const expectedBase40 = (cutoffOutput?.baseline as { sha?: unknown } | undefined)?.sha;
+    const expectedTests = (deps.gateTestsAtCommit ?? ((commit) => gateAssignableTestsAtCommit(deps.repo ?? process.cwd(), commit)))(tip.from);
+    const expectedGraphPins = (deps.gateGraphPinsAtCommit ?? ((commit) => gateSourcePins(deps.repo ?? process.cwd(), commit)))(tip.from);
+    const currentShardRecipe = (deps.gateShardRecipeAtCommit ?? ((commit) => gateShardRecipeIdentityAtCommit(deps.repo ?? process.cwd(), commit)))(tip.to);
+    const shardsFile = priorCutLogs ? readGateShards(join(priorCutLogs, 'shards.json')) : null;
+    const expectedIds = shardsFile?.shards.map((shard) => shard.id).filter((id) => /^pod-\d+$/.test(id)) ?? [];
+    const expectedShards = priorCutLogs && expectedIds.length ? expectedIds.map((id) => {
+      try {
+        const row = JSON.parse(readFileSync(join(priorCutLogs!, `${id}.json`), 'utf8')) as { commit?: string; files?: unknown };
+        if (row.commit !== tip.from || !Array.isArray(row.files) || !row.files.every((file) => typeof file === 'string')) return null;
+        return { id, files: row.files as string[] };
+      } catch { return null; }
+    }) : [];
+    if (typeof expectedBase40 !== 'string' || !/^[a-f0-9]{40}$/i.test(expectedBase40) || !expectedTests || !expectedGraphPins || !currentShardRecipe
+      || expectedShards.length !== expectedIds.length || expectedShards.some((shard) => !shard))
+      return fallback('formal gate receipt inventory or cutoff baseline is unavailable');
+    const inspected = inspectGateShardReceipts(formalReceiptDir!, { version: tip.version, commit: tip.from, base40: expectedBase40, graphPins: expectedGraphPins, ...currentShardRecipe,
+      envFingerprint: gateEnvFingerprint(process.env), shards: expectedShards as Array<{ id: string; files: string[] }>, tests: expectedTests });
+    if (inspected.kind !== 'valid')
+      return fallback(`formal gate receipt validation failed: ${inspected.kind === 'invalid' ? inspected.reason : 'receipt set absent'}`);
+    priorShards = inspected.images.map((image) => ({ imageDigest: image.imageDigest ?? null }));
+  } else if (priorCutLogs) priorShards = collectExecutedPodShardImages(priorCutLogs, tip.from).map((image) => ({ imageDigest: image.imageDigest ?? null }));
   const stalledFiles = movedStalledEvidence?.stalledShards.flatMap((shard) => shard.files) ?? [];
   const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: [...changed, ...stalledFiles],
     priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[],
@@ -692,6 +723,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
+  if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   assertReleaseResumeApprovalBoundary({ ...savedRun, statePath }, opts.from);
   let waiverCommit: string | undefined;
   if (opts.gateHost !== undefined && opts.gateExecutor === undefined) throw new Error('--gate-host requires --gate-executor host');
@@ -715,9 +747,9 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   if (waiver) debug.log('release-loop.resume', 'waiver', { runId: opts.runId, node: waiver.nodeId, reason: waiver.reason, unmeasured: waiver.unmeasured ?? null });
   const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
     ? releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from) : undefined;
-  if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // Validate request arguments before the tip refresh; the count is observational.
   reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
+  if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // A waived verdict may reuse its original commit. A moved tip still requires a full re-gate.
   if (waiver) {
     const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
@@ -888,7 +920,6 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
   if (!Array.isArray(opts.pick) || !opts.pick.length) throw new Error('release recover requires at least one --pick commit');
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = readRecoverJson(statePath, 'release run 상태') as GraphRunState;
-  if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // The saved version-release record names what to repair: the release branch and the commit the run cut.
   const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
   const recorded = lastJsonObject(versionRecord?.output);

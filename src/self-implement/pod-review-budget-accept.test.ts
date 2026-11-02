@@ -30,7 +30,7 @@ test('residue compares prior ids or nonempty keys, with no previous round remain
 });
 
 const git = (cwd: string, ...args: string[]) => {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_NAME: "Test", GIT_COMMITTER_EMAIL: "test@example.com" } });
   if (result.status !== 0) throw new Error(result.stderr);
   return result.stdout.trim();
 };
@@ -50,17 +50,16 @@ async function runPod(reviews: string[][], gatePassed = true) {
   process.env.ELANOUS_SUBSTRATE = 'pod';
   try {
     git(root, 'init', '-b', 'main');
-    git(root, 'config', 'user.email', 'test@example.com');
     git(root, 'config', 'user.name', 'Test');
+    git(root, 'config', 'user.email', 'test@example.com');
     writeFileSync(join(root, 'README.md'), 'base\n');
     git(root, 'add', 'README.md');
     git(root, 'commit', '-m', 'base');
-    git(root, 'checkout', '-b', 'test/pod-budget');
     let index = 0;
     const result = await runSelfImplement({
       feature: 'Fix the target', maxReworkRounds: reviews.length - 1, memory: false, autoMerge: true,
       seams: seams({
-        createWorktree: async () => ({ path: root, branch: 'test/pod-budget', resolvedBase: git(root, 'rev-parse', 'main') }),
+        createWorktree: async () => ({ path: root, branch: "main", resolvedBase: git(root, "rev-parse", "HEAD") }),
         implement: async () => {
           writeFileSync(join(root, 'change.ts'), 'export const fixed = true;\n');
           return { ok: true, summary: 'implemented' };

@@ -608,7 +608,9 @@ test('a completed historical copy cannot hide an incomplete predecessor with the
   addItem('0.2.14', { ...cell('predecessor'), owner: 'MK' }, { allowDuplicateId: true });
   addItem('0.2.15', { ...pullCell('dependent'), predecessors: ['predecessor'] });
   const plan = planPullForward({ ...pullDeps(), merged24h: 100 });
-  expect(plan).toEqual({ decisions: [], blocked: [] });
+  expect(plan).toEqual({ decisions: [], blocked: [], excluded: [
+    { id: 'dependent', from: '0.2.15', to: '0.2.14', reason: '선행 칸 predecessor 미완료 — 당겨오기 제외' },
+  ] });
 }, 60_000);
 
 test('missing traffic order uses P0 before P1 while preserving ledger order within a priority', () => {
@@ -680,10 +682,14 @@ test('pull-forward CLI exposes a read-only production caller and requires readab
   const nextLand = new Date(Date.now() + 8 * 24 * 60 * 60 * 1000).toISOString();
   setSchedule('0.2.14', { cutAt: land, landBy: land }, 'OP');
   setSchedule('0.2.15', { cutAt: nextLand, landBy: nextLand }, 'OP');
+  addItem('0.2.14', { ...cell('unresolved'), owner: 'MK' });
   addItem('0.2.15', pullCell('ready', 'P0'));
   addItem('0.2.15', pullCell('signal-first', 'P1'));
+  addItem('0.2.15', pullCell('held', 'P1'));
+  addItem('0.2.15', { ...pullCell('no-path', 'P1'), title: '설명만 있는 칸' });
+  addItem('0.2.15', { ...pullCell('dependent', 'P1'), predecessors: ['unresolved'] });
   const traffic = join(dir, 'traffic.json');
-  writeFileSync(traffic, JSON.stringify({ global: 'green', order: ['signal-first', 'ready'], hold: [] }));
+  writeFileSync(traffic, JSON.stringify({ global: 'green', order: ['signal-first', 'ready'], hold: ['held'] }));
   const bin = join(dir, 'bin');
   mkdirSync(bin);
   const gh = join(bin, 'gh');
@@ -699,6 +705,12 @@ test('pull-forward CLI exposes a read-only production caller and requires readab
   registerReleaseCommands(cmd);
   const lines: string[] = [];
   const output = spyOn(console, 'log').mockImplementation((value: string) => { lines.push(String(value)); });
+  const jsonLines: string[] = [];
+  const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+    jsonLines.push(String(chunk).trim());
+    (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.();
+    return true;
+  }) as typeof process.stdout.write);
   try {
     await cmd.parseAsync(['release', 'pull-forward', '--dry-run', '--traffic', traffic, '--checkout', checkout], { from: 'user' });
     const selected = lines.filter((line) => line.startsWith('· 드라이런 '));
@@ -707,6 +719,15 @@ test('pull-forward CLI exposes a read-only production caller and requires readab
     expect(lines.some((line) => line.includes('missing'))).toBe(false);
     expect(checklistHistory('ready').filter((row) => row.field === 'move')).toHaveLength(0);
     expect(readFileSync(targetFile).equals(targetBefore)).toBe(true);
+    await cmd.parseAsync(['release', 'pull-forward', '--dry-run', '--json', '--traffic', traffic, '--checkout', checkout], { from: 'user' });
+    const json = JSON.parse(jsonLines.at(-1)!);
+    expect(json.decisions.map((row: { id: string }) => row.id)).toEqual(['signal-first', 'ready']);
+    expect(json.excluded).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'held', reason: expect.stringContaining('hold') }),
+      expect.objectContaining({ id: 'no-path', reason: expect.stringContaining('경로') }),
+      expect.objectContaining({ id: 'dependent', reason: expect.stringContaining('선행') }),
+    ]));
+    expect(checklistHistory('ready').filter((row) => row.field === 'move')).toHaveLength(0);
     const linkedCheckout = join(dir, 'linked-checkout');
     mkdirSync(join(linkedCheckout, 'src', 'release-loop'), { recursive: true });
     expect(spawnSync('git', ['init', linkedCheckout], { encoding: 'utf8' }).status).toBe(0);
@@ -721,6 +742,7 @@ test('pull-forward CLI exposes a read-only production caller and requires readab
     await expect(cmd.parseAsync(['release', 'pull-forward', '--dry-run', '--traffic', join(dir, 'missing.json'), '--checkout', checkout], { from: 'user' }))
       .rejects.toThrow('traffic.json');
   } finally {
+    jsonOutput.mockRestore();
     output.mockRestore();
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;

@@ -29,6 +29,11 @@ export interface SetupKeysOptions {
   verifier?: SetupKeyVerifier;
 }
 
+export interface FirstRunProviderSetupOptions extends SetupKeysOptions {
+  /** Required so the first-run OAuth boundary is explicit and observable in tests. */
+  loginWithCodex: typeof loginWithCodex;
+}
+
 function providerForService(id: string): string | undefined {
   switch (id) {
     case 'openai-api': return 'openai';
@@ -150,7 +155,7 @@ export const FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES = '1 Codex 구독 로그인 �
 export const FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES = 3;
 
 /** First-run entry: offer the existing Codex device login or the same verified-key flow as `setup keys`. */
-export async function runFirstRunProviderSetup(io: SetupKeysIO, options: SetupKeysOptions): Promise<FirstRunProviderSetupResult> {
+export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRunProviderSetupOptions): Promise<FirstRunProviderSetupResult> {
   const choices = ['codex-login', 'api-key'] as const;
   let misses = 0;
   let choice: typeof choices[number];
@@ -170,7 +175,7 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: SetupKe
 
   if (choice === 'codex-login') {
     try {
-      await (options.loginWithCodex ?? loginWithCodex)({ onProgress: (event) => {
+      await options.loginWithCodex({ onProgress: (event) => {
         if (event.type === 'user_code') io.print(`Codex 로그인: ${event.loginUrl} · 코드 ${event.userCode}`);
         else if (event.type === 'polling') io.print('Codex 로그인을 기다리는 중…');
         else if (event.type === 'exchanging') io.print('Codex 로그인을 확인하는 중…');

@@ -14,6 +14,7 @@ import {
   EVENT_MONKEY_KINDS,
   EventMonkeyRefusedError,
   emitInjectedEvent,
+  renderEventMonkeyKinds,
   resolveEventMonkeyKind,
   type EventMonkeyDebugRow,
 } from './event-monkey.js';
@@ -44,7 +45,7 @@ function dbRows(root: string): EventMonkeyDebugRow[] {
 describe('event monkey (SIM-EVENT-MONKEY · L0) — real ledger writer into an isolated universe', () => {
   test('catalog names the six first kinds and each carries consumers', () => {
     expect([...EVENT_MONKEY_KINDS]).toEqual([
-      'child-error-long', 'same-cell-reuse-push', 'scope-escape-held', 'no-result-line', 'pr-terminal-null', 'land-slot-wait',
+      'child-error-long', 'same-cell-reuse-push', 'scope-escape-held', 'no-result-line', 'pr-terminal-null', 'land-slot-wait', 'author-reviewer-precheck',
     ]);
     for (const kind of EVENT_MONKEY_KINDS) {
       const entry = EVENT_MONKEY_CATALOG[kind];
@@ -94,6 +95,21 @@ describe('event monkey (SIM-EVENT-MONKEY · L0) — real ledger writer into an i
 
     const onlyAllowed = emitInjectedEvent({ kind: 'same-cell-reuse-push', variant: 'allowed', stateRoot: tempRoot() });
     expect(onlyAllowed.debugRows.filter((row) => row.event === 'same-cell-push-decision').map((row) => row.data.outcome)).toEqual(['allowed']);
+  });
+
+  test('author-reviewer-precheck kind lists both L0 outcomes with run-scoped injection tags', () => {
+    const result = emitInjectedEvent({ kind: 'author-reviewer-precheck', stateRoot: tempRoot() });
+    expect(result.debugRows.map((row) => `${row.category} ${row.event}`)).toEqual([
+      'author.reviewer-precheck completed', 'author.reviewer-precheck revision-rejected',
+    ]);
+    expect(result.debugRows.map((row) => row.data)).toEqual([
+      expect.objectContaining({ runId: result.runId, authorRunId: result.runId, status: 'completed', simulationVariant: 'applied', injected: true, injectionId: result.injectionId, level: 'L0' }),
+      expect.objectContaining({ runId: result.runId, authorRunId: result.runId, status: 'rejected-soft', simulationVariant: 'rejected-unprovable', injected: true, injectionId: result.injectionId, level: 'L0' }),
+    ]);
+    expect(result.ledgerRows[0]?.event).toBe('author-reviewer-precheck-simulation');
+    const kinds = renderEventMonkeyKinds(true).join('\n');
+    expect(kinds).toContain('author-reviewer-precheck');
+    expect(kinds).toContain('author.reviewer-precheck revision-rejected');
   });
 
   test('scope-escape-held: outOfScopeEdits names reach both the held event and child evidence', () => {
@@ -149,7 +165,7 @@ describe('event monkey (SIM-EVENT-MONKEY · L0) — real ledger writer into an i
   });
 
   test('short aliases resolve to the canonical kinds', () => {
-    expect(['child-error', 'same-cell', 'scope-escape', 'no-result', 'pr-null', 'slot-wait'].map((name) => resolveEventMonkeyKind(name)))
+    expect(['child-error', 'same-cell', 'scope-escape', 'no-result', 'pr-null', 'slot-wait', 'author-reviewer-precheck'].map((name) => resolveEventMonkeyKind(name)))
       .toEqual([...EVENT_MONKEY_KINDS]);
     expect(resolveEventMonkeyKind('child-error-long')).toBe('child-error-long');
     expect(resolveEventMonkeyKind('nope')).toBeUndefined();

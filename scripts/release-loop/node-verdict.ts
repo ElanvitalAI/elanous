@@ -8,6 +8,7 @@ import { runWithReleasePwaTraffic } from './gate-traffic-mode.js';
 export type NodeOutcome = 'ok' | 'fail' | 'error';
 export type NodeVerdict = 'pass' | 'flaky' | 'fail';
 export interface GraphContext {
+  graphId?: string;
   nodeId?: string;
   runId?: string;
   startedAt?: string;
@@ -24,7 +25,8 @@ export function readGraphContext(env: NodeJS.ProcessEnv = process.env): GraphCon
   const input = context.input as Record<string, unknown> | undefined;
   if (!input || typeof input.version !== 'string' || !isReleaseVersion(input.version)
     || typeof input.previousVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.previousVersion)) throw new Error('version and previousVersion required');
-  return { ...(typeof context.nodeId === 'string' ? { nodeId: context.nodeId } : {}),
+  return { ...(typeof context.graphId === 'string' ? { graphId: context.graphId } : {}),
+    ...(typeof context.nodeId === 'string' ? { nodeId: context.nodeId } : {}),
     ...(typeof context.runId === 'string' ? { runId: context.runId } : {}),
     ...(typeof context.startedAt === 'string' ? { startedAt: context.startedAt } : {}),
     input: input as GraphContext['input'], outputs: context.outputs && typeof context.outputs === 'object' ? context.outputs as GraphContext['outputs'] : {} };

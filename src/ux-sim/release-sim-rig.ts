@@ -9,6 +9,7 @@ const REPOSITORY_ROOT = join(import.meta.dir, '../..');
 const RELEASE_GRAPH = join(REPOSITORY_ROOT, 'graphs/release/release-loop.yaml');
 const CUT_TIP = 'a'.repeat(40);
 
+
 export interface ReleaseSimRigCase {
   id: string;
   mode?: 'baseline' | 'cut-tip-moved-after-resume';

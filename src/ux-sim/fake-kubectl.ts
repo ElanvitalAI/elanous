@@ -3,14 +3,19 @@ import { readFileSync } from 'node:fs';
 import type { PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 
 /** In-memory Kubernetes boundary for real pool admission and warm-provider tests. Unknown operations fail closed. */
-export function createFakeKubectl(options: { context: string; node: string; jobState?: 'running' | 'complete';
-  failGetPods?: string; podReadinessOnCreate?: boolean }) {
+export function createFakeKubectl(options: { context: string; node: string; nodes?: readonly string[]; jobState?: 'running' | 'complete';
+  failGetPods?: string; podReadinessOnCreate?: boolean; arch?: 'arm64' | 'amd64'; cpu?: number; pools?: string[] }) {
   const jobs = new Map<string, Record<string, unknown>>();
   const pods = new Map<string, Record<string, any>>();
   const calls: string[][] = [];
   const leaseCalls: string[] = [];
   const jobCreates: string[] = [];
   const jobDeletes: string[] = [];
+  const nodeNames = options.nodes ?? [options.node];
+  if (nodeNames.length === 0 || nodeNames.some((name) => !name.trim()) || new Set(nodeNames).size !== nodeNames.length
+    || !nodeNames.includes(options.node)) {
+    throw new Error('fake-kubectl requires unique, non-empty node names including the primary node');
+  }
   let lease: { workerId: string; podUid: string; key: unknown; job?: string; state: 'idle' | 'leased' | 'released' | 'quarantined' } | null = null;
   let loseNextLeaseResponse = false;
   const ok = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
@@ -50,9 +55,18 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
     const at = args.indexOf('get');
     const verb = args.find(arg => ['get', 'create', 'wait', 'patch'].includes(arg));
     if (verb === 'create' && args[args.indexOf('create') + 1] === 'secret') return ok({ kind: 'Secret' });
-    if (verb === 'get' && args[at + 1] === 'nodes') return ok({ items: [{ metadata: { name: options.node },
-      status: { allocatable: { memory: '64Gi', cpu: '16' }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
-    if (verb === 'get' && args[at + 1] === 'node') return ok({ metadata: { name: options.node, labels: { 'kubernetes.io/arch': 'amd64' } } });
+    if (verb === 'get' && args[at + 1] === 'ns' && args[at + 2] === 'elanous-test') return ok({ metadata: { name: 'elanous-test' } });
+    if (verb === 'get' && args[at + 1] === 'nodes') return ok({ items: nodeNames.map((name) => ({ metadata: { name },
+      status: { allocatable: { memory: '64Gi', cpu: String(name === options.node ? options.cpu ?? 16 : 16) },
+        conditions: [{ type: 'Ready', status: 'True' }] } })) });
+    if (verb === 'get' && args[at + 1] === 'node') {
+      const name = args[at + 2] ?? '';
+      return nodeNames.includes(name) ? ok({ metadata: { name, labels: {
+        'kubernetes.io/arch': name === options.node ? options.arch ?? 'amd64' : 'amd64',
+        ...(name === options.node && options.pools?.length ? { 'elanous.dev/pools': options.pools.join(',') } : {}),
+      } }, status: { allocatable: { memory: '64Gi', cpu: String(name === options.node ? options.cpu ?? 16 : 16) },
+        conditions: [{ type: 'Ready', status: 'True' }] } }) : missing('node');
+    }
     if (verb === 'get' && args[at + 1] === 'jobs') return ok({ items: [...jobs.values()] });
     if (verb === 'get' && args[at + 1] === 'job') {
       const name = args[at + 2] ?? '';
@@ -78,7 +92,8 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
       const name = manifest.metadata?.name;
       if (typeof name !== 'string' || pods.has(name)) return missing('existing or invalid pod');
       const created = { ...manifest, metadata: { ...manifest.metadata, uid: `${name}-uid`, resourceVersion: '1' },
-        ...(options.podReadinessOnCreate ? { status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } } : {}) };
+        ...(options.podReadinessOnCreate ? { status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }],
+          containerStatuses: [{ name: 'worker', ready: true }] } } : {}) };
       pods.set(name, created);
       return ok(created);
     }

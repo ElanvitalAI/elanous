@@ -61,8 +61,14 @@ async function classifyAmbiguous(article: NewsArticle): Promise<boolean> {
 }
 
 /** The CLI, not a local imitation of the checker, is the implication authority. No --author or release mutation. */
-async function checkWithCli(facts: readonly string[]): Promise<NewsCheck> {
-  const result = spawnSync('bun', ['bin/elanous.mjs', '--test', 'intake', 'check', ...facts.flatMap((fact) => ['--fact', fact]), '--json'], {
+export function intakeCheckArgs(facts: readonly string[], options: { testMode?: boolean } = {}): string[] {
+  // Installed production collectors may have no git tree, so only an explicitly isolated
+  // caller asks the CLI to resolve --test.
+  return ['bin/elanous.mjs', ...(options.testMode ? ['--test'] : []), 'intake', 'check', ...facts.flatMap((fact) => ['--fact', fact]), '--json'];
+}
+
+export async function runIntakeCheckCli(facts: readonly string[], options: { testMode?: boolean } = {}): Promise<NewsCheck> {
+  const result = spawnSync('bun', intakeCheckArgs(facts, options), {
     cwd: resolve(import.meta.dir, '..'), encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
   });
   if (result.error || result.status !== 0) throw new Error(result.error?.message ?? result.stderr?.trim() ?? `intake check exited ${result.status}`);
@@ -127,7 +133,7 @@ export async function runIntakeNews(options: { root: string; sources: readonly N
             `elanous는 \`${name}\` 관련 ${article.title} 기능을 지원한다`,
             ...summary.slice(0, 2).map((line) => `elanous는 다음 일을 한다: ${line.slice(0, 160)}`),
           ];
-          const check = await (deps.check ?? checkWithCli)(facts);
+          const check = await (deps.check ?? runIntakeCheckCli)(facts);
           if (!check.items.length) throw new Error('intake check 항목 없음');
           // «판단 필요» is a review suggestion, not an asserted absence; keep the check verdict attached.
           const suggestions = check.items.filter((item) => item.verdict === '없음' || item.verdict === '판단 필요')

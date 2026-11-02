@@ -30,7 +30,7 @@ import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 export const EVENT_MONKEY_LEVEL = 'L0' as const;
 
 export const EVENT_MONKEY_KINDS = [
-  'child-error-long', 'same-cell-reuse-push', 'scope-escape-held', 'no-result-line', 'pr-terminal-null', 'land-slot-wait',
+  'child-error-long', 'same-cell-reuse-push', 'scope-escape-held', 'no-result-line', 'pr-terminal-null', 'land-slot-wait', 'author-reviewer-precheck',
 ] as const;
 export type EventMonkeyKind = (typeof EVENT_MONKEY_KINDS)[number];
 
@@ -80,6 +80,12 @@ export const EVENT_MONKEY_CATALOG: Readonly<Record<EventMonkeyKind, EventMonkeyC
     ledgerEvents: ['land-slot-wait'],
     debugEvents: ['pr.land host-busy'],
     consumers: ['run doctor (host-overload)', 'elanous logs --category pr.land', 'OP 착지 줄(land-queue) 관측'],
+  },
+  'author-reviewer-precheck': {
+    summary: '목 모델이 reviewer-precheck applied 및 rejected-unprovable 관측 사건을 격리 logs.db 에 주입',
+    ledgerEvents: ['author-reviewer-precheck-simulation'],
+    debugEvents: ['author.reviewer-precheck completed', 'author.reviewer-precheck revision-rejected'],
+    consumers: ['AUTHOR-REVIEWER-PRECHECK-WIRE-FU validator and mock-scenario device'],
   },
 };
 
@@ -295,6 +301,18 @@ export function emitInjectedEvent(options: EmitInjectedEventOptions): EmitInject
       emit('pr.land', 'host-busy', data);
       break;
     }
+    case 'author-reviewer-precheck': {
+      ledger.write('author-reviewer-precheck-simulation', { outcomes: ['applied', 'rejected-unprovable'] });
+      emit('author.reviewer-precheck', 'completed', {
+        authorRunId: runId, status: 'completed', proposedFixCount: 1, appliedFixCount: 1, unappliedItemCount: 0,
+        simulationVariant: 'applied',
+      });
+      emit('author.reviewer-precheck', 'revision-rejected', {
+        authorRunId: runId, status: 'rejected-soft', proposedFixCount: 1, appliedFixCount: 0, unappliedItemCount: 1,
+        simulationVariant: 'rejected-unprovable',
+      });
+      break;
+    }
   }
 
   // 관측 줄 — 격리 우주 logs.db 하나로만(전역 싱크 0). 경로는 위 assertIsolatedEventRoot 가 이미 물리 대조했다.
@@ -374,6 +392,6 @@ export function renderEventMonkeyKinds(json = false): string[] {
   const alias = (kind: EventMonkeyKind): string => Object.entries(EVENT_MONKEY_ALIASES).find(([, k]) => k === kind)?.[0] ?? '-';
   return EVENT_MONKEY_KINDS.map((kind) => {
     const entry = EVENT_MONKEY_CATALOG[kind];
-    return `${kind} (${alias(kind)})\t${entry.summary}\n  원장: ${entry.ledgerEvents.join(' · ')}\n  소비자: ${entry.consumers.join(' · ')}`;
+    return `${kind} (${alias(kind)})\t${entry.summary}\n  원장: ${entry.ledgerEvents.join(' · ')}\n  관측: ${entry.debugEvents.join(' · ')}\n  소비자: ${entry.consumers.join(' · ')}`;
   });
 }

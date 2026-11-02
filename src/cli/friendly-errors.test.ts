@@ -25,6 +25,9 @@ describe('classifyFriendlyError', () => {
   test('maps the src/llm.ts credential wordings to credential-missing', () => {
     expect(classifyFriendlyError(new Error('Grok unavailable: run `grok login` (구독) 또는 XAI_API_KEY/GROK_API_KEY 설정'))).toBe('credential-missing');
     expect(classifyFriendlyError(new Error('openai-codex unavailable: run `elanous login openai-codex` or set `llm.apiKey`'))).toBe('credential-missing');
+    expect(classifyFriendlyError(new Error('CODEX_OWNER_MIRROR_REQUIRED'))).toBe('credential-missing');
+    expect(classifyFriendlyError(Object.assign(new Error('Codex owner mirror is unavailable'), { code: 'CODEX_OWNER_MIRROR_REQUIRED' }))).toBe('credential-missing');
+    expect(formatFriendlyError('credential-missing', 'en')).toContain('elanous login');
   });
 
   test('maps unknown provider and provider-model mismatch separately', () => {

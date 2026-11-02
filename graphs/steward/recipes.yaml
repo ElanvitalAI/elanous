@@ -21,3 +21,6 @@ steward-report:
 steward-release-day:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/release-day.ts"'
   timeout_ms: 30000
+steward-entrance-dispatch-shadow:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/entrance-dispatch-shadow.ts"'
+  timeout_ms: 120000

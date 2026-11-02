@@ -1,0 +1,26 @@
+version: 0
+id: graph-runtime-overlay-event-stream
+isolation: test
+seed: 110109
+triggers:
+  - id: runtime-overlay-dispatch
+    type: ux.graph-runtime-overlay.evaluate
+expect:
+  screen:
+    mode: widget
+    snapshot:
+      contains:
+        - "Graph runtime overlay event stream simulation"
+        - "status=done"
+        - "decisionObserved=true"
+        - "overlayApplied=true"
+  logs:
+    - category: self-implement
+      event: graph-overlay-decision
+      level: debug
+      count: 1
+      data:
+        runId: "$runId"
+        stage: runtime
+        applied:
+          - ux-sim-event-stream-runtime-overlay

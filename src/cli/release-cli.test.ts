@@ -23,6 +23,53 @@ import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
+import { runGateNode } from '../../scripts/release-loop/gate-node.js';
+
+const frozenGateRunner = {
+  command: async () => ({ rc: 0, output: '' }),
+  localCommand: async () => ({ rc: 0, output: '' }),
+  sweep: async () => ({ rc: 0, output: '' }),
+  add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {},
+} as never;
+
+function assertReleaseGateNodeRecipe(command: string, entrypoint: string): void {
+  const expected = `bun ${entrypoint} --json`;
+  if (command.trim() !== expected) throw new Error(`unexpected release gate recipe: ${command}`);
+}
+
+test('the release graph freeze probe records a changed gate recipe as a command failure', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'release-cli-bad-gate-recipe-'));
+  const root = join(dir, 'state');
+  const entrypoint = join(import.meta.dir, '../../scripts/release-loop/gate-node.ts');
+  const graph = join(dir, 'release-loop.yaml');
+  writeFileSync(graph, [
+    'graph_id: release-loop-bad-recipe', 'version: 1', 'entry_node: gate', 'terminal_nodes: [failed]', 'nodes:',
+    "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1 }", '  - { node_id: failed, kind: gate, max_visits: 1 }',
+    'edges:', '  - { from: gate, on: outcome, map: { ok: failed, fail: failed, error: failed } }', '',
+  ].join('\n'));
+  writeFileSync(join(dir, 'recipes.yaml'), `gate:\n  command: 'echo "bun ${entrypoint} --json"'\n`);
+  try {
+    const state = await runGraph(graph, { runId: 'bad-gate-recipe', deps: { root, runBash: async (command) => {
+      try {
+        assertReleaseGateNodeRecipe(command, entrypoint);
+        throw new Error('the altered recipe unexpectedly reached the gate invocation');
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('unexpected release gate recipe:'))
+          return { stdout: '', stderr: error.message, exitCode: 127 };
+        throw error;
+      }
+    } } });
+    const gate = state.nodes.find((node) => node.nodeId === 'gate')!;
+    expect(gate.ok).toBe(false);
+    expect(gate.exit).toBe(127);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('release freeze probe rejects a changed gate recipe instead of substituting the gate node', () => {
+  const entrypoint = join(import.meta.dir, '../../scripts/release-loop/gate-node.ts');
+  expect(() => assertReleaseGateNodeRecipe(`echo "bun ${entrypoint} --json"`, entrypoint)).toThrow('unexpected release gate recipe');
+  expect(() => assertReleaseGateNodeRecipe(`bun ${entrypoint} --json`, entrypoint)).not.toThrow();
+});
 
 const originalCwd = process.cwd();
 afterEach(() => { if (process.cwd() !== originalCwd) process.chdir(originalCwd); });
@@ -1381,7 +1428,21 @@ describe('release run CLI', () => {
         checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
         graph: async (_path, options) => {
           enableLandingFreeze({ reason: 'mid-run', by: 'OP' }, root); // after every entry check, before the gate node
-          state = await runGraph(join(graphDir, 'release-loop.yaml'), { ...options, input: { ...options.input, commit: 'a'.repeat(40) }, deps: { root } });
+          state = await runGraph(join(graphDir, 'release-loop.yaml'), { ...options, input: { ...options.input, commit: 'a'.repeat(40) }, deps: {
+            root,
+            runBash: async (command, runOptions) => {
+              const gateEntrypoint = join(import.meta.dir, '../../scripts/release-loop/gate-node.ts');
+              assertReleaseGateNodeRecipe(command, gateEntrypoint);
+              const gateLines: string[] = [];
+              const log = spyOn(console, 'log').mockImplementation((value: unknown) => { gateLines.push(String(value)); });
+              try {
+                const env: NodeJS.ProcessEnv = { ...runOptions.env, ELANOUS_STATE_DIR: root };
+                const exitCode = await runGateNode([], env, frozenGateRunner, undefined, undefined,
+                  () => ({ status: 'measured', empty: true, reservations: 0, authoringLeases: 0, waitingJobs: 0, activeJobs: 0 }));
+                return { stdout: gateLines.join('\n') + '\n', stderr: '', exitCode };
+              } finally { log.mockRestore(); }
+            },
+          } });
           return state;
         } });
       process.exitCode = 0;
@@ -1410,20 +1471,32 @@ describe('release run CLI', () => {
     const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
     try {
       const { disableLandingFreeze } = await import('../release-loop/landing-freeze.js');
-      // The real gate node, run as the graph runs it, meets a freeze switched on mid-run and records its refusal.
-      const realGateOutput = () => {
+      // Run the real gate node with its existing runner/probe seams: preserve freeze judgment while
+      // keeping this test independent of whichever live Pod pool is configured on the host.
+      const realGateOutput = async () => {
         enableLandingFreeze({ reason: 'mid-run', by: 'OP' }, root);
-        const node = Bun.spawnSync([process.execPath, join(import.meta.dir, '../../scripts/release-loop/gate-node.ts')], {
-          env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_GRAPH_CONTEXT: JSON.stringify({ input: { commit: 'a'.repeat(40), version: '0.2.4', previousVersion: '0.2.3' }, outputs: {} }) },
-        });
-        return node.stdout.toString();
+        const gateLines: string[] = [];
+        const log = spyOn(console, 'log').mockImplementation((value: unknown) => { gateLines.push(String(value)); });
+        const previousState = process.env.ELANOUS_STATE_DIR;
+        process.env.ELANOUS_STATE_DIR = root;
+        const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_STATE_DIR: root };
+        try {
+          env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ graphId: 'release-loop-freeze-probe', runId: 'freeze-probe',
+            input: { commit: 'a'.repeat(40), version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod' }, outputs: {} });
+          await runGateNode([], env, frozenGateRunner, undefined, undefined,
+            () => ({ status: 'measured', empty: true, reservations: 0, authoringLeases: 0, waitingJobs: 0, activeJobs: 0 }));
+          return gateLines.join('\n');
+        } finally {
+          log.mockRestore();
+          if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousState;
+        }
       };
       let failure: 'freeze' | 'other' = 'freeze';
       const cli = new Command();
       registerReleaseCommands(cli, { freezeRoot: root, ledgerRoot: ledger, config: { gatePodPool: 'pool' },
         checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
         graph: async () => {
-          const output = failure === 'freeze' ? realGateOutput() : (enableLandingFreeze({ reason: 'unrelated', by: 'OP' }, root), JSON.stringify({ outcome: 'regression', introduced: ['a > b'] }));
+          const output = failure === 'freeze' ? await realGateOutput() : (enableLandingFreeze({ reason: 'unrelated', by: 'OP' }, root), JSON.stringify({ outcome: 'regression', introduced: ['a > b'] }));
           return { status: 'failed', nodes: [{ nodeId: 'gate', ok: false, exit: 1, executed: true, output }] } as never;
         } });
       process.exitCode = 0;

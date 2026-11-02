@@ -1,7 +1,9 @@
-export type LightCliRoute = 'msg' | 'release' | 'tasks' | 'tasks-read' | 'pty' | 'logs' | 'config';
+import { decisionListSince } from './decision-list-since.js';
+
+export type LightCliRoute = 'msg' | 'decisions' | 'release' | 'tasks' | 'tasks-read' | 'pty' | 'logs' | 'config';
 
 const VALUE_FLAGS = new Set(['--config-dir', '--test-state-dir']);
-const HOT_ROOTS = new Set(['msg', 'pty', 'logs', 'tasks']);
+const HOT_ROOTS = new Set(['msg', 'decisions', 'pty', 'logs', 'tasks']);
 const ROOT_GLOBAL_FLAGS = new Set(['--test', '--config-dir', '--test-state-dir', '--state-dir', '--remote', '-r', '--name', '--help-all', '--version', '-V']);
 const LOG_SUBCOMMANDS = new Set([
   'instances', 'level', 'timeline', 'durations', 'model-input', 'degenerate', 'fields', 'unclosed', 'abandoned-draft-prs',
@@ -35,6 +37,21 @@ function isSupportedLogsShape(args: readonly string[]): boolean {
   return true;
 }
 
+function hasValidDecisionsSince(args: readonly string[]): boolean {
+  for (let index = 2; index < args.length; index += 1) {
+    const token = args[index]!;
+    if (token === '--since') {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith('-')) return false;
+      try { decisionListSince(value); return true; } catch { return false; }
+    }
+    if (token.startsWith('--since=')) {
+      try { decisionListSince(token.slice('--since='.length)); return true; } catch { return false; }
+    }
+  }
+  return true;
+}
+
 /** Select lightweight operational paths whose CLI modules can stand alone. */
 export function selectLightCliRoute(args: readonly string[]): LightCliRoute | undefined {
   const command: string[] = [];
@@ -57,12 +74,13 @@ export function selectLightCliRoute(args: readonly string[]): LightCliRoute | un
     command.push(token);
   }
 
-  // These four operational roots are the hot router. Keep all root flags and
+  // These operational roots are the hot router. Keep all root flags and
   // every leading-option form on the full entry so its isolation/bootstrap
   // parser remains the sole owner of those semantics.
   if (HOT_ROOTS.has(command[0] ?? '') && (args[0] !== command[0] || args.some(isRootGlobalFlag))) return undefined;
 
   if (command[0] === 'msg' && ['list', 'post', 'ack', 'watch'].includes(command[1] ?? '')) return 'msg';
+  if (command[0] === 'decisions' && command[1] === 'list') return hasValidDecisionsSince(args) ? 'decisions' : undefined;
   // --reveal has an audit-log contract owned by the full CLI.
   if (command[0] === 'config' && command[1] === 'get' && !args.some(arg => arg === '--reveal' || arg.startsWith('--reveal='))) return 'config';
   if (command[0] === 'release' && command[1] === 'checklist'

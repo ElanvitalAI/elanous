@@ -4,13 +4,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { openSurfaceEventsDb, recordEvent, surfaceEventsDbPath } from '../domains/surface-events.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
-import { spawnSync } from 'node:child_process';
+import { Command } from 'commander';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { CoordEvent } from './coord-events.js';
 import { runGraph, lastJsonObject } from '../graph-runner/runner.js';
 import { listLoops, setLoopEnabled } from '../loops/registry.js';
+import { registerLoopCommands } from '../loops/loop-cli.js';
 import { runNightlyStage, summarize, summaryInstruction } from './nightly-condense.js';
 import { condenseContextWindowWithReport, type MemoryItem } from './long-term-memory.js';
 
@@ -458,12 +459,21 @@ test('loop list declares 03:30 while leaving cron disabled until a person starts
     changes: [{ action: 'create', cron: '30 3 * * *' }] });
 });
 
-test('CLI loop list in the isolated instance shows nightly condensation disabled', () => {
+test('CLI loop list in the isolated instance shows nightly condensation disabled', async () => {
   const { state } = fixture();
-  const output = spawnSync(process.execPath, ['bin/elanous.mjs', '--test', 'loop', 'list', '--json'],
-    { cwd: root, encoding: 'utf8', env: { ...process.env, ELANOUS_INSTALL_PREFIX: state } });
-  expect(output.status).toBe(0);
-  const loops = JSON.parse(output.stdout) as Array<{ id: string; file: string; enabled: boolean; trigger: { cron: string }; jobs: unknown[] }>;
+  const program = new Command();
+  registerLoopCommands(program, { registryOptions: { root, stateRoot: state, schedules: [] } });
+  let stdout = '';
+  const originalWrite = process.stdout.write;
+  const previousExitCode = process.exitCode;
+  process.stdout.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+    stdout += String(chunk);
+    if (typeof callback === 'function') callback();
+    return true;
+  }) as typeof process.stdout.write;
+  try { await program.parseAsync(['loop', 'list', '--json'], { from: 'user' }); }
+  finally { process.stdout.write = originalWrite; process.exitCode = previousExitCode ?? 0; }
+  const loops = JSON.parse(stdout) as Array<{ id: string; file: string; enabled: boolean; trigger: { cron: string }; jobs: unknown[] }>;
   expect(loops.find(loop => loop.id === 'nightly-condense')).toMatchObject({
     file: 'graphs/context/nightly-condense.yaml', enabled: false, trigger: { cron: '30 3 * * *' }, jobs: [],
   });

@@ -278,7 +278,7 @@ test('resources query retains local credential creation when no join exists', as
   }) as typeof fetch);
   const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
-    expect(await runResourcesQuery({ json: true })).toBe(0);
+    expect(await runResourcesQuery({ port: '31413', json: true })).toBe(0);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(statSync(join(dir, 'control', 'tokens.json')).mode & 0o077).toBe(0);
   } finally {

@@ -47,6 +47,9 @@ export const DESIGN_PREVIEW_PATH_PREFIX = '/v1/design-previews/';
 /** `GET /v1/devices` — 디바이스 함대 스냅샷. */
 export const DEVICES_PATH = '/v1/devices';
 
+/** `GET /v1/ux-sim/devices` — read-only mock/test device catalog. */
+export const UX_SIM_DEVICES_PATH = '/v1/ux-sim/devices';
+
 /** Owner-only idea PR review and merge. */
 export const APPROVALS_MERGES_PATH = '/v1/approvals/merges';
 

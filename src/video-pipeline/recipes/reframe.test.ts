@@ -7,28 +7,35 @@
  * 🔑 ***내가 가진 환경이 「통과」한 것을 「검증」으로 읽지 않는다.***
  */
 import { describe, expect, test, spyOn } from 'bun:test';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as ffmpeg from './ffmpeg.js';
-const { run } = ffmpeg;
 import { affinityReachable, reframeOne, resetAffinityReachCache, sayReframe } from './reframe.js';
 
 const HOME = process.env.HOME ?? '/tmp';
 const mkSrc = (dir: string, w: number, h: number): string => {
   const p = join(dir, `src-${w}x${h}.png`);
-  const r = run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
-    '-i', `color=c=0x2b3a42:s=${w}x${h}`, '-frames:v', '1', p]);
-  if (!r.ok) throw new Error(`픽스처를 못 만들었다: ${r.err}`);
+  writeFileSync(p, `source fixture ${w}x${h}`);
   return p;
 };
-const sizeOf = (p: string): string =>
-  run('ffprobe', ['-v', 'error', '-select_streams', 'v:0',
-    '-show_entries', 'stream=width,height', '-of', 'csv=p=0', p]).out.trim();
+const sizeOf = (p: string): string => readFileSync(p, 'utf8').trim();
+
+function fakeFfmpegRun() {
+  return spyOn(ffmpeg, 'run').mockImplementation((cmd, args) => {
+    if (cmd === 'curl') return { ok: true, out: '200', err: '', code: 0, signal: null };
+    if (cmd === 'ffmpeg') {
+      const dimensions = args.join(' ').match(/scale=(\d+):(\d+)/);
+      const output = args.at(-1);
+      if (output) writeFileSync(output, dimensions ? `${dimensions[1]},${dimensions[2]}` : 'unknown');
+      return { ok: true, out: '', err: '', code: 0, signal: null };
+    }
+    return { ok: false, out: '', err: `unexpected command: ${cmd}`, code: 127, signal: null };
+  });
+}
 
 describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
-  // ⛔ 실물 ffmpeg 를 여러 번 부른다 — 기본 5초로는 «내 느림»이 실패로 보인다.
+  // ffmpeg process IO is faked; these tests cover fallback selection and requested dimensions.
   const T = 30_000;
 
   test('⛔ 도달성 probe 가 «한 런에 한 번»만 든다 (SSE 가 안 닫혀서 매번 최대 시간을 쓴다)', () => {
@@ -47,6 +54,7 @@ describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
   }, T);
   test('⛔ 산출이 «홈 밖»이면 Affinity 를 건너뛰고 ffmpeg 로 간다 ⊕ «이유»를 들고 간다', () => {
     const d = mkdtempSync(join(tmpdir(), 'rf-'));
+    const probe = fakeFfmpegRun();
     try {
       const src = mkSrc(d, 1024, 1024);
       const out = join(d, 'out.png');                      // ⛔ /tmp — Affinity 가 «못 내보내는» 자리
@@ -58,19 +66,17 @@ describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
       // ⛔ 「건너뛰었다」를 «조용히» 하지 않는다 — 이유가 산출에 있어야 한다.
       expect(r.skipped.some((s) => s.method === 'affinity')).toBe(true);
       expect(sayReframe(r)).toContain('못 쓴 것');
-    } finally { rmSync(d, { recursive: true, force: true }); }
+    } finally { probe.mockRestore(); rmSync(d, { recursive: true, force: true }); }
   }, T);
 
   test('⛔ 러너가 «없어도» 멈추지 않는다 (앱이 없는 고객 기계의 모습)', () => {
-    // Bun's userInfo() follows injected HOME under the isolated gate; Node reads
-    // the account database. Neither the checkout nor test HOME need be outside /tmp.
-    const accountHome = execFileSync('node', ['-p', "require('node:os').userInfo().homedir"], { encoding: 'utf8' }).trim();
-    const d = mkdtempSync(join(accountHome, '.rf-'));
+    // `reframeOne` deliberately skips Affinity for /tmp outputs. Use a disposable
+    // checkout-local path so isolated test HOME values cannot hide the missing-runner branch.
+    const d = mkdtempSync(join(process.cwd(), '.rf-'));
     const src = mkSrc(d, 800, 600);
     const out = join(d, 'out.png');
     resetAffinityReachCache();
-    const probe = spyOn(ffmpeg, 'run').mockImplementation((cmd, args, timeout) =>
-      cmd === 'curl' ? { ok: true, out: '200', err: '', code: 0, signal: null } : run(cmd, args, timeout));
+    const probe = fakeFfmpegRun();
     try {
       const r = reframeOne({ src, out, width: 1080, height: 1920, scriptDir: '/없는/스크립트/뿌리' });
       expect(r.ok).toBe(true);
@@ -93,12 +99,13 @@ describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
 
   test('⭐ 비율이 «이미 맞아도» 목표 크기로 내놓는다', () => {
     const d = mkdtempSync(join(HOME, '.rf-'));
+    const probe = fakeFfmpegRun();
     try {
       const src = mkSrc(d, 1280, 720);
       const out = join(d, 'out.png');
       const r = reframeOne({ src, out, width: 640, height: 360, scriptDir: '/없는/뿌리' });
       expect(r.ok).toBe(true);
       expect(sizeOf(out)).toBe('640,360');
-    } finally { rmSync(d, { recursive: true, force: true }); }
+    } finally { probe.mockRestore(); rmSync(d, { recursive: true, force: true }); }
   }, T);
 });

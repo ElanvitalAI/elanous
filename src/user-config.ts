@@ -3975,7 +3975,7 @@ export interface UserConfig {
   followUp?: 'shadow' | 'live';
 };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
-  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number; /** warm Pod 재사용 실전 손잡이(소비자별 · 기본 off · 문자 그대로 true 만). 판정 = pod-warm-switch.ts `decideWarmReuse` — 증거가 모자라면 flag 가 켜져도 off. */ warmReuse?: { gateRecheck?: boolean; land?: boolean; ta?: boolean; /** 연속 일치 표본 하한(양의 정수 · 기본 3). */ minMatchSamples?: number } };
+  pod?: { pool?: string; /** Host-local private warm provider config path. Env ELANOUS_WARM_POD_PROVIDER_CONFIG overrides this; absent path defaults to warm-pod-provider.json beside config.json. */ warmProviderConfig?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number; /** warm Pod 재사용 실전 손잡이(소비자별 · 기본 off · 문자 그대로 true 만). 판정 = pod-warm-switch.ts `decideWarmReuse` — 증거가 모자라면 flag 가 켜져도 off. */ warmReuse?: { gateRecheck?: boolean; land?: boolean; ta?: boolean; /** 연속 일치 표본 하한(양의 정수 · 기본 3). */ minMatchSamples?: number } };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -5193,6 +5193,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     ...(Object.keys(seatBudgets).length ? { org: { budget: seatBudgets } } : {}),
     pod: {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
+      ...(typeof legacyPod.warmProviderConfig === 'string' && legacyPod.warmProviderConfig.trim()
+        ? { warmProviderConfig: legacyPod.warmProviderConfig.trim() } : {}),
       ...(typeof legacyPod.hostMirror === 'string' && legacyPod.hostMirror.trim() ? { hostMirror: legacyPod.hostMirror.trim() } : {}),
       ...(typeof legacyPod.childLogMaxBytes === 'number' && Number.isSafeInteger(legacyPod.childLogMaxBytes) && legacyPod.childLogMaxBytes > 0 ? { childLogMaxBytes: legacyPod.childLogMaxBytes } : {}),
       ...(typeof legacyPod.groundingUrl === 'string' ? { groundingUrl: legacyPod.groundingUrl } : {}),

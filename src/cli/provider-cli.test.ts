@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -44,6 +45,9 @@ describe('provider CLI registration', () => {
     expect(names(isolatedProvider)).toEqual(['codex']);
     // src/index.ts calls registerProviderCommands(program); its codex status action is the live CLI caller.
     expect(names(entryProvider.commands.find(command => command.name() === 'codex')!)).toContain('status');
+    const account = entryProvider.commands.find(command => command.name() === 'codex')!.commands.find(command => command.name() === 'account')!;
+    const seatHome = account.commands.find(command => command.name() === 'seat-home')!;
+    expect(names(seatHome)).toEqual(['home', 'launch', 'sync', 'watch']);
     const compareChildren = (left: Command, right: Command): void => {
       expect(left.helpInformation()).toBe(right.helpInformation());
       expect(names(left)).toEqual(names(right));
@@ -70,6 +74,38 @@ describe('provider CLI registration', () => {
     expect(apiKeyEnvFor('openai-codex')).toBe(apiKeyEnvFor('openai'));
     expect(apiKeyEnvFor('local')).toBeUndefined();
   });
+});
+
+describe('provider codex account seat-home launch CLI', () => {
+  test('dispatches through the real CLI parser to a PATH codex executable with mapped home and forwarded args', () => {
+    const root = mkdtempSync(join(tmpdir(), 'provider-codex-seat-launch-cli-'));
+    fixtureDirs.push(root);
+    const home = join(root, 'codex-seat-homes', 'team');
+    const bin = join(root, 'bin');
+    mkdirSync(home, { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    const marker = join(root, 'launch-argv.txt');
+    const accessToken = `head.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.sig`;
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+      access_token: accessToken, refresh_token: '', refreshToken: '',
+    } }), { mode: 0o600 });
+    const codex = join(bin, 'codex');
+    writeFileSync(codex, '#!/bin/sh\nprintf \'%s\\n\' "$CODEX_HOME" "$@" > "$CODEX_SEAT_MARKER"\n', { mode: 0o755 });
+
+    const cli = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
+    const result = spawnSync(process.execPath, [cli, '--config-dir', root, 'provider', 'codex', 'account', 'seat-home',
+      'launch', 'TC', '--', '-p', 'seat launch argument'], {
+      cwd: new URL('../..', import.meta.url).pathname,
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, CODEX_SEAT_MARKER: marker },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(readFileSync(marker, 'utf8').trim().split('\n'))
+      .toEqual([home, '-p', 'seat launch argument']);
+  }, 30_000);
 });
 
 const priorEnv = { xdg: process.env.XDG_CONFIG_HOME, state: process.env.ELANOUS_STATE_DIR,

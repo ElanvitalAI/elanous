@@ -1,4 +1,5 @@
 import type { Command } from 'commander';
+import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
@@ -80,16 +81,6 @@ function integer(raw: string | undefined, flag: string, fallback: number, min: n
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${flag} must be an integer between ${min} and ${max}`);
   return value;
-}
-
-/** Emoji prefix per known kind; the `[kind]` text itself stays because operating scripts grep for it. */
-const KIND_EMOJI: Readonly<Record<string, string>> = {
-  coord: '🤝', report: '📋', info: 'ℹ️', question: '❓', alert: '🚨', progress: '⏳', incident: '🔥', coach: '🎓',
-};
-
-export function formatMessage(message: Message): string {
-  const kind = message.kind ? ` ${Object.hasOwn(KIND_EMOJI, message.kind) ? KIND_EMOJI[message.kind] : ''}[${message.kind}]` : '';
-  return `#${message.id} ${message.createdAt} ${message.from} → ${message.to}${kind}: ${message.body}`;
 }
 
 /** Register the durable, recipient-addressed CLI. Reading never advances the acknowledgement cursor. */
@@ -401,24 +392,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       emit(groups, opts.json, () => { if (!groups.length) out.log('No groups.'); else for (const address of groups) out.log(address); });
     })());
 
-  msg.command('list').description('List messages for one recipient or one thread without acknowledging them')
-    .option('--to <seat>').option('--thread <id>', 'request ID; list it and its replies, regardless of recipient')
-    .option('--after <id>', 'exclusive message ID (default: acknowledged cursor for a recipient, 0 for a thread)')
-    .option('--limit <count>', 'maximum messages (1–1000)').option('--json')
-    .action((opts: RecipientOptions) => run(() => {
-      if (opts.thread !== undefined && opts.to !== undefined) throw new Error('--thread cannot be used with --to');
-      const to = opts.thread === undefined ? seat(opts.to, '--to') : undefined;
-      const threadId = opts.thread === undefined ? undefined : integer(opts.thread, '--thread', 0, 1, Number.MAX_SAFE_INTEGER);
-      const limit = integer(opts.limit, '--limit', 100, 1, 1000);
-      const after = opts.after === undefined ? undefined : integer(opts.after, '--after', 0, 0, Number.MAX_SAFE_INTEGER);
-      const messages = withStore(store => threadId === undefined
-        ? store.list(to!, after ?? store.getCursor(to!), limit)
-        : store.listThread(threadId, after ?? 0, limit));
-      emit(messages, opts.json, () => {
-        if (!messages.length) out.log('No messages.');
-        for (const message of messages) out.log(formatMessage(message));
-      });
-    })());
+  registerMsgListCommand(msg, { openStore: open, cacheReads: deps.openStore === undefined, out, setExitCode });
 
   msg.command('ack [id]').description('Explicitly acknowledge messages through this ID for one recipient')
     .option('--to <seat>').option('--json')
@@ -636,3 +610,6 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     command.error = (message, options) => reportError(message, { ...options, exitCode: 2 });
   }
 }
+
+// Preserve the historical formatter export after moving list-only registration.
+export { formatMessage } from './msg-list-cli.js';

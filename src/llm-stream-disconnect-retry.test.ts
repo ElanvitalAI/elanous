@@ -252,7 +252,7 @@ describe('retry budget is per provider', () => {
   let tmpHome: string | null = null;
 
   beforeEach(() => {
-    for (const key of ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL']) {
+    for (const key of ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_SUBSTRATE', 'XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL']) {
       savedEnv[key] = process.env[key];
     }
     tmpHome = mkdtempSync(join(tmpdir(), 'llm-stream-retry-'));
@@ -320,6 +320,83 @@ describe('retry budget is per provider', () => {
     expect(grokChecks).toBeGreaterThanOrEqual(3);
     expect(logs).toContainEqual(expect.objectContaining({ category: 'llm.router', event: 'overload-failover',
       data: expect.objectContaining({ fallbackProvider: 'glm' }) }));
+  });
+
+  it('Pod rechecks a selected Grok fallback at the Codex overload handoff', async () => {
+    let grokChecks = 0;
+    let grokCalls = 0;
+    process.env.ELANOUS_SUBSTRATE = 'pod';
+    PROVIDERS.grok = {
+      ...testFakeLlmProvider,
+      name: 'grok',
+      available: () => ++grokChecks <= 3,
+      async *streamChat() { grokCalls++; throw new Error('Grok unavailable: run `grok login` or set XAI_API_KEY'); },
+    };
+    PROVIDERS.glm = { ...testFakeLlmProvider, name: 'glm', defaultModel: 'glm-5.3', available: () => true };
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
+      provider: 'openai-codex', fallbackChain: ['codex-rotate', 'grok', 'zai'] } }));
+    const codex: LLMProvider = {
+      name: 'openai-codex', defaultModel: 'gpt-6-sol', available: () => true,
+      async *chat() {},
+      async *streamChat() {
+        throw new OverloadFailoverError({ provider: 'codex', status: 503, kind: 'overloaded',
+          streak: 3, cause: new Error('server_is_overloaded') });
+      },
+    };
+
+    const answer = await streamLLM([{ role: 'user', content: 'go' }], () => {}, { initialProvider: codex });
+
+    expect(answer).toBe('[test-fake-llm] OK');
+    expect(grokCalls).toBe(0);
+    expect(grokChecks).toBeGreaterThanOrEqual(4);
+    expect(logs).toContainEqual(expect.objectContaining({ category: 'llm.router', event: 'provider-fallback',
+      data: expect.objectContaining({ blockedProvider: 'openai-codex', fallbackProvider: 'glm' }) }));
+    expect(logs.some((entry) => entry.category === 'llm.router' && entry.event === 'overload-failover'
+      && entry.data.fallbackProvider === 'grok')).toBe(false);
+  });
+
+  it('Pod reports each unavailable provider when the fallback chain has no usable candidate', async () => {
+    process.env.ELANOUS_SUBSTRATE = 'pod';
+    let grokCalls = 0;
+    PROVIDERS.grok = {
+      ...testFakeLlmProvider, name: 'grok', available: () => false,
+      async *streamChat() { grokCalls++; throw new Error('should not call unavailable Grok'); },
+    };
+    PROVIDERS.glm = { ...testFakeLlmProvider, name: 'glm', defaultModel: 'glm-5.3', available: () => false };
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
+      provider: 'openai-codex', fallbackChain: ['codex-rotate', 'grok', 'zai'] } }));
+    const codex: LLMProvider = {
+      name: 'openai-codex', defaultModel: 'gpt-6-sol', available: () => true,
+      async *chat() {},
+      async *streamChat() {
+        throw new OverloadFailoverError({ provider: 'codex', status: 503, kind: 'overloaded',
+          streak: 3, cause: new Error('server_is_overloaded') });
+      },
+    };
+
+    const answer = await streamLLM([{ role: 'user', content: 'go' }], () => {}, { initialProvider: codex });
+
+    expect(grokCalls).toBe(0);
+    expect(answer).toContain('no-usable-provider:');
+    expect(answer).toContain('grok(grok)=not-available');
+    expect(answer).toContain('zai(glm)=not-available');
+    expect(logs).toContainEqual(expect.objectContaining({ category: 'llm.router', event: 'provider-fallback-exhausted',
+      data: expect.objectContaining({ reason: expect.stringContaining('no-usable-provider:') }) }));
+  });
+
+  it('Pod preserves a non-fallback stop error even when another candidate is unavailable', async () => {
+    process.env.ELANOUS_SUBSTRATE = 'pod';
+    PROVIDERS.grok = { ...testFakeLlmProvider, name: 'grok', available: () => false };
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
+      provider: 'openai-codex', fallbackChain: ['grok'] } }));
+    const codex: LLMProvider = {
+      name: 'openai-codex', defaultModel: 'gpt-6-sol', available: () => true,
+      async *chat() {},
+      async *streamChat() { throw new Error('invalid request: malformed prompt'); },
+    };
+
+    await expect(streamLLM([{ role: 'user', content: 'go' }], () => {}, { initialProvider: codex }))
+      .rejects.toThrow('invalid request: malformed prompt');
   });
 
   it('tool stream skips a candidate that loses availability after a real fake HTTP 503 retry', async () => {

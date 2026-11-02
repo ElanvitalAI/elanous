@@ -93,7 +93,7 @@ test('first-run API-key setup selects the detected provider and keeps the key ou
       env,
       isTTY: true,
       detectProviders: async () => [],
-      setupWhenNoProvider: setupConfig => runFirstRunProviderSetup(io, { config: setupConfig, env, cacheDir }),
+      setupWhenNoProvider: setupConfig => runFirstRunProviderSetup(io, { config: setupConfig, env, cacheDir, loginWithCodex }),
       print: line => output.push(line),
     });
     expect(result).toEqual({ outcome: 'ready', provider: 'grok', inputs: 1 });
@@ -125,7 +125,7 @@ test('first-run setup menu re-asks parser misses, then asks for setup without re
       config,
       isTTY: true,
       detectProviders: async () => [],
-      setupWhenNoProvider: setupConfig => runFirstRunProviderSetup(io, { config: setupConfig }),
+      setupWhenNoProvider: setupConfig => runFirstRunProviderSetup(io, { config: setupConfig, loginWithCodex }),
       print: line => output.push(line),
     });
     expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
@@ -141,7 +141,7 @@ test('first-run setup menu re-asks parser misses, then asks for setup without re
       config: skipConfig,
       isTTY: true,
       detectProviders: async () => [],
-      setupWhenNoProvider: setupConfig => runFirstRunProviderSetup({ ...io, ask: async () => '' }, { config: setupConfig }),
+      setupWhenNoProvider: setupConfig => runFirstRunProviderSetup({ ...io, ask: async () => '' }, { config: setupConfig, loginWithCodex }),
       print: line => output.push(line),
     });
     expect(skipResult).toEqual({ outcome: 'ready', inputs: 1 });

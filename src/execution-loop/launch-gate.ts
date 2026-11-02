@@ -9,6 +9,35 @@ import { loadRunLedger } from '../self-implement/run-ledger.js';
 import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
 import { CODEX_PROVIDER, GROK_PROVIDER, decideLaunchBudget, type BudgetAction, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
+import type { LaunchStamp } from '../harness/launch-stamp.js';
+
+export interface LaunchDoorEnv {
+  readonly mode: 'shadow' | 'enforce';
+  readonly modeSource: 'default' | 'env' | 'invalid';
+  readonly permission: 'allow' | 'deny';
+  readonly signal: 'green' | 'red' | 'unknown';
+}
+
+/** Environment interpretation stays at this adapter; the launch decision itself remains pure. */
+export function resolveLaunchDoorEnv(env: Readonly<Record<string, string | undefined>> = process.env): LaunchDoorEnv {
+  const rawMode = env.ELANOUS_LAUNCH_DOOR_MODE;
+  return {
+    mode: rawMode === 'enforce' ? 'enforce' : 'shadow',
+    modeSource: rawMode === undefined || rawMode === '' ? 'default' : rawMode === 'enforce' || rawMode === 'shadow' ? 'env' : 'invalid',
+    permission: env.ELANOUS_LAUNCH_DOOR_PERMISSION === 'allow' ? 'allow' : 'deny',
+    signal: env.ELANOUS_LAUNCH_DOOR_SIGNAL === 'green' || env.ELANOUS_LAUNCH_DOOR_SIGNAL === 'red'
+      ? env.ELANOUS_LAUNCH_DOOR_SIGNAL : 'unknown',
+  };
+}
+
+export function decideLaunchDoor(stamp: LaunchStamp, input: LaunchDoorEnv): { readonly allowed: boolean; readonly reason: string } {
+  if (!['harness-say', 'harness-ask', 'queue-tick'].includes(stamp.entrance)) {
+    return { allowed: false, reason: `entrance ${stamp.entrance} not authorized` };
+  }
+  if (input.permission !== 'allow') return { allowed: false, reason: `permission ${input.permission}` };
+  if (input.signal !== 'green') return { allowed: false, reason: `signal ${input.signal}` };
+  return { allowed: true, reason: 'entrance, permission and signal authorized' };
+}
 
 export type ActiveRunsForGoal = readonly string[] | 'unknown';
 
@@ -303,6 +332,12 @@ export interface LaunchRequestLedgerRow {
   readonly source?: string;
   readonly receiptId?: string;
   readonly reason?: string;
+  /** Optional launch context; never contains the request body itself. */
+  readonly seat?: string;
+  readonly cell?: string;
+  readonly originalRef?: string;
+  /** Explicit retry-family key; absent for independent direct requests. */
+  readonly retryGroup?: string;
 }
 
 /** requestId 단위 소비 영수증 — 최초 1회만 발급된다(O_EXCL 파일이 곧 영수증이다). */
@@ -323,13 +358,55 @@ export type LaunchRequestConsumption =
 /** 발사 요청의 단일 문 — 원장 append · 단일 소비 · 실패 기록 · 원장 조회. */
 export interface LaunchRequestDoor {
   /** 요청 한 건을 원장에 append 하고 그 requestId 를 돌려준다(중복 재요청도 매번 append 된다). */
-  requestId(ask: string): string;
+  requestId(ask: string, context?: { readonly seat?: string; readonly cell?: string; readonly originalRef?: string; readonly retryGroup?: string; readonly reason?: string }): string;
   /** requestId 단위 단일 소비 — 영수증은 최초 1회만 발급된다(두 번째는 기존 영수증과 사유로 거절). */
   consume(requestId: string, opts?: { readonly force?: boolean; readonly inheritedReceipt?: string }): LaunchRequestConsumption;
   /** 발사 실패 사유를 원장에 append 한다(관측 — 발사를 막지 않는다). */
   fail(requestId: string, reason: string): void;
   /** 원장 조회 — 중복 거절·실패·재시도 사유를 읽는다(인자를 주면 그 requestId 의 행만). */
   rows(requestId?: string): readonly LaunchRequestLedgerRow[];
+}
+
+export interface LaunchRequestLedgerSummary {
+  readonly requests: number;
+  readonly uniqueRequests: number;
+  readonly unconsumed: number;
+  readonly consumed: number;
+  readonly retries: number;
+  readonly failed: number;
+  readonly refused: number;
+  readonly doorUnavailable: number;
+}
+
+/** A read-only count over append-only request rows. */
+export function summarizeLaunchRequestRows(all: readonly LaunchRequestLedgerRow[]): LaunchRequestLedgerSummary {
+  const byId = new Map<string, LaunchRequestLedgerRow[]>();
+  for (const row of all) byId.set(row.requestId, [...(byId.get(row.requestId) ?? []), row]);
+  let unconsumed = 0;
+  let consumed = 0;
+  let failed = 0;
+  let refused = 0;
+  let doorUnavailable = 0;
+  let retries = 0;
+  const logicalRequests = new Map<string, number>();
+  for (const entries of byId.values()) {
+    const events = entries.map((row) => row.event);
+    if (events.includes('consumed')) consumed += 1;
+    else if (events.includes('requested')) unconsumed += 1;
+    if (events.includes('launch-failed')) failed += 1;
+    if (events.includes('refused-duplicate')) refused += 1;
+    if (events.includes('door-unavailable')) doorUnavailable += 1;
+    const requestRow = entries.find((row) => row.event === 'requested');
+    if (requestRow) {
+      const logicalId = requestRow.retryGroup
+        ? `${requestRow.source ?? '-'}:${requestRow.retryGroup}`
+        : requestRow.requestId;
+      logicalRequests.set(logicalId, (logicalRequests.get(logicalId) ?? 0) + events.filter((event) => event === 'requested').length);
+    }
+  }
+  for (const count of logicalRequests.values()) retries += Math.max(0, count - 1);
+  return { requests: all.filter((row) => row.event === 'requested').length, uniqueRequests: byId.size,
+    unconsumed, consumed, retries, failed, refused, doorUnavailable };
 }
 
 /** 단일문 deps — 원장 뿌리(기본 = 이 우주의 실효 인스턴스 루트)·시계·요청 출처 표지. */
@@ -388,9 +465,12 @@ export function openLaunchRequestDoor(deps: LaunchRequestDoorDeps = {}): LaunchR
     } catch { return null; }
   };
 
-  const requestId = (ask: string): string => {
+  const requestId = (ask: string, context: { readonly seat?: string; readonly cell?: string; readonly originalRef?: string; readonly retryGroup?: string; readonly reason?: string } = {}): string => {
     const id = launchRequestId(ask);
-    appendRow({ event: 'requested', requestId: id, at: now().toISOString(), ...(source ? { source } : {}) });
+    appendRow({ event: 'requested', requestId: id, at: now().toISOString(), ...(source ? { source } : {}),
+      ...(context.seat ? { seat: context.seat } : {}), ...(context.cell ? { cell: context.cell } : {}),
+      ...(context.originalRef ? { originalRef: context.originalRef } : {}), ...(context.retryGroup ? { retryGroup: context.retryGroup } : {}),
+      ...(context.reason ? { reason: context.reason } : {}) });
     return id;
   };
 
@@ -457,26 +537,26 @@ export function openLaunchRequestDoor(deps: LaunchRequestDoorDeps = {}): LaunchR
   const rows = (requestId?: string): readonly LaunchRequestLedgerRow[] => {
     const result: LaunchRequestLedgerRow[] = [];
     let names: string[];
-    try {
-      assertLedgerPathPolicy(dir);
-      names = readdirSync(dir);
-    } catch { return result; }
+    assertLedgerPathPolicy(dir);
+    try { names = readdirSync(dir); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return result;
+      throw error;
+    }
     for (const name of names.filter((candidate) => LAUNCH_REQUEST_DATE_FILE.test(candidate)).sort()) {
+      const fd = openSync(join(dir, name), constants.O_RDONLY | constants.O_NOFOLLOW);
       let text: string;
       try {
-        const fd = openSync(join(dir, name), constants.O_RDONLY | constants.O_NOFOLLOW);
-        try {
-          if (!fstatSync(fd).isFile()) continue;
-          text = readFileSync(fd, 'utf8');
-        } finally { closeSync(fd); }
-      } catch { continue; }
+        if (!fstatSync(fd).isFile()) throw new Error(`launch request ledger entry is not a regular file: ${name}`);
+        text = readFileSync(fd, 'utf8');
+      } finally { closeSync(fd); }
       for (const line of text.split('\n')) {
         if (!line) continue;
-        try {
-          const row = JSON.parse(line) as LaunchRequestLedgerRow;
-          if (row && typeof row === 'object' && typeof row.event === 'string' && typeof row.requestId === 'string'
-            && typeof row.at === 'string' && (requestId === undefined || row.requestId === requestId)) result.push(row);
-        } catch { /* 찢어진 줄은 건너뛴다 */ }
+        const row = JSON.parse(line) as LaunchRequestLedgerRow;
+        if (!row || typeof row !== 'object' || typeof row.event !== 'string' || typeof row.requestId !== 'string' || typeof row.at !== 'string') {
+          throw new Error(`invalid launch request ledger row in ${name}`);
+        }
+        if (requestId === undefined || row.requestId === requestId) result.push(row);
       }
     }
     return result;

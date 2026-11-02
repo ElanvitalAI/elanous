@@ -47,12 +47,13 @@ describe('Pod fallback chain relay', () => {
     await done;
     const [secret, job] = applied as [
       { stringData: Record<string, string> },
-      { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
+      { spec: { template: { spec: { containers: Array<{ args: string[]; env?: Array<{ name: string; value?: string }> }> } } } },
     ];
     expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
     expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
     expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!))).toEqual(['harness', 'llm']);
     const script = job.spec.template.spec.containers[0]!.args[0]!;
+    expect(job.spec.template.spec.containers[0]!.env).toContainEqual({ name: 'ELANOUS_SUBSTRATE', value: 'pod' });
     expect(script).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
     expect(script.indexOf('install -m 600 /creds/llm-fallback-config.json')).toBeLessThan(script.indexOf('elanous self implement'));
   });

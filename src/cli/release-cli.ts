@@ -1324,7 +1324,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   release.command('resume')
     .description('실패한 릴리스 런을 이어 달린다 — cut-branch --append 로 고친 release/<v> 새 끝을 version-release 기록에 반영(빨리감기만·상태 백업) 뒤 --from 노드부터')
     .requiredOption('--run <runId>', '실패한 release-loop 런 ID')
-    .requiredOption('--from <node>', '다시 시작할 노드(예: gate)')
+    .option('--from <node>', '다시 시작할 노드(게이트 면제 시 --waive gate면 생략 가능)')
     .option('--partial', 'GATE-PARTIAL — --from gate 에서 바뀐 시험 ⊕ 앞 실패 ⊕ 바뀐 코드에 import 로 닿는 시험만 다시 돈다(끝이 움직인 --from gate 는 기본 · 의심이면 전체 게이트)')
     .option('--no-partial', 'GATE-REUSE-BY-DIFF 기본 부분 재검을 끄고 전체 게이트')
     .option('--waive <node>', '저장된 실패 노드 한 개를 면제(--from 은 그 노드 그대로)')
@@ -1339,7 +1339,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout(생략 시 현재 폴더)')
     .option('--dry-run', '재개 preflight만 수행하고 런·상태 원장·시도 횟수는 변경하지 않는다')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1350,9 +1350,13 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             throw new Error('acceptedRegressions must be an array of {id, note}');
           }
         }
+        if (o.waive !== undefined && !o.waive.trim()) throw new Error('--waive must not be empty');
+        if ((o.waive === undefined) !== (o.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
         if (o.shardOs !== undefined && o.shardOs !== 'darwin' && o.shardOs !== 'linux') throw new Error('--shard-os must be darwin or linux');
         const shardOs = o.shardOs as 'darwin' | 'linux' | undefined;
-        const resumeOptions = { runId: o.run, from: o.from, partial: o.partial, commandRoot: o.commandRoot,
+        const from = o.from ?? (o.waive === 'gate' ? 'gate' : undefined);
+        if (!from) throw new Error('--from is required unless --waive gate is used');
+        const resumeOptions = { runId: o.run, from, partial: o.partial, commandRoot: o.commandRoot,
           ...(o.waive === undefined ? {} : { waive: o.waive }),
           ...(o.reason === undefined ? {} : { reason: o.reason }),
           ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }),
@@ -1378,7 +1382,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (result.partial.requested) log(result.partial.applied
           ? `◐ 부분 재검${result.partial.auto ? '(기본)' : ''}: ${result.partial.files}파일${result.partial.closure ? ` (코드 닿음 ${result.partial.closure.reached} · 닫힘 불투명 ${result.partial.closure.opaque})` : ''} · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
           : `● 전체 게이트로: ${result.partial.reason}`);
-        log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${o.from} 부터 → ${result.state.status}`);
+        log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${from} 부터 → ${result.state.status}`);
         return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId,
           ...(o.gateExecutor !== undefined && executorOverride?.kind === 'gate-executor' ? { gateExecutor: executorOverride } : {}),
           ...(o.gatePodPool !== undefined && poolOverride?.kind === 'gate-pod-pool' ? { gatePodPool: poolOverride } : {}) };

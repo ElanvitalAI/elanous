@@ -18,6 +18,8 @@ export interface ResearchGapFollowupInput {
   request: string;
   questions: readonly BloomResearchQuestion[];
   evidence: readonly ResearchEvidenceEnvelope[];
+  /** Output-contract sections still below their evidence boundary. */
+  blankSlots?: readonly { id: string; title: string; purpose: string }[];
   signal?: AbortSignal;
   /** Optional remaining time supplied by the owning turn; omitted uses the fixed 2-minute cap. */
   remainingBudgetMs?: number;
@@ -86,7 +88,7 @@ export function planGapFollowup(input: ResearchGapFollowupInput): ResearchGapFol
   const allowlist = input.readOnlySkillAllowlist ?? READ_ONLY_AUTO_FOLLOWUP_SKILLS;
   const skillIndex = [...(input.skills ?? getSkillIndex())];
   const questions = new Map(input.questions.map((question) => [question.id, question]));
-  const gaps = findResearchGaps(input.questions, input.evidence);
+  const gaps = findResearchGaps(input.questions, input.evidence, input.blankSlots ?? []);
   const classifications: ResearchGapClassification[] = [];
   const followups: ResearchGapFollowupCall[] = [];
   const roundAvailable = (input.roundsUsed ?? 0) < MAX_GAP_FOLLOWUP_ROUNDS;
@@ -218,6 +220,7 @@ export async function runGapFollowup(
 function findResearchGaps(
   questions: readonly BloomResearchQuestion[],
   evidence: readonly ResearchEvidenceEnvelope[],
+  blankSlots: readonly { id: string; title: string; purpose: string }[] = [],
 ): Array<{ questionId: string; text: string }> {
   const byQuestion = new Map<string, ResearchEvidenceEnvelope[]>();
   for (const item of evidence) byQuestion.set(item.questionId, [...(byQuestion.get(item.questionId) ?? []), item]);
@@ -226,7 +229,9 @@ function findResearchGaps(
   for (const question of questions) {
     if (question.level !== 4 && question.level !== 5) continue;
     const items = byQuestion.get(question.id) ?? [];
+    const blankSlot = blankSlots.find((slot) => slot.id === question.sectionId);
     const questionGaps = new Set<string>();
+    if (blankSlot) questionGaps.add(`Output slot ${blankSlot.title}: ${blankSlot.purpose}`);
     if (items.length === 0) questionGaps.add(question.prompt);
     for (const item of items) {
       const sentences = item.content.split(/(?<=[.!?。！？])\s+|\n+/).map((sentence) => sentence.trim()).filter(Boolean);

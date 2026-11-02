@@ -10,19 +10,23 @@ const parsed = parseGraphTemplateYaml(yaml, 'explainer-line.yaml');
 const spec = parsed.template!;
 
 const recipes = [
-  ['script', 'explainer-script', 'read-only', ['facts', 'sources'], ['script_path'], 3],
+  ['script', 'explainer-script', 'workspace-write', ['briefing', 'facts', 'sources'], ['script_path'], 3],
+  ['scene', 'explainer-scene', 'workspace-write', ['script_path', 'facts', 'sources', 'chart_plan'], ['scene_plan', 'chart_plan', 'evidence_captions'], 2],
   ['vo', 'explainer-vo', 'network-write', ['script_path'], ['vo_dir', 'narration_seconds'], 2],
-  ['build', 'explainer-build', 'workspace-write', ['script_path', 'vo_dir'], ['hyperframes_project', 'timeline_path'], 3],
+  ['build', 'explainer-build', 'workspace-write', ['script_path', 'vo_dir', 'scene_plan', 'chart_plan', 'evidence_captions'], ['hyperframes_project', 'timeline_path'], 3],
   ['render', 'hyperframes-render', 'workspace-write', ['hyperframes_project'], ['hf_render_path', 'hf_snapshot_dir', 'hf_check'], 2],
   ['qc', 'explainer-qc', 'read-and-run', ['hf_render_path', 'script_path'], ['vo_match', 'loudness_lufs', 'true_peak_db'], 2],
+  ['deliver', 'explainer-deliver', 'network-write', ['hf_render_path', 'briefing'], ['delivery_mode', 'local_artifact_path', 'telegram_message_id'], 1],
 ] as const;
 
 const routes: Record<string, Record<string, string>> = {
-  script: { ok: 'vo', 'no-facts': 'needs-human', unmeasurable: 'unobserved' },
+  script: { ok: 'scene', 'no-facts': 'needs-human', collision: 'needs-human', unmeasurable: 'unobserved' },
+  scene: { ok: 'vo', 'no-facts': 'needs-human', unmeasurable: 'unobserved' },
   vo: { ok: 'build', 'no-key': 'needs-human', error: 'blocked', unmeasurable: 'unobserved' },
   build: { ok: 'render', 'bad-script': 'script', error: 'blocked', unmeasurable: 'unobserved' },
   render: { ok: 'qc', 'check-fail': 'build', 'render-mismatch': 'build', unmeasurable: 'unobserved' },
-  qc: { pass: 'delivered', 'vo-mismatch': 'vo', loudness: 'build', 'too-long': 'build', public: 'needs-human', unmeasurable: 'unobserved' },
+  qc: { pass: 'deliver', 'vo-mismatch': 'vo', loudness: 'build', 'too-short': 'build', 'too-long': 'build', public: 'needs-human', unmeasurable: 'unobserved' },
+  deliver: { ok: 'delivered', 'no-recipient': 'needs-human', error: 'blocked', unmeasurable: 'unobserved' },
 };
 
 describe('explainer-line declaration', () => {
@@ -59,7 +63,7 @@ describe('explainer-line declaration', () => {
       expect(path).not.toContain(next);
       path.push(next!);
     }
-    expect(path).toEqual(['script', 'vo', 'build', 'render', 'qc', 'delivered']);
+    expect(path).toEqual(['script', 'scene', 'vo', 'build', 'render', 'qc', 'deliver', 'delivered']);
   });
 
   test('every explainer recipe in the graph is a key of EXPLAINER', () => {

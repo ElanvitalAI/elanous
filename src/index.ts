@@ -4,6 +4,7 @@ import './ensure-bin-path.js';
 import './instance/resolve.js';
 import { WORKFLOW_NODE_VARIANT_KEYS } from './workflow-runtime/schema.js';
 import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import type { SelfDevRunParticipant, SelfDevRunState } from './self-dev/run-store.js';
 import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
 import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
@@ -20,6 +21,7 @@ import { ensureRunIdentity, getHarnessSpace, normalizeSpaceId } from './harness/
 import { installDevCompletionGuard } from './self-dev/dev-completion-guard.js';
 import { formatOrchestrateResultLine } from './self-dev/orchestrate-summary-line.js';
 import { normalizeOrchestrateRequest, splitOrchestrateGoalTexts } from './self-dev/orchestrate-cli-text.js';
+import { dispatchOrchestrateParent, orchestrateParentInputsShareable } from './self-dev/orchestrate-parent-dispatch.js';
 import { DEV_PLAN_REPLACEMENT, formatDevPlanOptionHelp, HARNESS_RUN_DEPRECATION_HELP } from './self-dev/cli-help-text.js';
 import { CLI_ENTRANCE_BASELINE, evaluateCommandEntranceBaseline } from './self-dev/entrance-baseline.js';
 import { CLI_HARNESS_DOGFOOD_ENTRANCE, CLI_HARNESS_ORCHESTRATE_ENTRANCE, describeEntranceCommand, listEntrancesWithModelExposure, renderLaunchEntrances, summarizeEntrances, type EntranceId } from './self-dev/entrance-registry.js';
@@ -59,7 +61,7 @@ applyConfigDirFlagFromArgv();
 
 // Only unambiguous root commands take the small registrar path. Root help,
 // unknown commands and unrecognized global flags keep the complete tree.
-const INDEX_FAST_ROOTS = new Set(['a2a', 'agent-env', 'away', 'bench', 'brief', 'card', 'connect', 'control', 'docs', 'doctor', 'fleet', 'flow', 'freeze', 'graph', 'guardian', 'import', 'intake', 'know', 'labels', 'launch-head', 'leader', 'live', 'llm', 'loop', 'machine', 'make', 'memory', 'msg', 'notify', 'ops', 'outputs', 'plugin', 'pod', 'provider', 'pty', 'publish', 'questions', 'relay', 'release', 'repo', 'research', 'resource', 'retro', 'role', 'schedule', 'seat', 'shadow', 'skills', 'start', 'storage', 'tasks', 'where']);
+const INDEX_FAST_ROOTS = new Set(['a2a', 'agent-env', 'away', 'bench', 'brief', 'card', 'connect', 'control', 'docs', 'doctor', 'fleet', 'flow', 'freeze', 'graph', 'guardian', 'import', 'intake', 'know', 'labels', 'launch-head', 'leader', 'live', 'llm', 'loop', 'machine', 'make', 'memory', 'msg', 'notify', 'ops', 'outputs', 'plugin', 'pod', 'provider', 'pty', 'publish', 'questions', 'relay', 'release', 'repo', 'research', 'resource', 'retro', 'role', 'runs', 'schedule', 'seat', 'shadow', 'skills', 'start', 'storage', 'tasks', 'where']);
 function selectedIndexFastRoot(args: readonly string[]): string | undefined {
   if (process.env.ELANOUS_TEST_FLAG_AUDIT === '1') return undefined;
   let index = 0;
@@ -225,6 +227,9 @@ const registerStorageDetectCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'st
 const registerPodCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'pod'
   ? (() => undefined)
   : (require('./cli/pod-cli.js') as typeof import('./cli/pod-cli.js')).registerPodCommands) as typeof import('./cli/pod-cli.js').registerPodCommands;
+const registerRunsTreeCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'runs'
+  ? (() => undefined)
+  : (require('./cli/runs-tree-cli.js') as typeof import('./cli/runs-tree-cli.js')).registerRunsTreeCommands) as typeof import('./cli/runs-tree-cli.js').registerRunsTreeCommands;
 const registerBrowserAnnotateCommand = (require('./cli/browser-annotate-cli.js') as typeof import('./cli/browser-annotate-cli.js')).registerBrowserAnnotateCommand;
 const registerPendingQuestionsCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'questions'
   ? (() => undefined)
@@ -1271,6 +1276,7 @@ registerLlmDetectCommand(program);
 registerStorageDetectCommand(program);
 registerLeaderCommands(program);
 registerPodCommands(program);
+registerRunsTreeCommands(program);
 // 🎨 봇이 모는 브라우저 페이지 «안»에 그린다 — `src/browser-annotate/` 원장의 «문»(42차).
 registerBrowserAnnotateCommand(program);
 registerPendingQuestionsCommand(program);
@@ -5116,6 +5122,16 @@ let selfOrchestrateSpawnForTesting: import('./task-orchestrator/surfaces/self-im
 export function setSelfOrchestrateSpawnForTesting(spawn: typeof selfOrchestrateSpawnForTesting): void {
   selfOrchestrateSpawnForTesting = spawn;
 }
+type SelfOrchestrateRemoteParentRunner = typeof import('./cli/tasks-cli.js').runRemoteTaskParent;
+let selfOrchestrateRemoteParentForTesting: SelfOrchestrateRemoteParentRunner | undefined;
+export function setSelfOrchestrateRemoteParentForTesting(runner: SelfOrchestrateRemoteParentRunner | undefined): void {
+  selfOrchestrateRemoteParentForTesting = runner;
+}
+type SelfOrchestratePodPoolFilter = (pool: string) => Promise<{ pool?: string; reason?: string }>;
+let selfOrchestratePodPoolFilterForTesting: SelfOrchestratePodPoolFilter | undefined;
+export function setSelfOrchestratePodPoolFilterForTesting(filter: SelfOrchestratePodPoolFilter | undefined): void {
+  selfOrchestratePodPoolFilterForTesting = filter;
+}
 
 export function readSelfOrchestrateGoals(parts: string[], goalFiles: readonly string[] = []): { request: string; goals: string[] } {
   const fileGoals = goalFiles.map((path) => readFileSync(path, 'utf8'));
@@ -5143,6 +5159,7 @@ const selfOrchestrateCmd = selfCmd
   .addOption(new Option('--child-llm-provider <id>', 'pod: 구현 자식 LLM provider(openai-codex|grok|openrouter|opengateway|anthropic|bedrock|glm) — 하니스 --child-llm-provider 가 이 자리로 온다(10-05)').hideHelp())
   .addOption(new Option('--child-llm-model <id>', 'pod: 구현 자식 LLM model(--child-llm-provider 와 함께)').hideHelp())
   .addOption(new Option('--child-llm-effort <level>', 'pod: 구현 자식 추론 노력(--child-llm-provider 와 함께)').hideHelp())
+  .addOption(new Option('--parent-host-worker', '원격 부모 실행 내부 표식').hideHelp())
   .option('--help-all', '모든 orchestrate 옵션 표시')
   .action(function (this: Command, parts: string[], opts: { goalFile?: string[]; concurrency?: string; autoMerge?: boolean; autoReview?: boolean; openPr?: boolean; base?: string; teardown?: boolean; resume?: string; board?: boolean; decompose?: boolean; fabricDecompose?: boolean; maxTasks?: string; supervise?: boolean; superviseRounds?: string; json?: boolean }) {
     return (async () => {
@@ -5181,6 +5198,125 @@ const selfOrchestrateCmd = selfCmd
     // ⭐ --resume 이면 goal 을 다시 안 줘도 된다 — 체크포인트가 goal 원형을 갖는다(2026-08-19).
     //   ⛔ 그래도 «옛 체크포인트»면 아래에서 goals 가 비어 있을 수 있어, 그 경우를 뒤에서 다시 막는다.
     if (goalTexts.length === 0 && !opts.resume) { ui.error('goal 필요: elanous self orchestrate "<goal1>" "<goal2>" (또는 "g1 ;; g2" · --decompose 로 1 goal 자동분해 · --resume <runId> 면 goal 불요)'); process.exit(2); }
+    const orchestrateOptions = opts as typeof opts & { substrate?: string; parentHostWorker?: boolean; childLlmProvider?: string; podPool?: string };
+    if (orchestrateOptions.substrate === 'pod' && !selfOrchestrateSpawnForTesting) {
+      const argv = process.argv.slice(2);
+      const goalFileIndex = opts.goalFile?.length ?? 0;
+      const valueOptions = new Set([...program.options, ...selfCmd.options, ...selfOrchestrateCmd.options]
+        .filter((option) => option.required || option.optional)
+        .map((option) => option.long).filter((name): name is string => Boolean(name)));
+      const findOptionTerminator = (args: readonly string[]): number => {
+        for (let i = 0; i < args.length; i++) {
+          const token = args[i]!;
+          if (token === '--') return i;
+          if (!token.includes('=') && valueOptions.has(token) && i + 1 < args.length) i++;
+        }
+        return -1;
+      };
+      const optionTerminator = findOptionTerminator(argv);
+      const optionEnd = optionTerminator >= 0 ? optionTerminator : argv.length;
+      let hasIsolatedInstance = false;
+      for (let i = 0; i < optionEnd; i++) {
+        const token = argv[i]!;
+        const optionName = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+        if (optionName === '--test' || optionName === '--config-dir' || optionName === '--test-state-dir') {
+          hasIsolatedInstance = true;
+          break;
+        }
+        if (!token.includes('=') && valueOptions.has(token) && i + 1 < optionEnd) i++;
+      }
+      const goalFilesShareable = goalFileIndex === (opts.goalFile?.length ?? 0)
+        && orchestrateParentInputsShareable({ goalFileCount: goalFileIndex, hasResume: !!opts.resume, hasIsolatedInstance });
+      const remoteParentConfigured = selfOrchestrateRemoteParentForTesting !== undefined || await (async () => {
+        try {
+          const parentHost = await import('./task-agent/parent-host.js');
+          return parentHost.resolveParentHosts(getUserConfig().taskAgent?.parentHost).length > 0;
+        } catch { return false; }
+      })();
+      if (!orchestrateOptions.parentHostWorker && goalFilesShareable && remoteParentConfigured && opts.autoMerge) {
+        ui.error('--auto-merge cannot be combined with remote Pod parent dispatch; omit --auto-merge');
+        process.exitCode = 2;
+        return;
+      }
+      const explicitPodPool = orchestrateOptions.podPool?.trim();
+      if (explicitPodPool) {
+        const filtered = selfOrchestratePodPoolFilterForTesting
+          ? await selfOrchestratePodPoolFilterForTesting(explicitPodPool)
+          : await (async () => {
+            const policy = await import('./task-orchestrator/surfaces/gate-pod-pool-policy.js');
+            const traffic = policy.readTrafficDispatchSnapshot(process.env);
+            if (traffic !== null && !policy.releaseGateTrafficActive(traffic)) return { pool: explicitPodPool };
+            const release = await import('../scripts/release-loop/unattended-release.js');
+            const result = policy.excludeGatePoolMembers(explicitPodPool, release.releaseLoopConfig().gatePodPool, traffic);
+            const reason = 'reason' in result ? result.reason : undefined;
+            return reason || !result.pool ? { reason: reason ?? 'task-pod-pool-filter-produced-empty-pool' } : { pool: result.pool };
+          })();
+        const filterReason = 'reason' in filtered ? filtered.reason : undefined;
+        if (filterReason || !filtered.pool) {
+          const reason = filterReason ?? 'task-pod-pool-filter-produced-empty-pool';
+          debug.log('self-dev.orchestrate', 'release-gate-pod-pool-blocked', { reason, pool: explicitPodPool }, { level: 'error' });
+          ui.error(`[self orchestrate] release gate pool exclusivity: ${reason}`);
+          process.exitCode = 2;
+          return;
+        }
+        orchestrateOptions.podPool = filtered.pool;
+      }
+      const decision = await dispatchOrchestrateParent({
+        requested: true,
+        worker: orchestrateOptions.parentHostWorker === true,
+        shareableInputs: goalFilesShareable,
+        args: (() => {
+          const separatorIndex = optionTerminator;
+          const optionArgs = separatorIndex >= 0 ? argv.slice(0, separatorIndex) : argv;
+          const positionalArgs = separatorIndex >= 0 ? argv.slice(separatorIndex) : [];
+          const forwarded = [...optionArgs, ...positionalArgs];
+          if (explicitPodPool && orchestrateOptions.podPool && explicitPodPool !== orchestrateOptions.podPool) {
+            const forwardedTerminator = findOptionTerminator(forwarded);
+            const optionLimit = forwardedTerminator >= 0 ? forwardedTerminator : forwarded.length;
+            for (let i = 0; i < optionLimit; i++) {
+              const token = forwarded[i]!;
+              const equals = token.indexOf('=');
+              const optionName = equals >= 0 ? token.slice(0, equals) : token;
+              if (optionName === '--pod-pool' && equals >= 0) forwarded[i] = `--pod-pool=${orchestrateOptions.podPool}`;
+              else if (optionName === '--pod-pool' && i + 1 < optionLimit) forwarded[++i] = orchestrateOptions.podPool;
+              else if (equals < 0 && valueOptions.has(optionName) && i + 1 < optionLimit) i++;
+            }
+          }
+          const forwardedSeparatorIndex = findOptionTerminator(forwarded);
+          const markerIndex = forwardedSeparatorIndex >= 0 ? forwardedSeparatorIndex : forwarded.length;
+          forwarded.splice(markerIndex, 0, '--parent-host-worker', '--no-auto-merge');
+          return forwarded;
+        })(),
+      }, {
+        runRemote: async (args) => {
+          const runRemoteTaskParent = selfOrchestrateRemoteParentForTesting
+            ?? (await import('./cli/tasks-cli.js')).runRemoteTaskParent;
+          const transportId = randomUUID();
+          const result = await runRemoteTaskParent(args, {
+            runId: `run-${transportId}`,
+            launchId: `parent-${transportId}`,
+            env: { ELANOUS_RUN_ID: `run-${transportId}` },
+            substrate: 'pod',
+            podGoal: joined,
+            ...(orchestrateOptions.childLlmProvider ? { effectiveChildProvider: orchestrateOptions.childLlmProvider } : {}),
+          });
+          return result;
+        },
+        logLocalFallback: (reason) => {
+          debug.log('self-dev.orchestrate', 'parent-dispatch-local-fallback', { reason, substrate: 'pod' });
+        },
+      });
+      if (decision.mode === 'remote') {
+        debug.log('self-dev.orchestrate', 'parent-dispatch-remote-completed', { host: decision.host, exitCode: decision.exitCode });
+        process.exitCode = decision.exitCode;
+        return;
+      }
+      if (decision.mode === 'blocked') {
+        debug.log('self-dev.orchestrate', 'parent-dispatch-blocked', { reason: decision.reason, substrate: 'pod' }, { level: 'error' });
+        process.exitCode = 2;
+        return;
+      }
+    }
     const concurrency = opts.concurrency ? Math.max(1, Number(opts.concurrency) || 2) : undefined;
     let reportRunId = 'unknown';
     const reportRun = async (results: readonly import('./self-dev/orchestrate.js').SelfDevJobResult[], failure?: string): Promise<void> => {
@@ -6360,8 +6496,9 @@ selfCmd
   .option('--json', '구조화 출력 {pr, verdict, mustFix, shouldFix, reviewed}')
   .option('--save <name>', '리뷰 결과를 상태 디렉터리의 review-results/<name>-<PR>-<head12>.json에 저장')
   .option('--since-review <saved review name|head>', '저장된 리뷰의 mustFix와 해당 head 이후 변경만 다시 판정')
+  .option('--full', '저장 리뷰가 있어도 PR 전체를 다시 리뷰')
   .option('--over-cap-reason <reason>', '저장 리뷰 r5 상한 이후 이번 호출 1회 예외 사유(doctor.review cap-override 기록)')
-  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; contextPack?: boolean; json?: boolean; save?: string; sinceReview?: string; overCapReason?: string }) => {
+  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; contextPack?: boolean; json?: boolean; save?: string; sinceReview?: string; full?: boolean; overCapReason?: string }) => {
     const prArgs = prParts.flatMap((p) => String(p).split(/[,\s]+/).filter(Boolean)); // 번호/#번호/URL·콤마목록.
     if (!prArgs.length) { ui.error('PR 필요: elanous self review <번호|URL> [..]'); process.exit(2); }
     // ⭐ 본문은 seam(`runSelfReviewCliCommand`)에 있다 — 이 액션은 **의존 배선만** 한다.
@@ -12477,6 +12614,18 @@ export function filterDashboardArgs(rawArgs: readonly string[], resumeFlagIdx?: 
 }
 
 async function main(): Promise<void> {
+  try {
+    // The flag is normally consumed during module initialization; this idempotent application also
+    // covers programmatic runCli() calls before any queued report reads user settings.
+    applyConfigDirFlagFromArgv();
+    const { flushCrashQueue, installFatalErrorHandlers } = await import('./error-report/report.js');
+    installFatalErrorHandlers('cli');
+    const outcome = await flushCrashQueue();
+    if (outcome.sent > 0) console.error(`이전 실행의 치명 오류 보고 ${outcome.sent}건을 전송했습니다.`);
+    else if (outcome.consentSkipped > 0) console.error('이전 실행의 치명 오류 기록이 있으나 동의가 없어 전송하지 않았습니다.');
+    else if (outcome.disabledSkipped > 0) console.error('이전 실행의 치명 오류 기록이 있으나 오류 보고가 꺼져 있어 전송하지 않았습니다.');
+    else if (outcome.skipped > 0) console.error(`이전 실행의 치명 오류 기록 ${outcome.skipped}건은 손상되었거나 전송할 수 없어 건너뛰었습니다.`);
+  } catch { /* crash reporting must not change command startup */ }
   // TUI-BOOT-TIMING-HOLES — «프로세스→sink» 구간(10:40 실측 9.3s). 그 9.3s 의 대부분은 이 모듈이
   //   import 되는 동안(모듈 로드) 흐르므로, main() 진입만 재면 구간을 잘라 먹는다. `performance.now()`
   //   의 기준점은 프로세스 시작(`performance.timeOrigin`)이라 sink 등록 직전의 «절대값» 이 곧
@@ -12820,7 +12969,7 @@ async function main(): Promise<void> {
       try {
         const result = await runFirstRun({ config: cfg, setupWhenNoProvider: async (config) => {
           const { runFirstRunProviderSetup } = await import('./cli/setup-keys.js');
-          return runFirstRunProviderSetup(setupIO, { config });
+          return runFirstRunProviderSetup(setupIO, { config, loginWithCodex });
         } });
         if (result.outcome !== 'ready') return;
       } finally { setupIO.close(); }
@@ -13146,12 +13295,8 @@ export function runCli(): void {
       debug.log('cli.friendly-error', 'shown', { code: friendlyCode, locale });
       process.exit(1);
     }
-    // ER1 — a real crash is reported once (consented · scrubbed · never blocks more than the send timeout).
-    try {
-      const { reportError } = await import('./error-report/report.js');
-      const outcome = await reportError({ code: 'cli-crash', message: err instanceof Error ? `${err.name}: ${err.message}` : String(err), ...(err instanceof Error && err.stack ? { stack: err.stack } : {}), surface: 'cli' });
-      if (outcome.sent) console.error(`오류를 운영팀에 알렸습니다${outcome.reportId ? ` (보고 번호 ${outcome.reportId})` : ''}.`);
-    } catch { /* the crash itself is what matters */ }
+    // The uncaughtExceptionMonitor records this unexpected crash without intercepting the runtime's
+    // normal diagnostic/exit path. Avoid a second immediate report that would leave the spool copy behind.
     throw err;
   });
 }

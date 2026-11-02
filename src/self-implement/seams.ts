@@ -20,7 +20,7 @@ import { spawn, spawnSync, execFile } from 'node:child_process';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createArtifactStore } from '../artifact/index.js';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { configuredWorktreeRoot, getUserConfig, resolveActiveProvider, resolveRoleLlm } from '../user-config.js';
@@ -133,6 +133,46 @@ import { evaluateTermination } from '../auto-research/termination-dsl.js';
 import { withIndependentChecker } from '../conductor/termination-checker.js';
 
 const GIT_TIMEOUT = 20_000;
+
+export async function enqueueThroughPinnedLandTrain(
+  input: { cwd: string; number: number; expectedHeadCommit: string },
+  runtime: { scriptPath?: string } = {},
+): Promise<{ pending: readonly { number: number; head: string }[] }> {
+  const allowedSeats = ['OP', 'MK', 'TC', 'UX', 'OPC', 'OPT', 'tf'] as const;
+  const cwdSeat = input.cwd.replaceAll('\\', '/').match(/\/(?:worktrees|seats)\/([^/]+)(?:\/|$)/)?.[1];
+  const seat = process.env.ELANOUS_SEAT ?? cwdSeat;
+  if (!seat || !allowedSeats.includes(seat as (typeof allowedSeats)[number])) {
+    throw new Error('land-enqueue seat identity unavailable; refusing to guess train owner');
+  }
+  if (!/^[0-9a-f]{40}$/i.test(input.expectedHeadCommit)) throw new Error('land-enqueue requires a full pinned head SHA');
+
+  const script = runtime.scriptPath ?? join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'tools', 'land-enqueue.sh');
+  let stdout: string;
+  let stderr: string;
+  try {
+    ({ stdout, stderr } = await execFileAsync(script, [
+      String(input.number), `train:${seat}`, '--expected-head', input.expectedHeadCommit,
+    ], { cwd: input.cwd, env: { ...process.env }, encoding: 'utf8', timeout: 180_000, maxBuffer: 2 * 1024 * 1024 }));
+  } catch (error) {
+    const failure = error as Error & { stdout?: string; stderr?: string; code?: number | string };
+    throw new Error(`land-enqueue failed (rc=${failure.code ?? 'unknown'}): ${(failure.stderr || failure.stdout || failure.message).trim().slice(0, 700)}`);
+  }
+  const receipt = stdout.split(/\r?\n/).find((line) => line.startsWith(
+    `OK #${input.number} head=${input.expectedHeadCommit.slice(0, 12)} headFull=${input.expectedHeadCommit.toLowerCase()}`,
+  ));
+  if (!receipt) throw new Error(`land-enqueue did not confirm pinned PR/head: ${(stderr || stdout).trim().slice(0, 500) || 'empty output'}`);
+
+  const queuePath = process.env.LAND_Q
+    ? resolve(input.cwd, process.env.LAND_Q)
+    : join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'land-queue.tsv');
+  const rows = readFileSync(queuePath, 'utf8').split(/\r?\n/)
+    .map((line) => line.split('\t'))
+    .filter((parts) => parts[0] === String(input.number));
+  if (rows.length !== 1 || rows[0]?.[1]?.toLowerCase() !== input.expectedHeadCommit.toLowerCase()) {
+    throw new Error(`land-enqueue receipt did not preserve one exact queue row for #${input.number}`);
+  }
+  return { pending: [{ number: input.number, head: rows[0]![1]! }] };
+}
 
 type GitCallContext = {
   repositoryRoot: string | null;
@@ -1691,6 +1731,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     },
 
     defaultBranchRef,
+    enqueueGateDeferredPr: enqueueThroughPinnedLandTrain,
     // ★ G2(2026-07-21) — 호출부가 해석한 대상만 PR 직전에 정합한다.
     mergeMain: async (worktreePath, mergeTarget) => {
       // BENCH-ISOLATED-ARMS ③ — 벤치 팔은 main 에 정합하지 않는다: 판정은 고정 base 위 게이트·시험·리뷰.

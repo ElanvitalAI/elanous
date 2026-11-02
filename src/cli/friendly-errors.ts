@@ -83,6 +83,10 @@ export function classifyFriendlyError(err: unknown): FriendlyErrorCode | null {
   const msg = messageOf(err);
   const errno = errnoOf(err);
 
+  // A blank host cannot have the Codex owner mirror yet. Treat this internal
+  // guard as a missing-login condition so the top-level CLI shows the normal
+  // browser OAuth entry point instead of exposing the guard and stack trace.
+  if (/CODEX_OWNER_MIRROR_REQUIRED/i.test(`${msg}\n${errno}`)) return 'credential-missing';
   if (/provider-model compatibility/i.test(msg)) return 'model-unavailable';
   if (/\bunknown provider:/i.test(msg)) return 'provider-unknown';
   if (/\bunavailable:\s+(set|run|configure)\b/i.test(msg)) return 'credential-missing';

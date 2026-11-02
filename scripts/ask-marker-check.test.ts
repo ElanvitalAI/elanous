@@ -8,7 +8,7 @@ import { GOAL_TYPES } from '../src/self-implement/goal-author.js';
 import {
   inspectNarrowedTestSignalWarnings, inspectAbsenceCountSignalWarnings, inspectUnportedIsolatedDaemonWarnings, inspectConditionObservationPairWarnings, inspectAskMarkers, inspectAskMarkersInRoot, inspectConsumerPathWarning, inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations, inspectWrappedMarkerWarnings, bunTestFileLaunchesRepositoryExecutable, formatAxis, formatAxisObservations, main } from './ask-marker-check.js';
 
-// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+// Keep one real Bun CLI entry-point check and the different-cwd contract; the repeated diagnostic matrix uses main() in-process.
 setDefaultTimeout(60_000);
 
 const script = fileURLToPath(new URL('./ask-marker-check.ts', import.meta.url));
@@ -152,9 +152,7 @@ const PRESENT_BUT_UNEXTRACTED = `대상 경로: scripts/x.ts
 `;
 
 /** ⭐ GATE-SPEED ③(2026-10-08): CLI 출력 계약을 «같은 프로세스»에서 `main()` 으로 잰다.
- *  초판은 호출마다 `bun scripts/ask-marker-check.ts` 를 새로 띄웠고(92회 · 건당 ≈1s · 게이트 873s),
- *  잰 것은 spawn 이 아니라 `main()` 의 stdout/stderr/rc 였다. ⛔ 실물 진입점 배선은 아래 «읽기 실패»·
- *  「쓰는 법」 describe 의 실물 spawn 과 `cwd` 를 준 호출(다른 작업 디렉토리 계약)이 계속 문다. */
+ *  출력·stderr·rc 는 얇은 console capture 로 수집하고, fixture 파일은 시스템 임시 디렉터리에 둔다. */
 function runMainInProcess(files: readonly string[]): { status: number | null; stdout: string; stderr: string } {
   const out: string[] = [];
   const err: string[] = [];
@@ -174,10 +172,12 @@ function runCli(ask: string, cwd?: string): { status: number | null; stdout: str
   const file = join(dir, 'ask.md');
   try {
     writeFileSync(file, ask);
-    // `cwd` 를 준 호출은 «작업 디렉토리와 무관하다»는 계약 자체를 재므로 실물 프로세스로 띄운다.
-    if (cwd === undefined) return runMainInProcess([file]);
-    const r = spawnSync(process.execPath, [script, file], { cwd, encoding: 'utf8' });
-    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+    // A supplied cwd exercises the actual executable from outside the repository.
+    if (cwd !== undefined) {
+      const result = spawnSync(process.execPath, [script, file], { cwd, encoding: 'utf8' });
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+    }
+    return runMainInProcess([file]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -499,7 +499,7 @@ describe('ask marker check — CLI 종료 경로', () => {
     expect(r.stdout).toContain('❌ 불변식 경로 — 1개 불변식 줄이 «실재하지도, 대상 경로로 선언되지도» 않은 경로만 댄다');
   });
 
-  it('counts a repository-root file from a different working directory', () => {
+  it('counts a repository-root file from a different working directory through the real Bun CLI', () => {
     const r = runCli(ROOT_FILE_INVARIANT, tmpdir());
 
     expect(r.status).toBe(0);
@@ -533,7 +533,7 @@ describe('ask marker check — CLI 종료 경로', () => {
 경계: 다른 스크립트는 대상이 아니다.
 판정 신호: 조건 = A; 관측 = B; 기대 = C 가 있다.
 `;
-      const r = runCli(ask, repositoryRoot);
+      const r = runCli(ask);
 
       expect(r.status).toBe(1);
       expect(r.stdout).toContain('❌ 불변식 경로 — 1개 불변식 줄이 «실재하지도, 대상 경로로 선언되지도» 않은 경로만 댄다');
@@ -637,11 +637,11 @@ describe('ask marker check — CLI 종료 경로', () => {
     expect(r.stderr).toBe('');
   });
 
-  it('exits 2 and says how to use it when given no file', () => {
-    const r = spawnSync(process.execPath, [script], { encoding: 'utf8' });
+  it('the real Bun CLI exits 2 and prints usage when given no file', () => {
+    const result = spawnSync(process.execPath, [script], { cwd: repositoryRoot, encoding: 'utf8' });
 
-    expect(r.status).toBe(2);
-    expect(r.stderr).toContain('쓰는 법');
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('쓰는 법');
   });
 });
 
@@ -649,7 +649,7 @@ describe('ask marker check — 읽기 실패', () => {
   it('reports an unreadable file in exactly one clean line with no stack frames', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ask-marker-missing-'));
     try {
-      const r = spawnSync(process.execPath, [script, join(dir, 'no-such-ask.md')], { encoding: 'utf8' });
+      const r = runMainInProcess([join(dir, 'no-such-ask.md')]);
       const lines = r.stderr.split('\n').filter((line) => line.trim().length > 0);
       const diagnostic = lines.filter((line) => !line.includes('경로를 확인하라') && !line.includes('마커를 온전히'));
 
@@ -669,7 +669,7 @@ describe('ask marker check — 읽기 실패', () => {
   it('suppresses stack and source lines for a directory argument too', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ask-marker-dir-'));
     try {
-      const r = spawnSync(process.execPath, [script, dir], { encoding: 'utf8' });
+      const r = runMainInProcess([dir]);
       const diagnostic = r.stderr.split('\n')
         .filter((line) => line.trim().length > 0)
         .filter((line) => !line.includes('경로를 확인하라') && !line.includes('마커를 온전히'));
@@ -689,7 +689,7 @@ describe('ask marker check — 읽기 실패', () => {
     try {
       const empty = join(dir, 'empty.md');
       writeFileSync(empty, '');
-      const r = spawnSync(process.execPath, [script, join(dir, 'no-such.md'), empty], { encoding: 'utf8' });
+      const r = runMainInProcess([join(dir, 'no-such.md'), empty]);
 
       expect(r.status).toBe(1);
       expect(r.stderr).toContain('1개 파일을 «읽지 못했다» — 경로를 확인하라');
@@ -704,7 +704,7 @@ describe('ask marker check — 읽기 실패', () => {
     try {
       const empty = join(dir, 'empty.md');
       writeFileSync(empty, '');
-      const r = spawnSync(process.execPath, [script, empty], { encoding: 'utf8' });
+      const r = runMainInProcess([empty]);
 
       expect(r.status).toBe(1);
       expect(r.stdout).toContain('마커가 «없다»');

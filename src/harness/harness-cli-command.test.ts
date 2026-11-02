@@ -29,6 +29,7 @@ import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/po
 import { HostPoolLease } from '../pod-lease/host-lease.js';
 import { createFakeKubectl } from '../ux-sim/fake-kubectl.js';
 import { createFakeGh } from '../ux-sim/fake-gh.js';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
 import { assessRunningRuns, buildRunProgressRows, renderRunProgressTable } from '../self-implement/running-runs.js';
@@ -2544,6 +2545,7 @@ describe('harness CLI command', () => {
     const root = mkdtempSync(join(tmpdir(), `pod-preflight-parent-${crypto.randomUUID()}-`));
     const origin = mkdtempSync(join(tmpdir(), `pod-preflight-origin-${crypto.randomUUID()}-`));
     const goal = join(root, 'goal.md');
+    const trafficSignal = join(root, 'traffic.json');
     const previousCwd = process.cwd();
     execFileSync('git', ['init', '-q', '-b', 'main', root]);
     execFileSync('git', ['-C', root, 'config', 'user.name', 'Harness CLI test']);
@@ -2557,6 +2559,7 @@ describe('harness CLI command', () => {
     execFileSync('git', ['-C', root, 'remote', 'add', 'origin', origin]);
     execFileSync('git', ['-C', origin, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
     const previousState = process.env.ELANOUS_STATE_DIR;
+    const previousTrafficSignal = process.env.ELANOUS_TRAFFIC_SIGNAL;
     const previousExit = process.exitCode;
     const errors: string[] = [];
     const logs: Array<{ category: string; event: string; data: unknown }> = [];
@@ -2564,6 +2567,8 @@ describe('harness CLI command', () => {
     const originalLog = debug.log;
     process.chdir(root);
     process.env.ELANOUS_STATE_DIR = root;
+    writeFileSync(trafficSignal, JSON.stringify({ global: 'green', podTarget: 0 }));
+    process.env.ELANOUS_TRAFFIC_SIGNAL = trafficSignal;
     process.exitCode = 0;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     debug.log = ((category: string, event: string, data?: unknown) => { logs.push({ category, event, data }); }) as typeof debug.log;
@@ -2586,6 +2591,8 @@ describe('harness CLI command', () => {
       process.chdir(previousCwd);
       if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previousState;
+      if (previousTrafficSignal === undefined) delete process.env.ELANOUS_TRAFFIC_SIGNAL;
+      else process.env.ELANOUS_TRAFFIC_SIGNAL = previousTrafficSignal;
       rmSync(root, { recursive: true, force: true });
       rmSync(origin, { recursive: true, force: true });
     }
@@ -2697,8 +2704,21 @@ describe('harness CLI command', () => {
       expect(applied[0]).toContain('goal-0');
       expect(applied[1]).toContain('goal-1');
       expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
-      await Bun.sleep(10);
+      const stayedQueued = await withSimClock(0, async (clock) => {
+        let windowElapsed = false;
+        let thirdSettled = false;
+        void third.then(() => { thirdSettled = true; }, () => { thirdSettled = true; });
+        const window = new Promise<void>((resolve) => {
+          setTimeout(() => { windowElapsed = true; resolve(); }, 10);
+        });
+        await Promise.resolve();
+        clock.tick(10);
+        await window;
+        return windowElapsed && !thirdSettled;
+      });
+      expect(stayedQueued).toBe(true);
       expect(applied).toHaveLength(2);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
       completed.add(applied[0]!);
       await jobs[0]!.done;
       await waitForApplied(3);

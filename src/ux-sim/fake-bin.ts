@@ -13,7 +13,7 @@
 // ⛔ This is not a simulator of the real tool: a spec only fixes stdout · stderr ·
 // exit code · lifetime, and records argv. Behaviour of the real tool stays with
 // tests that run where the tool exists.
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join } from 'node:path';
@@ -230,5 +230,76 @@ export async function withFakeBins<T>(
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
     fakeBins.cleanup();
+  }
+}
+
+/** Result receipt for a fake executable run, including the process result seen by the caller. */
+export interface FakeExecutableRun {
+  readonly name: string;
+  readonly argv: readonly string[];
+  readonly stdout: string | null;
+  readonly stderr: string | null;
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly error?: string;
+}
+
+export interface FakeExecutableDevice extends FakeBins {
+  /** Invocation argv captured by the executable shims. */
+  calls(): FakeBinCall[];
+  /** Results captured by run(), in invocation order. */
+  runs(): FakeExecutableRun[];
+  /** Spawn the registered fake by absolute shim path and capture its result without PATH fallback. */
+  run(
+    name: string,
+    argv?: readonly string[],
+    options?: Omit<SpawnSyncOptionsWithStringEncoding, 'encoding' | 'env' | 'shell'> & { env?: NodeJS.ProcessEnv },
+  ): SpawnSyncReturns<string>;
+}
+
+/** Create isolated PATH shims and a result recorder for external executable boundaries. */
+export function createFakeExecutableDevice(specs: Readonly<Record<string, FakeBinSpec>>): FakeExecutableDevice {
+  const bins = createFakeBins(specs);
+  const registeredNames = new Set(Object.keys(specs));
+  const observations: FakeExecutableRun[] = [];
+
+  return {
+    ...bins,
+    runs: () => observations.map((run) => ({ ...run, argv: [...run.argv] })),
+    run(name, argv = [], options = {}) {
+      if (!registeredNames.has(name)) throw new Error(`fake-bin: run requires a registered executable name: ${JSON.stringify(name)}`);
+      // This seam must preserve argv boundaries. Node's shell mode joins argv into a command string,
+      // so metacharacters can run outside the registered fake executable.
+      if (Object.hasOwn(options, 'shell')) throw new Error('fake-bin: run does not support shell; argv must remain literal');
+      if (options.stdio !== undefined && options.stdio !== 'pipe') {
+        throw new Error('fake-bin: run only supports stdio=pipe so output receipts remain observable');
+      }
+      const basePath = options.env?.PATH ?? process.env.PATH ?? '';
+      const env = { ...process.env, ...options.env, PATH: bins.path(basePath) };
+      const result = spawnSync(bins.bin(name), [...argv], { ...options, encoding: 'utf8', env });
+      observations.push({
+        name,
+        argv: [...argv],
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status,
+        signal: result.signal,
+        ...(result.error ? { error: result.error.message } : {}),
+      });
+      return result;
+    },
+  };
+}
+
+/** Create the device for one scoped callback and always remove its temporary PATH tree. */
+export async function withFakeExecutableDevice<T>(
+  specs: Readonly<Record<string, FakeBinSpec>>,
+  run: (device: FakeExecutableDevice) => T | Promise<T>,
+): Promise<T> {
+  const device = createFakeExecutableDevice(specs);
+  try {
+    return await run(device);
+  } finally {
+    device.cleanup();
   }
 }

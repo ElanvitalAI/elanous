@@ -4,11 +4,12 @@
 //    그대로 읽고, 거부 줄 원문·cardId·PR·head 를 그 간선 한 행에 묶는지만 문다.
 // 🔎 관측: `self-implement` / `graph-edge-taken` { from: merge, on: recovery, label: land-refused, to: recover, call: recover@1 }
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
+import { LogStore } from '../mss/logging/log-store.js';
 import { readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
 import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
@@ -149,7 +150,7 @@ test('an unpinned refusal is not bound — recover@1 needs pinned identity', asy
 });
 
 // ⭐ 생산 경로 실물 — TA 의 진짜 `defaultLand` 가 진짜 CLI(`bin/elanous.mjs pr land`)를 띄우고,
-//    fake gh(PATH shim · src/ux-sim/fake-bin)가 draft 를 돌려 거부를 세운다. 격리 config-dir 의 logs 를 진짜 `logs` CLI 로 읽는다.
+//    fake gh(PATH shim · src/ux-sim/fake-bin)가 draft 를 돌려 거부를 세운다. 격리 logs.db 는 LogStore 읽기 전용 API로 읽어 별도 CLI 부팅을 피한다.
 test('TA defaultLand → real pr land refusal → graph-edge-taken recover@1 row with the same cardId · merge SHA absent', async () => {
   const root = mkdtempSync(join(tmpdir(), 'land-refusal-edge-ta-'));
   const repo = join(root, 'repo');
@@ -160,7 +161,8 @@ test('TA defaultLand → real pr land refusal → graph-edge-taken recover@1 row
     expect(r.status).toBe(0);
     return r.stdout.trim();
   };
-  spawnSync('mkdir', ['-p', repo, configDir]);
+  mkdirSync(repo);
+  mkdirSync(configDir);
   git('init', '-q', '-b', 'main');
   git('-c', 'user.email=mock@example.invalid', '-c', 'user.name=mock', 'commit', '-q', '--allow-empty', '-m', 'base');
   const head = git('rev-parse', 'HEAD');
@@ -182,12 +184,12 @@ test('TA defaultLand → real pr land refusal → graph-edge-taken recover@1 row
     expect(outcome.status).toBe(1);
     expect(outcome.stderr ?? '').toContain(DRAFT_REFUSAL);
     expect(fakes.calls().some((call) => call.argv.join(' ').startsWith('pr merge'))).toBe(false);
-    const logs = spawnSync(process.execPath, [join(import.meta.dir, '../../bin/elanous.mjs'), '--config-dir', configDir,
-      'logs', '--instance', `test:${instanceName}`, '--event', 'graph-edge-taken', '--since', '10m', '--json', '--json-data'], {
-      encoding: 'utf8', env: { ...process.env, ELANOUS_STATE_DIR: configDir }, timeout: 60_000,
-    });
-    const parsed = logs.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { data?: unknown; _meta?: unknown }).filter((row) => row._meta === undefined);
-    const data = parsed.map((row) => (typeof row.data === 'string' ? JSON.parse(row.data) : row.data) as Record<string, unknown>);
+    const logs = LogStore.openReadOnly(join(configDir, 'logs', 'logs.db'));
+    let data: Record<string, unknown>[];
+    try {
+      data = logs.query({ instances: [`test:${instanceName}`], events: ['graph-edge-taken'], sinceMs: Date.now() - 10 * 60_000 })
+        .map((row) => JSON.parse(row.data ?? 'null') as Record<string, unknown>);
+    } finally { logs.close(); }
     const bound = data.filter((row) => row.on === 'recovery' && row.call === 'recover@1');
     // 영수증 — 다른 자리가 같은 줄을 다시 친다.
     console.log(`[land-refusal-edge] refusal=${JSON.stringify((outcome.stderr ?? '').trim().split('\n').find((l) => l.startsWith('✗ expected-head')))}`);

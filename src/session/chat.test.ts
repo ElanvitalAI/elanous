@@ -1,11 +1,14 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, LLMMessage, LLMOpts, LLMProvider, LLMToolSpec, StreamWithToolsHandlers } from '../llm.js';
+import * as actualLlm from '../llm.js';
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../agent/terminal-surface.js';
 import * as actualMemory from '../memory.js';
+import * as actualSurfaceEvents from '../domains/surface-events.js';
+import * as actualUserIntent from '../user-intent/index.js';
 import { debug } from '../debug/log.js';
 import { compactSessionHistory } from './compact-session.js';
 import { appendMessage, createSession, loadSession, rewriteSessionMessages } from './index.js';
@@ -24,26 +27,16 @@ const OMIT_DISPATCH_CTX = Symbol('omit-dispatch-ctx');
 let nextDispatchCtx: unknown = OMIT_DISPATCH_CTX;
 let activeStreamScript: ((messages: LLMMessage[], handlers: StreamWithToolsHandlers) => Promise<string>) | undefined;
 
-mock.module('../memory.js', () => ({
-  ...actualMemory,
-  buildMemoryInjection: () => ({ block: '', injectedIds: [] }),
-  buildMemoryInjectionLLM: async () => ({ block: '', injectedIds: [] }),
-}));
-
-mock.module('../domains/surface-events.js', () => ({
-  openSurfaceEventsDb: () => ({ close() {} }),
-  recallEvents: () => [],
-}));
-
-mock.module('../user-intent/index.js', () => ({
-  userIntentLogger: () => ({ emit() {} }),
-}));
-
-mock.module('../llm.js', () => ({
-  getProviderForConfig: () => activeProvider,
-  isAuthRejectionError: () => false,
-  getToolLoopPhaseRejectedTools: () => null,
-  streamLLMWithTools: async (
+const chatTestSpies = [
+  spyOn(actualMemory, 'buildMemoryInjection').mockReturnValue({ block: '', tokens: 0, injectedIds: [] }),
+  spyOn(actualMemory, 'buildMemoryInjectionLLM').mockResolvedValue({ block: '', tokens: 0, injectedIds: [] }),
+  spyOn(actualSurfaceEvents, 'openSurfaceEventsDb').mockImplementation(() => ({ close() {} } as never)),
+  spyOn(actualSurfaceEvents, 'recallEvents').mockReturnValue([]),
+  spyOn(actualUserIntent, 'userIntentLogger').mockImplementation(() => ({ emit: () => null } as never)),
+  spyOn(actualLlm, 'getProviderForConfig').mockImplementation(() => activeProvider as LLMProvider),
+  spyOn(actualLlm, 'isAuthRejectionError').mockReturnValue(false),
+  spyOn(actualLlm, 'getToolLoopPhaseRejectedTools').mockReturnValue(null),
+  spyOn(actualLlm, 'streamLLMWithTools').mockImplementation(async (
     messages: LLMMessage[],
     _handlers: StreamWithToolsHandlers,
     opts: LLMOpts & { tools?: LLMToolSpec[]; provider?: LLMProvider } = {},
@@ -62,8 +55,12 @@ mock.module('../llm.js', () => ({
       );
     streamCalls.push({ messages, opts, dispatchResult });
     return 'ok';
-  },
-}));
+  }),
+];
+
+afterAll(() => {
+  for (const spy of chatTestSpies) spy.mockRestore();
+});
 
 const { runTurn } = await import('./chat.js');
 const coreTurnModule = await import('../core-turn/index.js');

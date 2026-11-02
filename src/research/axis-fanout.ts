@@ -23,6 +23,8 @@ export interface AxisEvidenceGroup {
   questionId: string;
   evidence: ResearchEvidenceEnvelope[];
   error?: string;
+  /** Set only by native search/tool budget guards, never inferred from provider text. */
+  budgetExhausted?: boolean;
 }
 
 export interface AxisFanoutResult {
@@ -34,6 +36,14 @@ export type AxisSearchHit = WebSearchHit & { engine?: string };
 export interface AxisSearchResult {
   hits: AxisSearchHit[];
   errors: string[];
+  /** Native aggregate search deadline signal; provider messages cannot set this field. */
+  budgetExhausted?: boolean;
+}
+interface TimedAxisSearchResult extends AxisSearchResult {
+  observedAt: string;
+  fetchedPage?: { url: string; output: string };
+  fetchedPageObservedAt?: string;
+  fetchedPagePublishedAt?: string;
 }
 export interface AxisSearchContext {
   questionPrompt?: string;
@@ -46,6 +56,8 @@ export interface AxisFanoutDeps {
   fetchPage?: (url: string, question: BloomResearchQuestion, signal?: AbortSignal) => Promise<{ url: string; output: string }>;
   signal?: AbortSignal;
   admitToolCall?: (toolName: 'OmniSearch' | 'WebFetch') => boolean;
+  /** Observation clock seam for deterministic source-reference dates. */
+  now?: () => number;
 }
 
 interface ProviderHealth {
@@ -65,6 +77,7 @@ export function createResearchAxisSearcher(
   const allowed = [...webFallback];
   const health = new Map(allowed.map(provider => [provider.id, { failures: 0, open: false }]));
   const deadline = now() + RESEARCH_SEARCH_BUDGET_MS;
+  let searchBudgetExhausted = false;
   const tails = new Map<string, Promise<void>>();
 
   debug.log('research.search', 'provider-preflight', {
@@ -85,12 +98,15 @@ export function createResearchAxisSearcher(
   return async (query, signal) => {
     const hits: AxisSearchHit[] = [];
     const errors: string[] = [];
+    let budgetExhausted = searchBudgetExhausted;
     const execute = async (provider: WebSearchProvider): Promise<boolean> => enqueue(provider.id, async () => {
       const state = health.get(provider.id)!;
       if (state.open) return false;
       const remainingMs = deadline - now();
       if (remainingMs <= 0) {
         state.open = true;
+        searchBudgetExhausted = true;
+        budgetExhausted = true;
         errors.push(`${provider.id}: research search budget exhausted`);
         return false;
       }
@@ -152,7 +168,7 @@ export function createResearchAxisSearcher(
     };
     await runWebFallback();
     if (hits.length === 0 && errors.length === 0) errors.push('no healthy Exa/Firecrawl research provider');
-    return { hits, errors };
+    return { hits, errors, ...(budgetExhausted || searchBudgetExhausted ? { budgetExhausted: true } : {}) };
   };
 }
 
@@ -164,28 +180,34 @@ export function planAxisToolCalls(questions: readonly BloomResearchQuestion[]): 
     .map(query => ({ questionId: question.id, tool: 'OmniSearch' as const, query })));
 }
 
-function evidenceFromHit(question: BloomResearchQuestion, hit: AxisSearchHit): ResearchEvidenceEnvelope {
-  const published = hit.publishedAt;
-  const date = published !== undefined && Number.isFinite(published) && published > 0
-    ? new Date(published) : undefined;
-  const observedAt = date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+function evidenceFromHit(question: BloomResearchQuestion, hit: AxisSearchHit, observedAt: string): ResearchEvidenceEnvelope {
+  const publishedAt = publishedDateFromHit(hit);
   return {
     questionId: question.id,
     sourceKind: hit.engine ? `web-search:${hit.engine}` : 'web-search',
     source: hit.url,
+    observedAt,
     ...(question.requestedWindow ? { requestedWindow: question.requestedWindow } : {}),
-    ...(observedAt ? { observedAt } : {}),
+    ...(publishedAt ? { publishedAt } : {}),
     content: [hit.title, hit.snippet].filter(Boolean).join(' — '),
     outcome: hit.snippet ? 'complete' : 'partial',
     truncated: true, // Search snippets are excerpts, not the complete source page.
   };
 }
 
-function failedEvidence(question: BloomResearchQuestion, query: string, message: string): ResearchEvidenceEnvelope {
+function publishedDateFromHit(hit: AxisSearchHit): string | undefined {
+  const published = hit.publishedAt;
+  const date = published !== undefined && Number.isFinite(published) && published > 0
+    ? new Date(published) : undefined;
+  return date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+function failedEvidence(question: BloomResearchQuestion, query: string, message: string, observedAt: string): ResearchEvidenceEnvelope {
   return {
     questionId: question.id,
     sourceKind: 'search-query',
     source: query,
+    observedAt,
     ...(question.requestedWindow ? { requestedWindow: question.requestedWindow } : {}),
     content: message,
     outcome: 'failed',
@@ -198,6 +220,8 @@ export async function fanOutAxisEvidence(
   questions: readonly BloomResearchQuestion[],
   deps: AxisFanoutDeps = {},
 ): Promise<AxisFanoutResult> {
+  const now = deps.now ?? Date.now;
+  const referenceTime = (): string => new Date(now()).toISOString();
   const plan = planAxisToolCalls(questions);
   if (new Set(questions.map(question => question.id)).size !== questions.length) {
     throw new Error('research axis question IDs must be unique');
@@ -210,26 +234,44 @@ export async function fanOutAxisEvidence(
   const fetchedQuestions = new Set<string>();
   const settled = await Promise.allSettled(plan.map(async call => {
     if (deps.admitToolCall && !deps.admitToolCall('OmniSearch')) {
-      return { hits: [], errors: ['research tool budget reached'] } satisfies AxisSearchResult;
+      return {
+        hits: [], errors: ['research tool budget reached'], budgetExhausted: true, observedAt: referenceTime(),
+      } satisfies TimedAxisSearchResult;
     }
     const question = questions.find(candidate => candidate.id === call.questionId)!;
-    const raw = await search(call.query, deps.signal, {
-      questionPrompt: question.prompt,
-      requestedWindow: question.requestedWindow,
-    });
+    let raw: AxisSearchHit[] | AxisSearchResult;
+    try {
+      raw = await search(call.query, deps.signal, {
+        questionPrompt: question.prompt,
+        requestedWindow: question.requestedWindow,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { hits: [], errors: [message], observedAt: referenceTime() } satisfies TimedAxisSearchResult;
+    }
+    const observedAt = referenceTime();
     const response = Array.isArray(raw) ? { hits: raw, errors: [] } : raw;
-    if (!fetchPage || response.hits.length === 0 || fetchedQuestions.has(question.id)) return response;
+    if (!fetchPage || response.hits.length === 0 || fetchedQuestions.has(question.id)) {
+      return { ...response, observedAt } satisfies TimedAxisSearchResult;
+    }
     fetchedQuestions.add(question.id);
-    if (deps.admitToolCall && !deps.admitToolCall('WebFetch')) return response;
+    if (deps.admitToolCall && !deps.admitToolCall('WebFetch')) {
+      return { ...response, budgetExhausted: true, observedAt } satisfies TimedAxisSearchResult;
+    }
     try {
       const page = await fetchPage(response.hits[0]!.url, question, deps.signal);
-      return { ...response, fetchedPage: page };
+      const fetchedPagePublishedAt = page.url === response.hits[0]!.url
+        ? publishedDateFromHit(response.hits[0]!) : undefined;
+      return {
+        ...response, observedAt, fetchedPage: page, fetchedPageObservedAt: referenceTime(),
+        ...(fetchedPagePublishedAt ? { fetchedPagePublishedAt } : {}),
+      } satisfies TimedAxisSearchResult;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       debug.log('research.search', 'native-fetch-failed', {
         questionId: question.id, reason: message.slice(0, 200),
       }, { level: 'warn' });
-      return response;
+      return { ...response, observedAt } satisfies TimedAxisSearchResult;
     }
   }));
   const axes: AxisEvidenceGroup[] = questions.map(question => ({ questionId: question.id, evidence: [] }));
@@ -239,27 +281,35 @@ export async function fanOutAxisEvidence(
     if (!plan.some(call => call.questionId === question.id)) {
       const group = groups.get(question.id)!;
       group.error = 'no search terms';
-      group.evidence.push(failedEvidence(question, question.prompt, group.error));
+      group.evidence.push(failedEvidence(question, question.prompt, group.error, referenceTime()));
     }
   }
   settled.forEach((outcome, index) => {
     const call = plan[index]!;
     const group = groups.get(call.questionId)!;
     const question = byQuestion.get(call.questionId)!;
+    const observedAt = outcome.status === 'fulfilled' ? outcome.value.observedAt : referenceTime();
     if (outcome.status === 'fulfilled') {
       const response = outcome.value;
+      if (response.budgetExhausted) group.budgetExhausted = true;
       if (response.hits.length === 0 && response.errors.length === 0) {
-        group.evidence.push({ ...failedEvidence(question, call.query, 'no hits returned'), outcome: 'partial' });
+        group.evidence.push({ ...failedEvidence(question, call.query, 'no hits returned', observedAt), outcome: 'partial' });
       }
       const fetchedPage = 'fetchedPage' in response ? response.fetchedPage : undefined;
       if (fetchedPage) {
         const content = fetchedPage.output;
         const excerpt = Array.from(content).slice(0, 8_000).join('');
+        const fetchedPageObservedAt = 'fetchedPageObservedAt' in outcome.value
+          ? outcome.value.fetchedPageObservedAt : undefined;
+        const fetchedPagePublishedAt = 'fetchedPagePublishedAt' in outcome.value
+          ? outcome.value.fetchedPagePublishedAt : undefined;
         group.evidence.push({
           questionId: question.id,
           sourceKind: 'web-fetch',
           source: fetchedPage.url,
+          observedAt: fetchedPageObservedAt ?? observedAt,
           ...(question.requestedWindow ? { requestedWindow: question.requestedWindow } : {}),
+          ...(fetchedPagePublishedAt ? { publishedAt: fetchedPagePublishedAt } : {}),
           content: excerpt,
           outcome: excerpt ? 'complete' : 'partial',
           truncated: Array.from(content).length > 8_000,
@@ -267,21 +317,21 @@ export async function fanOutAxisEvidence(
       }
       for (const hit of response.hits) {
         try {
-          group.evidence.push(evidenceFromHit(question, hit));
+          group.evidence.push(evidenceFromHit(question, hit, observedAt));
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           group.error = group.error ? `${group.error}; ${message}` : message;
-          group.evidence.push(failedEvidence(question, call.query, message));
+          group.evidence.push(failedEvidence(question, call.query, message, observedAt));
         }
       }
       for (const message of response.errors) {
         group.error = group.error ? `${group.error}; ${message}` : message;
-        group.evidence.push(failedEvidence(question, call.query, message));
+        group.evidence.push(failedEvidence(question, call.query, message, observedAt));
       }
     } else {
       const message = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
       group.error = group.error ? `${group.error}; ${message}` : message;
-      group.evidence.push(failedEvidence(question, call.query, message));
+      group.evidence.push(failedEvidence(question, call.query, message, observedAt));
     }
   });
   return { plan, axes };

@@ -211,7 +211,7 @@ export function reserveReleaseGateHosts(root: string, runId: string, hosts: read
 }
 
 /** An unreadable claim is a reservation, never permission to enter a gate host. */
-export function inspectReleaseGateHost(root: string, host: string): GateHostReservation {
+export function inspectReleaseGateHost(root: string, host: string, options: { reclaimDead?: boolean } = {}): GateHostReservation {
   const dir = claimsDir(root);
   let names: string[];
   try { names = readdirSync(dir).filter(name => name.endsWith('.json')); }
@@ -234,8 +234,10 @@ export function inspectReleaseGateHost(root: string, host: string): GateHostRese
     } catch (error) { return { status: 'unknown', reason: `reservation unreadable: ${name}: ${String(error)}` }; }
     const live = claimAlive(claim);
     if (live === 'dead') {
-      try { rmSync(path); } catch { /* a confirmed dead process cannot still own the host */ }
-      debug.log('release-loop.gate', 'host-claim-reclaimed', { runId: claim.runId, hosts: claim.hosts, path });
+      if (options.reclaimDead !== false) {
+        try { rmSync(path); } catch { /* a confirmed dead process cannot still own the host */ }
+        debug.log('release-loop.gate', 'host-claim-reclaimed', { runId: claim.runId, hosts: claim.hosts, path });
+      }
       continue;
     }
     if (!claim.hosts.includes(host) && !claim.hosts.includes('*')) continue;

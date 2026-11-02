@@ -16,6 +16,7 @@ import { issueMemberToken, issueMemberTokenToFile, revokeMemberToken, listMember
 import { collectControlStatus, readControlHqLease } from '../control/control-status.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
+import { registerResourceLedgerCommands } from './resource-ledger-cli.js';
 
 function controlPort(flag?: string): number {
   const raw = flag ?? (process.env.ELANOUS_CONTROL_PORT?.trim() || undefined);
@@ -269,6 +270,7 @@ export function registerControlCommands(program: Command): void {
     });
 
   const resources = program.command('resources').description('관제부 자원 조회');
+  registerResourceLedgerCommands(resources);
   resources.command('where <nameOrKind>').description('이름 또는 kind 로 찾기')
     .option('--primary-url <url>', 'Primary 주소')
     .option('--query-token <token>', 'query 토큰')

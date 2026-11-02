@@ -48,6 +48,7 @@ describe('MCP native runtime exposure', () => {
     const mcpRuntimeIds = listToolRuntimes('mcp').map(runtime => runtime.id);
     expect(mcpRuntimeIds).toContain('aside.repl');
     expect(mcpRuntimeIds).toContain('self_implement');
+    expect(mcpRuntimeIds).toContain('elanous_ux_sim_devices');
     expect(mcpRuntimeIds).toEqual(expect.arrayContaining([
       'self_recall',
       'logs_query',
@@ -62,6 +63,7 @@ describe('MCP native runtime exposure', () => {
     ]));
     expect(names).toContain('aside.repl');
     expect(names).toContain('SelfImplement');
+    expect(names).toContain('elanous_ux_sim_devices');
     expect(names).toContain('elanous_autopilot_launch');
     expect(names.filter(name => name.startsWith('elanous_asana_'))).toEqual([
       'elanous_asana_workspaces', 'elanous_asana_list_tasks', 'elanous_asana_create_task',
@@ -74,6 +76,26 @@ describe('MCP native runtime exposure', () => {
       'ops_status',
       'memory_recall',
     ]));
+  });
+
+  test('tools/call dispatches the Nexus catalog runtime exposed by default', async () => {
+    const listResponse = await handleMcpRequest({
+      jsonrpc: '2.0', id: 21, method: 'tools/list',
+    });
+    const names = (listResponse.result as { tools: Array<{ name: string }> }).tools
+      .map(tool => tool.name);
+    expect(names).toContain('elanous_ux_sim_devices');
+
+    const response = await handleMcpRequest({
+      jsonrpc: '2.0',
+      id: 22,
+      method: 'tools/call',
+      params: { name: 'elanous_ux_sim_devices', arguments: {} },
+    });
+
+    expect(response.error).toBeUndefined();
+    expect((response.result as { structuredContent?: { output?: string } }).structuredContent?.output)
+      .toContain('Mock/test catalog v2:');
   });
 
   test('tools/call dispatches a listed self-cognition runtime through the MCP path', async () => {

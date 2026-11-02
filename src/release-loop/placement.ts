@@ -18,6 +18,8 @@ export interface PlacementDecision { id: string; from: string | null; version: s
 export interface RebalanceResult {
   decisions: PlacementDecision[];
   blocked: Array<{ id: string; from: string; to: string; reason: string }>;
+  /** Read-only pull-forward eligibility exclusions; absent from rebalance results. */
+  excluded?: Array<{ id: string; from: string; to: string; reason: string }>;
 }
 export interface PlacementDeps {
   now?: Date;
@@ -436,7 +438,7 @@ export function planPullForward(deps: PullForwardDeps): RebalanceResult {
   const open = rows.filter((row) => (!released || versionOrder(row.version, released) > 0) && available(row, now, backlog));
   const target = open[0];
   if (!target) throw new CliUserError('당겨올 판이 없다 — 착지 마감이 안 지난 판이 필요하다');
-  const result: RebalanceResult = { decisions: [], blocked: [] };
+  const result: RebalanceResult = { decisions: [], blocked: [], excluded: [] };
   const source = rows.find((row) => versionOrder(row.version, target.version) > 0 && !backlog.includes(row.version));
   if (!source || !available(source, now, backlog)) return result;
   const sources = [...new Set([...rows.map((row) => row.version), ...deps.checklists.keys(), ...backlog])];
@@ -465,13 +467,21 @@ export function planPullForward(deps: PullForwardDeps): RebalanceResult {
     const legacyNewFile = /^신설:\s*/.test(lines[1] ?? '');
     return paths.length > 0 && paths.every((path) => deps.targetPathExists(path) || legacyNewFile);
   };
-  const candidates = snapshots.get(source.version)!.filter((item) =>
-    (item.priority === 'P0' || item.priority === 'P1') && item.status !== 'green' && item.status !== 'done'
-    && !hold.has(item.id) && !human.test(item.title) && (!item.dispatchKind || item.dispatchKind === 'code')
-    && (item.ceoMinutes === undefined || item.ceoMinutes === 0)
-    && targetPathsReady(item.title)
-    && (item.predecessors ?? []).every((id) => complete.has(id) && !incomplete.has(id)))
-    .map((item, index) => ({ item, index }))
+  const candidates = snapshots.get(source.version)!.map((item, index) => {
+    if ((item.priority !== 'P0' && item.priority !== 'P1') || item.status === 'green' || item.status === 'done') return null;
+    const incompletePredecessor = (item.predecessors ?? []).find((id) => !complete.has(id) || incomplete.has(id));
+    const reason = hold.has(item.id) ? 'traffic hold — 당겨오기 제외'
+      : human.test(item.title) ? '수동 확인 칸 — 당겨오기 제외'
+        : item.dispatchKind && item.dispatchKind !== 'code' ? '코드 작업이 아닌 칸 — 당겨오기 제외'
+          : item.ceoMinutes !== undefined && item.ceoMinutes !== 0 ? '대표 시간 배정 칸 — 당겨오기 제외'
+            : !targetPathsReady(item.title) ? '대상 경로 없음 — 당겨오기 제외'
+              : incompletePredecessor ? `선행 칸 ${incompletePredecessor} 미완료 — 당겨오기 제외` : null;
+    if (reason) {
+      result.excluded!.push({ id: item.id, from: source.version, to: target.version, reason });
+      return null;
+    }
+    return { item, index };
+  }).filter((candidate): candidate is { item: ChecklistItem; index: number } => candidate !== null)
     .sort((a, b) => (rank.get(a.item.id) ?? Infinity) - (rank.get(b.item.id) ?? Infinity)
       || (a.item.priority === 'P0' ? 0 : 1) - (b.item.priority === 'P0' ? 0 : 1) || a.index - b.index);
   if (!candidates.length) return result;

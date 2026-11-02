@@ -54,11 +54,15 @@ afterEach(() => {
   }
 });
 
-// Unit fakes opt out explicitly; a supplied kubectl adapter in product code still measures on the host.
+// A fake kubectl controls the poll sequence; default polling sleeps must not add wall time.
+// Tests that model time or cancellation provide their own sleep adapter below.
 const podSelfImplementSpawn: typeof realPodSelfImplementSpawn = (options = {}) =>
-  realPodSelfImplementSpawn(options.kubectl ? { budgetSnapshot: () => undefined, fallbackConfig: () => ({ llm: {} }) as UserConfig,
+  realPodSelfImplementSpawn(options.kubectl ? { sleep: async () => {}, budgetSnapshot: () => undefined, fallbackConfig: () => ({ llm: {} }) as UserConfig,
     openGatewayConfig: () => ({ llm: {} }) as UserConfig,
     lookupOpenPrByBranch: () => ({ status: 'not-found', reason: 'test-fixture' }), ...options } : options);
+
+// `findGitDir` only reads the `.git` marker in these pod-adapter tests; no Git data is under test.
+function makeFakeGitRoot(root: string): void { mkdirSync(join(root, '.git')); }
 import { loadTokens } from '../../oauth/store.js';
 import { resolveCodexAccount } from '../../oauth/codex-account.js';
 import { statSync } from 'node:fs';
@@ -1306,7 +1310,7 @@ describe('pod memory inheritance from parent goal', () => {
       if (record.category === 'self-implement.pod' && record.event === 'memory-limit') events.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       process.chdir(root);
       const spawn = async (spaceId: string, env: NodeJS.ProcessEnv, text = feature) => {
@@ -1347,7 +1351,7 @@ describe('pod memory inheritance from parent goal', () => {
       if (record.category === 'self-implement.pod' && record.event === 'memory-limit') events.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       process.chdir(root);
       const { k, calls } = fakeKubectl(['Complete'], '');
       await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: 'missing.md' } })({ feature: 'Implement SchemaForm.tsx using flattenSchema and validateSchema', spaceId: 'missing-parent' }).done;
@@ -2162,7 +2166,7 @@ describe('podSelfImplementSpawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-regate-goal-'));
     const previous = process.cwd();
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, 'docs', 'goals', 'cell.md'), '# 골\n칸: X\n이 칸 완료\n');
       process.chdir(root);
@@ -2318,7 +2322,7 @@ describe('podSelfImplementSpawn', () => {
     const goal = 'docs/goals/ASK-a.md';
     const document = goalWithCompletionBoundary('# private goal text 38fjx');
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), document);
       process.chdir(root);
@@ -2409,7 +2413,7 @@ describe('podSelfImplementSpawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-child-supervise-'));
     const previous = process.cwd();
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       writeFileSync(join(root, 'GOAL.md'), '# goal');
       process.chdir(root);
       for (const hostSupervised of [undefined, false]) {
@@ -2430,7 +2434,7 @@ describe('podSelfImplementSpawn', () => {
     const previous = process.cwd();
     const goal = 'docs/goals/ASK-noresult.md';
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), goalWithCompletionBoundary('# goal'));
       process.chdir(root);
@@ -2484,7 +2488,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), exampleGoal);
       process.chdir(root);
@@ -2529,7 +2533,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), document);
       process.chdir(root);
@@ -2571,7 +2575,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), example);
       process.chdir(root);
@@ -2617,7 +2621,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), document);
       process.chdir(root);
@@ -2655,7 +2659,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), '# original goal');
       process.chdir(root);
@@ -2692,7 +2696,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       const exampleGoal = '# original goal\n\n## Shard identity\n{"pieceIndex":1,"totalShards":2}';
       writeFileSync(join(root, goal), exampleGoal);
@@ -2742,7 +2746,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), document);
       process.chdir(root);
@@ -2779,7 +2783,7 @@ describe('podSelfImplementSpawn', () => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
     } });
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
       writeFileSync(join(root, goal), document);
       process.chdir(root);
@@ -2799,7 +2803,7 @@ describe('podSelfImplementSpawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-dash-goal-'));
     const previous = process.cwd();
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       writeFileSync(join(root, '-goal.md'), '# root goal');
       process.chdir(root);
       const { k, calls } = fakeKubectl(['Complete'], '');
@@ -2827,7 +2831,7 @@ describe('podSelfImplementSpawn', () => {
     const outside = mkdtempSync(join(tmpdir(), 'pod-goal-external-'));
     const previous = process.cwd();
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       writeFileSync(join(outside, 'ASK.md'), '# outside');
       symlinkSync(join(outside, 'ASK.md'), join(root, 'ASK.md'));
       process.chdir(root);
@@ -3107,7 +3111,7 @@ test('branch-preservation stage and sanitized cause reach parent Pod failure evi
     const previous = process.cwd();
     try {
       const goal = 'GOAL.md';
-      execFileSync('git', ['init', '-q', dir]);
+      makeFakeGitRoot(dir);
       writeFileSync(join(dir, goal), '# Goal\n\n## ACCEPTANCE CRITERIA\n\n- 기존 조건: 완료 경계가 없다\n');
       process.chdir(dir);
       const { k: manifestKubectl, calls } = fakeKubectl(['Complete'], '');
@@ -3671,7 +3675,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     const previousCwd = process.cwd();
     const goalFile = 'GOAL.md';
     const previousState = process.env.ELANOUS_STATE_DIR;
-    execFileSync('git', ['init', '-q', root]);
+    makeFakeGitRoot(root);
     writeFileSync(join(root, goalFile), '# goal\n');
     const fixtureTail = [...Array.from({ length: 100 }, (_, i) => `fixture complete stage ${i}`),
       'child completed without a result line for sk-proj-ABCDEFGHIJKLMNOP1234'].join('\n') + '\n';
@@ -5007,7 +5011,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       return { status: 0, stdout: '', stderr: '' };
     };
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       writeFileSync(join(root, goal), '# Goal\n');
       process.chdir(root);
       const r = await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: { ELANOUS_STATE_DIR: root, ELANOUS_POD_GOAL_DOC: goal } })({ feature: 'x', spaceId: 'partial-goal' }).done;
@@ -5096,7 +5100,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     const root = mkdtempSync(join(tmpdir(), 'pod-failed-success-log-'));
     const previous = process.cwd();
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       writeFileSync(join(root, 'GOAL.md'), '# Goal\n');
       process.chdir(root);
       const { k } = fakeKubectl(['Failed'], '{"stage":"merged","merged":true,"ok":true}\n');
@@ -5124,7 +5128,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       return { status: 0, stdout: '', stderr: '' };
     };
     try {
-      execFileSync('git', ['init', '-q', root]);
+      makeFakeGitRoot(root);
       writeFileSync(join(root, 'GOAL.md'), '# Goal\n');
       process.chdir(root);
       const opts = { kubectl, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: 'GOAL.md', ELANOUS_STATE_DIR: root } };

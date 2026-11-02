@@ -64,7 +64,9 @@ export const GATE_NODE_SIM_SCENARIOS: readonly GateScenario[] = [
 ];
 
 function makeReceipt(id: string, files: string[], host: string): GateShardReceipt {
-  return { id, files, head40: H, base40: B, host, envKey: ENV, status: 'complete',
+  const imageDigest = 'sha256:' + 'a'.repeat(64);
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'e'.repeat(64) };
+  return { id, files, version: '0.2.46', graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, head40: H, base40: B, host, imageDigest, envFingerprint: runtimeIdentity.envFingerprint, runtimeIdentity, envKey: runtimeIdentity.envFingerprint + ':' + imageDigest, executions: [{ branch: '', attemptId: 'sim-' + id, host, imageDigest, runtimeIdentity }], status: 'complete',
     failureIds: [], errorIds: [], evidencePath: '/sim/pod-0.json', evidenceSha256: EVIDENCE,
     measuredAt: '2026-10-29T00:00:00.000Z', attempt: 1 };
 }
@@ -84,6 +86,8 @@ function plannerDecision(scenario: GateScenario, devices: { head40: string; mini
       shards, receipts,
       hosts: [{ id: 'node-c', platform: 'linux', available: devices.minihAvailable, reserved: false },
         { id: 'node-b', platform: 'linux', available: devices.msb1Available, reserved: false }],
+      graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
+      environmentIdentity: { imageDigest: 'sha256:' + 'a'.repeat(64), bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'e'.repeat(64) },
       ...(input.rerouteShard ? { rerouteShard: input.rerouteShard } : {}),
     });
     const dispositions = plan.map((item) => {

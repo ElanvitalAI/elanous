@@ -40,6 +40,7 @@ export interface MockScenarioCandidate {
 
 export interface MockScenarioCatalog {
   version: 2;
+  worldEvents: Array<{ id: string; name: string; description: string }>;
   runEvidence: {
     scope: string;
     runId: string;
@@ -92,9 +93,23 @@ function uniqueIds(rows: unknown[], path: string): Set<string> {
 /** Validate the checked-in index before CLI output or scenario metadata is consumed. */
 export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
   if (!isRecord(value) || value.version !== 2) throw new Error('mock scenario catalog must declare version: 2');
-  if (!Array.isArray(value.devices) || !Array.isArray(value.scenarios)) throw new Error('mock scenario catalog requires devices and scenarios arrays');
+  if (!Array.isArray(value.devices) || !Array.isArray(value.scenarios)) {
+    throw new Error('mock scenario catalog requires devices and scenarios arrays');
+  }
   const deviceIds = uniqueIds(value.devices, 'devices');
   uniqueIds(value.scenarios, 'scenarios');
+  const rawWorldEvents = value.worldEvents === undefined ? [] : value.worldEvents;
+  if (!Array.isArray(rawWorldEvents)) throw new Error('worldEvents must be an array');
+  uniqueIds(rawWorldEvents, 'worldEvents');
+
+  const worldEvents = rawWorldEvents.map((row, index) => {
+    if (!isRecord(row)) throw new Error(`worldEvents[${index}] must be an object`);
+    return {
+      id: requireString(row.id, `worldEvents[${index}].id`),
+      name: requireString(row.name, `worldEvents[${index}].name`),
+      description: requireString(row.description, `worldEvents[${index}].description`),
+    };
+  });
 
   const devices = value.devices.map((row, index): MockScenarioDevice => {
     if (!isRecord(row)) throw new Error(`devices[${index}] must be an object`);
@@ -232,6 +247,7 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
   const discovery = value.discovery;
   return {
     version: 2,
+    worldEvents,
     devices,
     scenarios,
     candidateAudit: {
@@ -304,6 +320,21 @@ export function renderMockScenarioDevices(catalog: MockScenarioCatalog): string[
       `recent=${device.recentUse ? `${device.recentUse.observedAt} runId=${device.recentUse.runId} event=${device.recentUse.event} scenario=${device.recentUse.scenarioId} cmd=${device.recentUse.command}` : '(not recorded)'}`,
     ].join('\t')),
     `omission check: required=${catalog.candidateAudit.omissionCheck.requiredPaths.length} missing=${catalog.candidateAudit.omissionCheck.missingPaths.length}`,
+  ];
+}
+
+/** Markdown source generated for the human registry in MANUAL §1. */
+export function renderMockScenarioDeviceMarkdownTable(catalog: MockScenarioCatalog): string[] {
+  const escape = (value: string) => value.replaceAll('|', '\\|').replaceAll('\n', ' ');
+  return [
+    '| ID | 장치 | 구현 · 시험 | 진입 명령 | test logs 근거 | 최근 사용 근거 |',
+    '|---|---|---|---|---|---|',
+    ...catalog.devices.map((device) => {
+      const recent = device.recentUse
+        ? `${device.recentUse.observedAt} · ${device.recentUse.runId} · ${device.recentUse.event} · ${device.recentUse.scenarioId}`
+        : '기록 없음';
+      return `| ${escape(device.id)} | ${escape(device.name)} | 구현: ${escape(device.implementation.join('<br>'))}<br>시험: ${escape(device.tests.join('<br>'))} | ${escape(device.entryCommands.join('<br>'))} | ${escape(device.logsRecorded)} · ${escape(device.eventNames.join(', ') || '(없음)')} | ${escape(recent)} |`;
+    }),
   ];
 }
 

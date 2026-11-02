@@ -416,6 +416,60 @@ export function registerProviderCommands(program: Command): void {
       console.log(`   백업: ${r.backupPath}`);
     });
 
+  const seatHomeCmd = accountCmd.command('seat-home').description('OPC seat Codex CODEX_HOME — account mirror distribution and owner-side refresh loop');
+  seatHomeCmd
+    .command('home <seat>')
+    .description('approved seat mapping for launch environment; default seats keep ~/.codex')
+    .action(async (seat: string) => {
+      const { codexSeatAccountForSeat, codexSeatHomeForSeat } = await import('../oauth/codex-seat-home.js');
+      const account = codexSeatAccountForSeat(seat);
+      const home = codexSeatHomeForSeat(seat);
+      if (!home) { console.log(`${seat} → default · CODEX_HOME unchanged (~/.codex)`); return; }
+      console.log(`${seat} → ${account} · CODEX_HOME=${home}`);
+    });
+
+  seatHomeCmd
+    .command('launch <seat> [codexArgs...]')
+    .allowUnknownOption()
+    .description('launch the installed Codex CLI with the approved seat CODEX_HOME; use -- before Codex flags')
+    .action(async (seat: string, codexArgs: string[] = []) => {
+      const { runCodexSeatCommand } = await import('../oauth/codex-seat-home.js');
+      const result = await runCodexSeatCommand(seat, codexArgs);
+      if (!result.ok) { console.error(`Codex seat launch refused (${result.kind}): ${result.reason}`); process.exitCode = 1; return; }
+      process.exitCode = result.exitCode;
+    });
+
+  seatHomeCmd
+    .command('sync <account>')
+    .description('refresh expiring named account if needed and atomically install its access-only seat-home auth.json')
+    .action(async (account: string) => {
+      const { syncCodexSeatHome } = await import('../oauth/codex-seat-home.js');
+      const result = await syncCodexSeatHome(account);
+      if (!result.ok) { console.error(`seat-home sync refused (${result.kind}): ${result.reason}`); process.exitCode = 1; return; }
+      console.log(`✅ seat-home ${result.account} · expiresAt=${new Date(result.expiresAt).toISOString()} · refreshed=${result.refreshed} · ${result.path}`);
+    });
+
+  seatHomeCmd
+    .command('watch <seat...>')
+    .description('owner-side 60s loop for selected seats; named accounts refresh 10 minutes before access expiry')
+    .action(async (seats: string[]) => {
+      const { codexSeatAccountForSeat, runCodexSeatHomeRefreshLoop } = await import('../oauth/codex-seat-home.js');
+      const accounts = [...new Set(seats.map(codexSeatAccountForSeat).filter((name) => name !== 'default'))];
+      if (!accounts.length) { console.error('seat-home watch requires at least one team/third seat; default remains ~/.codex'); process.exitCode = 1; return; }
+      let stopping = false;
+      const stop = () => { stopping = true; };
+      process.once('SIGINT', stop);
+      process.once('SIGTERM', stop);
+      console.log(`Codex seat-home watch · accounts=${accounts.join(',')} · poll=60s · refresh-before=10m (Ctrl-C to stop)`);
+      try {
+        await runCodexSeatHomeRefreshLoop(accounts, {
+          shouldStop: () => stopping,
+          onError: (account, result) => console.error(`Codex seat-home refresh failed · account=${account} · reason=${result.kind}`),
+        });
+      }
+      finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+    });
+
   const resetCreditsCmd = codexCmd.command('reset-credits').description('리셋 크레딧 — 조회 · 관측 · 사용(⛔ 사용은 되돌릴 수 없다)');
 
   resetCreditsCmd

@@ -33,7 +33,10 @@ describe('research axis fanout', () => {
       releases.set(query, () => resolve([{ url: `https://example.org/${started.indexOf(query)}`, title: query,
         snippet: '10Y yield 4.12% on 2026-10-25', publishedAt: Date.parse('2026-10-25T00:00:00Z') }]));
     });
-    const pending = fanOutAxisEvidence(axes, { search });
+    const pending = fanOutAxisEvidence(axes, {
+      search,
+      now: () => Date.parse('2026-11-01T12:34:56.000Z'),
+    });
     expect(started).toEqual(axes.map(axis => axis.searchTerms[0]));
     for (const release of releases.values()) release();
     const result = await pending;
@@ -43,7 +46,8 @@ describe('research axis fanout', () => {
       expect(axis.evidence).toHaveLength(1);
       expect(axis.evidence[0]!.questionId).toBe(axis.questionId);
       expect(axis.evidence[0]!.source).toMatch(/^https:\/\/example\.org\//);
-      expect(axis.evidence[0]!.observedAt).toContain('2026-10-25');
+      expect(axis.evidence[0]!.publishedAt).toBe('2026-10-25T00:00:00.000Z');
+      expect(axis.evidence[0]!.observedAt).toBe('2026-11-01T12:34:56.000Z');
       expect(axis.evidence[0]!.units).toBeUndefined();
       expect(axis.evidence[0]!.outcome).toBe('complete');
       expect(axis.evidence[0]!.truncated).toBe(true);
@@ -123,16 +127,77 @@ describe('research axis fanout', () => {
     }));
   });
 
-  it('검색 제공자와 원문 URL을 보존하되 없는 관측일·수치 단위는 만들지 않는다', async () => {
-    const result = await fanOutAxisEvidence([axes[0]!], { search: async () => [{
-      url: 'https://example.org/?a=1&amp;b=2', title: 'yield data', snippet: 'change in percent', engine: 'firecrawl',
-    }] });
+  it('carries a search publisher date to the fetched source only when the URL is the same', async () => {
+    const question = { ...axes[0]!, searchTerms: ['dated source'] };
+    const result = await fanOutAxisEvidence([question], {
+      now: () => Date.parse('2026-11-01T12:34:56.000Z'),
+      search: async () => [{
+        url: 'https://example.org/published-source', title: 'dated source', snippet: 'Source claim',
+        publishedAt: Date.parse('2026-10-30T00:00:00.000Z'),
+      }],
+      fetchPage: async (url) => ({ url, output: 'Full source claim.' }),
+    });
+
+    expect(result.axes[0]!.evidence).toContainEqual(expect.objectContaining({
+      sourceKind: 'web-fetch', source: 'https://example.org/published-source',
+      publishedAt: '2026-10-30T00:00:00.000Z', observedAt: '2026-11-01T12:34:56.000Z',
+    }));
+  });
+
+  it('does not transfer a search publisher date to a fetched page with a different URL', async () => {
+    const question = { ...axes[0]!, searchTerms: ['redirected source'] };
+    const result = await fanOutAxisEvidence([question], {
+      search: async () => [{
+        url: 'https://example.org/redirect', title: 'dated source', snippet: 'Source claim',
+        publishedAt: Date.parse('2026-10-30T00:00:00.000Z'),
+      }],
+      fetchPage: async () => ({ url: 'https://example.net/replacement', output: 'Different source claim.' }),
+    });
+
+    const fetchedEvidence = result.axes[0]!.evidence.find(item => item.sourceKind === 'web-fetch');
+    expect(fetchedEvidence).toMatchObject({ source: 'https://example.net/replacement' });
+    expect(fetchedEvidence).not.toHaveProperty('publishedAt');
+  });
+
+  it('검색 제공자·URL·확인일을 보존하되 없는 게시일·수치 단위는 만들지 않는다', async () => {
+    const result = await fanOutAxisEvidence([axes[0]!], {
+      now: () => Date.parse('2026-11-01T12:34:56.000Z'),
+      search: async () => [{
+        url: 'https://example.org/?a=1&amp;b=2', title: 'yield data', snippet: 'change in percent', engine: 'firecrawl',
+      }],
+    });
     expect(result.axes[0]!.evidence[0]).toMatchObject({
       sourceKind: 'web-search:firecrawl', source: 'https://example.org/?a=1&amp;b=2',
       requestedWindow: '2026-10',
     });
-    expect(result.axes[0]!.evidence[0]!.observedAt).toBeUndefined();
+    expect(result.axes[0]!.evidence[0]!.observedAt).toBe('2026-11-01T12:34:56.000Z');
+    expect(result.axes[0]!.evidence[0]!.publishedAt).toBeUndefined();
     expect(result.axes[0]!.evidence[0]!.units).toBeUndefined();
+  });
+
+  it('빠른 검색의 확인일은 느린 다른 축이 날짜 경계를 넘겨도 바뀌지 않는다', async () => {
+    const fast = { ...axes[0]!, searchTerms: ['fast source'] };
+    const slow = { ...axes[1]!, searchTerms: ['slow source'] };
+    let clock = Date.parse('2026-11-01T23:59:59.000Z');
+    let releaseSlow!: (hits: { url: string; title: string; snippet: string }[]) => void;
+    const slowResult = new Promise<{ url: string; title: string; snippet: string }[]>(resolve => {
+      releaseSlow = resolve;
+    });
+    const pending = fanOutAxisEvidence([fast, slow], {
+      now: () => clock,
+      search: async query => query === 'fast source'
+        ? [{ url: 'https://example.org/fast', title: 'fast', snippet: 'fast evidence' }]
+        : slowResult,
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    clock = Date.parse('2026-11-02T00:00:01.000Z');
+    releaseSlow([{ url: 'https://example.org/slow', title: 'slow', snippet: 'slow evidence' }]);
+    const result = await pending;
+
+    expect(result.axes[0]!.evidence[0]!.observedAt).toBe('2026-11-01T23:59:59.000Z');
+    expect(result.axes[1]!.evidence[0]!.observedAt).toBe('2026-11-02T00:00:01.000Z');
   });
 
   it('같은 축의 검색어 둘 중 하나가 실패해도 성공 근거와 실패 봉투를 함께 남긴다', async () => {
@@ -147,7 +212,7 @@ describe('research axis fanout', () => {
     expect(result.axes[0]!.evidence[1]!.source).toBe('https://example.org/alternate');
   });
 
-  it('0·NaN·범위 밖 publishedAt은 관측일로 승격하지 않고 다른 축 결과를 보존한다', async () => {
+  it('0·NaN·범위 밖 publishedAt은 게시일로 승격하지 않고 다른 축 결과를 보존한다', async () => {
     const times = [0, Number.NaN, 1e30];
     const result = await fanOutAxisEvidence(axes, { search: async query => [{
       url: 'https://example.org/rate', title: 'yield', snippet: '4.12%',
@@ -155,7 +220,7 @@ describe('research axis fanout', () => {
     }] });
     expect(result.axes).toHaveLength(3);
     expect(result.axes.map(axis => axis.evidence.length)).toEqual([1, 1, 1]);
-    for (const axis of result.axes) expect(axis.evidence[0]!.observedAt).toBeUndefined();
+    for (const axis of result.axes) expect(axis.evidence[0]!.publishedAt).toBeUndefined();
   });
 
   it('검색어가 없거나 결과 0건이어도 이유를 축별 봉투로 남긴다', async () => {
@@ -355,5 +420,23 @@ describe('research axis fanout', () => {
     expect(Date.now() - started).toBeLessThan(RESEARCH_SEARCH_BUDGET_MS);
     expect(calls).toEqual(['firecrawl']);
     expect(Array.isArray(result) ? result : result.hits).toMatchObject([{ engine: 'firecrawl' }]);
+  });
+
+  it('fixed search hits retain publisher date separately from the date we checked the source', async () => {
+    const result = await fanOutAxisEvidence([axes[0]!], {
+      now: () => Date.parse('2026-11-01T12:34:56.000Z'),
+      search: async () => [{
+        url: 'https://example.org/yield-report',
+        title: 'Treasury yield report',
+        snippet: 'The 10-year yield closed at 4.12%.',
+        publishedAt: Date.parse('2026-10-30T00:00:00.000Z'),
+      }],
+    });
+
+    expect(result.axes[0]!.evidence[0]).toMatchObject({
+      source: 'https://example.org/yield-report',
+      publishedAt: '2026-10-30T00:00:00.000Z',
+      observedAt: '2026-11-01T12:34:56.000Z',
+    });
   });
 });

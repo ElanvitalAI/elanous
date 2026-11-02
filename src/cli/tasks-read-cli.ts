@@ -16,6 +16,7 @@ import { writeStdoutFully } from './stdout-flush.js';
  */
 
 type TaskRow = Pick<Task, 'id' | 'title' | 'priority' | 'status' | 'createdAt' | 'approval' | 'generatedBy'>;
+type TaskDetailPayload = { task: TaskRow; [key: string]: unknown };
 
 /** `tasks hand`·`show` 가 남기는 `task-agent` 관측의 logs.db surface 라벨. */
 export const TASK_AGENT_SINK_SURFACE = 'task-agent';
@@ -144,22 +145,27 @@ export function registerTaskListCommand(tasks: Command, ctx: TasksCliContext): v
       try {
         ctx.clearToken();
         const auth = authenticate();
-        const response = await request(deps, auth, '/v1/tasks');
-        if (!response.ok) throw httpError(response);
-        const body = await responseJson(response) as { tasks?: Array<Pick<TaskRow, 'id' | 'status'>> };
-        if (!Array.isArray(body?.tasks)) throw new Error('넥서스 태스크 목록 형식이 유효하지 않다');
-        const cards = body.tasks.filter((task) => !opts.status || task.status === opts.status);
-        // The list endpoint returns board cards without approval or provenance.
-        // Obtain those fields from the detail endpoint rather than displaying guesses.
-        const rows: TaskRow[] = [];
-        for (const card of cards) {
-          const detail = await request(deps, auth, `/v1/tasks/${encodeURIComponent(card.id)}`);
-          if (!detail.ok) throw httpError(detail);
-          const data = await responseJson(detail) as { task?: TaskRow };
-          if (!data?.task || data.task.id !== card.id) throw new Error('넥서스 태스크 상세 형식이 유효하지 않다');
-          if (!opts.provider || (data.task.generatedBy?.kind === 'external' && data.task.generatedBy.provider === opts.provider)) rows.push(data.task);
-        }
-        rows.sort(taskOrder);
+        const load = async (): Promise<TaskRow[]> => {
+          const response = await request(deps, auth, '/v1/tasks');
+          if (!response.ok) throw httpError(response);
+          const body = await responseJson(response) as { tasks?: Array<Pick<TaskRow, 'id' | 'status'>> };
+          if (!Array.isArray(body?.tasks)) throw new Error('넥서스 태스크 목록 형식이 유효하지 않다');
+          const cards = body.tasks.filter((task) => !opts.status || task.status === opts.status);
+          // The list endpoint returns board cards without approval or provenance.
+          // Obtain those fields from the detail endpoint rather than displaying guesses.
+          const result: TaskRow[] = [];
+          for (const card of cards) {
+            const detail = await request(deps, auth, `/v1/tasks/${encodeURIComponent(card.id)}`);
+            if (!detail.ok) throw httpError(detail);
+            const data = await responseJson(detail) as { task?: TaskRow };
+            if (!data?.task || data.task.id !== card.id) throw new Error('넥서스 태스크 상세 형식이 유효하지 않다');
+            if (!opts.provider || (data.task.generatedBy?.kind === 'external' && data.task.generatedBy.provider === opts.provider)) result.push(data.task);
+          }
+          result.sort(taskOrder);
+          return result;
+        };
+        // Do not cache task API responses until the HTTP responder can prove its runtime identity.
+        const rows = await load();
         if (opts.json) await outFully(JSON.stringify(rows));
         else {
           out('id\t우선순위\t상태\t승인\t출처\t제목');
@@ -183,14 +189,19 @@ export function registerTaskShowCommand(tasks: Command, ctx: TasksCliContext): v
       try {
         ctx.clearToken();
         const auth = authenticate();
-        const response = await request(deps, auth, `/v1/tasks/${encodeURIComponent(id)}`);
-        if (!response.ok) throw httpError(response);
-        const data = await responseJson(response) as { task?: TaskRow };
-        if (!data?.task) throw new Error('넥서스 태스크 상세 형식이 유효하지 않다');
+        const load = async (): Promise<TaskDetailPayload> => {
+          const response = await request(deps, auth, `/v1/tasks/${encodeURIComponent(id)}`);
+          if (!response.ok) throw httpError(response);
+          const data = await responseJson(response) as { task?: TaskRow; [key: string]: unknown };
+          if (!data?.task) throw new Error('넥서스 태스크 상세 형식이 유효하지 않다');
+          return data as TaskDetailPayload;
+        };
+        // Do not cache task API responses until the HTTP responder can prove its runtime identity.
+        const data = await load();
         if (opts.json) await outFully(JSON.stringify(data));
         else {
           out(taskLine(data.task));
-          out(JSON.stringify(data, null, 2));
+          out(JSON.stringify({ task: data.task }, null, 2));
         }
       } catch (error) { handleError(error, out); }
     });

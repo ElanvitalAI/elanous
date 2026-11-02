@@ -3,7 +3,7 @@
 // installId = 무작위 UUID · email/telegramUser 는 «신원도 함께» 동의 때만 · nexus.instance 는 해시 12자 · dedupe 는 수신기가 만든다.
 // 규칙: 비밀·홈 경로를 지운 뒤에만 보낸다 · 실패하면 한 부만 남겨 다음 시작 때 한 번(하루 최대 한 번) · 절대 던지지 않는다.
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { arch, homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -166,7 +166,7 @@ export async function reportError(input: ErrorReportInput, deps: ErrorReportDeps
   }
 }
 
-async function post(report: ErrorReport, configDir: string, deps: ErrorReportDeps): Promise<ReportOutcome> {
+async function post(report: ErrorReport, configDir: string, deps: ErrorReportDeps, keepForRetry = true): Promise<ReportOutcome> {
   try {
     const response = await (deps.fetchImpl ?? fetch)(ERROR_REPORT_URL, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report), signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
@@ -177,11 +177,11 @@ async function post(report: ErrorReport, configDir: string, deps: ErrorReportDep
       debug.log('error-report', 'sent', { code: report.code, surface: report.app.surface, ...(reportId ? { reportId } : {}) });
       return { sent: true, ...(reportId ? { reportId } : {}) };
     }
-    keepPending(report, configDir, deps);
+    if (keepForRetry) keepPending(report, configDir, deps);
     debug.log('error-report', 'not-sent', { code: report.code, status: response.status });
     return { sent: false, reason: `http-${response.status}` };
   } catch (error) {
-    keepPending(report, configDir, deps);
+    if (keepForRetry) keepPending(report, configDir, deps);
     debug.log('error-report', 'not-sent', { code: report.code, reason: error instanceof Error ? error.name : 'network' });
     return { sent: false, reason: 'network' };
   }
@@ -195,6 +195,141 @@ function keepPending(report: ErrorReport, configDir: string, deps: ErrorReportDe
     mkdirSync(join(configDir, 'error-reports'), { recursive: true, mode: 0o700 });
     writeFileSync(pendingFile(configDir), JSON.stringify({ report, lastTry: (deps.now ?? Date.now)() }), { mode: 0o600 });
   } catch { /* nothing else to do */ }
+}
+
+const CRASH_QUEUE_MAX = 20;
+const CRASH_QUEUE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+const CRASH_QUEUE_RETRY_MS = 60_000;
+const crashQueueDir = (configDir: string): string => join(configDir, 'crash');
+
+/** Drop records whose filename timestamp is outside the retention window. */
+function pruneCrashQueue(dir: string, now: number): string[] {
+  const files = readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+  for (const name of files) {
+    const timestamp = Number(name.match(/^(\d+)-/)?.[1]);
+    if (!Number.isFinite(timestamp) || now - timestamp > CRASH_QUEUE_MAX_AGE_MS) {
+      rmSync(join(dir, name), { force: true });
+    }
+  }
+  return readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+}
+
+/** Persist a sanitized fatal error synchronously; this function is safe to call during process shutdown. */
+export function captureFatal(error: unknown, options: { surface: ReportSurface } & ErrorReportDeps): void {
+  try {
+    const configDir = (options.configDir ?? getElanousConfigDir)();
+    const settings = (options.settings ?? defaultSettings)();
+    const dir = crashQueueDir(configDir);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const now = (options.now ?? Date.now)();
+    const files = pruneCrashQueue(dir, now);
+    const source = error instanceof Error ? error : new Error(String(error));
+    const report = settings.enabled && settings.consented === true && (options.enabledByEnvironment ?? defaultEnabledByEnvironment)()
+      ? buildErrorReport({ code: 'fatal-error', message: `${source.name}: ${source.message}`, ...(source.stack ? { stack: source.stack } : {}), surface: options.surface }, {
+        installId: installId(configDir), settings, nexus: { alive: false }, at: new Date(now).toISOString(),
+      })
+      : undefined;
+    const filename = join(dir, `${now}-${randomUUID()}.json`);
+    const record = report ? { consented: true, report } : { consented: false };
+    const content = JSON.stringify(record);
+    if (Buffer.byteLength(content) > MAX_BYTES) return;
+    writeFileSync(filename, content, { mode: 0o600, flag: 'wx' });
+    for (const stale of files.slice(0, Math.max(0, files.length + 1 - CRASH_QUEUE_MAX))) rmSync(join(dir, stale), { force: true });
+  } catch { /* fatal recording must never replace the original failure */ }
+}
+
+/** Install process-level fatal hooks while retaining the runtime's normal non-zero termination. */
+export function installFatalErrorHandlers(surface: ReportSurface): () => void {
+  const token = Symbol(surface);
+  fatalHandlerSurfaces.set(token, surface);
+  if (!fatalHandlersInstalled) {
+    fatalHandlersInstalled = true;
+    process.on('uncaughtExceptionMonitor', onUncaughtException);
+    process.on('unhandledRejection', onUnhandledRejection);
+  }
+  return () => {
+    fatalHandlerSurfaces.delete(token);
+    if (fatalHandlerSurfaces.size === 0 && fatalHandlersInstalled) {
+      process.off('uncaughtExceptionMonitor', onUncaughtException);
+      process.off('unhandledRejection', onUnhandledRejection);
+      fatalHandlersInstalled = false;
+    }
+  };
+}
+
+const fatalHandlerSurfaces = new Map<symbol, ReportSurface>();
+let fatalHandlersInstalled = false;
+function activeFatalSurface(): ReportSurface { return [...fatalHandlerSurfaces.values()].at(-1) ?? 'cli'; }
+function onUncaughtException(error: Error): void { captureFatal(error, { surface: activeFatalSurface() }); }
+function onUnhandledRejection(reason: unknown): void {
+  // A rejection listener otherwise suppresses runtimes' normal fatal behavior. Re-throw on the next
+  // microtask so the runtime prints its usual diagnostic/exits; uncaughtExceptionMonitor records it.
+  queueMicrotask(() => { throw reason; });
+}
+
+/** Send only consented crash records using the existing ER1 POST contract. */
+type CrashQueueFlushResult = { sent: number; skipped: number; consentSkipped: number; disabledSkipped: number };
+const crashQueueFlushes = new Map<string, Promise<CrashQueueFlushResult>>();
+
+export function flushCrashQueue(deps: ErrorReportDeps = {}): Promise<CrashQueueFlushResult> {
+  try {
+    if (!(deps.enabledByEnvironment ?? defaultEnabledByEnvironment)()) return Promise.resolve(emptyCrashQueueFlush());
+    const configDir = (deps.configDir ?? getElanousConfigDir)();
+    const running = crashQueueFlushes.get(configDir);
+    if (running) return running;
+    const task = flushCrashQueueUnlocked(configDir, deps).finally(() => {
+      if (crashQueueFlushes.get(configDir) === task) crashQueueFlushes.delete(configDir);
+    });
+    crashQueueFlushes.set(configDir, task);
+    return task;
+  } catch { return Promise.resolve(emptyCrashQueueFlush()); }
+}
+
+function emptyCrashQueueFlush(): CrashQueueFlushResult { return { sent: 0, skipped: 0, consentSkipped: 0, disabledSkipped: 0 }; }
+
+async function flushCrashQueueUnlocked(configDir: string, deps: ErrorReportDeps): Promise<CrashQueueFlushResult> {
+  let sent = 0;
+  let skipped = 0;
+  let consentSkipped = 0;
+  let disabledSkipped = 0;
+  try {
+    const dir = crashQueueDir(configDir);
+    if (!existsSync(dir)) return emptyCrashQueueFlush();
+    const files = pruneCrashQueue(dir, (deps.now ?? Date.now)());
+    const settings = (deps.settings ?? defaultSettings)();
+    if (!settings.enabled) return { sent, skipped: files.length, consentSkipped, disabledSkipped: files.length };
+    if (settings.consented !== true) return { sent, skipped: files.length, consentSkipped: files.length, disabledSkipped };
+    for (const name of files) {
+      const file = join(dir, name);
+      try {
+        const record = JSON.parse(readFileSync(file, 'utf8')) as { consented?: boolean; report?: ErrorReport };
+        if (record.consented !== true) { skipped++; consentSkipped++; continue; }
+        if (!record.report) { skipped++; continue; }
+        if (Buffer.byteLength(JSON.stringify(record.report)) > MAX_BYTES) { skipped++; continue; }
+        // Current settings govern identity at send time; queued reports never retain a revoked address.
+        const report: ErrorReport = { ...record.report, who: {
+          installId: record.report.who.installId,
+          ...(settings.identity && settings.email ? { email: settings.email } : {}),
+          ...(settings.identity && settings.telegramUser ? { telegramUser: settings.telegramUser } : {}),
+        } };
+        const outcome = await post(report, configDir, deps, false);
+        if (!outcome.sent) { scheduleCrashQueueRetry(deps); break; }
+        rmSync(file, { force: true });
+        sent++;
+      } catch { skipped++; }
+    }
+  } catch { /* reporting is best-effort */ }
+  return { sent, skipped, consentSkipped, disabledSkipped };
+}
+
+let crashQueueRetryTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleCrashQueueRetry(deps: ErrorReportDeps): void {
+  if (crashQueueRetryTimer) return;
+  crashQueueRetryTimer = setTimeout(() => {
+    crashQueueRetryTimer = undefined;
+    void flushCrashQueue(deps);
+  }, CRASH_QUEUE_RETRY_MS);
+  crashQueueRetryTimer.unref?.();
 }
 
 /** At start-up: retry the one kept report, at most once a day. */

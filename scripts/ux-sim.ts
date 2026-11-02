@@ -43,6 +43,17 @@ if (argv[0] === 'devices') {
   console.log(renderMockScenarioDevices(loadMockScenarioCatalog()).join('\n'));
   process.exit(0);
 }
+if (argv[0] === 'grid-ready') {
+  if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts grid-ready'); process.exit(2); }
+  const { runGridReadyTierScenario } = await import('../src/ux-sim/grid-ready-tiers.js');
+  const { fleet, decisions } = await runGridReadyTierScenario();
+  console.log(JSON.stringify({
+    decisions: decisions.map(({ tier, action }) => ({ tier, action })),
+    hosts: fleet.statusAll().map(({ id, imageDigest, state, activeLeases, stopAfterAt }) => ({ id, imageDigest, state, activeLeases, stopAfterAt })),
+    events: fleet.events().map(({ type, id, at }) => ({ type, id, at })),
+  }, null, 2));
+  process.exit(0);
+}
 if (argv[0] === 'show') {
   if (argv.length !== 2) { console.error('usage: bun scripts/ux-sim.ts show <MS-id>'); process.exit(2); }
   try {

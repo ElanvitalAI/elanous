@@ -23,9 +23,8 @@ function builtPages(directory: string): string[] {
   return [...pages, '/404'];
 }
 
-// release/public-export.yaml excludes the private investment dashboard and the investor pitch room from the public export,
-// so there the grade stays while the page is absent (both trees must pass).
-const exportExcludedPages = ['/dashboard', '/pitch'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
+// The public export omits private pages; this scoped PR also withdraws resources UI while retaining its route grade for the follow-up.
+const exportExcludedPages = ['/dashboard', '/pitch', '/ops/resources'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
 
 describe('PWA route maturity', () => {
   test('every graded App Router page is classified exactly once (including nested and dynamic pages)', () => {

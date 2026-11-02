@@ -154,6 +154,7 @@ describe('renderer-independent sidetab model and actions', () => {
   test('publishes the same bounded action contract without importing a renderer', () => {
     expect(nextSidetabToolSpec.name).toBe('NextSidetab');
     expect((nextSidetabToolSpec.parameters.properties as { action: { enum: string[] } }).action.enum).toEqual(['list', 'switch', 'attach', 'detach', 'new', 'mission', 'kill']);
+    expect((nextSidetabToolSpec.parameters.properties as { agent: { enum: string[] } }).agent.enum).toEqual(['codex', 'claude', 'grok']);
     expect(isNextSidetabCall({ type: 'elanous.sidetab.call', callId: 'one', request: { action: 'list' } })).toBe(true);
     expect(isNextSidetabCall({ type: 'bad', callId: 'one', request: { action: 'list' } })).toBe(false);
   });
@@ -219,9 +220,10 @@ test('routes a mission through the visible Codex sidetab runner and requires mis
     ok: true, path: '/tmp/result.md', firstLine: '# done',
   });
   expect(await handler({ action: 'mission', agent: 'claude', mission: 'Review the note.' })).toMatchObject({ ok: true });
-  expect(await handler({ action: 'mission', agent: 'gemini' as never, mission: 'Review the note.' })).toEqual({ error: 'agent는 codex 또는 claude여야 합니다' });
+  expect(await handler({ action: 'mission', agent: 'grok', mission: 'Build the result.' })).toMatchObject({ ok: true });
+  expect(await handler({ action: 'mission', agent: 'gemini' as never, mission: 'Review the note.' })).toEqual({ error: 'agent는 codex, claude 또는 grok이어야 합니다' });
   expect(await handler({ action: 'mission' })).toEqual({ error: 'mission 텍스트가 필요합니다' });
-  expect(missions).toEqual(['codex:Write a note.', 'claude:Review the note.']);
+  expect(missions).toEqual(['codex:Write a note.', 'claude:Review the note.', 'grok:Build the result.']);
 });
 
 test('routes parallelMission to the pair runner and rejects a blank second branch', async () => {
@@ -240,5 +242,6 @@ test('routes parallelMission to the pair runner and rejects a blank second branc
     ok: true, results: { codex: { path: '/codex.md' }, claude: { path: '/claude.md' } },
   });
   await expect(handler({ action: 'mission', mission: 'review', parallelMission: '  ' })).resolves.toEqual({ error: 'parallelMission 텍스트가 비었습니다' });
+  await expect(handler({ action: 'mission', agent: 'grok', mission: 'review', parallelMission: 'implement' })).resolves.toEqual({ error: 'parallelMission은 Codex/Claude pair에서만 지원합니다' });
   expect(calls).toEqual(['claude:review|implement']);
 });

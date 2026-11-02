@@ -6,11 +6,34 @@ export interface GateShardIdentity {
   requiredOs?: 'darwin' | 'linux';
 }
 
+export interface GateShardExecutionEvidence {
+  branch: string;
+  attemptId: string;
+  host: string;
+  imageDigest: string;
+  runtimeIdentity: { bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+}
+
 export interface GateShardReceipt extends GateShardIdentity {
+  version: string;
+  graphSha: string;
+  recipeSha: string;
+  /** Exact gate node entry and command at receipt time; per shard despite same graph node. */
+  graphEntry?: string;
+  recipeCommand?: string;
+  recipeTimeoutMs?: number;
   head40: string;
   base40: string;
   host: string;
   envKey: string;
+  /** Duplicated top-level environment fact for explicit fieldwise comparison. */
+  envFingerprint?: string;
+  /** Executed imageID digest (not a mutable image ref). */
+  imageDigest?: string;
+  /** Bun/platform/architecture fingerprint observed inside the executed Pod. */
+  runtimeIdentity?: { bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+  /** Every Pod attempt that contributed to this logical shard; summary identity is valid only when these agree. */
+  executions?: GateShardExecutionEvidence[];
   status: 'complete' | 'unmeasured';
   /** A complete measurement can contain existing or introduced failures. */
   failureIds: string[];
@@ -18,6 +41,8 @@ export interface GateShardReceipt extends GateShardIdentity {
   /** Relative path to the measurement artifact, checked by the caller before reuse. */
   evidencePath: string;
   evidenceSha256: string;
+  /** Integrity checksum of the structured receipt record; never used as a reuse key. */
+  recordSha256?: string;
   measuredAt: string;
   attempt: number;
 }
@@ -82,11 +107,38 @@ export interface GateShardDispatchInput {
   shardHost?: string;
   /** IDs known to pass on macOS, supplied by the caller's env-known policy. */
   macPassShardIds?: readonly string[];
+  /** Shards whose test/import radius intersects the diff from each receipt baseline. */
+  invalidatedShardIds?: readonly string[];
+  /** Proof from changed-file/import-closure analysis that these moved-baseline shards are untouched. */
+  radiusUnchangedShardIds?: readonly string[];
+  graphEntry?: string;
+  recipeCommand?: string;
+  recipeTimeoutMs?: number;
+  environmentIdentity?: { imageDigest: string; bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+}
+
+/** Preserve the producer shard assignment while applying a changed-test import radius. Missing or incomplete inventory fails closed. */
+export function planGateReceiptRadius(input: { receipts: readonly GateShardReceipt[]; tests: readonly string[];
+  selectedFiles: readonly string[]; priorCommit: string }): { shards: GateShardIdentity[]; invalidatedShardIds: string[]; unchangedShardIds: string[] } | null {
+  if (!input.receipts.length || !input.tests.length || !input.selectedFiles.length || !/^[a-f0-9]{40}$/i.test(input.priorCommit)) return null;
+  const receipts = [...input.receipts].sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
+  if (receipts.some((receipt, index) => receipt.id !== `pod-${index}` || receipt.status !== 'complete' || receipt.head40 !== input.priorCommit)
+    || new Set(receipts.flatMap((receipt) => receipt.files)).size !== input.tests.length
+    || JSON.stringify(receipts.flatMap((receipt) => receipt.files).sort()) !== JSON.stringify([...input.tests].sort())
+    || input.selectedFiles.some((file) => !input.tests.includes(file))) return null;
+  const invalidatedShardIds: string[] = [];
+  const unchangedShardIds: string[] = [];
+  const shards = receipts.map((receipt) => {
+    const changed = receipt.files.some((file) => input.selectedFiles.includes(file));
+    (changed ? invalidatedShardIds : unchangedShardIds).push(receipt.id);
+    return { id: receipt.id, files: [...receipt.files] };
+  });
+  return { shards, invalidatedShardIds, unchangedShardIds };
 }
 
 export type GateShardAction =
-  | { shardId: string; files: string[]; kind: 'reuse'; receipt: GateShardReceipt }
-  | { shardId: string; files: string[]; kind: 'run'; host: string; replacing?: GateShardReceipt }
+  | { shardId: string; files: string[]; kind: 'reuse'; receipt: GateShardReceipt; reason: string }
+  | { shardId: string; files: string[]; kind: 'run'; host: string; reason: string; replacing?: GateShardReceipt }
   | { shardId: string; files: string[]; kind: 'unmeasured'; reason: string };
 
 const SHA40 = /^[a-f0-9]{40}$/i;
@@ -114,10 +166,27 @@ export function eligibleGateShardReceipt(
   shard: GateShardIdentity,
   head40: string,
   base40: string,
+  allowMovedHead = false,
 ): boolean {
-  return receipt.status === 'complete' && receipt.id === shard.id
-      && receipt.head40 === head40 && receipt.base40 === base40 && sameFiles(receipt.files, shard.files)
+  return receipt.status === 'complete' && /^\d+\.\d+\.\d+(?:-rc\.\d+)?$/.test(receipt.version)
+      && typeof receipt.graphEntry === 'string' && receipt.graphEntry.trim().length > 0
+      && typeof receipt.recipeCommand === 'string' && receipt.recipeCommand.trim().length > 0
+      && Number.isSafeInteger(receipt.recipeTimeoutMs) && receipt.recipeTimeoutMs! > 0
+      && /^[a-f0-9]{64}$/i.test(receipt.graphSha) && /^[a-f0-9]{64}$/i.test(receipt.recipeSha) && receipt.id === shard.id
+      && /^[a-f0-9]{40}$/i.test(receipt.head40) && (receipt.head40 === head40 || allowMovedHead) && receipt.base40 === base40 && sameFiles(receipt.files, shard.files)
       && receipt.envKey.trim().length > 0 && receipt.host.trim().length > 0
+      && typeof receipt.imageDigest === 'string' && /^sha256:[a-f0-9]{64}$/i.test(receipt.imageDigest)
+      && !!receipt.runtimeIdentity && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(receipt.runtimeIdentity.bunVersion)
+      && /^[a-z0-9_-]{1,32}$/.test(receipt.runtimeIdentity.platform) && /^[a-z0-9_-]{1,32}$/.test(receipt.runtimeIdentity.architecture)
+      && /^[a-f0-9]{64}$/i.test(receipt.runtimeIdentity.envFingerprint)
+      && receipt.envFingerprint === receipt.runtimeIdentity.envFingerprint
+      && receipt.envKey === `${receipt.envFingerprint}:${receipt.imageDigest}`
+      && Array.isArray(receipt.executions) && receipt.executions.length > 0
+      && receipt.executions.every((execution) => typeof execution.branch === 'string'
+        && typeof execution.attemptId === 'string' && execution.attemptId.trim().length > 0
+        && typeof execution.host === 'string' && execution.host.trim().length > 0
+        && execution.imageDigest === receipt.imageDigest
+        && JSON.stringify(execution.runtimeIdentity) === JSON.stringify(receipt.runtimeIdentity))
       && receipt.evidencePath.trim().length > 0 && /^[a-f0-9]{64}$/i.test(receipt.evidenceSha256)
       && Number.isSafeInteger(receipt.attempt) && receipt.attempt > 0
       && Array.isArray(receipt.failureIds) && receipt.failureIds.every((id) => typeof id === 'string')
@@ -133,22 +202,39 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
   const hosts = input.hosts.filter((host) => host.available && !host.reserved);
   const macPass = new Set(input.macPassShardIds ?? []);
   let nextHost = 0;
+  const radiusUnchanged = new Set(input.radiusUnchangedShardIds ?? []);
   return input.shards.map((shard) => {
-    const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40));
-    const prior = [...input.receipts].reverse().find((r) => r.id === shard.id && r.head40 === input.head40 && r.base40 === input.base40 && sameFiles(r.files, shard.files));
-    const forced = input.rerouteShard === shard.id;
+    const prior = [...input.receipts].reverse().find((r) => r.id === shard.id && r.base40 === input.base40 && sameFiles(r.files, shard.files));
+    const envFields = ['imageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const;
+    const storedEnv = prior?.runtimeIdentity && prior.imageDigest && prior.envFingerprint
+      ? { imageDigest: prior.imageDigest, ...prior.runtimeIdentity, envFingerprint: prior.envFingerprint } : undefined;
+    const environmentMismatch = storedEnv && input.environmentIdentity
+      ? envFields.find((field) => storedEnv[field] !== input.environmentIdentity![field])
+      : (!input.environmentIdentity ? 'environment-unmeasured' as const : undefined);
+    const recipeMismatch = prior && input.graphEntry && input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
+      ? (prior.graphEntry !== input.graphEntry ? 'graph-entry-mismatch' : prior.recipeCommand !== input.recipeCommand ? 'recipe-command-mismatch'
+        : prior.recipeTimeoutMs !== input.recipeTimeoutMs ? 'recipe-timeout-mismatch' : undefined)
+      : prior ? 'shard-recipe-unmeasured' : undefined;
+    const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40, radiusUnchanged.has(shard.id))
+      && !!input.graphEntry && !!input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
+      && r.graphEntry === input.graphEntry && r.recipeCommand === input.recipeCommand && r.recipeTimeoutMs === input.recipeTimeoutMs
+      && !!input.environmentIdentity && envFields.every((field) => ({ imageDigest: r.imageDigest, ...r.runtimeIdentity })[field] === input.environmentIdentity![field]));
+    const invalidated = new Set(input.invalidatedShardIds ?? []).has(shard.id);
+    const forced = input.rerouteShard === shard.id || invalidated;
     const auto = input.rerouteShard === 'auto' && (prior?.status === 'unmeasured'
       || (macPass.has(shard.id) && !!prior && (prior.failureIds.length > 0 || prior.errorIds.length > 0)));
     const receiptHost = hosts.find((host) => host.id === receipt?.host);
-    if (receipt && !forced && !auto && (!shard.requiredOs || receiptHost?.platform === shard.requiredOs))
-      return { shardId: shard.id, files: [...shard.files], kind: 'reuse', receipt };
+    if (receipt && (receipt.head40 === input.head40 || radiusUnchanged.has(shard.id)) && !forced && !auto && !invalidated && (!shard.requiredOs || receiptHost?.platform === shard.requiredOs))
+      return { shardId: shard.id, files: [...shard.files], kind: 'reuse', receipt, reason: 'unchanged-radius-from-' + receipt.head40.slice(0, 12) };
+    const rerunReason = invalidated ? 'radius-invalidated' : (prior && prior.head40 !== input.head40 && !radiusUnchanged.has(shard.id)) ? 'radius-proof-missing' : environmentMismatch ? 'environment-' + environmentMismatch + '-mismatch'
+      : recipeMismatch ?? (forced ? 'reroute-requested' : receipt ? 'receipt-ineligible' : 'receipt-unavailable');
     let candidates = hosts.filter((host) => !shard.requiredOs || host.platform === shard.requiredOs);
     if (input.shardHost && (forced || auto)) candidates = candidates.filter((host) => host.id === input.shardHost);
     else if (auto && macPass.has(shard.id)) candidates = candidates.filter((host) => host.platform === 'darwin');
     if ((forced || auto) && prior && candidates.some((host) => host.id !== prior.host)) candidates = candidates.filter((host) => host.id !== prior.host);
     if (!candidates.length) return { shardId: shard.id, files: [...shard.files], kind: 'unmeasured', reason: 'no eligible host' };
     const host = candidates[nextHost++ % candidates.length]!;
-    return { shardId: shard.id, files: [...shard.files], kind: 'run', host: host.id, ...(prior ? { replacing: prior } : {}) };
+    return { shardId: shard.id, files: [...shard.files], kind: 'run', host: host.id, reason: rerunReason, ...(prior ? { replacing: prior } : {}) };
   });
 }
 

@@ -4,24 +4,24 @@ import { fileLeaseStore } from '../hq/lease.js';
 import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 import { debug } from '../debug/log.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig } from '../user-config.js';
 import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
-import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry, type Seat, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
+import { DecisionLedger, importDecisionMarkdown, validateDecisionRaise, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry, type RaiseInput, type Seat, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
 import { formatProactMeter, readProactMeter } from '../decisions/proact-meter.js';
 import { CROWN_MARK, CROWN_THRESHOLD_CATEGORIES, CONSENSUS_CATEGORIES, ConsensusEngine, MAX_REVIEW_ROUND_TRIPS, categoryLabel, representativeLabel, type ConsensusCategory, type ConsensusRepresentative, type CrownCard, type ProposalCard } from '../loops/consensus.js';
 import { writeStdoutFully } from './stdout-flush.js';
+import { readQueryCache } from '../storage/short-lived-read-cache.js';
+import { formatDecisionRow } from './decision-list-format.js';
+import { decisionListSince, filterDecisionListSince } from './decision-list-since.js';
+import { openMsgStore } from '../msg/msg-store.js';
+import { resolveSeat } from '../seat-address/seat-address.js';
+// Preserve the formatter export for existing consumers of this CLI module.
+export { formatDecisionRow } from './decision-list-format.js';
 
 const repeat = (value: string, values: string[]) => [...values, value];
-function date(raw?: string): string | undefined {
-  if (!raw) return undefined;
-  const days = /^(\d+)d$/.exec(raw);
-  const parsed = days ? new Date(Date.now() - Number(days[1]) * 86400000) : new Date(raw);
-  if (!Number.isFinite(parsed.getTime())) throw new Error(`invalid since: ${raw}`);
-  return parsed.toISOString();
-}
 /** `+6h` → now + 6 hours; otherwise a UTC ISO timestamp (validated by the ledger). */
 function dueAt(raw: string): string {
   const hours = /^\+(\d+(?:\.\d+)?)h$/.exec(raw.trim());
@@ -40,9 +40,9 @@ function parseOption(raw: string): DecisionOption {
   if (!m) throw new Error(`invalid --option: ${raw} (expected a=label:consequence)`);
   return { key: m[1]!, label: m[2]!, consequence: m[3]! };
 }
-export function formatDecisionRow(e: DecisionEntry): string {
-  const recommendation = 'skipped' in e.recommendation ? '권고 생략' : `${e.recommendation.option} (${e.recommendation.why})`;
-  return `${e.id} · ${e.category} · ${e.title} · ${recommendation} · ${e.raisedAt ? kst(e.raisedAt) : '올린 시각 미상'} · ${version(e.version)}`;
+function hasKorean(text: string): boolean { return /\p{Script=Hangul}/u.test(text); }
+function missingJudgmentFields(text: string): string[] {
+  return ['근거', '무엇이 바뀌나', '기본값 시 결과'].filter(label => !new RegExp(`^${label}[ \\t]*[:：][ \\t]*\\S`, 'm').test(text));
 }
 export function formatDecisionDetail(e: DecisionEntry): string {
   return [formatDecisionRow(e), `상태: ${e.status}`, `S: ${e.scqa.s}`, `C: ${e.scqa.c}`, `Q: ${e.scqa.q ?? '(비움)'}`, `A: ${e.scqa.a ?? '(비움)'}`,
@@ -104,10 +104,10 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       const result = await projectDecisionsToLinear({ stateDir: config.stateDir, dryRun: o.dryRun });
       await emit(result, o.json, result.reason ?? `생성 ${result.created} · 닫음 ${result.closed} · 건너뜀 ${result.skipped} · 실패 ${result.failed}${result.plan?.length ? `\n${result.plan.map(p => `${p.action} ${p.decisionId}${p.issue ? ` ${p.issue}` : ''}`).join('\n')}` : ''}`);
     });
-  root.command('raise').description('SCQA·선택지와 권고로 결정 항목을 올린다')
+  root.command('raise').description('판단 재료가 있는 대표 결정 카드를 올린다 (자리는 OP 우편으로 제안한다)')
     .requiredOption('--title <text>').requiredOption('--category <category>')
     .requiredOption('--s <text>').requiredOption('--c <text>').option('--q <text>').option('--a <text>')
-    .option('--pending-question <text>', '판단 재료 전문 (무엇·지금까지·재측·선택지별 결과·권고·확신·그냥 두면·근거)')
+    .option('--pending-question <text>', '필수 판단 재료: 근거·무엇이 바뀌나·기본값 시 결과')
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])
     .option('--recommend <key>').option('--why <text>').option('--skip-recommend <reason>')
     .option('--xcheck <SEAT:메모>', '교차 확인 (반복)', repeat, [] as string[])
@@ -122,6 +122,9 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       if (o.run !== undefined && o.resumeQuestion === undefined) throw new Error('--run requires --resume-question');
       if (o.skipRecommend !== undefined && (o.recommend !== undefined || o.why !== undefined)) throw new Error('choose recommendation or skip, not both');
       if (o.skipRecommend === undefined && (!o.recommend || !o.why)) throw new Error('--recommend and --why required, or --skip-recommend <reason>');
+      if (!o.pendingQuestion?.trim()) throw new Error('--pending-question required (근거·무엇이 바뀌나·기본값 시 결과)');
+      const missingJudgment = missingJudgmentFields(o.pendingQuestion.trim());
+      if (missingJudgment.length) throw new Error(`--pending-question missing: ${missingJudgment.join('·')}`);
       const options: DecisionOption[] = o.option.map(parseOption);
       if (o.xcheck.length && o.noXcheck !== undefined) throw new Error('choose --xcheck or --no-xcheck, not both');
       const crossCheck = o.xcheck.map(raw => {
@@ -132,15 +135,65 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       if (!crossCheck.length && o.noXcheck === undefined && getUserConfig().decisions?.requireCrossCheck) throw new Error('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
       const who = agent(o.agent);
       if (!mayWrite('raise', o.hqOverride)) return;
-      const entry = new DecisionLedger(config).raise({ title: o.title, category: o.category, scqa: { s: o.s, c: o.c, ...(o.q ? { q: o.q } : {}), ...(o.a ? { a: o.a } : {}) }, options,
-        ...(o.pendingQuestion ? { pendingQuestion: o.pendingQuestion } : {}),
+      const raiseInput: RaiseInput = {
+        title: o.title, category: o.category,
+        scqa: { s: o.s, c: o.c, ...(o.q ? { q: o.q } : {}), ...(o.a ? { a: o.a } : {}) },
+        options,
+        pendingQuestion: o.pendingQuestion.trim(),
         ...(crossCheck.length ? { crossCheck } : { crossCheckSkipped: o.noXcheck ?? 'missing' }),
-        ...(o.alternative !== undefined ? { alternative: o.alternative } : {}), ...(o.dissent !== undefined ? { dissent: o.dissent } : {}),
+        ...(o.alternative !== undefined ? { alternative: o.alternative } : {}),
+        ...(o.dissent !== undefined ? { dissent: o.dissent } : {}),
         recommendation: o.skipRecommend !== undefined ? { skipped: true, reason: o.skipRecommend } : { option: o.recommend!, why: o.why! },
-        raisedBy: { agent: who, ...(o.track ? { track: o.track } : {}), ...(o.session ? { session: o.session } : {}) }, ...(o.ref.length ? { refs: o.ref } : {}),
+        raisedBy: { agent: who, ...(o.track ? { track: o.track } : {}), ...(o.session ? { session: o.session } : {}) },
+        ...(o.ref.length ? { refs: o.ref } : {}),
         ...(o.resumeQuestion !== undefined ? { resume: { questionId: o.resumeQuestion, ...(o.run !== undefined ? { runId: o.run } : {}) } } : {}),
-        ...(o.due ? { dueAt: dueAt(o.due) } : {}) });
-      if (entry.crossCheckSkipped === 'missing') console.error('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
+        ...(o.due ? { dueAt: dueAt(o.due) } : {}),
+      };
+      // Seat proposals are validated against the ledger contract without writing a representative decision.
+      const validated = validateDecisionRaise(raiseInput);
+      const pendingValues = validated.pendingQuestion!.split(/\r?\n/).map(line => line.replace(/^[^:：]+[:：][ \t]*/, '').trim());
+      const userCopy = [validated.title, validated.scqa.s, validated.scqa.c, validated.scqa.q, validated.scqa.a,
+        ...validated.options.flatMap(option => [option.label, option.consequence]), ...pendingValues,
+        ...(validated.crossCheck ?? []).map(check => check.note), validated.dissent, o.noXcheck,
+        'skipped' in validated.recommendation ? validated.recommendation.reason : validated.recommendation.why]
+        .filter((part): part is string => Boolean(part));
+      if (userCopy.some(part => !hasKorean(part))) console.error('한국어 문면 경고 — 대표 카드의 판단 재료와 선택지 문구를 한국어로 작성하세요.');
+      if (!validated.crossCheck?.length && o.noXcheck === undefined) console.error('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
+      // A release track is not the origin seat. A CLI command raised by OP can target UX for notice
+      // delivery while remaining a representative card; only explicit seat context routes as a proposal.
+      const seatHint = process.env.ELANOUS_SEAT?.trim() || who;
+      const seat = resolveSeat(seatHint)?.id;
+      if (process.env.ELANOUS_SEAT?.trim() && !seat) throw new Error(`unknown ELANOUS_SEAT: ${process.env.ELANOUS_SEAT.trim()}`);
+      if (seat && seat !== 'OP') {
+        const recommendation = 'skipped' in validated.recommendation ? `권고 생략: ${validated.recommendation.reason}` : `권고: ${validated.recommendation.option} — ${validated.recommendation.why}`;
+        const body = [
+          `대표 결정 제안: ${validated.title}`,
+          `분류: ${validated.category}`,
+          `S: ${validated.scqa.s}`,
+          `C: ${validated.scqa.c}`,
+          ...(validated.scqa.q ? [`Q: ${validated.scqa.q}`] : []),
+          ...(validated.scqa.a ? [`A: ${validated.scqa.a}`] : []),
+          `판단 재료: ${validated.pendingQuestion}`,
+          `선택지: ${validated.options.map(option => `${option.key.toUpperCase()}) ${option.label} — ${option.consequence}`).join(' · ')}`,
+          recommendation,
+          ...(validated.crossCheck?.length ? [`교차 확인: ${validated.crossCheck.map(check => `${check.seat} — ${check.note}`).join(' · ')}`] : []),
+          ...(o.noXcheck !== undefined ? [`교차 확인 생략 이유: ${validated.crossCheckSkipped}`] :
+            validated.crossCheckSkipped ? ['교차 확인: 미제공'] : []),
+          ...(validated.alternative ? [`대안: ${validated.alternative}`] : []),
+          ...(validated.dissent ? [`이견: ${validated.dissent}`] : []),
+          ...(validated.refs?.length ? [`근거 참조: ${validated.refs.join(' · ')}`] : []),
+          ...(validated.resume ? [`재개 연결: questionId=${validated.resume.questionId}${validated.resume.runId ? ` · runId=${validated.resume.runId}` : ''}`] : []),
+          ...(validated.resume ? [`후속 처리: OP 결정 카드에 --resume-question ${validated.resume.questionId}${validated.resume.runId ? ` --run ${validated.resume.runId}` : ''}를 전달해 대기 런에 답을 기록`] : []),
+          ...(validated.dueAt ? [`기한: ${validated.dueAt}`] : []),
+          ...((validated.raisedBy.track || validated.raisedBy.session) ? [`발신 맥락: track=${validated.raisedBy.track ?? '-'} · session=${validated.raisedBy.session ?? '-'}`] : []),
+        ].join('\n');
+        const store = openMsgStore(join(config.stateDir ?? elanousStateRoot(), 'msg', 'messages.db'));
+        try {
+          const message = store.append({ from: seat, to: 'OP', kind: 'question', body });
+          return emit({ routedTo: 'OP', messageId: message.id, body }, o.json, `OP 우편으로 제안 전달: #${message.id}`);
+        } finally { store.close(); }
+      }
+      const entry = new DecisionLedger(config).raise(validated);
       return emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
     }));
   root.command('record-seat').description('위임 범위에서 이미 내린 자리 결정을 사후 보고로 원장에 기록 (대표 카드 아님)')
@@ -158,7 +211,7 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
   root.command('seat-report').description('밤사이 자리들의 사후 결정을 한 번에 조회 (기본 최근 24시간)')
     .option('--since <date>', '조회 시작 UTC ISO 또는 Nd', '1d').option('--seat <OP|MK|TC|UX>').option('--json')
     .action((o: { since: string; seat?: Seat; json?: boolean }) => fail(() => {
-      const rows = new DecisionLedger(config).seatReport({ since: date(o.since), seat: o.seat });
+      const rows = new DecisionLedger(config).seatReport({ since: decisionListSince(o.since), seat: o.seat });
       return emit(rows, o.json, rows.length ? rows.map(formatSeatDecisionRow).join('\n') : '자리 결정 0건');
     }));
   root.command('proact').description('선제성 기준선 — 지난 7일, 먼저 낸 수·채택 수·물어서야 드러난 수')
@@ -173,7 +226,13 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .option('--status <open|decided|all>', '기본 open', 'open').option('--since <date>').option('--version <version>')
     .option('--decided-by <human|auto>').option('--category <category>').option('--json')
     .action((o: { status: 'open' | 'decided' | 'all'; since?: string; version?: string; decidedBy?: 'human' | 'auto'; category?: DecisionCategory; json?: boolean }) => fail(() => {
-      const rows = new DecisionLedger(config).list({ status: o.status, since: date(o.since), version: o.version, decidedBy: o.decidedBy, category: o.category });
+      const ledger = new DecisionLedger(config);
+      const filters = { status: o.status, since: decisionListSince(o.since), version: o.version, decidedBy: o.decidedBy, category: o.category };
+      const { since, ...stableFilters } = filters;
+      const cachedRows = readQueryCache({ root: join(dirname(ledger.path), '..', 'cache', 'cli-read-query'),
+        key: { command: 'decisions-list', filters: { ...stableFilters, since: o.since ?? null } }, sourcePaths: [ledger.path], ttlMs: 500,
+        load: () => ledger.list(stableFilters) });
+      const rows = filterDecisionListSince(cachedRows, since);
       return emit(rows, o.json, rows.length ? rows.map(formatDecisionRow).join('\n') : '결정 0건');
     }));
   root.command('show <id>').description('SCQA · 선택지 · 권고 · 이력 · 판').option('--json')
@@ -194,8 +253,9 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
         process.exitCode = 3;
         return emit({ ...entry, ...(delivery ? { delivery } : {}), notice }, o.json, `결정: ${formatDecisionDetail(entry)}\n${failures.join('\n')}`);
       }
-      const sent = notice.status === 'sent' ? `\n자리 우편: ${notice.seat} #${notice.messageId}` : '';
-      return emit({ ...entry, ...(delivery ? { delivery } : {}), notice }, o.json, `결정: ${formatDecisionDetail(entry)}${sent}`);
+      const noticeStatus = notice.status === 'sent' ? `\n자리 우편: ${notice.seat} #${notice.messageId}`
+        : notice.status === 'skipped' ? '\n자리 우편: 올린 자리 없음 — 우편 대상 없음' : '';
+      return emit({ ...entry, ...(delivery ? { delivery } : {}), notice }, o.json, `결정: ${formatDecisionDetail(entry)}${noticeStatus}`);
     }));
   root.command('retry-notify <id>').description('기록된 결정의 올린 자리 우편만 중복 없이 재시도한다').option('--json').option('--hq-override')
     .action((id: string, o: { json?: boolean; hqOverride?: boolean }) => fail(() => {

@@ -63,7 +63,7 @@ test('only a pinned, complete, clean full cut with one observed Pod digest earns
   row(1, ['b.test.ts'], digest);
   const input = { root: dir, version: '0.2.34', commit: sha, fullSweep: true, graphPins: pins,
     envFingerprint: testEnvFingerprint };
-  expect(gateBaselineReceipt(input)).toMatchObject({ schema: 2, valid: true, imageDigest: digest, executionIdentity: runtimeIdentity, files: 2, shards: 2,
+  expect(gateBaselineReceipt(input)).toMatchObject({ schema: 2, valid: true, head40: sha, imageDigest: digest, executionIdentity: runtimeIdentity, files: 2, shards: 2,
     graphSha: pins.graphSha, recipeSha: pins.recipeSha });
   writeFileSync(join(logs, 'pod-0-c0.json'), JSON.stringify({ commit: 'f'.repeat(40), files: ['old.test.ts'],
     parentAttempt: 'old-attempt', attemptId: 'old-child' }));

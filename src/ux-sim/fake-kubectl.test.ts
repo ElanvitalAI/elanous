@@ -26,6 +26,14 @@ test('MOCK-FAKE-KUBECTL: pod listing matches Kubernetes PodList metadata contrac
   expect(JSON.parse(result.stdout)).toMatchObject({ apiVersion: 'v1', kind: 'PodList', metadata: { resourceVersion: '1', continue: '' }, items: [] });
 });
 
+test('MOCK-FAKE-KUBECTL: multi-node inventory includes the primary node', () => {
+  const device = createFakeKubectl({ context: 'fake', node: 'worker-a', nodes: ['worker-a', 'worker-b'] });
+  const listed = device.kubectl(['--context', 'fake', 'get', 'nodes', '-o', 'json']);
+  expect(JSON.parse(listed.stdout).items.map((item: { metadata: { name: string } }) => item.metadata.name)).toEqual(['worker-a', 'worker-b']);
+  expect(() => createFakeKubectl({ context: 'fake', node: 'worker-a', nodes: ['worker-b'] }))
+    .toThrow('fake-kubectl requires unique, non-empty node names including the primary node');
+});
+
 const replay = () => ({ protocol: 1 as const, runId: 'run-1', attemptId: 'attempt-1', cutSha: spec.cutSha,
   deadlineAt: Date.now() + 60_000, files: ['src/example.test.ts'], envProfile: 'gate-v1' as const });
 

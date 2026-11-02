@@ -56,6 +56,7 @@ test('saturated and unknown parent capacity reports measured reasons without rem
   try {
     const result = await defaultTaskLauncher(['harness', 'say', 'goal'], undefined, { runId: 'run-capacity-refused', launchId: 'tl-capacity-refused', env: { ELANOUS_RUN_ID: 'run-capacity-refused' } }, {
       parentHost: [{ host: 'measured', cwd: '/repo', approvalCapacity: 14 }, { host: 'unknown', cwd: '/repo', approvalCapacity: 14 }],
+      releaseGatePolicy: null,
       ssh, spawn, earlyExitWindowMs: 0, launchHoldActive: () => false, notice: () => {},
     });
     expect(result).toEqual({ runId: 'run-capacity-refused' });
@@ -427,7 +428,7 @@ async function run(args: string[], deps: TasksCliDeps, readRealGoalLedgers = fal
   registerTasksCommands(program, {
     ...(args.includes('cover') && !readRealGoalLedgers ? { coverGoalAsks: () => [], coverGoalRuns: () => [] } : {}),
     handOpenPrRun: () => ({ status: 0, stdout: '[]' }),
-    handOriginRepo: () => 'ElanvitalAI/elanous',
+    handOriginRepo: () => 'https://github.com/ElanvitalAI/elanous',
     ...deps, output: (line) => lines.push(line),
   });
   const previous = process.exitCode;
@@ -1381,7 +1382,7 @@ test('tasks hand reuses one OPEN PR for its release cell and fails closed on an 
     adoptChecklist: (foundVersion) => ({ version: foundVersion, released: '', dev: '', items: [{ id: cell, title, status: 'yellow', updatedAt: '', updatedBy: '' }], history: [] }),
     adoptPrView: () => ({ number: 30262, url: 'https://github.com/ElanvitalAI/elanous/pull/30262', state: 'OPEN', baseRefName: 'main', headRefOid: 'a'.repeat(40) }),
     taskLauncher: () => { launched++; },
-    handOriginRepo: () => 'ElanvitalAI/elanous',
+    handOriginRepo: () => 'https://github.com/ElanvitalAI/elanous',
   };
   try {
     for (const result of [
@@ -1682,6 +1683,8 @@ test('status/provider filters and JSON show preserve the full detail payload', a
   expect(JSON.parse(filtered.lines[0]!).map((task: { id: string }) => task.id)).toEqual(['urgent', 'high', 'low']);
   const shown = await run(['tasks', 'show', 'urgent', '--json'], deps);
   expect(JSON.parse(shown.lines[0]!)).toMatchObject({ task: { id: 'urgent', priority: 'urgent', approval: { state: 'pending' } }, executions: [], events: [] });
+  const shownHuman = await run(['tasks', 'show', 'urgent'], deps);
+  expect(Object.keys(JSON.parse(shownHuman.lines[1]!))).toEqual(['task']);
   expect(filtered.lines.concat(shown.lines).join('\n')).not.toContain(token);
 });
 

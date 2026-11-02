@@ -26,6 +26,8 @@ export interface ResearchEvidenceEnvelope {
   source: string;
   requestedWindow?: string;
   observedAt?: string;
+  /** Publisher-provided date for this source, distinct from when we observed it. */
+  publishedAt?: string;
   observedWindow?: string;
   units?: string;
   content: string;

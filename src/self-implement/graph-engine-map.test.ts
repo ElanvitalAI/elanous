@@ -117,6 +117,7 @@ describe('GRAPH-ENGINE-MAP', () => {
   });
 
   test('주요 실행 단계 인용이 현재 orchestrator 경계들을 덮는다', () => {
+    // MAP ranges were re-anchored after #34231 (0418bf763) moved these orchestration branches.
     const currentMarkers: Array<[string, RegExp, string]> = [
       ['dispatch', /^async function runSelfImplementInner\(/, 'runSelfImplementInner entry'],
       ['plan', /^\s*const goalSource = opts\.naturalLanguageDispatch/, 'plan preparation boundary'],
@@ -128,7 +129,7 @@ describe('GRAPH-ENGINE-MAP', () => {
       ['salvage', /^\s*const salvageHardCap = async/, 'hard-cap salvage'],
       ['re-ground', /^function goalContentHash\(/, 'goal content hash'],
       ['main-sync', /progress\('gating', `최신/, 'main-sync progress'],
-      ['regate', /const regate = await/, 'post-sync gate'],
+      ['regate', /const regate = deferGateToLand/, 'post-sync gate (deferred to pinned train by #34231)'],
       ['open-pr', /^\s*progress\('pr-opening', 'PR 생성…'\);/, 'PR opening'],
       ['freeze-check', /const landing = admitLandingMerge\(/, 'landing freeze admission'],
       ['hold', /const detail = landing\.kind === 'held'/, 'held landing result'],

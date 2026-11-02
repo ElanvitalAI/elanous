@@ -81,8 +81,14 @@ async function crawlWithOmniCrawl(): Promise<CommunityPoint[]> {
 }
 
 /** 함의 판정은 로컬 흉내가 아니라 CLI(intake check) 가 정본이다. 칸이나 판을 바꾸지 않는다. */
-async function checkWithCli(facts: readonly string[]): Promise<SocialCheck> {
-  const result = spawnSync('bun', ['bin/elanous.mjs', '--test', 'intake', 'check', ...facts.flatMap((fact) => ['--fact', fact]), '--json'], {
+export function intakeCheckArgs(facts: readonly string[], options: { testMode?: boolean } = {}): string[] {
+  // Installed production collectors may have no git tree, so only an explicitly isolated
+  // caller asks the CLI to resolve --test.
+  return ['bin/elanous.mjs', ...(options.testMode ? ['--test'] : []), 'intake', 'check', ...facts.flatMap((fact) => ['--fact', fact]), '--json'];
+}
+
+export async function runIntakeCheckCli(facts: readonly string[], options: { testMode?: boolean } = {}): Promise<SocialCheck> {
+  const result = spawnSync('bun', intakeCheckArgs(facts, options), {
     cwd: resolve(import.meta.dir, '..'), encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
   });
   if (result.error || result.status !== 0) throw new Error(result.error?.message ?? result.stderr?.trim() ?? `intake check exited ${result.status}`);
@@ -143,7 +149,7 @@ export async function runIntakeSocial(options: { root: string; deps?: SocialDeps
         ...splitSentences(point.title).filter(isProductClaim),
         ...summary.filter(isProductClaim),
       ])];
-      const check = await (deps.check ?? checkWithCli)(facts);
+      const check = await (deps.check ?? runIntakeCheckCli)(facts);
       if (!check.items.length) throw new Error('intake check 항목 없음');
       const productClaims = new Set(facts.filter(isProductClaim));
       const judgedClaims = check.items.filter((item) => productClaims.has(item.fact));

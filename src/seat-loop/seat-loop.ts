@@ -428,7 +428,8 @@ function decisionCardMaterial(input: {
       `무엇: ${input.what}`, `지금까지: ${input.soFar}`, `지금 상태 재측: ${input.current}`,
       ...input.options.map((option) => `선택지 ${option.key} (${option.label}) 결과: ${option.consequence}`),
       'skipped' in input.recommendation ? `권고 비움: ${input.recommendation.reason}` : `권고: ${input.recommendation.option} — ${input.recommendation.why}`,
-      `확신: ${input.confidence}`, `그냥 두면: ${input.ifUntouched}`, `근거: ${input.evidence}`,
+      `확신: ${input.confidence}`, `그냥 두면: ${input.ifUntouched}`,
+      `근거: ${input.evidence}`, `무엇이 바뀌나: ${input.answer}`, `기본값 시 결과: ${input.ifUntouched}`,
       `Q: ${input.question}`, `A: ${input.answer}`,
     ].join('\n'),
   };

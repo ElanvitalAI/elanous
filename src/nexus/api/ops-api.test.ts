@@ -11,6 +11,8 @@ import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { NexusEventBus } from './event-bus.js';
 import { routeRequest } from './http-server.js';
 import { readReleaseRuns, setOverviewCacheForTest } from './ops-api.js';
+import { setResourceLedgerSnapshotForTest } from './resource-ledger.js';
+import { buildResourceLedgerSnapshot } from '../../cli/resource-ledger-cli.js';
 import { createOverviewCache } from '../../ops/overview-cache.js';
 import { okCell, unmeasured, type OverviewSnapshot } from '../../ops/overview.js';
 import { gateShardsPath, writeGateShards } from '../../release-loop/gate-shards.js';
@@ -24,6 +26,7 @@ const dirs: string[] = [];
 const originalXdgConfig = process.env.XDG_CONFIG_HOME;
 afterEach(() => {
   setOverviewCacheForTest(null);
+  setResourceLedgerSnapshotForTest(null);
   if (originalXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdgConfig;
   resetUserConfig();
@@ -60,6 +63,63 @@ function fixture(enabled: boolean | undefined) {
   };
   return { dir, send, run };
 }
+
+test('resource ledger: operator-gated handler returns the mocked host/lane snapshot without local paths', async () => {
+  const { send } = fixture(true);
+  const at = '2026-11-02T00:00:00.000Z';
+  let reads = 0;
+  setResourceLedgerSnapshotForTest(() => {
+    reads++;
+    const snapshot = buildResourceLedgerSnapshot({
+      events: () => [],
+      hosts: () => [{ host: 'gcp2', poolMapped: true, capacity: { gate: 4 } }],
+      now: () => new Date(at),
+      run: (command, args) => {
+        if (command === 'kubectl' && args.includes('nodes')) return { status: 0,
+          stdout: JSON.stringify({ items: [{ metadata: { name: 'gcp2-node' } }] }), stderr: '' };
+        if (command === 'kubectl') return { status: 0, stdout: JSON.stringify({ items: [{
+          metadata: { namespace: 'harness', name: 'gate-pod', labels: { 'elanous.ai/fp': 'fp_ledger1234', 'elanous.ai/lane': 'gate' } },
+          status: { phase: 'Running' }, spec: { nodeName: 'gcp2-node', containers: [{ resources: { requests: { cpu: '500m', memory: '128Mi' } } }] },
+        }] }), stderr: '' };
+        if (command === 'ps') return { status: 0, stdout: '123 1 elanous train fp_ledger1234\n', stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      },
+    });
+    return { ...snapshot,
+      findings: [...snapshot.findings, { kind: 'measurement-unavailable' as const, host: 'gcp2', id: 'fixture',
+        detail: `open:/비밀/설정; unc=//비밀 Bearer ${API_KEY}`, action: 'report-only' as const }],
+      measurements: snapshot.measurements.map(measurement => ({ ...measurement,
+        errors: [`kubectl: /tmp/kubeconfig Bearer ${API_KEY}`],
+        processes: [{ id: 'pid:123', fp: 'fp_ledger1234', command: `kubectl --token ${API_KEY} --kubeconfig /tmp/kubeconfig` }],
+      })),
+    };
+  });
+
+  expect((await send('/v1/ops/resources/ledger'))?.status).toBe(401);
+  expect((await send('/v1/ops/resources/ledger', { 'x-elanous-operator': 'forged-forged-forged-forged' }))?.status).toBe(403);
+  expect(reads).toBe(0);
+  const response = await send('/v1/ops/resources/ledger', { 'x-elanous-operator': SECRET });
+  expect(response?.status).toBe(200);
+  expect(response?.headers.get('cache-control')).toBe('no-store');
+  const responseText = await response?.text() ?? '';
+  const body = JSON.parse(responseText) as { ledgerPath?: string; observedAt: string; matrix: Array<{ host: string; lane: string; leases: number; measuredPods: number | null }>;
+    findings: Array<{ detail: string }>; measurements: Array<{ host: string; pods: Array<{ phase: string }>; processes: Array<{ id: string; command?: string }>;
+      errors: string[] }> };
+  expect(body.ledgerPath).toBeUndefined();
+  expect(responseText).not.toContain('/tmp/kubeconfig');
+  expect(responseText).not.toContain('/home/operator/.kube/config');
+  expect(responseText).not.toContain('/비밀/설정');
+  expect(responseText).not.toContain('//비밀');
+  expect(responseText).not.toContain(API_KEY);
+  expect(responseText).not.toContain('kubectl --token');
+  expect(body.measurements[0]?.processes).toEqual([{ id: 'pid:123', fp: 'fp_ledger1234' }]);
+  expect(body.observedAt).toBe(at);
+  expect(body.matrix).toContainEqual(expect.objectContaining({ host: 'gcp2', lane: 'gate', leases: 0, measuredPods: 1 }));
+  expect(body.measurements[0]).toMatchObject({ host: 'gcp2', pods: [{ phase: 'Running' }] });
+  expect(reads).toBe(1);
+  expect((await send('/v1/ops/resources/ledger', { 'x-elanous-operator': SECRET }, 'POST'))?.status).toBe(405);
+  expect(reads).toBe(1);
+});
 
 test('overview: routeRequest reuses operator gate, no-store, snapshot memo and background-only Pod measurement', async () => {
   const { send } = fixture(true);

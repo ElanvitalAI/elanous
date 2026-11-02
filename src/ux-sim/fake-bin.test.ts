@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 
-import { createFakeBins, withFakeBins } from './fake-bin.js';
+import { createFakeBins, createFakeExecutableDevice, withFakeBins, withFakeExecutableDevice } from './fake-bin.js';
 
 describe('fake-bin', () => {
   test('recorder does not recurse when its own mktemp, cat, and rm utilities are faked', () => {
@@ -161,6 +163,121 @@ describe('fake-bin', () => {
   test('rejects names that are not a single path segment', () => {
     for (const name of ['../grok', '.', '..', '']) {
       expect(() => createFakeBins({ [name]: {} })).toThrow('invalid executable name');
+    }
+  });
+});
+
+describe('fake executable result receipts', () => {
+  test('run preserves shell metacharacters as argv and rejects shell mode', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fake-bin-shell-boundary-'));
+    const marker = join(root, 'shell-ran');
+    const payload = `before; touch '${marker}'; \`echo injected\` $(echo injected) after`;
+    const device = createFakeExecutableDevice({ mocktool: { stdout: 'safe\n' } });
+    try {
+      const result = device.run('mocktool', ['--value', payload]);
+      expect(result.status).toBe(0);
+      expect(device.calls()).toEqual([{ name: 'mocktool', argv: ['--value', payload] }]);
+      expect(device.runs()[0]?.argv).toEqual(['--value', payload]);
+      expect(existsSync(marker)).toBe(false);
+
+      expect(() => device.run('mocktool', ['--value', payload], { shell: true } as never))
+        .toThrow('fake-bin: run does not support shell; argv must remain literal');
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      device.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('PATH execution captures argv, stdout, stderr, and exit status', () => {
+    const device = createFakeExecutableDevice({
+      mocktool: { stdout: 'out\n', stderr: 'warn\n', exitCode: 7 },
+    });
+    try {
+      const result = device.run('mocktool', ['--name', 'two words', '']);
+      expect(result.status).toBe(7);
+      expect(result.stdout).toBe('out\n');
+      expect(result.stderr).toBe('warn\n');
+      expect(device.calls()).toEqual([{ name: 'mocktool', argv: ['--name', 'two words', ''] }]);
+      expect(device.runs()).toEqual([{
+        name: 'mocktool', argv: ['--name', 'two words', ''], stdout: 'out\n', stderr: 'warn\n', exitCode: 7, signal: null,
+      }]);
+    } finally {
+      device.cleanup();
+    }
+    expect(existsSync(device.dir)).toBe(false);
+  });
+
+  test('captures a zero exit and supports caller environment while keeping the fake first on PATH', async () => {
+    let dir = '';
+    await withFakeExecutableDevice({ tool: { stdout: 'ready\n' } }, async (device) => {
+      dir = device.dir;
+      const result = spawnSync('tool', ['--version'], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: device.path('/usr/bin') },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('ready\n');
+      expect(device.path('/usr/bin').split(':').slice(0, 2)).toEqual([device.dir, '/usr/bin']);
+      expect(device.calls()).toEqual([{ name: 'tool', argv: ['--version'] }]);
+    });
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  test('records a signaled child as no exit code plus its signal', () => {
+    const device = createFakeExecutableDevice({ quiet: { killSignal: 'TERM' } });
+    try {
+      const result = device.run('quiet', ['check']);
+      expect(result.status).toBeNull();
+      expect(result.signal).toBe('SIGTERM');
+      expect(device.runs()).toEqual([{
+        name: 'quiet', argv: ['check'], stdout: '', stderr: '', exitCode: null, signal: 'SIGTERM',
+      }]);
+    } finally {
+      device.cleanup();
+    }
+  });
+
+  test('refuses unregistered names and stdio modes that prevent output capture', () => {
+    const device = createFakeExecutableDevice({ tool: { stdout: 'ok\n' } });
+    try {
+      expect(() => device.run('/bin/echo', ['must-not-run'])).toThrow(/registered executable name/);
+      expect(() => device.run('tool', [], { stdio: 'inherit' })).toThrow(/stdio=pipe/);
+      expect(device.runs()).toEqual([]);
+      expect(device.calls()).toEqual([]);
+    } finally {
+      device.cleanup();
+    }
+  });
+
+  test('records spawn errors alongside the returned error object', () => {
+    const name = 'echo';
+    const parentPath = mkdtempSync(join(tmpdir(), 'ux-sim-fake-executable-parent-path-'));
+    const marker = join(parentPath, 'external-echo-ran');
+    const externalEcho = join(parentPath, name);
+    writeFileSync(externalEcho, `#!/bin/sh\nprintf reached > '${marker}'\n`);
+    chmodSync(externalEcho, 0o755);
+    const device = createFakeExecutableDevice({ [name]: {} });
+    device.cleanup();
+
+    try {
+      const result = device.run(name, ['must-not-fall-through'], {
+        env: { PATH: [parentPath, process.env.PATH ?? ''].filter(Boolean).join(delimiter) },
+      });
+      expect(result.error).toBeDefined();
+      expect(result.error?.message).toContain('ENOENT');
+      expect(existsSync(marker)).toBe(false);
+      expect(device.runs()).toEqual([{
+        name,
+        argv: ['must-not-fall-through'],
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.status,
+        signal: result.signal,
+        error: result.error?.message,
+      }]);
+    } finally {
+      rmSync(parentPath, { recursive: true, force: true });
     }
   });
 });

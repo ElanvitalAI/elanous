@@ -2106,6 +2106,11 @@ export function openSyncSetupWindow(
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
+  let disposeFatalErrorHandlers = (): void => {};
+  try {
+    const { installFatalErrorHandlers } = await import('../error-report/report.js');
+    disposeFatalErrorHandlers = installFatalErrorHandlers('tui');
+  } catch { /* fatal hook installation must not block the dashboard */ }
   // TUI-BOOT-TIMING-HOLES — 첫 프레임 직전 동기 셋업 구간을 여기서 연다(셋업 종료 지점에서 닫는다).
   const syncSetupWindow = openSyncSetupWindow(opts.onSyncSetupComplete);
   let firstDashboardFrameRendered = false;
@@ -2119,6 +2124,8 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
   let closeClassicSidetabRuntime = (): void => {};
   let restoreTuiStderrOwner = (): void => {};
   const closeDashboardTui = (): void => {
+    try { disposeFatalErrorHandlers(); } catch { /* never block dashboard cleanup */ }
+    disposeFatalErrorHandlers = (): void => {};
     disposeDashboardEventLoopMonitor();
     try { disposeDashboardAgentWake(); } catch { /* never block exit */ }
     disposeClassicSigquit();
@@ -7668,7 +7675,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const notice = skillRepairNotice(problems);
     if (notice) chatLines.push(C.info(notice));
     // ER1 — tell operations too (consented · scrubbed · async); a kept unsent report is retried once a day.
-    void import('../error-report/report.js').then(async ({ reportError, retryPendingErrorReport }) => {
+    void import('../error-report/report.js').then(async ({ flushCrashQueue, reportError, retryPendingErrorReport }) => {
+      const crashOutcome = await flushCrashQueue();
+      if (crashOutcome.sent > 0) chatLines.push(C.muted(`이전 실행의 치명 오류 보고 ${crashOutcome.sent}건을 전송했습니다.`));
+      else if (crashOutcome.consentSkipped > 0) chatLines.push(C.muted('이전 실행의 치명 오류 기록이 있으나 동의가 없어 전송하지 않았습니다.'));
+      else if (crashOutcome.disabledSkipped > 0) chatLines.push(C.muted('이전 실행의 치명 오류 기록이 있으나 오류 보고가 꺼져 있어 전송하지 않았습니다.'));
+      else if (crashOutcome.skipped > 0) chatLines.push(C.muted(`이전 실행의 치명 오류 기록 ${crashOutcome.skipped}건은 손상되었거나 전송할 수 없어 건너뛰었습니다.`));
       await retryPendingErrorReport();
       for (const p of problems.slice(0, 3)) {
         const outcome = await reportError({ code: 'skill-index', message: `${p.name}: ${p.code ?? ''} ${p.error}`.trim(), surface: 'tui' });

@@ -454,8 +454,11 @@ export function buildDriveSpawnOptions(
   if (opts.elanous) {
     const ptyId = opts.ptyId ?? ctx.envPtyId;
     const observeOnly = opts.observeOnly || resolveObserveOnlyDecision().enabled;
+    const heldTuiRepoRoot = opts.hold && process.env.ELANOUS_HOLD_OWNER === '1'
+      ? process.env.ELANOUS_HOLD_TUI_REPO_ROOT?.trim()
+      : undefined;
     return elanousTuiSpawnOptions({
-      repoRoot: opts.repoRoot ?? resolve(import.meta.dir, '../..'),
+      repoRoot: heldTuiRepoRoot || opts.repoRoot || resolve(import.meta.dir, '../..'),
       cwd: ctx.cwd,
       configDir: ctx.configDir!,
       stateDir: ctx.stateDir!,
@@ -833,6 +836,27 @@ async function runPtyDriveInner(opts: PtyDriveOpts): Promise<{ exitCode: number 
       //    종전엔 finally 가 `opts.hold` 만 봐서, 위 setAccessMode·renderScreen·writeScreen 중
       //    하나라도 던지면 **detached PTY 와 isolation 이 유출**됐다(아무도 거두지 않는다).
       handedOff = true;
+      // The detached owner is also the Bun native-PTY host. Returning here
+      // closes its PTY master, which can make an otherwise-live child exit
+      // immediately after the caller's readiness check. Keep the owner alive
+      // until the handed-off child exits; the caller can still control it via
+      // the shared PTY registry while this process waits.
+      if (process.env.ELANOUS_HOLD_OWNER === '1') {
+        // Bun does not keep the owner event loop alive for an unresolved
+        // promise alone, so poll liveness with a referenced timer.
+        await new Promise<void>((resolve) => {
+          const checkExit = setInterval(() => {
+            if (!h!.isAlive()) {
+              clearInterval(checkExit);
+              resolve();
+            }
+          }, 100);
+          if (!h!.isAlive()) {
+            clearInterval(checkExit);
+            resolve();
+          }
+        });
+      }
       return { exitCode: 0 };
     }
     const { runPtyControlLoop, controlDepsForHandle } = await import('../autopilot/pty-control-loop.js');

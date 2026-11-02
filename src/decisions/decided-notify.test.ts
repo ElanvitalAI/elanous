@@ -28,7 +28,8 @@ test('production decisions CLI sends one notice to the raised track; retry adds 
   try {
     const raised = run('raise', '--title', 'UX 알림 검증', '--category', 'scope', '--s', '결정이 올라왔다.',
       '--c', '수신 자리를 확인한다.', '--option', 'a=승인:전달', '--option', 'b=보류:대기', '--recommend', 'a',
-      '--why', '알림 경로 확인', '--track', 'UX', '--agent', 'UX', '--no-xcheck', '격리 회귀', '--json') as { id: string };
+      '--why', '알림 경로 확인', '--pending-question', '근거: 알림 경로 시험\n무엇이 바뀌나: 승인 시 UX에 전달\n기본값 시 결과: 전달 없음',
+      '--track', 'UX', '--agent', 'OP', '--no-xcheck', '격리 회귀', '--json') as { id: string };
     const decided = run('decide', raised.id, 'a', '--note', '실행 경로 통과', '--json') as {
       status: string; notice: { status: string; seat: string; messageId: number };
     };
@@ -47,6 +48,26 @@ test('production decisions CLI sends one notice to the raised track; retry adds 
       expect(messages[0]).toMatchObject({ id: decided.notice.messageId, from: 'OP', to: 'UX', kind: 'info' });
       expect(messages[0]!.body).toContain(`${raised.id} · UX 알림 검증 · 선택 a: 승인 · 근거 실행 경로 통과`);
     } finally { store.close(); }
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('production decisions CLI reports a skipped notice when no track was raised', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'decided-notify-cli-skipped-'));
+  const output: string[] = [];
+  const program = new Command();
+  registerDecisionsCommands(program, options(stateDir), { log: line => output.push(line) });
+  const run = (...args: string[]) => {
+    output.length = 0;
+    program.parse(['decisions', ...args], { from: 'user' });
+    return output.at(-1)!;
+  };
+  try {
+    const raised = JSON.parse(run('raise', '--title', '알림 대상 없음', '--category', 'scope', '--s', '결정이 올라왔다.',
+      '--c', '올린 track이 없다.', '--option', 'a=승인:전달 없음', '--option', 'b=보류:대기', '--recommend', 'a',
+      '--why', '대상이 없다', '--pending-question', '근거: 대상 없음 시험\n무엇이 바뀌나: 승인해도 전달되지 않음\n기본값 시 결과: 대상 없이 유지',
+      '--agent', 'OP', '--no-xcheck', '격리 회귀', '--json')) as { id: string };
+    expect(run('decide', raised.id, 'a', '--note', '전달 대상 없음')).toContain('자리 우편: 올린 자리 없음 — 우편 대상 없음');
+    expect(run('retry-notify', raised.id)).toBe('올린 자리 없음 — 우편 대상 없음');
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });
 

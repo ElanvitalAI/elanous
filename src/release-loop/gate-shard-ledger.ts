@@ -30,6 +30,8 @@ export interface GateShardLedgerRow {
   junitPath: string | null;
   stopReason: string | null;
   attemptId: string | null;
+  reuseDecision?: 'reuse' | 'rerun' | 'candidate';
+  reuseReason?: string;
 }
 
 export function gateShardLedgerPath(version: string, root = releaseLedgerRoot()): string {

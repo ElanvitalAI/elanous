@@ -56,6 +56,22 @@ describe('buildDriveSpawnOptions — 두 경로의 화면 크기 배선', () => 
     expect([o.cols, o.rows]).toEqual([200, 120]);
   });
 
+  test('held owner may launch the latest-main TUI entry while its owner code stays on the caller CLI', () => {
+    const previousOwner = process.env.ELANOUS_HOLD_OWNER;
+    const previousEntry = process.env.ELANOUS_HOLD_TUI_REPO_ROOT;
+    try {
+      process.env.ELANOUS_HOLD_OWNER = '1';
+      process.env.ELANOUS_HOLD_TUI_REPO_ROOT = '/latest-main/worktree';
+      const options = buildDriveSpawnOptions({ elanous: true, hold: true } as never, ctx);
+      expect(options.args?.[0]).toBe('/latest-main/worktree/bin/elanous.mjs');
+    } finally {
+      if (previousOwner === undefined) delete process.env.ELANOUS_HOLD_OWNER;
+      else process.env.ELANOUS_HOLD_OWNER = previousOwner;
+      if (previousEntry === undefined) delete process.env.ELANOUS_HOLD_TUI_REPO_ROOT;
+      else process.env.ELANOUS_HOLD_TUI_REPO_ROOT = previousEntry;
+    }
+  });
+
   test('elanous 경로는 owner ELANOUS_STATE_DIR에서 control inbox를 해석한다', () => {
     const previousStateDir = process.env.ELANOUS_STATE_DIR;
     const previousInboxDir = process.env.ELANOUS_CONTROL_INBOX_DIR;

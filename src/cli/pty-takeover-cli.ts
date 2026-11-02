@@ -6,7 +6,8 @@ import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
 import { getPty, listPty, renamePty, requestPtyTakeover, startPty, type StartOpts } from '../pty-shell/registry.js';
 import { describePtyRunState, describeTurnCell, formatTurnCell, judgeTurnProgress, ptyTurnViewOfRow, readCheckoutHead, readCurrentInstallRecord, shortSha, UNKNOWN_TURN_CELL, type InstalledRecord, type PtyRunStateView, type PtyTurnCell, type TurnProgressJudgment } from '../pty-shell/tui-run-state.js';
-import { getPtyManifest, isProcessAlive, listPtyManifest, listPtyManifestRows, listPtyManifestRowsAt, ptyManifestDbPath, readPtyManifestFrame, reapDeadPtyManifest, reapDeadPtyManifestAt, reapStalePtyManifest, removePtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, PTY_MANIFEST_STALE_MS, type PtyManifestExternalReapResult, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
+import { getPtyManifest, isProcessAlive, ptyManifestDbPath, readPtyManifestFrame, reapDeadPtyManifest, reapDeadPtyManifestAt, reapStalePtyManifest, removePtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, PTY_MANIFEST_STALE_MS, type PtyManifestExternalReapResult, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
+import { listPtyManifestRowsCached, listPtyManifestRowsCachedAt } from '../pty-shell/pty-manifest-query-cache.js';
 import { readPtyEventsAfter, readPtyEventsAfterAt, type PtyEventLogReadResult, type PtyEventRow } from '../pty-shell/pty-event-log.js';
 import { resolvePtyRef, type PtyRefItem } from '../pty-shell/pty-ref.js';
 import { parsePtyWriteActor, resolveRemoteControlActor, resolveTakeover, type PtyWriteActor } from '../pty-shell/pty-write-arbiter.js';
@@ -518,7 +519,7 @@ export function readLivePtyAddressBook(): PtyAddressBook {
   const localIds = new Set(local.map((handle) => handle.id));
   try { reapDeadPtyManifest(); } catch { /* fail-soft */ }
   try { reapStalePtyManifest(Date.now()); } catch { /* fail-soft */ }
-  const rows = listPtyManifest();
+  const rows = listPtyManifestRowsCached();
   const manifest = rows.filter((row) => row.alive);
   const deadRefs = rows
     .filter((row) => !row.alive && !localIds.has(row.id))
@@ -544,8 +545,8 @@ const liveDeps: PtyTakeoverCommandDeps = {
   readInstalledBuild: () => readCurrentInstallRecord(),
   readCheckoutHead,
   // `find`/`retire` must prove before removal: this reader never invokes any reaper.
-  listManifestRows: listPtyManifestRows,
-  listManifestRowsAt: listPtyManifestRowsAt,
+  listManifestRows: listPtyManifestRowsCached,
+  listManifestRowsAt: listPtyManifestRowsCachedAt,
   currentManifestDbPath: ptyManifestDbPath,
   realpath: (path) => { try { return realpathSync(path); } catch { return path; } },
   removeManifest: removePtyManifest,
@@ -554,7 +555,7 @@ const liveDeps: PtyTakeoverCommandDeps = {
   readLifecycleRows: () => readPtyEventsAfter(0, { kind: 'lifecycle' }),
   inspectControlInbox,
   readFederatedLineage({ includeTest }) {
-    const manifestRows = ptyManifestTargets({ includeTest }).flatMap((target) => listPtyManifestRowsAt(target.dbPath).map((row) => ({ ...row, sourceRoot: target.name })));
+    const manifestRows = ptyManifestTargets({ includeTest }).flatMap((target) => listPtyManifestRowsCachedAt(target.dbPath).map((row) => ({ ...row, sourceRoot: target.name })));
     const lifecycleRows: PtyEventRow[] = [];
     const unreadableRoots: PtyLineageRoot[] = [];
     const missingRoots: PtyLineageRoot[] = [];
@@ -575,7 +576,7 @@ const liveDeps: PtyTakeoverCommandDeps = {
   //    ⚠️ 정적 import 로 배선한다 — `runPtyList` 는 동기라 `await import` 를 못 쓰고,
   //      ESM 에서 `require` 는 런타임 의존이다(Bun 에선 돌지만 계약으로 삼지 않는다·리뷰 must-fix).
   listFederatedRefs({ includeTest }) {
-    return federatedPtyRefs(federatedManifestTargets(ptyManifestTargets({ includeTest }), ptyManifestDbPath(), (path) => { try { return realpathSync(path); } catch { return path; } }), (dbPath) => listPtyManifestRowsAt(dbPath));
+    return federatedPtyRefs(federatedManifestTargets(ptyManifestTargets({ includeTest }), ptyManifestDbPath(), (path) => { try { return realpathSync(path); } catch { return path; } }), listPtyManifestRowsCachedAt);
   },
   reapManifestAt: reapDeadPtyManifestAt,
   manifestTargets: ({ includeTest }) => ptyManifestTargets({ includeTest }),

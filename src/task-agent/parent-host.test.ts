@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defaultTaskLauncher, type DetachedSpawn } from '../cli/tasks-cli.js';
+import { defaultTaskLauncher as launchDefaultTask, runRemoteTaskParent, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
 import { hostCredentials } from '../task-orchestrator/surfaces/self-implement-pod.js';
@@ -21,6 +21,10 @@ const TEST_CODEX_MIRROR = {
   elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: ACCESS_TOKEN, refreshToken: '', refresh_token: '' } } } }),
   codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: ACCESS_TOKEN, id_token: ACCESS_TOKEN, refresh_token: '', refreshToken: '' } }),
 };
+async function defaultTaskLauncher(args: string[], cwd?: string, context?: Parameters<typeof launchDefaultTask>[2],
+  deps: Parameters<typeof launchDefaultTask>[3] = {}): ReturnType<typeof launchDefaultTask> {
+  return launchDefaultTask(args, cwd, context, { releaseGatePolicy: null, ...deps });
+}
 const capacitySample = (active = 0, waiting = 0, cpu = 0, cores = 4): string =>
   `__ELANOUS_PARENT_CAPACITY__${active}\n${waiting ? JSON.stringify({ category: 'pod-lease', event: 'admit-by-usage', data: { runId: 'run-waiting', recommended: 0 } }) + '\n' : ''}__ELANOUS_PARENT_APPROVALS__\n__ELANOUS_PARENT_LOAD__${cpu.toFixed(3)}\n__ELANOUS_PARENT_LOAD__cores=${cores}\n`;
 
@@ -37,7 +41,7 @@ function stubSsh(responses: Array<{ match: RegExp; stdout?: string; status?: num
 
 async function launchWithTestMirror(args: string[], cwd: string | undefined, context: Parameters<typeof defaultTaskLauncher>[2],
   deps: Parameters<typeof defaultTaskLauncher>[3] = {}): ReturnType<typeof defaultTaskLauncher> {
-  return defaultTaskLauncher(args, cwd, context, { codexAccessMirror: async () => TEST_CODEX_MIRROR, ownerCodexLeaseHolder: () => true, ...deps });
+  return defaultTaskLauncher(args, cwd, context, { releaseGatePolicy: null, codexAccessMirror: async () => TEST_CODEX_MIRROR, ownerCodexLeaseHolder: () => true, ...deps });
 }
 const orderParentHosts = (targets: readonly ParentHostConfig[], runId: string, capacities: Parameters<typeof rankParentHosts>[2]): ParentHostConfig[] =>
   rankParentHosts(targets, runId, capacities).map(({ target }) => target);
@@ -59,6 +63,74 @@ describe('resolveParentHost — 기본 OFF', () => {
 describe('multi-host parent routing', () => {
   const hosts: ParentHostConfig[] = [TARGET, { host: 'node-c', cwd: '/srv/elanous', approvalCapacity: 8 }];
   const minihHost = hosts[1]!;
+  test('self orchestrate parent runs attached on selected host with auto-merge disabled', async () => {
+    const scripts: string[] = [];
+    const result = await runRemoteTaskParent(
+      ['self', 'orchestrate', 'goal text', '--substrate', 'pod', '--auto-merge', '--child-llm-provider', 'openrouter', '--parent-host-worker'],
+      { runId: 'run-parent-dispatch-test', launchId: 'parent-dispatch-test', env: { ELANOUS_RUN_ID: 'run-parent-dispatch-test' }, substrate: 'pod', effectiveChildProvider: 'openrouter' },
+      {
+        parentHost: TARGET,
+        releaseGatePolicy: null,
+        ssh: (host, script) => {
+          scripts.push(`${host}:${script}`);
+          return { status: script.includes('self orchestrate') ? 7 : 0, stdout: script.includes('self orchestrate') ? '' : GOOD_FACTS, stderr: '' };
+        },
+        launchHoldActive: () => false,
+        localVersion: '0.2.20-dev.0',
+        spawn: (() => { throw new Error('parent dispatch must not spawn locally'); }) as unknown as DetachedSpawn,
+      },
+    );
+    expect(result).toEqual({ dispatched: true, exitCode: 7, host: 'node-b' });
+    const attached = scripts.find((script) => script.includes('self orchestrate')) ?? '';
+    expect(attached).toContain('--parent-host-worker');
+    expect(attached).toContain('--no-auto-merge');
+    expect(attached).not.toMatch(/(?:^| )--auto-merge(?: |$)/);
+    expect(scripts.every((script) => script.startsWith('node-b:'))).toBe(true);
+  });
+  test('gate traffic with podTarget=0 excludes node-b and launches the parent on gcp1', async () => {
+    const scripts: string[] = [];
+    const result = await runRemoteTaskParent(
+      ['self', 'orchestrate', 'goal text', '--substrate', 'pod', '--child-llm-provider', 'openrouter', '--parent-host-worker'],
+      { runId: 'run-gate-parent-dispatch-test', launchId: 'gate-parent-dispatch-test', env: { ELANOUS_RUN_ID: 'run-gate-parent-dispatch-test' }, substrate: 'pod', effectiveChildProvider: 'openrouter' },
+      {
+        parentHost: [TARGET, { host: 'gcp1', cwd: '/srv/elanous', podPool: 'k3d-elanous-pool:12', approvalCapacity: 4 }],
+        releaseGatePolicy: { traffic: { global: 'gate', podTarget: 0 }, gatePool: 'pool-node-b@node-b:4,pool-node-c@node-c:3',
+          resolveHostIdentity: (host) => host.split('@').at(-1) ?? null },
+        ssh: (host, script) => {
+          scripts.push(`${host}:${script}`);
+          if (script.includes('__ELANOUS_PARENT_CAPACITY__')) return { status: 0, stdout: capacitySample(0), stderr: '' };
+          return { status: script.includes('self orchestrate') ? 7 : 0, stdout: script.includes('self orchestrate') ? '' : GOOD_FACTS, stderr: '' };
+        },
+        launchHoldActive: () => false,
+        localVersion: '0.2.20-dev.0',
+      },
+    );
+    expect(result).toEqual({ dispatched: true, exitCode: 7, host: 'gcp1' });
+    expect(scripts.every((script) => script.startsWith('gcp1:'))).toBe(true);
+    expect(scripts.find((script) => script.includes('self orchestrate'))).toContain('--pod-pool k3d-elanous-pool:12');
+  });
+  test('unreadable traffic still excludes configured gate hosts from parent selection', async () => {
+    const scripts: string[] = [];
+    const result = await runRemoteTaskParent(
+      ['self', 'orchestrate', 'goal text', '--substrate', 'pod', '--child-llm-provider', 'openrouter', '--parent-host-worker'],
+      { runId: 'run-unknown-gate-parent-dispatch-test', launchId: 'unknown-gate-parent-dispatch-test',
+        env: { ELANOUS_RUN_ID: 'run-unknown-gate-parent-dispatch-test' }, substrate: 'pod', effectiveChildProvider: 'openrouter' },
+      {
+        parentHost: [TARGET, { host: 'gcp1', cwd: '/srv/elanous', podPool: 'k3d-elanous-pool:12', approvalCapacity: 4 }],
+        releaseGatePolicy: { traffic: null, gatePool: 'pool-node-b@node-b:4,pool-node-c@node-c:3',
+          resolveHostIdentity: (host) => host.split('@').at(-1) ?? null },
+        ssh: (host, script) => {
+          scripts.push(`${host}:${script}`);
+          if (script.includes('__ELANOUS_PARENT_CAPACITY__')) return { status: 0, stdout: capacitySample(0), stderr: '' };
+          return { status: 0, stdout: script.includes('self orchestrate') ? '' : GOOD_FACTS, stderr: '' };
+        },
+        launchHoldActive: () => false,
+        localVersion: '0.2.20-dev.0',
+      },
+    );
+    expect(result).toEqual({ dispatched: true, exitCode: 0, host: 'gcp1' });
+    expect(scripts.every((script) => script.startsWith('gcp1:'))).toBe(true);
+  });
   test('node allocatable excludes a 32Gi Job from a 31.36Gi pool without creating a Pod', () => {
     const target = { ...minihHost, podPool: 'k3d-elanous-pool:8' };
     const calls: string[] = [];
@@ -489,12 +561,38 @@ describe('multi-host parent routing', () => {
 });
 
 describe('원격 인자 — HQ 병합 권한을 넘기지 않는다', () => {
+  test.each([
+    ['gcp1', 'k3d-elanous-pool:12'],
+    ['gcp2', 'k3d-elanous-pool:6'],
+  ])('%s parent receives its configured local k3d pool', (_host, podPool) => {
+    const args = remoteParentArgs(['self', 'orchestrate', 'goal text'], podPool);
+    expect(args.slice(args.indexOf('--pod-pool'), args.indexOf('--pod-pool') + 2)).toEqual(['--pod-pool', podPool]);
+  });
   test('--merge-by-host → --no-auto-merge · --pod-pool 덧붙임', () => {
     const args = remoteParentArgs(['harness', 'say', '--seat', 'OP', '--substrate', 'pod', '--merge-by-host', 'goal text'], 'k3d-elanous-pool:40');
     expect(args).not.toContain('--merge-by-host');
     expect(args).toContain('--no-auto-merge');
     expect(args.slice(2, 4)).toEqual(['--pod-pool', 'k3d-elanous-pool:40']);
     expect(args.at(-1)).toBe('goal text');
+  });
+
+  test('remote-parent safety options do not rewrite option-looking positional goals', () => {
+    expect(remoteParentArgs(['harness', 'say', '--', '--auto-merge', '--auto-merge=true']))
+      .toEqual(['harness', 'say', '--no-auto-merge', '--', '--auto-merge', '--auto-merge=true']);
+    expect(remoteParentArgs(['harness', 'say', '--', '--auto-merge'], 'pool-gcp1@gcp1:12'))
+      .toEqual(['harness', 'say', '--pod-pool', 'pool-gcp1@gcp1:12', '--no-auto-merge', '--', '--auto-merge']);
+  });
+  test('remote-parent safety removes auto-merge only as an option, preserving option-looking values', () => {
+    expect(remoteParentArgs(['harness', 'say', '--seat', '--auto-merge', '--substrate', 'pod', '--auto-merge']))
+      .toEqual(['harness', 'say', '--no-auto-merge', '--seat', '--auto-merge', '--substrate', 'pod']);
+  });
+  test('remote-parent safety does not treat an option value as an existing no-auto-merge flag', () => {
+    expect(remoteParentArgs(['harness', 'say', '--base', '--no-auto-merge', 'goal']))
+      .toEqual(['harness', 'say', '--no-auto-merge', '--base', '--no-auto-merge', 'goal']);
+  });
+  test('remote-parent safety treats a terminator-looking option value as a value', () => {
+    expect(remoteParentArgs(['harness', 'say', '--base', '--', '--auto-merge']))
+      .toEqual(['harness', 'say', '--no-auto-merge', '--base', '--']);
   });
   test('원격 셸 한 줄 — 런 id env · 따옴표 · 로그 · pid', () => {
     const script = remoteLaunchScript(TARGET, ['harness', 'say', '--merge-by-host', "it's a goal\nline2"], { ELANOUS_RUN_ID: 'run-abcd1234' });
@@ -679,7 +777,7 @@ describe('defaultTaskLauncher — 원격 부모', () => {
       runId: context.runId, launchId: 'grok-expiry-preflight', effectiveChildProvider: 'grok',
       env: { ELANOUS_RUN_ID: context.runId },
     }, {
-      parentHost: TARGET, ssh, localVersion: '0.2.20-dev.0',
+      parentHost: TARGET, releaseGatePolicy: null, ssh, localVersion: '0.2.20-dev.0',
       launchHoldActive: () => false,
       spawn: () => { throw new Error('local launch after invalid host credential'); },
     })).rejects.toThrow('parent-host-provision-pending');
@@ -1389,6 +1487,7 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
     };
     const context = { runId: 'run-mirror0001', launchId: 'tl-mirror', env: { ELANOUS_RUN_ID: 'run-mirror0001' } };
     const deps = { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+      releaseGatePolicy: null,
       codexAccessMirror: async () => { mirrorReads++; return { ...TEST_CODEX_MIRROR, account: 'third', usedPercent: 47, thresholdPercent: 60 }; }, ownerCodexLeaseHolder: () => true, spawn: () => { throw Error('local fallback'); } };
 
     const first = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context, deps);
@@ -1721,7 +1820,7 @@ describe('HOST-TOOL-SELF-PROVISION — provider-ready parent admission', () => {
       const calls: string[] = [];
       const notices: string[] = [];
       await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, {
-        parentHost: testTarget, ssh: (_host, script) => { calls.push(script); return { status: 0, stdout: script.includes('--version') ? hostFacts(state) : '', stderr: '' }; },
+        parentHost: testTarget, releaseGatePolicy: null, ssh: (_host, script) => { calls.push(script); return { status: 0, stdout: script.includes('--version') ? hostFacts(state) : '', stderr: '' }; },
         launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
         spawn: () => { throw Error('local launch forbidden'); }, notice: (line) => notices.push(line),
       })).rejects.toThrow(`parent-host-provision-pending`);
@@ -1730,7 +1829,7 @@ describe('HOST-TOOL-SELF-PROVISION — provider-ready parent admission', () => {
         .toEqual([`[parent-host] remote-a provision 요청 — grok-credential-${state}; 준비 완료 전 배정 대기`]);
     }
     const launched = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, {
-      parentHost: testTarget, ssh: (_host, script) => ({ status: 0, stdout: script.includes('--version') ? hostFacts('valid') : script.includes('nohup') ? 'pid=4242\n' : '', stderr: '' }),
+      parentHost: testTarget, releaseGatePolicy: null, ssh: (_host, script) => ({ status: 0, stdout: script.includes('--version') ? hostFacts('valid') : script.includes('nohup') ? 'pid=4242\n' : '', stderr: '' }),
       launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
       spawn: () => { throw Error('local launch forbidden'); },
     });

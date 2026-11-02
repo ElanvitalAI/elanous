@@ -102,6 +102,7 @@ export async function runCompactPipeline(
         const summaryMsg: LLMMessage = {
           role: 'system',
           content: `<context_summary>\n${summary.summary}\n</context_summary>`,
+          cacheVolatile: true,
         };
         // Wave 7 (2026-05-04) — user-message replay. ref/opencode
         // `compaction.process` (session/compaction.ts:155-175,

@@ -45,6 +45,7 @@ export const FEATURE_MATURITY = {
     '/loops': { pwa: 'beta' },
     '/ops/release': { pwa: 'ops' },
     '/ops/seats': { pwa: 'ops' },
+    '/ops/resources': { pwa: 'ops' },
     '/ops/checklist': { pwa: 'ops' },
     '/ceo': { pwa: 'ops' },
     '/decisions': { pwa: 'ops' },
@@ -61,7 +62,7 @@ export const FEATURE_MATURITY = {
   cliRoot: {
     preview: 'beta', pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta', catalog: 'beta',
     where: 'stable', bench: 'beta', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
-    pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', live: 'beta',
+    pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', runs: 'beta', live: 'beta',
     research: 'beta', release: 'beta', rfc: 'beta', know: 'beta', life: 'beta', freeze: 'beta', herdr: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',
     control: 'beta', resources: 'beta', hooks: 'beta', setup: 'stable', start: 'stable',
     grounding: 'beta', graph: 'beta', loop: 'stable', resource: 'beta', card: 'stable', 'launch-head': 'beta',

@@ -1,4 +1,4 @@
-import { Command } from 'commander';
+import { Command, CommanderError } from 'commander';
 import type { LightCliRoute } from './cli/light-entry-route.js';
 
 /** Dispatch a small operational command without loading the full command registry. */
@@ -29,10 +29,23 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
   }
 
   const program = new Command().name('elanous').enablePositionalOptions();
+  // The legacy msg command maps parser failures to rc 2; use an override only
+  // there so the other roots retain their native Commander exit behavior.
+  if (route === 'msg') program.exitOverride();
   switch (route) {
     case 'msg': {
-      const { registerMsgCommands } = await import('./cli/msg-cli.js');
-      registerMsgCommands(program);
+      if (args[1] === 'list') {
+        const { registerMsgListCommand } = await import('./cli/msg-list-cli.js');
+        registerMsgListCommand(program.command('msg').description('Durable seat-addressed messages'));
+      } else {
+        const { registerMsgCommands } = await import('./cli/msg-cli.js');
+        registerMsgCommands(program);
+      }
+      break;
+    }
+    case 'decisions': {
+      const { registerDecisionsListCommand } = await import('./cli/decisions-list-cli.js');
+      registerDecisionsListCommand(program);
       break;
     }
     case 'release': {
@@ -110,6 +123,10 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
   try {
     await program.parseAsync(['node', 'elanous', ...process.argv.slice(2)]);
   } catch (error) {
+    if (error instanceof CommanderError) {
+      process.exitCode = ['commander.helpDisplayed', 'commander.version'].includes(error.code) ? 0 : route === 'msg' ? 2 : error.exitCode;
+      return;
+    }
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   }

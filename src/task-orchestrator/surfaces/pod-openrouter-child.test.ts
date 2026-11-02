@@ -313,9 +313,8 @@ describe('explicit OpenRouter Pod child', () => {
           callLLM: seams.elaborateCallLLM,
           observe: (event, data) => events.push({ event, data }),
         });
-        expect(attemptedProviders[0]).toBe('openrouter');
-        expect(attemptedProviders.every((provider) => provider === 'openrouter' || provider === 'openai')).toBe(true);
-        expect(missingCredentialFailure).toBe('openrouter unavailable: configure apiKey via `elanous setup`');
+        expect(attemptedProviders).toEqual([]);
+        expect(missingCredentialFailure).toBeUndefined();
         expect(step).toMatchObject({ parked: false, prompt: 'ROUND0' });
         expect(events).toHaveLength(1);
         expect(events[0]).toMatchObject({ event: 'goal-elaboration-skipped', data: { outcome: 'skipped', reason: 'provider-failed' } });

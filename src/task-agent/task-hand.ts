@@ -41,7 +41,7 @@ import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDone
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
 import { draftClaimComment, draftClaimRecordLive, draftClaimState, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 import { parseAskTargetPathHints, parseAskTargetPathHintsResult, type AskTargetPathHintsParseResult } from '../self-dev/launch-preflight-text.js';
-import { draftMissingGoalDoneBoundary, inspectGoalDoneBoundary, linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { draftMissingGoalDoneBoundary, inspectGoalDoneBoundary, normalizeGoalDoneBoundaryDocument } from '../self-implement/goal-author.js';
 import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
 // IMPL-FINDINGS-FEEDBACK — 병합 판정(postLand) 뒤 구현이 밝힌 절의 되먹임(원장 1회 기록·다음 저작 주입·후속 초안).
 import type { recordImplFindingsFeedback as RecordImplFindingsFeedback } from '../self-implement/impl-findings-feedback.js';
@@ -1227,25 +1227,8 @@ export function dispatchDeliverableCompletion(id: string, input: { ref: string; 
 /**
  * ENTRANCE-EVIDENCE-COMMAND-ONLY — 증거 명령 줄의 «형태» 판정. 기존 TA-HAND-PREFLIGHT 의 계약 줄 «존재» 검사
  * (`inspectGoalDoneBoundary`)와 구분된다: 세 경계 줄이 이미 갖춰진 골에서 증거 명령 줄의 값이 명령 원문인지만 본다.
- * 설명 접미(예: `→ 0 fail`)와 백틱 장식은 줄마다 이유를 붙여 거부한다. 빈 값·누락은 존재 검사 몫이다.
+ * 공유 goal-author 경계 파서가 알려진 결과 장식·백틱을 정규화한다. 알 수 없는 접미는 같은 경계 검사에서 거부하고, 빈 값·누락은 존재 검사 몫이다.
  */
-const GOAL_EVIDENCE_COMMAND_LINE = /^\s*(?:[-*]\s*)?완료 경계 증거 명령\s*:\s*(.*?)\s*$/;
-const GOAL_EVIDENCE_COMMAND_DESCRIPTION_SUFFIX = /->|→/;
-const GOAL_EVIDENCE_COMMAND_BACKTICK_DECORATION = /`/;
-const GOAL_EVIDENCE_COMMAND_TYPECHECK_DECORATION = /·\s*typecheck\b/i;
-
-function goalEvidenceCommandFormViolations(document: string): string[] {
-  const violations: string[] = [];
-  for (const line of linesOutsideFencedCode(document)) {
-    const value = GOAL_EVIDENCE_COMMAND_LINE.exec(line.text)?.[1];
-    if (value === undefined || !value.trim()) continue;
-    if (GOAL_EVIDENCE_COMMAND_BACKTICK_DECORATION.test(value)) violations.push(`백틱 장식: ${value}`);
-    else if (GOAL_EVIDENCE_COMMAND_DESCRIPTION_SUFFIX.test(value)) violations.push(`설명 접미: ${value}`);
-    else if (GOAL_EVIDENCE_COMMAND_TYPECHECK_DECORATION.test(value)) violations.push(`설명 접미: ${value}`);
-  }
-  return violations;
-}
-
 /**
  * FIRST-LINE-PATH-LIST-ONLY — 골 «첫 줄»의 형태 판정: `대상 경로:` 뒤의 «경로 조각» 에는 괄호·줄번호·덧말이 붙지 않는다.
  * 첫 줄만 보는 판정은 `parseAskTargetPathHintsResult` 가 이미 하므로 새 파서를 만들지 않고 그 결과에 얹는다:
@@ -1463,6 +1446,12 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   // Injected launchers are test seams and opt in explicitly at the contract test.
   if (opts.live && opts.preflightGoalDoneBoundary && !selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') {
     readTaskAgentState(path);
+    const normalizedMetadata = normalizeGoalDoneBoundaryDocument(metadataText);
+    if (normalizedMetadata !== metadataText) {
+      text = text.replace(metadataText, normalizedMetadata);
+      metadataText = normalizedMetadata;
+      card = { ...card, text };
+    }
     const metadataBeforeDraft = metadataText;
     const drafted = draftMissingGoalDoneBoundary(metadataText, targetPaths);
     if (drafted.added.length > 0) {
@@ -1474,11 +1463,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     }
     const { missing } = inspectGoalDoneBoundary(metadataText);
     if (missing.length > 0) throw new Error(`goal-revision-required: 완료 경계 누락 ${missing.join(' · ')}`);
-    // ENTRANCE-EVIDENCE-COMMAND-ONLY — 존재 검사와 구분된 형태 판정: 증거 명령 줄은 명령 원문만 받는다.
-    const formViolations = goalEvidenceCommandFormViolations(metadataText);
-    if (formViolations.length > 0) {
-      throw new Error(`goal-revision-required: 완료 경계 증거 명령은 명령 원문이어야 한다 ${formViolations.join(' · ')} — 증거 명령 줄에 설명 접미(예: → 0 fail)나 백틱 장식을 붙이지 말고 명령만 적은 뒤 다시 넘기세요`);
-    }
+    // The shared goal-author boundary parser normalizes known presentation decoration;
+    // unknown suffixes remain missing and are refused by the same boundary check above.
     // FIRST-LINE-PATH-LIST-ONLY — 첫 줄 형태 판정(발사 전 거부): 괄호·줄번호·덧말이 붙은 골은 자식을 띄우지 않는다.
     // 카드 기록(writeCard)과 launcher 호출 뒤로 밀리면 «발사 전 거부·카드 0» 이 깨지므로 이 자리에서 던진다.
     const firstLineViolations = firstLinePathListViolations(targetPathHints);
@@ -1638,7 +1624,13 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const launchDoor = opts.launchRequestDoor
     ?? (process.env.NODE_ENV === 'test' ? undefined : openLaunchRequestDoor({ source: 'hand' }));
   const launchAttemptKey = `${card.id}\n${card.createdAt}\n${randomBytes(12).toString('hex')}\n${card.text}`;
-  const launchDoorRequestId = launchDoor?.requestId(launchAttemptKey);
+  const launchDoorRequestId = launchDoor?.requestId(launchAttemptKey, {
+    ...(card.seat ? { seat: card.seat } : {}),
+    ...(card.checklistId ? { cell: card.checklistId } : {}),
+    originalRef: card.id,
+    retryGroup: card.id,
+    reason: `completion=${completion}; launcher=${selected.launcher}`,
+  });
   let inheritedLaunchDoorReceipt: string | undefined;
   if (launchDoor !== undefined && launchDoorRequestId !== undefined) {
     const doorConsumption = launchDoor.consume(launchDoorRequestId);

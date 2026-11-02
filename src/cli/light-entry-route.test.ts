@@ -19,6 +19,7 @@ describe('light CLI entry routing', () => {
     expect(selectLightCliRoute(['msg', 'ack', '17', '--to', 'MK'])).toBe('msg');
     expect(selectLightCliRoute(['msg', 'post', '--to', 'OP', '--body', 'hello'])).toBe('msg');
     expect(selectLightCliRoute(['msg', 'watch', '--to', 'OP', '--once'])).toBe('msg');
+    expect(selectLightCliRoute(['decisions', 'list', '--json'])).toBe('decisions');
     expect(selectLightCliRoute(['config', 'get', 'llm.provider'])).toBe('config');
     expect(selectLightCliRoute(['config', 'get', 'llm.provider', '--reveal'])).toBeUndefined();
     expect(selectLightCliRoute(['config', 'get', 'llm.provider', '--reveal=true'])).toBeUndefined();
@@ -311,6 +312,46 @@ exit 0
     expect(fast.stdout).toContain('hot-router-pipe-proof');
   }, 30000);
 
+  test('decisions list output and rc match through non-TTY pipes in an isolated ledger', () => {
+    const root = mkdtempSync(join(tmpdir(), 'hot-router-decisions-pipe-'));
+    tempDirs.push(root);
+    const env = { ...entrypointEnv, ELANOUS_STATE_DIR: join(root, 'state') };
+    const args = ['bin/elanous.mjs', 'decisions', 'list', '--json'];
+    const fast = spawnSync('bun', args, { cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe', timeout: 15000 });
+    const legacy = spawnSync('bun', args, { cwd: process.cwd(), env: { ...env, ELANOUS_FAST_ROUTER: '0' }, encoding: 'utf8', stdio: 'pipe', timeout: 20000 });
+    expect([fast.status, fast.signal, fast.stdout, fast.stderr]).toEqual([legacy.status, legacy.signal, legacy.stdout, legacy.stderr]);
+    expect(fast.status).toBe(0);
+    expect(JSON.parse(fast.stdout)).toEqual([]);
+  }, 30000);
+
+  test('decisions list since parsing and invalid-input output match the full CLI', () => {
+    const root = mkdtempSync(join(tmpdir(), 'hot-router-decisions-since-'));
+    tempDirs.push(root);
+    const env = { ...entrypointEnv, ELANOUS_STATE_DIR: join(root, 'state') };
+    for (const filters of [['--since', '2d'], ['--since', 'not-a-date'], ['--bogus']]) {
+      const args = ['bin/elanous.mjs', 'decisions', 'list', ...filters, '--json'];
+      const fast = spawnSync('bun', args, { cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe', timeout: 15000 });
+      const legacy = spawnSync('bun', args, {
+        cwd: process.cwd(), env: { ...env, ELANOUS_FAST_ROUTER: '0' }, encoding: 'utf8', stdio: 'pipe', timeout: 20000,
+      });
+      expect([fast.status, fast.signal, fast.stdout, fast.stderr]).toEqual([legacy.status, legacy.signal, legacy.stdout, legacy.stderr]);
+    }
+  }, 90000);
+
+  test('msg list invalid arguments keep full CLI errors and exit codes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'hot-router-msg-errors-'));
+    tempDirs.push(root);
+    const env = { ...entrypointEnv, ELANOUS_STATE_DIR: join(root, 'state') };
+    for (const flags of [['--to', 'not a seat'], ['--to', 'MK', '--limit', '0'], ['--to', 'MK', '--thread', '1'], ['--to', 'MK', '--bogus']]) {
+      const args = ['bin/elanous.mjs', 'msg', 'list', ...flags];
+      const fast = spawnSync('bun', args, { cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe', timeout: 15000 });
+      const legacy = spawnSync('bun', args, {
+        cwd: process.cwd(), env: { ...env, ELANOUS_FAST_ROUTER: '0' }, encoding: 'utf8', stdio: 'pipe', timeout: 20000,
+      });
+      expect([fast.status, fast.signal, fast.stdout, fast.stderr]).toEqual([legacy.status, legacy.signal, legacy.stdout, legacy.stderr]);
+    }
+  }, 90000);
+
   test('msg ack advances the isolated recipient cursor identically to legacy', () => {
     const root = mkdtempSync(join(tmpdir(), 'hot-router-msg-ack-'));
     tempDirs.push(root);
@@ -340,6 +381,27 @@ exit 0
       return [ack.status, ack.signal, ack.stdout, ack.stderr];
     };
     expect(seedAndAck(join(root, 'fast-state'))).toEqual(seedAndAck(join(root, 'legacy-state'), true));
+  }, 45000);
+
+  test('msg list cache misses after ack advances the recipient cursor', () => {
+    const root = mkdtempSync(join(tmpdir(), 'hot-router-msg-cache-ack-'));
+    tempDirs.push(root);
+    const env = { ...entrypointEnv, ELANOUS_STATE_DIR: join(root, 'state') };
+    const seed = `const { openMsgStore } = await import('./src/msg/msg-store.ts'); const store = openMsgStore(); const message = store.post({ from: 'OP', to: 'MK', body: 'cache-ack-proof' }); store.close(); console.log(message.id);`;
+    const seeded = spawnSync('bun', ['-e', seed], { cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe', timeout: 8000 });
+    expect([seeded.status, seeded.signal, seeded.stderr]).toEqual([0, null, '']);
+    const id = seeded.stdout.trim();
+    const list = () => spawnSync('bun', ['bin/elanous.mjs', 'msg', 'list', '--to', 'MK', '--json'], {
+      cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe', timeout: 15000,
+    });
+    expect(JSON.parse(list().stdout)).toHaveLength(1);
+    const ack = spawnSync('bun', ['bin/elanous.mjs', 'msg', 'ack', id, '--to', 'MK', '--json'], {
+      cwd: process.cwd(), env, encoding: 'utf8', stdio: 'pipe', timeout: 15000,
+    });
+    expect(ack.status).toBe(0);
+    const refreshed = list();
+    expect(refreshed.status).toBe(0);
+    expect(JSON.parse(refreshed.stdout)).toEqual([]);
   }, 45000);
 
   test('msg list preserves the legacy warning for the ignored config env marker', () => {

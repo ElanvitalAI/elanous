@@ -1,16 +1,17 @@
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getProvider, streamLLM } from '../llm.js';
+import { getProvider, getProviderForConfig, streamLLM } from '../llm.js';
+import { debug } from '../debug/log.js';
 import { buildDefaultSelfImplementSeams, planDevPipeline } from './dev-pipeline.js';
-import { clearLaunchRoleLlmOverrides, parseSubscriptionReviewerSpec, setUserConfigOverlay } from '../user-config.js';
+import { clearLaunchRoleLlmOverrides, getUserConfig, parseSubscriptionReviewerSpec, setUserConfigOverlay } from '../user-config.js';
 import { parseReviewResult, renderReview } from '../agent-substrate/pr-reviewer.js';
 import { defaultLlmPolicy, validateLlmPolicy } from '../policy/llm-policy.js';
 import {
-  classifyReviewProviderFailure, buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback,
+  classifyReviewProviderFailure, buildReviewProviderAttempts, planReviewProviderAttempts, noUsableReviewProviderError, defaultReviewFallbackModel, runReviewWithFallback,
   type ReviewFallbackObservation, subscriptionReviewerSpawn, runSubscriptionReviewer,
   subscriptionReviewerAvailability, parseTeamclaudeStatusJson, parseTeamclaudeBaseUrl,
 } from './review-provider-fallback.js';
@@ -215,6 +216,9 @@ describe('classifyReviewProviderFailure — 「제공자가 아픈가」만 문�
   test('OpenRouter 자격 미설정은 다른 프로바이더로 넘길 수 있는 가용성 실패다', () => {
     expect(classifyReviewProviderFailure('openrouter unavailable: configure apiKey via `elanous setup`')).toBe('credentials-unavailable');
   });
+  test('Grok의 XAI_API_KEY 안내도 자격 미설정으로 분류한다', () => {
+    expect(classifyReviewProviderFailure('Grok unavailable: run `grok login` (구독) 또는 XAI_API_KEY/GROK_API_KEY 설정')).toBe('credentials-unavailable');
+  });
 });
 
 describe('self review isolated CLI model routing', () => {
@@ -301,6 +305,74 @@ describe('self implement reviewDiff fallback route', () => {
 });
 
 describe('buildReviewProviderAttempts — 순서와 중복 제거', () => {
+  test('Pod 리뷰 정책은 기본·설정 폴백 중 Codex 이외 provider를 모두 제외한다', () => {
+    const glm = { model: 'glm', label: 'primary' };
+    const config = getUserConfig();
+    const codexModel = 'gpt-6.1-sol';
+    const codex = {
+      model: codexModel,
+      provider: getProviderForConfig({ ...config, llm: { ...config.llm, provider: 'openai-codex' } }, codexModel),
+      label: 'codex-credits',
+    };
+    const plan = planReviewProviderAttempts(glm, [B, { ...glm, label: 'configured-glm' }, codex], {
+      skipUnavailableProviders: true,
+      allowedProviderNames: ['openai-codex'],
+      isAvailable: () => true,
+    });
+
+    expect(plan.attempts.map((attempt) => [attempt.label, attempt.provider?.name])).toEqual([['codex-credits', 'openai-codex']]);
+    expect(plan.skipped.map((candidate) => [candidate.label, candidate.provider, candidate.why])).toEqual([
+      ['primary', 'openrouter', 'provider-not-allowed'],
+      ['grok', 'grok', 'provider-not-allowed'],
+    ]);
+  });
+
+  test('Pod 리뷰에서 허용되지 않은 후보만 있으면 사유를 남기고 호출 후보를 비운다', () => {
+    const plan = planReviewProviderAttempts({ model: 'glm', label: 'primary' }, [B], {
+      skipUnavailableProviders: true,
+      allowedProviderNames: ['openai-codex'],
+      isAvailable: () => true,
+    });
+
+    expect(plan.attempts).toEqual([]);
+    expect(plan.skipped.map(({ label, provider, why }) => [label, provider, why])).toEqual([
+      ['primary', 'openrouter', 'provider-not-allowed'],
+      ['grok', 'grok', 'provider-not-allowed'],
+    ]);
+    expect(noUsableReviewProviderError(plan.skipped).message).toContain('provider-not-allowed');
+  });
+
+  test('Pod에서는 자격 없는 primary를 건너뛰고 다음 사용 가능한 provider를 고른다', () => {
+    const plan = planReviewProviderAttempts(B, [A], {
+      skipUnavailableProviders: true,
+      isAvailable: (provider) => provider.name !== 'grok',
+    });
+    expect(plan.attempts.map((attempt) => attempt.label)).toEqual(['codex']);
+    expect(plan.skipped).toEqual([{ label: 'grok', model: B.model, provider: 'grok', why: 'no-credential' }]);
+  });
+
+  test('unresolved primary log includes a stable why code', () => {
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+      events.push({ category, event, data: (data ?? {}) as Record<string, unknown> });
+    }) as typeof debug.log);
+    try {
+      planReviewProviderAttempts(B, [A], { skipUnavailableProviders: true, isAvailable: () => false });
+      expect(events).toContainEqual(expect.objectContaining({ category: 'review.fallback', event: 'primary-unresolved',
+        data: expect.objectContaining({ why: 'no-credential' }) }));
+    } finally { spy.mockRestore(); }
+  });
+
+  test('Pod의 모든 provider가 자격 없으면 후보별 사유를 포함한 명확한 오류를 만든다', () => {
+    const plan = planReviewProviderAttempts(A, [B], {
+      skipUnavailableProviders: true,
+      isAvailable: () => false,
+    });
+    expect(plan.attempts).toEqual([]);
+    expect(noUsableReviewProviderError(plan.skipped).message)
+      .toBe(`no-usable-provider: ${A.provider.name}(${A.model})=no-credential, grok(${B.model})=no-credential`);
+  });
+
   test('기본 provider fallback은 provider inference 가능한 canonical 모델 ID를 쓴다', () => {
     expect(defaultReviewFallbackModel('grok')).toBe('claude-opus-5-5');
     expect(defaultReviewFallbackModel('openrouter')).toBe('grok-4.7');
@@ -475,6 +547,90 @@ describe('runReviewWithFallback — 계약 넷', () => {
     expect(result).toMatchObject({ text: 'PASS from grok', used: B, attemptIndex: 1 });
     expect(seen.map(({ event }) => event)).toEqual(['attempt', 'fallback', 'attempt', 'completed']);
     expect(seen[1]?.data).toMatchObject({ afterReason: 'credentials-unavailable' });
+  });
+
+  test('Grok 구독/API 자격이 호출 전 사라져도 설정된 다음 provider로 넘어간다', async () => {
+    const calls: string[] = [];
+    const result = await runReviewWithFallback([B, A], async (attempt) => {
+      calls.push(attempt.label);
+      if (attempt === B) throw new Error('Grok unavailable: run `grok login` (구독) 또는 XAI_API_KEY/GROK_API_KEY 설정');
+      return 'PASS from codex';
+    });
+    expect(calls).toEqual(['grok', 'codex']);
+    expect(result).toMatchObject({ text: 'PASS from codex', used: A, attemptIndex: 1 });
+  });
+
+  test('Pod 재확인에서 호출 직전 사라진 provider를 건너뛰고 전부 사라지면 후보별 사유를 낸다', async () => {
+    const calls: string[] = [];
+    const checked: string[] = [];
+    const availableAtCall = (attempt: typeof A | typeof B) => {
+      checked.push(attempt.label);
+      return attempt === B;
+    };
+    const result = await runReviewWithFallback([A, B], async (attempt) => {
+      calls.push(attempt.label);
+      return 'PASS from grok';
+    }, () => {}, { skipUnavailable: (attempt) => availableAtCall(attempt as typeof A | typeof B)
+      ? undefined
+      : { label: attempt.label, model: attempt.model, provider: attempt.provider!.name, why: 'no-credential' } });
+    expect(checked).toEqual(['codex', 'grok']);
+    expect(calls).toEqual(['grok']);
+    expect(result.used).toBe(B);
+
+    await expect(runReviewWithFallback([A, B], async (attempt) => {
+      calls.push(attempt.label);
+      return 'should not call';
+    }, () => {}, {
+      preSkipped: [{ label: 'primary', model: 'openrouter/z-ai/glm-5.3', provider: 'openrouter', why: 'no-credential' }],
+      skipUnavailable: (attempt) => ({ label: attempt.label, model: attempt.model,
+        provider: attempt.provider!.name, why: 'availability-check-failed' }),
+    }))
+      .rejects.toThrow('no-usable-provider: openrouter(openrouter/z-ai/glm-5.3)=no-credential, openai(gpt-5.6-sol)=availability-check-failed, grok(grok-4)=availability-check-failed');
+    expect(calls).toEqual(['grok']);
+  });
+
+  test('Pod skips do not consume the two-call budget before a later available provider', async () => {
+    const calls: string[] = [];
+    const result = await runReviewWithFallback([A, B, C], async (attempt) => {
+      calls.push(attempt.label);
+      return 'PASS from claude';
+    }, () => {}, {
+      maxCalls: 2,
+      skipUnavailable: (attempt) => attempt === C ? undefined : {
+        label: attempt.label, model: attempt.model, provider: attempt.provider!.name, why: 'no-credential',
+      },
+    });
+    expect(calls).toEqual(['claude']);
+    expect(result.used).toBe(C);
+  });
+
+  test('a later unavailable candidate does not replace the previous provider error', async () => {
+    {
+      const calls: string[] = [];
+      await expect(runReviewWithFallback([A, B], async (attempt) => {
+        calls.push(attempt.label);
+        throw new Error('Our servers are currently overloaded.');
+      }, () => {}, {
+        skipUnavailable: (attempt) => attempt === B
+          ? { label: attempt.label, model: attempt.model, provider: attempt.provider!.name, why: 'no-credential' }
+          : undefined,
+      })).rejects.toThrow('Our servers are currently overloaded.');
+      expect(calls).toEqual(['codex']);
+    }
+
+    {
+      const calls: string[] = [];
+      await expect(runReviewWithFallback([A, B, C], async (attempt) => {
+        calls.push(attempt.label);
+        throw new Error(attempt === A ? 'Our servers are currently overloaded.' : 'rate limit exceeded');
+      }, () => {}, {
+        maxCalls: 2,
+        skipUnavailable: (attempt) => attempt === C
+          ? { label: attempt.label, model: attempt.model, provider: attempt.provider!.name, why: 'no-credential' }
+          : undefined,
+      })).rejects.toThrow('rate limit exceeded');
+      expect(calls).toEqual(['codex', 'grok']);
+    }
   });
 
   test('② 폴백 불가능한 오류는 사유를 남기고 즉시 던진다 — 다른 모델로 안 샌다', async () => {

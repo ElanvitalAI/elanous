@@ -60,6 +60,19 @@ export interface OpsChecklist {
   history?: unknown[];
 }
 
+export interface ResourceLedger {
+  observedAt: string;
+  readStatus: 'ok';
+  matrix: Array<{ host: string; lane: string; capacity: number | null; leases: number; leasedCpu: number; leasedMemoryBytes: number;
+    observedPodCpuRequests: number | null; observedPodMemoryRequestsBytes: number | null; measuredPods: number | null;
+    unknownPods: number | null; measuredProcesses: number | null; unknownProcesses: number | null; deltaLeasesVsPods: number | null }>;
+  leases: Array<{ id: string; fp: string; host: string; lane: string; resources: { cpu?: number; memoryBytes?: number; shards?: number; pods?: number };
+    mission: { cell?: string; goalId?: string; pr?: number }; heartbeatAt: string; startedAt: string }>;
+  measurements: Array<{ host: string; observedAt: string; pods: Array<{ id: string; phase: string; fp?: string; lane?: string; mission?: string }>;
+    processes: Array<{ id: string; fp?: string; lane?: string; mission?: string }>; errors: string[] }>;
+  findings: Array<{ kind: string; host: string; id: string; fp?: string; detail: string; action: 'report-only' }>;
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -173,5 +186,27 @@ export function getOpsChecklist(client: DaemonClient, version: string): Promise<
       ...(value.byOwner !== undefined ? { byOwner: value.byOwner } : {}),
       ...(value.history !== undefined ? { history: value.history } : {}),
     };
+  });
+}
+
+export function getResourceLedger(client: DaemonClient): Promise<OpsResult<ResourceLedger>> {
+  return get(client, '/v1/ops/resources/ledger', (value) => {
+    if (!record(value) || !string(value.observedAt) || value.readStatus !== 'ok'
+      || !Array.isArray(value.matrix) || !Array.isArray(value.leases) || !Array.isArray(value.measurements) || !Array.isArray(value.findings)) return null;
+    const numberOrNull = (input: unknown) => input === null || (typeof input === 'number' && Number.isFinite(input));
+    const matrix = value.matrix;
+    if (!matrix.every((row: unknown) => record(row) && string(row.host) && string(row.lane) && numberOrNull(row.capacity)
+      && Number.isInteger(row.leases) && typeof row.leasedCpu === 'number' && typeof row.leasedMemoryBytes === 'number'
+      && numberOrNull(row.observedPodCpuRequests) && numberOrNull(row.observedPodMemoryRequestsBytes)
+      && numberOrNull(row.measuredPods) && numberOrNull(row.unknownPods) && numberOrNull(row.measuredProcesses)
+      && numberOrNull(row.unknownProcesses) && numberOrNull(row.deltaLeasesVsPods))) return null;
+    if (!value.leases.every((lease: unknown) => record(lease) && string(lease.id) && string(lease.fp) && string(lease.host)
+      && string(lease.lane) && record(lease.resources) && record(lease.mission) && string(lease.heartbeatAt) && string(lease.startedAt))) return null;
+    if (!value.measurements.every((measurement: unknown) => record(measurement) && string(measurement.host) && string(measurement.observedAt)
+      && Array.isArray(measurement.pods) && Array.isArray(measurement.processes) && Array.isArray(measurement.errors)
+      && measurement.errors.every(string))) return null;
+    if (!value.findings.every((finding: unknown) => record(finding) && string(finding.kind) && string(finding.host)
+      && string(finding.id) && string(finding.detail) && finding.action === 'report-only')) return null;
+    return value as unknown as ResourceLedger;
   });
 }

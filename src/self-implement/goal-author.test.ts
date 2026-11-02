@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
-import { draftMissingGoalDoneBoundary, explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, validateGoalDoneEvidenceCommand, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
+import { draftMissingGoalDoneBoundary, explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, normalizeGoalDoneBoundaryDocument, validateGoalDoneEvidenceCommand, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
 import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -211,9 +211,22 @@ describe('goal author grade', () => {
       'test -f $(printf /tmp/proof)', 'bun test src/example.test.ts;']) {
       expect(validateGoalDoneEvidenceCommand(value)).toEqual({ error: '증거 명령에 셸 연산자 — 명령 한 줄만' });
     }
-    // The production parser stays strict until the follow-up wires every duplicate evidence line.
-    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts\n완료 경계 실물: 시험\n완료 경계 증거 명령: bun test src/example.test.ts; 결과 확인').missing)
+    const decorated = '완료 경계 코드: src/example.ts\n완료 경계 실물: 시험\n완료 경계 증거 명령: `bun test src/example.test.ts` → 0 fail';
+    expect(normalizeGoalDoneBoundaryDocument(decorated)).toBe(
+      '완료 경계 코드: src/example.ts\n완료 경계 실물: 시험\n완료 경계 증거 명령: bun test src/example.test.ts',
+    );
+    expect(inspectGoalDoneBoundary(decorated)).toMatchObject({ values: { '완료 경계 증거 명령': 'bun test src/example.test.ts' }, missing: [] });
+    expect(inspectGoalDoneBoundary(decorated.replace('0 fail', '1 pass'))).toMatchObject({ values: { '완료 경계 증거 명령': 'bun test src/example.test.ts' }, missing: [] });
+    expect(inspectGoalDoneBoundary(decorated.replace('0 fail', 'arbitrary result')).missing).toContain('완료 경계 증거 명령');
+    expect(inspectGoalDoneBoundary(`${decorated}; rm -rf target`).missing).toContain('완료 경계 증거 명령');
+    expect(inspectGoalDoneBoundary(decorated.replace(' → 0 fail', ' → 0 fail; rm -rf target')).missing)
       .toContain('완료 경계 증거 명령');
+    expect(inspectGoalDoneBoundary(`${decorated}\n완료 경계 증거 명령: bun test src/example.test.ts; rm -rf target`))
+      .toMatchObject({ missing: ['완료 경계 증거 명령'] });
+    expect(inspectGoalDoneBoundary(`${decorated}\n완료 경계 증거 명령: TBD`).missing).toContain('완료 경계 증거 명령');
+    const fenced = `\`\`\`md\n${decorated}\n\`\`\`\n${decorated}`;
+    const normalizedOutsideFence = decorated.replace('`bun test src/example.test.ts` → 0 fail', 'bun test src/example.test.ts');
+    expect(normalizeGoalDoneBoundaryDocument(fenced)).toBe(`\`\`\`md\n${decorated}\n\`\`\`\n${normalizedOutsideFence}`);
     expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts\n완료 경계 실물: 시험\n완료 경계 증거 명령: bun test src/example.test.ts &').missing)
       .toContain('완료 경계 증거 명령');
   });
@@ -696,6 +709,199 @@ describe('goal author correction devices', () => {
     expect(prompt).toContain('목장치');
     expect(prompt).toContain('실물 점검만 요구');
     expect(prompt).toContain('fake-kubectl: inject Pod failure');
+  });
+
+  test('UNATTAINABLE-COMPLETION event: E5-only boundary gets a catalog E4 and <cell>-LIVE split, mock E4 passes', async () => {
+    const impossible = [
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '## ACCEPTANCE CRITERIA',
+      '- 완료 경계 코드: report-deficit is preserved and harvest result is visible.',
+      '- 완료 경계 실물: 무조건 실물 E5 장시간 실런, 외부 계정과 미래 판 핀, 사람 손 확인까지 끝나야 완료한다.',
+      '- 완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n');
+    const e4 = [
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '## ACCEPTANCE CRITERIA',
+      '- 완료 경계 실물: E4 격리 시험에서 Fault injection devices (fault-injection) 장치로 UX-MS-01 사건을 주입한다. 사건 trigger=A child completes with report-deficit while a later child has a harvestable PR. 관측=failure classification remains report-deficit · Pod terminal data stays attached · later harvest remains independent. 기대=report-deficit is preserved and harvest result is visible.',
+      '- 후속: <칸>-LIVE에서 외부 실물 결과를 별도로 확인한다.',
+    ].join('\n');
+    const prompts: string[] = [];
+    const stream = (async (messages: Array<{ content: string }>) => {
+      prompts.push(messages.map((message) => message.content).join('\n'));
+      return JSON.stringify({ suggestions: [], fixes: [], fixEvidence: [], remainingNeedsHuman: [], revisedDocument: impossible });
+    }) as never;
+    const catalog = defaultGoalAuthorDeps(process.cwd()).mockScenarioCatalog;
+    const reviewed = await runGoalAuthorReviewerPrecheck(impossible, {
+      config: { llm: { provider: 'openai-codex' } } as never, stream, mockScenarioCatalog: catalog,
+    });
+    expect(reviewed.suggestions.some((suggestion) => suggestion.startsWith('unattainable-completion:'))).toBe(true);
+    expect(reviewed.suggestions.some((suggestion) => suggestion.includes('E4') && suggestion.includes('<칸>-LIVE') && suggestion.includes('사건 주입'))).toBe(true);
+    expect(prompts[0]).toContain('unattainable-completion');
+
+    const authored = await authorGoal(impossible, {
+      ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: 'unattainable-completion-test',
+    });
+    expect(authored.document).toContain('완료 경계 실물: E4');
+    expect(authored.document).toContain('fault-injection');
+    expect(authored.document).toContain('UX-MS-01');
+    expect(authored.document).toContain('<칸>-LIVE');
+    expect(authored.document).toContain('무조건 실물 E5 장시간 실런, 외부 계정과 미래 판 핀, 사람 손 확인까지 끝나야 완료한다.');
+
+    const e5Review = await runGoalAuthorSelfReview({ ask: impossible, document: impossible, steps: [], checklist: [], facts: null });
+    expect(e5Review.reviews[0]!.items).toContainEqual(expect.objectContaining({
+      check: 'unattainable-completion', verdict: 'needs-human', detail: expect.stringContaining('E5'),
+    }));
+    const e4Review = await runGoalAuthorSelfReview({ ask: e4, document: e4, steps: [], checklist: [], facts: null });
+    expect(e4Review.reviews[0]!.items).toContainEqual(expect.objectContaining({
+      check: 'unattainable-completion', verdict: 'pass',
+    }));
+    const mixedNegation = impossible.replace('무조건 실물 E5 장시간 실런, 외부 계정과 미래 판 핀, 사람 손 확인까지 끝나야 완료한다.', '실물 E5 없이 외부 계정은 필수로 한다.');
+    const mixedReview = await runGoalAuthorReviewerPrecheck(mixedNegation, {
+      config: { llm: { provider: 'openai-codex' } } as never,
+      stream: (async () => JSON.stringify({ suggestions: [], fixes: [], fixEvidence: [], remainingNeedsHuman: [], revisedDocument: mixedNegation })) as never,
+      mockScenarioCatalog: catalog,
+    });
+    const mixedSuggestion = mixedReview.suggestions.find((suggestion) => suggestion.startsWith('unattainable-completion:'));
+    expect(mixedSuggestion).toContain('external account');
+    expect(mixedSuggestion).not.toContain('required human work');
+    const mixedSelfReview = await runGoalAuthorSelfReview({ ask: mixedNegation, document: mixedNegation, steps: [], checklist: [], facts: null });
+    expect(mixedSelfReview.reviews[0]!.items).toContainEqual(expect.objectContaining({
+      check: 'unattainable-completion', verdict: 'needs-human', detail: expect.stringContaining('external account'),
+    }));
+    const mixedOptional = impossible.replace(
+      '무조건 실물 E5 장시간 실런, 외부 계정과 미래 판 핀, 사람 손 확인까지 끝나야 완료한다.',
+      '외부 계정은 필수이며 E5는 선택 사항이다.',
+    );
+    const mixedOptionalReview = await runGoalAuthorReviewerPrecheck(mixedOptional, {
+      config: { llm: { provider: 'openai-codex' } } as never,
+      stream: (async () => JSON.stringify({ suggestions: [], fixes: [], fixEvidence: [], remainingNeedsHuman: [], revisedDocument: mixedOptional })) as never,
+      mockScenarioCatalog: catalog,
+    });
+    expect(mixedOptionalReview.suggestions.find((suggestion) => suggestion.startsWith('unattainable-completion:'))).toContain('external account');
+    expect(mixedOptionalReview.suggestions.find((suggestion) => suggestion.startsWith('unattainable-completion:'))).not.toContain('unconditional real-world E5');
+    const repeatedE5 = impossible.replace(
+      '무조건 실물 E5 장시간 실런, 외부 계정과 미래 판 핀, 사람 손 확인까지 끝나야 완료한다.',
+      'E5는 선택 사항이지만 E5는 필수 완료 조건이다.',
+    );
+    const repeatedReview = await runGoalAuthorReviewerPrecheck(repeatedE5, {
+      config: { llm: { provider: 'openai-codex' } } as never,
+      stream: (async () => JSON.stringify({ suggestions: [], fixes: [], fixEvidence: [], remainingNeedsHuman: [], revisedDocument: repeatedE5 })) as never,
+      mockScenarioCatalog: catalog,
+    });
+    expect(repeatedReview.suggestions.find((suggestion) => suggestion.startsWith('unattainable-completion:'))).toContain('unconditional real-world E5');
+    const repeatedSelfReview = await runGoalAuthorSelfReview({ ask: repeatedE5, document: repeatedE5, steps: [], checklist: [], facts: null });
+    expect(repeatedSelfReview.reviews[0]!.items).toContainEqual(expect.objectContaining({
+      check: 'unattainable-completion', verdict: 'needs-human', detail: expect.stringContaining('unconditional real-world E5'),
+    }));
+
+    const individualCases = [
+      { label: '완료 경계 실물', value: '무조건 실물 E5로 완료해야 한다.', forbidden: ['E5', '무조건'] },
+      { label: '완료 경계 실물', value: '12-hour long-running live run을 완료해야 한다.', forbidden: ['long-running live run', '12-hour'] },
+      { label: '완료 경계 실물', value: 'run live for 24 hours before completion.', forbidden: ['run live for 24 hours', '24 hours'] },
+      { label: '완료 경계 코드', value: '외부 계정으로 요청 결과를 확인해야 한다.', forbidden: ['외부 계정'] },
+      { label: '완료 경계 증거 명령', value: 'bun test src/ux-sim/fault-pod-child-result.test.ts after future PR #99999 lands', forbidden: ['future PR #99999'] },
+      { label: '완료 경계 실물', value: '사람이 직접 로그를 수동 확인해야 한다.', forbidden: ['사람이 직접', '수동 확인'] },
+    ] as const;
+    for (const [index, item] of individualCases.entries()) {
+      const fields = {
+        '완료 경계 코드': 'report-deficit is preserved and harvest result is visible',
+        '완료 경계 실물': '격리 시험에서 요청 결과를 확인한다.',
+        '완료 경계 증거 명령': 'bun test src/ux-sim/fault-pod-child-result.test.ts',
+        [item.label]: item.value,
+      };
+      const caseAsk = [
+        '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+        '## ACCEPTANCE CRITERIA',
+        ...Object.entries(fields).map(([label, value]) => `- ${label}: ${value}`),
+      ].join('\n');
+      const authoredCase = await authorGoal(caseAsk, {
+        ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: `unattainable-case-${index}`,
+      });
+      const authoredBoundaries = inspectGoalDoneBoundary(authoredCase.document).values;
+      expect(authoredBoundaries['완료 경계 실물']).toContain('E4');
+      const liveLine = authoredCase.document.split('\n').find((line) => line.startsWith('- 분할 제안: <칸>-LIVE'));
+      expect(liveLine).toBeDefined();
+      for (const forbidden of item.forbidden) {
+        expect(Object.values(authoredBoundaries).join('\n')).not.toContain(forbidden);
+        expect(liveLine).toContain(forbidden);
+      }
+      if (item.label === '완료 경계 코드') expect(authoredBoundaries['완료 경계 코드']).not.toBe(item.value);
+      if (item.label === '완료 경계 증거 명령') expect(authoredBoundaries['완료 경계 증거 명령']).toBe('bun test src/ux-sim/fault-pod-child-result.test.ts');
+    }
+
+    const mixedCodeAsk = [
+      '대상 경로: src/ux-sim/fault-pod-child-result.ts · src/ux-sim/fault-pod-child-result.test.ts',
+      '## ACCEPTANCE CRITERIA',
+      '- 완료 경계 코드: report-deficit remains visible and an external account must be connected',
+      '- 완료 경계 실물: 격리 시험에서 결과를 확인한다.',
+      '- 완료 경계 증거 명령: bun test src/ux-sim/fault-pod-child-result.test.ts',
+    ].join('\n');
+    const mixedCodeAuthored = await authorGoal(mixedCodeAsk, {
+      ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: 'mixed-code-boundary-test',
+    });
+    const mixedCodeBoundaries = inspectGoalDoneBoundary(mixedCodeAuthored.document).values;
+    expect(mixedCodeBoundaries['완료 경계 코드']).toContain('report-deficit remains visible');
+    expect(mixedCodeBoundaries['완료 경계 코드']).not.toContain('external account');
+    expect(mixedCodeAuthored.document).toContain('원래 불가 조건과 실물 확인을 보존: «완료 경계 코드: report-deficit remains visible and an external account must be connected');
+    const mixedConditionAsk = mixedCodeAsk.replace(
+      'report-deficit remains visible and an external account must be connected',
+      'report-deficit remains visible whenever an external account is connected',
+    );
+    const mixedConditionAuthored = await authorGoal(mixedConditionAsk, {
+      ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: 'mixed-condition-boundary-test',
+    });
+    const mixedConditionBoundaries = inspectGoalDoneBoundary(mixedConditionAuthored.document).values;
+    expect(mixedConditionBoundaries['완료 경계 코드']).toContain('report-deficit remains visible');
+    expect(mixedConditionBoundaries['완료 경계 코드']).not.toContain('external account');
+    expect(mixedConditionBoundaries['완료 경계 코드']).toContain('report-deficit remains visible');
+    expect(mixedConditionAuthored.document).toContain('LIVE — 원래 불가 조건과 실물 확인을 보존: «완료 경계 코드: report-deficit remains visible whenever an external account is connected');
+    const abilityAsk = mixedConditionAsk.replace(
+      'report-deficit remains visible whenever an external account is connected',
+      'ability to retry after a transient failure',
+    );
+    const abilityAuthored = await authorGoal(abilityAsk, {
+      ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: 'ability-to-retry-boundary-test',
+    });
+    expect(inspectGoalDoneBoundary(abilityAuthored.document).values['완료 경계 코드']).toContain('ability to retry after a transient failure');
+
+    const optionalE5 = impossible.replace(
+      '무조건 실물 E5 장시간 실런, 외부 계정과 미래 판 핀, 사람 손 확인까지 끝나야 완료한다.',
+      'E4 또는 E5로 검증할 수 있으며 E5는 선택 사항이다.',
+    );
+    const optionalAuthored = await authorGoal(optionalE5, {
+      ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: 'optional-e5-test',
+    });
+    expect(inspectGoalDoneBoundary(optionalAuthored.document).values['완료 경계 실물']).toContain('E4 또는 E5');
+    const optionalReview = await runGoalAuthorSelfReview({ ask: optionalE5, document: optionalE5, steps: [], checklist: [], facts: null });
+    expect(optionalReview.reviews[0]!.items).toContainEqual(expect.objectContaining({ check: 'unattainable-completion', verdict: 'pass' }));
+
+    const optionalExternal = optionalE5.replace(
+      'E4 또는 E5로 검증할 수 있으며 E5는 선택 사항이다.',
+      '외부 계정은 선택 사항이며 mock으로 검증한다.',
+    );
+    const optionalExternalAuthored = await authorGoal(optionalExternal, {
+      ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: 'optional-external-test',
+    });
+    expect(inspectGoalDoneBoundary(optionalExternalAuthored.document).values['완료 경계 실물']).toContain('외부 계정은 선택 사항');
+
+    const unmatchedAsk = [
+      '대상 경로: src/self-implement/goal-author.ts · src/self-implement/goal-author.test.ts',
+      '## ACCEPTANCE CRITERIA',
+      '- 완료 경계 코드: a newly requested checksum remains visible in the authored report',
+      '- 완료 경계 실물: 무조건 실물 E5로 완료해야 한다.',
+    ].join('\n');
+    const unmatchedAuthored = await authorGoal(unmatchedAsk, {
+      ...deps, mockScenarioCatalog: catalog, repositoryRoot: process.cwd(), goalId: 'unmatched-scenario-test',
+    });
+    expect(unmatchedAuthored.document).toContain('ScenarioV0');
+    expect(unmatchedAuthored.document).toContain('trigger=');
+    expect(unmatchedAuthored.document).toContain('input=');
+    expect(unmatchedAuthored.document).toContain('observe=');
+    expect(unmatchedAuthored.document).toContain('expected=');
+    const unmatchedReview = await runGoalAuthorSelfReview({ ask: unmatchedAsk, document: unmatchedAuthored.document, steps: [], checklist: [], facts: null });
+    expect(unmatchedReview.reviews[0]!.items).toContainEqual(expect.objectContaining({
+      check: 'unattainable-completion', verdict: 'needs-human', detail: expect.stringContaining('등록 및 회귀시험이 필요'),
+    }));
   });
 });
 
@@ -11589,7 +11795,7 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
   });
 });
 
-// ── SELF-REVIEW-PRELAUNCH — 발사 전 self-review 페이즈(다섯 검사 · 1회 재저작 · 잔여 needs-human) ──
+// ── SELF-REVIEW-PRELAUNCH — 발사 전 self-review 페이즈(여섯 검사 · 1회 재저작 · 잔여 needs-human) ──
 describe('SELF-REVIEW-PRELAUNCH: 발사 전 self-review 페이즈', () => {
   /** author.self-review 관측만 캡처한다 — 카테고리도 함께 남겨 채널 쌍을 문다. */
   function captureAuthorSelfReview(): { events: Array<Record<string, unknown>>; categories: string[]; restore: () => void } {
@@ -11626,7 +11832,7 @@ describe('SELF-REVIEW-PRELAUNCH: 발사 전 self-review 페이즈', () => {
     }));
   });
 
-  test('self-review check inventory is the observed five-check contract', async () => {
+  test('self-review check inventory is the observed six-check contract', async () => {
     const capture = captureAuthorSelfReview();
     try {
       await authorGoal('대상 경로: src/example.ts', {
@@ -11699,7 +11905,7 @@ describe('SELF-REVIEW-PRELAUNCH: 발사 전 self-review 페이즈', () => {
         slice: expect.stringContaining('난이도: 하'),
       }));
       expect(second.filter((item) => item.check === 'slice-difficulty' && item.verdict === 'needs-human')).toEqual([]);
-      // 다섯 검사는 매 시도에 항목별 verdict 로 남는다.
+      // 여섯 검사는 매 시도에 항목별 verdict 로 남는다.
       expect([...new Set(first.map((item) => item.check))].sort())
         .toEqual([...GOAL_AUTHOR_SELF_REVIEW_CHECKS].sort());
       expect(capture.categories).toEqual(expect.arrayContaining(['goal-author', 'harness.author']));

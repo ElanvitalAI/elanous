@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { collectGraphEvents, formatApprovalMessage, notifyGraphEvents as notifyGraphEventsRaw, setGraphNotifyFlockForTest, type GraphNotifyOptions } from './graph-notify.js';
 import type { GraphRunState } from './runner.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
 
 // Approval events now raise decision cards; the real ledger resolves versions from git (seconds per card), so tests pin it.
 function notifyGraphEvents(options: GraphNotifyOptions) {
@@ -15,7 +16,8 @@ function notifyGraphEvents(options: GraphNotifyOptions) {
 }
 
 const roots: string[] = [];
-afterEach(() => { setGraphNotifyFlockForTest(undefined); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const initialCwd = process.cwd();
+afterEach(() => { process.chdir(initialCwd); setGraphNotifyFlockForTest(undefined); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 function fixture(): { root: string; graphsDir: string; statePath: string; state: GraphRunState; ledgerPath: string } {
   const root = mkdtempSync(join(tmpdir(), 'graph-notify-'));
@@ -55,35 +57,35 @@ test('collects opted-in node and pending approval from persisted runs without ch
   expect(existsSync(ledgerPath)).toBe(false);
 });
 
-test('the registered CLI previews graph notifications from persisted runs without sending or writing a ledger', () => {
+async function runGraphNotifyCommand(root: string, dryRun = false) {
+  return simInProcessCli(['graph', 'notify', ...(dryRun ? ['--dry-run'] : []), '--graphs-dir', join(root, 'graphs')], {
+    allowPaths: [['graph', 'notify']], stateRoot: root,
+  });
+}
+
+test('the registered CLI previews graph notifications from persisted runs without sending or writing a ledger', async () => {
   const { root, statePath, ledgerPath } = fixture();
   const before = readFileSync(statePath, 'utf8');
-  const repo = resolve(import.meta.dir, '../..');
-  const proc = Bun.spawnSync(['bun', join(repo, 'bin/elanous.mjs'), `--test=${root}`, 'graph', 'notify', '--dry-run'], {
-    cwd: root, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: root },
-  });
-  expect(new TextDecoder().decode(proc.stderr)).toBe('');
-  expect(proc.exitCode).toBe(0);
-  expect(new TextDecoder().decode(proc.stdout)).toContain('pending graph notifications: 2');
+  const result = await runGraphNotifyCommand(root, true);
+  expect(result.stderr).toBe('');
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain('pending graph notifications: 2');
   expect(existsSync(ledgerPath)).toBe(false);
   expect(readFileSync(statePath, 'utf8')).toBe(before);
-}, 30000);
+});
 
-test('the registered CLI invokes the non-preview notifier and skips ledger-recorded events', () => {
+test('the registered CLI invokes the non-preview notifier and skips ledger-recorded events', async () => {
   const { root, graphsDir, statePath, ledgerPath } = fixture();
   const before = readFileSync(statePath, 'utf8');
   const events = collectGraphEvents({ root, graphsDir });
   const ledger = events.map((event) => JSON.stringify({ id: event.id })).join('\n') + '\n';
   writeFileSync(ledgerPath, ledger);
-  const repo = resolve(import.meta.dir, '../..');
-  const proc = Bun.spawnSync(['bun', join(repo, 'bin/elanous.mjs'), `--test=${root}`, 'graph', 'notify'], {
-    cwd: root, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: root },
-  });
-  expect(proc.exitCode).toBe(0);
-  expect(new TextDecoder().decode(proc.stdout)).toContain('sent graph notifications: 0');
+  const result = await runGraphNotifyCommand(root);
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain('sent graph notifications: 0');
   expect(readFileSync(ledgerPath, 'utf8')).toBe(ledger);
   expect(readFileSync(statePath, 'utf8')).toBe(before);
-}, 30000);
+});
 
 test('unconfigured approvals notify by default and nodes remain opt-in', () => {
   const { root, graphsDir, statePath, state } = fixture();
@@ -220,20 +222,29 @@ test('visit number distinguishes repeat node results; a decided approval is not 
   expect(collectGraphEvents({ root, graphsDir }).map((event) => [event.nodeId, event.visit, event.kind])).toEqual([['announce', 2, 'node']]);
 });
 
-test('simultaneous cold-start invocations agree on one lock before sending', async () => {
+test.skipIf(process.platform === 'win32')('simultaneous cold-start invocations overlap under real flock and send each event once', async () => {
   const { root, graphsDir, ledgerPath } = fixture();
+  // undefined restores platform detection, which loads and calls the actual libc flock.
   setGraphNotifyFlockForTest(undefined);
-  let delivered = 0;
-  const send = async () => { delivered++; await Bun.sleep(10); };
-  const results = await Promise.allSettled([
-    notifyGraphEvents({ root, graphsDir, send }),
-    notifyGraphEvents({ root, graphsDir, send }),
-  ]);
-  expect(results.filter((result) => result.status === 'fulfilled').map((result) => result.value.length)).toEqual([2]);
-  expect(results.filter((result) => result.status === 'rejected').map((result) => String(result.reason))).toEqual([
-    expect.stringContaining('graph notification is already running'),
-  ]);
-  expect(delivered).toBe(2);
+  const lockPath = `${ledgerPath}.flock`;
+  const sent: string[] = [];
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const send = async (_message: string, event: { nodeId: string }) => {
+    sent.push(event.nodeId);
+    if (sent.length === 1) { entered(); await held; }
+  };
+  const first = notifyGraphEvents({ root, graphsDir, send });
+  await started;
+  try {
+    expect(existsSync(lockPath)).toBe(true);
+    await expect(notifyGraphEvents({ root, graphsDir, send: () => { throw new Error('duplicate send'); } }))
+      .rejects.toThrow('graph notification is already running');
+  } finally { release(); }
+  expect(await first).toHaveLength(2);
+  expect(sent).toEqual(['announce', 'gate']);
   expect(readFileSync(ledgerPath, 'utf8').trim().split('\n')).toHaveLength(2);
 });
 

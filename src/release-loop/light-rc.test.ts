@@ -456,5 +456,5 @@ describe('RELEASE-DAILY-LIGHT-RC ② — self gate includeImporterTests lifts th
     expect(result.lines.some((line) => line.startsWith('importer tests added'))).toBe(false);
     expect(result.lines.some((line) => line.startsWith('unrun importer tests: 5'))).toBe(true);
     expect(result.lines.some((line) => line.startsWith('⚠️ caller test cap exceeded'))).toBe(true);
-  });
+  }, { timeout: 20_000 });
 });

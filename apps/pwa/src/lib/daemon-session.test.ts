@@ -30,16 +30,19 @@ function withFakeWindow(href: string): { restore: () => void; store: Record<stri
     key: (i: number) => Object.keys(store)[i] ?? null,
     get length() { return Object.keys(store).length; },
   };
-  const realWindow = (globalThis as { window?: unknown }).window;
-  (globalThis as { window?: unknown }).window = {
+  const realWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const realStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'window', { configurable: true, writable: true, value: {
     location: { search: href.includes('?') ? '?' + href.split('?')[1] : '' },
-  };
-  (globalThis as { localStorage?: unknown }).localStorage = fakeStorage;
+  } });
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, writable: true, value: fakeStorage });
   return {
     store,
     restore: () => {
-      (globalThis as { window?: unknown }).window = realWindow;
-      delete (globalThis as { localStorage?: unknown }).localStorage;
+      if (realWindow) Object.defineProperty(globalThis, 'window', realWindow);
+      else Reflect.deleteProperty(globalThis, 'window');
+      if (realStorage) Object.defineProperty(globalThis, 'localStorage', realStorage);
+      else Reflect.deleteProperty(globalThis, 'localStorage');
     },
   };
 }

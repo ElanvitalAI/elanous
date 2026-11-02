@@ -32,6 +32,7 @@ import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride, type GateShardRerouteOverride } from '../../scripts/release-loop/resume.js';
 import { resolveChildAllowance } from './arg-allowance.js';
+import { emitReleaseStageTransition, postReleaseStageMail, type ReleaseStageState } from '../release-loop/stage-mail.js';
 
 type BashRun = WorkflowDeps['runBash'];
 
@@ -294,7 +295,7 @@ export interface GraphRunOptions {
   branchParentOutputs?: Readonly<Record<string, unknown>>;
   /** Optional per-run Bloom edge policy hook. */
   researchEdgeDecisionRegistry?: ResearchEdgeDecisionRegistry;
-  deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; monotonicMs?: () => number; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; growthScope?: GraphGrowthScope; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] }; inProcessHandlers?: InProcessHandlerRegistry };
+  deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; releaseStageMail?: (input: { runId: string; nodeId: string; state: ReleaseStageState }) => unknown; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; monotonicMs?: () => number; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; growthScope?: GraphGrowthScope; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] }; inProcessHandlers?: InProcessHandlerRegistry };
 }
 
 /** The command directory must itself be the checkout at the cut tip. */
@@ -1120,6 +1121,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (state.status === 'done' || state.status === 'failed' || state.status === 'budget-exceeded') state.finishedAt ??= new Date().toISOString();
     persistOwnedRun(state, runnerOwner);
   };
+  const emitReleaseStage = (nodeId: string, stage: ReleaseStageState): boolean => {
+    return emitReleaseStageTransition(graphId, state.dryRun, { runId, nodeId, state: stage },
+      options.deps?.releaseStageMail ?? postReleaseStageMail);
+  };
   const baseLog = options.deps?.log ?? ((event: string, data: Record<string, unknown>) => debug.log('graph.runner', event, data));
   // RFC §U: every event of a unit (child) run carries its parentRunId.
   const log = options.unitContext
@@ -1202,7 +1207,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (!state.dryRun && !state.pending.notifiedAt) {
         try {
           log('approval-pending', { graphId, runId, nodeId: current, message: state.pending.message, since: state.pending.since });
-          state.pending = { ...state.pending, notifiedAt: new Date().toISOString() };
+          if (emitReleaseStage(current, 'wait')) state.pending = { ...state.pending, notifiedAt: new Date().toISOString() };
         } catch (error) {
           persist();
           throw error;
@@ -1219,6 +1224,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: 'start', dryRun: state.dryRun });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: 'start' });
     log('node-start', { graphId, runId, nodeId: current, visit: visits.get(current), dryRun: state.dryRun });
+    emitReleaseStage(current, 'start');
     persist();
     const joinedFanout = Object.values(state.fanOuts ?? {}).find((fanout) => fanout.join === current &&
       Object.values(fanout.branches).every((branch) => branch.status === 'done' || branch.status === 'failed'));
@@ -1542,10 +1548,13 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
     }
+    const completedRecord = [...state.nodes].reverse().find(record => record.nodeId === current);
     if (isReleaseLoop && graph.terminalNodes.includes(current) && node.recipe === 'none' &&
-      (exit !== null || output !== undefined || error !== undefined || state.nodes.at(-1)?.executed)) {
+      (exit !== null || output !== undefined || error !== undefined || completedRecord?.executed)) {
+      emitReleaseStage(current, 'fail');
       throw new Error(`release terminal received command output: ${current}`);
     }
+    emitReleaseStage(current, !ok ? 'fail' : (waiving || approval || joinedFanout || graph.terminalNodes.includes(current) || completedRecord?.executed) ? 'ok' : 'skip');
     if (approval) {
       delete state.pending;
       delete state.approvalSourceHash;

@@ -199,6 +199,7 @@ test('a failed retirement is repaired on retry even when the candidate was alrea
       updatedAt: '2026-10-02T01:00:00.000Z', status: 'active' } }, dir);
   const card: MemoryItem = { project: 'alpha', seat: 'TC', topic: 'release', summary: 'new',
     source: 'https://example.test/new', updatedAt: '2026-10-03T01:00:00.000Z', status: 'active' };
+  const now = new Date('2026-10-04T00:00:00.000Z');
   let failRetirement = true;
   const store = {
     list: () => listMemories({}, dir),
@@ -209,9 +210,9 @@ test('a failed retirement is repaired on retry even when the candidate was alrea
     raise: () => { throw new Error('unexpected conflict'); },
     withLock: <T>(action: () => T) => action(),
   };
-  expect(() => applyCondensedCards([card], store)).toThrow('retirement write failed');
+  expect(() => applyCondensedCards([card], store, now)).toThrow('retirement write failed');
   expect(listMemories({}, dir).filter(e => e.contextCard?.status === 'active')).toHaveLength(2);
-  expect(applyCondensedCards([card], store)).toMatchObject({ written: 0, retired: 1, decisions: [] });
+  expect(applyCondensedCards([card], store, now)).toMatchObject({ written: 0, retired: 1, decisions: [] });
   const entries = listMemories({}, dir);
   expect(entries).toHaveLength(2);
   expect(entries.find(e => e.id === old.id)?.contextCard?.status).toBe('retired');
@@ -235,9 +236,10 @@ test('concurrent apply calls to the same memory directory leave exactly one acti
     summary: source, source, updatedAt, status: 'active' });
   const first = card('https://example.test/first', '2026-10-03T01:00:00.000Z');
   const second = card('https://example.test/second', '2026-10-03T02:00:00.000Z');
+  const now = new Date('2026-10-04T00:00:00.000Z');
   const results = await Promise.all([
-    Promise.resolve().then(() => applyCondensedCards([first], store)),
-    Promise.resolve().then(() => applyCondensedCards([second], store)),
+    Promise.resolve().then(() => applyCondensedCards([first], store, now)),
+    Promise.resolve().then(() => applyCondensedCards([second], store, now)),
   ]);
   expect(results.reduce((sum, result) => sum + result.written, 0)).toBe(2);
   const entries = listMemories({}, dir);

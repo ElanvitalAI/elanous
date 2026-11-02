@@ -1,0 +1,27 @@
+version: 0
+id: ux-author-reviewer-precheck-applied
+isolation: test
+seed: 2451101
+triggers:
+  - id: author-reviewer-precheck-applied
+    type: ux.author-reviewer-precheck.evaluate
+    variant: applied
+expect:
+  screen:
+    mode: widget
+    snapshot:
+      contains:
+        - "Goal author reviewer precheck simulation"
+        - "variant=applied"
+        - "status=completed"
+  logs:
+    - category: author.reviewer-precheck
+      event: completed
+      level: debug
+      count: 1
+      data:
+        runId: "$runId"
+        authorRunId: "$runId"
+        status: completed
+        appliedFixCount: 1
+        unappliedItemCount: 0

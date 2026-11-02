@@ -121,6 +121,44 @@ read-only · read-and-run · network-read · workspace-write · network-write ·
 
 ---
 
+## Explainer-line 브리핑 영상 실행·검증
+
+`explainer-line.yaml`은 기존 영상 레시피 walker(`src/video-pipeline/walk-line.ts` → `ALL_RECIPES`)를 재사용한다. 이 코드 조각의 수용 경계는 기존 그래프의 mock E4다: 입력 대본 불변, 60초 composition 생성, 렌더 파일 길이를 `ffprobe`로 확인, 로컬 산출물 또는 주입된 Telegram mock callback으로 전달 흐름 확인. `target_seconds: 60`보다 대본 구성이 짧으면 CTA 구간을 늘려 60초 composition을 만들고, 실제 렌더 길이가 59.9–60.1초 밖이면 `too-short`/`too-long`으로 rebuild한다. `script_path` 원본은 수정하지 않고 scene/chart/caption이 반영된 build-only 입력을 run workdir의 private `.explainer-build-*/script.json`에 쓴다. `script`는 입력 `script_path`가 없을 때 `briefing.confirmed === true`와 출처에 연결된 facts(`id`, `text`, `sourceId`)를 받아 workdir의 `script.json`을 만든다. 확정 브리핑, facts, sources가 불충분하면 `needs-human`으로 끝난다.
+
+`chart_plan`은 선택 입력이며 사실 하나에 연결된 `{ factId, kind: 'bar' | 'line', title, points: [{ label, value }] }` 항목으로 구성한다. 점은 2~8개이고 label은 비어 있지 않은 문자열, value는 유한한 숫자여야 한다. 사실 ID가 맞지 않거나 형식이 잘못된 차트는 만들지 않고 사람 확인으로 보낸다. 차트 입력이 없으면 빈 차트를 그리거나 값을 추정하지 않는다. `scene`은 차트 계획을 챕터에 연결하고, `build`는 장면·차트·근거 자막을 `script.json`에 합쳐 기존 HyperFrames 엔진이 SVG 막대/선 그래프와 출처 label을 실제 화면·캡션에 렌더한다. source URL도 대본의 `sourceUrl` 필드로 보존한다. `script_path`가 이미 있는 기존 대본은 `facts`/`sources`가 없더라도 차트 합성을 생략하고 기존 챕터로 진행한다. 단, `chart_plan`까지 요청했는데 근거가 없으면 사람 확인으로 보낸다. `script_path` 없이 생성할 때는 `workdir/script.json`이 이미 있으면 `collision`으로 멈춰 기존 파일을 덮어쓰지 않는다.
+
+전달 단계는 렌더 결과 `hf_render_path`를 입력으로 받는다. `sendTelegramVideo(file, briefing)` callback이 주입되면 메시지 ID를 확인하고 `delivery_mode: telegram`으로 끝난다. `telegram_chat_id`가 지정됐는데 callback/token이 없으면 `no-recipient`→`needs-human`으로 끝나 Telegram 전달 요청을 local `delivered`로 오인하지 않는다. Telegram 요청 자체가 없으면 `delivery_mode: local-artifact`와 파일 경로만 반환해 기존의 로컬 `delivered` 기본 경로를 보존하며 Telegram 도착은 주장하지 않는다. 실제 Telegram 설정이 있지만 전송 확인이 실패하면 `blocked`다. 기존 생산 진입점 `scripts/video-pipeline.ts`의 `walk()`는 `walk --graph explainer-line`으로 이 선언을 로드해 공용 `walkLine`/`ALL_RECIPES`를 실행한다. JSON state의 `telegram_chat_id`와 `TELEGRAM_BOT_TOKEN`이 있으면 CLI가 기존 `explainer-deliver` 레시피에 `sendVideo` callback을 주입한다. 아직 판단 메모 확정 시점의 자동 호출과 3막 사전 시작, 렌더 머신 자원 지도 등록은 배선되지 않았다. 이 경계는 `DEMO1104-VIDEO-OUTPUT-LIVE` hold-first 후속 칸이다. `src/briefing`에는 확정 상태/API가 없고, 확인된 HITL 승인은 미션 arming 신호라 일반 판단 메모 확정으로 간주하지 않았다. 이를 자동 트리거로 오용하면 unrelated mission approval 때마다 영상을 보내게 된다. 생산 CLI 전체 경로 시험은 외부 VO/build/render 도구와 Telegram을 mock으로 대체한다. 별도 엔진 시험은 기존 `build.mjs`를 실제 실행해 오프라인 자산으로 SVG 차트와 근거 자막을 렌더한다. 운영 Telegram 도착과 실제 판단 메모의 영상 전달은 이 mock 증거만으로 주장하지 않는다.
+
+기존 그래프 실행 CLI(확정 메모, `facts`, `sources`, 선택 `chart_plan`, 렌더 도구 설정, Telegram 설정이 든 JSON state 필요): `TELEGRAM_BOT_TOKEN=<bot-token> bun scripts/video-pipeline.ts walk --graph explainer-line --state <state.json>`.
+
+검증용 Telegram mock은 `TELEGRAM_API_BASE`로 loopback sink를 지정한다; 이 옵션은 테스트 주입용이며 기본 API는 `https://api.telegram.org`다.
+
+격리 mock 전달 시험: `bun test src/video-pipeline/explainer-line-delivery.test.ts`
+생산 CLI 진입부터 Telegram loopback까지 시험: `bun test scripts/video-explainer-entry.test.ts` (외부 VO/build/render 도구와 Telegram은 격리 mock)
+Explainer 레시피·그래프 선언 회귀: `bun test src/video-pipeline/recipes/explainer.test.ts`
+공용 walker 회귀: `bun test src/video-pipeline/walk-line.test.ts`
+그래프 YAML 컴파일러 회귀: `bun test src/self-implement/graph-yaml.test.ts`
+레지스트리 회귀: `bun test src/video-pipeline/registry-identity.test.ts`
+`src/video-pipeline/capabilities.test.ts`와 `src/video-pipeline/config.test.ts`는 저장소에 없어 실행하지 않는다.
+선언 확인: `bun scripts/check-graph-declaration.ts graphs/video/explainer-line.yaml`
+타입 확인: `bun bin/elanous.mjs self typecheck`
+실물 완료 경계는 판단 메모 1건에서 실제 Telegram에 60초 영상이 도착하는 것이다; 아직 자동 생산 배선 및 운영 도착 검증은 완료되지 않았다.
+
+### 검증 기록
+
+최신 head 회귀 묶음: `bun test src/video-pipeline/recipes/explainer.test.ts graphs/video/explainer-line.test.ts src/video-pipeline/explainer-line-delivery.test.ts scripts/video-explainer-entry.test.ts` → 29 pass / 0 fail / 442 expect() calls. 이는 mock E4 코드 경계와 기존 script/local-artifact 기본 경로를 검증하며 실물 촬영·운영 Telegram 도착을 대신하지 않는다.
+
+- 무대 이름: `explainer-line mock delivery` — 실제 YAML과 `walkLine`/`ALL_RECIPES`를 사용해 script·scene·VO·build·QC·delivery 레시피를 실행하고 render만 mock artifact로 대체해 Telegram sink 전달을 검증한다.
+- TDD RED/GREEN mutation: `bun test src/video-pipeline/explainer-line-delivery.test.ts`에서 deliver 간선의 `ok: delivered`를 임시로 `ok: needs-human`으로 바꿨을 때 `Expected: "delivered" / Received: "needs-human"` · `Ran 1 test across 1 file` (0 pass, 1 fail, 12 expect() calls); 간선을 복원한 같은 명령은 `1 pass / 0 fail / 13 expect() calls`. 격리 작업 규칙이 commit을 금지하므로 RED 선행 커밋은 만들지 않았다.
+- 생산 CLI 호출 경로: `scripts/video-pipeline.ts`의 `walk()` → `walkLine({ ..., recipes: ALL_RECIPES, ... })`. `bun test scripts/video-explainer-entry.test.ts` → `3 pass / 0 fail / 30 expect() calls`; mock worker가 실제 YAML을 읽어 CLI가 `explainer-script`를 dispatch하며, 전달 시나리오가 loopback Telegram sink로 파일을 보내 `delivered`에 도달한다. `telegram_chat_id`는 있으나 bot token이 없는 전체 호출은 `needs-human`으로 끝나며 local `delivered`로 오인하지 않는다.
+- `bun test src/video-pipeline/recipes/explainer.test.ts`: `13 pass / 0 fail / 287 expect() calls`.
+- `bun test src/video-pipeline/walk-line.test.ts`: `7 pass / 1 skip / 0 fail / 15 expect() calls`(외부 walker 미설치로 실선언 시험 skip).
+- `bun test src/self-implement/graph-yaml.test.ts`: `37 pass / 0 fail / 384 expect() calls`.
+- `bun test src/video-pipeline/registry-identity.test.ts`: `5 pass / 0 fail / 6 expect() calls`.
+- `bun bin/elanous.mjs self typecheck` 및 `bun run scripts/ci-typecheck-changed.ts`: 변경 TS 파일 검사 통과. `bun scripts/check-graph-declaration.ts graphs/video/explainer-line.yaml`: errors 0.
+- 보존 확인: `git diff --check` 통과; 기존 `scripts/video-pipeline.ts walk()`는 선택된 그래프를 기존 공용 실행기로 실행한다. 변경 diff에 decision ledger, 원장 형식, 삭제 경로는 없다.
+- 미완료 경계: mock은 생산 CLI 전체 경로, 차트 SVG, 근거 자막을 검증하지만 실제 판단 메모의 자동 확정 트리거, 3막 사전 시작, 렌더 머신 자원 지도 등록, 운영 렌더와 Telegram 도착·시간 실측은 증명하지 않는다. 이를 완료로 기록하지 않는다.
+
 ## 쓰는 법
 
 ```bash

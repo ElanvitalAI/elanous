@@ -140,9 +140,13 @@ export function createClassicSidetabMissionTool(
       }
       const agent = input.agent;
       const mission = typeof input.mission === 'string' ? input.mission.trim() : '';
-      const parallelMission = typeof input.parallelMission === 'string' ? input.parallelMission.trim() : '';
+      const requestedParallelMission = typeof input.parallelMission === 'string' ? input.parallelMission.trim() : '';
       const linearIssueId = typeof input.linearIssueId === 'string' ? input.linearIssueId.trim() : '';
       const withGrok = input.withGrok === true;
+      // Some parent tool callers duplicate the same prompt into both fields.
+      // Treat that redundant pair field as omitted in trio mode; a distinct
+      // second prompt remains an invalid combination below.
+      const parallelMission = withGrok && requestedParallelMission === mission ? '' : requestedParallelMission;
       if (agent !== 'codex' && agent !== 'claude') return output('error', 'agent must be codex or claude');
       if (!mission) return output('error', 'mission text is required');
       if (!withGrok && input.parallelMission !== undefined && !parallelMission) return output('error', 'parallelMission must contain prompt text');

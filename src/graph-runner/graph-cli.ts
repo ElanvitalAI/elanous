@@ -344,11 +344,12 @@ export function registerGraphCommands(program: Command, runsDeps: {
   graph.command('notify')
     .description('Deliver graph run events not yet recorded in the notification ledger')
     .option('--dry-run', 'Preview notifications without sending or recording them')
-    .action(async (opts: { dryRun?: boolean }) => {
+    .option('--graphs-dir <path>', 'Read graph declarations from this directory')
+    .action(async (opts: { dryRun?: boolean; graphsDir?: string }) => {
       try {
         if (!opts.dryRun) await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
         const { notifyGraphEvents } = await import('./graph-notify.js');
-        const events = await notifyGraphEvents({ dryRun: opts.dryRun });
+        const events = await notifyGraphEvents({ dryRun: opts.dryRun, ...(opts.graphsDir ? { graphsDir: opts.graphsDir } : {}) });
         if (opts.dryRun) for (const event of events) console.log(`${event.id} ${event.message}`);
         console.log(`${opts.dryRun ? 'pending' : 'sent'} graph notifications: ${events.length}`);
       } catch (error) {

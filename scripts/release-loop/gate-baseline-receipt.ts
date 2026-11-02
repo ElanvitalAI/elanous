@@ -29,6 +29,7 @@ export interface GateBaselineReceipt {
   reason: string;
   version: string;
   commit: string;
+  head40: string;
   graphSha: string | null;
   recipeSha: string | null;
   envFingerprint: string;
@@ -79,6 +80,33 @@ export function gateSourcePins(repo: string, commit: string): { graphSha: string
   };
 }
 
+/** Per-shard reusable recipe surface: the gate node's graph entry and its concrete command, not whole-file hashes. */
+export function gateShardRecipeIdentityAtCommit(repo: string, commit: string): { graphEntry: string; recipeCommand: string; recipeTimeoutMs: number } | null {
+  if (!/^[0-9a-f]{40}$/i.test(commit)) return null;
+  const show = (file: string): string | null => {
+    const result = spawnSync('git', ['show', `${commit}:${file}`], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    return result.status === 0 && !result.error ? result.stdout : null;
+  };
+  const graph = show('graphs/release/release-loop.yaml');
+  const recipes = show('graphs/release/recipes.yaml');
+  const graphEntry = graph?.split(/\r?\n/).find((line) => /node_id:\s*gate(?:,|\s|})/.test(line))?.trim();
+  if (!graphEntry || !recipes) return null;
+  let inGate = false;
+  let recipeCommand: string | undefined;
+  let recipeTimeoutMs: number | undefined;
+  for (const line of recipes.split(/\r?\n/)) {
+    if (/^gate:\s*$/.test(line)) { inGate = true; continue; }
+    if (inGate && /^\S/.test(line) && !/^#/.test(line)) break;
+    if (inGate) {
+      const match = /^\s+command:\s*['"]([^'"]+)['"]\s*$/.exec(line);
+      if (match) recipeCommand = match[1];
+      const timeout = /^\s+timeout_ms:\s*(\d+)\s*$/.exec(line);
+      if (timeout) recipeTimeoutMs = Number(timeout[1]);
+    }
+  }
+  return recipeCommand && typeof recipeTimeoutMs === 'number' && Number.isSafeInteger(recipeTimeoutMs) ? { graphEntry, recipeCommand, recipeTimeoutMs } : null;
+}
+
 /** Only Kubernetes' observed child container imageID is evidence; the requested image tag is not. */
 export function actualGatePodImageDigest(podJson: string): string | null {
   try {
@@ -113,7 +141,7 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
   graphPins: { graphSha: string; recipeSha: string } | null; envFingerprint: string;
   attributionRecheck?: { summary: number; observed: number; identified: number; baselineResult: string; targetFiles: string[] } }): GateBaselineReceipt {
   const { root, version, commit, graphPins, envFingerprint } = input;
-  const base = { schema: 2 as const, version, commit, graphSha: graphPins?.graphSha ?? null,
+  const base = { schema: 2 as const, version, commit, head40: commit, graphSha: graphPins?.graphSha ?? null,
     recipeSha: graphPins?.recipeSha ?? null, envFingerprint, imageDigest: null as string | null,
     executionIdentity: null as GatePodRuntimeIdentity | null, files: 0, shards: 0 };
   const invalid = (reason: string): GateBaselineReceipt => ({ ...base, valid: false, reason });

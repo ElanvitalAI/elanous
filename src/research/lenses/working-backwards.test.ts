@@ -89,10 +89,12 @@ test('ladder context exposes output slots and stopping criteria without wiring a
 });
 
 test('THINK-LENS-T1-WORKING-BACKWARDS: 채권 금리 질문(지시문 없이)에서 골격 칸이 답 구조로 나온다', async () => {
+  const runId = `run-working-backwards-${crypto.randomUUID()}`;
   let contractPrompt = '';
   let ladderPrompt = '';
   let followupCalls = 0;
   const result = await runResearchQuestionLadder('미국 10년물 국채 금리는 6개월 안에 어떤 방향으로 움직일까?', {
+    runId,
     enableResearchFanout: false,
     generateContract: async (prompt) => {
       contractPrompt = prompt;
@@ -173,6 +175,12 @@ test('THINK-LENS-T1-WORKING-BACKWARDS: 채권 금리 질문(지시문 없이)에
   expect((fanoutBoundary?.data as { plannedNodes?: string[] } | undefined)?.plannedNodes).toEqual(['axis:q6']);
   const stop = latest.find((event) => event.category === 'research.turn' && event.event === 'completion-boundary-stop');
   expect((stop?.data as { stage?: string } | undefined)?.stage).toBe('gap-followup');
+
+  const boundaryEvent = debug.events(500).find((event) => event.category === 'research.turn'
+    && event.event === 'completion-boundary'
+    && (event.data as { runId?: string; stage?: string } | undefined)?.runId === runId
+    && (event.data as { stage?: string } | undefined)?.stage === 'axis-fanout');
+  expect(boundaryEvent?.data).toMatchObject({ runId, stage: 'axis-fanout' });
 });
 
 test('THINK-LENS-T1-WORKING-BACKWARDS: 완료 경계 단위는 출력 계약 → 빈 칸 목록 → 노드 계획을 내고 다 차면 stop이다', () => {

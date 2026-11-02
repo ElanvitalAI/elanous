@@ -11,7 +11,7 @@ import { registerReleaseCommands } from '../cli/release-cli.js';
 import { runGraph } from '../graph-runner/runner.js';
 import type { LightRcResult } from './light-rc.js';
 import { setSchedule, type ReleaseSchedule } from './release-schedule.js';
-import { planRehearsal as livePlanRehearsal, rehearsalLeakFailureDetail, runRehearsalLeakCheck, runRehearsalTick, sanitizeRehearsalLeakDetail, type HardGateResult, type RehearsalDeps, type StepId } from './rehearsal.js';
+import { spawnHardRehearsalGate, planRehearsal as livePlanRehearsal, rehearsalLeakFailureDetail, runRehearsalLeakCheck, runRehearsalTick, sanitizeRehearsalLeakDetail, type HardGateResult, type RehearsalDeps, type StepId } from './rehearsal.js';
 import { planRehearsalShards } from './rehearsal-shard-plan.js';
 import { hardRehearsalGateVersion } from '../../scripts/release-loop/gate-radius-live.js';
 
@@ -97,7 +97,7 @@ test('cut minus five hours launches one pinned full Pod gate with twelve shards 
   expect(stamp(root, 'hard-5h')).toMatchObject({ outcome: 'regression', selection: { remote: 'node-b', shards: 12 },
     hardGate: { outcome: 'regression', executor: 'pod', introduced: ['test/new.test.ts > new case'] } });
   expect(stamp(root, 'hard-5h')).toMatchObject({ hardGateRunId: runId, hardGateLog: join(root, 'release', schedule.version, 'rehearsal', `${runId}.log`) });
-  expect(h.notifications.some(text => text.includes('hard gate regression') && text.includes('원격 Pod · 12 shards'))).toBe(true);
+  expect(h.notifications.some(text => text.includes('hard gate regression') && text.includes('원격 Pod node-b · 12 shards'))).toBe(true);
 });
 
 test('invalid pinned Pod result fails closed', async () => {
@@ -118,36 +118,127 @@ test('an ok Pod verdict with introduced failures is recorded as an error', async
   expect(result.measurementGap.cause).toContain('ok verdict contains introduced failures');
 });
 
-test('default hard-gate execution passes twelve Pod shards and the pinned SHA to gate-node', async () => {
-  const root = newRoot(), checkout = join(root, 'checkout'), bin = join(root, 'bin'), capture = join(root, 'gate-argv.txt');
+async function runDefaultHardGateFixture(options: {
+  pool?: string;
+  receiptRuntime?: { bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+  graphProbeThrows?: string;
+  identityProbeThrows?: string;
+  omitGateVerdict?: boolean;
+  omitGraphSha?: boolean;
+} = {}) {
+  const root = newRoot(), checkout = join(root, 'checkout');
+  const sha = 'a'.repeat(40), digest = `sha256:${'b'.repeat(64)}`;
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'arm64', envFingerprint: 'c'.repeat(64) };
+  const graphPins = { graphSha: 'd'.repeat(64), recipeSha: 'e'.repeat(64) };
+  const receipt = { valid: true, reason: 'complete clean full sweep', version: 'pending', commit: sha, head40: sha, ...graphPins, envFingerprint: 'c'.repeat(64), imageDigest: digest,
+    executionIdentity: options.receiptRuntime ?? runtimeIdentity };
+  const gateVerdict = { commit: sha, outcome: 'ok', baselineReceipt: receipt };
+  mkdirSync(checkout);
+  mkdirSync(join(root, 'release', schedule.version), { recursive: true });
+  mkdirSync(join(root, 'release', '0.2.22'), { recursive: true });
   const releaseVerdict = join(root, 'release', schedule.version, 'gate-verdict.json');
-  const originalVerdict = '{"owner":"release","bytes":"unchanged"}\n';
+  const originalVerdict = '{"owner":"release","bytes":"unchanged"}\\n';
   writeFileSync(releaseVerdict, originalVerdict);
-  const sha = 'a'.repeat(40), h = harness(at(300)), priorPath = process.env.PATH;
-  mkdirSync(checkout); mkdirSync(bin); mkdirSync(join(root, 'release', '0.2.22'), { recursive: true });
   writeFileSync(join(root, 'release', '0.2.22', 'release.json'), JSON.stringify({ version: '0.2.22', publishedAt: '2026-10-09T00:00:00Z' }));
-  writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'k3d-elanous-pool@node-b:56' } } }));
-  writeFileSync(join(bin, 'bun'), `#!/bin/sh\nprintf '%s\\n' "$@" > "$REHEARSAL_CAPTURE"\nversion=''\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = '--version' ]; then shift; version="$1"; fi\n  shift\ndone\nmkdir -p "$ELANOUS_STATE_DIR/release/$version"\nprintf '%s\\n' '{"commit":"${sha}","outcome":"ok"}' > "$ELANOUS_STATE_DIR/release/$version/gate-verdict.json"\nprintf '%s\\n' '{"outcome":"ok","commit":"${sha}","executor":"pod","introduced":[],"preexisting":0}'\n`);
-  chmodSync(join(bin, 'bun'), 0o755);
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: options.pool ?? 'k3d-elanous-pool@node-b:56,pool-aws2@aws2:12' } } }));
   setElanousConfigDir(root);
-  process.env.PATH = `${bin}:${priorPath}`;
-  process.env.REHEARSAL_CAPTURE = capture;
+  const h = harness(at(300));
+  let argv: string[] = [];
+  h.deps.leakCheck = () => ({ status: 0 });
   h.deps.git = args => ({ rc: 0, stdout: args[0] === 'rev-parse' ? sha : '' });
   h.deps.hardGate = undefined;
-  try {
-    await runRehearsalTick({ ledgerRoot: root, checkout, apply: true }, h.deps);
-    const argv = readFileSync(capture, 'utf8').trim().split('\n');
-    expect(argv).toContain('scripts/release-loop/gate-node.ts');
-    expect(argv.slice(argv.indexOf('--commit'), argv.indexOf('--commit') + 2)).toEqual(['--commit', sha]);
-    expect(argv.slice(argv.indexOf('--pod-shards'), argv.indexOf('--pod-shards') + 2)).toEqual(['--pod-shards', '12']);
-    expect(argv.slice(argv.indexOf('--executor'), argv.indexOf('--executor') + 2)).toEqual(['--executor', 'pod']);
-    const hard = stamp(root, 'hard-5h');
-    expect(hard.outcome).toBe('ok');
-    const gateVersion = hardRehearsalGateVersion(schedule.version, hard.hardGateRunId!);
-    expect(argv.slice(argv.indexOf('--version'), argv.indexOf('--version') + 2)).toEqual(['--version', gateVersion]);
-    expect(readFileSync(releaseVerdict, 'utf8')).toBe(originalVerdict);
-    expect(JSON.parse(readFileSync(join(root, 'release', gateVersion, 'gate-verdict.json'), 'utf8'))).toMatchObject({ commit: sha, outcome: 'ok' });
-  } finally { process.env.PATH = priorPath; delete process.env.REHEARSAL_CAPTURE; }
+  h.deps.hardGateGraphPins = () => { if (options.graphProbeThrows) throw new Error(options.graphProbeThrows); return graphPins; };
+  h.deps.hardGateIdentity = () => { if (options.identityProbeThrows) throw new Error(options.identityProbeThrows); return { ...runtimeIdentity, imageDigest: digest }; };
+  h.deps.hardGateSpawn = gate => {
+    argv = gate.args;
+    const versionIndex = gate.args.indexOf('--version');
+    const gateVersion = gate.args[versionIndex + 1];
+    if (!gateVersion) throw new Error('hard rehearsal omitted the isolated gate version');
+    mkdirSync(join(root, 'release', gateVersion), { recursive: true });
+    receipt.version = gateVersion;
+    if (options.omitGraphSha) delete (receipt as { graphSha?: string }).graphSha;
+    if (!options.omitGateVerdict) writeFileSync(join(root, 'release', gateVersion, 'gate-verdict.json'), JSON.stringify(gateVerdict));
+    writeFileSync(gate.logPath, JSON.stringify({ outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 }) + '\\n');
+    return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 };
+  };
+  await runRehearsalTick({ ledgerRoot: root, checkout, apply: true, remote: 'aws2' }, h.deps);
+  return { root, sha, digest, runtimeIdentity, receipt, gateVerdict, releaseVerdict, originalVerdict, state: stamp(root, 'hard-5h'), argv };
+}
+
+test('default hard gate subprocess preserves args, state environment, and verdict parsing', () => {
+  const root = mkdtempSync(join(tmpdir(), 'rehearsal-spawn-gate-')); roots.push(root);
+  const checkout = join(root, 'checkout'); mkdirSync(checkout);
+  const logPath = join(root, 'release', 'hard.log'), sha = 'a'.repeat(40);
+  const script = `console.log(JSON.stringify({outcome:'ok',commit:'${sha}',executor:'pod',introduced:[],preexisting:0,env:process.env.ELANOUS_STATE_DIR,argv:process.argv.slice(1)}))`;
+  const result = spawnHardRehearsalGate({ binary: process.execPath, args: ['-e', script, '--', 'gate-arg'], checkout,
+    ledgerRoot: root, logPath, timeoutMs: 10_000, sha });
+  expect(result).toMatchObject({ outcome: 'ok', commit: sha, executor: 'pod' });
+  const log = readFileSync(logPath, 'utf8');
+  expect(log).toContain(`"env":"${root}"`);
+  expect(log).toContain('gate-arg');
+});
+
+test('default hard rehearsal targets the requested Pod and writes a complete structured receipt', async () => {
+  const fixture = await runDefaultHardGateFixture();
+  const gateVersion = hardRehearsalGateVersion(schedule.version, fixture.state.hardGateRunId!);
+  expect(fixture.argv).toContain('scripts/release-loop/gate-node.ts');
+  expect(fixture.argv.slice(fixture.argv.indexOf('--pod-pool'), fixture.argv.indexOf('--pod-pool') + 2)).toEqual(['--pod-pool', 'pool-aws2@aws2:12']);
+  expect(fixture.state).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'aws2' },
+    hardGate: { receiptRecord: { available: true } } });
+  expect(JSON.parse(readFileSync(join(fixture.root, 'release', gateVersion, 'gate-verdict.json'), 'utf8')))
+    .toMatchObject({ commit: fixture.sha, outcome: 'ok', baselineReceipt: {
+      version: gateVersion, commit: fixture.sha, head40: fixture.sha, graphSha: 'd'.repeat(64), recipeSha: 'e'.repeat(64),
+      imageDigest: fixture.digest, envFingerprint: fixture.runtimeIdentity.envFingerprint, executionIdentity: fixture.runtimeIdentity,
+    } });
+});
+
+test('hard rehearsal rejects a writer record whose selected-host architecture differs', async () => {
+  const fixture = await runDefaultHardGateFixture({ receiptRuntime: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'c'.repeat(64) } });
+  expect(fixture.state).toMatchObject({ outcome: 'ok', hardGate: { receiptRecord: { available: false, reason: 'receipt environment-architecture-mismatch' } } });
+  const gateVersion = hardRehearsalGateVersion(schedule.version, fixture.state.hardGateRunId!);
+  expect(JSON.parse(readFileSync(join(fixture.root, 'release', gateVersion, 'gate-verdict.json'), 'utf8')))
+    .toMatchObject({ baselineReceipt: { executionIdentity: { architecture: 'x64' } } });
+});
+
+test('hard rehearsal reports missing structured receipt fields instead of claiming reuse', async () => {
+  const fixture = await runDefaultHardGateFixture({ omitGraphSha: true });
+  expect(fixture.state).toMatchObject({ outcome: 'ok', hardGate: { receiptRecord: { available: false } } });
+  expect(fixture.state.summary).toContain('영수증 재사용 불가: 기록 검증 실패: receipt graph/recipe source pins differ from recorded commit');
+});
+
+test('hard rehearsal preserves graph preflight and receipt-read failures together', async () => {
+  const fixture = await runDefaultHardGateFixture({ graphProbeThrows: 'probe failed', identityProbeThrows: 'identity probe failed', omitGateVerdict: true });
+  expect(fixture.state.hardGate.receiptRecord).toMatchObject({ available: false });
+  expect(fixture.state.summary).toContain('receipt source pins could not be read: probe failed');
+  expect(fixture.state.summary).toContain('receipt identity preflight failed: identity probe failed');
+  expect(fixture.state.summary).toContain('gate receipt readback failed');
+});
+
+test('a hard rehearsal with no requested Pod member refuses before launching gate-node', async () => {
+  const fixture = await runDefaultHardGateFixture({ pool: 'k3d-elanous-pool@node-b:56' });
+  expect(fixture.state.outcome).toBe('error');
+  expect(fixture.state.summary).toContain('configured Pod member for --remote aws2');
+  expect(fixture.argv).toEqual([]);
+});
+
+test('an unreadable source graph pin does not suppress the hard gate verdict', async () => {
+  const fixture = await runDefaultHardGateFixture({ graphProbeThrows: 'probe unavailable' });
+  expect(fixture.state).toMatchObject({ outcome: 'ok', hardGate: { outcome: 'ok', receiptRecord: { available: false } } });
+  expect(fixture.state.summary).toContain('영수증 재사용 불가: 기록 검증 실패: receipt source pins could not be read: probe unavailable');
+  expect(fixture.argv).toContain('scripts/release-loop/gate-node.ts');
+});
+
+test('a hard gate receipt identity mismatch is visible without changing the gate verdict', async () => {
+  const root = newRoot(), h = harness(at(300));
+  h.deps.hardGate = async (_version, _checkout, sha, _ledger, _runId, remote) => {
+    expect(remote).toBe('aws2');
+    return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0,
+      receiptRecord: { available: false, reason: 'receipt writer record incomplete' } };
+  };
+  await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, remote: 'aws2' }, h.deps);
+  expect(stamp(root, 'hard-5h')).toMatchObject({ outcome: 'ok', selection: { remote: 'aws2' },
+    hardGate: { receiptRecord: { available: false } } });
+  expect(stamp(root, 'hard-5h').summary).toContain('영수증 재사용 불가: 기록 검증 실패: receipt writer record incomplete');
 });
 
 test('a gate launch with no JSON appends its cause to an already created empty evidence log', async () => {

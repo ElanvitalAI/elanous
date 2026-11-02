@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -18,7 +18,7 @@ import { baselineFromCutLogs } from './baseline-from-logs';
 import { mergePartialFailures, readPartialPlanResult, testFileOfId, verifyDocsOnlyCarry } from './gate-partial';
 import { planGateRadiusShadow, shadowActual, writeGateRadiusShadow, type GateRadiusShadowPlan } from './gate-radius-shadow';
 import { planHardRehearsalRadius, partialGateImagesMatch, preflightGateExecutionIdentity, preflightGateImageDigest } from './gate-radius-live';
-import { actualGatePodImageDigest, gateBaselineReceipt, gateEnvFingerprint, gateGraphPins, gateSourcePins, parseGatePodRuntimeIdentity,
+import { actualGatePodImageDigest, gateBaselineReceipt, gateEnvFingerprint, gateGraphPins, gateShardRecipeIdentityAtCommit, gateSourcePins, parseGatePodRuntimeIdentity,
   POD_SWEEP_INTEGRATION_ONLY } from './gate-baseline-receipt';
 import { gateImagePinPath, normalizeGateImageDigest, pinnedGateImageSync as buildPinnedGateImageSync, readGateImagePin,
   readGateImagePinForRun, replaceGateImagePin, resolveGateImagePin, writeGateImagePin } from './gate-image-pin.js';
@@ -48,16 +48,17 @@ import { DEFAULT_CONTROL_PORT } from '../../src/control-plane/server.js';
 import { createRunScopedWarmControlForward, startWarmControlPortForward } from './warm-control-forward.js';
 import { resolveWarmPoolProfile } from '../../src/self-implement/pod-warm-pool-profile.js';
 import { decideWarmReuse, type WarmReuseSwitchConfig, type WarmReuseEvidence } from '../../src/task-orchestrator/surfaces/pod-warm-switch.js';
-import { getUserConfig } from '../../src/user-config.js';
+import { getUserConfig, userConfigPath } from '../../src/user-config.js';
 import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateJobTerminal, type GateShard } from '../../src/release-loop/gate-shards.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { markGateShardUnmeasured, nextGateShardAttempt, readGateShardManifest, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
-import { planGateShardDispatch, summarizeGateProgress, type GateProgressGroup, type GateShardReceipt } from './gate-shard-dispatch.js';
+import { planGateReceiptRadius, planGateShardDispatch, summarizeGateProgress, type GateProgressGroup, type GateShardReceipt } from './gate-shard-dispatch.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from './tui-node-checks.js';
 import { runWithReleaseGateTraffic, runWithReleasePwaTraffic } from './gate-traffic-mode.js';
 import { emitPodLifecycle, gatePodLifecycleEvent, gatePodOutcome } from '../../src/task-orchestrator/surfaces/pod-lifecycle-stages.js';
-import { gateHostReservationRoot, reserveReleaseGateHosts } from '../../src/release-loop/gate-host-reservation.js';
+import { gateHostReservationRoot, readGateHostResourcesForHost, reserveReleaseGateHosts, type GateHostResourceReading } from '../../src/release-loop/gate-host-reservation.js';
+import { startReleaseStageStallWatch } from '../../src/release-loop/stage-mail.js';
 import { normRoot } from '../../src/instance/resolve.js';
 import { cleanRetryVerdict, junitFailedCaseIds, junitTestcaseCount, junitTestcaseFiles } from './gate-shard-load-flaky.js';
 import { decideAndRecordGateAutoheal, gateAutohealCause, type GateAutohealDecision } from './gate-autoheal.js';
@@ -124,6 +125,8 @@ export interface GateTools {
   kubectl?: typeof defaultKubectl;
   /** Mock-only imageID observation seam; production reads the completed Job's child imageID from Kubernetes. */
   podImageDigest?: (input: { job: PodCommandResult; host: string }) => string | null;
+  /** Mock-only graph/recipe facts for an isolated gate tree; production pins the requested commit. */
+  graphRecipePins?: (repo: string, commit: string) => ({ graphSha: string; recipeSha: string; graphEntry: string; recipeCommand: string; recipeTimeoutMs: number }) | null;
   /** SSH transport behind {@link GateRunner.command} on a remote host; absent = a real `ssh` child. */
   ssh?: (host: string, script: string, limitMs?: number) => { rc: number; output: string; timedOut?: boolean };
   /** SSH reachability probe of a multi-host roster; absent = `defaultRemoteRun`. */
@@ -232,6 +235,9 @@ export function reconcileStaleGateShardBoard(input: {
 }
 export interface GateOptions {
   commit: string;
+  /** Present only when launched as a graph command; used to scope release-stage stall mail. */
+  graphId?: string;
+  dryRun?: boolean;
   /** Explicit pre-cut warm↔fresh comparison, persisted before the ordinary gate reads warmHistory. */
   warmPrecutCanary?: { file: string };
   /** RELEASE-POLICY-PACK — the gate Pod image is tied to this resolved cut commit. */
@@ -331,7 +337,7 @@ export interface GateOptions {
     abortTests?: (job: { name: string; context?: string }, reason: string) => boolean | void;
     /** GATE-LIVE-OBS — the shard state file (`gateShardsPath(version)`) this sweep keeps current; absent = not written. */
     shardsFile?: { path: string; version: string; ledgerPath?: string; envFingerprint?: string;
-      receiptRoot?: string; base40?: string; expectedImageDigest?: string | null };
+      receiptRoot?: string; base40?: string; expectedImageDigest?: string | null; graphPins?: ({ graphSha: string; recipeSha: string } & { graphEntry?: string; recipeCommand?: string; recipeTimeoutMs?: number }) | null; executionIdentity?: import('./gate-radius-live.js').GatePodExecutionIdentity | null; radiusPriorCommit?: string };
     /** GATE-RISK-LANE — the ledgers `gateHistory` reads its watch list from; absent = no risk lane (the sweep plans as before). */
     riskWatch?: { instanceRoots: readonly string[]; ledgerRoots: readonly string[] };
     /** GATE-MULTI-HOST — is this pool member reachable (kubectl ns ⊕ ssh)? Injected by tests; absent = the real probe on
@@ -345,35 +351,49 @@ export interface GateOptions {
 }
 
 /** Gate-profile opt-in wires the producer only for the process entry, never a test runner seam. */
+export interface WarmGateControlDependencies {
+  startPortForward?: typeof startWarmControlPortForward;
+  loadProvider?: typeof loadWarmPodProvider;
+  configureProvider?: typeof configureWarmPodProvider;
+  requestReplay?: typeof requestWarmPodReplay;
+}
+
+function safeWarmControlFailureReason(error: unknown): string {
+  if (error instanceof SyntaxError) return 'provider-config-invalid-json';
+  if (error instanceof Error) {
+    if (error.message === 'warm provider config unavailable') return 'provider-config-unavailable';
+    if (error.message === 'warm provider config must be private') return 'provider-config-not-private';
+    if (error.message === 'invalid warm provider config') return 'provider-config-invalid';
+    if (error.message === 'warm provider target is incomplete'
+      || error.message === 'warm control forward requires one cluster and namespace per gate run') {
+      return 'provider-config-target-invalid';
+    }
+  }
+  const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+    ? error.code : undefined;
+  if (code === 'ENOENT') return 'provider-config-unavailable';
+  if (code === 'EACCES' || code === 'EPERM') return 'provider-config-permission-denied';
+  return 'warm-control-setup-failed';
+}
+
 export function withWarmGateHooks(opts: GateOptions, config: unknown, injectedRunner = false,
-  onWarmCleanup?: (cleanup: () => Promise<void>) => void): GateOptions {
+  onWarmCleanup?: (cleanup: () => Promise<void>) => void,
+  controlDependencies: WarmGateControlDependencies = {}): GateOptions {
   if (injectedRunner || !opts.pod || resolveWarmPoolProfile(config) !== 'gate') return opts;
   const warmReuseConfig = config && typeof config === 'object' && 'pod' in config
     && config.pod && typeof config.pod === 'object' && 'warmReuse' in config.pod
     ? config.pod.warmReuse as WarmReuseSwitchConfig : undefined;
   const lifecycle = createRunScopedWarmControlForward(async () => {
-    const configPath = process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG;
-    if (!configPath) throw new Error('warm provider config unavailable');
-    const target = warmProviderTarget(configPath);
-    const forward = await startWarmControlPortForward({ context: target.context, namespace: target.namespace,
-      service: 'elanous-control', remotePort: DEFAULT_CONTROL_PORT });
-    try {
-      const provider = loadWarmPodProvider(configPath, { runtimeOverrides: { controlUrl: forward.url } });
-      configureWarmPodProvider(provider);
-      return forward;
-    } catch (error) {
-      await forward.stop();
-      throw error;
-    }
+    return startWarmGateControl(config, controlDependencies);
   });
   const replay: NonNullable<GateOptions['pod']>['warmReplay'] = async (input) => {
     try { await lifecycle.ensure(); }
     catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = safeWarmControlFailureReason(error);
       debug.log('pod.warm.control-forward', 'unavailable', { reason, fallback: 'fresh-job' }, { level: 'error' });
       return { command: null, transport: { status: 'fallback', reason: 'control-unavailable', reply: null } };
     }
-    return requestWarmPodReplay(input);
+    return (controlDependencies.requestReplay ?? requestWarmPodReplay)(input);
   };
   const cleanup = async () => {
     try { await lifecycle.stop(); }
@@ -384,7 +404,21 @@ export function withWarmGateHooks(opts: GateOptions, config: unknown, injectedRu
     warmFinalize: finalizeWarmPodReplay, warmQuarantine: quarantineWarmPodReplay, warmProducerEnabled: true, warmReuseConfig } };
 }
 
-function warmProviderTarget(path: string): { context: string; namespace: string } {
+export function resolveWarmProviderConfig(config: unknown): { path: string; source: 'env' | 'config' | 'default' } | undefined {
+  const envPath = process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG?.trim();
+  if (envPath) return { path: envPath, source: 'env' };
+
+  const pod = config && typeof config === 'object' && !Array.isArray(config) && 'pod' in config
+    && config.pod && typeof config.pod === 'object' && !Array.isArray(config.pod)
+    ? config.pod as Record<string, unknown> : undefined;
+  const configuredPath = typeof pod?.warmProviderConfig === 'string' ? pod.warmProviderConfig.trim() : '';
+  if (configuredPath) return { path: configuredPath, source: 'config' };
+
+  const defaultPath = join(dirname(userConfigPath()), 'warm-pod-provider.json');
+  return existsSync(defaultPath) ? { path: defaultPath, source: 'default' } : undefined;
+}
+
+export function warmProviderTarget(path: string): { context: string; namespace: string } {
   if (!isAbsolute(path) || (statSync(path).mode & 0o077) !== 0) throw new Error('warm provider config must be private');
   const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid warm provider config');
@@ -401,6 +435,24 @@ function warmProviderTarget(path: string): { context: string; namespace: string 
   }
   if (targets.size !== 1) throw new Error('warm control forward requires one cluster and namespace per gate run');
   return [...targets.values()][0]!;
+}
+
+async function startWarmGateControl(config: unknown, dependencies: WarmGateControlDependencies) {
+  const resolvedConfig = resolveWarmProviderConfig(config);
+  if (!resolvedConfig) throw new Error('warm provider config unavailable');
+  debug.log('pod.warm.control-forward', 'config-discovered', { source: resolvedConfig.source });
+  const configPath = resolvedConfig.path;
+  const target = warmProviderTarget(configPath);
+  const forward = await (dependencies.startPortForward ?? startWarmControlPortForward)({ context: target.context,
+    namespace: target.namespace, service: 'elanous-control', remotePort: DEFAULT_CONTROL_PORT });
+  try {
+    const provider = (dependencies.loadProvider ?? loadWarmPodProvider)(configPath, { runtimeOverrides: { controlUrl: forward.url } });
+    (dependencies.configureProvider ?? configureWarmPodProvider)(provider);
+    return forward;
+  } catch (error) {
+    await forward.stop();
+    throw error;
+  }
 }
 
 export interface GateResult {
@@ -1818,18 +1870,32 @@ export function createGateRootLimiter(slots: number): <T>(run: () => Promise<T>)
   };
 }
 /** A direct gate has no preflight image pin. Its measured receipt still carries its own image digest. */
-export function gateReceiptReuseKey(receipt: GateShardReceipt | null, fingerprint: string, expectedImageDigest: string | null | undefined,
-  hosts: ReadonlySet<string>): { envKey?: string; reason: string } {
+export function gateReceiptReuseKey(receipt: GateShardReceipt | null, version: string, head40: string, fingerprint: string,
+  expectedImageDigest: string | null | undefined, currentIdentity: import('./gate-radius-live.js').GatePodExecutionIdentity | null,
+  graphPins: ({ graphSha: string; recipeSha: string } & { graphEntry?: string; recipeCommand?: string; recipeTimeoutMs?: number }) | null): { envKey?: string; reason: string } {
   if (!receipt) return { reason: 'receipt-missing' };
   if (receipt.status !== 'complete') return { reason: 'receipt-unmeasured' };
-  if (!hosts.has(receipt.host)) return { reason: 'receipt-host-outside-pool' };
-  if (expectedImageDigest) return receipt.envKey === `${fingerprint}:${expectedImageDigest}`
-    ? { envKey: receipt.envKey, reason: 'image-pinned' } : { reason: 'receipt-image-or-env-drift' };
-  const prefix = `${fingerprint}:`;
-  if (!receipt.envKey.startsWith(prefix)) return { reason: 'receipt-env-drift' };
-  return /^sha256:[a-f0-9]{64}$/i.test(receipt.envKey.slice(prefix.length))
-    ? { envKey: receipt.envKey, reason: 'measured-image' } : { reason: 'receipt-image-unmeasured' };
+  if (!currentIdentity) return { reason: 'current-environment-unmeasured' };
+  if (!graphPins?.graphEntry || !graphPins.recipeCommand) return { reason: 'current-shard-recipe-unmeasured' };
+  if (!receipt.version || !receipt.head40 || !receipt.graphSha || !receipt.recipeSha || !receipt.graphEntry || !receipt.recipeCommand || !Number.isSafeInteger(receipt.recipeTimeoutMs) || !receipt.imageDigest || !receipt.runtimeIdentity || !receipt.envFingerprint)
+    return { reason: 'receipt-reuse-record-incomplete' };
+  if (receipt.graphEntry !== graphPins.graphEntry) return { reason: 'graph-entry-mismatch' };
+  if (receipt.recipeCommand !== graphPins.recipeCommand) return { reason: 'recipe-command-mismatch' };
+  if (receipt.recipeTimeoutMs !== graphPins.recipeTimeoutMs) return { reason: 'recipe-timeout-mismatch' };
+  const environmentFields = ['imageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const;
+  const stored: Record<string, string> = { imageDigest: receipt.imageDigest, ...receipt.runtimeIdentity, envFingerprint: receipt.envFingerprint };
+  const current: Record<string, string> = { ...currentIdentity };
+  for (const field of environmentFields) {
+    if (!stored[field] || !current[field]) return { reason: `environment-${field}-unmeasured` };
+    if (stored[field] !== current[field]) return { reason: `environment-${field}-mismatch` };
+  }
+  if (receipt.envFingerprint !== receipt.runtimeIdentity.envFingerprint || receipt.envKey !== `${receipt.envFingerprint}:${receipt.imageDigest}`)
+    return { reason: 'receipt-env-record-inconsistent' };
+  if (receipt.runtimeIdentity.envFingerprint !== fingerprint) return { reason: 'environment-envFingerprint-current-fingerprint-mismatch' };
+  if (expectedImageDigest && expectedImageDigest !== currentIdentity.imageDigest) return { reason: 'environment-imageDigest-current-pin-mismatch' };
+  return { envKey: receipt.envKey, reason: `environment-match; baseline=${receipt.version}@${receipt.head40.slice(0, 12)}; current=${version}@${head40.slice(0, 12)}` };
 }
+
 export type GateAdmissionOutcome = 'granted' | 'admission-timeout' | 'admission-error' | 'off';
 export interface GateAdmissionResult { outcome: GateAdmissionOutcome; waitedMs: number; reason?: string; release: () => void }
 export const gateAdmissionWaitText = (reading: string | null) => `메모리 여유 대기(admission) · ${reading ?? '측정 전'}`.slice(0, 160);
@@ -1975,7 +2041,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
   };
   const podSweep = async (tree: string, logDir: string | undefined, pod: NonNullable<GateOptions['pod']>, only?: readonly string[], onProgress?: (progress: GateSweepProgress) => void): Promise<CommandResult> => {
     const sweepId = randomUUID();
-    const shardCount = pod.shards ?? 24;
+    let shardCount = pod.shards ?? 24;
     const isolationConcurrency = pod.isolationConcurrency ?? 4;
     // GATE-TIMEOUT-HEAL ①: the configured value is the floor; each shard's own deadline is shardDeadlineSeconds(planned).
     const deadlineSeconds = pod.shardTimeoutSeconds ?? POD_SHARD_TIMEOUT_FLOOR_SECONDS;
@@ -1998,7 +2064,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     // by not running. Fail closed (gate error), never a smaller sweep than planned.
     const missing = only?.filter((file) => !allFiles.includes(file)) ?? [];
     if (missing.length) throw new Error(`partial plan file missing at this commit: ${missing.slice(0, 5).join(', ')}`);
-    const files = onlySet ? allFiles.filter((file) => onlySet.has(file)) : allFiles;
+    let files = onlySet ? allFiles.filter((file) => onlySet.has(file)) : allFiles;
     const rulesBaseSha = await rulesGateBaseFor(commit, files);
     if (files.some((file) => file.startsWith('-') || file.startsWith('/') || file.startsWith('./')
       || file.split('/').some((part) => !part || part === '.' || part === '..') || /[\r\n]/.test(file))) throw new Error('unsafe pod test path');
@@ -2009,7 +2075,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const cdpPatterns = cdp.output.split(/\r?\n/).filter((path) => path.endsWith('.test.ts'));
     // CDP 시험은 `test:deterministic` 이 스스로 뺀다 — 조각에 그것만 남으면 bun «시험 없음» exit 1 을 «불완전»으로 읽었다(09-30 G1d 실측 둘).
     // bun 의 탐색은 숨은 디렉터리(`.x/`)를 안 연다 — 사람의 `bun test` 가 한 번도 안 돌리는 빈 픽스처가 조각에 혼자 남아 «Ran 0 tests» 를 «불완전»으로 읽었다(09-30 G1e 5번 조각).
-    const assignable = files.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
+    const allAssignable = allFiles.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
+      && !file.split('/').some((part) => part.startsWith('.')));
+    let assignable = files.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
       && !file.split('/').some((part) => part.startsWith('.')));
     const integrationOnly = files.filter((file) => POD_SWEEP_INTEGRATION_ONLY.includes(file));
     if (integrationOnly.length) debug.log('release-loop.gate', 'pod-sweep-integration-only', { files: integrationOnly });
@@ -2023,11 +2091,25 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     // the first shard; heavy files stay solo and spawn files keep their own lane, so the rest of the plan is unchanged.
     const watchList = pod.riskWatch ? readGateRiskWatchList(pod.riskWatch) : [];
     const riskPlan = planGateRiskLaneShards({ assignable, durations, shardCount, heavy, watchList });
-    const shards = riskPlan.shards;
+    let shards = riskPlan.shards;
     const receiptRoot = pod.shardsFile?.receiptRoot;
+    const priorReceiptRows = only && receiptRoot && existsSync(receiptRoot) ? readdirSync(receiptRoot).filter((name) => /^pod-\d+\.receipt\.json$/.test(name))
+      .sort((a, b) => Number(a.slice(4).split('.')[0]) - Number(b.slice(4).split('.')[0]))
+      .map((name) => readGateShardManifest(receiptRoot, name.replace('.receipt.json', ''))).filter((row): row is GateShardReceipt => !!row) : [];
+    const radiusReceiptPlan = only && priorReceiptRows.length ? planGateReceiptRadius({ receipts: priorReceiptRows, tests: allAssignable, selectedFiles: files, priorCommit: pod.shardsFile?.radiusPriorCommit ?? '' }) : null;
+    const radiusUnchangedShardIds = radiusReceiptPlan?.unchangedShardIds ?? [];
+    const radiusInvalidatedShardIds = radiusReceiptPlan?.invalidatedShardIds ?? [];
+    if (radiusReceiptPlan) { assignable = allAssignable; shards = radiusReceiptPlan.shards.map((shard) => ({ ...shard, plannedSeconds: shard.files.reduce((total, file) => total + (durations.get(file) ?? 0), 0) })); shardCount = shards.length; }
     const base40 = pod.shardsFile?.base40;
     const envFingerprint = pod.shardsFile?.envFingerprint;
     const expectedImageDigest = pod.shardsFile?.expectedImageDigest;
+  const injectedGraphRecipePins = tools.graphRecipePins?.(repo, commit) ?? null;
+  const sourceGraphPins = pod.shardsFile?.graphPins ?? injectedGraphRecipePins ?? gateSourcePins(repo, commit);
+  const shardRecipeIdentity = pod.shardsFile?.graphPins?.graphEntry && pod.shardsFile.graphPins.recipeCommand
+    ? { graphEntry: pod.shardsFile.graphPins.graphEntry, recipeCommand: pod.shardsFile.graphPins.recipeCommand, recipeTimeoutMs: pod.shardsFile.graphPins.recipeTimeoutMs }
+    : injectedGraphRecipePins ?? gateShardRecipeIdentityAtCommit(repo, commit);
+  const currentGraphPins = sourceGraphPins && shardRecipeIdentity ? { ...sourceGraphPins, ...shardRecipeIdentity } : null;
+  const currentExecutionIdentity = pod.shardsFile?.executionIdentity ?? preflightGateExecutionIdentity(pod.pool, process.env, commit);
     if (riskPlan.spawnFiles.length) debug.log('release-loop.gate', 'pod-spawn-lane', { files: riskPlan.spawnFiles, shards: riskPlan.spawnShardCount });
     if (riskPlan.riskFiles.length) debug.log('release-loop.gate', 'pod-risk-lane-plan', { files: riskPlan.riskFiles, shard: 0,
       plannedSeconds: riskPlan.riskPlannedSeconds, shards: shards.length, watch: watchList.length });
@@ -2049,16 +2131,25 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const ready = poolOverride ? undefined : checkPodPool(parsePodPool(pod.pool), kubectl);
     if (ready && !ready.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
     const poolScheduler = poolOverride ?? new PodPoolScheduler(ready!.ready);
+    type GateShardExecution = NonNullable<ReturnType<typeof parseGatePodRuntimeIdentity>>;
+    type GateShardDetail = Partial<GateShardLedgerRow> & { runtimeIdentity?: GateShardExecution };
+    const detailsById = new Map<string, GateShardDetail>();
+    const executionsByShard = new Map<string, Array<{ branch: string; attemptId: string; imageDigest: string | null;
+      runtimeIdentity: GateShardExecution | null; host: string | null }>>();
     const receiptChecks = shards.map((item, shard) => {
       if (pod.freshShards) return { reason: 'fresh-shards' };
       if (!receiptRoot || !base40 || !envFingerprint) return { reason: 'receipt-context-missing' };
       const prior = readGateShardManifest(receiptRoot, `pod-${shard}`);
-      const key = gateReceiptReuseKey(prior, envFingerprint, expectedImageDigest,
-        new Set(poolScheduler.members.map((member) => member.context)));
-      if (!key.envKey) return { reason: key.reason };
+      const key = gateReceiptReuseKey(prior, pod.shardsFile!.version, commit, envFingerprint, expectedImageDigest, currentExecutionIdentity, currentGraphPins);
+      if (!key.envKey) {
+        return { reason: key.reason };
+      }
       const result = readGateShardResult(receiptRoot, { shard: { id: `pod-${shard}`, files: item.files },
-        head40: commit, base40, envKey: key.envKey });
-      return result ? { reason: key.reason, result } : { reason: 'receipt-identity-or-evidence-invalid' };
+        head40: prior!.head40, base40, envKey: key.envKey });
+      const decision = result ? 'reuse' as const : 'rerun' as const;
+      const reason = result ? key.reason : 'receipt-payload-or-shard-radius-mismatch';
+
+      return result ? { reason, result } : { reason };
     });
     const receipts = receiptChecks.flatMap((check) => check.result ? [check.result.receipt] : []);
     const requiredOs = pod.shardCapabilities ?? {};
@@ -2089,8 +2180,29 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       shards: shards.map((item, shard) => ({ id: `pod-${shard}`, files: item.files,
         ...(requiredOs[`pod-${shard}`]?.os ? { requiredOs: requiredOs[`pod-${shard}`]!.os } : {}) })), receipts,
       hosts,
+      graphEntry: currentGraphPins?.graphEntry, recipeCommand: currentGraphPins?.recipeCommand, recipeTimeoutMs: currentGraphPins?.recipeTimeoutMs, environmentIdentity: currentExecutionIdentity ?? undefined,
+      radiusUnchangedShardIds, invalidatedShardIds: radiusInvalidatedShardIds,
       macPassShardIds,
       ...(pod.rerouteShard ? { rerouteShard: pod.rerouteShard } : {}), ...(pod.shardHost ? { shardHost: pod.shardHost } : {}) });
+    for (const action of hostPlan) {
+      const decision = action.kind === 'reuse' ? 'reuse' as const : 'rerun' as const;
+      const reason = action.reason;
+      const prior = receiptChecks[Number(action.shardId.slice(4))]?.result?.receipt
+        ?? readGateShardManifest(receiptRoot ?? '', action.shardId);
+      detailsById.set(action.shardId, { reuseDecision: decision, reuseReason: reason });
+      debug.log('gate.receipt', 'reuse-decision', { shardId: action.shardId, decision, reason });
+      if (pod.shardsFile?.ledgerPath && envFingerprint) {
+        try { appendGateShardLedger(pod.shardsFile.ledgerPath, {
+          v: 1, version: pod.shardsFile!.version, phase: 'cut', shardId: action.shardId, files: [...action.files],
+          host: action.kind === 'run' ? action.host : prior?.host ?? null, executor: 'pod',
+          imageDigest: prior?.imageDigest ?? null, commit, envFingerprint, startedAt: null, endedAt: null,
+          observedAt: new Date().toISOString(), state: action.kind === 'reuse' ? 'done' : 'pending',
+          rc: null, pass: null, fail: null, errors: null, ran: null, failureIds: prior?.failureIds ?? null,
+          errorIds: prior?.errorIds ?? null, attribution: action.kind === 'reuse' ? 'complete' : 'unmeasured',
+          logPath: null, junitPath: null, stopReason: null, attemptId: null, reuseDecision: decision, reuseReason: reason,
+        }); } catch (error) { debug.log('gate.receipt', 'reuse-ledger-write-failed', { shardId: action.shardId, error: String(error) }); }
+      }
+    }
     // Leave ordinary shards to the live free-slot scheduler. A static plan can pick a busy member
     // while another is idle; pin only a capability or a deliberate cross-host replacement.
     const hostPins = new Map(hostPlan.flatMap((item) => item.kind === 'run'
@@ -2244,7 +2356,6 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     })) });
     reportProgress();
     const filesById = new Map(shards.map((item, index) => [`pod-${index}`, [...item.files]]));
-    const detailsById = new Map<string, Partial<GateShardLedgerRow>>();
     const observeShard = (row: GateShard) => {
       if (!pod.shardsFile?.ledgerPath || !pod.shardsFile.envFingerprint) return;
       const detail = detailsById.get(row.id) ?? {};
@@ -2260,7 +2371,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           state: row.state, rc: row.rc ?? null, pass: detail.pass ?? null, fail: detail.fail ?? null,
           errors: detail.errors ?? null, ran: detail.ran ?? null,
           failureIds: detail.failureIds ?? null, errorIds: detail.errorIds ?? null,
-          attribution: detail.attribution ?? 'unmeasured', logPath, junitPath,
+          attribution: detail.attribution ?? 'unmeasured', reuseDecision: detail.reuseDecision, reuseReason: detail.reuseReason, logPath, junitPath,
           stopReason: detail.stopReason ?? row.waitReason ?? null, attemptId: row.attemptId ?? null,
         });
       } catch (error) { debug.log('release-loop.gate', 'shard-ledger-write-failed', { shard: row.id, error: String(error) }, { level: 'warn' }); }
@@ -2316,7 +2427,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           failureIds.push(...parsed.failures); errorIds.push(...parsed.errors);
         } catch { attributed = false; }
       }
-      const detail: Partial<GateShardLedgerRow> = { ...(detailsById.get(id) ?? {}), ...counts, failureIds: attributed ? [...new Set(failureIds)].sort() : null,
+      const detail: GateShardDetail = { ...(detailsById.get(id) ?? {}), ...counts, failureIds: attributed ? [...new Set(failureIds)].sort() : null,
         errorIds: attributed ? [...new Set(errorIds)].sort() : null, attribution: attributed ? 'complete' : 'unmeasured',
         stopReason: done.stalled.map((item) => item.reason).join(', ') || null };
       detailsById.set(id, detail);
@@ -2656,7 +2767,14 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         }
       }
       const installSeconds = parseInstallSeconds(output ?? '');
-      if (imageDigest) detailsById.set(`pod-${shard}${branch}`, { ...(detailsById.get(`pod-${shard}${branch}`) ?? {}), imageDigest });
+      detailsById.set(`pod-${shard}${branch}`, { ...(detailsById.get(`pod-${shard}${branch}`) ?? {}),
+        ...(imageDigest ? { imageDigest } : {}), ...(runtimeIdentity ? { runtimeIdentity } : {}) });
+      if (!reused) {
+        const rootId = `pod-${shard}`;
+        executionsByShard.set(rootId, [...(executionsByShard.get(rootId) ?? []), {
+          branch, attemptId, imageDigest, runtimeIdentity: runtimeIdentity ?? null, host: placedOn ?? board[rowIndex(shard, branch)]?.host ?? (poolScheduler.members.length === 1 ? poolScheduler.members[0]?.context : undefined) ?? null,
+        }]);
+      }
       // GATE-TIMEOUT-HEAL ③: a cut shard is «reason: timeout» (with the files that still finished), not a bare rc=null.
       if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, gateDeps: parseGateDeps(output ?? ''), deadlineSeconds: shardDeadline, parts: parts.length, ...(placedOn ? { host: placedOn } : {}),
         ...(testSeconds !== undefined ? { testSeconds } : {}),
@@ -2935,7 +3053,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           const receiptAttempt = receiptRoot ? nextGateShardAttempt(receiptRoot, shardId) : 1;
           if (receiptRoot && base40 && envFingerprint) {
             try {
-              markGateShardUnmeasured(receiptRoot, { id: shardId, files: [...item.files], head40: commit, base40,
+              markGateShardUnmeasured(receiptRoot, { id: shardId, files: [...item.files], version: pod.shardsFile!.version, graphSha: currentGraphPins?.graphSha ?? '', recipeSha: currentGraphPins?.recipeSha ?? '', head40: commit, base40,
                 host: 'pending', envKey: `${envFingerprint}:${expectedImageDigest ?? 'unmeasured'}`, status: 'unmeasured',
                 failureIds: [], errorIds: [], evidencePath: 'pending', evidenceSha256: '0'.repeat(64),
                 measuredAt: new Date().toISOString(), attempt: receiptAttempt });
@@ -2957,18 +3075,34 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           markShard(shard, { state, rc: done.stalled.length || done.runs.some((run) => run.fail || run.errors) ? 1 : 0, endedAt: new Date().toISOString() }, ['waitReason']);
           recordShardResult(`pod-${shard}`, done);
           if (receiptRoot && base40 && envFingerprint && !done.stalled.length) {
-            const imageDigest = detailsById.get(shardId)?.imageDigest;
-            const attribution = detailsById.get(shardId)?.attribution;
-            const row = board[shard];
-            if (imageDigest && row?.host && attribution === 'complete') {
+            const executionRows = executionsByShard.get(shardId) ?? [];
+            const executionEvidenceComplete = executionRows.length > 0
+              && executionRows.every((execution) => !!execution.imageDigest && !!execution.runtimeIdentity && !!execution.host);
+            const imageDigests = [...new Set(executionRows.map((execution) => execution.imageDigest).filter((value): value is string => !!value))];
+            const runtimes = [...new Map(executionRows.flatMap((execution) => execution.runtimeIdentity
+              ? [[JSON.stringify(execution.runtimeIdentity), execution.runtimeIdentity] as const] : [])).values()];
+            const imageDigest = imageDigests.length === 1 ? imageDigests[0] : undefined;
+            const runtimeIdentity = runtimes.length === 1 ? runtimes[0] : undefined;
+            const detail = detailsById.get(shardId);
+            if (imageDigest && runtimeIdentity) { const { imageDigest: _oldImageDigest, ...detailWithoutImage } = detail ?? {}; detailsById.set(shardId, { ...detailWithoutImage, imageDigest, runtimeIdentity }); }
+            const attribution = detail?.attribution;
+            const executionHosts = [...new Set(executionRows.map((execution) => execution.host).filter((host): host is string => !!host))];
+            const executedHost = executionHosts[0];
+            if (executionEvidenceComplete && imageDigest && runtimeIdentity && executedHost && currentGraphPins && attribution === 'complete') {
               try {
                 saveGateShardResult(receiptRoot, { receipt: { id: shardId, files: [...item.files], head40: commit, base40,
-                  host: row.host, envKey: `${envFingerprint}:${imageDigest}`, status: 'complete',
-                  failureIds: detailsById.get(shardId)?.failureIds ?? [], errorIds: detailsById.get(shardId)?.errorIds ?? [],
+                  version: pod.shardsFile!.version, graphSha: currentGraphPins!.graphSha, recipeSha: currentGraphPins!.recipeSha,
+                  graphEntry: currentGraphPins?.graphEntry, recipeCommand: currentGraphPins?.recipeCommand, recipeTimeoutMs: currentGraphPins?.recipeTimeoutMs,
+                  host: executedHost, envKey: `${envFingerprint}:${imageDigest}`, envFingerprint, imageDigest, runtimeIdentity,
+                  executions: executionRows.map((execution) => ({ branch: execution.branch, attemptId: execution.attemptId,
+                    host: execution.host!, imageDigest: execution.imageDigest!, runtimeIdentity: execution.runtimeIdentity! })), status: 'complete',
+                  failureIds: detail?.failureIds ?? [], errorIds: detail?.errorIds ?? [],
                   evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: new Date().toISOString(),
                   attempt: receiptAttempt }, runs: done.runs });
               } catch (error) { debug.log('release-loop.gate', 'shard-receipt-write-failed', { shard: shardId, error: String(error) }, { level: 'warn' }); }
-            }
+            } else debug.log('release-loop.gate', 'shard-receipt-not-saved', { shard: shardId,
+              missingImageDigest: !imageDigest, missingRuntimeIdentity: !runtimeIdentity, executionEvidenceComplete,
+              executedHost: executedHost ?? null, attribution: attribution ?? 'unmeasured' });
           }
           return done;
         } catch (error) {
@@ -3327,7 +3461,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       const onlySet = only ? new Set(only) : undefined;
       const missing = only?.filter((file) => !allFiles.includes(file)) ?? [];
       if (missing.length) throw new Error(`partial plan file missing at this commit: ${missing.slice(0, 5).join(', ')}`);
-      const files = onlySet ? allFiles.filter((file) => onlySet.has(file)) : allFiles;
+      let files = onlySet ? allFiles.filter((file) => onlySet.has(file)) : allFiles;
       const groups = onlySet ? [{ name: 'partial', paths: files }] : [
         { name: 'src-cli', paths: ['src/cli'] },
         { name: 'src-rest', paths: [...new Set(files.filter((f) => f.startsWith('src/') && !f.startsWith('src/cli/')).map((f) => f.split('/').length === 2 ? f : f.split('/').slice(0, 2).join('/')))] },
@@ -3492,6 +3626,20 @@ export function saveBaselineFileCache(ledger: string, commit: string, rows: Base
   } finally { if (existsSync(temp)) rmSync(temp); }
 }
 
+class InvalidPodSweepOptionsError extends Error {
+  constructor() {
+    super('invalid pod sweep options');
+    this.name = 'InvalidPodSweepOptionsError';
+  }
+}
+
+function assertValidPodSweepOptions(opts: GateOptions): void {
+  if (opts.pod && (!opts.pod.pool || !Number.isSafeInteger(opts.pod.shards ?? 24) || (opts.pod.shards ?? 24) < 1
+    || !Number.isSafeInteger(opts.pod.shardTimeoutSeconds ?? 1200) || (opts.pod.shardTimeoutSeconds ?? 1200) < 1)) {
+    throw new InvalidPodSweepOptionsError();
+  }
+}
+
 export async function judgeGate(opts: GateOptions, runner: GateRunner = createGateRunner(opts.repo ?? process.cwd(), opts.remote, undefined, undefined, undefined, undefined, { graphRunId: opts.graphRunId ?? null }),
   imageProbe: typeof preflightGateImageDigest = preflightGateImageDigest,
   identityProbe: typeof preflightGateExecutionIdentity = preflightGateExecutionIdentity,
@@ -3553,8 +3701,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     catch (error) { debug.log('release-loop.gate', 'radius-shadow-unavailable', { reason: String(error) }); }
     if (!Number.isSafeInteger(opts.recheckFileLimit ?? GATE_HOST_RECHECK_FILE_LIMIT) || (opts.recheckFileLimit ?? GATE_HOST_RECHECK_FILE_LIMIT) < 1)
       throw new Error('invalid gate recheck file limit');
-    if (opts.pod && (!opts.pod.pool || !Number.isSafeInteger(opts.pod.shards ?? 24) || (opts.pod.shards ?? 24) < 1
-      || !Number.isSafeInteger(opts.pod.shardTimeoutSeconds ?? 1200) || (opts.pod.shardTimeoutSeconds ?? 1200) < 1)) throw new Error('invalid pod sweep options');
+    assertValidPodSweepOptions(opts);
     if (opts.pod && opts.graphRunId) {
       const components = opts.pod.pool.split(',').map((part) => part.trim()).filter(Boolean);
       const members = parsePodPool(opts.pod.pool);
@@ -3612,11 +3759,16 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       const hasPoolImage = [...poolImages.values()].some((images) => images.some((image) => normalizeGateImageDigest(image) !== null));
       if (!savedDigest && !hasPoolImage) {
         let syncResults: Awaited<ReturnType<typeof syncPoolImages>>;
+        const stopImageSyncWatch = startReleaseStageStallWatch({ runId: pinRunId, nodeId: 'gate' }, {
+          graphId: opts.graphId ?? '', dryRun: opts.dryRun === true,
+        });
         try { syncResults = await syncImages(members, podCommandImageFor([], true), opts.commit); }
         catch (error) {
           debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, decision: 'fail-closed',
             reason: 'initial-image-sync-failed', error: String(error).slice(0, 300) }, { level: 'error' });
           throw new Error('gate image pin refused: initial image sync failed');
+        } finally {
+          stopImageSyncWatch();
         }
         const failedSyncs = memberSpecs.filter((member) => !syncResults.get(member.context)?.ok);
         if (failedSyncs.length) {
@@ -3826,7 +3978,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           ledgerPath: gateShardLedgerPath(opts.version, ledger), envFingerprint: gateEnvFingerprint(process.env),
           receiptRoot: join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts'),
           base40: receiptBase,
-          expectedImageDigest: receiptImage } } : undefined,
+          expectedImageDigest: receiptImage, graphPins: opts.pod.shardsFile?.graphPins ?? gateSourcePins(repo, opts.commit),
+          executionIdentity: currentIdentity ?? opts.pod.shardsFile?.executionIdentity ?? null, ...(selected?.priorCommit ? { radiusPriorCommit: selected.priorCommit } : {}) } } : undefined,
       selected?.files, (progress) => { latest = progress; emitProgress(); });
         emitProgress();
         return sweepResult;
@@ -4456,6 +4609,28 @@ export function reservedGateHosts(opts: Pick<GateOptions, 'pod' | 'remote'>): st
     : [opts.remote?.split('@').at(-1) ?? hostname()];
 }
 
+export type GatePoolResourceProbe = (host: string, env: NodeJS.ProcessEnv, members: readonly PodPoolMember[]) => GateHostResourceReading;
+
+export type GatePoolStartBlock = { host: string; reason: string; resources?: Pick<Extract<GateHostResourceReading, { status: 'measured' }>, 'reservations' | 'authoringLeases' | 'waitingJobs' | 'activeJobs'> };
+
+/** The gate starts only after every host in its exclusive pool is measured empty. */
+export function releaseGatePoolStartBlock(opts: GateOptions, env: NodeJS.ProcessEnv,
+  probe: GatePoolResourceProbe = (host, probeEnv, members) => readGateHostResourcesForHost(host, probeEnv, { members })): GatePoolStartBlock | null {
+  if (!opts.pod) return null;
+  let members: PodPoolMember[];
+  try { members = parsePodPool(opts.pod.pool); }
+  catch (error) { return { host: 'unknown', reason: `gate-pool-invalid: ${error instanceof Error ? error.message : String(error)}` }; }
+  for (const host of reservedGateHosts(opts)) {
+    const reading = probe(host, env, members);
+    if (reading.status === 'unmeasurable') return { host, reason: `gate-pool-unmeasurable:${reading.reason}` };
+    if (!reading.empty) return { host, reason: 'gate-host-busy', resources: {
+      reservations: reading.reservations, authoringLeases: reading.authoringLeases,
+      waitingJobs: reading.waitingJobs, activeJobs: reading.activeJobs,
+    } };
+  }
+  return null;
+}
+
 /** What was asked for, read best-effort when the options themselves were refused — so a failed gate still says which executor. */
 export function requestedGateExecutor(args: string[], env: NodeJS.ProcessEnv): { executor: string | null; host: string | null } {
   let executor: unknown;
@@ -4504,6 +4679,8 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
       || !['darwin', 'linux'].includes((value as { os?: string }).os ?? ''))))
     throw new Error('gateShardCapabilities must map pod-N to {os: darwin|linux}');
   const opts: GateOptions = {
+    ...(context?.graphId ? { graphId: context.graphId } : {}),
+    dryRun: env.ELANOUS_GRAPH_DRY_RUN === '1',
     ...(fromGraph.gateImagePin === 'cut-commit' ? { imagePin: 'cut-commit' as const } : {}),
     rehearsalTui: fromGraph.rehearsalTui === true,
     recheckFileLimit: fromGraph.gateRecheckFileLimit !== undefined ? Number(fromGraph.gateRecheckFileLimit) : undefined,
@@ -4611,7 +4788,8 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
  *  `runner` is a seam for tests; the process entry passes none. */
 export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner?: GateRunner,
   judge: (opts: GateOptions, runner?: GateRunner, imageProbe?: typeof preflightGateImageDigest) => Promise<GateResult> = judgeGate,
-  imageProbe: typeof preflightGateImageDigest = preflightGateImageDigest): Promise<number> {
+  imageProbe: typeof preflightGateImageDigest = preflightGateImageDigest,
+  poolResourceProbe?: GatePoolResourceProbe): Promise<number> {
   const start = Date.now();
   let result: GateResult | undefined;
   let version = '';
@@ -4628,6 +4806,24 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
     }
     const opts = parsed === 'help' ? parsed : withWarmGateHooks(parsed, config, !!runner,
       cleanup => { warmControlCleanup = cleanup; });
+    if (opts !== 'help' && opts.pod) {
+      // Reject malformed shard settings before touching the live host pool.
+      assertValidPodSweepOptions(opts);
+      // Supplying a runner or judge is the node's existing simulation seam; never issue a real Kubernetes read from it.
+      const probe = poolResourceProbe ?? (runner || judge !== judgeGate
+        ? (() => ({ status: 'measured' as const, empty: true, reservations: 0, authoringLeases: 0, waitingJobs: 0, activeJobs: 0 }))
+        : undefined);
+      const occupied = releaseGatePoolStartBlock(opts, env, probe);
+      if (occupied) {
+        debug.log('release-loop.gate', 'gate-host-pool-preflight-blocked', { host: occupied.host, reason: occupied.reason,
+          resources: occupied.resources ?? null, version: opts.version }, { level: 'error' });
+        const counts = occupied.resources
+          ? ` · reservations=${occupied.resources.reservations} · authoringLeases=${occupied.resources.authoringLeases} · waitingJobs=${occupied.resources.waitingJobs} · activeJobs=${occupied.resources.activeJobs}`
+          : '';
+        console.error(`🚨 release gate 즉시 차단 — gate 호스트 풀 ${occupied.host}: ${occupied.reason}${counts}`);
+        throw new Error(`release gate host pool preflight blocked (${occupied.host}): ${occupied.reason}`);
+      }
+    }
     if (opts !== 'help' && opts.warmPrecutCanary) {
       const canaryRunner = runner ?? createGateRunner(opts.repo ?? process.cwd(), opts.remote, undefined, undefined, undefined, undefined, { graphRunId: opts.graphRunId ?? null });
       const warmPrecutTestSeam = (runner as (GateRunner & { warmPrecutCanaryTestSeam?: {
@@ -4665,7 +4861,8 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
     try { result = await judge(context?.runId ? { ...opts, graphRunId: context.runId } : opts, runner, imageProbe); }
     finally { releaseHosts(); }
   } catch (error) {
-    result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start, error: String(error) };
+    result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start,
+      error: error instanceof InvalidPodSweepOptionsError ? error.message : String(error) };
     placement ??= requestedGateExecutor(argv, env);
   } finally {
     try { await warmControlCleanup?.(); }

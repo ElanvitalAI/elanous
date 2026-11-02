@@ -96,22 +96,53 @@ describe('establishElanousTuiIsolation — config materialization', () => {
     }
   });
 
-  test('원천 동기화 실패를 failed로 남기고 격리는 계속 수립한다', () => {
+  test('새 머신에 사용자 원천 config가 없어도 빈 test-safe 사본을 만들고 created를 관측한다', () => {
     const root = tempDir();
     const missingSource = join(root, 'missing-source');
+    // #34259 / 17d801e65: clean machine without a prior user-config write intentionally syncs from {}.
     try {
+      let isolation: ReturnType<typeof establishElanousTuiIsolation> | undefined;
       const events = observeIsolationConfig(() => {
-        const isolation = establishElanousTuiIsolation({ root, sourceConfigDir: missingSource });
-        expect(isolation.configDir).toBe(realpathSync(root));
-        expect(isolation.stateDir).toBe(realpathSync(root));
+        isolation = establishElanousTuiIsolation({ root, sourceConfigDir: missingSource });
       });
+      const configPath = join(root, 'config.json');
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, any>;
+      expect(isolation).toMatchObject({ configDir: realpathSync(root), stateDir: realpathSync(root) });
+      expect(existsSync(configPath)).toBe(true);
+      expect(existsSync(missingSource)).toBe(false);
+      expect(config._testSyncedFrom).toBe(join(missingSource, 'config.json'));
+      expect(config._testSyncedAt).toEqual(expect.any(String));
+      expect(config.telegram.enabled).toBe(false);
+      expect(config.discord.enabled).toBe(false);
+      expect(events).toContainEqual({
+        category: 'pty.drive',
+        event: 'isolation-config-materialized',
+        data: { configDir: realpathSync(root), outcome: 'created' },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('잘못된 원천 config는 failed를 기록하지만 격리는 계속 수립한다', () => {
+    const root = tempDir();
+    const source = tempDir();
+    writeFileSync(join(source, 'config.json'), '{invalid json');
+    try {
+      let isolation: ReturnType<typeof establishElanousTuiIsolation> | undefined;
+      const events = observeIsolationConfig(() => {
+        isolation = establishElanousTuiIsolation({ root, sourceConfigDir: source });
+      });
+      expect(isolation).toMatchObject({ configDir: realpathSync(root), stateDir: realpathSync(root) });
+      expect(existsSync(join(root, 'config.json'))).toBe(false);
       expect(events).toContainEqual(expect.objectContaining({
         category: 'pty.drive',
         event: 'isolation-config-materialized',
-        data: expect.objectContaining({ configDir: realpathSync(root), outcome: 'failed' }),
+        data: expect.objectContaining({ configDir: realpathSync(root), outcome: 'failed', error: expect.any(String) }),
       }));
     } finally {
       rmSync(root, { recursive: true, force: true });
+      rmSync(source, { recursive: true, force: true });
     }
   });
 

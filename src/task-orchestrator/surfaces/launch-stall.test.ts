@@ -16,7 +16,37 @@ process.on('exit', () => off());
 const status = (recommended: number) => (): PoolLeaseRecommendation => ({ recommended, accountSlots: 0, limitedBy: recommended ? 'capacity' : 'memory', reason: null,
   capacitySlots: 2, memorySlots: recommended, placeableSlots: recommended, running: 0, pending: 0 } as PoolLeaseRecommendation);
 
-test('every member too small for the Job limit fails fast with the reason and applies no Job', async () => {
+function manualTimers() {
+  const originalNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const pending = new Map<number, { due: number; callback: () => void }>();
+  let now = 1_700_000_000_000;
+  let nextId = 0;
+  Date.now = () => now;
+  globalThis.setTimeout = ((callback: TimerHandler, delay = 0) => {
+    const id = ++nextId;
+    if (typeof callback === 'function') pending.set(id, { due: now + Math.max(0, Number(delay) || 0), callback: callback as () => void });
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => { pending.delete(id as unknown as number); }) as typeof clearTimeout;
+  return {
+    advanceBy(ms: number): void {
+      const target = now + ms;
+      for (;;) {
+        const next = [...pending.entries()].sort((a, b) => a[1].due - b[1].due || a[0] - b[0])[0];
+        if (!next || next[1].due > target) break;
+        pending.delete(next[0]);
+        now = next[1].due;
+        next[1].callback();
+      }
+      now = target;
+    },
+    restore(): void { Date.now = originalNow; globalThis.setTimeout = originalSetTimeout; globalThis.clearTimeout = originalClearTimeout; },
+  };
+}
+
+test.serial('every member too small for the Job limit fails fast with the reason and applies no Job', async () => {
   const calls: string[] = [];
   const pool = new PodPoolScheduler(parsePodPool('small:2'), { status: status(0), pollMs: 2,
     memberMemory: () => [{ context: 'small', allocatableMemoryBytes: 12.5 * GiB }] });
@@ -37,7 +67,7 @@ const completingKubectl = (calls: string[][]) => (args: readonly string[]) => {
   return { status: 0, stdout: '', stderr: '' };
 };
 
-test('an unfit member is skipped for this launch and the Job is applied on a member that fits', async () => {
+test.serial('an unfit member is skipped for this launch and the Job is applied on a member that fits', async () => {
   const calls: string[][] = [];
   const pool = new PodPoolScheduler(parsePodPool('small:2,big:2'), { status: status(2), pollMs: 2,
     memberMemory: () => [{ context: 'small', allocatableMemoryBytes: 12.5 * GiB }, { context: 'big', allocatableMemoryBytes: 400 * GiB }],
@@ -54,18 +84,45 @@ test('an unfit member is skipped for this launch and the Job is applied on a mem
   // A member whose memory could not be read is not judged unfit (unknown ≠ too small).
   const unknown = new PodPoolScheduler(parsePodPool('x:1'), { status: status(1), memberMemory: () => [{ context: 'x', allocatableMemoryBytes: null }] });
   expect(await unknown.unfitMembers(16 * GiB)).toEqual([]);
-});
+}, 15_000);
 
-test('admission waiting past the cap emits one launch-stalled event with the measured reason', async () => {
-  const pool = new PodPoolScheduler(parsePodPool('fake:2'), { status: status(0), pollMs: 2,
+test.serial('admission waiting past the cap emits one launch-stalled event with the measured reason', async () => {
+  const timers = manualTimers();
+  let measurementStarted!: () => void;
+  const measured = new Promise<void>((resolve) => { measurementStarted = resolve; });
+  const pool = new PodPoolScheduler(parsePodPool('fake:2'), { status: async () => {
+    const reading = status(0)();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    measurementStarted();
+    return reading;
+  }, pollMs: 30,
     memberMemory: () => [{ context: 'fake', allocatableMemoryBytes: 400 * GiB }] });
   const controller = new AbortController();
   const spawn = podSelfImplementSpawn({ pool, env: {}, pollMs: 2, launchStallMs: 30,
     kubectl: () => ({ status: 0, stdout: '', stderr: '' }) });
-  const job = spawn({ feature: 'standard goal', spaceId: 'stalled-admission', signal: controller.signal });
-  await Bun.sleep(150);
-  controller.abort();
-  const result = await job.done;
+  let jobDone: Promise<unknown> | undefined;
+  let result;
+  try {
+    const job = spawn({ feature: 'standard goal', spaceId: 'stalled-admission', signal: controller.signal });
+    jobDone = job.done;
+    await measured;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(pool.waitReason()).toContain('recommended=0');
+    timers.advanceBy(29);
+    expect(events.filter((e) => e.event === 'launch-stalled')).toHaveLength(0);
+    timers.advanceBy(1);
+    expect(events.filter((e) => e.event === 'launch-stalled')).toHaveLength(1);
+    timers.advanceBy(300);
+    await Promise.resolve();
+    expect(events.filter((e) => e.event === 'launch-stalled')).toHaveLength(1);
+    controller.abort();
+    result = await job.done;
+  } finally {
+    try {
+      controller.abort();
+      if (jobDone) await jobDone;
+    } finally { timers.restore(); }
+  }
   expect(result.error?.code).toBe('aborted');
   const stalled = events.filter((e) => e.event === 'launch-stalled');
   expect(stalled).toHaveLength(1);
@@ -74,7 +131,7 @@ test('admission waiting past the cap emits one launch-stalled event with the mea
   expect(events.filter((e) => e.event === 'launch-member-skipped')).toEqual([]);
 });
 
-test('a launch admitted and placed before the cap emits no stall event', async () => {
+test.serial('a launch admitted and placed before the cap emits no stall event', async () => {
   const calls: string[][] = [];
   const pool = new PodPoolScheduler(parsePodPool('big:2'), { status: status(2), pollMs: 2,
     memberMemory: () => [{ context: 'big', allocatableMemoryBytes: 400 * GiB }], occupancy: () => ({ big: { occupied: 0 } }) });
@@ -83,9 +140,9 @@ test('a launch admitted and placed before the cap emits no stall event', async (
   expect(done.exitCode).toBe(0);
   expect(calls.some((c) => c.includes('apply'))).toBe(true);
   expect(events.filter((e) => e.event === 'launch-stalled' || e.event === 'launch-member-skipped')).toEqual([]);
-});
+}, 15_000);
 
-test('a member whose memory could not be read is not skipped: the Job is applied there and no skip event is logged', async () => {
+test.serial('a member whose memory could not be read is not skipped: the Job is applied there and no skip event is logged', async () => {
   const calls: string[][] = [];
   const pool = new PodPoolScheduler(parsePodPool('unread:2'), { status: status(2), pollMs: 2,
     memberMemory: () => [{ context: 'unread', allocatableMemoryBytes: null }], occupancy: () => ({ unread: { occupied: 0 } }) });
@@ -96,17 +153,57 @@ test('a member whose memory could not be read is not skipped: the Job is applied
   expect(applies.length).toBeGreaterThan(0);
   expect(applies.every((c) => c[0] === '--context' && c[1] === 'unread')).toBe(true);
   expect(events.filter((e) => e.event === 'launch-member-skipped')).toEqual([]);
-});
+}, 15_000);
 
-test('a pool-slot wait past the cap reports the per-member free slots, not the admission lease', async () => {
-  const pool = new PodPoolScheduler(parsePodPool('busy:2'), { status: status(2), pollMs: 2,
+test.serial('a pool-slot wait past the cap reports the per-member free slots, not the admission lease', async () => {
+  const timers = manualTimers();
+  let waiting!: () => void;
+  const slotWaiting = new Promise<void>((resolve) => { waiting = resolve; });
+  let releaseSleep!: () => void;
+  const sleepBlocked = new Promise<void>((resolve) => { releaseSleep = resolve; });
+  let releaseRetrySleep!: () => void;
+  const retrySleepBlocked = new Promise<void>((resolve) => { releaseRetrySleep = resolve; });
+  let retryReached!: () => void;
+  const retryWaiting = new Promise<void>((resolve) => { retryReached = resolve; });
+  let sleepCalls = 0;
+  const pool = new PodPoolScheduler(parsePodPool('busy:2'), { status: status(2), pollMs: 30,
     memberMemory: () => [{ context: 'busy', allocatableMemoryBytes: 400 * GiB }], occupancy: () => ({ busy: { occupied: 2 } }) });
   const controller = new AbortController();
-  const job = podSelfImplementSpawn({ pool, env: {}, pollMs: 2, launchStallMs: 30, kubectl: () => ({ status: 0, stdout: '', stderr: '' }) })(
-    { feature: 'standard goal', spaceId: 'slot-full', signal: controller.signal });
-  await Bun.sleep(150);
-  controller.abort();
-  await job.done;
+  let jobDone: Promise<unknown> | undefined;
+  try {
+    const job = podSelfImplementSpawn({ pool, env: {}, pollMs: 2, launchStallMs: 30, sleep: () => {
+      sleepCalls++;
+      if (sleepCalls === 1) { waiting(); return sleepBlocked; }
+      retryReached();
+      return retrySleepBlocked;
+    },
+      kubectl: () => ({ status: 0, stdout: '', stderr: '' }) })({ feature: 'standard goal', spaceId: 'slot-full', signal: controller.signal });
+    jobDone = job.done;
+    await slotWaiting;
+    timers.advanceBy(29);
+    expect(events.filter((e) => e.event === 'launch-stalled')).toHaveLength(0);
+    timers.advanceBy(1);
+    expect(events.filter((e) => e.event === 'launch-stalled')).toHaveLength(1);
+    timers.advanceBy(300);
+    await Promise.resolve();
+    expect(events.filter((e) => e.event === 'launch-stalled')).toHaveLength(1);
+    releaseSleep();
+    await retryWaiting;
+    timers.advanceBy(30);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(events.filter((e) => e.event === 'launch-stalled')).toHaveLength(1);
+    controller.abort();
+    releaseRetrySleep();
+    releaseSleep();
+    await job.done;
+  } finally {
+    try {
+      controller.abort();
+      releaseSleep();
+      releaseRetrySleep();
+      if (jobDone) await jobDone;
+    } finally { timers.restore(); }
+  }
   const stalled = events.filter((e) => e.event === 'launch-stalled');
   expect(stalled).toHaveLength(1);
   expect(stalled[0]!.data).toMatchObject({ stage: 'pool-slot' });

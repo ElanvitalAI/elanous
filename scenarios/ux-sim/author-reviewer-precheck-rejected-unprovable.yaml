@@ -1,0 +1,27 @@
+version: 0
+id: ux-author-reviewer-precheck-rejected-unprovable
+isolation: test
+seed: 2451102
+triggers:
+  - id: author-reviewer-precheck-rejected-unprovable
+    type: ux.author-reviewer-precheck.evaluate
+    variant: rejected-unprovable
+expect:
+  screen:
+    mode: widget
+    snapshot:
+      contains:
+        - "Goal author reviewer precheck simulation"
+        - "variant=rejected-unprovable"
+        - "status=rejected-soft"
+  logs:
+    - category: author.reviewer-precheck
+      event: revision-rejected
+      level: debug
+      count: 1
+      data:
+        runId: "$runId"
+        authorRunId: "$runId"
+        status: rejected-soft
+        appliedFixCount: 0
+        unappliedItemCount: 1

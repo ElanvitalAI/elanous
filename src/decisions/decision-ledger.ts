@@ -152,6 +152,11 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
     ...(input.dueAt ? { dueAt: utc(input.dueAt) } : {}) };
 }
 
+/** Validate a prospective raise without writing the decision ledger (seat-to-OP proposal routing). */
+export function validateDecisionRaise(input: RaiseInput): RaiseInput {
+  return validate(input);
+}
+
 export class DecisionLedger {
   readonly path: string;
   private readonly lockPath: string;

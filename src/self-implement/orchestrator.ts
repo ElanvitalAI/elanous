@@ -437,6 +437,8 @@ export function clarificationResolverSkipHint(reason: ClarificationResolverSkipR
 
 export interface SelfImplementGateResult {
   passed: boolean;
+  /** The full gate was deliberately deferred to the landing train's integrated candidate SHA. */
+  deferredToLand?: true;
   log?: string;
   /** verify-by-breaking의 문자열 노트와 독립된 구조화 판정. `ran:false`는 실행된 0건과 다르다. */
   verifyByBreaking?: {
@@ -613,6 +615,7 @@ function postSyncGatePolicy(
 export function postSyncGateObservation(
   regate: {
     passed: boolean;
+    deferredToLand?: true;
     log?: string;
     scopeReason?: string;
     testStepExecuted?: boolean;
@@ -624,6 +627,15 @@ export function postSyncGateObservation(
   detectModuleLoadFailure: (output: string) => boolean,
   syncStatus: PostSyncStatus,
 ): Record<string, unknown> {
+  if (regate.deferredToLand) return {
+    passed: false,
+    deferredToLand: true,
+    gateExecuted: false,
+    mode: 'deferred-to-land',
+    branch,
+    syncStatus,
+    landingGate: 'merge-train',
+  };
   const facts = regate.reflectGateFacts;
   const { exempted, exemptionWithheld } = postSyncGatePolicy(
     regate.passed,
@@ -1187,6 +1199,8 @@ export interface SelfImplementSeams {
   reviewBaselineObservationSource?: (cwd: string, base: string) => Promise<string | undefined>;
   /** ④ gate — cwd 에서 bun test/build. postsync=정합 후 재게이트(merge-base 실행 범위). */
   gate: (cwd: string, ctx?: { runId?: string; mode?: 'postsync'; round?: number }) => Promise<SelfImplementGateResult>;
+  /** Production connects a ready gate-deferred PR to the pinned landing queue. Omission keeps the legacy direct-gate path for focused unit fixtures. */
+  enqueueGateDeferredPr?: (input: { cwd: string; number: number; runId: string; expectedHeadCommit: string }) => Promise<{ pending: readonly { number: number; head: string }[] }>;
   /**
    * GATE-ENV-RETRY — 환경 결손 gate 실패에 «게이트만» 다시 도는 정책. 생략 시 기본(2회 · 20초).
    * `attempts: 0` 이면 재시도하지 않는다. 시험은 `sleep` 으로 대기를 주입한다.
@@ -3320,6 +3334,32 @@ export function completionIntentOf(opts: Pick<SelfImplementOptions, 'completion'
 
 function autoMergeEnabled(opts: Pick<SelfImplementOptions, 'completion' | 'autoMerge' | 'mergeByHost'>): boolean {
   return completionIntentOf(opts) === 'auto-merge';
+}
+
+export function deferredGateEnqueueAuthorized(
+  opts: Pick<SelfImplementOptions, 'completion' | 'autoMerge' | 'mergeByHost' | 'draft'>,
+): boolean {
+  return autoMergeEnabled(opts) && opts.draft !== true;
+}
+
+export function deferredGateQueueEligible(
+  opts: Pick<SelfImplementOptions, 'completion' | 'autoMerge' | 'mergeByHost' | 'draft'>,
+  checks: {
+    gateTimedOut: boolean;
+    reviewed: boolean;
+    reviewDeferredToHost: boolean;
+    reviewVerdict?: string;
+    reviewMustFixCount: number;
+    reviewDiffComplete: boolean;
+    requiredEvidenceMissing: boolean;
+    latestSignalIncomplete: boolean;
+    decisionSignalRed: boolean;
+  },
+): boolean {
+  return deferredGateEnqueueAuthorized(opts) && !checks.gateTimedOut
+    && (checks.reviewed || checks.reviewDeferredToHost) && checks.reviewVerdict !== 'fail'
+    && checks.reviewMustFixCount === 0 && checks.reviewDiffComplete && !checks.requiredEvidenceMissing
+    && !checks.latestSignalIncomplete && !checks.decisionSignalRed;
 }
 
 /**
@@ -6209,6 +6249,19 @@ async function runSelfImplementInner(
     };
   }
   let round = 0;
+  const deferFullGateToLand = (roundNumber: number, mode: 'run-stage' | 'postsync'): SelfImplementGateResult => {
+    observe('harness.gate-deferred-to-land', {
+      runId, round: roundNumber, mode, passed: false, gateExecuted: false, landingGate: 'merge-train',
+    });
+    return {
+      passed: false,
+      deferredToLand: true,
+      testStepExecuted: false,
+      scopeReason: 'deferred-to-land',
+      log: 'Full gate not executed in run stage; pending landing merge train gate.',
+    };
+  };
+  const deferGateToLand = !!s.enqueueGateDeferredPr && deferredGateEnqueueAuthorized(opts);
   // A timeout is evidence about this command, not an invitation to spend the
   // next rework round on the identical oversized check.
   const runBudgetedEvidenceChecks = createRequiredEvidenceBudget({ run: s.evidenceCommandRunner });
@@ -8406,7 +8459,9 @@ async function runSelfImplementInner(
     const runsGate = gateRoute.runsGate;
     progress('gating', !runsGate
       ? `gate 건너뜀 — 이 그래프(${graphTemplate.graphId})는 gate 노드를 갖지 않는다`
-      : round === 0 ? 'gate 실행 (bun test/build+tsc)…' : `gate 재검 (rework ${round})…`);
+      : deferGateToLand
+        ? `전체 gate는 landing merge train에서 실행 · run-stage gate 미실행 (${round === 0 ? '첫 라운드' : `rework ${round}`})`
+        : round === 0 ? 'gate 실행 (bun test/build+tsc)…' : `gate 재검 (rework ${round})…`);
     try {
       if (runsGate) {
         const stoppedBeforeGate = honorParentSoftStop('gate');
@@ -8415,31 +8470,34 @@ async function runSelfImplementInner(
           return { ...stoppedBeforeGate, ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(review ? { review } : {}) };
         }
         onNodeEntry(node('gate'), round);
-        gate = await stepTimeout(s.gate(wt.path, { runId, round }), T.gate, 'gate');
-        // ⭐ GATE-ENV-RETRY — 「잰 쪽」이 넘어진 실패(시험 결과 미수신·index.lock·OOM·측정 불가·네트워크)는
-        //   구현을 버리지 않고 짧게 쉰 뒤 gate «만» 다시 돈다. ⛔ 도입 실패·자식 책임은 판정자가 거짓을 낸다.
-        gateEnvDeficitKind = undefined;
-        let envVerdict = classifyGateEnvDeficit(gate);
-        const envRetryAttempts = Math.max(0, s.gateEnvRetry?.attempts ?? DEFAULT_GATE_ENV_RETRY.attempts);
-        const envRetryDelayMs = Math.max(0, s.gateEnvRetry?.delayMs ?? DEFAULT_GATE_ENV_RETRY.delayMs);
-        const envRetrySleep = s.gateEnvRetry?.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
-        for (let attempt = 1; envVerdict.envDeficit && attempt <= envRetryAttempts; attempt++) {
-          const kind = envVerdict.kind;
-          debug.log('self-implement.gate-env-retry', 'retry-scheduled', { runId, round, attempt, attempts: envRetryAttempts, kind, delayMs: envRetryDelayMs });
-          observe('gate-env-retry', { round, attempt, attempts: envRetryAttempts, kind, delayMs: envRetryDelayMs }, { level: 'warn' });
-          progress('gating', `gate 환경 결손(${kind}) — 구현 유지 · ${Math.round(envRetryDelayMs / 1000)}초 뒤 gate 만 재측정 (${attempt}/${envRetryAttempts})`);
-          await envRetrySleep(envRetryDelayMs);
+        if (deferGateToLand) {
+          gate = deferFullGateToLand(round, 'run-stage');
+        } else {
           gate = await stepTimeout(s.gate(wt.path, { runId, round }), T.gate, 'gate');
-          envVerdict = classifyGateEnvDeficit(gate);
-          debug.log('self-implement.gate-env-retry', 'retry-result', {
-            runId, round, attempt, kind, passed: gate.passed,
-            stillEnvDeficit: envVerdict.envDeficit,
-            ...(envVerdict.envDeficit ? { nextKind: envVerdict.kind } : { verdict: envVerdict.reason }),
-          });
-        }
-        if (envVerdict.envDeficit) {
-          gateEnvDeficitKind = envVerdict.kind;
-          debug.log('self-implement.gate-env-retry', 'exhausted', { runId, round, attempts: envRetryAttempts, kind: envVerdict.kind });
+          // ⭐ GATE-ENV-RETRY — 환경 결손이면 구현을 버리지 않고 짧게 쉰 뒤 gate «만» 다시 돈다.
+          gateEnvDeficitKind = undefined;
+          let envVerdict = classifyGateEnvDeficit(gate);
+          const envRetryAttempts = Math.max(0, s.gateEnvRetry?.attempts ?? DEFAULT_GATE_ENV_RETRY.attempts);
+          const envRetryDelayMs = Math.max(0, s.gateEnvRetry?.delayMs ?? DEFAULT_GATE_ENV_RETRY.delayMs);
+          const envRetrySleep = s.gateEnvRetry?.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+          for (let attempt = 1; envVerdict.envDeficit && attempt <= envRetryAttempts; attempt++) {
+            const kind = envVerdict.kind;
+            debug.log('self-implement.gate-env-retry', 'retry-scheduled', { runId, round, attempt, attempts: envRetryAttempts, kind, delayMs: envRetryDelayMs });
+            observe('gate-env-retry', { round, attempt, attempts: envRetryAttempts, kind, delayMs: envRetryDelayMs }, { level: 'warn' });
+            progress('gating', `gate 환경 결손(${kind}) — 구현 유지 · ${Math.round(envRetryDelayMs / 1000)}초 뒤 gate 만 재측정 (${attempt}/${envRetryAttempts})`);
+            await envRetrySleep(envRetryDelayMs);
+            gate = await stepTimeout(s.gate(wt.path, { runId, round }), T.gate, 'gate');
+            envVerdict = classifyGateEnvDeficit(gate);
+            debug.log('self-implement.gate-env-retry', 'retry-result', {
+              runId, round, attempt, kind, passed: gate.passed,
+              stillEnvDeficit: envVerdict.envDeficit,
+              ...(envVerdict.envDeficit ? { nextKind: envVerdict.kind } : { verdict: envVerdict.reason }),
+            });
+          }
+          if (envVerdict.envDeficit) {
+            gateEnvDeficitKind = envVerdict.kind;
+            debug.log('self-implement.gate-env-retry', 'exhausted', { runId, round, attempts: envRetryAttempts, kind: envVerdict.kind });
+          }
         }
       } else {
         observe('gate-skipped-by-graph', { ...graphAuthorityFields(graphAuthority, graphTemplate), round, reason: gateRoute.reason, changedFileCount: gateRouteFiles?.length ?? null });
@@ -8463,7 +8521,8 @@ async function runSelfImplementInner(
       passed: gate.passed,
       loadAtEnd,
       // ⛔ 「통과」와 「미실행」은 다른 값이다 — 원장에서도 가른다.
-      gateExecuted: runsGate,
+      gateExecuted: runsGate && !gate.deferredToLand,
+      ...(gate.deferredToLand ? { gateDeferredToLand: true } : {}),
       gateRouteReason: gateRoute.reason,
       round,
       ...(gate.testStepExecuted !== undefined ? { testStepExecuted: gate.testStepExecuted } : {}),
@@ -8516,11 +8575,16 @@ async function runSelfImplementInner(
     // ⛔⭐ 「안 돌렸다」를 「통과」로 찍지 않는다 — 사람이 «시험이 돌았다»고 읽는다.
     //   📏 2026-09-08 실측: 승격을 켠 첫 research 런이 게이트를 «건너뛰고» 화면엔 `gate 통과` 를 찍었다.
     //     원장은 정직했고(걸음에 gate 없음 · gate-skipped-by-graph 3건) 화면만 거짓이었다.
-    progress('gated', !runsGate
+    progress('gated', gate.deferredToLand
+      ? 'run-stage full gate 미실행 — landing merge train 판정 대기'
+      : !runsGate
       ? `gate 미실행 — 이 그래프(${graphTemplate.graphId})는 gate 노드를 갖지 않는다`
       : gate.passed ? 'gate 통과' : `gate 실패(라운드 ${round})`);
-    if (gate.passed) lastGateUnverifiedKey = undefined;
-    if (!gate.passed) {
+    if (gate.passed || gate.deferredToLand) lastGateUnverifiedKey = undefined;
+    if (opts.goalFile && gate.deferredToLand) {
+      observe('goal-slot-fill-unmeasured', { runId, round, gateExecuted: false, reason: 'run-stage-gate-deferred' });
+    }
+    if (!gate.passed && !gate.deferredToLand) {
       await onFailureVerdict('gate');
       const facts = gate.reflectGateFacts;
       const failureDisposition = decideGateFailureDisposition(facts);
@@ -8835,7 +8899,7 @@ async function runSelfImplementInner(
       progress('reviewed', review.reviewed
         ? `리뷰: ${review.verdict} (must-fix ${review.mustFix.length}·should-fix ${review.shouldFix.length}) · 추이 ${reviewMustFixCountHistory.join('→')} (${reviewMustFixTrend()})`
         : `리뷰 미실행${review.failureReason !== undefined ? ` (${review.failureReason})` : ''}`);
-      if (opts.goalFile) {
+      if (opts.goalFile && !gate.deferredToLand) {
         let goalSlotFill: SupervisorGoalFillResult = 'unverifiable';
         let goalSlotDeficit: import('./goal-supervisor-fill.js').SupervisorGoalDeficit | undefined;
         let goalSlotAction: 'remeasure' | 'connect-goal' | undefined;
@@ -9199,7 +9263,18 @@ async function runSelfImplementInner(
   //   종전 `verdict !== 'fail'` 만 보던 이 자리에서 auto 가 됐다(#25914 · #25934 · #25918 실물).
   //   ⭐ 반사가 must-fix 를 «전부» 기각하면 위에서 `review.mustFix = []` 로 비우므로 그 길은 종전 그대로다.
   const reviewMustFixCount = review?.mustFix?.length ?? 0;
-  let canAuto = !gateTimeoutUnmeasured && autoMerge && (reviewReal || reviewDeferredToHost) && review!.verdict !== 'fail' && reviewMustFixCount === 0 && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
+  let canAuto = !gate.deferredToLand && !gateTimeoutUnmeasured && autoMerge && (reviewReal || reviewDeferredToHost) && review!.verdict !== 'fail' && reviewMustFixCount === 0 && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
+  const canQueueDeferredGate = gate.deferredToLand && deferredGateQueueEligible(opts, {
+    gateTimedOut: gateTimeoutUnmeasured,
+    reviewed: reviewReal,
+    reviewDeferredToHost,
+    reviewVerdict: review?.verdict,
+    reviewMustFixCount,
+    reviewDiffComplete,
+    requiredEvidenceMissing,
+    latestSignalIncomplete,
+    decisionSignalRed,
+  });
   // ⭐⭐ 통과의 «이유»를 둘로 가른다 — ⛔ 막지는 «않는다»(대표 판단 2026-08-11: ⓐ 문면만).
   //   📏 근거(`JDG-T36` · merge-decision 300건 전수): `verifyByBreaking` 이 실린 8건의 auto 중 ***5건***이
   //     ***ran=true 인데 distinguishes=0***(아무것도 안 가르는 자기검증)이었고, 그 다섯이 «전부»
@@ -9213,7 +9288,8 @@ async function runSelfImplementInner(
   const verifyStructuralRed = gate.verifyByBreaking?.ran === true && (gate.verifyByBreaking.missingAtBase ?? 0) > 0;
   const verifyInconclusive = gate.verifyByBreaking?.ran === true
     && (gate.verifyByBreaking.distinguishes ?? 0) === 0 && !verifyStructuralRed;
-  let mergeReason = canAuto && reviewDeferredToHost ? REVIEW_DEFERRED_TO_HOST_MERGE_REASON
+  let mergeReason = gate.deferredToLand ? 'gate-deferred-to-land'
+    : canAuto && reviewDeferredToHost ? REVIEW_DEFERRED_TO_HOST_MERGE_REASON
     : canAuto ? (verifyStructuralRed ? 'review-clean-verify-structural-red' : verifyInconclusive ? 'review-clean-verify-inconclusive' : 'review-clean-armed')
     : gateTimeoutUnmeasured ? GATE_TIMEOUT_UNMEASURED_MERGE_REASON
     : !autoMerge ? 'no-auto-flag'
@@ -9333,19 +9409,22 @@ async function runSelfImplementInner(
     if (sync.status === 'llm-resolved' || sync.status === 'merged' || sync.status === 'deterministic-resolved') {
       preservationBase = opts.base ?? mergeTarget;
       progress('gating', sync.status === 'llm-resolved' || sync.status === 'deterministic-resolved'
-        ? `${mergeTarget} 충돌해결됨 — ${formatLlmMergeOutcome(sync)} — 통합 결과 full 재-gate…`
-        : `${mergeTarget} 정합됨 — 통합 결과 full 재-gate…`);
+        ? deferGateToLand
+          ? `${mergeTarget} 충돌해결됨 — ${formatLlmMergeOutcome(sync)} — full gate를 landing merge train에 위임`
+          : `${mergeTarget} 충돌해결됨 — ${formatLlmMergeOutcome(sync)} — 통합 결과 full 재-gate…`
+        : deferGateToLand
+          ? `${mergeTarget} 정합됨 — full gate를 landing merge train에 위임`
+          : `${mergeTarget} 정합됨 — 통합 결과 full 재-gate…`);
       onNodeEntry('regate', round);
-      const regate = await withStepTimeout(s.gate(wt.path, { runId, mode: 'postsync', round }), T.gate, 'gate');
-      if (!regate.passed) await onFailureVerdict('gate');
+      const regate = deferGateToLand
+        ? deferFullGateToLand(round, 'postsync')
+        : await withStepTimeout(s.gate(wt.path, { runId, mode: 'postsync', round }), T.gate, 'gate');
+      if (!regate.deferredToLand && !regate.passed) await onFailureVerdict('gate');
       // `mode` name/meaning stay: `full` = existing gate including tests. Both
       // conflict-resolved and clean-merge reuse this same `s.gate` invocation.
-      const timeoutOnlyPostSync = !regate.passed && postSyncTimeoutOnly(regate.reflectGateFacts);
-      const postSyncPolicy = postSyncGatePolicy(
-        regate.passed,
-        regate.reflectGateFacts,
-        sync.status,
-      );
+      const timeoutOnlyPostSync = !regate.deferredToLand && !regate.passed && postSyncTimeoutOnly(regate.reflectGateFacts);
+      const postSyncPolicy = regate.deferredToLand ? { exempted: false, exemptionWithheld: false, mustStop: false }
+        : postSyncGatePolicy(regate.passed, regate.reflectGateFacts, sync.status);
       observe('gate.postsync', postSyncGateObservation(regate, wt.branch, hasModuleLoadFailure, sync.status));
       // MERGE-INTENT-RESOLVE — join the resolver's sibling-intent decisions with the regate verdict (OP metric).
       if (sync.intentResolve?.length) {
@@ -9389,7 +9468,7 @@ async function runSelfImplementInner(
         const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate: regate, salvageStatusExpected: false });
         return { ok: false, stage: 'gate-failed', node: 'regate', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate: regate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(review ? { review } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
       }
-      if (!regate.passed) {
+      if (!regate.passed && !regate.deferredToLand) {
         progress('gating', timeoutOnlyPostSync
           ? 'main 정합 후 gate 타임아웃만 — 사람 확인으로 진행'
           : 'main 정합 후 gate 실패는 자식 책임 없음으로 면책 — 통합 깨짐으로 중단하지 않고 계속 진행');
@@ -9491,7 +9570,9 @@ async function runSelfImplementInner(
       body: preparedPrBody.body,
       head: wt.branch,
       ...(opts.base ? { base: opts.base } : {}),
-      draft: canAuto ? false : (opts.draft ?? true),
+      // The operational land-enqueue contract changes a draft to ready only after it has
+      // verified the exact-head review and pin. A deferred-gate PR stays draft on refusal.
+      draft: gate.deferredToLand ? true : canAuto ? false : (opts.draft ?? true),
       // The review poller must not see this PR before its actual paths have been inspected.
       ...(labels?.length ? { labels: labels.filter((label) => label !== AUTO_REVIEW_LABEL) } : {}),
       cwd: wt.path,
@@ -9632,6 +9713,53 @@ async function runSelfImplementInner(
     recordMergeDecision();
     progress('pr-opened', `OP 승인 대기 (#${pr.number}): PR 경로 조회 실패`);
     return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason, prUrl: pr.url, prNumber: pr.number };
+  }
+
+  if (gate.deferredToLand && canQueueDeferredGate) {
+    if (releasePathInspectionError || releaseHoldPath) {
+      mergeReason = mergeSkipReason = releasePathInspectionError
+        ? 'gate-deferred-to-land-skipped: release-path-inspection-unavailable'
+        : 'gate-deferred-to-land-skipped: release-path-hold';
+      recordMergeDecision();
+      observe('gate-deferred-to-land-enqueue-skipped', {
+        runId, number: pr.number, reason: releasePathInspectionError ? 'release-path-inspection-unavailable' : 'release-path-hold',
+      }, { level: 'warn' });
+    } else if (!s.enqueueGateDeferredPr) {
+      // The deferred marker is only produced when this seam exists; retain a fail-closed guard if that contract changes.
+      mergeReason = mergeSkipReason = 'gate-deferred-to-land-enqueue-unavailable';
+      observe('gate-deferred-to-land-enqueue-failed', { runId, number: pr.number, reason: 'enqueue-seam-unavailable' }, { level: 'error' });
+    } else {
+      try {
+        if (!s.readPrCommitShas) throw new Error('PR head pin read unavailable');
+        const current = await withStepTimeout(s.readPrCommitShas({ number: pr.number, cwd: wt.path }), T.pr, 'pr');
+        if (!/^[0-9a-f]{40}$/i.test(current.headCommit)) throw new Error('PR head pin is not a full commit SHA');
+        const queue = await s.enqueueGateDeferredPr({ cwd: wt.path, number: pr.number, runId, expectedHeadCommit: current.headCommit });
+        const receipt = queue.pending.find((item) => item.number === pr.number);
+        if (!receipt || !/^[0-9a-f]{40}$/i.test(receipt.head) || receipt.head !== current.headCommit) {
+          throw new Error('queue receipt did not preserve the verified PR/head pin');
+        }
+        observe('gate-deferred-to-land-enqueued', {
+          runId, number: receipt.number, head: receipt.head, gateExecuted: false, landingGate: 'merge-train',
+        });
+      } catch (error) {
+        mergeReason = mergeSkipReason = 'gate-deferred-to-land-enqueue-failed';
+        observe('gate-deferred-to-land-enqueue-failed', {
+          runId, number: pr.number, reason: safeErrorDescription(error),
+        }, { level: 'error' });
+      }
+    }
+  } else if (gate.deferredToLand) {
+    // A deferred gate is not consent to ready or queue a PR. The train can land it,
+    // so require explicit auto-merge opt-in and honor an explicit draft request.
+    mergeReason = mergeSkipReason = !deferredGateEnqueueAuthorized(opts)
+      ? opts.draft === true ? 'gate-deferred-to-land-awaiting-explicit-draft-release' : 'gate-deferred-to-land-awaiting-auto-merge-consent'
+      : 'gate-deferred-to-land-automerge-prerequisites-not-met';
+    observe('gate-deferred-to-land-enqueue-skipped', {
+      runId, number: pr.number, reason: !deferredGateEnqueueAuthorized(opts)
+        ? opts.draft === true ? 'explicit-draft' : 'auto-merge-not-authorized'
+        : 'auto-merge-prerequisites-not-met',
+    }, { level: 'warn' });
+    recordMergeDecision();
   }
 
   if (canAuto && (s.mergePr || opts.mergeByHost)) {
