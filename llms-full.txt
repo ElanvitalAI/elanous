@@ -5170,6 +5170,23 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.45
+
+Source: https://docs.elanous.ai/releases/0-2-45/
+
+This release improves reliability across the CLI, isolated testing, research, and resource management.
+
+- Intake collectors use the installed CLI in production.
+- Isolated gate and remote Pod workflows are more reliable.
+- Simulation tools cover resource, network, and device scenarios.
+- Research results better preserve source traceability and surface evidence gaps.
+
+## Known issues
+
+One isolated-config test for `gatePodPool` times out in the gate image; no product behavior change; fix in 0.2.46.
+
+---
+
 # 0.2.43
 
 Source: https://docs.elanous.ai/releases/0-2-43/
