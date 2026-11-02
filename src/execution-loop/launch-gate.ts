@@ -23,7 +23,7 @@ export function resolveLaunchDoorEnv(env: Readonly<Record<string, string | undef
   const rawMode = env.ELANOUS_LAUNCH_DOOR_MODE;
   const modeSource = rawMode === undefined || rawMode === '' ? 'default' : rawMode === 'enforce' || rawMode === 'shadow' ? 'env' : 'invalid';
   return {
-    mode: rawMode === 'enforce' || modeSource === 'default' ? 'enforce' : 'shadow',
+    mode: rawMode === 'enforce' ? 'enforce' : 'shadow',
     modeSource,
     permission: env.ELANOUS_LAUNCH_DOOR_PERMISSION === 'allow' ? 'allow' : 'deny',
     signal: env.ELANOUS_LAUNCH_DOOR_SIGNAL === 'green' || env.ELANOUS_LAUNCH_DOOR_SIGNAL === 'red'

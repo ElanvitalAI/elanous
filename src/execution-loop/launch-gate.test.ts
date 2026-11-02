@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { BUDGET_SNAPSHOT_ENV, activeRunsForGoal, encodeBudgetSnapshot, harnessLaunchBudgetDecision, launchRequestId, preLaunchGate, resolveLaunchBudget, type BudgetSnapshot } from './launch-gate.js';
+import { BUDGET_SNAPSHOT_ENV, activeRunsForGoal, encodeBudgetSnapshot, harnessLaunchBudgetDecision, launchRequestId, preLaunchGate, resolveLaunchBudget, resolveLaunchDoorEnv, type BudgetSnapshot } from './launch-gate.js';
 import type { BudgetInputs } from '../self-implement/budget-gate.js';
 import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
 import type { QueriedRunningRunsResult, RunningRunAssessment } from '../self-implement/running-runs.js';
@@ -9,6 +9,15 @@ import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 const goalId = 'goal-A';
 const runId = 'run-11111111-1111-1111-1111-111111111111';
 const directory = '/isolated/run-ledger';
+
+
+test('launch door defaults to shadow and enforces only an explicit enforce setting', () => {
+  expect(resolveLaunchDoorEnv({})).toMatchObject({ mode: 'shadow', modeSource: 'default' });
+  expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: '' })).toMatchObject({ mode: 'shadow', modeSource: 'default' });
+  expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: 'invalid' })).toMatchObject({ mode: 'shadow', modeSource: 'invalid' });
+  expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: 'enforce' })).toMatchObject({ mode: 'enforce', modeSource: 'env' });
+  expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: 'shadow' })).toMatchObject({ mode: 'shadow', modeSource: 'env' });
+});
 
 function run(status: RunningRunAssessment['status'], overrides: Partial<RunningRunAssessment> = {}): RunningRunAssessment {
   return {
