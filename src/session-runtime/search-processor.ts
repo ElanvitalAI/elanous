@@ -113,7 +113,9 @@ export function handleRepeatedCandidateListing(
   }
   const candidateKey = getScopedCandidateListingKey(name, args, scopedAnalysis);
   if (!candidateKey) return { kind: 'none' };
-  if (planner.phase !== 'idle') {
+  // A narrowing read can move the planner to inspecting before any listing ran.
+  // Only a recorded candidate scope makes a later listing a repeat.
+  if (planner.phase !== 'idle' && planner.pendingCandidateScopeKey !== null) {
     // CC same-turn fan-out: when the current call lands in the SAME turn
     // that opened the scope, the model couldn't possibly have seen the
     // earlier results yet — this is parallel exploration, not a stuck
@@ -165,10 +167,11 @@ export function handleRepeatedCandidateListing(
     });
     return { kind: 'block', message: buildRepeatedCandidateListingBlockMessage(planner.suggestedCandidates) };
   }
+  const firstCandidateScope = planner.pendingCandidateScopeKey === null;
   planner.phase = 'listed';
   planner.pendingCandidateScopeKey = candidateKey;
   planner.nextCandidateIndex = 0;
-  if (currentTurn !== undefined && planner.scopeOpenedAtTurn === null) {
+  if (currentTurn !== undefined && (firstCandidateScope || planner.scopeOpenedAtTurn === null)) {
     planner.scopeOpenedAtTurn = currentTurn;
   }
   debug.log('session-runtime.search', 'planner.candidate-scope-opened', {

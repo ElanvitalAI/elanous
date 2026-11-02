@@ -97,7 +97,7 @@ function writeInterruptedShardReceipts(root: string, envKey = `${gateEnvFingerpr
   saveGateShardResult(receiptRoot, { receipt: { version: VERSION, graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/complete.test.ts'], head40: SHA,
     base40: 'b'.repeat(40), host: 'node-b', envKey, envFingerprint: envKey.split(':')[0], imageDigest: envKey.split(':').at(-1) === 'unmeasured' ? undefined : envKey.slice(envKey.indexOf('sha256:')),
     runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64',
-      envFingerprint: /^[a-f0-9]{64}$/.test(envKey.split(':')[0] ?? '') ? envKey.split(':')[0]! : gateEnvFingerprint(process.env) }, executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest: envKey.slice(envKey.indexOf('sha256:')), runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: /^[a-f0-9]{64}$/.test(envKey.split(':')[0] ?? '') ? envKey.split(':')[0]! : gateEnvFingerprint(process.env) } }], status: 'complete', failureIds: [], errorIds: [],
+      envFingerprint: /^[a-f0-9]{64}$/.test(envKey.split(':')[0] ?? '') ? envKey.split(':')[0]! : gateEnvFingerprint(process.env), baseImageDigest: 'sha256:' + 'a'.repeat(64) }, executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest: envKey.slice(envKey.indexOf('sha256:')), runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: /^[a-f0-9]{64}$/.test(envKey.split(':')[0] ?? '') ? envKey.split(':')[0]! : gateEnvFingerprint(process.env), baseImageDigest: 'sha256:' + 'a'.repeat(64) } }], status: 'complete', failureIds: [], errorIds: [],
     evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: '2026-10-29T02:00:00.000Z', attempt: 1 },
     runs: [{ output: '1 pass', rc: 0, pass: 1, fail: 0, errors: 0, ran: 1, files: 1, passedIds: ['src/complete.test.ts > ok'] }] });
   markGateShardUnmeasured(receiptRoot, { version: VERSION, graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-1', files: ['src/stalled.test.ts'], head40: SHA,
@@ -170,7 +170,7 @@ const podCommand = async (options) => {
   mkdirSync(artifactsDir, { recursive: true });
   writeFileSync(join(artifactsDir, 'install.rc'), '0\\n');
   writeFileSync(join(artifactsDir, 'install.log'), '');
-  writeFileSync(join(artifactsDir, 'runtime-identity.json'), JSON.stringify({ bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: gateEnvFingerprint(process.env) }));
+  writeFileSync(join(artifactsDir, 'runtime-identity.json'), JSON.stringify({ bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: gateEnvFingerprint(process.env), baseImageDigest: 'sha256:' + 'a'.repeat(64) }));
   writeFileSync(join(artifactsDir, 'part-0.rc'), '0\\n');
   const suites = assigned.map((file) => '<testsuite file="' + file + '" tests="1"><testcase name="ok" file="' + file + '"/></testsuite>').join('');
   const log = assigned.map((file) => file + ':\\n(pass) ok [1.00ms]').join('\\n')
@@ -668,7 +668,7 @@ test('RELEASE-GATE-POD-RADIUS-REUSE: production resume plan trusts complete rece
   const cutLogs = join(releaseDir, 'gate-logs', 'cut');
   const receiptRoot = join(cutLogs, 'receipts');
   const fingerprint = gateEnvFingerprint(process.env), imageDigest = `sha256:${'c'.repeat(64)}`;
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   const shards = tests.map((file, index) => ({ id: `pod-${index}`, files: [file] }));
   mkdirSync(cutLogs, { recursive: true });
   writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: SHA, failures: [], errors: [] }));

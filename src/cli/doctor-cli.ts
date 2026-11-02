@@ -264,7 +264,7 @@ function readReviewBriefEventsFromLogs(dbPath = logsDbPath(), runId?: string): A
       const data = parseReviewBriefLogData(row.data);
       const rowRunId = typeof data.runId === 'string' && data.runId ? data.runId : undefined;
       if (runId !== undefined && rowRunId !== runId) return [];
-      return [{ timestamp: new Date(row.ts_ms).toISOString(), sequence: row.id, ...(rowRunId ? { runId: rowRunId } : {}), key: String(data.pr), evidence: `PR #${data.pr} head ${data.head.slice(0, 12)} r${data.round} rx=${String(data.rx)}${data.source === 'pr-disposition' ? ' source=pr-disposition' : ''}` }];
+      return [{ timestamp: new Date(row.ts_ms).toISOString(), sequence: row.id, ...(rowRunId ? { runId: rowRunId } : {}), key: String(data.pr), evidence: `PR #${data.pr} head ${(typeof data.head === 'string' ? data.head.slice(0, 12) : 'unknown')} r${data.round} rx=${String(data.rx)}${data.source === 'pr-disposition' ? ' source=pr-disposition' : ''}` }];
     });
   } catch (error) {
     throw new Error(`review event logs could not be read: ${error instanceof Error ? error.message : String(error)}`);
@@ -1395,7 +1395,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           membership = { intent, machines, parentHosts, intentError, machinesError, parentHostsError };
         }
       }
-      const report = runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected, membership });
+      const report = await runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected, membership });
       out.log(json ? JSON.stringify(report, null, 2) : formatHostDoctorLines(report).join('\n'));
       if (!report.ok) setExitCode(1);
     });

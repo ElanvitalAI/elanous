@@ -976,9 +976,9 @@ import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAge
 import { visibleMissionFailureLogData } from './visible-mission-diagnostics.js';
 import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, createClassicSidetabMissionPairSessionRegistry, type ClassicSidetabHandReplyInput, type ClassicSidetabMissionAgent, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionPairResult, type ClassicSidetabMissionResult, type ClassicSidetabMissionTrioResult } from './classic-sidetab-mission.js';
 import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
-import { enqueueClassicSidetabMissionCompletion } from './classic-sidetab-mission-job.js';
+import { enqueueClassicSidetabMissionCompletion, runPreparedClassicSidetabVisibleMission } from './classic-sidetab-mission-job.js';
 import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
-import { startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
+import { captureClassicMissionExitObservation, createClassicSidetabMissionTrioVisibleRunner, startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
 import { createDashboardPluginWizardRuntime } from './plugin-wizard-runtime.js';
 import { TUI_PLUGIN_WIZARD_TOOL_NAME } from './plugin-wizard-tool.js';
 import { probeGrokLogin } from '../agent-mission/grok-auth-status.js';
@@ -1185,7 +1185,7 @@ import { openDashboardShellRollupPopup } from './shell-rollup-popup.js';
 import { spawnCodingAgent, CodingAgentBinaryMissing } from '../terminal/coding-agent.js';
 import type { TerminalSession } from '../terminal/session-registry.js';
 import { createSessionPickerModal } from '../session/picker-modal.js';
-import { listSessions as listChatSessionsForResume, adoptSession as adoptChatSession, setActiveSessionId as markActiveChatSession } from '../session/index.js';
+import { listSessions as listChatSessionsForResume, adoptSession as adoptChatSession, setActiveSessionId as markActiveChatSession, getActiveSessionId, replaceTuiSessionHistory } from '../session/index.js';
 import { idPrefixCell, sessionIdPrefixes, sessionListTime } from '../session/id-prefix.js';
 // TUI 부활 S-b — 타임트래블 포크 엔진 (codex ForkSnapshot 동형 · 2026-07-09
 // 이식 후 호출처 0 이던 방치 자산 회수). 순수 히스토리 절단 로직만 소비;
@@ -14040,10 +14040,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         let missionFinished = false;
         let askMonitor: Promise<void> | undefined;
         try {
-          const [{ runVisibleAgentMission }, { codexBackend, claudeBackend }] = await Promise.all([
-            import('../sidetab-core/visible-agent-mission.js'),
-            import('../agent-mission/driver.js'),
-          ]);
+          const { codexBackend, claudeBackend } = await import('../agent-mission/driver.js');
           const targetOutputPath = outputPath.slice(0, -4);
           missionStore.create({ missionId: missionId!, agent: member, prompt, cwd: session.cwd, outputPath, targetOutputPath });
           const lineIdentity = handLines.get(missionId!);
@@ -14076,7 +14073,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               await new Promise((resolve) => setTimeout(resolve, 400));
             }
           })();
-          const resultPromise = Promise.resolve().then(() => runVisibleAgentMission({
+          const resultPromise = Promise.resolve().then(() => runPreparedClassicSidetabVisibleMission({
             pty: {
               snapshot: () => session.preview.renderForLLM(),
               write: (bytes) => session.preview.write(bytes),
@@ -14150,31 +14147,22 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           return null;
         }
       };
-      const runVisible = async (member: ClassicSidetabMissionAgent, prompt: string, session: TerminalSession | null, missionId?: string): Promise<ClassicSidetabMissionResult> => {
-        const outputPath = session ? join(session.cwd, '.elanous', 'mission-results', `classic-trio-${member}-${session.id}-${Date.now()}.md.tmp`) : '';
-        if (!session) return { ok: false, status: 'failed', path: outputPath, error: `${member} sidetab PTY could not start` };
-        try {
-          const { runVisibleAgentMission } = await import('../sidetab-core/visible-agent-mission.js');
+      const runVisibleBase = createClassicSidetabMissionTrioVisibleRunner<TerminalSession>({
+        ptyForSession: (session) => ({ snapshot: () => session.preview.renderForLLM(), write: (bytes) => session.preview.write(bytes), isAlive: () => session.preview.isAlive, exitCode: () => session.exitCode }),
+        outputPath: (member, session) => join(session.cwd, '.elanous', 'mission-results', `classic-trio-${member}-${session.id}-${Date.now()}.md.tmp`),
+        handleTrust: (member, screen, write) => {
           const backend = member === 'codex' ? codexBackend : member === 'claude' ? claudeBackend : grokBackend;
-          const result = await runVisibleAgentMission({
-            pty: { snapshot: () => session.preview.renderForLLM(), write: (bytes) => session.preview.write(bytes), isAlive: () => session.preview.isAlive },
-            mission: prompt,
-            outputPath,
-            handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
-          });
+          return backend.handleTrust?.(screen, write) ?? false;
+        },
+        onFailure: (member, result, missionId) => {
           const failure = visibleMissionFailureLogData(member, result, missionId);
           if (failure) debug.log('classic-sidetab.mission-trio', 'member-failed', failure, { level: 'warn' });
-          return { ...result, status: result.ok ? 'completed' : 'failed', interactionId: missionId, finalScreen: session.preview.renderForLLM() };
-        } catch (error) {
-          return {
-            ok: false,
-            status: 'failed',
-            path: outputPath,
-            interactionId: missionId,
-            error: error instanceof Error ? error.message : String(error),
-            finalScreen: session.preview.renderForLLM(),
-          };
-        }
+        },
+      });
+      const runVisible = async (member: ClassicSidetabMissionAgent, prompt: string, session: TerminalSession | null, missionId?: string) => {
+        const result = await runVisibleBase(member, prompt, session, missionId);
+        if (!session) return result;
+        return { ...result, ...captureClassicMissionExitObservation(session.state === 'exited', session.exitCode), completionMarker: result.completionMarker };
       };
       const started = await startClassicSidetabMissionTrio({
         mission,
@@ -14183,8 +14171,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         spawnVisible: (member, missionId) => spawnVisible(member, missionId),
         runVisible,
         registry: classicMissionPairSessions,
-        hasSession: (sessionId) => Boolean(sessionRegistry.get(sessionId)),
-        killSession: (sessionId) => sessionRegistry.kill(sessionId),
         enqueue: (notification) => globalTaskNotificationQueue.enqueue(notification),
       });
       void started.completion;
@@ -15955,7 +15941,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         },
         // TUI-TOKEN-GUARD-WIRE — the request-size cap writes its compaction back here so the
         // next prompt reads the compacted history instead of reloading the original.
-        replaceChatHistory: (msgs) => {
+        getPersistentSessionId: () => attachedSessionId ?? getActiveSessionId(),
+        replaceChatHistory: (msgs, ctx) => {
+          const sessionId = attachedSessionId ?? getActiveSessionId();
+          if (!sessionId) throw new Error('cannot persist compacted TUI history without an active session');
+          replaceTuiSessionHistory(sessionId, msgs, ctx.userText);
           chat.history.length = 0;
           for (const m of msgs) chat.history.push(m);
         },

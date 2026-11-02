@@ -762,3 +762,54 @@ test('GPT-6 guard counters are process-global: concurrent streams aggregate into
   })));
   expect(getGpt6CodexGuardStats()['inspect-budget']).toEqual({ wouldBlock: 2, blocked: 0 });
 });
+
+test('streamLLMWithTools carries request compaction into canonical history for the next provider round', async () => {
+  const requests: string[][] = [];
+  let calls = 0;
+  const provider: LLMProvider = {
+    name: 'request-compaction-history-test',
+    defaultModel: 'test-model',
+    available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat(messages, opts) {
+      calls++;
+      requests.push(messages.map((message) => typeof message.content === 'string'
+        ? message.content
+        : JSON.stringify(message.content)));
+      if (calls === 1) {
+        const guard = opts?.requestSizeGuard;
+        expect(guard).toBeDefined();
+        const compacted = await guard!.compactMessages(messages, {
+          provider: provider.name, requestChars: 600_000, maxChars: 400_000,
+        });
+        expect(compacted).toBeDefined();
+        messages.splice(0, messages.length, ...compacted!.messages);
+        guard!.onCompacted?.(messages);
+        yield { type: 'tool_call', id: 'call-read', name: 'read_file', args: { path: 'x' } };
+        return;
+      }
+      yield { type: 'text', delta: 'done' };
+    },
+  };
+
+  const result = await streamLLMWithTools(
+    [{ role: 'user', content: `large history ${'x'.repeat(500_000)}` }],
+    { onText() {}, dispatchTool: async () => 'tool evidence' },
+    {
+      provider,
+      model: 'test-model',
+      tools: [{ name: 'read_file', description: 'read', parameters: { type: 'object', properties: {} } }],
+      requestSizeGuard: {
+        maxChars: 400_000,
+        compactMessages: async () => ({ messages: [{ role: 'user', content: 'persistent compact summary' }], reason: 'test-compact' }),
+      },
+    },
+  );
+
+  expect(result).toBe('done');
+  expect(requests).toHaveLength(2);
+  expect(requests[0]![0]).toContain('large history');
+  expect(requests[1]!.join('\n')).toContain('persistent compact summary');
+  expect(requests[1]!.join('\n')).not.toContain('large history');
+  expect(requests[1]!.join('\n')).toContain('tool evidence');
+});

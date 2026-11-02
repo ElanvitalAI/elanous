@@ -11,11 +11,13 @@ export interface GateShardExecutionEvidence {
   attemptId: string;
   host: string;
   imageDigest: string;
-  runtimeIdentity: { bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+  runtimeIdentity: { bunVersion: string; platform: string; architecture: string; envFingerprint: string; baseImageDigest?: string };
 }
 
 export interface GateShardReceipt extends GateShardIdentity {
   version: string;
+  /** Graph execution run that produced this formal measurement; moved-tip carry is scoped to this run. */
+  graphRunId?: string;
   graphSha: string;
   recipeSha: string;
   /** Exact gate node entry and command at receipt time; per shard despite same graph node. */
@@ -31,7 +33,7 @@ export interface GateShardReceipt extends GateShardIdentity {
   /** Executed imageID digest (not a mutable image ref). */
   imageDigest?: string;
   /** Bun/platform/architecture fingerprint observed inside the executed Pod. */
-  runtimeIdentity?: { bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+  runtimeIdentity?: { bunVersion: string; platform: string; architecture: string; envFingerprint: string; baseImageDigest?: string };
   /** Every Pod attempt that contributed to this logical shard; summary identity is valid only when these agree. */
   executions?: GateShardExecutionEvidence[];
   status: 'complete' | 'unmeasured';
@@ -114,13 +116,13 @@ export interface GateShardDispatchInput {
   graphEntry?: string;
   recipeCommand?: string;
   recipeTimeoutMs?: number;
-  environmentIdentity?: { imageDigest: string; bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+  environmentIdentity?: { baseImageDigest?: string; imageDigest?: string; bunVersion: string; platform: string; architecture: string; envFingerprint: string };
 }
 
 /** Preserve the producer shard assignment while applying a changed-test import radius. Missing or incomplete inventory fails closed. */
 export function planGateReceiptRadius(input: { receipts: readonly GateShardReceipt[]; tests: readonly string[];
   selectedFiles: readonly string[]; priorCommit: string }): { shards: GateShardIdentity[]; invalidatedShardIds: string[]; unchangedShardIds: string[] } | null {
-  if (!input.receipts.length || !input.tests.length || !input.selectedFiles.length || !/^[a-f0-9]{40}$/i.test(input.priorCommit)) return null;
+  if (!input.receipts.length || !input.tests.length || !/^[a-f0-9]{40}$/i.test(input.priorCommit)) return null;
   const receipts = [...input.receipts].sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
   if (receipts.some((receipt, index) => receipt.id !== `pod-${index}` || receipt.status !== 'complete' || receipt.head40 !== input.priorCommit)
     || new Set(receipts.flatMap((receipt) => receipt.files)).size !== input.tests.length
@@ -179,6 +181,7 @@ export function eligibleGateShardReceipt(
       && !!receipt.runtimeIdentity && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(receipt.runtimeIdentity.bunVersion)
       && /^[a-z0-9_-]{1,32}$/.test(receipt.runtimeIdentity.platform) && /^[a-z0-9_-]{1,32}$/.test(receipt.runtimeIdentity.architecture)
       && /^[a-f0-9]{64}$/i.test(receipt.runtimeIdentity.envFingerprint)
+      && typeof receipt.runtimeIdentity.baseImageDigest === 'string' && /^sha256:[a-f0-9]{64}$/i.test(receipt.runtimeIdentity.baseImageDigest)
       && receipt.envFingerprint === receipt.runtimeIdentity.envFingerprint
       && receipt.envKey === `${receipt.envFingerprint}:${receipt.imageDigest}`
       && Array.isArray(receipt.executions) && receipt.executions.length > 0
@@ -205,9 +208,9 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
   const radiusUnchanged = new Set(input.radiusUnchangedShardIds ?? []);
   return input.shards.map((shard) => {
     const prior = [...input.receipts].reverse().find((r) => r.id === shard.id && r.base40 === input.base40 && sameFiles(r.files, shard.files));
-    const envFields = ['imageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const;
+    const envFields = ['baseImageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const;
     const storedEnv = prior?.runtimeIdentity && prior.imageDigest && prior.envFingerprint
-      ? { imageDigest: prior.imageDigest, ...prior.runtimeIdentity, envFingerprint: prior.envFingerprint } : undefined;
+      ? { ...prior.runtimeIdentity, envFingerprint: prior.envFingerprint } : undefined;
     const environmentMismatch = storedEnv && input.environmentIdentity
       ? envFields.find((field) => storedEnv[field] !== input.environmentIdentity![field])
       : (!input.environmentIdentity ? 'environment-unmeasured' as const : undefined);
@@ -218,7 +221,7 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40, radiusUnchanged.has(shard.id))
       && !!input.graphEntry && !!input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
       && r.graphEntry === input.graphEntry && r.recipeCommand === input.recipeCommand && r.recipeTimeoutMs === input.recipeTimeoutMs
-      && !!input.environmentIdentity && envFields.every((field) => ({ imageDigest: r.imageDigest, ...r.runtimeIdentity })[field] === input.environmentIdentity![field]));
+      && !!input.environmentIdentity && envFields.every((field) => ({ ...r.runtimeIdentity })[field] === input.environmentIdentity![field]));
     const invalidated = new Set(input.invalidatedShardIds ?? []).has(shard.id);
     const forced = input.rerouteShard === shard.id || invalidated;
     const auto = input.rerouteShard === 'auto' && (prior?.status === 'unmeasured'

@@ -17,6 +17,7 @@ import { formatPtyWebAddress, ptyWebAddress, type PtyWebAddress } from './pty-we
 import { ensureRunId, getHarnessRunId, normalizeRunIdSource, type RunIdSource } from '../harness/harness-space.js';
 import { inspectControlInbox, type ControlInboxSnapshot } from '../harness/control-inbox.js';
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../pty-shell/pty-control-ipc.js';
+import { registerRemoteElnPtyCommands } from './remote-eln-pty.js';
 import { resolvePtySpecialKey, type PtyKeyEncoding } from '../pty-shell/pty-special-keys.js';
 import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from '../pty-shell/pty-mouse.js';
 import { resizePtyWithOutcome, writePtyWithOutcome, writePtyWithOutcomeDetail } from '../pty-shell/pty-write-outcome.js';
@@ -2353,6 +2354,7 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
     //   종전 도움말은 `<ptyId>` 라 **실제보다 좁게** 적혀 있었다(구현은 처음부터 ref 를 받았다).
     "PTY control — <ref> is an id, nickname, or unique prefix (see 'pty list')",
   );
+  registerRemoteElnPtyCommands(pty);
   // ⚠️ 명령을 **thunk 로** 받는다 — 미리 만든 Promise 를 받으면 명령이 이미 돌기 시작한 뒤라
   //    sink 등록 前에 나간 로그를 놓친다(짧은 명령일수록 잘 놓친다).
   const run = async <T extends { readonly exitCode: number; readonly message: string; readonly notice?: string }>(start: () => Promise<T>) => {

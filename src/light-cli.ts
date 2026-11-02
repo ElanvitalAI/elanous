@@ -1,4 +1,6 @@
 import { Command, CommanderError } from 'commander';
+import { formatCliUserError, isCliUserError } from './cli/cli-user-error.js';
+import { registerPrLandOptions } from './cli/pr-land-options.js';
 import type { LightCliRoute } from './cli/light-entry-route.js';
 
 /** Dispatch a small operational command without loading the full command registry. */
@@ -11,7 +13,7 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
   // warns when the removed ELANOUS_CONFIG_DIR env var disagrees with it.
   // Preserve that observable warning on hot routes without loading the
   // resolver for the common case where the ignored env var is absent.
-  if (['msg', 'pty', 'logs', 'tasks', 'tasks-read'].includes(route) && process.env.ELANOUS_CONFIG_DIR !== undefined) {
+  if (['msg', 'pty', 'logs', 'tasks', 'tasks-read', 'tasks-advance'].includes(route) && process.env.ELANOUS_CONFIG_DIR !== undefined) {
     const { getElanousConfigDir } = await import('./elanous-config-dir.js');
     getElanousConfigDir();
   }
@@ -48,6 +50,16 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
       registerDecisionsListCommand(program);
       break;
     }
+    case 'release-landed': {
+      const { registerReleaseChecklistLandedCommand } = await import('./cli/release-checklist-landed-cli.js');
+      registerReleaseChecklistLandedCommand(program);
+      break;
+    }
+    case 'release-set': {
+      const { registerReleaseChecklistSetCommand } = await import('./cli/release-checklist-set-cli.js');
+      registerReleaseChecklistSetCommand(program);
+      break;
+    }
     case 'release': {
       const { registerReleaseChecklistReadCommands } = await import('./cli/release-checklist-read-cli.js');
       registerReleaseChecklistReadCommands(program);
@@ -63,9 +75,27 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
       registerTaskReadCommands(program);
       break;
     }
+    case 'tasks-advance': {
+      const { registerTasksAdvanceCommand } = await import('./cli/tasks-advance-cli.js');
+      registerTasksAdvanceCommand(program);
+      break;
+    }
     case 'pty': {
       const { registerPtyTakeoverCommands } = await import('./cli/pty-takeover-cli.js');
       registerPtyTakeoverCommands(program);
+      break;
+    }
+    case 'pr-land': {
+      const pr = program.command('pr').description('PR landing commands');
+      const land = pr.command('land');
+      registerPrLandOptions(land);
+      land.action(async () => {
+        const { registerPrCommands } = await import('./cli/pr-cli.js');
+        const fullProgram = new Command().name('elanous').enablePositionalOptions();
+        registerPrCommands(fullProgram);
+        const prLandUserArgs = process.argv.slice(2);
+        await fullProgram.parseAsync(prLandUserArgs, { from: 'user' });
+      });
       break;
     }
     case 'logs': {
@@ -127,7 +157,7 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
       process.exitCode = ['commander.helpDisplayed', 'commander.version'].includes(error.code) ? 0 : route === 'msg' ? 2 : error.exitCode;
       return;
     }
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(error instanceof Error && isCliUserError(error) ? formatCliUserError(error) : error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   }
 }

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { expect, test } from 'bun:test';
-import { activeRunsForGoal, launchRequestId, preLaunchGate, resolveLaunchDoorEnv } from '../execution-loop/launch-gate.js';
+import { activeRunsForGoal, decideLaunchDoor, launchRequestId, preLaunchGate, resolveLaunchDoorEnv } from '../execution-loop/launch-gate.js';
 import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 
 const repo = resolve(import.meta.dir, '../..');
@@ -61,12 +61,21 @@ function say(extraEnv: Record<string, string> = {}, flags: string[] = [], active
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-test('default shadow admits the CLI request without permission before the isolated child provider check', () => {
+test('default enforce refuses without permission before dispatch or ledger writes', () => {
   const result = say();
-  expect(result.stderr).not.toContain('launch door: blocked');
-  expect(result.status).toBe(1);
-  expect(result.stderr).toContain('No LLM provider available');
-  expect(result.runLedgers.length).toBeGreaterThan(0);
+  expect(result.stderr).toContain('launch door: blocked');
+  expect(result.status).toBe(3);
+  expect(result.runLedgers).toEqual([]);
+  expect(result.launchStamps).toEqual([]);
+});
+
+test('default and empty modes honor explicit permission and signal', () => {
+  const permission = { ELANOUS_LAUNCH_DOOR_PERMISSION: 'allow', ELANOUS_LAUNCH_DOOR_SIGNAL: 'green' };
+  for (const env of [permission, { ...permission, ELANOUS_LAUNCH_DOOR_MODE: '' }]) {
+    const resolved = resolveLaunchDoorEnv(env);
+    expect(resolved.mode).toBe('enforce');
+    expect(decideLaunchDoor({ entrance: 'harness-say', actor: 'DOOR', viaQueue: false }, resolved).allowed).toBe(true);
+  }
 });
 
 test('enforce refuses before dispatch with an explicit status and reason, even when --force-gate would bypass a duplicate', () => {
@@ -111,7 +120,8 @@ test('ordinary CLI and queue-tick admit a green signal and allow permission unde
 }, 300_000);
 
 test('env adapter defaults safely and malformed values never grant permission', () => {
-  expect(resolveLaunchDoorEnv({})).toEqual({ mode: 'shadow', modeSource: 'default', permission: 'deny', signal: 'unknown' });
+  expect(resolveLaunchDoorEnv({})).toEqual({ mode: 'enforce', modeSource: 'default', permission: 'deny', signal: 'unknown' });
+  expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: '' })).toEqual({ mode: 'enforce', modeSource: 'default', permission: 'deny', signal: 'unknown' });
   expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: 'enforce', ELANOUS_LAUNCH_DOOR_PERMISSION: 'allow', ELANOUS_LAUNCH_DOOR_SIGNAL: 'green' }))
     .toEqual({ mode: 'enforce', modeSource: 'env', permission: 'allow', signal: 'green' });
   expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: 'typo', ELANOUS_LAUNCH_DOOR_PERMISSION: 'yes', ELANOUS_LAUNCH_DOOR_SIGNAL: 'maybe' }))

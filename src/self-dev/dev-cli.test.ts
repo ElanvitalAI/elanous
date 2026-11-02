@@ -28,6 +28,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { readHarnessScreen } from '../harness/harness-screen.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } from '../self-implement/elanous-tui-spawn.js';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -4427,6 +4428,10 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
       rmSync(sandbox, { recursive: true, force: true });
     }
   }
+  async function runInProcessCli(args: string[]): Promise<{ code: number; stderr: string; stdout: string }> {
+    const result = await simInProcessCli(args, { allowPaths: [['dev'], ['drive']] });
+    return { code: result.exitCode, stderr: result.stderr, stdout: result.stdout };
+  }
 
   // ⭐⭐⭐ **양성 대조** — 가드가 «실제로 설치돼 있는가».
   //   ⛔ 아래 두 「부재」 회귀만으로는 «가드를 통째로 지워도» 통과한다(무인 리뷰가 두 번 짚었다).
@@ -4443,7 +4448,7 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('self-mission의 명시 --role-llm은 실물 dev 진입점에서 child LLM 대안과 함께 거부한다', async () => {
-    const r = await runCli(['--test', 'dev', '--file', '/dev/null', '--role-llm', 'implement=grok']);
+    const r = await runInProcessCli(['dev', '--file', '/dev/null', '--role-llm', 'implement=grok']);
     expect(r.code).not.toBe(0);
     expect(r.stderr).toContain('--role-llm');
     expect(r.stderr).toContain('--child-llm-provider');
@@ -4451,13 +4456,13 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('명시 --role-llm은 실물 drive 별칭 진입점에서 거부한다', async () => {
-    const r = await runCli(['--test', 'drive', 'echo hi', '--goal', 'g', '--role-llm', 'implement=grok']);
+    const r = await runInProcessCli(['drive', 'echo hi', '--goal', 'g', '--role-llm', 'implement=grok']);
     expect(r.code).not.toBe(0);
     expect(r.stderr).toContain('--role-llm');
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('attach advisory points to the existing PTY command without interrupting the existing validation path', async () => {
-    const r = await runCli(['dev', '--attach', 'pty-123', 'x']);
+    const r = await runInProcessCli(['dev', '--attach', 'pty-123', 'x']);
     expect(r.stderr).toContain('elanous pty auto');
     expect(r.stderr).toContain("elanous pty auto 'pty-123'");
     expect(r.stderr).toContain('무효한 옵션: attach');
@@ -4465,14 +4470,14 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('attach advisory shell-quotes spaces, quotes, and shell metacharacters as one argument', async () => {
-    const r = await runCli(['dev', '--attach', "pty ref'; $(unsafe);", 'x']);
+    const r = await runInProcessCli(['dev', '--attach', "pty ref'; $(unsafe);", 'x']);
     expect(r.stderr).toContain("elanous pty auto 'pty ref'\\''; $(unsafe);'");
     expect(r.stderr).toContain('무효한 옵션: attach');
     expect(r.code).not.toBe(0);
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('external backend advisory points to the existing agent-mission command without interrupting the existing validation path', async () => {
-    const r = await runCli(['dev', '--backend', 'codex', '--branch', 'wt/advisory', '--evidence', 'invalid', 'x']);
+    const r = await runInProcessCli(['dev', '--backend', 'codex', '--branch', 'wt/advisory', '--evidence', 'invalid', 'x']);
     expect(r.stderr).toContain('elanous agent-mission mission');
     expect(r.stderr).toContain('elanous agent-mission mission --backend codex');
     expect(r.stderr).toContain('--evidence 는 tsc|doc|test 만');
@@ -4490,7 +4495,7 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
       ['dev', '--evidence', 'invalid', 'x'],
       ['dev', '--observe-only', 'x'],
     ]) {
-      const r = await runCli(args);
+      const r = await runInProcessCli(args);
       expect(r.stderr).not.toContain('elanous agent-mission mission');
       expect(r.stderr).toContain('무효한 옵션');
       expect(r.code).not.toBe(0);
@@ -4498,7 +4503,7 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('JSON mode is rejected outside hold before attach validation', async () => {
-    const r = await runCli(['dev', '--json', '--attach', 'pty-123', 'x']);
+    const r = await runInProcessCli(['dev', '--json', '--attach', 'pty-123', 'x']);
     expect(r.code).toBe(2);
     // #25547 widened the message (hold · self --target · self --ask/--say); --attach is still rejected before validation.
     expect(r.stderr).toContain('--json은 --hold, self --target 또는 self --ask/--say 전제 검사 중단 전용입니다');
@@ -4520,7 +4525,7 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
   }, REAL_CLI_TEST_TIMEOUT_MS);
 
   it('초입 거부(self + 비-pty transport)는 정직한 결론이므로 미결론 산출이 없다', async () => {
-    const r = await runCli(['dev', '--backend', 'self', '--transport', 'acp', 'x']);
+    const r = await runInProcessCli(['dev', '--backend', 'self', '--transport', 'acp', 'x']);
     expect(r.stderr).toContain('--transport 는 external backend 전용');
     expect(r.code).not.toBe(0);
     expect(`${r.stdout}${r.stderr}`).not.toContain(UNCONCLUDED);
@@ -4531,7 +4536,7 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
     // ⛔ 증거 태그가 «없는» 골 — preflightGoalFileEvidence 가 runDevPipeline 안에서 던진다.
     writeFileSync(goal, '이 골은 요구 증거가 없다. 거부되어야 한다.\n', 'utf8');
     try {
-      const r = await runCli(['dev', '--file', goal]);
+      const r = await runInProcessCli(['dev', '--file', goal]);
       expect(r.stderr).toContain('요구 증거가 없습니다');
       expect(r.code).not.toBe(0);
       expect(`${r.stdout}${r.stderr}`).not.toContain(UNCONCLUDED);

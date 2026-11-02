@@ -489,7 +489,7 @@ describe('ops-ledger checklist tools (판)', () => {
 });
 
 describe('ops-ledger RunShell 스티어링', () => {
-  test('TUI dashboard 진입점의 실제 카탈로그로 msg list를 거부하며 subprocess 0건', async () => {
+  test('TUI dashboard 진입점은 명시한 msg list CLI를 실행한다', async () => {
     registerAllDefaultToolRuntimes();
     const tools = buildSessionRuntimeToolSpecs({
       userText: 'TC 우편 msg list 확인',
@@ -519,25 +519,22 @@ describe('ops-ledger RunShell 스티어링', () => {
           dispatchPluginTool: async () => ({ ok: false, error: 'unexpected plugin dispatch' }),
         },
       ) as { approvalKey?: string };
-      expect(result.approvalKey).toBe('rejected:ops-ledger-cli');
-      expect(spawn).toHaveBeenCalledTimes(0);
+      expect(result.approvalKey).not.toBe('rejected:ops-ledger-cli');
+      expect(spawn).toHaveBeenCalledTimes(1);
     } finally {
       spawn.mockRestore();
     }
   });
 
-  test('덮은 CLI 모양은 네이티브 툴로 안내하고 나머지는 통과한다', async () => {
+  test('명시한 msg list CLI는 통과하고 덮은 쓰기 명령은 네이티브 툴로 안내한다', async () => {
     const availableToolNames = ALL_OPS_LEDGER_RUNTIMES.map(runtime => runtime.spec.name);
     const steer = (command: string[]) => rejectedLedgerCliResult(command, availableToolNames);
-    const msgListReject = await dispatchRunShell(
-      { command: ['elanous', 'msg', 'list', '--to', 'OP', '--json'] }, { availableToolNames });
-    expect(msgListReject.approvalKey).toBe('rejected:ops-ledger-cli');
+    const msgListPass = steer(['elanous', 'msg', 'list', '--to', 'OP', '--json']);
+    expect(msgListPass).toBeNull();
     const privateBody = 'private-message-body-token';
     const postReject = steer(['elanous', 'msg', 'post', '--from', 'TC', '--to', 'OP', '--body', privateBody]);
     expect(postReject?.output).toContain('MsgPost');
     expect(postReject?.output).not.toContain(privateBody);
-    expect(msgListReject.output).toContain('MsgList');
-    expect(msgListReject.outcome).toBe('spawn-error');
 
     const setReject = await dispatchRunShell(
       { command: ['bun', 'bin/elanous.mjs', 'release', 'checklist', 'set', 'K1', '--status', 'green', '--version', '9.9.9'] },
@@ -550,7 +547,7 @@ describe('ops-ledger RunShell 스티어링', () => {
     expect(steer(['elanous', 'msg', 'ack', '7', '--to', 'TC'])?.output).toContain('MsgAck');
     expect(steer(['elanous', 'release', 'checklist', 'list', '--version', '9.9.9'])?.output).toContain('ChecklistList');
     expect(steer(['elanous', 'release', 'checklist', 'add', 'K9', 'title'])?.output).toContain('ChecklistAdd');
-    expect(steer(['env', 'elanous', 'msg', 'list', '--to', 'OP'])?.output).toContain('MsgList');
+    expect(steer(['env', 'elanous', 'msg', 'list', '--to', 'OP'])).toBeNull();
     expect(steer(['/usr/bin/env', 'FOO=bar', 'bunx', '--bun', 'elanous', 'release', 'checklist', 'set', 'K1'])?.output).toContain('ChecklistSet');
 
     // 안 덮은 것 · 다른 우주 명시 · 다른 바이너리 — 통과.
@@ -566,18 +563,18 @@ describe('ops-ledger RunShell 스티어링', () => {
     expect(steer(['env', 'ELANOUS_TRACK=TC', 'elanous', 'release', 'checklist', 'move', 'K1', '--from', '0.2.9', '--to', '0.2.10', '--reason', 'x'])).toBeNull();
     expect(steer(['env', '-u', 'ELANOUS_TRACK', 'elanous', 'release', 'checklist', 'move', 'K1'])).toBeNull();
     expect(steer(['env', '--unset=ELANOUS_TRACK', 'elanous', 'msg', 'post', '--from', 'OP', '--to', 'TC'])).toBeNull();
-    expect(steer(['env', 'ELANOUS_DEBUG=1', 'elanous', 'msg', 'list', '--to', 'OP'])?.output).toContain('MsgList');
+    expect(steer(['env', 'ELANOUS_DEBUG=1', 'elanous', 'msg', 'list', '--to', 'OP'])).toBeNull();
     expect(steer(['env', '-i', 'elanous', 'msg', 'list', '--to', 'OP'])).toBeNull();
     expect(steer(['env', 'elanous', '--test', 'msg', 'list', '--to', 'OP'])).toBeNull();
     expect(steer(['bun', 'run.ts', 'msg', 'list'])).toBeNull();
     expect(rejectedLedgerCliResult(['elanous', 'msg', 'list', '--to', 'OP'])).toBeNull();
     expect(rejectedLedgerCliResult(['elanous', 'msg', 'list', '--to', 'OP'], ['ChecklistList'])).toBeNull();
-    expect(steer(['elanous', 'msg', 'list', '--to', 'OP'])?.output).toContain('MsgList');
-    const runtimeReject = await runShellRuntime.run(
+    expect(steer(['elanous', 'msg', 'list', '--to', 'OP'])).toBeNull();
+    const runtimePass = await runShellRuntime.run(
       { command: ['elanous', 'msg', 'list', '--to', 'OP'] },
       { surface: 'tui', agentHostTools: [ALL_OPS_LEDGER_RUNTIMES[0]!.spec] },
     );
-    expect(runtimeReject.approvalKey).toBe('rejected:ops-ledger-cli');
+    expect(runtimePass.approvalKey).not.toBe('rejected:ops-ledger-cli');
   });
 });
 

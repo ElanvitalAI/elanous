@@ -188,8 +188,13 @@ describe('createDaemonRunTurn — dispatch context userText', () => {
   });
 
   test('concurrent ACP turns keep their own cwd across asynchronous tool calls', async () => {
+    let started = 0;
+    let releaseBoth!: () => void;
+    const bothStarted = new Promise<void>((resolve) => { releaseBoth = resolve; });
     streamImpl = async ({ handlers }) => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      started += 1;
+      if (started === 2) releaseBoth();
+      await bothStarted;
       await handlers.dispatchTool('CaptureCtx', {}, { callId: 'call-1' });
       return '';
     };
@@ -201,7 +206,7 @@ describe('createDaemonRunTurn — dispatch context userText', () => {
       runTurn(makeTurnCtx({ sessionId: 'b', cwd: '/tmp/b' })),
     ]);
     expect(new Set(dispatchContexts.map((ctx) => ctx.cwd))).toEqual(new Set(['/tmp/a', '/tmp/b']));
-  });
+  }, 5_000);
 
   test('forwards multi-line human source text while preserving dispatch fields', async () => {
     const userText = '첫 번째 줄\n둘 번째 줄';

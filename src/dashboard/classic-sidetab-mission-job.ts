@@ -1,14 +1,30 @@
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { debug } from '../debug/log.js';
 import { redactMissionResultPath, type StartedClassicMissionCliJob } from './mission-cli-consumer.js';
 import type { ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
+import { runVisibleAgentMission, type VisibleMissionDeps } from '../sidetab-core/visible-agent-mission.js';
 
 export type ClassicMissionNotificationEnqueue = (notification: PendingTaskNotification) => void;
 export const CLASSIC_SIDETAB_MISSION_LABEL = 'sidetab mission';
 const CLASSIC_SIDETAB_PAIR_TIMEOUT_MS = 60 * 60 * 1_000;
+
+/** Ensure visible agents can create their requested result file on first run. */
+export function prepareClassicSidetabMissionOutputDirectory(outputPath: string): void {
+  if (!outputPath.trim()) throw new Error('sidetab mission output path is required');
+  mkdirSync(dirname(outputPath), { recursive: true, mode: 0o700 });
+}
+
+/** Prepare the production result path before the visible agent can write to it. */
+export async function runPreparedClassicSidetabVisibleMission(
+  deps: Omit<VisibleMissionDeps, 'outputPath'> & { outputPath: string },
+) {
+  prepareClassicSidetabMissionOutputDirectory(deps.outputPath);
+  return runVisibleAgentMission(deps);
+}
+
 export interface ClassicSidetabMissionPairCompletionResult {
   codex: ClassicSidetabMissionResult;
   claude: ClassicSidetabMissionResult;

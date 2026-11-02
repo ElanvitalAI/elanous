@@ -68,16 +68,21 @@ export interface ResourceReconcileTickDeps {
   cleanupExpired?: boolean;
   /** Active self-gate/train run.fp begin records from the local read-only log store. */
   fingerprints?: () => readonly GateTrainFingerprint[];
+  releaseReservation?: () => ReturnType<typeof inspectReleaseGateHost>;
   log?: (event: string, data: Record<string, unknown>) => void;
 }
 
 type GuardianFinding = ResourceFinding | { kind: 'release-reservation'; host: 'node-b'; id: string; detail: string; action: 'report-only' };
 
-type ResourceReconcileSnapshot = Awaited<ReturnType<typeof resourceReconcileTick>> & {
+export type ResourceReconcileSnapshot = Awaited<ReturnType<typeof resourceReconcileTick>> & {
   stale: boolean; staleReason?: string; lastFailureAt?: string;
 };
 let latestResourceSnapshot: ResourceReconcileSnapshot | null = null;
+let latestResourceFailure: { reason: string; failedAt: string } | null = null;
 export function getLatestResourceSnapshot(): ResourceReconcileSnapshot | null { return latestResourceSnapshot; }
+export function getLatestResourceFailure(): { reason: string; failedAt: string } | null { return latestResourceFailure; }
+/** Test seam for the Nexus projection; production updates this only from the reconcile loop. */
+export function setLatestResourceSnapshotForTest(snapshot: ResourceReconcileSnapshot | null): void { latestResourceSnapshot = snapshot; latestResourceFailure = null; }
 
 /** Gather each configured host once, hand discrepancies to the guardian event stream, and reap only an absent expired lease. */
 export async function resourceReconcileTick(overrides: ResourceReconcileTickDeps = {}) {
@@ -115,7 +120,8 @@ export async function resourceReconcileTick(overrides: ResourceReconcileTickDeps
       expectedHeartbeatAt: candidate.expectedLeaseHeartbeatAt, expectedExpiresAtMs: candidate.expectedLeaseExpiresAtMs,
       observedAtMs: candidate.observedAtMs }),
   });
-  const releaseReservation = inspectReleaseGateHost(gateHostReservationRoot(), 'node-b', { reclaimDead: false });
+  const releaseReservation = overrides.releaseReservation?.()
+    ?? inspectReleaseGateHost(gateHostReservationRoot(), 'node-b', { reclaimDead: false });
   const findings: GuardianFinding[] = [...snapshot.findings, ...fingerprintFindings,
     ...(fingerprintReadError ? [{ kind: 'measurement-unavailable' as const, host: 'local', id: 'run.fp', detail: fingerprintReadError, action: 'report-only' as const }] : []),
     { kind: 'release-reservation' as const, host: 'node-b', id: releaseReservation.status,
@@ -133,6 +139,7 @@ export async function resourceReconcileTick(overrides: ResourceReconcileTickDeps
   catch { /* reconciliation is observation and must not stop the guardian */ }
   const result = { ...snapshot, findings, cleanup, releaseReservation };
   latestResourceSnapshot = { ...result, stale: false };
+  latestResourceFailure = null;
   return result;
 }
 
@@ -149,8 +156,11 @@ export function startResourceReconcileLoop(options: { tick?: () => Promise<unkno
     inFlight = true;
     try { await (options.tick ?? (() => resourceReconcileTick()))(); }
     catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const failedAt = new Date().toISOString();
+      latestResourceFailure = { reason, failedAt };
       if (latestResourceSnapshot) latestResourceSnapshot = { ...latestResourceSnapshot, stale: true,
-        staleReason: error instanceof Error ? error.message : String(error), lastFailureAt: new Date().toISOString() };
+        staleReason: reason, lastFailureAt: failedAt };
       try { (options.onError ?? (reason => debug.log('loop.guardian', 'resource-reconcile-failed', { error: String(reason) }, { level: 'warn' })))(error); }
       catch { /* guardian loop remains alive */ }
     } finally { inFlight = false; }

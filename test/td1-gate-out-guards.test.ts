@@ -54,7 +54,7 @@ test('TD1 gate-out candidates with defect guards are retained without new exclus
   expect(GATE_NIGHTLY_AUDITS).toEqual([
     'test/f12-sweep.test.ts',
     'scripts/unwired-exports.test.ts',
-    'test/pwa-build-typecheck.test.ts',
+    'test/pwa-build-typecheck.test.ts', 'scripts/resource-map-check.test.ts',
   ]);
   expect(report).toContain('야간 이동 0개');
 });

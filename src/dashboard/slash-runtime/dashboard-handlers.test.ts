@@ -38,13 +38,16 @@ import { checkSlashCatalogBaseline } from './registry.js';
 import type { LoopScheduler } from '../loop-scheduler.js';
 import type { dashboardLoops } from '../../domains/dashboard-data.js';
 import * as directiveModule from '../../steward/directive.js';
+import * as controlInboxModule from '../../harness/control-inbox.js';
 import { slashMaturity } from '../../maturity/tui-slash-maturity.js';
 
 const originalDirectiveModule = { ...directiveModule };
+const originalControlInboxModule = { ...controlInboxModule };
 const addDirectiveSpy = mock(async () => ({ issue: 'ELA-1', status: 'created' }));
 mock.module('../../steward/directive.js', () => ({ ...originalDirectiveModule, addDirective: addDirectiveSpy }));
 afterAll(() => {
   mock.module('../../steward/directive.js', () => originalDirectiveModule);
+  mock.module('../../harness/control-inbox.js', () => originalControlInboxModule);
 });
 
 type AskLaunchInput = {

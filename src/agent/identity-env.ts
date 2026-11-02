@@ -61,6 +61,7 @@ const IDENTITY_ENV_KEYS = [
   'ELANOUS_CONTROLLER',       // 현재 프로세스의 상위 PTY/run 제어자(층마다 갱신 가능)
   'ELANOUS_CONTROL_CHANNELS', // 자식을 조작할 수 있는 관 목록(쉼표 구분)
   'ELANOUS_PTY_CHAIN_ORIGIN', // PTY 실행 사슬의 tree/worktree 출발지(실행 출신과 별도 축)
+  'ELANOUS_REMOTE_CODEX_ACCESS_ONLY', // access-only 정책 표식만 — 자격 값·인증 경로는 전파하지 않는다
 ] as const;
 
 /** ⛔⭐⭐⭐ **래칫용 — `buildPtyEnv` 가 «합성»하는 키 목록**(2026-08-19 · `OBS-T118` 후속).

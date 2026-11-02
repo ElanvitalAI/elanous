@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { nativeToolCatalog } from '../src/native-tool-catalog.js';
 import { splitDeferredToolSpecs } from '../src/session-runtime/tier-flip.js';
 import type { UserConfig } from '../src/user-config.js';
@@ -29,14 +29,19 @@ const LEGACY_CLI_TOOLS = [
   'WebSearch',
 ];
 
-const originalCodexToolset = process.env.ELANOUS_CODEX_TOOLSET;
-const originalTuiTools = process.env.ELANOUS_EVAL_INCLUDE_TUI_TOOLS;
+let previousCodexToolset: string | undefined;
+let previousTuiTools: string | undefined;
+
+beforeEach(() => {
+  previousCodexToolset = process.env.ELANOUS_CODEX_TOOLSET;
+  previousTuiTools = process.env.ELANOUS_EVAL_INCLUDE_TUI_TOOLS;
+});
 
 afterEach(() => {
-  if (originalCodexToolset === undefined) delete process.env.ELANOUS_CODEX_TOOLSET;
-  else process.env.ELANOUS_CODEX_TOOLSET = originalCodexToolset;
-  if (originalTuiTools === undefined) delete process.env.ELANOUS_EVAL_INCLUDE_TUI_TOOLS;
-  else process.env.ELANOUS_EVAL_INCLUDE_TUI_TOOLS = originalTuiTools;
+  if (previousCodexToolset === undefined) delete process.env.ELANOUS_CODEX_TOOLSET;
+  else process.env.ELANOUS_CODEX_TOOLSET = previousCodexToolset;
+  if (previousTuiTools === undefined) delete process.env.ELANOUS_EVAL_INCLUDE_TUI_TOOLS;
+  else process.env.ELANOUS_EVAL_INCLUDE_TUI_TOOLS = previousTuiTools;
 });
 
 describe('elanous repro tool surface selection', () => {

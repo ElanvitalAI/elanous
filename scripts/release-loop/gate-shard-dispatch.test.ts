@@ -4,7 +4,7 @@ import { planGateReceiptRadius, planGateShardDispatch, summarizeGateProgress, ty
 test('receipt baseline radius proof reaches dispatch and rejects mixed receipt heads', () => {
   const priorCommit = 'a'.repeat(40), currentCommit = 'b'.repeat(40), base40 = 'c'.repeat(40);
   const fingerprint = 'd'.repeat(64), imageDigest = `sha256:${'e'.repeat(64)}`;
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   const tests = ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'];
   const receipts: GateShardReceipt[] = tests.map((file, index) => ({
     id: `pod-${index}`, files: [file], version: '1.0.1', head40: priorCommit, base40,
@@ -17,13 +17,16 @@ test('receipt baseline radius proof reaches dispatch and rejects mixed receipt h
   }));
   const radius = planGateReceiptRadius({ receipts, tests, selectedFiles: ['src/a.test.ts'], priorCommit });
   expect(radius).toMatchObject({ invalidatedShardIds: ['pod-0'], unchangedShardIds: ['pod-1', 'pod-2'] });
+  expect(planGateReceiptRadius({ receipts, tests, selectedFiles: [], priorCommit })).toMatchObject({
+    invalidatedShardIds: [], unchangedShardIds: ['pod-0', 'pod-1', 'pod-2'],
+  });
   const proof = radius!;
   const actions = planGateShardDispatch({
     head40: currentCommit, base40, shards: proof.shards, receipts,
     invalidatedShardIds: proof.invalidatedShardIds, radiusUnchangedShardIds: proof.unchangedShardIds,
     hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }],
     graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json',
-    recipeTimeoutMs: 14400000, environmentIdentity: { imageDigest, ...runtimeIdentity },
+    recipeTimeoutMs: 14400000, environmentIdentity: runtimeIdentity,
   });
   expect(actions.map(({ shardId, kind }) => [shardId, kind])).toEqual([
     ['pod-0', 'run'], ['pod-1', 'reuse'], ['pod-2', 'reuse'],

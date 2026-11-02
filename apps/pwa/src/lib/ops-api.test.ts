@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { DaemonClient } from './daemon-client';
-import { getOpsChecklist, getReleaseNodeLog, getReleaseRuns, getSeats, type OpsSeats } from './ops-api';
+import { getOpsChecklist, getReleaseNodeLog, getReleaseRuns, getResourceGuardian, getSeats, type OpsSeats } from './ops-api';
 
 const RUN = { runId: 'run-1', status: 'running', startedAt: '2026-10-02T00:00:00Z', version: '0.2.9', path: ['gate'], nodes: [{ nodeId: 'gate', ok: null, summary: '진행' }] };
 const CHECKLIST = { version: '0.2.9', items: [{ id: 'K1', title: '판정', status: 'yellow', owner: 'OP', updatedAt: 'now', evidence: '근거' }], history: [], byOwner: { OP: 1 } };
@@ -42,6 +42,22 @@ describe('OPS seats read-only API', () => {
 });
 
 describe('OPS read-only daemon API', () => {
+  test('guardian resource client accepts pending/stale snapshots and rejects malformed findings', async () => {
+    const calls: Array<{ path: string; method: string }> = [];
+    const ready = { state: 'ready', stale: false, observedAt: '2026-11-02T00:00:00.000Z', findings: [
+      { kind: 'drift', host: 'aws2', id: 'fp_guardian01', fp: 'fp_guardian01', detail: 'host/lane mismatch', action: 'report-only' },
+    ], cleanup: { reaped: 0, skipped: 0, errors: 0 }, releaseReservation: { status: 'free', reason: 'free' } };
+    expect(await getResourceGuardian(client(async () => json(ready), calls))).toMatchObject({ kind: 'ready', data: ready });
+    expect(await getResourceGuardian(client(async () => json({ state: 'pending', stale: true, observedAt: null, findings: [],
+      cleanup: { reaped: 0, skipped: 0, errors: 0 } }), calls))).toMatchObject({ kind: 'ready', data: { state: 'pending' } });
+    expect(await getResourceGuardian(client(async () => json({ state: 'failed', stale: true, observedAt: null, staleReason: 'first tick failed',
+      lastFailureAt: '2026-11-02T00:00:00.000Z', findings: [], cleanup: { reaped: 0, skipped: 0, errors: 0 } }), calls)))
+      .toMatchObject({ kind: 'ready', data: { state: 'failed', lastFailureAt: '2026-11-02T00:00:00.000Z' } });
+    expect(await getResourceGuardian(client(async () => json({ ...ready, findings: [{ ...ready.findings[0], action: 'delete-pod' }] }), calls)))
+      .toEqual({ kind: 'error', status: 200 });
+    expect(calls.every((call) => call.path === '/v1/ops/resources/guardian' && call.method === 'GET')).toBe(true);
+  });
+
   test('normalizes optional, absent and malformed schedule without rejecting checklist rows', async () => {
     const calls: Array<{ path: string; method: string }> = [];
     const read = (schedule: unknown, absent = false) => getOpsChecklist(client(async () => json(absent ? CHECKLIST : { ...CHECKLIST, schedule }), calls), '0.2.10');

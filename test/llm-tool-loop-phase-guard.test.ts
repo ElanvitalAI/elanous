@@ -78,6 +78,11 @@ const TOOLS = ['Agent', 'Edit', 'Write', 'Bash', 'RunShell', 'Glob', 'Grep', 'Re
   description: 'd',
   parameters: { type: 'object' },
 }));
+const VERIFY_FOLLOWUP_TOOLS = ['ScheduleWakeup', 'skill_exec'].map((name) => ({
+  name,
+  description: 'd',
+  parameters: { type: 'object' },
+}));
 
 afterEach(() => {
   resetPlanModeState();
@@ -200,6 +205,14 @@ describe('tool-loop followup phase rejection', () => {
     },
   );
 
+  test('verify-action permits wake scheduling and policy-gated skill execution only in verification', () => {
+    const calls = ['ScheduleWakeup', 'skill_exec'].map((name) => ({ id: name, name, args: {} }));
+    expect(getToolLoopPhaseRejectedCalls('verify-action', calls)).toEqual([]);
+    for (const phase of ['inspect-action', 'inspect-execution', 'repair-action'] as const) {
+      expect(getToolLoopPhaseRejectedCalls(phase, calls).map((call) => call.name)).toEqual(['ScheduleWakeup', 'skill_exec']);
+    }
+  });
+
   test('inspect-execution still rejects edit tools next to the added observation tools', () => {
     const calls = ['logs_query', 'PtyShellPoll', 'Edit', 'Write'].map((name) => ({ id: name, name, args: {} }));
     expect(getToolLoopPhaseRejectedCalls('inspect-execution', calls).map((c) => c.id)).toEqual(['Edit', 'Write']);
@@ -210,12 +223,15 @@ describe('tool-loop followup phase rejection', () => {
     expect(getToolLoopPhaseRejectedCalls('inspect-synthesis', calls).map((c) => c.id)).toEqual(['logs_query', 'PtyShellPoll']);
   });
 
-  test('verify phase runs MsgPost/MsgList/MsgAck after edits and still rejects Glob', async () => {
+  test('verify phase permits Read, ScheduleWakeup, and policy-allowed skill_exec after edits; Glob stays blocked', async () => {
     const dispatched: string[] = [];
     const { provider, capturedMessagesAt } = scriptedProvider([
       [{ type: 'tool_call', id: 'fail', name: 'Bash', args: { command: 'bun test focused.ts' } }],
       [{ type: 'tool_call', id: 'edit', name: 'Edit', args: { file_path: 'a.ts', old_string: 'a', new_string: 'b' } }],
+      [{ type: 'tool_call', id: 'read', name: 'Read', args: { file_path: 'a.ts' } }],
       [
+        { type: 'tool_call', id: 'wake', name: 'ScheduleWakeup', args: { delaySeconds: 60 } },
+        { type: 'tool_call', id: 'skill', name: 'skill_exec', args: { skill: 'elanous-logs', task: 'read recent evidence' } },
         { type: 'tool_call', id: 'post', name: 'MsgPost', args: { to: 'OP', body: 'done' } },
         { type: 'tool_call', id: 'list', name: 'MsgList', args: {} },
         { type: 'tool_call', id: 'ack', name: 'MsgAck', args: { id: 1 } },
@@ -233,14 +249,16 @@ describe('tool-loop followup phase rejection', () => {
           return name === 'Bash' ? { output: 'failed', exitCode: 1, outcome: 'exit' } : `${name} ran`;
         },
       },
-      { provider, tools: TOOLS, maxTurns: 30 },
+      { provider, tools: [...TOOLS, ...VERIFY_FOLLOWUP_TOOLS], maxTurns: 30 },
     );
 
     expect(result).toContain('reported');
-    expect(dispatched).toEqual(['Bash', 'Edit', 'MsgPost', 'MsgList', 'MsgAck']);
-    const results = toolResults(capturedMessagesAt(3)).slice(-4);
-    expect(results.map((block) => block.content)).toEqual(['MsgPost ran', 'MsgList ran', 'MsgAck ran', expect.stringContaining('Glob did NOT run')]);
-    expect(String(results[3]!.content)).toContain('VERIFY ACTION REQUIRED');
+    expect(dispatched).toEqual(['Bash', 'Edit', 'Read', 'ScheduleWakeup', 'skill_exec', 'MsgPost', 'MsgList', 'MsgAck']);
+    const results = toolResults(capturedMessagesAt(4)).slice(-6);
+    expect(results.map((block) => block.content)).toEqual([
+      'ScheduleWakeup ran', 'skill_exec ran', 'MsgPost ran', 'MsgList ran', 'MsgAck ran', expect.stringContaining('Glob did NOT run'),
+    ]);
+    expect(String(results[5]!.content)).toContain('VERIFY ACTION REQUIRED');
   });
 
   test('repair phase receives a delegated result via AgentOutput and still rejects Glob', async () => {

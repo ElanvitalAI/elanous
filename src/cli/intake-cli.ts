@@ -35,6 +35,8 @@ export interface IntakeCandidatesCliDeps {
 export interface IntakeCliDeps extends IntakeCandidatesCliDeps {
   /** 흡수 원장 우주 (기본 effectiveInstanceRoot()) — 시험은 격리 임시 root 를 넣는다. */
   root?: string;
+  /** intake digest command seam — integration tests inject a Telegram sender without replacing CLI parsing. */
+  digest?: IntakeDigestCliDeps & { onResult?: (result: Awaited<ReturnType<typeof runIntakeDigestCli>>) => void };
   /** 텔레그램 «저장된 메시지» 연결 (기본 gramjsFetchSaved) — 시험은 가짜 fetch 를 넣는다. */
   connectSaved?: () => Promise<{ fetch: FetchSavedMessages; close: () => Promise<void> }>;
   /** 수집 연결 실패를 CLI 사용자에게 보고한다. */
@@ -95,7 +97,7 @@ export interface IntakeDigestCliDeps {
   root?: string;
   annotateLens?: (root: string, day: string) => Promise<unknown>;
   buildDigest?: typeof import('../intake-plane/digest.js').buildIntakeDigest;
-  sendTelegram?: (text: string) => Promise<boolean>;
+  sendTelegram?: (text: string) => Promise<boolean | { messageId: number }>;
 }
 
 export function intakeToTasksMessages(content: string) {
@@ -157,7 +159,7 @@ export async function runIntakeToTasksCli(
 export async function runIntakeDigestCli(
   opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string; seat?: string },
   deps: IntakeDigestCliDeps = {},
-): Promise<{ sent?: boolean; empty?: boolean }> {
+): Promise<{ sent?: boolean; empty?: boolean; arrival?: { messageId: number; absorbedIds: string[] } }> {
   const { buildIntakeDigest, recordSeatBriefed, renderDigestMarkdown, renderDigestTelegram } = await import('../intake-plane/digest.js');
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
   const root = deps.root ?? effectiveInstanceRoot();
@@ -176,13 +178,15 @@ export async function runIntakeDigestCli(
   if (opts.telegram) {
     if (!seat && !d.absorbed.length && !d.news?.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return { empty: true }; }
     const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
-    const sent = deps.sendTelegram
+    const delivery = deps.sendTelegram
       ? await deps.sendTelegram(text)
       : await (async () => {
         const { sendTelegramReport } = await import('../telegram-report.js');
         const { getUserConfig } = await import('../user-config.js');
         return sendTelegramReport(getUserConfig(), text, { markdown: true, kind: 'intake' });
       })();
+    const sent = typeof delivery === 'boolean' ? delivery : Number.isSafeInteger(delivery.messageId) && delivery.messageId > 0;
+    const arrival = typeof delivery === 'boolean' || !sent ? undefined : { messageId: delivery.messageId, absorbedIds: d.absorbed.map((entry) => entry.id) };
     const judgedCount = (entries: { verdict: string }[] | undefined) => (entries ?? []).filter((entry) => entry.verdict !== '판정 대기').length;
     debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length,
       github: d.githubNew?.length ?? 0, githubJudged: judgedCount(d.githubNew), x: d.xTrends?.length ?? 0, xJudged: judgedCount(d.xTrends), sent });
@@ -190,7 +194,7 @@ export async function runIntakeDigestCli(
     if (seat === 'user') debug.log('watch.default', 'brief', { topics: (await import('../intake-plane/intake-sources.js')).listSources({ seat }, root).length, items: d.absorbed.length, sent });
     console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');
     if (!sent) process.exitCode = 3;
-    return { sent };
+    return { sent, ...(arrival ? { arrival } : {}) };
   }
   if (opts.json) { await writeStdoutFully(JSON.stringify(d, null, 2)); return {}; }
   await writeStdoutFully(renderDigestMarkdown(d));
@@ -452,7 +456,8 @@ export function registerIntakeCommands(program: Command, candidateDeps: IntakeCl
     .option('--vault <root>', '옵시디언 볼트 뿌리 — 텔레그램 판에 노트 열기 주소를 싣는다')
     .option('--note <path>', '열기 주소가 가리킬 노트(그날 트렌드 노트)')
     .action(async (opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string; seat?: string }) => {
-      await runIntakeDigestCli(opts);
+      const result = await runIntakeDigestCli(opts, candidateDeps.digest);
+      candidateDeps.digest?.onResult?.(result);
     });
 
   intakeCmd

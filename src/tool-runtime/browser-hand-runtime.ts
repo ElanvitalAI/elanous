@@ -106,8 +106,16 @@ function blockedKind(value: string | undefined): 'login' | 'paywall' | undefined
   return LOGIN_PATTERN.test(value) ? 'login' : undefined;
 }
 
-function failureBlockKind(action: BrowserActionResult): 'login' | 'paywall' | undefined {
-  return action.ok ? undefined : blockedKind(action.error);
+function isBrowserSessionUnavailableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (['CdpUnavailable', 'AsideSessionUnavailableError', 'BrowserSessionUnavailableError'].includes(error.name)) return true;
+  return /^aside\s+session\b[\s\S]{0,40}\b(?:unavailable|blocked|disconnected|closed|refused|timed?\s*out)\b/i.test(error.message);
+}
+
+function failureBlockKind(action: BrowserActionResult): 'login' | 'paywall' | 'session' | undefined {
+  if (action.ok) return undefined;
+  if (action.reason === 'load-unavailable' || action.reason === 'session-unavailable') return 'session';
+  return blockedKind(action.error);
 }
 
 function recordRepairNode(node: BrowserHandRepairNode, deps: BrowserHandDeps): void {
@@ -148,7 +156,7 @@ function recordRepairNode(node: BrowserHandRepairNode, deps: BrowserHandDeps): v
 }
 
 function createRepairNode(input: {
-  block: 'login' | 'paywall';
+  block: 'login' | 'paywall' | 'session';
   sourceUrl: string;
   detourUrl: string;
   outcome: 'detoured' | 'detour-failed';
@@ -165,7 +173,9 @@ function createRepairNode(input: {
     node: `browser-repair-${orchestration}`,
     kind: 'hand' as const,
     decider: 'browser-hand' as const,
-    reason: `${input.block} blocked source; one alternate source checked`,
+    reason: input.block === 'session'
+      ? 'browser session unavailable; one alternate source checked'
+      : `${input.block} blocked source; one alternate source checked`,
     who: 'Elanous' as const,
     what: input.outcome === 'detoured' ? `Continue browser work from ${input.detourUrl}` : 'Stop after blocked browser source',
     missionId: input.issueId,
@@ -240,20 +250,35 @@ export async function dispatchBrowserHand(args: BrowserHandArgs, _ctx?: ToolRunt
   let repairNode: BrowserHandRepairNode | undefined;
   let sourceText: string | undefined;
   let capturedPath: string | undefined;
-  const runBrowserAction = async (actionUrl: string) => {
+  const runBrowserAction = async (actionUrl: string): Promise<BrowserActionResult> => {
     const observe = (event: string, data: Record<string, unknown>) => {
       if (event === BROWSER_ACT_EVENT) {
         const attachmentRef = data.attachmentRef;
         if (typeof attachmentRef === 'string' && attachmentRef.trim()) capturedPath = attachmentRef;
       }
-      (deps.browserActDeps?.observe ?? ((name, value) => debug.log(BROWSER_ACT_CATEGORY, name, value)))(event, data);
+      try {
+        (deps.browserActDeps?.observe ?? ((name, value) => debug.log(BROWSER_ACT_CATEGORY, name, value)))(event, data);
+      } catch { /* observers must not alter browser execution or fallback classification */ }
     };
-    return (deps.browserAct ?? performBrowserAction)({
-      url: actionUrl, target, armed: true, entryPoint: 'tool-runtime/browser-hand', ...(persona ? { persona } : {}),
-    }, { ...browserActDeps, observe, reversibilityPolicy: 'navigation-only' });
+    try {
+      return await (deps.browserAct ?? performBrowserAction)({
+        url: actionUrl, target, armed: true, entryPoint: 'tool-runtime/browser-hand', ...(persona ? { persona } : {}),
+      }, { ...browserActDeps, observe, reversibilityPolicy: 'navigation-only' });
+    } catch (error) {
+      // Only classified session failures enter the one-shot alternate path;
+      // observer/programming and other action exceptions remain ordinary failures.
+      const sessionUnavailable = isBrowserSessionUnavailableError(error);
+      return {
+        ok: false as const,
+        url: actionUrl,
+        target,
+        reason: sessionUnavailable ? 'load-unavailable' as const : 'execution-failed' as const,
+        error: sessionUnavailable ? 'browser session unavailable' : 'browser action failed',
+      };
+    }
   };
   try { sourceText = await inspect(url, pagePort); } catch { /* unavailable observation stays unknown */ }
-  let block = blockedKind(sourceText);
+  let block: 'login' | 'paywall' | 'session' | undefined = blockedKind(sourceText);
   if (block) {
     blocked = true;
     const alternate = args.alternateUrl?.trim() ?? '';
@@ -309,7 +334,12 @@ export async function dispatchBrowserHand(args: BrowserHandArgs, _ctx?: ToolRunt
     repairNode = createRepairNode({ block, sourceUrl: url, detourUrl: detoured ? actionUrl : '', outcome: detoured && action.ok ? 'detoured' : 'detour-failed', issueId, deps });
     recordRepairNode(repairNode, deps);
   }
-  if (!action.ok) return { ok: false, blocked, detoured, ...(repairNode ? { repairNode } : {}), reason: action.reason, output: `브라우저 작업이 안전 경계에서 중단되었습니다: ${action.reason}` };
+  if (!action.ok) return {
+    ok: false, blocked, detoured, ...(repairNode ? { repairNode } : {}), reason: action.reason,
+    output: block === 'session'
+      ? '브라우저 세션을 사용할 수 없고 허용된 대체 경로도 완료하지 못해 씬을 중단했습니다.'
+      : `브라우저 작업이 안전 경계에서 중단되었습니다: ${action.reason}`,
+  };
 
   let captureUrl: string | undefined;
   let attachmentId: string | undefined;

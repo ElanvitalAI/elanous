@@ -6,9 +6,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const ORIG = process.env.ELANOUS_SESSION_ROOT;
+let previousRoot: string | undefined;
 let tmp: string;
 beforeEach(async () => {
+  previousRoot = process.env.ELANOUS_SESSION_ROOT;
   tmp = mkdtempSync(join(tmpdir(), 'sess-p2-'));
   process.env.ELANOUS_SESSION_ROOT = tmp;
   const { _clearSubscriberIndexForTest } = await import('../src/session/index.js');
@@ -16,7 +17,7 @@ beforeEach(async () => {
 });
 afterEach(() => {
   if (tmp) rmSync(tmp, { recursive: true, force: true });
-  if (ORIG === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = ORIG;
+  if (previousRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = previousRoot;
 });
 
 describe('session_manage 구독 액션 (전 서피스 노출)', () => {
@@ -75,7 +76,7 @@ describe('presence 셀프힐 — reconcileSessionPresence(TTL)', () => {
     S.setSubscriberPresence(m.id, key, 'grace', tmp); // lastSeenAt = 실시간(전이 시점)
 
     // now 를 lastSeenAt 훨씬 이후로 주입 → TTL 초과 → 이탈.
-    const future = Date.now() + 10 * 60_000;
+    const future = Date.parse(S.listSubscribers(m.id)[0]!.lastSeenAt) + 60_001;
     const evicted = S.reconcileSessionPresence(m.id, { ttlMs: 60_000, now: future }, tmp);
     expect(evicted).toEqual([key]);
     expect(S.listSubscribers(m.id, { presence: 'left' }, tmp).length).toBe(1);
@@ -87,7 +88,8 @@ describe('presence 셀프힐 — reconcileSessionPresence(TTL)', () => {
     const key = S.subscriberKey('pwa', 'p');
     S.subscribeSession(m.id, { surface: 'pwa', endpoint: 'p' }, {}, tmp);
     S.setSubscriberPresence(m.id, key, 'grace', tmp);
-    const evicted = S.reconcileSessionPresence(m.id, { ttlMs: 10 * 60_000, now: Date.now() }, tmp);
+    const lastSeenAt = Date.parse(S.listSubscribers(m.id)[0]!.lastSeenAt);
+    const evicted = S.reconcileSessionPresence(m.id, { ttlMs: 10 * 60_000, now: lastSeenAt + 10 * 60_000 }, tmp);
     expect(evicted).toEqual([]);
     expect(S.listSubscribers(m.id, { presence: 'grace' }, tmp).length).toBe(1);
   });
@@ -100,7 +102,7 @@ describe('presence 셀프힐 — reconcileSessionPresence(TTL)', () => {
     S.setSubscriberPresence(a.id, S.subscriberKey('pwa', 'a'), 'grace', tmp);
     const b = S.createSession({ source: 'cli' }, tmp);
     S.subscribeSession(b.id, { surface: 'telegram', endpoint: 'b' }, {}, tmp); // active
-    const future = Date.now() + 10 * 60_000;
+    const future = Date.parse(S.listSubscribers(a.id)[0]!.lastSeenAt) + 60_001;
     const evicted = S.sweepSessionPresence({ ttlMs: 60_000, now: future }, tmp);
     expect(evicted).toBe(1);                                          // A 만 이탈
     expect(S.listSubscribers(a.id, { presence: 'left' }, tmp).length).toBe(1);

@@ -128,7 +128,11 @@ export async function runCompactPipeline(
                   .map(b => (b as { text: string }).text)
                   .join('\n');
             if (text.trim().length > 0) {
-              replayedUser = { role: 'user', content: text };
+              replayedUser = {
+                role: 'user',
+                content: text,
+                ...(m.transientTurnUser === true ? { transientTurnUser: true } : {}),
+              };
             }
             break;
           }

@@ -16,6 +16,90 @@ export interface ReleaseNoteFragment {
 export type ReleaseNoteSection = Omit<ReleaseNoteFragment, 'pr' | 'source' | 'mergeSha'>;
 type Section = ReleaseNoteSection;
 
+/** Evidence stored with one version's release facts. Commands stay internal; only HTTPS citations can accompany public copy. */
+export type ReleaseFactEvidence =
+  | { kind: 'url'; url: string; label: string }
+  | { kind: 'command'; command: string; result: string };
+
+export interface ReleaseFact {
+  id: string;
+  claim: string;
+  visibility: 'public' | 'internal';
+  evidence: ReleaseFactEvidence[];
+}
+
+export interface PublicReleaseFact {
+  claim: string;
+  citations: Array<{ label: string; url: string }>;
+}
+
+export interface PublicReleaseFacts {
+  version: string;
+  facts: PublicReleaseFact[];
+  problems: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validReleaseFactEvidence(value: unknown): value is ReleaseFactEvidence {
+  if (!isRecord(value)) return false;
+  if (value.kind === 'url') {
+    if (typeof value.url !== 'string' || typeof value.label !== 'string' || !value.label.trim()) return false;
+    try {
+      const url = new URL(value.url);
+      return url.protocol === 'https:' && !url.username && !url.password;
+    } catch { return false; }
+  }
+  return value.kind === 'command'
+    && typeof value.command === 'string' && !!value.command.trim()
+    && typeof value.result === 'string' && !!value.result.trim();
+}
+
+/** Parse version-bound facts fail-closed, then expose only cited facts explicitly marked public. */
+export function publicReleaseFacts(value: unknown, expectedVersion: string): PublicReleaseFacts {
+  const result: PublicReleaseFacts = { version: expectedVersion, facts: [], problems: [] };
+  if (!expectedVersion.trim()) {
+    result.problems.push('expected version must be non-empty');
+    return result;
+  }
+  if (!isRecord(value) || typeof value.version !== 'string' || !Array.isArray(value.facts)) {
+    result.problems.push('document must contain version and facts[]');
+    return result;
+  }
+  if (!value.version.trim()) {
+    result.problems.push('document version must be non-empty');
+    return result;
+  }
+  if (value.version !== expectedVersion) {
+    result.problems.push(`version mismatch: expected ${expectedVersion}, got ${value.version}`);
+    return result;
+  }
+
+  for (const [index, candidate] of value.facts.entries()) {
+    if (!isRecord(candidate)
+      || typeof candidate.id !== 'string' || !candidate.id.trim()
+      || typeof candidate.claim !== 'string' || !candidate.claim.trim()
+      || (candidate.visibility !== 'public' && candidate.visibility !== 'internal')
+      || !Array.isArray(candidate.evidence)
+      || !candidate.evidence.every(validReleaseFactEvidence)) {
+      result.problems.push(`facts[${index}] is invalid`);
+      continue;
+    }
+    if (candidate.visibility !== 'public') continue;
+    const citations = (candidate.evidence as ReleaseFactEvidence[])
+      .filter((evidence): evidence is Extract<ReleaseFactEvidence, { kind: 'url' }> => evidence.kind === 'url')
+      .map(({ label, url }) => ({ label, url }));
+    if (citations.length === 0) {
+      result.problems.push(`facts[${index}] is public but has no HTTPS citation`);
+      continue;
+    }
+    result.facts.push({ claim: candidate.claim, citations });
+  }
+  return result;
+}
+
 /** Blank out fenced code blocks (``` / ~~~) line-for-line so example headings and fields inside them are never read as the real section. */
 function blankFencedCode(text: string): string {
   let fence: string | null = null;

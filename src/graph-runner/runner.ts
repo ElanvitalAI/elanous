@@ -33,6 +33,7 @@ import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps 
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride, type GateShardRerouteOverride } from '../../scripts/release-loop/resume.js';
 import { resolveChildAllowance } from './arg-allowance.js';
 import { emitReleaseStageTransition, postReleaseStageMail, type ReleaseStageState } from '../release-loop/stage-mail.js';
+import { openMsgStore } from '../msg/msg-store.js';
 
 type BashRun = WorkflowDeps['runBash'];
 
@@ -1123,7 +1124,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   };
   const emitReleaseStage = (nodeId: string, stage: ReleaseStageState): boolean => {
     return emitReleaseStageTransition(graphId, state.dryRun, { runId, nodeId, state: stage },
-      options.deps?.releaseStageMail ?? postReleaseStageMail);
+      options.deps?.releaseStageMail ?? ((mail) => postReleaseStageMail(mail, {
+        configPath: join(root, 'config.json'),
+        openStore: () => openMsgStore(join(root, 'msg', 'messages.db')),
+      })));
   };
   const baseLog = options.deps?.log ?? ((event: string, data: Record<string, unknown>) => debug.log('graph.runner', event, data));
   // RFC §U: every event of a unit (child) run carries its parentRunId.

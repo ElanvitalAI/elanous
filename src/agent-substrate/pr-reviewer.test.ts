@@ -1641,4 +1641,68 @@ describe('reviewPullRequest — VERDICT 줄 없는 응답 fail-closed', () => {
       else process.env.ELANOUS_PR_REVIEW_DIFF_CHARS = prev;
     }
   });
+
+  it('같은 위치의 다른 대상 blocker는 UNVERIFIED가 제거하지 않고, 같은 finding 반복은 접는다', () => {
+    const result = parseReviewResult([
+      'VERDICT: FAIL', 'MUST-FIX:',
+      '- Authorization check missing for guest production requests at src/a.ts:140',
+      '- Authorization check missing for guest production requests at src/a.ts:140',
+      'UNVERIFIED:', '- Authorization check missing for admin production requests at src/a.ts:140 — omitted hunk',
+    ].join('\n'));
+    expect(result).toMatchObject({ verdict: 'fail', mustFix: ['Authorization check missing for guest production requests at src/a.ts:140'] });
+    const sameLocationDistinct = parseReviewResult([
+      'VERDICT: FAIL', 'MUST-FIX:',
+      '- Cache invalidation at src/a.ts:140 — writes leave stale data',
+      '- Cache invalidation at src/a.ts:140 — deletes leave stale data',
+    ].join('\n'));
+    expect(sameLocationDistinct.mustFix).toHaveLength(2);
+    const longSharedContext = parseReviewResult([
+      'VERDICT: FAIL', 'MUST-FIX:',
+      '- Authorization validation for the production transaction path must preserve all session metadata and reject guest requests before cached response reuse at src/a.ts:140',
+      '- Authorization validation for the production transaction path must preserve all session metadata and reject admin requests before cached response reuse at src/a.ts:140',
+    ].join('\n'));
+    expect(longSharedContext.mustFix).toHaveLength(2);
+    const numberedTargets = parseReviewResult([
+      'VERDICT: FAIL', 'MUST-FIX:',
+      '- Cache entry record 1 remains stale at src/a.ts:140',
+      '- Cache entry record 2 remains stale at src/a.ts:140',
+    ].join('\n'));
+    expect(numberedTargets.mustFix).toHaveLength(2);
+    const shortActions = parseReviewResult([
+      'VERDICT: FAIL', 'MUST-FIX:',
+      '- Authorization is on for guest requests at src/a.ts:140',
+      '- Authorization is off for guest requests at src/a.ts:140',
+      '- Allow guest requests and deny admin requests at src/a.ts:141',
+      '- Deny guest requests and allow admin requests at src/a.ts:141',
+    ].join('\n'));
+    expect(shortActions.mustFix).toHaveLength(4);
+  });
+
+  it('fold compares blockers beyond the public six-item cap before applying UNVERIFIED', () => {
+    const blockers = Array.from({ length: 7 }, (_, index) => `Blocker token${index} corrupts field${index} during path${index}`);
+    const parsed = parseReviewResult(['VERDICT: FAIL', 'MUST-FIX:', ...blockers.map((item) => `- ${item}`)].join('\n'));
+    expect(parsed.mustFix).toHaveLength(6);
+    const unverified = parseReviewResult(['VERDICT: WARN', 'UNVERIFIED:', ...blockers.slice(0, 6).map((item) => `- ${item}`)].join('\n'));
+    expect(foldReviewResults([parsed, unverified])).toMatchObject({ verdict: 'fail', mustFix: [blockers[6]] });
+  });
+
+  it('전체 UNVERIFIED를 pass 사이에서 비교하고 독립 FAIL은 WARN으로 낮추지 않는다', () => {
+    const first = parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- Authorization check missing at src/a.ts:140');
+    const second = parseReviewResult([
+      'VERDICT: WARN', 'UNVERIFIED:', ...Array.from({ length: 6 }, (_, index) => `- unrelated observation ${index}`),
+      '- Authorization check missing at src/a.ts:140 — omitted hunk',
+    ].join('\n'));
+    expect(foldReviewResults([first, second])).toMatchObject({ verdict: 'warn', mustFix: [] });
+    expect(parseReviewResult('VERDICT: FAIL\nSHOULD-FIX:\n- unrelated cleanup\nUNVERIFIED:\n- other finding at src/a.ts:140 — omitted hunk').verdict)
+      .toBe('fail');
+    expect(parseReviewResult('VERDICT: FAIL\nSHOULD-FIX:\n- unrelated cleanup\nUNVERIFIED:\n- other finding at src/a.ts:140 — omitted hunk'))
+      .toMatchObject({ verdict: 'fail', mustFix: ['unrelated cleanup'] });
+    const repeated = parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- Authorization check missing at src/a.ts:140');
+    const paraphrase = parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- Authorization check probably missing at src/a.ts:140');
+    expect(foldReviewResults([repeated, paraphrase]).mustFix).toHaveLength(2);
+    const omitted = parseReviewResult('VERDICT: WARN\nUNVERIFIED:\n- Authorization check missing at src/a.ts:140 — omitted hunk');
+    expect(foldReviewResults([repeated, omitted])).toMatchObject({ verdict: 'warn', mustFix: [] });
+    const emptyToken = parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- IO');
+    expect(foldReviewResults([emptyToken, parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- IO')]).mustFix).toEqual(['IO']);
+  });
 });

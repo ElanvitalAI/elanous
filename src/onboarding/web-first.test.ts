@@ -190,7 +190,7 @@ test('bare first run with no daemon switches to offline TUI without launching or
     expect(await runWebFirstSetup(deps)).toBe('fallback');
     expect(Date.now() - began).toBeLessThan(3_000);
     expect({ starts, probes }).toEqual({ starts: 0, probes: 0 });
-    expect(lines).toEqual(['오프라인 모드']);
+    expect(lines).toEqual(['웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다']);
   }
 });
 
@@ -200,13 +200,44 @@ test('bare first run with a healthy daemon still shows the web link without star
   expect(lines).toContain('http://127.0.0.1:4321/setup#t=secret%2B%2F%3D');
 });
 
-test('bare first run checks running daemon health only once before offline fallback', async () => {
-  let probes = 0;
-  const { deps, lines } = fixture({ startIfMissing: false, probeHealth: async () => { probes++; return false; },
-    startDaemon: async () => { throw Error('must not start'); } });
+test('bare first run preserves an unknown daemon inspection instead of claiming it is absent', async () => {
+  let starts = 0;
+  const { deps, lines } = fixture({
+    startIfMissing: false,
+    showNexus: async () => { throw new Error('inspection unavailable'); },
+    startDaemon: async () => { starts++; throw Error('must not start'); },
+  });
   expect(await runWebFirstSetup(deps)).toBe('fallback');
-  expect(probes).toBe(1);
-  expect(lines).toEqual(['오프라인 모드']);
+  expect(starts).toBe(0);
+  expect(lines).toEqual(['웹 셋업 데몬 상태를 확인하지 못했습니다 · 터미널 설정을 계속합니다']);
+});
+
+test('bare first run distinguishes a running daemon without setup URLs from health failure', async () => {
+  const { deps, lines } = fixture({
+    startIfMissing: false,
+    showNexus: async () => ({ exitCode: 0, status: 'unregistered' } as NexusShowResult),
+    startDaemon: async () => { throw Error('must not start'); },
+  });
+  expect(await runWebFirstSetup(deps)).toBe('fallback');
+  expect(lines).toEqual(['웹 셋업 데몬은 실행 중이지만 셋업 주소를 확인할 수 없습니다 · 터미널 설정을 계속합니다']);
+});
+
+test('bare first run reports failed and throwing health probes separately from daemon inspection', async () => {
+  for (const probeMode of ['false', 'throws'] as const) {
+    let probes = 0;
+    const { deps, lines } = fixture({
+      startIfMissing: false,
+      probeHealth: async () => {
+        probes++;
+        if (probeMode === 'throws') throw new Error('health endpoint unavailable');
+        return false;
+      },
+      startDaemon: async () => { throw Error('must not start'); },
+    });
+    expect(await runWebFirstSetup(deps)).toBe('fallback');
+    expect(probes).toBe(1);
+    expect(lines).toEqual(['웹 셋업 데몬은 실행 중이지만 헬스 확인에 실패했습니다 · 터미널 설정을 계속합니다']);
+  }
 });
 
 // must-fix 3 red witness: 한국어 fallback 문면은 전역 ELANOUS_LANG 없이 deps.locale
@@ -220,7 +251,7 @@ test('ko fallback wording comes from deps.locale and the shared process env stay
     const { deps, lines } = fixture({ startIfMissing: false,
       showNexus: async () => ({ exitCode: 1, status: 'absent' } as NexusShowResult) });
     expect(await runWebFirstSetup(deps)).toBe('fallback');
-    expect(lines).toEqual(['오프라인 모드']);
+    expect(lines).toEqual(['웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다']);
     expect(process.env.ELANOUS_LANG).toBeUndefined();
   } finally {
     if (saved === undefined) delete process.env.ELANOUS_LANG;
@@ -617,8 +648,8 @@ test('FIRST-RUN-EN-LOCALE: LANG=en_US.UTF-8 real CLI (no ELANOUS_LANG) prints En
       { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60_000 });
     const text = child.stdout + child.stderr;
     expect(child.error).toBeUndefined();
-    expect(text).toContain('offline mode');
-    expect(text).not.toContain('오프라인 모드');
+    expect(text).toContain('web setup daemon is not running yet; continuing in terminal setup');
+    expect(text).not.toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 120_000);
 
@@ -635,7 +666,7 @@ test('FIRST-RUN-EN-LOCALE: LANG=ko_KR.UTF-8 control keeps Korean web-first offli
       { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60_000 });
     const text = child.stdout + child.stderr;
     expect(child.error).toBeUndefined();
-    expect(text).toContain('오프라인 모드');
-    expect(text).not.toContain('offline mode');
+    expect(text).toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
+    expect(text).not.toContain('web setup daemon is not running yet; continuing in terminal setup');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 120_000);

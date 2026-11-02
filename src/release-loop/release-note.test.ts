@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, openSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, readReleaseNotes, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment } from './release-note.js';
+import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, readReleaseNotes, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, publicReleaseFacts, type ReleaseNoteFragment } from './release-note.js';
 import { debug } from '../debug/log.js';
 
 const scratch: string[] = [];
@@ -11,6 +11,41 @@ afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: 
 const fragment: ReleaseNoteFragment = {
   pr: 42, line: '사용자에게 보이는 개선', kind: 'feat', docs: { path: 'release/public/docs/cli.md' }, target: 'next', source: 'pr-body',
 };
+
+test('release facts are version-bound and only cited public facts become publication candidates', () => {
+  const document = {
+    version: '0.2.45',
+    facts: [
+      { id: 'users', claim: '40 teams adopted the feature', visibility: 'public', evidence: [{ kind: 'url', url: 'https://example.com/report', label: 'release report' }] },
+      { id: 'internal-count', claim: 'Internal run count: 97', visibility: 'internal', evidence: [{ kind: 'command', command: 'elanous logs --since 1d', result: '97 runs' }] },
+      { id: 'uncited-count', claim: '12 internal trials', visibility: 'public', evidence: [] },
+      { id: 'command-only', claim: 'The feature shipped', visibility: 'public', evidence: [{ kind: 'command', command: 'git log -1', result: 'abc123' }] },
+      { id: 'unsafe-url', claim: 'Untrusted citation', visibility: 'public', evidence: [{ kind: 'url', url: 'javascript:alert(1)', label: 'bad' }] },
+      { id: 'mixed-citation', claim: 'Bad citation mixture', visibility: 'public', evidence: [{ kind: 'url', url: 'https://example.com/good', label: 'good' }, { kind: 'url', url: 'https://user:secret@example.com/private', label: 'credentialed' }] },
+    ],
+  };
+  expect(publicReleaseFacts(document, '0.2.45')).toEqual({
+    version: '0.2.45',
+    facts: [{ claim: '40 teams adopted the feature', citations: [{ label: 'release report', url: 'https://example.com/report' }] }],
+    problems: [
+      'facts[2] is public but has no HTTPS citation',
+      'facts[3] is public but has no HTTPS citation',
+      'facts[4] is invalid',
+      'facts[5] is invalid',
+    ],
+  });
+});
+
+test('release facts reject a different version and malformed documents without exposing claims', () => {
+  expect(publicReleaseFacts({ version: '0.2.44', facts: [{ id: 'x', claim: 'private number 99', visibility: 'public', evidence: [{ kind: 'url', url: 'https://example.com', label: 'source' }] }] }, '0.2.45'))
+    .toEqual({ version: '0.2.45', facts: [], problems: ['version mismatch: expected 0.2.45, got 0.2.44'] });
+  expect(publicReleaseFacts({ facts: [] }, '0.2.45'))
+    .toEqual({ version: '0.2.45', facts: [], problems: ['document must contain version and facts[]'] });
+  expect(publicReleaseFacts({ version: '', facts: [] }, '0.2.45'))
+    .toEqual({ version: '0.2.45', facts: [], problems: ['document version must be non-empty'] });
+  expect(publicReleaseFacts({ version: '', facts: [] }, ''))
+    .toEqual({ version: '', facts: [], problems: ['expected version must be non-empty'] });
+});
 
 test('valid four-field PR section parses and render/parse round trips', () => {
   const section = `Intro\n${renderReleaseNoteSection(fragment)}\n## 다른 절\n- 대상: later\n`;

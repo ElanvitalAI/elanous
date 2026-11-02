@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
-import { alternateRepairModel, repairModelAvailability, resolveRepairOwner, runRepairCycle, type RepairLaunchRequest } from './repair-cycle.js';
+import { aggregateRepairTierModel, alternateRepairModel, repairModelAvailability, resolveRepairOwner, runRepairCycle, type RepairLaunchRequest, type RepairTierModelSource } from './repair-cycle.js';
 import { applyRepairBundle, REPAIR_BUNDLE_REF, type RepairCasDeps, type RepairCasRequest } from './repair-branch-cas.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
 import { addItem } from '../release-loop/checklist.js';
@@ -27,6 +27,60 @@ function fixture() {
     modelAvailability: { codexSubscription: false, grokSubscription: false }, ...over });
   return { dir, statePath, card, input };
 }
+
+test('REPAIR-TIER-MODEL: aggregate the first post-merge 24h window without writing the ledger', () => {
+  const mergedAt = '2026-10-13T08:00:00.000Z';
+  const cards: RepairTierModelSource[] = [
+    { taskId: 'ta-high', tier: '상', repairs: [
+      { pr: 30, at: '2026-10-13T07:59:59.000Z', runId: 'before-merge', fromModel: 'glm/glm-5.3', toModel: 'openai-codex/gpt-6-sol', status: 'failed' },
+      { pr: 30, at: '2026-10-13T09:00:00.000Z', runId: 'first-sol', fromModel: 'glm/glm-5.3', toModel: 'openai-codex/gpt-6-sol', status: 'failed' },
+      { pr: 30, at: '2026-10-14T09:00:00.000Z', runId: 'outside-window', fromModel: 'glm/glm-5.3', toModel: 'openai-codex/gpt-6-sol', status: 'applied' },
+    ] },
+    { taskId: 'ta-mid', tier: '중', repairs: [
+      { pr: 31, at: '2026-10-13T10:00:00.000Z', runId: 'mid-glm', fromModel: 'openrouter/z-ai/glm-5.3', toModel: 'openrouter/z-ai/glm-5.3', status: 'applied' },
+    ] },
+    { taskId: 'ta-unknown', repairs: [
+      { pr: 32, at: '2026-10-14T08:59:00.000Z', runId: 'unknown-luna', fromModel: 'glm/glm-5.3', toModel: 'openai-codex/gpt-6-luna', status: 'requested' },
+    ] },
+  ];
+
+  const snapshot = structuredClone(cards);
+  const result = aggregateRepairTierModel({ cards, mergedAt, observedAt: '2026-10-14T09:00:00.000Z' });
+  expect(result).toMatchObject({ status: 'measured', n: 3,
+    window: { from: '2026-10-13T09:00:00.000Z', until: '2026-10-14T09:00:00.000Z' } });
+  expect(result.byTierModel).toEqual([
+    { tier: 'unknown', model: 'openai-codex/gpt-6-luna', n: 1 },
+    { tier: '상', model: 'openai-codex/gpt-6-sol', n: 1 },
+    { tier: '중', model: 'openrouter/z-ai/glm-5.3', n: 1 },
+  ]);
+  expect(result.solTargets).toEqual([{ taskId: 'ta-high', pr: 30, runId: 'first-sol', at: '2026-10-13T09:00:00.000Z',
+    tier: '상', fromModel: 'glm/glm-5.3', toModel: 'openai-codex/gpt-6-sol', status: 'failed' }]);
+  expect(cards).toEqual(snapshot);
+});
+
+test('REPAIR-TIER-MODEL: N=0 stays unmeasured', () => {
+  expect(aggregateRepairTierModel({ cards: [], mergedAt: '2026-10-13T08:00:00.000Z', observedAt: '2026-10-15T08:00:00.000Z' }))
+    .toEqual({ status: 'unmeasured', reason: 'no-post-merge-repair', n: 0, byTierModel: [], solTargets: [] });
+});
+
+
+
+test('REPAIR-TIER-MODEL: observedAt is an exclusive snapshot boundary', () => {
+  const result = aggregateRepairTierModel({ cards: [{ taskId: 'ta-first', tier: '특', repairs: [
+    { pr: 30, at: '2026-10-13T09:00:00.000Z', runId: 'first', fromModel: 'glm', toModel: 'openai-codex/gpt-6-sol', status: 'failed' },
+    { pr: 30, at: '2026-10-13T10:00:00.000Z', runId: 'at-observation', fromModel: 'glm', toModel: 'openrouter/z-ai/glm-5.3', status: 'applied' },
+  ] }], mergedAt: '2026-10-13T08:00:00.000Z', observedAt: '2026-10-13T10:00:00.000Z' });
+  expect(result).toMatchObject({ status: 'unmeasured', reason: 'window-incomplete', n: 1 });
+  expect(result.byTierModel).toEqual([{ tier: '특', model: 'openai-codex/gpt-6-sol', n: 1 }]);
+});
+
+test('REPAIR-TIER-MODEL: incomplete first post-merge 24h window stays unmeasured', () => {
+  const result = aggregateRepairTierModel({ cards: [{ taskId: 'ta-first', tier: '특', repairs: [
+    { pr: 30, at: '2026-10-13T09:00:00.000Z', runId: 'first', fromModel: 'glm', toModel: 'openai-codex/gpt-6-sol', status: 'failed' },
+  ] }], mergedAt: '2026-10-13T08:00:00.000Z', observedAt: '2026-10-13T10:00:00.000Z' });
+  expect(result).toMatchObject({ status: 'unmeasured', reason: 'window-incomplete', n: 1,
+    window: { from: '2026-10-13T09:00:00.000Z', until: '2026-10-14T09:00:00.000Z' } });
+});
 
 test('supervisor report-deficit consumes the same evidence without requesting a PR repair', async () => {
   const f = fixture();

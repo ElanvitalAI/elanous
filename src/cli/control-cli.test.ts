@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONTROL_PORT, ensureControlTokens } from '../control-plane/server.js';
 import { issueMemberToken, machineForToken } from '../control-plane/member-tokens.js';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -38,6 +40,23 @@ function root() {
   roots.push(dir);
   return dir;
 }
+async function readStartupLine(reader: ReadableStreamDefaultReader<Uint8Array>, label: string): Promise<string> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      (async () => {
+        let text = '';
+        while (!text.includes('\n')) {
+          const chunk = await reader.read();
+          if (chunk.done) throw new Error(`control serve exited before startup line: ${text}`);
+          text += new TextDecoder().decode(chunk.value);
+        }
+        return text.slice(0, text.indexOf('\n'));
+      })(),
+      new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(label)), 15_000); }),
+    ]);
+  } finally { if (timeout) clearTimeout(timeout); }
+}
 function launch(dir: string, ...args: string[]) {
   const child = Bun.spawn(['bun', entry, `--test=${dir}`, ...args], {
     cwd, env: {
@@ -53,28 +72,32 @@ function launch(dir: string, ...args: string[]) {
   children.push(child);
   return child;
 }
-async function command(dir: string, ...args: string[]) {
+async function realCommand(dir: string, ...args: string[]) {
   const child = launch(dir, ...args);
   const [code, stdout, stderr] = await Promise.all([
     child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
   ]);
   return { code, stdout, stderr };
 }
+async function command(dir: string, ...args: string[]) {
+  const path = args[0] === 'resources'
+    ? args[1]?.startsWith('-') || args.length === 1 ? args.slice(0, 1) : args.slice(0, 2)
+    : args[1] === 'token' ? args.slice(0, 3)
+      : args[1]?.startsWith('-') || args.length === 1 ? args.slice(0, 1) : args.slice(0, 2);
+  const previousHome = process.env.HOME;
+  process.env.HOME = dir;
+  try {
+    const result = await simInProcessCli(args, { stateRoot: dir, allowPaths: [path] });
+    return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+  }
+}
 async function serve(dir: string) {
   const child = launch(dir, 'control', 'serve', '--port', '0');
   const reader = child.stdout.getReader();
-  const line = await Promise.race([
-    (async () => {
-      let text = '';
-      while (!text.includes('\n')) {
-        const chunk = await reader.read();
-        if (chunk.done) throw new Error(`control serve exited before startup line: ${text}`);
-        text += new TextDecoder().decode(chunk.value);
-      }
-      return text.slice(0, text.indexOf('\n'));
-    })(),
-    Bun.sleep(15_000).then(() => { throw new Error('control serve startup timeout'); }),
-  ]);
+  const line = await readStartupLine(reader, 'control serve startup timeout');
   reader.releaseLock();
   const port = /관제부 127\.0\.0\.1:(\d+) · 토큰 /.exec(line)?.[1];
   expect(port).toBeDefined();
@@ -96,14 +119,14 @@ test('real control status --json returns seven rows and the table distinguishes 
   mkdirSync(installRoot, { recursive: true });
   const testCommit = 'a'.repeat(40);
   writeFileSync(join(installRoot, 'install.json'), JSON.stringify({ version: '0.0.0-test', commit: testCommit }));
-  const result = await command(dir, 'control', 'status', '--json');
+  const result = await realCommand(dir, 'control', 'status', '--json');
   expect(result.code).toBe(0);
   const { rows } = JSON.parse(result.stdout) as { rows: Array<{ row: string; state: string; reason?: string }> };
   expect(rows).toHaveLength(7);
   expect(rows.map(r => r.row)).toEqual(['집', '판', '자원', '자격', '동결·몫', '루프', 'config']);
   expect(rows[1]).toMatchObject({ row: '판', state: 'ok', text: `설치본 0.0.0-test · ${testCommit}` });
   for (const row of rows.slice(2, 4)) expect(row).toMatchObject({ state: 'unmeasured', reason: expect.any(String) });
-  const table = await command(dir, 'control', 'status');
+  const table = await realCommand(dir, 'control', 'status');
   expect(table.code).toBe(0);
   expect(table.stdout.trim().split('\n')).toHaveLength(7);
   expect(table.stdout).toContain(`판 · 정상 · 설치본 0.0.0-test · ${testCommit}`);
@@ -235,8 +258,8 @@ test('control serve --host forwards a permitted host and rejects a public bind b
   const child = launch(dir, 'control', 'serve', '--host', '127.0.0.1', '--port', '0');
   const reader = child.stdout.getReader();
   try {
-    const line = await Promise.race([reader.read(), Bun.sleep(15_000).then(() => { throw new Error('startup timeout'); })]);
-    expect(new TextDecoder().decode(line.value)).toContain('관제부 127.0.0.1:');
+    const line = await readStartupLine(reader, 'startup timeout');
+    expect(line).toContain('관제부 127.0.0.1:');
   } finally { reader.releaseLock(); child.kill('SIGTERM'); await child.exited; }
 });
 
@@ -310,10 +333,7 @@ test('real CLI --follow-lease reports its bucket and keeps serving when GCS cann
   children.push(child);
   const reader = child.stdout.getReader();
   try {
-    const line = await Promise.race([
-      reader.read().then(result => new TextDecoder().decode(result.value)),
-      Bun.sleep(15_000).then(() => { throw new Error('follow-lease startup timeout'); }),
-    ]);
+    const line = await readStartupLine(reader, 'follow-lease startup timeout');
     expect(line).toContain('임대 따름 · gs://example-bucket · 나=');
     const port = /관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!;
     const primary = await fetch(`http://127.0.0.1:${port}/v1/primary`, { signal: AbortSignal.timeout(30_000) });
@@ -349,7 +369,7 @@ test('control serve follows the lease only when opted in', async () => {
     const active = runControlServe({ port: '0', followLease, bucket: followLease ? 'gs://example-bucket' : 'ignored-without-follow-lease', read, machine: 'mbp', signal: controller.signal });
     const stop = async () => { controller.abort(); await active; };
     try {
-      for (let n = 0; n < 100 && logs.length === 0; n++) await Bun.sleep(10);
+      expect(logs).toHaveLength(1);
       const line = logs.shift()!;
       expect(line).toContain('관제부 127.0.0.1:');
       return { active, stop, port: /관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!, line };
@@ -367,12 +387,14 @@ test('control serve follows the lease only when opted in', async () => {
       expect(denied.headers.get('x-primary-generation')).toBe('7');
       expect(await denied.json()).toEqual({ error: 'not-primary', holder: 'fixture-node', generation: 7 });
       expect(readCount).toBeGreaterThan(0);
-      holder = 'mbp';
-      await Bun.sleep(10_050);
-      const accepted = await register(followed.port);
-      expect(accepted.status).toBe(200);
-      expect(accepted.headers.get('x-primary-generation')).toBe('8');
-      expect((await accepted.json() as { name: string }).name).toBe('demo');
+      await withSimClock(Date.now(), async clock => {
+        holder = 'mbp';
+        clock.tick(10_050);
+        const accepted = await register(followed.port);
+        expect(accepted.status).toBe(200);
+        expect(accepted.headers.get('x-primary-generation')).toBe('8');
+        expect((await accepted.json() as { name: string }).name).toBe('demo');
+      });
     } finally { await followed.stop(); }
     const legacy = await launchInProcess(false);
     try {
@@ -400,7 +422,7 @@ async function withHqControl(readHq: NonNullable<Parameters<typeof runControlSer
   const controller = new AbortController();
   const active = runControlServe({ port: '0', followHqLease: true, machine: 'role-alias', hqHostName: 'mbp', readHq, signal: controller.signal });
   try {
-    for (let n = 0; n < 100 && lines.length === 0; n++) await Bun.sleep(10);
+    expect(lines).toHaveLength(1);
     const line = lines[0]!;
     expect(line).toContain('HQ 임대 따름 · 나=mbp');
     await check(/관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!, dir);

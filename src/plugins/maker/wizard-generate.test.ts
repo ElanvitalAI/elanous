@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, readdirSync, mkdirSync, symlinkSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { debug } from '../../debug/log.js';
 import { validatePluginDir } from './plugin-maker.js';
 import { runGraph } from '../../graph-runner/runner.js';
 import { generateWizardFiles, listWizardDrafts, saveWizardDraft, type WizardResearchDraft } from './wizard-generate.js';
@@ -35,6 +36,59 @@ test('research draft writes structurally valid files, declared secret names only
   expect(parseYaml(skill.split('---')[1]!)).toMatchObject({ name: 'weather-research', requires: ['openai'] });
   expect(skill).toContain('Read the forecast before answering.');
   expect(readdirSync(dir).sort()).toEqual(['README.md', 'examples', 'graphs', 'plugin.json', 'skills']);
+});
+
+test('successful scaffold generations emit one minimal redacted shadow receipt each', () => {
+  const dir = temp();
+  const receipts: Array<{ slug: string; writtenPaths: string[] }> = [];
+  const emit = (receipt: { slug: string; writtenPaths: string[] }) => { receipts.push(receipt); };
+  const privateDraft: WizardResearchDraft = {
+    description: 'PROMPT_SENTINEL never goes into the receipt',
+    connectors: [{ id: 'weather', credentials: [{ name: 'WEATHER_API_KEY' }] }],
+    skill: { description: 'DESCRIPTION_SENTINEL', instructions: 'CONTENT_SENTINEL', requires: ['openai'] },
+  };
+
+  const firstPaths = generateWizardFiles(dir, 'shadow-research', privateDraft, { onShadowReceipt: emit });
+  expect(receipts).toEqual([{ slug: 'shadow-research', writtenPaths: firstPaths }]);
+  expect(Object.keys(receipts[0]!).sort()).toEqual(['slug', 'writtenPaths']);
+  const secondPaths = generateWizardFiles(dir, 'shadow-research', {
+    description: 'REVISED_PROMPT_SENTINEL', connectors: [],
+    skill: { description: 'REVISED_DESCRIPTION_SENTINEL', instructions: 'REVISED_CONTENT_SENTINEL', requires: [] },
+  }, { regenerate: true, onShadowReceipt: emit });
+  expect(receipts).toEqual([
+    { slug: 'shadow-research', writtenPaths: firstPaths },
+    { slug: 'shadow-research', writtenPaths: secondPaths },
+  ]);
+  expect(JSON.stringify(receipts)).not.toMatch(/PROMPT_SENTINEL|DESCRIPTION_SENTINEL|CONTENT_SENTINEL|WEATHER_API_KEY|REVISED_/);
+  expect(() => generateWizardFiles(dir, 'shadow-research', privateDraft, { onShadowReceipt: emit })).toThrow('already exists');
+  expect(receipts).toHaveLength(2);
+});
+
+test('default scaffold generation emits one safe debug receipt and observer failures do not fail generation', () => {
+  const dir = temp();
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const unregister = debug.registerSink({ name: 'wizard-generation-shadow-test', emit: record => {
+    if (record.category === 'plugin.wizard' && record.event === 'generation-shadow-receipt') events.push(record);
+  } });
+  try {
+    const writtenPaths = generateWizardFiles(dir, 'default-shadow', draft);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ category: 'plugin.wizard', event: 'generation-shadow-receipt',
+      data: { slug: 'default-shadow', writtenPaths } });
+    expect(Object.keys(events[0]!.data as object).sort()).toEqual(['slug', 'writtenPaths']);
+    const safeData = JSON.stringify(events[0]!.data);
+    expect(safeData).not.toContain(draft.description);
+    expect(safeData).not.toContain(draft.skill!.instructions);
+    expect(safeData).not.toContain('WEATHER_API_KEY');
+  } finally {
+    unregister();
+  }
+
+  const callbackDir = temp();
+  expect(() => generateWizardFiles(callbackDir, 'observer-failure', draft, {
+    onShadowReceipt: () => { throw new Error('observer unavailable'); },
+  })).not.toThrow();
+  expect(readFileSync(join(callbackDir, 'plugin.json'), 'utf8')).toContain('observer-failure');
 });
 
 test('declared knowledge packs go to plugin requires, while resource requires stay in skill metadata and survive inventory reload', async () => {

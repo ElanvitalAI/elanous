@@ -16,7 +16,7 @@ const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': {
 const CODEX_AUTH = JSON.stringify({ tokens: { access_token: 'access', refresh_token: 'refresh' } });
 const config = (provider?: string, fastPath = true) => ({ llm: { provider }, chat: { fastPath } }) as UserConfig;
 
-type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; gitAvailable?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[]; firstRunTopics?: boolean };
+type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; gitAvailable?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[]; firstRunTopics?: boolean; doctorFixThrows?: boolean; providerWriteThrows?: boolean };
 
 async function runSetup(state: SetupState = {}) {
   const output: string[] = [];
@@ -42,7 +42,7 @@ async function runSetup(state: SetupState = {}) {
       return value;
     },
     getUserConfig: () => ({ ...config(currentProvider, state.fastPath), skills: { ...config(currentProvider, state.fastPath).skills, deny: deniedSkills } }),
-    saveUserConfig: (next) => { writes.push(next); currentProvider = next.llm.provider; deniedSkills = next.skills.deny ?? []; },
+    saveUserConfig: (next) => { if (state.providerWriteThrows) throw new Error("save failed"); writes.push(next); currentProvider = next.llm.provider; deniedSkills = next.skills.deny ?? []; },
     detectSkillCliAuth: () => detectSkillCliAuth({ path: state.cliPath ?? '' }),
     runDoctor: () => {
       doctorCalls += 1;
@@ -56,7 +56,7 @@ async function runSetup(state: SetupState = {}) {
       };
     },
     prompt: async (message) => { prompts.push(message); return message.startsWith('추천대로') ? state.recommendationAnswer : state.answer; },
-    runDoctorFix: async (args) => { doctorFixCalls.push([...args]); return state.doctorFixExitCode ?? 0; },
+    runDoctorFix: async (args) => { doctorFixCalls.push([...args]); if (state.doctorFixThrows) throw new Error("fix failed"); return state.doctorFixExitCode ?? 0; },
     isStdinTty: () => state.stdinTty === true,
     out: { log: (line) => output.push(line), error: (line) => errors.push(line) },
     setExitCode: (code) => exitCodes.push(code),
@@ -215,42 +215,47 @@ test('starter topics and watch opt-out survive user-config save and reload', () 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('first-run setup asks for topics even when provider is auto', async () => {
+test('first-run setup uses one consent and does not prompt for starter topics', async () => {
   const root = mkdtempSync(join(tmpdir(), 'watch-first-provider-'));
   let cfg = { ...config('auto'), skills: { deny: [], allow: [] } } as unknown as UserConfig;
+  const prompts: string[] = [];
+  const output: string[] = [];
+  let fixes = 0;
   const program = new Command();
   try {
     registerSetupCommand(program, {
       firstRunTopics: true, watchRoot: root, getUserConfig: () => cfg, saveUserConfig: (next) => { cfg = next; },
       runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }), detectSkillCliAuth: () => [],
-      isStdinTty: () => true, prompt: async (message) => message.startsWith('관심 주제') ? 'AI agents' : 'y',
-      out: { log: () => {} }, setExitCode: () => {}, runDoctorFix: async () => 0,
+      isStdinTty: () => true, prompt: async (message) => { prompts.push(message); return 'y'; },
+      out: { log: (line) => output.push(line) }, setExitCode: () => {}, runDoctorFix: async () => { fixes += 1; return 0; },
     });
     await program.parseAsync(['node', 'elanous', 'setup']);
-    expect(cfg.starter?.topics).toEqual(['AI agents']);
-    expect(listSources({ seat: 'user' }, root).map(source => source.spec)).toEqual(['AI agents']);
+    expect(prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(output).toHaveLength(1);
+    expect(fixes).toBe(1);
+    expect(cfg.starter?.topics).toBeUndefined();
+    expect(listSources({ seat: 'user' }, root)).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('first-run setup accepts interested topics and persists user sources', async () => {
+test('first-run acceptance does not ask a second question for starter topics', async () => {
   const root = mkdtempSync(join(tmpdir(), 'watch-first-run-'));
   const cfg = { ...config('openai-codex'), skills: { deny: [], allow: [] } } as unknown as UserConfig;
-  const saved: UserConfig[] = [];
+  const prompts: string[] = [];
+  let fixes = 0;
   const program = new Command();
   try {
     registerSetupCommand(program, {
-      firstRunTopics: true, watchRoot: root, getUserConfig: () => saved.at(-1) ?? cfg,
-      saveUserConfig: (next) => { saved.push(next); },
+      firstRunTopics: true, watchRoot: root, getUserConfig: () => cfg,
+      saveUserConfig: () => {},
       runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }), detectSkillCliAuth: () => [],
-      isStdinTty: () => true, prompt: async (message) => message.startsWith('관심 주제') ? 'AI agents, robotics' : 'n',
-      out: { log: () => {} }, setExitCode: () => {},
+      isStdinTty: () => true, prompt: async (message) => { prompts.push(message); return 'y'; },
+      out: { log: () => {} }, setExitCode: () => {}, runDoctorFix: async () => { fixes += 1; return 0; },
     });
     await program.parseAsync(['node', 'elanous', 'setup']);
-    expect(saved.at(-1)?.starter?.topics).toEqual(['AI agents', 'robotics']);
-    expect(listSources({ seat: 'user' }, root).map(source => source.spec)).toEqual(['AI agents', 'robotics']);
-    await program.parseAsync(['node', 'elanous', 'setup']);
-    expect(saved).toHaveLength(1);
-    expect(listSources({ seat: 'user' }, root)).toHaveLength(2);
+    expect(prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(fixes).toBe(1);
+    expect(listSources({ seat: 'user' }, root)).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -390,6 +395,29 @@ describe('setup CLI', () => {
         expect(result.doctorFixCalls).toEqual([]);
       }
     }
+  });
+
+  test('first-run setup has one consent, is a no-op on decline, and prints one outcome even when a write or doctor fails', async () => {
+    const declined = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'n' });
+    expect(declined.prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(declined.writes).toEqual([]);
+    expect(declined.doctorFixCalls).toEqual([]);
+    expect(declined.output).toHaveLength(1);
+
+    const accepted = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y' });
+    expect(accepted.prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
+    expect(accepted.writes).toHaveLength(1);
+    expect(accepted.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
+    expect(accepted.output).toHaveLength(1);
+
+    const fixFailed = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y', doctorFixThrows: true });
+    expect(fixFailed.output).toHaveLength(1);
+    expect(fixFailed.exitCodes).toEqual([1]);
+
+    const saveFailed = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y', providerWriteThrows: true });
+    expect(saveFailed.output).toHaveLength(1);
+    expect(saveFailed.doctorFixCalls).toEqual([]);
+    expect(saveFailed.exitCodes).toEqual([1]);
   });
 
   test('--yes configures a missing provider before reporting readiness and running doctor on a non-TTY', async () => {
@@ -537,24 +565,14 @@ describe('setup CLI', () => {
     expect(r.text).toContain('missing: LLM provider configuration');
   });
 
-  test('격리 첫 실행(대화형)에서는 기본 묶음 1건과 항목별 승인 등급을 보이고 승인 전 설치·자격 쓰기는 0이다', async () => {
-    const result = await runSetup({ firstRunTopics: true, provider: 'openai-codex', nonInteractive: false, stdinTty: true, recommendationAnswer: 'n' });
-    const proposal = section(result.text, 'Setup: 기본 플러그인·커넥터 묶음 제안 (읽기 전용)', '고칠 것 고치기');
-    expect(result.text.match(/^묶음 1\/1:/gm) ?? []).toHaveLength(1);
-    expect(proposal).toContain('묶음 1/1: 기본 묶음 — 키 없이 항상 켬(0층) · 항목 10개');
-    expect(proposal).toContain('보안 등급: 읽기 · 승인: 불요');
-    expect(proposal).toContain('보안 등급: 쓰기(로컬) · 승인: 기존 모래상자·워크트리 규칙');
-    expect(proposal).toContain('보안 등급: 쓰기(로컬) · 승인: vault-write-guard');
-    expect(proposal).toContain('보안 등급: 읽기(네트워크) · 승인: 불요(클릭·입력은 쓰기 → 승인)');
-    expect(proposal).toContain('후속 층(승인 뒤 조각): 1층 로그인된 CLI 재사용 · 2층 원격 MCP 한 번 OAuth · 3층 채널');
-    expect(proposal).toContain('승인 전 설치 0 · 자격 쓰기 0');
+  test('interactive first-run uses one consent and reports one result without the manual bundle list', async () => {
+    const result = await runSetup({ firstRunTopics: true, provider: 'openai-codex', nonInteractive: false, stdinTty: true, answer: 'y' });
+    expect(result.output).toHaveLength(1);
+    expect(result.text).not.toContain('묶음 1/1:');
     expect(result.writes).toEqual([]);
-    expect(result.doctorFixCalls).toEqual([]);
-    expect(result.prompts).toEqual(['관심 주제는 무엇인가요? (쉼표로 구분 · 건너뛰려면 Enter) ', '추천대로 켤까요? [Y/n] ']);
+    expect(result.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
+    expect(result.prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
     expect(result.exitCodes).toEqual([0]);
-    // recommendedSetup 두 줄은 제안이 끼어들어도 여전히 맨 끄트마다(보존 계약).
-    expect(result.output.at(-2)).toContain('고칠 것 고치기');
-    expect(result.output.at(-1)).toContain('chat.fastPath');
   });
 
   test('비대화형 격리 첫 실행에서도 묶음 제안은 표시만 한다 — 묻지 않고 쓰지 않는다', async () => {

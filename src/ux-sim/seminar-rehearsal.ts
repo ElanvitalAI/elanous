@@ -1,3 +1,10 @@
+import { randomUUID } from 'node:crypto';
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { withFileLockSync } from '../storage/file-lock.js';
+
+import { assertSimWorldOwnership, type SimWorld } from './world-store.js';
+
 /**
  * Simulate the 40-minute, seven-scene seminar rehearsal protocol.
  *
@@ -106,4 +113,105 @@ export function renderSeminarRehearsal(result: SeminarRehearsalResult): string[]
     `세미나 리허설 · ${result.totalTargetMinutes}분 · ${result.verdict} · sim only (실제 행사 실행 증거 아님)`,
     ...result.scenes.map((scene) => `  S${scene.scene} ${scene.name.padEnd(18)} ${scene.observedMinutes === null ? '미확인' : `${scene.observedMinutes}분`.padEnd(5)} / 목표 ${scene.targetMinutes}분 · ${scene.verdict} · ${scene.reason}`),
   ];
+}
+
+export interface SeminarFreezeApproval {
+  readonly owner: string;
+  readonly buildId: string;
+  readonly receiptId: string;
+}
+
+export interface SeminarFreezeState {
+  readonly format: 1;
+  readonly buildId: string;
+  readonly consecutivePasses: number;
+  readonly frozen: boolean;
+  readonly updatedAt: string;
+  readonly lastDeniedBuildId: string | null;
+  readonly approvedBy: string | null;
+}
+
+export interface SeminarFreezeAttempt {
+  readonly accepted: boolean;
+  readonly decision: 'recorded' | 'owner-approval-required';
+  readonly rehearsal: SeminarRehearsalResult | null;
+  readonly state: SeminarFreezeState;
+}
+
+const SEMINAR_FREEZE_FILE = 'seminar-rehearsal-freeze.json';
+const SAFE_BUILD_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function parseSeminarFreezeState(path: string): SeminarFreezeState | undefined {
+  let raw: string;
+  try { raw = readFileSync(path, 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('seminar freeze state must be an object');
+  const state = value as Record<string, unknown>;
+  if (state.format !== 1 || typeof state.buildId !== 'string' || !SAFE_BUILD_ID.test(state.buildId)
+    || !Number.isInteger(state.consecutivePasses) || (state.consecutivePasses as number) < 0 || (state.consecutivePasses as number) > 3
+    || typeof state.frozen !== 'boolean' || typeof state.updatedAt !== 'string'
+    || !(state.lastDeniedBuildId === null || (typeof state.lastDeniedBuildId === 'string' && SAFE_BUILD_ID.test(state.lastDeniedBuildId)))
+    || !(state.approvedBy === null || (typeof state.approvedBy === 'string' && state.approvedBy.trim() !== ''))) {
+    throw new Error('seminar freeze state is invalid');
+  }
+  if (state.frozen !== (state.consecutivePasses === 3)) throw new Error('seminar freeze state has inconsistent pass count');
+  return state as unknown as SeminarFreezeState;
+}
+
+function persistSeminarFreezeState(world: SimWorld, state: SeminarFreezeState): void {
+  const path = join(world.stateDir, SEMINAR_FREEZE_FILE);
+  const temp = join(world.stateDir, `.${SEMINAR_FREEZE_FILE}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    renameSync(temp, path);
+  } finally {
+    try { unlinkSync(temp); } catch { /* rename consumed the temp file */ }
+  }
+}
+
+/** Record the real seminar verdict in an owned sim world and freeze after three same-build passes. */
+export function recordSeminarRehearsal(world: SimWorld, input: {
+  readonly buildId: string;
+  readonly records: readonly SeminarSceneRecord[];
+  readonly approval?: SeminarFreezeApproval;
+}): SeminarFreezeAttempt {
+  assertSimWorldOwnership(world);
+  if (!SAFE_BUILD_ID.test(input.buildId)) throw new Error('seminar rehearsal buildId must be a safe token');
+  return withFileLockSync(join(world.stateDir, `${SEMINAR_FREEZE_FILE}.lock`), () => {
+    const path = join(world.stateDir, SEMINAR_FREEZE_FILE);
+    const prior = parseSeminarFreezeState(path);
+    const now = new Date().toISOString();
+
+    if (prior?.frozen && input.buildId !== prior.buildId) {
+      const approval = input.approval;
+      const approved = approval?.buildId === input.buildId && approval.owner.trim() !== '' && approval.receiptId.trim() !== '';
+      if (!approved) {
+        const state: SeminarFreezeState = { ...prior, updatedAt: now, lastDeniedBuildId: input.buildId };
+        persistSeminarFreezeState(world, state);
+        return { accepted: false, decision: 'owner-approval-required', rehearsal: null, state };
+      }
+    }
+
+    const sameBuild = prior?.buildId === input.buildId;
+    const basePasses = sameBuild ? prior.consecutivePasses : 0;
+    const rehearsal = simSeminarRehearsal(input.records);
+    const consecutivePasses = sameBuild && prior?.frozen
+      ? 3
+      : rehearsal.verdict === 'pass' ? Math.min(3, basePasses + 1) : 0;
+    const state: SeminarFreezeState = {
+      format: 1,
+      buildId: input.buildId,
+      consecutivePasses,
+      frozen: consecutivePasses === 3,
+      updatedAt: now,
+      lastDeniedBuildId: null,
+      approvedBy: sameBuild ? prior?.approvedBy ?? null : prior?.frozen ? input.approval?.owner.trim() ?? null : null,
+    };
+    persistSeminarFreezeState(world, state);
+    return { accepted: true, decision: 'recorded', rehearsal, state };
+  }, { breakDeadHolder: true });
 }

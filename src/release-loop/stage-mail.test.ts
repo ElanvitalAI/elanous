@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openMsgStore } from '../msg/msg-store.js';
+import { defaultMsgStorePath, openMsgStore } from '../msg/msg-store.js';
 import { runGraph } from '../graph-runner/runner.js';
 import { emitReleaseStageTransition, postReleaseStageMail, startReleaseStageStallWatch, type ReleaseStageState } from './stage-mail.js';
 
@@ -59,8 +59,8 @@ test('release stage watchdog emits one stall transition after a quiet interval a
   const logged: string[] = [];
   const stop = startReleaseStageStallWatch({ runId: 'run-watch', nodeId: 'gate' }, {
     graphId: 'release-loop', dryRun: false,
-    afterMs: 5, schedule: (callback) => { callbacks.push(callback); return 1 as ReturnType<typeof setTimeout>; },
-    cancel: () => { cancelled++; }, emit: (mail) => { emitted.push(mail.state); }, log: (event) => { logged.push(event); },
+    afterMs: 5, schedule: (callback) => { callbacks.push(callback); return setTimeout(() => {}, 60_000); },
+    cancel: (timer) => { cancelled++; clearTimeout(timer); }, emit: (mail) => { emitted.push(mail.state); }, log: (event) => { logged.push(event); },
   });
   callbacks[0]!();
   stop();
@@ -74,11 +74,13 @@ test('stall watcher is a no-op outside real release-loop runs', () => {
   const emitted: string[] = [];
   for (const context of [{ graphId: 'document-loop', dryRun: false }, { graphId: 'release-loop', dryRun: true }]) {
     const callbacks: Array<() => void> = [];
-    startReleaseStageStallWatch({ runId: 'run-filtered', nodeId: 'gate' }, { ...context,
-      schedule: (callback) => { callbacks.push(callback); return 1 as ReturnType<typeof setTimeout>; }, cancel: () => {},
+    const stop = startReleaseStageStallWatch({ runId: 'run-filtered', nodeId: 'gate' }, { ...context,
+      schedule: (callback) => { callbacks.push(callback); return setTimeout(() => {}, 60_000); },
+      cancel: (timer) => clearTimeout(timer),
       emit: (mail) => { emitted.push(mail.state); }, log: () => {},
     });
     callbacks[0]!();
+    stop();
   }
   expect(emitted).toEqual([]);
 });
@@ -116,6 +118,36 @@ test('release graph runner emits start and terminal result transitions through t
     { runId: 'stage-mail-graph-run', nodeId: 'done', state: 'start' },
     { runId: 'stage-mail-graph-run', nodeId: 'done', state: 'ok' },
   ]);
+});
+
+test('release graph default stage mail stays in the graph runner state root', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-stage-isolated-root-')); scratch.push(root);
+  const foreignStateRoot = mkdtempSync(join(tmpdir(), 'release-stage-foreign-state-')); scratch.push(foreignStateRoot);
+  const previousStateRoot = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = foreignStateRoot;
+  try {
+    const externalStorePath = defaultMsgStorePath();
+    const externalEntriesBefore = readdirSync(foreignStateRoot);
+    expect(externalStorePath).toBe(join(foreignStateRoot, 'msg', 'messages.db'));
+    const graph = join(root, 'release-loop.yaml');
+    writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+    writeFileSync(graph, [
+      'graph_id: release-loop', 'version: 1', 'entry_node: done', 'terminal_nodes: [done]', 'nodes:',
+      '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }', '',
+    ].join('\n'));
+    const run = await runGraph(graph, { runId: 'isolated-stage-mail-run', deps: { root } });
+    expect(run.status).toBe('done');
+    const isolated = openMsgStore(join(root, 'msg', 'messages.db'));
+    try {
+      expect(isolated.listByRecipient('OP')).toHaveLength(2);
+      expect(isolated.listByRecipient('TC')).toHaveLength(0);
+      expect(readdirSync(foreignStateRoot)).toEqual(externalEntriesBefore);
+      expect(existsSync(externalStorePath)).toBe(false);
+    } finally { isolated.close(); }
+  } finally {
+    if (previousStateRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateRoot;
+  }
 });
 
 test('non-release approval remains notified as a no-op for release mail', async () => {

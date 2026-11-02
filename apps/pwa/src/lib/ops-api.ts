@@ -68,9 +68,17 @@ export interface ResourceLedger {
     unknownPods: number | null; measuredProcesses: number | null; unknownProcesses: number | null; deltaLeasesVsPods: number | null }>;
   leases: Array<{ id: string; fp: string; host: string; lane: string; resources: { cpu?: number; memoryBytes?: number; shards?: number; pods?: number };
     mission: { cell?: string; goalId?: string; pr?: number }; heartbeatAt: string; startedAt: string }>;
+  recentReclaims?: Array<{ id: string; fp: string; host: string; lane: string; at: string; kind: 'lease-ended' | 'lease-reaped'; reason: string; stoppedBy: string }>;
   measurements: Array<{ host: string; observedAt: string; pods: Array<{ id: string; phase: string; fp?: string; lane?: string; mission?: string }>;
     processes: Array<{ id: string; fp?: string; lane?: string; mission?: string }>; errors: string[] }>;
   findings: Array<{ kind: string; host: string; id: string; fp?: string; detail: string; action: 'report-only' }>;
+}
+export interface ResourceGuardianSnapshot {
+  state: 'pending' | 'ready' | 'stale' | 'failed'; stale: boolean; observedAt: string | null;
+  staleReason?: string; lastFailureAt?: string;
+  findings: Array<{ kind: string; host: string; id: string; fp?: string; detail: string; action: 'report-only' }>;
+  cleanup: { reaped: number; skipped: number; errors: number };
+  releaseReservation?: { status: string; reason: string };
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -202,11 +210,36 @@ export function getResourceLedger(client: DaemonClient): Promise<OpsResult<Resou
       && numberOrNull(row.unknownProcesses) && numberOrNull(row.deltaLeasesVsPods))) return null;
     if (!value.leases.every((lease: unknown) => record(lease) && string(lease.id) && string(lease.fp) && string(lease.host)
       && string(lease.lane) && record(lease.resources) && record(lease.mission) && string(lease.heartbeatAt) && string(lease.startedAt))) return null;
+    if (value.recentReclaims !== undefined && (!Array.isArray(value.recentReclaims) || !value.recentReclaims.every((row: unknown) => record(row) && string(row.id)
+      && string(row.fp) && string(row.host) && string(row.lane) && string(row.at)
+      && (row.kind === 'lease-ended' || row.kind === 'lease-reaped') && string(row.reason) && string(row.stoppedBy)))) return null;
     if (!value.measurements.every((measurement: unknown) => record(measurement) && string(measurement.host) && string(measurement.observedAt)
       && Array.isArray(measurement.pods) && Array.isArray(measurement.processes) && Array.isArray(measurement.errors)
       && measurement.errors.every(string))) return null;
     if (!value.findings.every((finding: unknown) => record(finding) && string(finding.kind) && string(finding.host)
       && string(finding.id) && string(finding.detail) && finding.action === 'report-only')) return null;
     return value as unknown as ResourceLedger;
+  });
+}
+
+export function getResourceGuardian(client: DaemonClient): Promise<OpsResult<ResourceGuardianSnapshot>> {
+  return get(client, '/v1/ops/resources/guardian', (value) => {
+    if (!record(value) || !['pending', 'ready', 'stale', 'failed'].includes(value.state as string)
+      || typeof value.stale !== 'boolean' || (value.observedAt !== null && !string(value.observedAt))
+      || (value.staleReason !== undefined && !string(value.staleReason))
+      || (value.lastFailureAt !== undefined && !string(value.lastFailureAt))
+      || !Array.isArray(value.findings) || !record(value.cleanup)) return null;
+    const count = (input: unknown) => Number.isSafeInteger(input) && (input as number) >= 0;
+    if (!value.findings.every((finding: unknown) => record(finding) && string(finding.kind) && string(finding.host)
+      && string(finding.id) && (finding.fp === undefined || string(finding.fp)) && string(finding.detail)
+      && finding.action === 'report-only')) return null;
+    if (!count(value.cleanup.reaped) || !count(value.cleanup.skipped) || !count(value.cleanup.errors)) return null;
+    if (value.releaseReservation !== undefined && !(record(value.releaseReservation)
+      && string(value.releaseReservation.status) && string(value.releaseReservation.reason))) return null;
+    if (value.state === 'pending' && value.observedAt !== null) return null;
+    if (value.state === 'ready' && (value.stale || value.observedAt === null)) return null;
+    if (value.state === 'stale' && !value.stale) return null;
+    if (value.state === 'failed' && (!value.stale || value.observedAt !== null || !string(value.lastFailureAt))) return null;
+    return value as unknown as ResourceGuardianSnapshot;
   });
 }

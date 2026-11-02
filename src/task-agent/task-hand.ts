@@ -39,6 +39,7 @@ import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type Work
 import { recordCoordinatorShadowDispatch, resolveCoordinatorShadowRoot } from '../loops/orchestrator/coordinator-shadow.js';
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
+import { collectDraftMetrics, DRAFT_NEEDS_OWNER_SEAT_CAP, shouldHoldSeatNewLaunch, type DraftMetrics } from '../self-dev/draft-sweep.js';
 import { draftClaimComment, draftClaimRecordLive, draftClaimState, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 import { parseAskTargetPathHints, parseAskTargetPathHintsResult, type AskTargetPathHintsParseResult } from '../self-dev/launch-preflight-text.js';
 import { draftMissingGoalDoneBoundary, inspectGoalDoneBoundary, normalizeGoalDoneBoundaryDocument } from '../self-implement/goal-author.js';
@@ -49,6 +50,9 @@ import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-re
 import { taskParentRoleEnv, taskParentRolePinsForChild } from './task-parent-role-llm.js';
 import { runHarvestUnit, type ReviewInvocation } from './harvest-unit.js';
 import { TASK_CARD_PREFIX } from './task-card-prefix.js';
+import { TASK_SEATS, TaskAgentStateError, cardPrNumber, readTaskAgentState as readState, readTaskAgentState, readTaskCard, taskAgentStatePath, updateTaskCard, updateTaskCardsAtomically, writeTaskCards, TaskCardSupersededError } from './task-card-state.js';
+import type { TaskAgentStateFile } from './task-card-state.js';
+export { TASK_SEATS, TaskAgentStateError, cardPrNumber, readTaskAgentState, readTaskCard, taskAgentStatePath, updateTaskCard, updateTaskCardsAtomically, writeTaskCards, TaskCardSupersededError } from './task-card-state.js';
 import { childLlmEffortProblem } from '../intelligence-map/model-catalog.js';
 
 export interface ResolveHandTextDeps {
@@ -103,7 +107,6 @@ export function resolveHandText(text: string, deps: ResolveHandTextDeps = { cwd:
   return { kind: 'inlined', text: content, path, chars: carried.length, sha256: createHash('sha256').update(carried).digest('hex') };
 }
 
-export const TASK_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TaskSeat = typeof TASK_SEATS[number];
 /** 과제 카드 id 접두 — `task show <id>` 가 이 접두로 TOX 태스크와 갈린다(정본 = task-card-prefix.ts). */
 export { TASK_CARD_PREFIX };
@@ -449,10 +452,6 @@ export function parseChildLlm(value: string, effort?: string): TaskChildLlm {
 export interface TaskCardPr { number: number; url?: string }
 
 /** 카드의 PR 번호 — 수동(number)·묶음(`{number,url}`) 둘 다. */
-export function cardPrNumber(card: Pick<TaskCard, 'pr'>): number | undefined {
-  return typeof card.pr === 'number' ? card.pr : card.pr?.number;
-}
-
 /** A stale terminal marker must never close a card after its PR binding changes. */
 export function boundPrTerminal(card: Pick<TaskCard, 'pr' | 'prTerminal'>): TaskCard['prTerminal'] | undefined {
   const marker = card.prTerminal;
@@ -655,7 +654,6 @@ async function resolveHandDraftClaim(input: {
   };
 }
 
-interface TaskAgentStateFile { tasks?: Record<string, TaskCard>; [key: string]: unknown }
 
 /**
  * DRAFT-CLAIM-AUTO-2-FU — 손이 draft 를 잡을 때 필요한 관측·게시·수확 리뷰 포트(생산 기본값은 gh CLI ⊕ `elanous self
@@ -766,108 +764,6 @@ function isGitWorkTree(path: string): boolean {
   } catch { return false; }
 }
 
-export function taskAgentStatePath(): string {
-  return join(effectiveInstanceRoot(), 'task-agent-actions.json');
-}
-
-/** 상태 파일을 읽을 수 없거나(ENOENT 제외) 해석할 수 없다 — 덮어쓰기 전에 멈춘다. */
-export class TaskAgentStateError extends Error {
-  constructor(path: string, cause: unknown) {
-    super(`task-agent 상태 파일을 읽을 수 없다 — 덮어쓰지 않고 멈춘다: ${path} (${cause instanceof Error ? cause.message : String(cause)})`);
-    this.name = 'TaskAgentStateError';
-  }
-}
-
-/**
- * 실행부·과제 넘기기 문이 함께 쓰는 상태 파일(`task-agent-actions.json`)의 엄격한 읽기.
- * 파일이 «없음»(ENOENT)만 빈 상태다. 그 밖의 읽기·해석 오류(손상된 JSON · 객체 아님 · 권한)는
- * 던진다 — 빈 상태로 읽고 다시 쓰면 failureCounts·착지 기록·과제 카드가 지워진다.
- */
-export function readTaskAgentState<T extends object = TaskAgentStateFile>(path: string): T {
-  let raw: string;
-  try { raw = readFileSync(path, 'utf8'); } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return {} as T;
-    return stateError(path, error);
-  }
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch (error) { return stateError(path, error); }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return stateError(path, new Error('최상위가 객체가 아니다'));
-  return parsed as T;
-}
-
-function stateError(path: string, cause: unknown): never {
-  const error = new TaskAgentStateError(path, cause);
-  try { debug.log('task-agent', 'state-unreadable', { path, reason: error.message }); } catch { /* fail-soft */ }
-  throw error;
-}
-
-function readState(path: string): TaskAgentStateFile {
-  return readTaskAgentState<TaskAgentStateFile>(path);
-}
-
-/** 카드 여럿을 한 잠금 안에서 적는다(미션 ⊕ 조각) — 종전 칸은 `...disk` 로 보존. */
-export function writeTaskCards(path: string, cards: readonly TaskCard[]): void {
-  withFileLockSync(`${path}.lock`, () => {
-    const disk = readState(path);
-    mkdirSync(dirname(path), { recursive: true });
-    const tasks = { ...(disk.tasks ?? {}) };
-    for (const card of cards) tasks[card.id] = card;
-    writeFileSync(path, JSON.stringify({ ...disk, tasks }));
-  });
-}
-
-/** 여러 카드의 관계 변경을 한 잠금 안에서 검사·기록한다(예: 기존 PR 결속 이동). */
-export function updateTaskCardsAtomically(path: string,
-  update: (tasks: Readonly<Record<string, TaskCard>>) => readonly TaskCard[] | undefined): TaskCard[] | undefined {
-  return withFileLockSync(`${path}.lock`, () => {
-    const disk = readState(path);
-    const current = disk.tasks ?? {};
-    const replacements = update(current);
-    if (!replacements) return undefined;
-    if (!replacements.length || replacements.some((card) => !card.id)) throw new Error('카드 원자 갱신은 id가 있는 카드가 필요하다');
-    const tasks = { ...current };
-    for (const card of replacements) tasks[card.id] = card;
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ ...disk, tasks }));
-    return [...replacements];
-  });
-}
-
-/** 카드 하나를 잠금 안에서 읽고 고쳐 쓴다 — `update` 가 undefined 를 돌려주면 쓰지 않는다. 쓴(또는 그대로인) 카드를 돌려준다. */
-export function updateTaskCard(path: string, id: string, update: (card: TaskCard | undefined, tasks: Readonly<Record<string, TaskCard>>) => TaskCard | undefined,
-  options: { doctorLedgerDir?: string } = {}): TaskCard | undefined {
-  let needsOwner: { runId: string; at: string; reason: string; transitionIndex: number } | undefined;
-  const result = withFileLockSync(`${path}.lock`, () => {
-    const disk = readState(path);
-    const current = disk.tasks?.[id];
-    const next = update(current, disk.tasks ?? {});
-    if (!next) return current;
-    const transitionIndex = next.history.length - 1;
-    const last = next.history[transitionIndex];
-    if (current?.status === 'launched' && next.status === 'failed' && next.runId
-      && next.history.length > (current?.history.length ?? 0) && last?.event === 'failed'
-      && last.detail?.startsWith('failed/needs-owner')) {
-      needsOwner = { runId: next.runId, at: last.at, reason: last.detail, transitionIndex };
-    }
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ ...disk, tasks: { ...(disk.tasks ?? {}), [id]: next } }));
-    return next;
-  });
-  if (needsOwner) {
-    try {
-      const visit = recordTaskAgentNeedsOwnerVisit({ ...needsOwner, cardId: id, dir: options.doctorLedgerDir });
-      debug.log('task-agent', 'doctor-visit', { card: id, runId: needsOwner.runId, status: visit.status });
-    } catch (error) {
-      debug.log('task-agent', 'doctor-visit-failed', { card: id, runId: needsOwner.runId,
-        reason: error instanceof Error ? error.message : String(error) });
-    }
-  }
-  return result;
-}
-
-export function readTaskCard(id: string, path = taskAgentStatePath()): TaskCard | undefined {
-  return readState(path).tasks?.[id];
-}
 
 /**
  * IMPL-FINDINGS-FEEDBACK — 착지(landed·landed-by-hand) 판정이 난 카드의 병합 PR 본문 절을
@@ -1147,6 +1043,8 @@ export interface HandTaskOptions {
   pluginWizardDeps?: PluginWizardDeps;
   /** `--live` 일 때만 불린다. */
   launcher?: TaskLauncher;
+  /** Fresh per-seat draft observation; tests can inject an isolated inventory. */
+  draftMetrics?: (now: Date) => Promise<Pick<DraftMetrics, 'needsOwnerBySeat'>>;
   /**
    * 2판 — launcher 'graph-run' 조합을 실제 graph run 으로 발사한다(기본 = src/graph-runner/runner.ts runGraph).
    * 시험은 이 seam 을 주입해 발사 인자(선택된 조합 경로 ⊕ GraphRunOptions)를 'calls' capture 로 검증한다.
@@ -1181,14 +1079,6 @@ export interface HandTaskOptions {
    * 생산은 기본 문(이 우주의 인스턴스 루트)을 쓰고, 시험은 격리 루트의 문을 주입해 같은 생산 경로로 검증한다.
    */
   launchRequestDoor?: LaunchRequestDoor;
-}
-
-/** `writeGuard` 가 거짓 — 다른 넘김이 카드를 가져갔다. 카드는 건드리지 않았다. */
-export class TaskCardSupersededError extends Error {
-  constructor(id: string) {
-    super(`과제 카드를 다른 넘김이 가져갔다 — 쓰지 않았다: ${id}`);
-    this.name = 'TaskCardSupersededError';
-  }
 }
 
 /** `--live` 발사가 실패했다 — 카드는 launch-failed 로 남았다. */
@@ -1471,6 +1361,24 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (firstLineViolations.length > 0) {
       try { debug.log('task-agent.hand', 'first-line-path-list-rejected', { card: id, violations: firstLineViolations }); } catch { /* fail-soft */ }
       throw new Error(`goal-revision-required: 골 첫 줄은 «대상 경로:» 뒤에 경로 목록만 적어야 한다 ${firstLineViolations.join(' · ')} — 괄호·줄번호·덧말을 떼고 경로만 적은 뒤 다시 넘기세요`);
+    }
+  }
+  if (opts.live && opts.seat && !selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') {
+    let metrics: Pick<DraftMetrics, 'needsOwnerBySeat'> | undefined;
+    try {
+      if (opts.draftMetrics) metrics = await opts.draftMetrics(now);
+      else {
+        const [{ resolveRepositoryName }, { githubDraftSweepAdapters }] = await Promise.all([
+          import('../harness/repository-name.js'), import('../harness/harness-cli-command.js'),
+        ]);
+        metrics = await collectDraftMetrics(resolveRepositoryName({}), githubDraftSweepAdapters(), now);
+      }
+      if (!metrics.needsOwnerBySeat) throw new Error('per-seat draft inventory missing');
+    } catch (error) {
+      try { debug.log('task-agent.hand', 'needs-owner-unobserved', { seat: opts.seat, reason: String(error).slice(0, 140) }); } catch { /* observation must not affect dispatch */ }
+    }
+    if (metrics?.needsOwnerBySeat && shouldHoldSeatNewLaunch(opts.seat, metrics.needsOwnerBySeat)) {
+      throw new Error(`needs-owner ${opts.seat}: ${metrics.needsOwnerBySeat[opts.seat]} > ${DRAFT_NEEDS_OWNER_SEAT_CAP} — new launch held`);
     }
   }
   writeCard(path, card);

@@ -268,7 +268,7 @@ describe('ledger and card draft', () => {
       // replacing only that binary with a compatible timed-command fixture on Linux.
       writeFileSync(join(bin, 'ssh'), `#!/bin/sh\ncat > "$TEST_CAPTURED"\nsed -e "s|/usr/bin/time -l|$TEST_TIME|g" -e 's|$HOME/.bun/bin:||g' "$TEST_CAPTURED" | bash\n`);
       writeFileSync(join(bin, 'git'), `#!/bin/sh\ncase "$1" in\n  clone) for target do :; done; mkdir -p "$target/apps/pwa" ;;\n  rev-parse) echo abc ;;\n  *) exit 2 ;;\nesac\n`);
-      writeFileSync(join(bin, 'bun'), `#!/bin/sh\ncase "$1" in\n  install) exit 0 ;;\n  run) [ "$ELANOUS_NIGHTLY_AUDIT" = 1 ] || exit 3; printf '%s\\n' "$3" >> "$TEST_EXECUTIONS"; if [ "$3" = "./test/f12-sweep.test.ts" ]; then echo '1 fail' >&2; exit 1; fi; echo '1 pass' >&2 ;;\n  *) exit 2 ;;\nesac\n`);
+      writeFileSync(join(bin, 'bun'), `#!/bin/sh\ncase "$1" in\n  install) exit 0 ;;\n  run) [ "$GATE_INTEGRATION_ONLY" = 1 ] && [ "$ELANOUS_NIGHTLY_AUDIT" = 1 ] || exit 3; printf '%s\\n' "$3" >> "$TEST_EXECUTIONS"; if [ "$3" = "./test/f12-sweep.test.ts" ]; then echo '1 fail' >&2; exit 1; fi; echo '1 pass' >&2 ;;\n  *) exit 2 ;;\nesac\n`);
       writeFileSync(fixture, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$TEST_TIMED"\nif [ "$1" = "timeout" ]; then shift 3; fi\n"$@"\nrc=$?\necho '104857600 maximum resident set size' >&2\nexit "$rc"\n`);
       for (const path of [join(bin, 'ssh'), join(bin, 'git'), join(bin, 'bun'), fixture]) chmodSync(path, 0o700);
       const repo = join(import.meta.dir, '../..');
@@ -278,6 +278,7 @@ describe('ledger and card draft', () => {
       expect({ status: audit.status, stdout: audit.stdout, stderr: audit.stderr }).toMatchObject({ status: 0 });
       const result = JSON.parse(audit.stdout.trim()) as { outcome: string; measurements: Array<{ file: string; rc: number; rssMb: number; pass: number | null; fail: number | null }> };
       expect(result.outcome).toBe('ok');
+      expect(GATE_NIGHTLY_AUDITS).toContain('scripts/resource-map-check.test.ts');
       const selected = GATE_NIGHTLY_AUDITS.map((file) => `./${file}`);
       expect(readFileSync(executions, 'utf8').trim().split('\n')).toEqual(selected);
       expect(readFileSync(timed, 'utf8').trim().split('\n').map((line) => line.split(' ').at(-1))).toEqual(selected);
@@ -298,7 +299,7 @@ describe('ledger and card draft', () => {
       expect(readdirSync(join(root, 'test-diet/cards'))).toHaveLength(1);
       const script = readFileSync(captured, 'utf8');
       expect(script).toContain('/usr/bin/time -l');
-      expect(script).toContain('300 env ELANOUS_NIGHTLY_AUDIT=1 bun run scripts/test-deterministic.ts "./$f"');
+      expect(script).toContain('300 env GATE_INTEGRATION_ONLY=1 ELANOUS_NIGHTLY_AUDIT=1 bun run scripts/test-deterministic.ts "./$f"');
       expect(script).toContain(`done <<'TEST_DIET_FILES'\n${GATE_NIGHTLY_AUDITS.join('\n')}\nTEST_DIET_FILES`);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

@@ -99,6 +99,7 @@ test('production pair seam starts both PTYs, binds both IDs, and routes one join
   cleanupWorkspace();
 });
 
+
 test('pair opens Codex last for the completion-marker workaround regardless of primary mission agent', async () => {
   const cwd = createWorkspace();
   const spawned: string[] = [];

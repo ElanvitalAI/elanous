@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { gridSshBroker } from '../grid/ssh-broker.js';
 import { debug } from '../debug/log.js';
 import type { ResourceView } from '../control-plane/ledger.js';
 import type { MachineLedger, MachineFleetIntent } from '../machines/machine-ledger.js';
@@ -23,7 +24,7 @@ export interface HostDoctorRun {
 }
 
 /** 주입 가능한 원격 실행 — 기본 = ssh BatchMode · `<host>=local` 이면 이 기계(bash -c). */
-export type HostDoctorRemote = (host: string, probe: string) => HostDoctorRun | null;
+export type HostDoctorRemote = (host: string, probe: string) => HostDoctorRun | null | Promise<HostDoctorRun | null>;
 
 /** HQ 실측값(본부의 설치 판 · 이미지 핀) — 없으면 그 점검은 unmeasured 다. */
 export interface HostDoctorExpected {
@@ -271,13 +272,12 @@ export const HOST_DOCTOR_CHECKS: readonly HostDoctorCheckSpec[] = [
 ];
 
 /** 기본 원격 실행 — `<host>=local` 이면 이 기계의 비대화형 셸, 아니면 ssh BatchMode. 못 쏘면 null. */
-export function defaultHostDoctorRemote(host: string, probe: string): HostDoctorRun | null {
-  const viaSsh = host !== 'local';
-  const spawned = viaSsh
-    // `--` 로 host 를 끊는다(«-o…» 로 시작하는 인자가 ssh 옵션으로 읽히지 않게) · ConnectTimeout 으로 패킷을 떨구는 호스트의 대기를 줄인다.
-    ? spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '--', host, probe], { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] })
-    : spawnSync('bash', ['-c', probe], { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] });
-  return hostDoctorRunFromSpawn(spawned, viaSsh);
+export async function defaultHostDoctorRemote(host: string, probe: string): Promise<HostDoctorRun | null> {
+  if (host !== 'local') {
+    const result = await gridSshBroker.run(host, probe, 20_000);
+    return hostDoctorRunFromSpawn({ status: result.status, stdout: result.stdout, stderr: result.stderr, error: result.error ? new Error(result.error) : undefined }, true);
+  }
+  return hostDoctorRunFromSpawn(spawnSync('bash', ['-c', probe], { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] }), false);
 }
 
 /** spawn 결과 → 원격 한 발. ⛔ ssh 는 «연결 자체» 실패(거부·이름 못 풂·키 거절)를 exit 255 로 낸다 — 그건 탐침이
@@ -360,21 +360,21 @@ export function checkHostMembership(host: string, platform: HostDoctorPlatform |
 }
 
 /** 원격 `uname -s` ⊕ `/proc/version` 의 microsoft 로 darwin|linux|wsl. 못 재면 null. */
-export function detectHostDoctorPlatform(remote: HostDoctorRemote, host: string): HostDoctorPlatform | null {
-  const uname = remote(host, 'uname -s');
+export async function detectHostDoctorPlatform(remote: HostDoctorRemote, host: string): Promise<HostDoctorPlatform | null> {
+  const uname = await remote(host, 'uname -s');
   if (!uname || uname.status !== 0) return null;
   const kernel = line(uname.stdout).toLowerCase();
   if (kernel === 'darwin') return 'darwin';
   if (kernel === 'linux') {
-    const procVersion = remote(host, 'cat /proc/version 2>/dev/null || true');
+    const procVersion = await remote(host, 'cat /proc/version 2>/dev/null || true');
     return procVersion && procVersion.status === 0 && /microsoft/i.test(procVersion.stdout) ? 'wsl' : 'linux';
   }
   return null;
 }
 
 /** 원격 아키텍처(`uname -m`). 못 재면 null. */
-export function detectHostDoctorArch(remote: HostDoctorRemote, host: string): string | null {
-  const run = remote(host, 'uname -m');
+export async function detectHostDoctorArch(remote: HostDoctorRemote, host: string): Promise<string | null> {
+  const run = await remote(host, 'uname -m');
   if (!run || run.status !== 0) return null;
   const arch = line(run.stdout);
   return nonEmpty(arch) ? arch : null;
@@ -387,8 +387,8 @@ function unmeasuredBecauseUnreached(spec: HostDoctorCheckSpec, options: { platfo
 }
 
 /** 점검 하나를 돌린다 — 원격 실패는 «pass 가 아닌» unmeasured 로만 간다. */
-function runCheck(spec: HostDoctorCheckSpec, options: Required<Pick<HostDoctorOptions, 'host'>> & { remote: HostDoctorRemote; role: HostDoctorRole; platform: HostDoctorPlatform | null; arch: string | null; expected: HostDoctorExpected }): HostDoctorCheckResult {
-  const run = options.remote(options.host, spec.probe);
+async function runCheck(spec: HostDoctorCheckSpec, options: Required<Pick<HostDoctorOptions, 'host'>> & { remote: HostDoctorRemote; role: HostDoctorRole; platform: HostDoctorPlatform | null; arch: string | null; expected: HostDoctorExpected }): Promise<HostDoctorCheckResult> {
+  const run = await options.remote(options.host, spec.probe);
   const base = { id: spec.id, fixKind: spec.fixKind, ...(spec.fix !== undefined ? { fix: spec.fix } : {}) };
   if (run === null) return unmeasuredBecauseUnreached(spec, options);
   const verdict = spec.expect(run, { platform: options.platform, arch: options.arch, expected: options.expected });
@@ -396,18 +396,18 @@ function runCheck(spec: HostDoctorCheckSpec, options: Required<Pick<HostDoctorOp
 }
 
 /** `elanous doctor host <host>` — 읽기 전용. ok 는 fail 0 ⊕ unmeasured 0 일 때만. */
-export function runHostDoctor(options: HostDoctorOptions): HostDoctorReport {
+export async function runHostDoctor(options: HostDoctorOptions): Promise<HostDoctorReport> {
   const host = options.host;
   const role: HostDoctorRole = options.role === 'hq' ? 'hq' : 'worker';
   const remote = options.remote ?? defaultHostDoctorRemote;
   const expected = options.expected ?? {};
   // 첫 발(uname -s)부터 못 쏘면 그 호스트에 «닿지 않는다» — 남은 탐침을 하나씩 기다리지 않고 전부 unmeasured 로 둔다.
-  const reached = remote(host, 'uname -s') !== null;
-  const platform = reached ? detectHostDoctorPlatform(remote, host) : null;
-  const arch = reached ? detectHostDoctorArch(remote, host) : null;
+  const reached = await remote(host, 'uname -s') !== null;
+  const platform = reached ? await detectHostDoctorPlatform(remote, host) : null;
+  const arch = reached ? await detectHostDoctorArch(remote, host) : null;
   const specs = HOST_DOCTOR_CHECKS.filter((spec) => spec.roles.includes(role));
   const remoteChecks = reached
-    ? specs.map((spec) => runCheck(spec, { host, remote, role, platform, arch, expected }))
+    ? await Promise.all(specs.map((spec) => runCheck(spec, { host, remote, role, platform, arch, expected })))
     : specs.map((spec) => unmeasuredBecauseUnreached(spec, { platform, arch, expected }));
   const checks = [...remoteChecks, ...(role === 'worker' && options.membership ? checkHostMembership(host, platform, options.membership) : [])];
   const mismatch = checks.filter((check) => (check.id === 'registry.member' || check.id === 'parentHost.member') && check.status === 'fail');

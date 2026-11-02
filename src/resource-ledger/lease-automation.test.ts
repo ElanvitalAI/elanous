@@ -67,8 +67,10 @@ test('cleanup defaults to report-only and only records confirmed reaped candidat
     { kind: 'orphan', id: 'pod-1', host: 'gcp1' },
     { kind: 'measurement-unavailable', id: 'gcp2', host: 'gcp2' },
   ];
-  const dryRun = await reconcileLeaseCleanup({ findings, nowMs: 2_000 });
+  let dryRunRecorderCalls = 0;
+  const dryRun = await reconcileLeaseCleanup({ findings, nowMs: 2_000, recordReaped: () => { dryRunRecorderCalls++; return true; } });
   expect(dryRun).toMatchObject({ mode: 'dry-run', candidates: [{ id: 'fp_reaped', host: 'gcp1', expectedLeaseHeartbeatAt: new Date(0).toISOString() }], reaped: [], mutations: [] });
+  expect(dryRunRecorderCalls).toBe(0);
 
   const applied: string[] = [];
   const cleanup = await reconcileLeaseCleanup({ findings, mode: 'cleanup', nowMs: 2_000, recordReaped: async item => { await Promise.resolve(); applied.push(`${item.host}:${item.id}`); return true; } });

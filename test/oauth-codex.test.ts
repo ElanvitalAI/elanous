@@ -253,6 +253,24 @@ describe('loginWithCodex (full flow)', () => {
     expect(reloaded?.tokens.accessToken).toBe('A');
   });
 
+  test('AbortSignal cancels the pending device-code wait before another poll', async () => {
+    const { fetchImpl, calls } = makeFetch(call => call.url === CODEX_DEVICE_USERCODE_URL
+      ? { status: 200, json: { user_code: 'ABCD-1234', device_auth_id: 'abort-fixture', interval: 1 } }
+      : { status: 403, json: {} });
+    const controller = new AbortController();
+    let started!: () => void;
+    const waiting = new Promise<void>(resolve => { started = resolve; });
+    const login = loginWithCodex({
+      fetchImpl, signal: controller.signal, maxWaitMs: 60_000,
+      sleepImpl: async () => { started(); return new Promise<void>(() => {}); },
+      mirrorCodex: false,
+    });
+    await waiting;
+    controller.abort();
+    await expect(login).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).toHaveLength(1);
+  });
+
   test('timeout → throws when polling never resolves', async () => {
     const { fetchImpl } = makeFetch((c) => {
       if (c.url === CODEX_DEVICE_USERCODE_URL) return { status: 200, json: { user_code: 'X', device_auth_id: 'd' } };

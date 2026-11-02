@@ -112,16 +112,13 @@ describe('bootDashboardAcpSession — always boots (post-Phase-5c-2)', () => {
     expect('agentVersion' in opts).toBe(false);
   });
 
-  test('boots a real in-process ACP session with no daemon target', async () => {
-    mock.restore();
+  test('selects the in-process branch without a daemon target using the session fake', async () => {
     const result = await bootDashboardAcpSession(makeMinimalDeps());
-    try {
-      expect(result.mode).toBe('in-process');
-      expect(typeof result.session.id).toBe('string');
-      expect(result.session.id.length).toBeGreaterThan(0);
-    } finally {
-      await result.session.close();
-    }
+    expect(result.mode).toBe('in-process');
+    expect(result.session).toBe(mockSessionStub);
+    expect(result.session.id).toBe('mock-session-id');
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]!.opts.cwd).toBe('/tmp');
   });
 });
 
@@ -230,7 +227,7 @@ describe('bootDashboardAcpSession — getter injection (fresh reads)', () => {
 
     // Turn 1 — history empty; composer appends user.
     const m1 = await opts.getMessages({ sessionId: 's1', userText: 'hi' });
-    expect(m1).toEqual([{ role: 'user', content: 'hi' }]);
+    expect(m1).toEqual([{ role: 'user', content: 'hi', transientTurnUser: true }]);
 
     // Turn 2 — dashboard pushed an assistant reply + next user msg.
     history.push({ role: 'assistant', content: 'yo' } as ChatMessage);
@@ -556,7 +553,7 @@ describe('bootDashboardAcpSession — preamble + history merge', () => {
     }));
     const opts = createCalls[0]!.opts;
     const m = await opts.getMessages({ sessionId: 's', userText: 'hi' });
-    expect(m[0]).toEqual({ role: 'system', content: 'you are elanous' });
-    expect(m[m.length - 1]).toEqual({ role: 'user', content: 'hi' });
+    expect(m[0]).toEqual({ role: 'system', content: 'you are elanous', transientPreamble: true });
+    expect(m[m.length - 1]).toEqual({ role: 'user', content: 'hi', transientTurnUser: true });
   });
 });

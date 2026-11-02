@@ -1,6 +1,6 @@
 import { setDefaultTimeout, describe, expect, it, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { LogStore } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
@@ -32,6 +32,22 @@ import type { RunningRunsResult } from '../self-implement/running-runs.js';
 import type { LaunchPreflightResult } from './launch-preflight.js';
 
 const WINDOW = 30 * 60_000; // 30분
+
+async function withTemporaryEnvironment<T>(values: Record<string, string>, run: () => T | Promise<T>): Promise<T> {
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+  try {
+    return await run();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
 
 const confidenceRunningRuns = (
   confirmed: number,
@@ -1488,7 +1504,7 @@ describe('완료 런 경로 겹침 — 완료 사실은 값으로만 낸다', ()
     expect(line).not.toContain('run-completed-7');
   });
 
-  test('[same-path-inspection-command-recovers-every-hidden-fixture-id-with-quoted-path] 전부 보기 명령은 상한 초과 fixture 원장의 숨긴 완료·중단 ID를 모두 복구한다', () => {
+  test('[same-path-inspection-command-encodes-quoted-path-and-query-recovers-hidden-ids] 전부 보기 명령의 인코딩 경로와 조회기가 상한 초과 fixture 원장의 숨긴 완료·중단 ID를 보존한다', () => {
     const root = mkdtempSync(join(tmpdir(), 'launch-preflight-inspection-'));
     const ledgerDirectory = runLedgerDir(root);
     const goalsDirectory = join(root, 'goals');
@@ -1530,14 +1546,20 @@ describe('완료 런 경로 겹침 — 완료 사실은 값으로만 낸다', ()
       expect(command).toBeDefined();
       expect(command).not.toContain(targetPath);
       for (const hiddenId of hiddenIds) expect(rendered).not.toContain(hiddenId);
+      const parsedCommand = command!.match(/^bun -e '([\s\S]*)' ([A-Za-z0-9_-]+)$/);
+      expect(parsedCommand).not.toBeNull();
+      const encodedPaths = parsedCommand![2]!;
+      expect(JSON.parse(Buffer.from(encodedPaths, 'base64url').toString('utf8'))).toEqual([targetPath]);
+      // Execute the rendered command whole via sh -c (never rebuild argv from parsed text); stdout IDs must match the fixture IDs below.
       const executed = spawnSync('sh', ['-c', command!], {
         cwd: resolve(import.meta.dir, '..', '..'),
-        encoding: 'utf8',
         env: { ...process.env, ELANOUS_STATE_DIR: root },
+        encoding: 'utf8', timeout: 120_000,
       });
+      expect(executed.error?.message).toBeUndefined();
+      expect(executed.signal).toBeNull();
       expect(executed.status).toBe(0);
-      expect(executed.stderr).toBe('');
-      const recoveredIds = executed.stdout.trim().split('\n');
+      const recoveredIds = (executed.stdout ?? '').trim().split(/\r?\n/).filter(Boolean).sort();
       expect(recoveredIds).toEqual([...completedIds, ...interruptedIds].sort());
       for (const hiddenId of hiddenIds) expect(recoveredIds).toContain(hiddenId);
     } finally {
@@ -1864,18 +1886,27 @@ import {
   resolveLiveRunWindowMinutes,
 } from './launch-preflight.js';
 import { buildAskPreflightDeps } from './ask-launch-io.js';
+
+function listInterruptedRuns(
+  deps: Awaited<ReturnType<typeof buildAskPreflightDeps>>,
+  limit: number,
+) {
+  const list = deps.listInterruptedRuns;
+  if (!list) throw new Error('buildAskPreflightDeps must provide listInterruptedRuns');
+  return list(limit);
+}
 describe('buildAskPreflightDeps — 중단 런 원장 변환의 판독 불가 보존', () => {
   const interruptedRun = { runId: 'run-interrupted', interruptionReason: 'repeat', terminal: { timestamp: '2026-08-31T00:00:00.000Z' }, ledgerDirectory: '/state/ledger' };
   const lookup = () => ({ entries: [interruptedRun], unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0 });
 
   test('[missing-ledger-is-unreadable-not-checked-zero] 원장이 없으면 정상 무결과로 축약하지 않는다', async () => {
     const deps = await buildAskPreflightDeps({ interruptedRunLookup: lookup, loadRunLedger: () => null });
-    expect(deps.listInterruptedRuns!(200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 1, missingGoalFileNames: 0, unreadableOrMissingGoalDocuments: 0 } });
+    expect(listInterruptedRuns(deps, 200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 1, missingGoalFileNames: 0, unreadableOrMissingGoalDocuments: 0 } });
   });
 
   test('[missing-goal-file-is-unreadable-not-checked-zero] start/goalFile이 없으면 정상 무결과로 축약하지 않는다', async () => {
     const deps = await buildAskPreflightDeps({ interruptedRunLookup: lookup, loadRunLedger: () => [{ event: 'start', data: {} }] });
-    expect(deps.listInterruptedRuns!(200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 0, missingGoalFileNames: 1, unreadableOrMissingGoalDocuments: 0 } });
+    expect(listInterruptedRuns(deps, 200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 0, missingGoalFileNames: 1, unreadableOrMissingGoalDocuments: 0 } });
   });
 
   test('[goal-read-failure-is-unreadable-not-checked-zero] 목표 파일 읽기 실패는 판독 불가로 전달된다', async () => {
@@ -1884,7 +1915,7 @@ describe('buildAskPreflightDeps — 중단 런 원장 변환의 판독 불가 �
       loadRunLedger: () => [{ event: 'start', data: { goalFile: '/goals/interrupted.md' } }],
       readGoalDocument: () => { throw new Error('EACCES'); },
     });
-    expect(deps.listInterruptedRuns!(200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 0, missingGoalFileNames: 0, unreadableOrMissingGoalDocuments: 1 } });
+    expect(listInterruptedRuns(deps, 200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 0, missingGoalFileNames: 0, unreadableOrMissingGoalDocuments: 1 } });
   });
 
   test('[goal-parse-failure-is-unreadable-not-checked-zero] 목표 파일 파싱 실패는 판독 불가로 전달된다', async () => {
@@ -1894,7 +1925,7 @@ describe('buildAskPreflightDeps — 중단 런 원장 변환의 판독 불가 �
       readGoalDocument: () => 'goal',
       tracedPaths: () => { throw new Error('malformed goal'); },
     });
-    expect(deps.listInterruptedRuns!(200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 0, missingGoalFileNames: 0, unreadableOrMissingGoalDocuments: 1 } });
+    expect(listInterruptedRuns(deps, 200)).toEqual({ entries: [], unreadableRuns: 1, observationFailures: { ledgerLoadThrows: 0, nullLedgers: 0, missingGoalFileNames: 0, unreadableOrMissingGoalDocuments: 1 } });
   });
 
   test('[converted-entry-reaches-nonblocking-preflight] 변환 성공 값은 preflight에 도달하고 중단 런은 발사를 막지 않는다', async () => {
@@ -1904,13 +1935,13 @@ describe('buildAskPreflightDeps — 중단 런 원장 변환의 판독 불가 �
       readGoalDocument: () => 'goal',
       tracedPaths: () => ['src/a.ts'],
     });
-    const result = evaluateLaunchPreflight({ paths: ['src/a.ts'], openPrs: [], unfinishedRuns: [], interruptedRuns: deps.listInterruptedRuns!(200), liveRunWindowMs: WINDOW, nowMs: Date.parse('2026-09-01T00:00:00.000Z') });
+    const result = evaluateLaunchPreflight({ paths: ['src/a.ts'], openPrs: [], unfinishedRuns: [], interruptedRuns: listInterruptedRuns(deps, 200), liveRunWindowMs: WINDOW, nowMs: Date.parse('2026-09-01T00:00:00.000Z') });
     expect(result.interruptedRunMatches).toEqual([{ runId: 'run-interrupted', plannedPaths: ['src/a.ts'], interruptionReason: 'repeat', terminatedAtMs: Date.parse('2026-08-31T00:00:00.000Z'), ledgerDirectory: '/state/ledger' }]);
     expect(result.priorIncompleteRuns).toEqual({ state: 'checked', count: 1 });
     expect(result.blockers).toEqual([]);
   });
 
-  test('[default-lookup-real-ledger-terminal-timestamp-reaches-prior-incomplete-observation] 기본 lookup이 등록된 격리 원장의 종료 시각·대상 경로를 읽어 최근 미완주 관측으로 내며 발사를 막지 않는다', () => {
+  test('[injected-federated-lookup-real-ledger-terminal-timestamp-reaches-prior-incomplete-observation] 격리 원장의 연합 조회와 변환은 종료 시각·대상 경로를 최근 미완주 관측으로 내며 발사를 막지 않는다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'preflight-prior-incomplete-default-lookup-'));
     const stateRoot = join(root, 'test-state');
     const ledgerDirectory = join(stateRoot, 'run-ledger');
@@ -1931,26 +1962,24 @@ describe('buildAskPreflightDeps — 중단 런 원장 변환의 판독 불가 �
       { timestamp: terminalTimestamp, runId, event: 'rework-budget', data: { verdict: 'UNCONVERGEABLE', reason: 'fixture' } },
       { timestamp: terminalTimestamp, runId, event: 'run-status', data: { runStatus: 'failed' } },
     ].map((entry) => JSON.stringify(entry)).join('\n'), 'utf8');
-    const script = `
-      const { buildAskPreflightDeps } = await import('./src/self-dev/ask-launch-io.ts');
-      const { evaluateLaunchPreflight } = await import('./src/self-dev/launch-preflight.ts');
-      const deps = await buildAskPreflightDeps();
-      const interruptedRuns = deps.listInterruptedRuns(200);
-      const input = { openPrs: [], unfinishedRuns: [], interruptedRuns, liveRunWindowMs: ${WINDOW}, nowMs: ${nowMs} };
-      const matching = evaluateLaunchPreflight({ ...input, paths: [${JSON.stringify(targetPath)}] });
-      const different = evaluateLaunchPreflight({ ...input, paths: ['src/unmatched.ts'] });
-      console.log(JSON.stringify({ interruptedRuns, matching: { priorIncompleteRuns: matching.priorIncompleteRuns, blockers: matching.blockers }, different: different.priorIncompleteRuns }));
-    `;
     try {
-      const executed = spawnSync(process.execPath, ['-e', script], {
-        cwd: resolve(import.meta.dir, '..', '..'),
-        encoding: 'utf8',
-        // 부모 셸의 config 위치가 자식 관측에 경고를 더하지 않도록 설정 축도 fixture 아래로 격리한다.
-        env: { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, 'xdg-config'), ELANOUS_STATE_DIR: stateRoot },
-      });
-      // 종료 상태와 구조화된 결과가 기본 lookup의 기능 계약이다. 환경 경고의 문면은 계약이 아니다.
-      expect(executed.status).toBe(0);
-      expect(JSON.parse(executed.stdout)).toEqual({
+      const targets = [{ name: 'fixture', dbPath: join(stateRoot, 'logs', 'logs.db') }];
+      const result = await (async () => {
+        const deps = await buildAskPreflightDeps({
+          interruptedRunLookup: (limit, paths) => queryFederatedInterruptedRunLedgers({
+            targets,
+            includeTest: true,
+            limit,
+            ...(paths === undefined ? {} : typeof paths === 'string' ? { path: paths } : { paths }),
+          }),
+        });
+        const interruptedRuns = listInterruptedRuns(deps, 200);
+        const input = { openPrs: [], unfinishedRuns: [], interruptedRuns, liveRunWindowMs: WINDOW, nowMs };
+        const matching = evaluateLaunchPreflight({ ...input, paths: [targetPath] });
+        const different = evaluateLaunchPreflight({ ...input, paths: ['src/unmatched.ts'] });
+        return { interruptedRuns, matching: { priorIncompleteRuns: matching.priorIncompleteRuns, blockers: matching.blockers }, different: different.priorIncompleteRuns };
+      })();
+      expect(result).toEqual({
         interruptedRuns: {
           entries: [{ runId, plannedPaths: [targetPath, otherPath], interruptionReason: 'fixture', terminatedAtMs: Date.parse(terminalTimestamp), ledgerDirectory }],
           unreadableRuns: 0,
@@ -2643,25 +2672,19 @@ describe('decideAskPreflight — CLI 배선', () => {
     expect(d.shouldLaunch).toBe(true);
   });
 
-  test('[default-queryRunningRuns-path-is-used] queryRunningRuns를 주입하지 않으면 격리 상태에서 기본 구현을 호출해 확신 부록을 만든다', () => {
+  test('[default-queryRunningRuns-path-is-used] queryRunningRuns를 주입하지 않으면 격리 상태에서 기본 구현을 호출해 확신 부록을 만든다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'preflight-default-running-runs-'));
-    const script = `
-      const { decideAskPreflight } = await import('./src/self-dev/launch-preflight.ts');
-      const decision = decideAskPreflight(
-        { goalFile: 'g.md', liveRunWindowMinutes: 30, recentChangeWindowDays: 7 },
-        { readGoalDocument: () => 'doc', tracedPaths: () => ['src/a.ts'], listOpenPrs: () => [], listUnfinishedRuns: () => [] },
-        false,
-      );
-      console.log(JSON.stringify({ shouldLaunch: decision.shouldLaunch, appendix: decision.result.runningRunsConfidenceAppendix }));
-    `;
     try {
-      const executed = spawnSync('bun', ['-e', script], {
-        cwd: resolve(import.meta.dir, '..', '..'),
-        encoding: 'utf8',
-        env: { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, 'xdg-config'), ELANOUS_STATE_DIR: join(root, 'state') },
+      const result = await withTemporaryEnvironment({
+        HOME: root, XDG_CONFIG_HOME: join(root, 'xdg-config'), ELANOUS_STATE_DIR: join(root, 'state'),
+      }, () => {
+        const decision = decideAskPreflightWithDefault(
+          { goalFile: 'g.md', liveRunWindowMinutes: 30, recentChangeWindowDays: 7 },
+          { readGoalDocument: () => 'doc', tracedPaths: () => ['src/a.ts'], listOpenPrs: () => [], listUnfinishedRuns: () => [] },
+          false,
+        );
+        return { shouldLaunch: decision.shouldLaunch, appendix: decision.result.runningRunsConfidenceAppendix };
       });
-      expect(executed.status).toBe(0);
-      const result = JSON.parse(executed.stdout) as { shouldLaunch: boolean; appendix: string | undefined };
       expect(result.shouldLaunch).toBe(true);
       expect(result.appendix).toMatch(/^\[preflight\] (?:실제 도는 런 확신 판정:|⚠️ 실제 도는 런 확신 판정을 얻지 못했다)/);
     } finally {
@@ -3138,24 +3161,10 @@ describe('도는 런의 작업 트리 실제 변경 관측 — decideAskPrefligh
     expect(d.result.warnings[0]!.detail).toContain('실제 unreadable');
   });
 
-  test('[ledger-worktree-event-observes-both-git-axes-and-keeps-warning-nonblocking] 결과 기록이 없어도 원장 worktree 이벤트 경로에서 미커밋·커밋 축과 경고 문면을 관측한다', () => {
+  test('[ledger-worktree-event-carries-both-git-axes-and-keeps-warning-nonblocking] 결과 기록이 없어도 원장 worktree 이벤트 경로에서 주입한 미커밋·커밋 축과 경고 문면을 관측한다', () => {
     const state = mkdtempSync(join(tmpdir(), 'preflight-ledger-state-'));
-    const repo = mkdtempSync(join(tmpdir(), 'preflight-ledger-worktree-'));
-    const git = (...args: string[]) => {
-      const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
-      if (result.status !== 0) throw new Error(result.stderr);
-    };
+    const repo = join(state, 'fixture-worktree');
     try {
-      git('init', '-b', 'main');
-      git('config', 'user.email', 'test@example.com');
-      git('config', 'user.name', 'Test');
-      writeFileSync(join(repo, 'committed.ts'), 'base\n');
-      writeFileSync(join(repo, 'uncommitted.ts'), 'base\n');
-      git('add', '.'); git('commit', '-m', 'base');
-      git('switch', '-c', 'run');
-      writeFileSync(join(repo, 'committed.ts'), 'changed\n');
-      git('add', 'committed.ts'); git('commit', '-m', 'change committed');
-      writeFileSync(join(repo, 'uncommitted.ts'), 'changed\n');
       const ledgerDirectory = join(state, 'run-ledger');
       mkdirSync(ledgerDirectory);
       writeFileSync(join(ledgerDirectory, 'run-ledger-event.jsonl'), `${JSON.stringify({ runId: 'run-ledger-event', event: 'worktree', data: { path: repo } })}\n`);
@@ -3165,7 +3174,10 @@ describe('도는 런의 작업 트리 실제 변경 관측 — decideAskPrefligh
       expect(mapped.worktreePath).toBe(repo);
       const result = evaluateLaunchPreflight({
         paths: ['committed.ts', 'uncommitted.ts'], askTargetPaths: ['committed.ts', 'uncommitted.ts'], openPrs: [],
-        unfinishedRuns: [{ ...mapped, worktreePathTouches: observeWorktreePathTouches(mapped, ['committed.ts', 'uncommitted.ts']) }], liveRunWindowMs: WINDOW,
+        unfinishedRuns: [{ ...mapped, worktreePathTouches: {
+          'committed.ts': touch('touched', 'untouched', 'touched'),
+          'uncommitted.ts': touch('touched', 'touched', 'untouched'),
+        } }], liveRunWindowMs: WINDOW,
       });
       expect(result.blockers).toHaveLength(0);
       expect(result.warnings[0]!.overlapPaths).toEqual([
@@ -3176,7 +3188,6 @@ describe('도는 런의 작업 트리 실제 변경 관측 — decideAskPrefligh
       expect(result.warnings[0]!.detail).toContain('uncommitted.ts(대상 · 실제 touched)');
     } finally {
       rmSync(state, { recursive: true, force: true });
-      rmSync(repo, { recursive: true, force: true });
     }
   });
 
@@ -3262,64 +3273,72 @@ describe('도는 런의 작업 트리 실제 변경 관측 — decideAskPrefligh
     expect(d.result.warnings[0]!.detail).toContain('실제 worktree-unknown');
   });
 
-  test('[default-git-axes-through-outer-entry] 실제 Git observer는 미커밋·커밋·무변경을 각 축으로 보존한다', () => {
-    const repo = mkdtempSync(join(tmpdir(), 'launch-preflight-'));
-    const git = (...args: string[]) => {
-      const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
-      if (result.status !== 0) throw new Error(result.stderr);
+  test('[injected-git-axes-through-outer-entry] 주입된 Git 관측값은 미커밋·커밋·무변경을 각 축으로 보존한다', () => {
+    const observations = {
+      'a.ts': touch('touched', 'untouched', 'touched'),
+      'b.ts': touch('touched', 'touched', 'untouched'),
+      'untouched.ts': touch('untouched', 'untouched', 'untouched'),
     };
-    try {
-      git('init', '-b', 'main');
-      git('config', 'user.email', 'test@example.com');
-      git('config', 'user.name', 'Test');
-      writeFileSync(join(repo, 'a.ts'), 'base\n');
-      writeFileSync(join(repo, 'b.ts'), 'base\n');
-      git('add', '.'); git('commit', '-m', 'base');
-      git('switch', '-c', 'run');
-      writeFileSync(join(repo, 'a.ts'), 'committed\n');
-      git('add', 'a.ts'); git('commit', '-m', 'change a');
-      writeFileSync(join(repo, 'b.ts'), 'uncommitted\n');
-      const d = decideAskPreflight(
-        { goalFile: 'g.md', liveRunWindowMinutes: 30, recentChangeWindowDays: 7 },
-        {
-          readGoalDocument: () => 'doc', tracedPaths: () => ['a.ts', 'b.ts', 'untouched.ts'], askTargetPaths: () => ['a.ts', 'b.ts', 'untouched.ts'],
-          listOpenPrs: () => [], listUnfinishedRuns: () => [{ runId: 'git-run', plannedPaths: ['a.ts', 'b.ts', 'untouched.ts'], lastActivityAgeMs: 1, worktreePath: repo }],
-        }, false,
-      );
-      expect(d.result.warnings[0]!.overlapPaths).toEqual([
-        { path: 'a.ts', role: 'target', worktreeTouch: touch('touched', 'untouched', 'touched') },
-        { path: 'b.ts', role: 'target', worktreeTouch: touch('touched', 'touched', 'untouched') },
-        { path: 'untouched.ts', role: 'target', worktreeTouch: touch('untouched', 'untouched', 'untouched') },
-      ]);
-      expect(d.shouldLaunch).toBe(true);
-    } finally { rmSync(repo, { recursive: true, force: true }); }
-  });
-
-  test('[successful-rename-or-typechange-output-is-touched-through-outer-entry] 경로 한정 Git 출력이 비어 있지 않으면 rename·typechange 형식도 touched다', () => {
-    const repo = mkdtempSync(join(tmpdir(), 'launch-preflight-'));
-    const git = (...args: string[]) => {
-      const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
-      if (result.status !== 0) throw new Error(result.stderr);
-    };
-    const decide = () => decideAskPreflight(
+    let observedRunPath: string | undefined;
+    const d = decideAskPreflight(
       { goalFile: 'g.md', liveRunWindowMinutes: 30, recentChangeWindowDays: 7 },
       {
-        readGoalDocument: () => 'doc', tracedPaths: () => ['a.ts'], askTargetPaths: () => ['a.ts'],
-        listOpenPrs: () => [], listUnfinishedRuns: () => [{ runId: 'git-run', plannedPaths: ['a.ts'], lastActivityAgeMs: 1, worktreePath: repo }],
+        readGoalDocument: () => 'doc', tracedPaths: () => ['a.ts', 'b.ts', 'untouched.ts'], askTargetPaths: () => ['a.ts', 'b.ts', 'untouched.ts'],
+        listOpenPrs: () => [], listUnfinishedRuns: () => [{ runId: 'git-run', plannedPaths: ['a.ts', 'b.ts', 'untouched.ts'], lastActivityAgeMs: 1, worktreePath: '/fixture/git-axes' }],
+        observeWorktreePathTouches: (run, paths) => {
+          observedRunPath = run.worktreePath;
+          expect(paths).toEqual(['a.ts', 'b.ts', 'untouched.ts']);
+          return observations;
+        },
       }, false,
     );
+    expect(observedRunPath).toBe('/fixture/git-axes');
+    expect(d.result.warnings[0]!.overlapPaths).toEqual([
+      { path: 'a.ts', role: 'target', worktreeTouch: touch('touched', 'untouched', 'touched') },
+      { path: 'b.ts', role: 'target', worktreeTouch: touch('touched', 'touched', 'untouched') },
+      { path: 'untouched.ts', role: 'target', worktreeTouch: touch('untouched', 'untouched', 'untouched') },
+    ]);
+    expect(d.shouldLaunch).toBe(true);
+  });
+
+  test('[rename-and-typechange-observations-remain-touched-through-outer-entry] 실제 Git rename·typechange 출력은 observer의 두 축에서 touched다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'launch-preflight-git-observer-'));
+    const runGit = (...args: string[]) => {
+      const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+      if (result.error) throw new Error(`git spawn 실패: ${result.error.message}`);
+      if (result.status !== 0) throw new Error(`git ${args.join(' ')} 종료 ${result.status}: ${result.stderr}`);
+      return result.stdout ?? '';
+    };
     try {
-      git('init', '-b', 'main');
-      git('config', 'user.email', 'test@example.com');
-      git('config', 'user.name', 'Test');
-      writeFileSync(join(repo, 'a.ts'), 'base\n');
-      git('add', 'a.ts'); git('commit', '-m', 'base');
-      git('switch', '-c', 'run');
-      renameSync(join(repo, 'a.ts'), join(repo, 'renamed.ts'));
-      expect(decide().result.warnings[0]!.overlapPaths![0]!.worktreeTouch).toEqual(touch('touched', 'touched', 'untouched'));
-      git('add', '-A'); git('commit', '-m', 'rename a');
-      expect(decide().result.warnings[0]!.overlapPaths![0]!.worktreeTouch).toEqual(touch('touched', 'untouched', 'touched'));
-    } finally { rmSync(repo, { recursive: true, force: true }); }
+      runGit('init', '-b', 'main');
+      runGit('config', 'user.name', 'GOALAUTH fixture');
+      runGit('config', 'user.email', 'goalauth-fixture@example.invalid');
+      mkdirSync(join(root, 'src'), { recursive: true });
+      writeFileSync(join(root, 'src', 'old-name.ts'), 'export const value = 1;\n');
+      writeFileSync(join(root, 'src', 'typechange.ts'), 'export const value = 2;\n');
+      writeFileSync(join(root, 'src', 'target.ts'), 'export const target = true;\n');
+      writeFileSync(join(root, 'src', 'pending-old.ts'), 'export const pending = true;\n');
+      runGit('add', '.');
+      runGit('commit', '-m', 'fixture base');
+      runGit('switch', '-c', 'run');
+      runGit('mv', 'src/old-name.ts', 'src/renamed.ts');
+      runGit('commit', '-m', 'committed rename');
+      runGit('rm', 'src/typechange.ts');
+      symlinkSync('target.ts', join(root, 'src', 'typechange.ts'));
+      runGit('add', 'src/typechange.ts');
+      runGit('commit', '-m', 'committed file type change');
+      runGit('mv', 'src/pending-old.ts', 'src/pending-new.ts');
+
+      const observations = observeWorktreePathTouches(
+        { runId: 'git-observer-fixture', plannedPaths: [], lastActivityAgeMs: 0, worktreePath: root },
+        ['src/renamed.ts', 'src/typechange.ts', 'src/pending-new.ts'],
+      );
+      expect(observations['src/renamed.ts']).toEqual({ state: 'touched', uncommitted: 'untouched', committed: 'touched' });
+      expect(observations['src/typechange.ts']).toEqual({ state: 'touched', uncommitted: 'untouched', committed: 'touched' });
+      expect(observations['src/pending-new.ts']).toEqual({ state: 'touched', uncommitted: 'touched', committed: 'untouched' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('[empty-ask-target-paths-use-unknown-role] 빈 대상 경로는 역할 미상과 실제 손댐 경고를 보존하고 발사를 허용한다', () => {
@@ -3552,14 +3571,26 @@ describe('최근 머지 임계 해석 — resolveRecentChangeWindowDays', () => 
 //   ⇒ in-process import 로는 원리상 못 잡는다. 그래서 «실물 CLI 를 spawn» 한다.
 describe('셋째 축이 «실행 경로»에 있다 — 실물 진입점', () => {
   const CLI = resolve(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
-  let cached: string | undefined;
+  let cachedFlagInvocation: { readonly output: string; readonly status: number | null } | undefined;
+  let cachedDevHelp: { readonly output: string; readonly status: number | null } | undefined;
   function devHelp(): string {
-    if (cached !== undefined) return cached;
-    const r = spawnSync('bun', [CLI, 'dev', '--help-all'], { encoding: 'utf8', timeout: 60_000 });
+    if (cachedDevHelp !== undefined) return cachedDevHelp.output;
+    const r = spawnSync('bun', [CLI, 'dev', '--help-all'], {
+      cwd: resolve(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000,
+    });
+    if (r.error) throw new Error(`도움말 spawn 실패: ${r.error.message}`);
+    if (r.signal) throw new Error(`도움말 시그널 종료: ${r.signal}`);
+    cachedDevHelp = { output: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
+    if (cachedDevHelp.status !== 0) throw new Error(`실물 dev --help-all 종료 코드: ${cachedDevHelp.status}`);
+    return cachedDevHelp.output;
+  }
+  function invokeRetiredOption(): { readonly output: string; readonly status: number | null } {
+    if (cachedFlagInvocation !== undefined) return cachedFlagInvocation;
+    const r = spawnSync('bun', [CLI, 'dev', '--recent-change-window', '14'], { encoding: 'utf8', timeout: 60_000 });
     if (r.error) throw new Error(`spawn 실패(결함 아님): ${r.error.message}`);
     if (r.signal) throw new Error(`시그널 종료(타임아웃 의심): ${r.signal}`);
-    cached = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-    return cached;
+    cachedFlagInvocation = { output: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status };
+    return cachedFlagInvocation;
   }
 
   it('[flag-reaches-the-entrypoint] 최근-변경 경고가 실물 dev 에서 «기본»으로 돈다', () => {
@@ -3572,18 +3603,16 @@ describe('셋째 축이 «실행 경로»에 있다 — 실물 진입점', () =>
     expect(out).not.toContain('--recent-change-window');
     // ⭐ 그 동작이 «사람에게 보이는 자리»는 이제 도움말이 아니라 «은퇴 안내»다.
     //   ⛔ 그러니 그것을 «실물로» 눌러서 확인한다 — 문면만 보면 「사라졌다」로 읽힌다.
-    const r = spawnSync('bun', [CLI, 'dev', '--recent-change-window', '14'], { encoding: 'utf8', timeout: 60_000 });
-    if (r.error) throw new Error(`spawn 실패(결함 아님): ${r.error.message}`);
-    const pressed = `${r.stdout ?? ''}${r.stderr ?? ''}`.replace(/\s+/g, ' ');
+    const r = invokeRetiredOption();
+    const pressed = r.output.replace(/\s+/g, ' ');
     expect(pressed.length).toBeGreaterThan(0);
     expect(pressed).toContain('--recent-change-window 은퇴');
     expect(pressed).toContain('적용 기본값');   // ⭐ 「무엇이 기본이 됐나」가 사람에게 보이는 자리
   });
 
   it('[dependent-flag-rejected-without-ask] --ask/--say 없이 주면 이름을 대고 거부한다', () => {
-    const r = spawnSync('bun', [CLI, 'dev', '--recent-change-window', '14'], { encoding: 'utf8', timeout: 60_000 });
-    if (r.error) throw new Error(`spawn 실패(결함 아님): ${r.error.message}`);
-    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+    const r = invokeRetiredOption();
+    const out = r.output;
     expect(out.length).toBeGreaterThan(0);
     // ⛔ 종속 인자를 «조용히» 무시하면 사람이 준 것이 아무 일도 안 한 채 지나간다.
     expect(out).toContain('--recent-change-window');

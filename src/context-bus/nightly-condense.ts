@@ -16,7 +16,7 @@ type NightlyAssignment = { owner: 'coordinator'; assignee: 'nightly-task-agent';
 type GuardianAssignment = { owner: 'guardian'; assignee: 'guardian'; recipe: 'retire-aged'; items: readonly MemoryItem[]; now: string }
   | { owner: 'guardian'; assignee: 'guardian'; recipe: 'store-snapshot'; root: string; project: string; seat: string; value: MemoryItem[] }
   | { owner: 'guardian'; assignee: 'guardian'; recipe: 'store-candidates'; root: string; value: unknown[] };
-type Assignment = NightlyAssignment | GuardianAssignment;
+export type Assignment = NightlyAssignment | GuardianAssignment;
 
 /** Execute an assigned recipe in a separate, short-lived task worker, never in the coordinator's stage process. */
 async function dispatchAssignment<T>(assignment: Assignment): Promise<{ result: T; workerPid: number }> {
@@ -32,7 +32,7 @@ async function dispatchAssignment<T>(assignment: Assignment): Promise<{ result: 
   return { result: JSON.parse(stdout) as T, workerPid: worker.pid };
 }
 
-async function executeAssignment(assignment: Assignment): Promise<MemorySummary | MemoryItem[] | { stored: true }> {
+export async function executeAssignment(assignment: Assignment): Promise<MemorySummary | MemoryItem[] | { stored: true }> {
   if (assignment.owner === 'coordinator' && assignment.assignee === 'nightly-task-agent'
     && assignment.contract === 'librarian' && assignment.recipe === 'sleep-review') {
     return summarize(assignment.source, assignment.summary ? { [assignment.source.source]: assignment.summary } : undefined, assignment.recipe);
@@ -187,7 +187,8 @@ const defaultGuardianTask: GuardianTask = (items, assignee, now) => {
 
 /** Stage outputs travel only through the graph runner's per-run contexts. No decision ledger write occurs here. */
 export async function runNightlyStage(stage: Stage, context: Context, root: string, dryRun: boolean, now = new Date(),
-  nightlyTask?: NightlyTask, guardianTask: GuardianTask = defaultGuardianTask): Promise<Record<string, unknown>> {
+  nightlyTask?: NightlyTask, guardianTask: GuardianTask = defaultGuardianTask,
+  assignmentDispatcher: typeof dispatchAssignment = dispatchAssignment): Promise<Record<string, unknown>> {
   const input = context.input ?? {};
   if (dryRun && stage !== 'collect' && (!input.events || !input.decisions || !input.summaries)) {
     throw new Error('dry-run requires fake events, decisions and summaries');
@@ -219,7 +220,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
       summarize: async source => {
         if (dryRun) return summarize(source, input.summaries, 'sleep-review');
         if (nightlyTask) return nightlyTask(source, 'nightly-task-agent', 'sleep-review');
-        const { result, workerPid } = await dispatchAssignment<MemorySummary>({ owner: 'coordinator', assignee: 'nightly-task-agent',
+        const { result, workerPid } = await assignmentDispatcher<MemorySummary>({ owner: 'coordinator', assignee: 'nightly-task-agent',
           contract: 'librarian', recipe: 'sleep-review', source, ...(input.summaries ? { summary: input.summaries[source.source] } : {}) });
         assignments.push({ owner: 'coordinator', assignee: 'nightly-task-agent', contract: 'librarian', recipe: 'sleep-review', workerPid });
         return result;
@@ -233,7 +234,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
     const grouped = new Map<string, MemoryItem[]>();
     // The guardian task owns retirement; the librarian never mutates the stored status.
     const guardianRun = guardianTask === defaultGuardianTask && !dryRun
-      ? await dispatchAssignment<MemoryItem[]>({ owner: 'guardian', assignee: 'guardian', recipe: 'retire-aged', items, now: now.toISOString() })
+      ? await assignmentDispatcher<MemoryItem[]>({ owner: 'guardian', assignee: 'guardian', recipe: 'retire-aged', items, now: now.toISOString() })
       : { result: await guardianTask(items, 'guardian', now), workerPid: undefined };
     const memoryItems = guardianRun.result;
     for (const item of memoryItems) {
@@ -249,7 +250,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
         for (const [file, group] of grouped) {
           const first = group[0]!;
           written.push({ file, previous: snapshot(file), previousBackup: snapshot(`${file}.gz`) });
-          const stored = await dispatchAssignment<{ stored: true }>({ owner: 'guardian', assignee: 'guardian', recipe: 'store-snapshot',
+          const stored = await assignmentDispatcher<{ stored: true }>({ owner: 'guardian', assignee: 'guardian', recipe: 'store-snapshot',
             root, project: first.project, seat: first.seat, value: group });
           if (!stored.result.stored) throw new Error('guardian snapshot not stored');
         }
@@ -277,7 +278,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
       sources: item.conflict!.sources, status: 'candidate' as const,
     }));
     if (!dryRun) await withCurrentDay(root, day, async () => {
-      const stored = await dispatchAssignment<{ stored: true }>({ owner: 'guardian', assignee: 'guardian', recipe: 'store-candidates',
+      const stored = await assignmentDispatcher<{ stored: true }>({ owner: 'guardian', assignee: 'guardian', recipe: 'store-candidates',
         root, value: candidates });
       if (!stored.result.stored) throw new Error('guardian candidates not stored');
     });

@@ -17,7 +17,7 @@ const shards = [
 
 function receipt(id: string, files: string[], host: string, overrides: Record<string, unknown> = {}) {
   const imageDigest = 'sha256:' + 'a'.repeat(64);
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: SHA };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: SHA , baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   return { id, files, version: '0.2.46', graphSha: '0'.repeat(64), recipeSha: '0'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun gate', recipeTimeoutMs: 1000, head40: HEAD, base40: BASE, host, imageDigest, envFingerprint: SHA, runtimeIdentity, envKey: `${SHA}:${imageDigest}`, executions: [{ branch: '', attemptId: `sim-${id}`, host, imageDigest, runtimeIdentity }], status: 'complete' as const,
     failureIds: [], errorIds: [], evidencePath: `gate-logs/${id}-${host}.json`, evidenceSha256: SHA,
     measuredAt: '2026-10-27T00:00:00.000Z', attempt: 1, ...overrides };

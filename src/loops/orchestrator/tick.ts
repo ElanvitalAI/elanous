@@ -1,5 +1,5 @@
 import { withFileLockSync } from '../../storage/file-lock.js';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-store.js';
 import { Database } from 'bun:sqlite';
@@ -433,13 +433,36 @@ export function readCompletionHeartbeat(root: string): CompletionHeartbeat | und
     return { runId, node: node as Node, window: window as Window, mode: mode as Mode, boardWrittenAt, tickCompletedAt };
   } catch { return undefined; }
 }
-/** Temp + rename, so a guardian in another process never reads a torn record. */
+/** Serialize read/merge/write so overlapping runs cannot replace a newer heartbeat with stale timestamps. */
 function recordCompletionHeartbeat(root: string, completion: CompletionHeartbeat): void {
   const path = completionHeartbeatPath(root);
   mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, JSON.stringify(completion));
-  renameSync(temp, path);
+  withFileLockSync(`${path}.lock`, () => {
+    const previous = readCompletionHeartbeat(root);
+    const later = (left: string | null | undefined, right: string | null): string | null => {
+      if (!left) return right;
+      if (!right) return left;
+      return Date.parse(left) >= Date.parse(right) ? left : right;
+    };
+    const tickCompletedAt = later(previous?.tickCompletedAt, completion.tickCompletedAt);
+    const boardWrittenAt = later(previous?.boardWrittenAt, completion.boardWrittenAt);
+    const completionIsNewest = !!completion.tickCompletedAt
+      && (!previous?.tickCompletedAt || Date.parse(completion.tickCompletedAt) >= Date.parse(previous.tickCompletedAt));
+    const metadata = previous && !completionIsNewest ? previous : completion;
+    const merged: CompletionHeartbeat = { ...metadata, boardWrittenAt, tickCompletedAt };
+    const temp = `${path}.${process.pid}.tmp`;
+    try {
+      const previousTemp = lstatSync(temp);
+      if (previousTemp.isSymbolicLink()) throw new Error(`completion heartbeat temp is a symlink: ${temp}`);
+      unlinkSync(temp); // Recover a regular temp left by a crashed writer while holding the record lock.
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    }
+    const fd = openSync(temp, 'wx'); // Never follow a temp-path symlink.
+    try { writeFileSync(fd, JSON.stringify(merged)); }
+    finally { closeSync(fd); }
+    renameSync(temp, path);
+  });
 }
 function restorePrevious(root: string, day: string, mode: Mode): Pick<TickState, 'cards' | 'cells' | 'launched'> | null {
   const dir = join(root, 'loop', 'orchestrator');
@@ -1027,10 +1050,7 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   observe('tick', state.nodes[node], state.cells.length);
   if (mode === 'live' && node === 'place' && state.boardWrittenAt) {
     // A board write can succeed even when a later cell fails. Advance its clock without claiming run completion.
-    const previous = readCompletionHeartbeat(root);
-    recordCompletionHeartbeat(root, previous
-      ? { ...previous, boardWrittenAt: state.boardWrittenAt }
-      : { runId, node, window, mode, boardWrittenAt: state.boardWrittenAt, tickCompletedAt: null });
+    recordCompletionHeartbeat(root, { runId, node, window, mode, boardWrittenAt: state.boardWrittenAt, tickCompletedAt: null });
   }
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(state));

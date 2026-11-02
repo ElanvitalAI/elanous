@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { findNativeTool } from '../native-tool-catalog.js';
@@ -66,6 +67,41 @@ function spawnedChild(): TestChild & { emitExit(code: number | null, signal?: st
     child.stderr.emit('end');
   };
   return child;
+}
+
+type DeadlineProbe = {
+  ready: Promise<void>;
+  delayMs: () => number;
+  scheduleTimeout: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  cancelTimeout: (timer: ReturnType<typeof setTimeout>) => void;
+};
+
+function createDeadlineProbe(): DeadlineProbe {
+  let delay: number | undefined;
+  let release!: () => void;
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  return {
+    ready,
+    delayMs: () => {
+      if (delay === undefined) throw new Error('hold deadline not scheduled');
+      return delay;
+    },
+    scheduleTimeout: (callback, delayMs) => {
+      delay = delayMs;
+      release();
+      return setTimeout(callback, delayMs);
+    },
+    cancelTimeout: timer => clearTimeout(timer),
+  };
+}
+
+async function runHoldWithClock<T>(probe: DeadlineProbe, run: () => Promise<T>, advanceMs?: number): Promise<T> {
+  return withSimClock(0, async clock => {
+    const pending = run();
+    await probe.ready;
+    clock.tick(advanceMs ?? probe.delayMs());
+    return await pending;
+  });
 }
 
 describe('ElanousHold runtime', () => {
@@ -269,13 +305,14 @@ describe('ElanousHold runtime', () => {
 
   test('returns timeout diagnostics and SIGTERM-cleans a child without a held line', async () => {
     const child = spawnedChild();
+    const deadline = createDeadlineProbe();
     const signals: Array<string | undefined> = [];
     child.kill = (signal?: NodeJS.Signals | number) => { signals.push(signal as string | undefined); return true; };
-    inject({ spawn: () => {
+    inject({ scheduleTimeout: deadline.scheduleTimeout, cancelTimeout: deadline.cancelTimeout, spawn: () => {
       setTimeout(() => child.stderr.emit('data', 'oops'), 0);
       return child;
     } });
-    const result = await dispatchElanousHold({ timeoutMs: 50 });
+    const result = await runHoldWithClock(deadline, () => dispatchElanousHold({ timeoutMs: 50 }));
     expect(result.ptyId).toBeNull();
     expect(result.output).toStartWith('ElanousHold failed:');
     expect(result.output).toContain('exit=running');
@@ -287,7 +324,8 @@ describe('ElanousHold runtime', () => {
     const child = spawnedChild();
     const childDeadlineMs = 50;
     const initializationDelayMs = 8_698;
-    inject({ spawn: (_command, args) => {
+    const deadline = createDeadlineProbe();
+    inject({ scheduleTimeout: deadline.scheduleTimeout, cancelTimeout: deadline.cancelTimeout, spawn: (_command, args) => {
       expect(args.slice(args.indexOf('--ready-timeout-ms'), args.indexOf('--ready-timeout-ms') + 2)).toEqual(['--ready-timeout-ms', String(childDeadlineMs)]);
       setTimeout(() => {
         child.stderr.emit('data', `hold-wait-timeout after ${childDeadlineMs}ms\n`);
@@ -297,7 +335,7 @@ describe('ElanousHold runtime', () => {
       return child;
     } });
 
-    const result = await dispatchElanousHold({ timeoutMs: childDeadlineMs });
+    const result = await runHoldWithClock(deadline, () => dispatchElanousHold({ timeoutMs: childDeadlineMs }), initializationDelayMs + childDeadlineMs + 25);
     expect(result.ptyId).toBeNull();
     expect(result.output).toContain('exit=1');
     expect(result.output).toContain(`hold-wait-timeout after ${childDeadlineMs}ms`);
@@ -406,15 +444,16 @@ describe('ElanousHold runtime', () => {
   test('fails on child exit even if an inherited pipe later emits a held line', async () => {
     const child = spawnedChild();
     const signals: Array<string | undefined> = [];
+    const deadline = createDeadlineProbe();
     child.kill = (signal?: NodeJS.Signals | number) => { signals.push(signal as string | undefined); return true; };
-    inject({ spawn: () => {
+    inject({ scheduleTimeout: deadline.scheduleTimeout, cancelTimeout: deadline.cancelTimeout, spawn: () => {
       setTimeout(() => {
         child.emitExit(null, 'SIGKILL');
         child.stdout.emit('data', '⛭ held pty_afterexit\n');
       }, 0);
       return child;
     } });
-    const result = await dispatchElanousHold({ timeoutMs: 100 });
+    const result = await runHoldWithClock(deadline, () => dispatchElanousHold({ timeoutMs: 100 }));
     expect(result.ptyId).toBeNull();
     expect(result.output).toContain('exit=signal=SIGKILL');
     expect(signals).toEqual([]);
@@ -422,11 +461,12 @@ describe('ElanousHold runtime', () => {
 
   test('reports exited rather than timeout when an inherited pipe remains open', async () => {
     const child = spawnedChild();
-    inject({ spawn: () => {
+    const deadline = createDeadlineProbe();
+    inject({ scheduleTimeout: deadline.scheduleTimeout, cancelTimeout: deadline.cancelTimeout, spawn: () => {
       setTimeout(() => child.emitExit(1), 0);
       return child;
     } });
-    const result = await dispatchElanousHold({ timeoutMs: 50 });
+    const result = await runHoldWithClock(deadline, () => dispatchElanousHold({ timeoutMs: 50 }));
     expect(result.ptyId).toBeNull();
     expect(result.output).toContain('exit=1');
   }, 12_000);
@@ -434,11 +474,12 @@ describe('ElanousHold runtime', () => {
   test('bounds an unterminated diagnostic line while preserving its tail', async () => {
     const child = spawnedChild();
     const marker = 'tail-marker';
-    inject({ spawn: () => {
+    const deadline = createDeadlineProbe();
+    inject({ scheduleTimeout: deadline.scheduleTimeout, cancelTimeout: deadline.cancelTimeout, spawn: () => {
       setTimeout(() => child.stderr.emit('data', `${'x'.repeat(20_000)}${marker}`), 0);
       return child;
     } });
-    const result = await dispatchElanousHold({ timeoutMs: 50 });
+    const result = await runHoldWithClock(deadline, () => dispatchElanousHold({ timeoutMs: 50 }));
     expect(result.output).toContain(marker);
     expect(result.output.length).toBeLessThan(9_000);
   }, 12_000);

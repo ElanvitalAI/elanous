@@ -7,6 +7,8 @@ import type { LLMMessage, LLMOpts, LLMProvider, LLMStreamEvent } from '../llm.js
 
 export const TEST_FAKE_LLM_ENV = 'ELANOUS_TEST_FAKE_LLM';
 export const TEST_FAKE_LLM_RESPONSE_ENV = 'ELANOUS_TEST_FAKE_LLM_RESPONSE';
+/** Optional maximum Unicode code points per emitted text delta (unset = one delta). */
+export const TEST_FAKE_LLM_CHUNK_SIZE_ENV = 'ELANOUS_TEST_FAKE_LLM_CHUNK_SIZE';
 /** TUI-400-AUTOHEAL-FALLBACK — 호출별 결함 스크립트(쉼표 목록 · `400` | `400codex` | `ok`). 예: `400,ok,ok`.
  *  `400` 칸은 실측 «대화 기록 어긋남» 꼴(`LLM API 400: … No tool call found for function call output …`)을 던진다.
  *  스크립트가 끝나면 `ok`. 칸 소비는 이 프로세스 안 호출 순서다(라이브 TUI 격리 무대용 — 생산은 이 env 를 안 본다). */
@@ -31,6 +33,17 @@ export function testFakeLlmResponse(messages?: readonly LLMMessage[]): string {
   const step = (messages ?? []).filter((m) => m.role === 'user'
     && !(Array.isArray(m.content) && m.content.some((block) => block.type === 'tool_result'))).length;
   return text.split(TEST_FAKE_LLM_STEP_TOKEN).join(String(step));
+}
+
+function responseChunks(text: string): string[] {
+  const rawSize = process.env[TEST_FAKE_LLM_CHUNK_SIZE_ENV];
+  if (rawSize === undefined || rawSize.trim() === '') return [text];
+  const size = Number(rawSize);
+  if (!Number.isSafeInteger(size) || size < 1) return [text];
+  const points = Array.from(text);
+  const chunks: string[] = [];
+  for (let index = 0; index < points.length; index += size) chunks.push(points.slice(index, index + size).join(''));
+  return chunks;
 }
 
 let scriptCursor = 0;
@@ -140,6 +153,6 @@ export const testFakeLlmProvider: LLMProvider = {
     }
     const call = scriptedToolCall(messages);
     if (call) { yield call; return; }
-    yield { type: 'text', delta: testFakeLlmResponse(messages) };
+    for (const delta of responseChunks(testFakeLlmResponse(messages))) yield { type: 'text', delta };
   },
 };

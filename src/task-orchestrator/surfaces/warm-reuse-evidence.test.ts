@@ -1,10 +1,10 @@
 import { expect, spyOn, test } from 'bun:test';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decideWarmReuse } from './pod-warm-switch.js';
 import { debug } from '../../debug/log.js';
-import { loadWarmReuseEvidenceByConsumer, readWarmReuseEvidence, recordWarmReuseEvidence } from './warm-reuse-evidence.js';
+import { invalidateWarmReuseEvidence, loadWarmReuseEvidenceByConsumer, readWarmReuseEvidence, recordWarmGateEvidence, recordWarmReuseEvidence } from './warm-reuse-evidence.js';
 
 const head = 'a'.repeat(40);
 const main = 'b'.repeat(40);
@@ -119,4 +119,64 @@ test('actual journal rows supply measured TA evidence; missing rows stay unmeasu
     const changedWorker = loadWarmReuseEvidenceByConsumer({ head: 'd'.repeat(40), main }, path);
     expect(changedWorker?.['gate-recheck']?.consecutiveMatchSamples).toBe(1);
   } finally { spy.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test('unmeasured gate sample supersedes prior success; mismatched head and main are fail-closed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-evidence-'));
+  const path = join(root, 'warm-reuse-evidence.jsonl');
+  try {
+    const lease = { workerId: 'worker-1', leaseId: 'lease-1', generation: 1, expectedLockHash: lock,
+      workerLockHash: lock, leaseValid: true, canaryPassed: true, agree: true };
+    recordWarmGateEvidence({ head, main: head, evidence: lease }, path);
+    recordWarmGateEvidence({ head, main: head, reason: 'decision-unavailable' }, path);
+    const afterUnmeasured = loadWarmReuseEvidenceByConsumer({ head, main: head }, path);
+    expect(afterUnmeasured?.['gate-recheck']).toMatchObject({ consecutiveMatchSamples: 0 });
+    recordWarmGateEvidence({ head, main: 'd'.repeat(40), evidence: lease }, path);
+    expect(readWarmReuseEvidence(path, { consumer: 'gate-recheck', head, main: 'd'.repeat(40) })?.at(-1))
+      .toMatchObject({ leaseValid: false, canaryPassed: false, agree: false });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('failed gate evidence append removes prior success', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-evidence-fail-'));
+  const path = join(root, 'warm-reuse-evidence.jsonl');
+  try {
+    recordWarmGateEvidence({ head, main: head, evidence: { workerId: 'worker-1', leaseId: 'lease-1', generation: 1,
+      expectedLockHash: lock, workerLockHash: lock, leaseValid: true, canaryPassed: true, agree: true } }, path);
+    expect(() => recordWarmGateEvidence({ head, main: head, reason: 'unmeasured' }, path,
+      () => { throw new Error('disk full'); })).toThrow('disk full');
+    expect(readWarmReuseEvidence(path, { consumer: 'gate-recheck', head, main: head })).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test('gate invalidation preserves independent land and TA evidence', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-invalidate-'));
+  const path = join(root, 'warm-reuse-evidence.jsonl');
+  try {
+    recordWarmReuseEvidence(path, { schema: 1, consumer: 'gate-recheck', head, main: head,
+      recordedAt: new Date().toISOString(), workerId: 'worker-g', leaseId: 'gate-lease', generation: 1,
+      expectedLockHash: lock, workerLockHash: lock, leaseValid: true, canaryPassed: true, agree: true });
+    recordWarmReuseEvidence(path, { schema: 1, consumer: 'land', pr: 21, head, main,
+      recordedAt: new Date().toISOString(), workerId: 'worker-l', leaseId: 'land-lease', generation: 1,
+      expectedLockHash: lock, workerLockHash: lock, leaseValid: true, canaryPassed: true, agree: true });
+    recordWarmReuseEvidence(path, { schema: 1, consumer: 'ta', pr: 22, head, main,
+      recordedAt: new Date().toISOString(), reason: 'cold-fallback' });
+    invalidateWarmReuseEvidence(path);
+    expect(readWarmReuseEvidence(path, { consumer: 'gate-recheck', head, main: head })).toBeUndefined();
+    expect(readWarmReuseEvidence(path, { consumer: 'land', pr: 21, head, main })).toHaveLength(1);
+    expect(readWarmReuseEvidence(path, { consumer: 'ta', pr: 22, head, main })).toHaveLength(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test('gate invalidation lock inspection failure times out instead of spinning forever', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-warm-lock-timeout-'));
+  const path = join(root, 'warm-reuse-evidence.jsonl');
+  try {
+    writeFileSync(path, '');
+    symlinkSync(join(root, 'missing-lock-target'), `${path}.lock`);
+    expect(() => invalidateWarmReuseEvidence(path, 20)).toThrow('timed out locking warm reuse evidence invalidation');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -79,7 +79,7 @@ function fixture() {
   const pins = { graphSha: 'c'.repeat(64), recipeSha: 'd'.repeat(64) };
   const envFingerprint = 'e'.repeat(64);
   const imageDigest = `sha256:${'f'.repeat(64)}`;
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint , baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   const executionIdentity = { imageDigest, ...runtimeIdentity };
   const stampDir = join(root, 'release', version, 'rehearsal');
   const gateDir = join(root, 'release', gateVersion);
@@ -138,7 +138,7 @@ test('missing or mismatched receipt identities return a full gate', () => {
   writeFileSync(join(gateDir, 'gate-logs', 'cut', 'pod-0.json'), JSON.stringify({
     commit: input.forCommit, files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], imageDigest: input.imageDigest,
     runtimeIdentity: { bunVersion: input.executionIdentity.bunVersion, platform: input.executionIdentity.platform,
-      architecture: input.executionIdentity.architecture, envFingerprint: input.executionIdentity.envFingerprint },
+      architecture: input.executionIdentity.architecture, envFingerprint: input.executionIdentity.envFingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) },
     shardCount: 1, sweepId: 'sweep-one', attemptId: 'attempt-one',
   }));
   expect(planHardRehearsalRadius(input).plan).toBeNull();

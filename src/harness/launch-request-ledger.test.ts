@@ -52,10 +52,15 @@ test('LAUNCH-SINGLE-DOOR-1C: 요청 맥락과 누적·미소비·재시도 통�
   door.consume(consumedId);
   door.requestId('소비 요청', { seat: 'OP', originalRef: 'goal-2' });
   door.consume(consumedId);
+  const retryGroup = 'mock-goal-24';
+  const retryOne = door.requestId('재시도 첫 요청', { retryGroup });
+  door.consume(retryOne);
+  const retryTwo = door.requestId('재시도 다음 요청', { retryGroup });
+  door.consume(retryTwo);
   door.fail(consumedId, 'spawn refused');
   expect(door.rows(pendingId)[0]).toMatchObject({ event: 'requested', seat: 'TC', cell: 'LAUNCH-SINGLE-DOOR-1C', originalRef: 'card-1', reason: 'awaiting-permission' });
   door.fail(consumedId, 'repeat failure');
-  expect(summarizeLaunchRequestRows(door.rows())).toEqual({ requests: 3, uniqueRequests: 2, unconsumed: 1, consumed: 1, retries: 1, failed: 1, refused: 1, doorUnavailable: 0 });
+  expect(summarizeLaunchRequestRows(door.rows())).toEqual({ requests: 5, uniqueRequests: 4, unconsumed: 1, consumed: 3, retries: 2, failed: 1, refused: 1, doorUnavailable: 0 });
 });
 
 test('harness launch-requests reports isolated request counts as JSON', async () => {
@@ -170,6 +175,8 @@ test('TASK-HAND-RETRY: 시도별 영수증이 있어도 실행 중인 같은 골
 
   const previousCardId = process.env.ELANOUS_TASK_CARD_ID;
   const previousReceipt = process.env[LAUNCH_DOOR_RECEIPT_ENV];
+  const previousDoorMode = process.env.ELANOUS_LAUNCH_DOOR_MODE;
+  process.env.ELANOUS_LAUNCH_DOOR_MODE = 'shadow';
   process.env.ELANOUS_TASK_CARD_ID = contextEnv!.ELANOUS_TASK_CARD_ID!;
   process.env[LAUNCH_DOOR_RECEIPT_ENV] = inherited!;
   const dispatched: string[] = [];
@@ -190,6 +197,8 @@ test('TASK-HAND-RETRY: 시도별 영수증이 있어도 실행 중인 같은 골
     else process.env.ELANOUS_TASK_CARD_ID = previousCardId;
     if (previousReceipt === undefined) delete process.env[LAUNCH_DOOR_RECEIPT_ENV];
     else process.env[LAUNCH_DOOR_RECEIPT_ENV] = previousReceipt;
+    if (previousDoorMode === undefined) delete process.env.ELANOUS_LAUNCH_DOOR_MODE;
+    else process.env.ELANOUS_LAUNCH_DOOR_MODE = previousDoorMode;
   }
   expect(dispatched).toEqual([]);
   expect(errors.join('\n')).toContain('blocked-duplicate — same-goal active runs: run-active-card');
@@ -202,6 +211,8 @@ test('LAUNCH-SINGLE-DOOR-1C: harness say 관문 배선 — 같은 원문 2회가
   setElanousConfigDir(root);
   const door = openLaunchRequestDoor({ root, source: 'cli-harness-say' });
   const sentence = '같은문장으로-두-번-두드린다';
+  const previousDoorMode = process.env.ELANOUS_LAUNCH_DOOR_MODE;
+  process.env.ELANOUS_LAUNCH_DOOR_MODE = 'shadow';
   const dispatched: string[] = [];
   const program = new Command().exitOverride();
   installHarnessCliCommand(program, {
@@ -219,6 +230,8 @@ test('LAUNCH-SINGLE-DOOR-1C: harness say 관문 배선 — 같은 원문 2회가
     await program.parseAsync(['node', 'elanous', 'harness', 'say', sentence]);
   } finally {
     console.error = originalError;
+    if (previousDoorMode === undefined) delete process.env.ELANOUS_LAUNCH_DOOR_MODE;
+    else process.env.ELANOUS_LAUNCH_DOOR_MODE = previousDoorMode;
   }
   expect(dispatched).toEqual([sentence]);      // 두 번째 요청은 자식 발사 없이 거절됐다
   expect(process.exitCode).toBe(3);

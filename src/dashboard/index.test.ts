@@ -2411,98 +2411,13 @@ describe('TUI-BOOT-TIMING-HOLES — show-dashboard 동기 셋업 계측', () => 
     expect(() => openSyncSetupWindow(undefined).finish()).not.toThrow();
   });
 
-  test('실물 showDashboard() 부팅이 첫 프레임 前 셋업 구간을 보고한다', async () => {
+  test('실물 showDashboard() 부팅이 stdout flush 뒤 첫 프레임 전에 셋업 구간을 보고한다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dashboard-sync-setup-'));
     const folder = join(root, 'folder');
     const configRoot = join(root, 'config');
     const sessionDir = join(root, 'sessions');
     const markerFile = join(root, 'boot-markers.jsonl');
     const driver = join(root, 'sync-setup-driver.ts');
-    const previousConfig = getElanousConfigDirOverride();
-    const previousSessionRoot = process.env.ELANOUS_SESSION_ROOT;
-    const previousCwd = process.cwd();
-    try {
-      mkdirSync(folder);
-      mkdirSync(configRoot, { recursive: true });
-      setElanousConfigDir(configRoot);
-      process.env.ELANOUS_SESSION_ROOT = sessionDir;
-      process.chdir(folder);
-      writeFileSync(
-        driver,
-        [
-          "import { appendFileSync } from 'node:fs';",
-          `const markerFile = ${JSON.stringify(markerFile)};`,
-          "const mark = (line: string) => appendFileSync(markerFile, line + '\\n');",
-          `const { setElanousConfigDir } = await import(${JSON.stringify(join(import.meta.dir, '../elanous-config-dir.ts'))});`,
-          `setElanousConfigDir(${JSON.stringify(configRoot)});`,
-          "setTimeout(() => { mark('timeout'); process.exit(1); }, 90_000).unref();",
-          `const { showDashboard } = await import(${JSON.stringify(join(import.meta.dir, 'index.ts'))});`,
-          'await showDashboard({',
-          '  onSyncSetupComplete: (ms) => { mark(`setup=${ms}`); },',
-          "  onFirstFrameRendered: () => { mark('first-frame'); process.exit(0); },",
-          '});',
-          "mark('dashboard-returned');",
-        ].join('\n'),
-      );
-
-      const child = spawn(process.execPath, [driver], {
-        cwd: folder,
-        env: {
-          ...process.env,
-          HOME: join(root, 'home'),
-          ELANOUS_STATE_DIR: configRoot,
-          ELANOUS_SESSION_ROOT: sessionDir,
-          TERM: process.env.TERM ?? 'xterm-256color',
-          CI: '1',
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stderr = '';
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (chunk: string) => {
-        stderr += chunk;
-      });
-      let stdout = '';
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => {
-        stdout += chunk;
-      });
-      const code = await new Promise<number | null>((resolveExit, reject) => {
-        child.on('error', reject);
-        child.on('close', resolveExit);
-      });
-
-      const markers = readFileSync(markerFile, 'utf8')
-        .split('\n')
-        .filter((line) => line.trim());
-      if (code !== 0) {
-        throw new Error(`dashboard boot driver rc=${code} stderr=${stderr.slice(-900)} stdout=${stdout.slice(-900)}`);
-      }
-      const setupIndex = markers.findIndex((line) => line.startsWith('setup='));
-      const frameIndex = markers.indexOf('first-frame');
-      expect(setupIndex).toBeGreaterThanOrEqual(0);
-      expect(frameIndex).toBeGreaterThan(setupIndex);
-      const setupMs = Number(markers[setupIndex]?.slice('setup='.length));
-      expect(Number.isFinite(setupMs)).toBe(true);
-      expect(setupMs).toBeGreaterThanOrEqual(0);
-      expect(markers).not.toContain('dashboard-returned');
-    } finally {
-      process.chdir(previousCwd);
-      if (previousConfig !== undefined) setElanousConfigDir(previousConfig);
-      else resetElanousConfigDir();
-      if (previousSessionRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
-      else process.env.ELANOUS_SESSION_ROOT = previousSessionRoot;
-      rmSync(root, { recursive: true, force: true });
-    }
-  }, 180_000);
-
-  test('셋업 창은 화면 조립이 아니라 첫 프레임 flush 완료 시점에 닫힌다', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'dashboard-sync-setup-flush-'));
-    const folder = join(root, 'folder');
-    const configRoot = join(root, 'config');
-    const sessionDir = join(root, 'sessions');
-    const markerFile = join(root, 'flush-markers.jsonl');
-    const driver = join(root, 'sync-setup-flush-driver.ts');
     const previousConfig = getElanousConfigDirOverride();
     const previousSessionRoot = process.env.ELANOUS_SESSION_ROOT;
     const previousCwd = process.cwd();
@@ -2570,13 +2485,18 @@ describe('TUI-BOOT-TIMING-HOLES — show-dashboard 동기 셋업 계측', () => 
         .split('\n')
         .filter((line) => line.trim());
       if (code !== 0) {
-        throw new Error(`dashboard flush driver rc=${code} stderr=${stderr.slice(-900)} stdout=${stdout.slice(-900)}`);
+        throw new Error(`dashboard boot driver rc=${code} stderr=${stderr.slice(-900)} stdout=${stdout.slice(-900)}`);
       }
       const setupIndex = markers.findIndex((line) => line.startsWith('setup='));
-      expect(setupIndex).toBeGreaterThan(0);
+      const frameIndex = markers.indexOf('first-frame');
       expect(markers).toContain('flush');
+      expect(setupIndex).toBeGreaterThan(0);
       expect(markers[setupIndex - 1]).toBe('flush');
-      expect(markers.indexOf('first-frame')).toBeGreaterThan(setupIndex);
+      expect(frameIndex).toBeGreaterThan(setupIndex);
+      const setupMs = Number(markers[setupIndex]?.slice('setup='.length));
+      expect(Number.isFinite(setupMs)).toBe(true);
+      expect(setupMs).toBeGreaterThanOrEqual(0);
+      expect(markers).not.toContain('dashboard-returned');
     } finally {
       process.chdir(previousCwd);
       if (previousConfig !== undefined) setElanousConfigDir(previousConfig);

@@ -286,6 +286,12 @@ export interface LLMMessage {
    *  prefix reuse) and sends them as a `developer` item placed just before
    *  the latest user message. Other providers ignore the flag. */
   cacheVolatile?: boolean;
+  /** Internal dashboard-only marker for system messages injected for one
+   *  request. It is deliberately ignored by provider serializers and removed
+   *  before a compacted transcript is persisted. */
+  transientPreamble?: true;
+  /** Internal marker for the user message belonging to the active turn. */
+  transientTurnUser?: true;
 }
 
 /** JSONSchema-shaped tool definition sent to the provider (no handler). */
@@ -436,6 +442,13 @@ export type LLMStreamEvent =
  *  model from ever emitting a final text answer (loop never terminates). */
 export type ToolChoice = 'auto' | 'required' | 'none' | { name: string };
 
+class RequestSizeLimitError extends Error {
+  constructor(requestChars: number, maxChars: number, reason: string) {
+    super(`Codex request remains over the ${maxChars}-character limit after compaction (${requestChars}; ${reason})`);
+    this.name = 'RequestSizeLimitError';
+  }
+}
+
 export interface LLMOpts {
   model?: string;
   /** Explicit research surface verdict from the turn router. Relaxes early
@@ -459,6 +472,8 @@ export interface LLMOpts {
       messages: LLMMessage[],
       info: { provider: string; requestChars: number; maxChars: number },
     ) => Promise<{ messages: LLMMessage[]; reason: string } | null>;
+    /** Receives compacted provider messages so the tool-loop can replace its canonical history. */
+    onCompacted?: (messages: LLMMessage[]) => void | Promise<void>;
     onMeasured?: (info: {
       provider: string;
       requestChars: number;
@@ -6333,7 +6348,7 @@ const TOOL_LOOP_PHASE_DIRECTIVES: Record<ToolLoopFollowupPhase, (autoNarrowedRea
     + 'or answer in plain text if no code change is needed (e.g. a read-only investigation whose finding is the deliverable).',
   'verify-action': () =>
     'VERIFY ACTION REQUIRED — edits already happened. '
-    + 'Stop gathering more files and move to RunShell/Bash/Agent or a narrow verification followup (Read/Lsp/Grep content/count), '
+    + 'Stop gathering more files and move to RunShell/Bash/Agent, ScheduleWakeup, a policy-allowed skill_exec, or a narrow verification followup (Read/Lsp/Grep content/count), '
     + 'ops ledger/delegate tools (MsgList/MsgPost/MsgAck/Checklist*/AgentOutput) still run, '
     + 'or answer in plain text if verification is not needed.',
 };
@@ -8260,6 +8275,8 @@ const VERIFY_ACTION_TOOLS = new Set([
   'RunShell',
   'Bash',
   'Agent',
+  'ScheduleWakeup',
+  'skill_exec',
   'UpdatePlan',
   'Plan',
   'MarkStepDone',
@@ -9449,8 +9466,18 @@ export async function streamLLMWithTools(
               collectTupleItemsSchemaPaths(tool.parameters).map((path, pathIndex) => [String(pathIndex), path]),
             ),
           }]));
+          const requestSizeGuard = turnOpts.requestSizeGuard;
+          const providerRequestSizeGuard = requestSizeGuard ? {
+            ...requestSizeGuard,
+            onCompacted: async (compactedProviderMessages: LLMMessage[]) => {
+              const compactedHistory = mapProviderToolNamesInMessages(compactedProviderMessages, nameMap.toOriginalName);
+              history.splice(0, history.length, ...compactedHistory);
+              await requestSizeGuard.onCompacted?.(compactedHistory);
+            },
+          } : undefined;
           const providerOpts: LLMOpts = {
             ...turnOpts,
+            ...(providerRequestSizeGuard ? { requestSizeGuard: providerRequestSizeGuard } : {}),
             signal: attemptAbort.signal,
             tools: turnOpts.tools?.map((tool) => ({ ...tool, name: nameMap.toProviderName(tool.name) })),
             toolChoice: turnOpts.toolChoice && typeof turnOpts.toolChoice === 'object'
@@ -9476,6 +9503,7 @@ export async function streamLLMWithTools(
         await recordChildFirstLlmResponse({ status: 'error', ...(status === undefined ? {} : { httpStatus: status }), error: err });
         if (idleTimer) clearTimeout(idleTimer);
         releaseStreamAttempt(true, err);
+        if (err instanceof RequestSizeLimitError) throw err;
         if (err instanceof ApiHttpError && err.status === 400 && providerToolSchemaDiagnostics) {
           debug.log('llm.tool-schema', 'provider-request-rejected', {
             provider: activeProvider.name,
@@ -12629,6 +12657,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
                 const compactChars = compactWireBody.length;
                 if (compactChars < requestChars) {
                   messages.splice(0, messages.length, ...compacted.messages);
+                  await requestGuard.onCompacted?.(messages);
                   requestBody = compactBody;
                   serializedWireBody = compactWireBody;
                   requestChars = compactChars;
@@ -12665,6 +12694,13 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
             compacted: requestCompacted,
             reason: requestCompactReason,
           });
+          if (requestChars > requestGuard.maxChars) {
+            debug.log('llm.request', 'request-size-limit-blocked', {
+              provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
+              compacted: requestCompacted, reason: requestCompactReason,
+            }, { level: 'error' });
+            throw new RequestSizeLimitError(requestChars, requestGuard.maxChars, requestCompactReason);
+          }
         }
         yield* streamCodexResponsesEvents(responsesUrl, tokens.accessToken, requestBody, opts.signal, {
           accountId,

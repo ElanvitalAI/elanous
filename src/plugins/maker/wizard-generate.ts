@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { debug } from '../../debug/log.js';
 
 /** Research is descriptive. Credential values are never an input to the generator. */
 export interface WizardResearchDraft {
@@ -16,8 +17,14 @@ export interface WizardResearchDraft {
 const SLUG = /^[a-z0-9][a-z0-9-]{1,31}$/;
 const FIELD = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 
+export interface WizardGenerationShadowReceipt {
+  slug: string;
+  writtenPaths: string[];
+}
+
 /** Materialize a research draft; its graph steps fail until the requested processing is implemented. */
-export function generateWizardFiles(dir: string, slug: string, draft: WizardResearchDraft, options: { regenerate?: boolean } = {}): string[] {
+export function generateWizardFiles(dir: string, slug: string, draft: WizardResearchDraft,
+  options: { regenerate?: boolean; onShadowReceipt?: (receipt: WizardGenerationShadowReceipt) => void } = {}): string[] {
   if (!SLUG.test(slug)) throw new Error(`invalid wizard plugin name: ${slug}`);
   if (!draft || typeof draft.description !== 'string' || !draft.description.trim()) throw new Error('wizard description is required');
   if (draft.connectors !== undefined && !Array.isArray(draft.connectors)) throw new Error('invalid wizard connectors');
@@ -125,6 +132,11 @@ process.exitCode = 1;
     mkdirSync(join(target, '..'), { recursive: true });
     writeFileSync(target, content, { flag: existing && (path === 'plugin.json' || options.regenerate) ? 'w' : 'wx' });
   }
+  const receipt: WizardGenerationShadowReceipt = { slug, writtenPaths: generated.map(([path]) => path) };
+  try {
+    if (options.onShadowReceipt) options.onShadowReceipt(receipt);
+    else debug.log('plugin.wizard', 'generation-shadow-receipt', receipt);
+  } catch { /* Shadow observation must not change the scaffold result. */ }
   return generated.map(([path]) => path);
 }
 

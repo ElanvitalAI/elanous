@@ -17,12 +17,10 @@
 //   - `estimateRequestChars` — cheap pre-send estimate (JSON chars of the
 //     messages plus tool specs) used by the ACP bridge preflight.
 //
-// ⚠️ `llm.ts` applies the compacted list with `messages.splice(...)`, but the
-// array it receives is a per-request copy (`mapProviderToolNamesInMessages`),
-// not `streamLLMWithTools`'s `history`. Compaction therefore does not survive
-// into the next tool round by itself — the guard re-measures each request —
-// and only a host write-back (chat.ts session rewrite / dashboard history
-// replace) makes it survive into the next prompt.
+// `llm.ts` applies the compacted list to its provider copy, then invokes the
+// optional `onCompacted` callback to replace `streamLLMWithTools`'s canonical
+// history before the next tool round. A host writer may additionally persist
+// the session-facing transcript across turns.
 
 import type { LLMMessage, LLMOpts, LLMToolSpec } from '../llm.js';
 import type { CompactProvider } from '../compact/provider.js';
@@ -35,7 +33,7 @@ export type RequestSizeMeasurement = Parameters<NonNullable<RequestSizeGuard['on
 export type RequestSizeCompactInfo = Parameters<RequestSizeGuard['compactMessages']>[1];
 export type RequestSizeCompactResult = Awaited<ReturnType<RequestSizeGuard['compactMessages']>>;
 
-type RunCompactPipeline = typeof import('../compact/pipeline.js').runCompactPipeline;
+export type RunCompactPipeline = typeof import('../compact/pipeline.js').runCompactPipeline;
 
 export interface CompactLiveMessagesOptions {
   sessionId?: string;
@@ -85,6 +83,7 @@ export interface CreateRequestSizeGuardOptions {
     currentMessages: LLMMessage[],
     info: RequestSizeCompactInfo,
   ) => Promise<RequestSizeCompactResult>;
+  onCompacted?: RequestSizeGuard['onCompacted'];
   onMeasured?: (measurement: RequestSizeMeasurement) => void;
 }
 
@@ -103,6 +102,7 @@ export function createRequestSizeGuard(opts: CreateRequestSizeGuardOptions): Req
       measuredProviderRequests += 1;
       opts.onMeasured?.(measurement);
     },
+    ...(opts.onCompacted ? { onCompacted: opts.onCompacted } : {}),
   };
 }
 

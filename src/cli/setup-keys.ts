@@ -5,11 +5,15 @@ import { loginWithCodex } from '../oauth/codex.js';
 import type { FirstRunProviderSetupResult } from '../onboarding/first-run.js';
 import { MODEL_ROLES, resolveRoleLlm, type LLMProviderName, type UserConfig } from '../user-config.js';
 import { parseMenuAnswer } from '../onboarding/menu-answer.js';
+import { isHeadlessEnv } from '../acp/codex-auth.js';
 
 export interface SetupKeysIO {
   ask(prompt: string): Promise<string>;
   askSecret?(prompt: string): Promise<string>;
   print(message: string): void;
+  updateLine?(message: string): void;
+  finishLine?(): void;
+  onInterrupt?(handler: () => void): () => void;
 }
 
 export type SetupKeyProvider = Extract<(typeof SERVICE_KEY_CATALOG)[number], { kind: 'api-key' }>['id'];
@@ -23,6 +27,8 @@ export interface SetupKeysOptions {
   env?: NodeJS.ProcessEnv;
   cacheDir?: string;
   includeOptional?: boolean;
+  /** Override GUI-less shell detection in first-run tests/embedders. */
+  isHeadless?: () => boolean;
   /** Existing OAuth fetch injection used by deterministic login simulation. */
   loginWithCodex?: typeof loginWithCodex;
   /** Verification seam for deterministic setup simulations; the production default remains verifyServiceKey. */
@@ -108,7 +114,7 @@ export async function importServiceKeys(values: ParsedServiceKeyEnv, io: Pick<Se
       unverified.push(name);
       io.print(`${item.label}: 최소 확인을 지원하지 않아 검증 없이 저장합니다 · 값 출력 0`);
     }
-    else {
+    else if (verification.success === false) {
       rejected.push(name);
       io.print(`${item.label}: 검증 ${verification.reason}${verification.httpStatus ? ` (HTTP ${verification.httpStatus})` : ''} · 저장 안 함`);
     }
@@ -174,17 +180,78 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
   }
 
   if (choice === 'codex-login') {
+    const headless = options.isHeadless?.() ?? isHeadlessEnv(options.env);
+    const controller = new AbortController();
+    let waitingStartedAt: number | undefined;
+    let waitLineStarted = false;
+    let waitingLinePrinted = false;
+    let cancelled = false;
+    let cancelLogin: (() => void) | undefined;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const elapsedSeconds = () => Math.floor((Date.now() - (waitingStartedAt ?? Date.now())) / 1000);
+    const updateWaitLine = () => {
+      if (!headless || !io.updateLine || waitingStartedAt === undefined) return;
+      waitLineStarted = true;
+      io.updateLine('Codex 로그인 대기 중… ' + elapsedSeconds() + '초 · Ctrl-C 건너뛰기');
+    };
+    const interrupted = new Promise<'cancel'>(resolve => {
+      cancelLogin = io.onInterrupt?.(() => {
+        cancelled = true;
+        controller.abort();
+        resolve('cancel');
+      });
+    });
+    const login = options.loginWithCodex({
+      signal: controller.signal,
+      onProgress: (event) => {
+        if (event.type === 'user_code') {
+          if (headless) {
+            io.print('헤드리스 Codex 로그인 · 브라우저에서 아래 주소를 열고 코드를 입력하세요');
+            io.print('주소: ' + event.loginUrl);
+            io.print('코드: ' + event.userCode);
+            waitingStartedAt = Date.now();
+            updateWaitLine();
+            if (io.updateLine) timer = setInterval(updateWaitLine, 1_000);
+          } else {
+            io.print('Codex 로그인: ' + event.loginUrl + ' · 코드 ' + event.userCode);
+          }
+        } else if (event.type === 'polling') {
+          if (headless) updateWaitLine();
+          else if (!waitingLinePrinted) {
+            io.print('Codex 로그인을 기다리는 중… · Ctrl-C 건너뛰기');
+            waitingLinePrinted = true;
+          }
+        } else if (event.type === 'exchanging') {
+          if (headless) {
+            if (timer !== undefined) {
+              clearInterval(timer);
+              timer = undefined;
+            }
+            io.updateLine?.('Codex 로그인 확인 중… ' + elapsedSeconds() + '초');
+          } else io.print('Codex 로그인을 확인하는 중…');
+        }
+      },
+    });
     try {
-      await options.loginWithCodex({ onProgress: (event) => {
-        if (event.type === 'user_code') io.print(`Codex 로그인: ${event.loginUrl} · 코드 ${event.userCode}`);
-        else if (event.type === 'polling') io.print('Codex 로그인을 기다리는 중…');
-        else if (event.type === 'exchanging') io.print('Codex 로그인을 확인하는 중…');
-      } });
+      const outcome = await Promise.race([login.then(() => 'complete' as const), interrupted]);
+      if (outcome === 'cancel') {
+        controller.abort();
+        void login.catch(() => {});
+        if (waitLineStarted) io.finishLine?.();
+        io.print('Codex 로그인을 건너뛰었습니다. 나중에 elanous login openai-codex로 이어갈 수 있습니다.');
+        return null;
+      }
+      if (waitLineStarted) io.finishLine?.();
       io.print('Codex 로그인 완료');
       return 'openai-codex';
     } catch {
-      io.print('Codex 로그인을 완료하지 못했습니다. 다시 시도하거나 Enter로 건너뛰세요.');
+      if (waitLineStarted) io.finishLine?.();
+      io.print('Codex 로그인을 완료하지 못했습니다. 나중에 elanous login openai-codex로 다시 시도할 수 있습니다.');
       return null;
+    } finally {
+      if (timer !== undefined) clearInterval(timer);
+      cancelLogin?.();
+      if (cancelled) void login.catch(() => {});
     }
   }
   // Keep the exact environment object through storage and rediscovery: storeServiceKeys

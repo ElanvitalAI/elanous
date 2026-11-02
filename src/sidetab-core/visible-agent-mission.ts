@@ -35,7 +35,7 @@ export interface VisibleMissionResult {
 }
 
 export type VisibleAgentCli = 'codex' | 'claude' | 'grok';
-export type AgentStartupScreen = 'codex-update-choice' | 'claude-update-choice' | 'claude-login' | 'claude-workspace-trust';
+export type AgentStartupScreen = 'codex-update-choice' | 'codex-hooks-review' | 'claude-update-choice' | 'claude-login' | 'claude-workspace-trust' | 'grok-workspace-trust';
 
 export interface VisibleMissionDeps {
   pty: VisibleMissionPty;
@@ -43,13 +43,20 @@ export interface VisibleMissionDeps {
   mission: string;
   outputPath: string;
   handleTrust(screen: string, write: (bytes: string) => void): boolean;
+  /** Enabled only for the user-started trio when cwd is a linked Git worktree. */
+  allowWorkspaceTrustOnce?: boolean;
+  /** Dismiss known, non-trusting first-run notices once for the explicit three-agent demo only. */
+  allowDemoStartupDismissalsOnce?: boolean;
   onStartupScreen?(screen: AgentStartupScreen): void;
   readFile?(path: string): string;
   sleep?(ms: number): Promise<void>;
   readyTimeoutMs?: number;
   visibilityTimeoutMs?: number;
   completionTimeoutMs?: number;
+  /** Bound the one-time Grok directory-trust screen independently of prompt-readiness time. */
+  workspaceTrustTimeoutMs?: number;
   pollMs?: number;
+  now?(): number;
 }
 
 const sleepDefault = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
@@ -87,10 +94,16 @@ export function isAgentInputPrompt(screen: string): boolean {
 /** Classify only known startup blockers; never copy arbitrary PTY contents into logs. */
 export function classifyAgentStartupScreen(agent: VisibleAgentCli | undefined, screen: string): AgentStartupScreen | undefined {
   const plain = stripAnsi(screen);
+  if (agent === 'codex' && /Hooks need review/i.test(plain) && /Continue without trusting\s*\(hooks won't run\)/i.test(plain)) return 'codex-hooks-review';
   if (agent === 'codex' && /update available/i.test(plain) && /\besc(?:ape)?\s+(?:to\s+)?skip\b/i.test(plain)) return 'codex-update-choice';
-  if (agent === 'claude' && /update available/i.test(plain)) return 'claude-update-choice';
+  if (agent === 'claude' && /(?:update available|updated to latest)/i.test(plain)) return 'claude-update-choice';
   if (agent === 'claude' && /(?:sign in|log in|login|authentication required|claude\.ai\/login)/i.test(plain)) return 'claude-login';
   if (agent === 'claude' && /(?:Yes, I trust this folder|Quick safety check|Accessing workspace)/i.test(plain)) return 'claude-workspace-trust';
+  if (agent === 'grok'
+    && /Do you trust the contents of this directory\?/i.test(plain)
+    && /Grok Build may run or modify contents in this directory/i.test(plain)
+    && /Yes, proceed\s+y/i.test(plain)
+    && /No, quit\s+n/i.test(plain)) return 'grok-workspace-trust';
   return undefined;
 }
 
@@ -99,6 +112,7 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   const sleep = deps.sleep ?? sleepDefault;
   const pollMs = deps.pollMs ?? 150;
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, 'utf8'));
+  const now = deps.now ?? Date.now;
   let promptReady = false;
   let missionVisible = false;
   let missionTyped = false;
@@ -108,11 +122,15 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   let initialScreen: string | undefined;
   let startupScreen: AgentStartupScreen | undefined;
   let codexUpdateSkipSent = false;
+  let codexHooksContinueSent = false;
+  let claudeUpdateDismissSent = false;
   let startupScreenReported = false;
+  let grokTrustResponseSent = false;
+  let grokTrustWaitStartedAt: number | undefined;
   let lastObservedScreen = '';
   let exitCode: number | null | undefined;
-  const completionDeadline = Date.now() + (deps.completionTimeoutMs ?? 300_000);
-  const stageDeadline = (timeoutMs: number): number => Math.min(completionDeadline, Date.now() + timeoutMs);
+  const completionDeadline = now() + (deps.completionTimeoutMs ?? 300_000);
+  const stageDeadline = (timeoutMs: number): number => Math.min(completionDeadline, now() + timeoutMs);
   const snapshot = (): string => { lastObservedScreen = deps.pty.snapshot(); return lastObservedScreen; };
   const safeSnapshot = (): string => { try { return snapshot(); } catch { return lastObservedScreen; } };
   const recordExit = (): number | null | undefined => {
@@ -143,10 +161,10 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   // Readiness is settled by the observed prompt/input echo; this is only one
   // shared safety cap, not a per-stage 60s/5s guess.
   const safetyCapMs = deps.completionTimeoutMs ?? 300_000;
-  const readyDeadline = stageDeadline(deps.readyTimeoutMs ?? safetyCapMs);
+  let readyDeadline = stageDeadline(deps.readyTimeoutMs ?? safetyCapMs);
   let lastScreen = '';
 
-  while (Date.now() < readyDeadline) {
+  while (now() < readyDeadline || grokTrustWaitStartedAt !== undefined) {
     if (!deps.pty.isAlive()) {
       // The process may exit before the first poll; its final frame can still
       // identify the startup screen that prevented the prompt from appearing.
@@ -161,6 +179,58 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     lastScreen = snapshot();
     initialScreen ??= redactSensitive(stripAnsi(lastScreen)).slice(-1_200);
     const detectedScreen = observeStartupScreen(lastScreen);
+    if (detectedScreen === 'grok-workspace-trust' && deps.agent === 'grok' && deps.allowWorkspaceTrustOnce) {
+      if (!grokTrustResponseSent) {
+        // Answer Grok's exact directory prompt once. A redraw never repeats the approval.
+        grokTrustResponseSent = true;
+        grokTrustWaitStartedAt = now();
+        if (deps.pty.write('y\r') === false) {
+          return failure({ path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, startupScreen, error: 'Grok workspace-trust response was rejected by the PTY' }, 'prompt-readiness', lastScreen);
+        }
+      }
+      const trustWaitStartedAt = grokTrustWaitStartedAt;
+      if (trustWaitStartedAt !== undefined && (now() - trustWaitStartedAt >= (deps.workspaceTrustTimeoutMs ?? 30_000) || now() >= completionDeadline)) {
+        return failure({ path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, startupScreen, error: 'Grok workspace-trust screen did not clear before its bounded wait expired' }, 'prompt-readiness', lastScreen);
+      }
+      await sleep(pollMs);
+      continue;
+    }
+    if (deps.allowDemoStartupDismissalsOnce && detectedScreen === 'codex-hooks-review') {
+      if (!codexHooksContinueSent) {
+        // Codex's numbered choice 3 is the verified non-persistent option:
+        // “Continue without trusting (hooks won't run)”. Never trust hooks here.
+        codexHooksContinueSent = true;
+        if (deps.pty.write('3') === false) {
+          return failure({ path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, startupScreen, error: 'Codex continue-without-trusting choice was rejected by the PTY' }, 'prompt-readiness', lastScreen);
+        }
+      }
+      if (!isAgentInputPrompt(lastScreen)) {
+        await sleep(500);
+        continue;
+      }
+    }
+    if (deps.allowDemoStartupDismissalsOnce && detectedScreen === 'claude-update-choice') {
+      if (!claudeUpdateDismissSent) {
+        claudeUpdateDismissSent = true;
+        if (deps.pty.write('\u001b') === false) {
+          return failure({ path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, startupScreen, error: 'Claude update-notice dismissal was rejected by the PTY' }, 'prompt-readiness', lastScreen);
+        }
+      }
+      if (!isAgentInputPrompt(lastScreen)) {
+        await sleep(500);
+        continue;
+      }
+    }
+    if (grokTrustWaitStartedAt !== undefined) {
+      // Exclude only observed Grok trust-dialog time from readiness, still
+      // bounded by the overall mission deadline.
+      const trustWaitElapsed = now() - grokTrustWaitStartedAt;
+      if (trustWaitElapsed >= (deps.workspaceTrustTimeoutMs ?? 30_000) || now() >= completionDeadline) {
+        return failure({ path: deps.outputPath, promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, startupScreen, error: 'Grok workspace-trust screen did not clear before its bounded wait expired' }, 'prompt-readiness', lastScreen);
+      }
+      readyDeadline = Math.min(completionDeadline, readyDeadline + trustWaitElapsed);
+      grokTrustWaitStartedAt = undefined;
+    }
     if (detectedScreen) {
       if (detectedScreen === 'codex-update-choice') {
         if (!codexUpdateSkipSent) {
@@ -178,7 +248,9 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     }
     // Backend handlers recognize their own narrow auth/trust prompts; gating
     // readiness on workspace-trust text leaves other first-run screens stuck.
-    if (detectedScreen !== 'codex-update-choice' && deps.handleTrust(lastScreen, bytes => deps.pty.write(bytes))) {
+    if (detectedScreen !== 'codex-update-choice'
+      && (detectedScreen !== 'codex-hooks-review' || !deps.allowDemoStartupDismissalsOnce)
+      && deps.handleTrust(lastScreen, bytes => deps.pty.write(bytes))) {
       await sleep(500);
       continue;
     }
@@ -212,12 +284,12 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   }
   const visibleMissionTail = Array.from(mission).slice(-24).join('');
   const visibilityDeadline = stageDeadline(deps.visibilityTimeoutMs ?? safetyCapMs);
-  while (Date.now() < visibilityDeadline) {
+  while (now() < visibilityDeadline) {
     if (!deps.pty.isAlive()) recordExit();
     const visibleText = normalizeVisibleText(snapshot());
     if (visibleText.includes(normalizeVisibleText(visibleMissionTail))) { missionVisible = true; break; }
     if (!deps.pty.isAlive()) break;
-    await sleep(Math.min(pollMs || 25, Math.max(1, visibilityDeadline - Date.now())));
+    await sleep(Math.min(pollMs || 25, Math.max(1, visibilityDeadline - now())));
   }
   if (!missionVisible) {
     return failure({ path: deps.outputPath, promptReady, missionVisible: false, promptReturned: false, completionMarker: false, initialScreen, ...(startupScreen ? { startupScreen } : {}), error: 'Mission text was not visible in the agent PTY before submission' }, 'mission-visibility');
@@ -228,7 +300,7 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   missionSubmitted = true;
 
   let resultFileObserved = false;
-  while (Date.now() < completionDeadline) {
+  while (now() < completionDeadline) {
     if (!deps.pty.isAlive()) { recordExit(); break; }
     lastScreen = snapshot();
     if (deps.handleTrust(lastScreen, bytes => deps.pty.write(bytes))) {
@@ -269,10 +341,10 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
   }
   const markerVisibleDeadline = stageDeadline(deps.visibilityTimeoutMs ?? safetyCapMs);
   let markerRequestVisible = false;
-  while (Date.now() < markerVisibleDeadline) {
+  while (now() < markerVisibleDeadline) {
     const markerInputScreen = stripAnsi(snapshot()).replace(/\s+/g, ' ');
     if (markerInputScreen.includes(completionMarkerText)) { markerRequestVisible = true; break; }
-    await sleep(Math.min(pollMs || 25, Math.max(1, markerVisibleDeadline - Date.now())));
+    await sleep(Math.min(pollMs || 25, Math.max(1, markerVisibleDeadline - now())));
   }
   if (!markerRequestVisible) {
     return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker request was not visible in the agent PTY' }, 'marker-visibility');
@@ -284,7 +356,7 @@ export async function runVisibleAgentMission(deps: VisibleMissionDeps): Promise<
     return failure({ path: deps.outputPath, firstLine, promptReady, missionVisible, promptReturned, completionMarker: false, ...(startupScreen ? { startupScreen } : {}), error: 'Completion marker submit key was rejected by the agent PTY' }, 'marker-submit');
   }
 
-  while (Date.now() < completionDeadline) {
+  while (now() < completionDeadline) {
     try {
       if (readFile(completionMarkerPath).trim() === completionMarkerText) { completionMarker = true; break; }
     } catch { /* the agent has not written the completion marker file yet */ }

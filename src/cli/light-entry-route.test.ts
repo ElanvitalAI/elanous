@@ -24,8 +24,15 @@ describe('light CLI entry routing', () => {
     expect(selectLightCliRoute(['config', 'get', 'llm.provider', '--reveal'])).toBeUndefined();
     expect(selectLightCliRoute(['config', 'get', 'llm.provider', '--reveal=true'])).toBeUndefined();
     expect(selectLightCliRoute(['release', 'checklist', 'status', '--version', '0.2.33'])).toBe('release');
+    expect(selectLightCliRoute(['release', 'checklist', 'set', 'CELL-X', '--status', 'green'])).toBe('release-set');
+    expect(selectLightCliRoute(['release', 'checklist', 'landed-but-yellow', '--version', '0.2.45', '--json'])).toBe('release-landed');
     expect(selectLightCliRoute(['release', 'checklist', 'list', '--version', '0.2.35', '--json'])).toBe('release');
     expect(selectLightCliRoute(['tasks', 'show', 'CARD-ID'])).toBe('tasks-read');
+    expect(selectLightCliRoute(['tasks', 'advance', '--help'])).toBe('tasks-advance');
+    expect(selectLightCliRoute(['pr', 'land', '--help'])).toBe('pr-land');
+    expect(selectLightCliRoute(['--test=/tmp/isolated', 'tasks', 'advance', '--help'])).toBeUndefined();
+    expect(selectLightCliRoute(['tasks', 'advance', '--help'])).toBe('tasks-advance');
+    expect(selectLightCliRoute(['pr', 'land', '--help'])).toBe('pr-land');
     expect(selectLightCliRoute(['tasks', 'list', '--status', 'active'])).toBe('tasks-read');
     expect(selectLightCliRoute(['tasks', '--help'])).toBe('tasks');
     expect(selectLightCliRoute(['tasks', '-h'])).toBe('tasks');

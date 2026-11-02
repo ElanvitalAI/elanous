@@ -46,7 +46,7 @@ export function gateShardRerouteScenario(
   hostResults: readonly FakeGateShardHostResult[],
 ): GateShardRerouteScenario {
   const imageDigest = 'sha256:' + 'a'.repeat(64);
-  const environmentIdentity = input.environmentIdentity ?? { imageDigest, bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'c'.repeat(64) };
+  const environmentIdentity = input.environmentIdentity ?? { imageDigest, bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'c'.repeat(64), baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   return { input: { ...input, graphEntry: input.graphEntry ?? 'gate-entry-v1', recipeCommand: input.recipeCommand ?? 'bun gate', recipeTimeoutMs: input.recipeTimeoutMs ?? 1000, environmentIdentity }, hostResults };
 }
 
@@ -72,7 +72,7 @@ export function simGateShardHostReroute(scenario: GateShardRerouteScenario): Gat
     const evidence = JSON.stringify({ head40: scenario.input.head40, base40: scenario.input.base40,
       shardId: action.shardId, host: action.host, files: action.files, result });
     const imageDigest = 'sha256:' + 'a'.repeat(64);
-    const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'c'.repeat(64) };
+    const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'c'.repeat(64), baseImageDigest: 'sha256:' + 'a'.repeat(64) };
     receipts.push({ id: action.shardId, files: [...action.files], version: '0.2.46', graphSha: '0'.repeat(64), recipeSha: '0'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun gate', recipeTimeoutMs: 1000, head40: scenario.input.head40, base40: scenario.input.base40,
       host: action.host, imageDigest, envFingerprint: runtimeIdentity.envFingerprint, runtimeIdentity, envKey: result.envKey ?? `${runtimeIdentity.envFingerprint}:${imageDigest}`, executions: [{ branch: '', attemptId: `sim-${action.shardId}`, host: action.host, imageDigest, runtimeIdentity }], status: result.status,
       failureIds: [...result.failureIds], errorIds: [...result.errorIds],

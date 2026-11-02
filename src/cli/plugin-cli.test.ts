@@ -5,6 +5,7 @@ import { generateIndexKeyPair, signIndex } from '../market/signed-index.js';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -24,7 +25,38 @@ function fixture(dir: string, withNodes = false): string {
   writeFileSync(join(dir, 'plugin.ts'), `export default { name: 'sample-test', initialState: () => ({}), panes: {} };`);
   return dir;
 }
-async function cli(root: string, args: string[], preload?: string, input?: string) {
+const pluginPaths = [
+  ['plugin', 'add'], ['plugin', 'credentials'], ['plugin', 'list'], ['plugin', 'make'],
+  ['plugin', 'market', 'add'], ['plugin', 'market', 'internal'], ['plugin', 'market', 'list'], ['plugin', 'market', 'update'],
+  ['plugin', 'node', 'add'], ['plugin', 'remove'],
+] as const;
+let inProcessTail: Promise<void> = Promise.resolve();
+async function withInProcessTurn<T>(run: () => Promise<T>): Promise<T> {
+  const turn = inProcessTail;
+  let release!: () => void;
+  inProcessTail = new Promise<void>(resolve => { release = resolve; });
+  await turn;
+  try { return await run(); } finally { release(); }
+}
+async function inProcessCli(root: string, args: string[]) {
+  return withInProcessTurn(async () => {
+    const result = await simInProcessCli(['plugin', ...args], { allowPaths: pluginPaths, stateRoot: root });
+    return { code: result.exitCode, output: result.stdout, stderr: result.stderr };
+  });
+}
+type FetchHandler = (input: unknown) => Promise<Response>;
+async function cliWithFetch(root: string, args: string[], fetcher: FetchHandler) {
+  return withInProcessTurn(async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = fetcher as typeof fetch;
+    try {
+      const result = await simInProcessCli(['plugin', ...args], { allowPaths: pluginPaths, stateRoot: root });
+      return { code: result.exitCode, output: result.stdout, stderr: result.stderr };
+    } finally { globalThis.fetch = previousFetch; }
+  });
+}
+async function cli(root: string, args: string[]) { return inProcessCli(root, args); }
+async function processCli(root: string, args: string[], preload?: string, input?: string) {
   const proc = Bun.spawn([process.execPath, ...(preload ? ['--preload', preload] : []), 'bin/elanous.mjs', `--test=${root}`, 'plugin', ...args], {
     cwd: repo, env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_CONFIG_DIR: root }, stdin: input === undefined ? 'ignore' : 'pipe', stdout: 'pipe', stderr: 'pipe',
   });
@@ -32,6 +64,7 @@ async function cli(root: string, args: string[], preload?: string, input?: strin
   const [code, output, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   return { code, output, stderr };
 }
+
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 test('plugin add --from-codex imports one installed marketplace package with skill metadata, skipping uninstalled entries', async () => {
@@ -66,7 +99,7 @@ for await (const chunk of process.stdin) {
   chmodSync(bin, 0o755);
   const preload = join(root, 'codex-path.js');
   writeFileSync(preload, `process.env.PATH = ${JSON.stringify(join(bin, '..'))} + ':' + process.env.PATH;`);
-  const imported = await cli(root, ['add', 'mail-kit@openai-curated', '--from-codex', '--json'], preload);
+  const imported = await processCli(root, ['add', 'mail-kit@openai-curated', '--from-codex', '--json'], preload);
   expect(imported).toMatchObject({ code: 0 });
   expect(imported.output.trim().split('\n').map(line => JSON.parse(line)).find(event => event.event === 'registered'))
     .toMatchObject({ skills: ['read-mail'] });
@@ -75,7 +108,7 @@ for await (const chunk of process.stdin) {
   expect(readFileSync(join(installed[0].path, 'skills', 'read-mail', 'SKILL.md'), 'utf8')).toContain('description: Read mail');
   const ledger = JSON.parse(readFileSync(join(root, 'plugins', 'installed.json'), 'utf8'));
   expect(Object.keys(ledger[0]).sort()).toEqual(['installedAt', 'market', 'name', 'sha256', 'version']);
-  const skipped = await cli(root, ['add', 'not-installed@openai-curated', '--from-codex', '--json'], preload);
+  const skipped = await processCli(root, ['add', 'not-installed@openai-curated', '--from-codex', '--json'], preload);
   expect(skipped.code).toBe(1);
   expect(JSON.parse(skipped.output.trim().split('\n').at(-1)!)).toMatchObject({ event: 'failed', reason: 'io' });
   expect(JSON.parse((await cli(root, ['list', '--json'])).output).map((entry: { name: string }) => entry.name)).toEqual(['mail-kit']);
@@ -143,11 +176,11 @@ test('CLI reports staged node count even if a previous version registered the ki
       description: 'previous version', schema: { type: 'object' }, run: { bash: 'echo old' } });
     if (!result.ok || !getNodeKind('workflow', 'sample-test:action')) throw new Error('preload registration failed');
     console.error('preloaded sample-test:action');`);
-  const human = await cli(root, ['add', source, '--yes'], preload);
+  const human = await processCli(root, ['add', source, '--yes'], preload);
   expect(human.stderr).toContain('preloaded sample-test:action');
   expect(human.code).toBe(0);
   expect(human.output).toContain('Installed sample-test@1.0.0 (1 nodes)');
-  const json = await cli(temp(), ['add', source, '--yes', '--json'], preload);
+  const json = await processCli(temp(), ['add', source, '--yes', '--json'], preload);
   expect(json.stderr).toContain('preloaded sample-test:action');
   expect(json.code).toBe(0);
   expect(json.output.trim().split('\n').map(line => JSON.parse(line)).find(event => event.event === 'registered'))
@@ -226,28 +259,27 @@ test('market CLI registers, lists and refreshes signed indices using the configu
   expect((await cli(root, ['market', 'add', 'community', marketUrl])).code).toBe(1);
   expect((await cli(root, ['market', 'add', 'unsafe', 'http://example.org/'])).code).toBe(1);
   expect(JSON.parse(listed.output).map((entry: { name: string }) => entry.name)).toContain('elanous');
-  const preload = join(root, 'fetch-preload.js');
-  writeFileSync(preload, `globalThis.fetch = async input => {
+  const fetcher: FetchHandler = async input => {
     const url = String(input);
-    if (!url.startsWith(${JSON.stringify(marketUrl)})) throw new Error('unexpected market URL');
-    return new Response(url.endsWith('/index.sig') ? ${JSON.stringify(signature)} : ${JSON.stringify(index.toString())}, { status: 200 });
-  };`);
-  const updated = await cli(root, ['market', 'update', 'community'], preload);
+    if (!url.startsWith(marketUrl)) throw new Error('unexpected market URL');
+    return new Response(url.endsWith('/index.sig') ? signature : index.toString(), { status: 200 });
+  };
+  const updated = await cliWithFetch(root, ['market', 'update', 'community'], fetcher);
   expect(updated.code).toBe(0);
   expect(updated.output).toContain('sequence 1');
   expect(readFileSync(join(root, 'plugins', 'markets', 'community', 'marketplace.json'))).toEqual(index);
   const nextIndex = Buffer.from(JSON.stringify({ name: 'community', interface: { displayName: 'Community' }, sequence: 2, plugins: [] }));
   const nextSignature = signIndex(nextIndex, keys.privateKeyPem, keys.keyId);
-  writeFileSync(preload, `globalThis.fetch = async input => {
+  const nextFetcher: FetchHandler = async input => {
     const url = String(input);
-    if (!url.startsWith(${JSON.stringify(marketUrl)})) throw new Error('unexpected market URL');
-    return new Response(url.endsWith('/index.sig') ? ${JSON.stringify(nextSignature)} : ${JSON.stringify(nextIndex.toString())}, { status: 200 });
-  };`);
-  const refreshed = await cli(root, ['market', 'update', 'community'], preload);
+    if (!url.startsWith(marketUrl)) throw new Error('unexpected market URL');
+    return new Response(url.endsWith('/index.sig') ? nextSignature : nextIndex.toString(), { status: 200 });
+  };
+  const refreshed = await cliWithFetch(root, ['market', 'update', 'community'], nextFetcher);
   expect(refreshed.code).toBe(0);
   expect(refreshed.output).toContain('sequence 2');
   expect(readFileSync(join(root, 'plugins', 'markets', 'community', 'marketplace.json'))).toEqual(nextIndex);
-  expect((await cli(root, ['market', 'update', 'unknown'], preload)).code).toBe(1);
+  expect((await cliWithFetch(root, ['market', 'update', 'unknown'], nextFetcher)).code).toBe(1);
 }, 60_000);
 
 test('internal market CLI fetches and caches authorized signed entries, rejecting disallowed tenants and unbound signatures', async () => {
@@ -261,58 +293,62 @@ test('internal market CLI fetches and caches authorized signed entries, rejectin
   const config = join(root, 'config.json');
   writeFileSync(config, JSON.stringify({ market: { trustedKeys: [{ keyId: other.keyId, publicKey: other.publicKey }],
     internalMarkets: [{ name: 'private', url: marketUrl, enterpriseIds: ['tenant-a'], trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }] }] } }));
-  const preload = join(root, 'fetch-preload.js');
-  const prepare = (signature: string, bytes: Buffer = index) => writeFileSync(preload, `globalThis.fetch = async input => {
+  let servedSignature = '';
+  let servedBody = index.toString();
+  let rejectFetch = false;
+  const fetcher: FetchHandler = async input => {
+    if (rejectFetch) throw new Error('unexpected network request');
     const url = String(input);
-    if (!url.startsWith(${JSON.stringify(marketUrl)})) throw new Error('unexpected market URL');
-    return new Response(url.endsWith('/index.sig') ? ${JSON.stringify(signature)} : ${JSON.stringify(bytes.toString())}, { status: 200 });
-  };`);
+    if (!url.startsWith(marketUrl)) throw new Error('unexpected market URL');
+    return new Response(url.endsWith('/index.sig') ? servedSignature : servedBody, { status: 200 });
+  };
+  const prepare = (signature: string, bytes: Buffer = index) => { servedSignature = signature; servedBody = bytes.toString(); rejectFetch = false; };
+  const run = (args: string[]) => cliWithFetch(root, args, fetcher);
   prepare(signIndex(index, keys.privateKeyPem, keys.keyId));
-  const fetched = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--json'], preload);
+  const fetched = await run(['market', 'internal', 'private', 'tenant-a', '--json']);
   expect(fetched.code).toBe(0);
   expect(JSON.parse(fetched.output)).toMatchObject({ name: 'private', enterpriseId: 'tenant-a', sequence: 3,
     knowledgePacks: [{ name: 'sales', enterpriseId: 'tenant-a' }], loopBundles: [{ name: 'loop', enterpriseId: 'tenant-a' }] });
   const directory = join(root, 'plugins', 'markets', '.internal', 'private');
   expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
-  writeFileSync(preload, `globalThis.fetch = async () => { throw new Error('unexpected network request'); };`);
-  expect((await cli(root, ['market', 'internal', 'private', 'tenant-a', '--json'], preload)).output).toBe(fetched.output);
-  const disallowed = await cli(root, ['market', 'internal', 'private', 'tenant-b', '--json'], preload);
+  rejectFetch = true;
+  expect((await run(['market', 'internal', 'private', 'tenant-a', '--json'])).output).toBe(fetched.output);
+  const disallowed = await run(['market', 'internal', 'private', 'tenant-b', '--json']);
   expect(disallowed.code).toBe(1);
   expect(JSON.parse(disallowed.output)).toMatchObject({ event: 'failed', cause: expect.stringContaining('enterprise not allowed') });
-  expect((await cli(root, ['market', 'update', 'private'], preload)).code).toBe(1);
+  expect((await run(['market', 'update', 'private'])).code).toBe(1);
   expect((await cli(root, ['market', 'list', '--json'])).output).not.toContain('private');
   prepare('');
-  const unsigned = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--refresh', '--json'], preload);
+  const unsigned = await run(['market', 'internal', 'private', 'tenant-a', '--refresh', '--json']);
   expect(unsigned.code).toBe(1);
   expect(JSON.parse(unsigned.output)).toMatchObject({ event: 'failed' });
   expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
   prepare(signIndex(index, other.privateKeyPem, other.keyId));
-  const unbound = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--refresh', '--json'], preload);
+  const unbound = await run(['market', 'internal', 'private', 'tenant-a', '--refresh', '--json']);
   expect(unbound.code).toBe(1);
   expect(JSON.parse(unbound.output)).toMatchObject({ event: 'failed', cause: expect.stringContaining('unknown-key') });
   expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
   const alien = Buffer.from(index.toString().replaceAll('tenant-a', 'tenant-b'));
   prepare(signIndex(alien, keys.privateKeyPem, keys.keyId), alien);
-  const crossTenant = await cli(root, ['market', 'internal', 'private', 'tenant-a', '--refresh', '--json'], preload);
+  const crossTenant = await run(['market', 'internal', 'private', 'tenant-a', '--refresh', '--json']);
   expect(crossTenant.code).toBe(1);
   expect(JSON.parse(crossTenant.output)).toMatchObject({ event: 'failed', cause: expect.stringContaining('outside enterprise allowlist') });
   expect(readFileSync(join(directory, createHash('sha256').update('tenant-a').digest('hex'), 'marketplace.json'))).toEqual(index);
-  expect((await cli(root, ['add', 'sales@private', '--json'], preload)).code).toBe(1);
+  expect((await run(['add', 'sales@private', '--json'])).code).toBe(1);
 });
 
 test('market CLI without a name continues to configured markets after a failed built-in fetch', async () => {
   const root = temp();
   const config = join(root, 'config.json');
-  const preload = join(root, 'fetch-preload.js');
   const keys = generateIndexKeyPair();
   const index = Buffer.from(JSON.stringify({ name: 'community', interface: { displayName: 'Community' }, sequence: 1, plugins: [] }));
   writeFileSync(config, JSON.stringify({ market: { markets: [{ name: 'community', url: 'https://example.org/community/' }],
     trustedKeys: [{ keyId: keys.keyId, publicKey: keys.publicKey }] } }));
   const signature = signIndex(index, keys.privateKeyPem, keys.keyId);
-  writeFileSync(preload, `globalThis.fetch = async input => String(input).startsWith('https://example.org/community/')
-    ? new Response(String(input).endsWith('/index.sig') ? ${JSON.stringify(signature)} : ${JSON.stringify(index.toString())}, { status: 200 })
-    : new Response('service unavailable', { status: 503 });`);
-  const result = await cli(root, ['market', 'update'], preload);
+  const fetcher: FetchHandler = async input => String(input).startsWith('https://example.org/community/')
+    ? new Response(String(input).endsWith('/index.sig') ? signature : index.toString(), { status: 200 })
+    : new Response('service unavailable', { status: 503 });
+  const result = await cliWithFetch(root, ['market', 'update'], fetcher);
   expect(result.code).toBe(1);
   expect(result.stderr).toContain('HTTP 503');
   expect(result.stderr).toContain('marketplace.json');
@@ -345,9 +381,9 @@ test('credentials CLI sets, reads stdin, unsets and never prints values', async 
   expect(JSON.parse(set.output)).toEqual({ fields: [{ name: 'API_KEY', env: 'ELANOUS_PLUGIN_SAMPLE_TEST_API_KEY', set: true }] });
   const table = await cli(root, ['credentials', 'sample-test']);
   expect(table.output).toContain('API_KEY\tELANOUS_PLUGIN_SAMPLE_TEST_API_KEY\tset');
-  const stdinSet = await cli(root, ['credentials', 'sample-test', '--stdin', 'API_KEY', '--json'], undefined, 'stdin-secret\nignored');
+  const stdinSet = await processCli(root, ['credentials', 'sample-test', '--stdin', 'API_KEY', '--json'], undefined, 'stdin-secret\nignored');
   expect(JSON.parse(stdinSet.output).fields[0].set).toBe(true);
-  const emptyStdin = await cli(root, ['credentials', 'sample-test', '--stdin', 'API_KEY', '--json'], undefined, '');
+  const emptyStdin = await processCli(root, ['credentials', 'sample-test', '--stdin', 'API_KEY', '--json'], undefined, '');
   expect(emptyStdin.code).toBe(1);
   const rejected = await cli(root, ['credentials', 'sample-test', '--set', 'UNKNOWN=reject-secret', '--json']);
   expect(rejected.code).toBe(1);
@@ -395,7 +431,7 @@ test('real make --draft-file --run --json refuses unimplemented processing inste
     skill: { description: 'Weather researcher', instructions: 'Check the forecast.', requires: ['openai'] },
   }));
   const input = { city: 'Seoul', question: 'What is the forecast?' };
-  const result = await cli(root, ['make', 'weather research', '--name', 'weather-research', '--draft-file', draftFile,
+  const result = await processCli(root, ['make', 'weather research', '--name', 'weather-research', '--draft-file', draftFile,
     '--run', '--input', JSON.stringify(input), '--json']);
   expect(result.code).toBe(1);
   const response = JSON.parse(result.output);

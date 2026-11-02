@@ -44,7 +44,10 @@ const STARTUP_TIMEOUT_MS = 12_000;
 const WEB_FIRST_TEXT = {
   ko: {
     unavailable: (reason: string) => `웹 셋업을 사용할 수 없습니다 (${reason}). 터미널 설정으로 전환합니다.`,
-    offline: '오프라인 모드',
+    daemonNotRunning: '웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다',
+    daemonHealthUnavailable: '웹 셋업 데몬은 실행 중이지만 헬스 확인에 실패했습니다 · 터미널 설정을 계속합니다',
+    daemonEndpointUnavailable: '웹 셋업 데몬은 실행 중이지만 셋업 주소를 확인할 수 없습니다 · 터미널 설정을 계속합니다',
+    daemonInspectionUnavailable: '웹 셋업 데몬 상태를 확인하지 못했습니다 · 터미널 설정을 계속합니다',
     startingDaemon: '웹 셋업을 위해 데몬을 시작합니다.',
     continueInBrowser: '브라우저에서 셋업을 이어가세요',
     phoneOnSameWifi: (link: string) => `같은 와이파이의 폰이면: ${link}`,
@@ -56,7 +59,10 @@ const WEB_FIRST_TEXT = {
   },
   en: {
     unavailable: (reason: string) => `web setup is unavailable (${reason}); switching to terminal setup.`,
-    offline: 'offline mode',
+    daemonNotRunning: 'web setup daemon is not running yet; continuing in terminal setup',
+    daemonHealthUnavailable: 'web setup daemon is running but its health check failed; continuing in terminal setup',
+    daemonEndpointUnavailable: 'web setup daemon is running but its setup endpoint is unavailable; continuing in terminal setup',
+    daemonInspectionUnavailable: 'could not inspect the web setup daemon; continuing in terminal setup',
     startingDaemon: 'starting the daemon for web setup.',
     continueInBrowser: 'continue setup in your browser',
     phoneOnSameWifi: (link: string) => `on a phone on the same wifi: ${link}`,
@@ -99,11 +105,14 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
 
   const show = deps.showNexus ?? (() => runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } }));
   let shown: NexusShowResult | undefined;
-  try { shown = await show(); } catch { /* A missing daemon may make inspection fail. */ }
+  let inspectionFailed = false;
+  try { shown = await show(); } catch { inspectionFailed = true; }
   const running = shown?.status === 'unregistered' || (shown?.status === 'registered' && shown.instance?.alive === true);
+  const confirmedNotRunning = shown?.status === 'absent' || (shown?.status === 'registered' && shown.instance?.alive === false);
   if (deps.startIfMissing === false && !running) {
-    print(text.offline);
-    observe('fallback', 'offline');
+    const reason = confirmedNotRunning ? 'daemon-not-running' : 'daemon-inspection-failed';
+    print(confirmedNotRunning ? text.daemonNotRunning : text.daemonInspectionUnavailable);
+    observe('fallback', reason);
     return 'fallback';
   }
   // A script, pipe or CI run never starts a daemon on its own: without a terminal the web path
@@ -115,10 +124,11 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     if (!up) { observe('fallback', 'non-tty'); return 'fallback'; }
   }
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
-  if (!running || !shown?.urls?.pwa.loopback) {
+  if (!running || !shown?.urls?.pwa.loopback || !shown?.urls?.rest.loopback) {
     if (deps.startIfMissing === false) {
-      print(text.offline);
-      observe('fallback', 'offline');
+      const reason = !running ? 'daemon-not-running' : 'daemon-endpoint-unavailable';
+      print(!running ? text.daemonNotRunning : text.daemonEndpointUnavailable);
+      observe('fallback', reason);
       return 'fallback';
     }
     print(text.startingDaemon);
@@ -133,22 +143,43 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   while (Date.now() < deadline) {
     try {
       shown = await show();
+      inspectionFailed = false;
+    } catch {
+      inspectionFailed = true; /* A daemon may not have published its status yet. */
+    }
+    if (!inspectionFailed && shown) {
       const live = shown.status === 'unregistered' || (shown.status === 'registered' && shown.instance?.alive === true);
       if (live && shown.urls?.pwa.loopback && shown.urls.rest.loopback) {
         const remaining = deadline - Date.now();
-        if (remaining > 0 && await (deps.probeHealth ?? probeHealth)(joinRestHealthUrl(shown.urls.rest.loopback), Math.min(remaining, 500))) {
-          healthy = true;
-          break;
+        if (remaining > 0) {
+          try {
+            healthy = await (deps.probeHealth ?? probeHealth)(joinRestHealthUrl(shown.urls.rest.loopback), Math.min(remaining, 500));
+          } catch {
+            healthy = false; /* A probe exception is a failed health check, not a show/inspection failure. */
+          }
+          if (healthy) break;
         }
       }
-    } catch { /* A daemon may not have published its URLs yet. */ }
+    }
     if (deps.startIfMissing === false) break;
     const remaining = deadline - Date.now();
     if (remaining > 0) await Bun.sleep(Math.min(200, remaining));
   }
   if (!healthy && deps.startIfMissing === false) {
-    print(text.offline);
-    observe('fallback', 'offline');
+    const stillRunning = shown?.status === 'unregistered' || (shown?.status === 'registered' && shown.instance?.alive === true);
+    const confirmedNotRunning = shown?.status === 'absent' || (shown?.status === 'registered' && shown.instance?.alive === false);
+    const endpointMissing = stillRunning && (!shown?.urls?.pwa.loopback || !shown.urls.rest.loopback);
+    const reason = inspectionFailed ? 'daemon-inspection-failed'
+      : endpointMissing ? 'daemon-endpoint-unavailable'
+      : stillRunning ? 'daemon-health-unavailable'
+      : confirmedNotRunning ? 'daemon-not-running'
+      : 'daemon-inspection-failed';
+    const message = reason === 'daemon-health-unavailable' ? text.daemonHealthUnavailable
+      : reason === 'daemon-endpoint-unavailable' ? text.daemonEndpointUnavailable
+      : reason === 'daemon-not-running' ? text.daemonNotRunning
+      : text.daemonInspectionUnavailable;
+    print(message);
+    observe('fallback', reason);
     return 'fallback';
   }
   if (!healthy) return fallback(running ? 'daemon-health-unavailable' : 'daemon-health-timeout');

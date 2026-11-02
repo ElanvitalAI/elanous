@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { Command } from 'commander';
@@ -27,6 +27,20 @@ import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack } from '../self-implement/kno
 import { authorGoal, inspectGoalDoneBoundary, type GoalAuthorDeps } from '../self-implement/goal-author.js';
 import { parseAskTargetPathHints } from '../self-dev/launch-preflight-text.js';
 import { prTitle } from '../self-implement/pr-title.js';
+import { collectDraftMetrics } from '../self-dev/draft-sweep.js';
+
+// Keep default draft observations isolated from GitHub in the existing CLI and hand tests.
+const originalPath = process.env.PATH;
+let fakeGhDir: string;
+beforeAll(() => {
+  fakeGhDir = mkdtempSync(join(tmpdir(), 'task-hand-fake-gh-'));
+  writeFileSync(join(fakeGhDir, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  process.env.PATH = `${fakeGhDir}:${originalPath ?? ''}`;
+});
+afterAll(() => {
+  if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+  rmSync(fakeGhDir, { recursive: true, force: true });
+});
 
 // MS-05 + isolated temporary git: the real tasks hand CLI decides, only the external launcher is captured.
 test('tasks hand --live opt-in carries one bounded KNOWHOW pack to the first child goal without changing cards or ledgers', async () => {
@@ -173,6 +187,58 @@ function statePath(): string {
 function liveGoal(text: string): string {
   return `${text}\n- 완료 경계 코드: src/task-agent/task-hand.ts live hand 조건을 판정한다\n- 완료 경계 실물: 카드가 발사 전 완료 경계를 요구한다\n- 완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts`;
 }
+
+function fakeDraftMetrics(counts: Record<string, number>) {
+  const drafts = Object.entries(counts).flatMap(([seat, count]) => Array.from({ length: count }, (_, i) => ({
+    number: 0, branch: `self-impl/${seat}-${i}`, title: 'draft', labels: [`elanous:seat-${seat}`], createdAt: '2026-01-01T00:00:00Z',
+  }))).map((draft, i) => ({ ...draft, number: i + 1 }));
+  return (now: Date) => collectDraftMetrics('fake/repo', {
+    listDrafts: async (page) => page === 1 ? drafts : [],
+    listRecentClosed: async () => [],
+    getActiveClaimOwner: async () => undefined,
+  }, now);
+}
+
+test('DRAFT-WIP-LIMIT-1: live hand refuses observed needsOwner 16 before card creation and launch', async () => {
+  const path = statePath();
+  let launches = 0;
+  const draftMetrics = fakeDraftMetrics({ MK: 16 });
+  await expect(handTask({ id: 'ta-draft-cap', text: liveGoal('ship it'), seat: 'MK', live: true,
+    statePath: path, draftMetrics, launcher: () => { launches++; } }))
+    .rejects.toThrow('needs-owner MK: 16 > 15');
+  expect(readTaskCard('ta-draft-cap', path)).toBeUndefined();
+  expect(launches).toBe(0);
+});
+
+test('DRAFT-WIP-LIMIT-1: boundary, seat isolation and unobserved census allow live launches', async () => {
+  for (const [name, draftMetrics] of [
+    ['boundary', fakeDraftMetrics({ MK: 15 })],
+    ['other-seat', fakeDraftMetrics({ MK: 1, TC: 16 })],
+    ['unavailable', async () => { throw new Error('census unavailable'); }],
+    ['missing', async () => ({ needsOwnerBySeat: undefined })],
+  ] as const) {
+    const path = statePath();
+    let launches = 0;
+    const result = await handTask({ id: `ta-draft-${name}`, text: liveGoal('ship it'), seat: 'MK', live: true,
+      statePath: path, draftMetrics, launcher: () => { launches++; } });
+    expect(result.launched).toBe(true);
+    expect(readTaskCard(`ta-draft-${name}`, path)?.status).toBe('launched');
+    expect(launches).toBe(1);
+  }
+});
+
+test('DRAFT-WIP-LIMIT-1: shadow does not observe or block drafts', async () => {
+  const path = statePath();
+  let observations = 0;
+  let launches = 0;
+  const result = await handTask({ id: 'ta-draft-shadow', text: liveGoal('ship it'), seat: 'MK', statePath: path,
+    draftMetrics: async () => { observations++; return { needsOwnerBySeat: { MK: 16 } }; },
+    launcher: () => { launches++; } });
+  expect(result).toMatchObject({ mode: 'shadow', launched: false });
+  expect(readTaskCard('ta-draft-shadow', path)).toBeDefined();
+  expect(observations).toBe(0);
+  expect(launches).toBe(0);
+});
 
 function compositionFixture(kind: string, launcher: 'harness-say' | 'graph-run' = 'harness-say'): string {
   const root = mkdtempSync(join(tmpdir(), 'task-composition-'));
@@ -1709,7 +1775,7 @@ test('COORD-ENTRANCE-FOLD: 실제 tasks hand work-order 발사가 원문 hash �
     expect(rows).toEqual(days.map((day) => ({ date: day.slice(0, 10), agent: 'builder-4', recipient: 'UX', cell: order.cellId, directive })));
     const decisionsDir = join(root, 'decisions');
     const raised = await tickCoordinatorShadow({ root: repoRoot, stateDir: decisionsDir, now: () => new Date(days[2]!) });
-    expect(raised.evidence).toEqual({ agent: 'builder-4', recipient: 'UX', cell: order.cellId, directive, dates: days.map((day) => day.slice(0, 10)) });
+    expect<unknown>(raised.evidence).toEqual({ agent: 'builder-4', recipient: 'UX', cell: order.cellId, directive, dates: days.map((day) => day.slice(0, 10)) });
     expect(raised.cardId).toBeDefined();
     // 수신 seat는 호출자 agent의 증거가 아니다. 호출자 식별자가 없으면 기록을 생략한다.
     delete process.env.ELANOUS_SEAT;
@@ -1762,7 +1828,7 @@ test('COORD-ENTRANCE-FOLD: 중첩 cwd의 실제 tasks hand 진입은 주입 없�
     });
     await program.parseAsync(['node', 'elanous', 'tasks', 'hand', process.env.ORDER_FILE, '--seat', 'UX', '--live', '--json']);
   `;
-  const env = { ...process.env, TASKS_CLI_MODULE: modulePath, COMMANDER_MODULE: commanderModule, TASK_STATE_PATH: state, ORDER_FILE: orderFile,
+  const env: NodeJS.ProcessEnv = { ...process.env, TASKS_CLI_MODULE: modulePath, COMMANDER_MODULE: commanderModule, TASK_STATE_PATH: state, ORDER_FILE: orderFile,
     ELANOUS_SEAT: 'builder-4', ELANOUS_STATE_DIR: stateDir };
   delete env.AI_AGENT;
   delete env.ELANOUS_CONFIG_DIR;

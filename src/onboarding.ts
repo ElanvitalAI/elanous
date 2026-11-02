@@ -162,6 +162,12 @@ export interface WizardIO {
    *  and `ask` otherwise. */
   askSecret?(prompt: string, field?: string): Promise<string>;
   print(text: string): void;
+  /** Replace the current terminal line for transient progress (no newline). */
+  updateLine?(text: string): void;
+  /** Finish the transient line with one newline. */
+  finishLine?(): void;
+  /** Subscribe to Ctrl-C while a cancellable operation is active. */
+  onInterrupt?(handler: () => void): () => void;
   /** Synthetic, unattended IO (never issue or display a connection token). */
   nonInteractive?: boolean;
   /** Called once after a successful config save. */
@@ -280,6 +286,9 @@ export function realIO(): WizardIO {
     ask: async (prompt) => (await rl.question(prompt)).trim(),
     askSecret: realAskSecret,
     print: (text) => { output.write(text + '\n'); },
+    updateLine: (text) => { output.write('\r' + text + '\x1b[K'); },
+    finishLine: () => { output.write('\n'); },
+    onInterrupt: (handler) => { rl.on('SIGINT', handler); return () => { rl.off('SIGINT', handler); }; },
     close: () => { rl.close(); },
     showStep: (spec) => {
       if (debug.enabled) {

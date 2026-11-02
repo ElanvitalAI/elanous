@@ -91,7 +91,7 @@ export function preflightGateExecutionIdentity(pool: string, env: NodeJS.Process
     if (!members.length) return null;
     const baseline = gateTestBaseline(env);
     const expectedEnvFingerprint = gateEnvFingerprint(env);
-    const script = "const {createHash}=require('node:crypto');const keys=['ELANOUS_TEST_FAKE_LLM','LANG','LC_ALL','TZ'];const e=Object.fromEntries(keys.sort().map(k=>[k,process.env[k]??'']));const envFingerprint=createHash('sha256').update(JSON.stringify(e)).digest('hex');console.log(JSON.stringify({bunVersion:Bun.version,platform:process.platform,architecture:process.arch,envFingerprint}));";
+    const script = "const {createHash}=require('node:crypto');const keys=['ELANOUS_TEST_FAKE_LLM','LANG','LC_ALL','TZ'];const e=Object.fromEntries(keys.sort().map(k=>[k,process.env[k]??'']));const envFingerprint=createHash('sha256').update(JSON.stringify(e)).digest('hex');console.log(JSON.stringify({bunVersion:Bun.version,platform:process.platform,architecture:process.arch,envFingerprint,baseImageDigest:process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST??''}));";
     const rows = members.map((member): GatePodExecutionIdentity | null => {
       const imageDigest = probeGateRepoDigest(member, image, commit);
       if (!imageDigest || !DIGEST.test(imageDigest)) return null;
@@ -105,9 +105,9 @@ export function preflightGateExecutionIdentity(pool: string, env: NodeJS.Process
       try {
         const row = JSON.parse(result.stdout.trim()) as Partial<GatePodRuntimeIdentity>;
         if (typeof row.bunVersion !== 'string' || typeof row.platform !== 'string' || typeof row.architecture !== 'string'
-          || row.envFingerprint !== expectedEnvFingerprint) return null;
+          || row.envFingerprint !== expectedEnvFingerprint || typeof row.baseImageDigest !== 'string' || !DIGEST.test(row.baseImageDigest)) return null;
         return { imageDigest, bunVersion: row.bunVersion, platform: row.platform, architecture: row.architecture,
-          envFingerprint: row.envFingerprint };
+          envFingerprint: row.envFingerprint, baseImageDigest: row.baseImageDigest };
       } catch { return null; }
     });
     if (rows.some((row) => row === null)) return null;
@@ -161,6 +161,7 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
   if (!/^\d+\.\d+\.\d+$/.test(input.version) || !SHA.test(input.forCommit)) return full('invalid release identity');
   if (!input.graphPins || !/^[0-9a-f]{64}$/i.test(input.envFingerprint) || !input.imageDigest || !DIGEST.test(input.imageDigest)
     || !input.executionIdentity || input.executionIdentity.imageDigest !== input.imageDigest.toLowerCase()
+    || typeof input.executionIdentity.baseImageDigest !== 'string' || !DIGEST.test(input.executionIdentity.baseImageDigest)
     || input.executionIdentity.envFingerprint !== input.envFingerprint
     || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(input.executionIdentity.bunVersion)
     || !/^[a-z0-9_-]{1,32}$/.test(input.executionIdentity.platform)
@@ -203,7 +204,7 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
         || !receipt.executionIdentity
         || JSON.stringify(receipt.executionIdentity) !== JSON.stringify({ bunVersion: input.executionIdentity.bunVersion,
           platform: input.executionIdentity.platform, architecture: input.executionIdentity.architecture,
-          envFingerprint: input.executionIdentity.envFingerprint })
+          envFingerprint: input.executionIdentity.envFingerprint, baseImageDigest: input.executionIdentity.baseImageDigest })
         || !Number.isSafeInteger(receipt.files) || receipt.files < 1 || !Number.isSafeInteger(receipt.shards) || receipt.shards < 1)
         return full('hard rehearsal receipt or current execution identity differs');
       const recomputed = gateBaselineReceipt({ root: input.root, version: gateVersion, commit: stamp.sha,

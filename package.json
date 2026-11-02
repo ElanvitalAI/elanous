@@ -1,7 +1,7 @@
 {
   "name": "elanous",
   "mcpName": "io.github.ElanvitalAI/elanous",
-  "version": "0.2.45",
+  "version": "0.2.46",
   "description": "Self-healing coding harness where eyes, hands, and memory all turn on one sentence — it authors its own goals, implements them in isolated worktrees, and reviews its own work.",
   "license": "Apache-2.0",
   "author": "Elanvital AI",
@@ -69,6 +69,7 @@
     "search:eval": "bun run src/tool-search-eval.ts",
     "check:tool-wiring": "bun run scripts/check-native-tool-wiring.ts",
     "test:deterministic": "bun run scripts/test-deterministic.ts --dots",
+    "test:pod40-control-inbox": "bun run scripts/test-pod40-control-inbox-isolation.ts",
     "test:tree-invariants": "bun test scripts/botlab/bot-canary-doc-commands.test.ts scripts/botlab/bot-canary-alarm-intent.test.ts scripts/botlab/bot-canary-binding-intent.test.ts scripts/botlab/heartbeat-stale-drill.test.ts scripts/botlab/heartbeat-exit-audit.test.ts scripts/botlab/tree-invariants-alias.test.ts",
     "gate:isolation": "bun run scripts/ci-isolation-hardcode-gate.ts",
     "gate:stdout-json": "bun run scripts/ci-stdout-json-gate.ts",

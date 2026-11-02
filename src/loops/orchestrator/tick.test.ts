@@ -327,6 +327,48 @@ describe('COORD-HA ③ progress heartbeat — tick completion and board write ti
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  test('overlapping run reports keep board and completion timestamps monotonic when an older run finishes last', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'orch-progress-overlap-'));
+    const record = { runId: 'hb-baseline', node: 'report' as const, window: '08' as const, mode: 'shadow' as const,
+      boardWrittenAt: '2026-10-05T00:10:00.000Z', tickCompletedAt: '2026-10-05T00:10:00.000Z' };
+    const seedRun = (runId: string, boardWrittenAt: string) => {
+      const path = join(root, 'loop', 'orchestrator', `${runId}.json`);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ runId, window: '08', mode: 'shadow', day: '2026-10-05', cards: [], skippedCards: [],
+        cells: [], placed: 0, delegated: 0, wouldDelegate: 0,
+        reconciled: { reached: 0, progressing: 0, blocked: 0, unknown: 0 }, steps: [],
+        nodes: { intake: 'ok', split: 'ok', place: 'ok', delegate: 'ok', launch: 'ok', reconcile: 'ok' }, missing: [], boardWrittenAt }));
+    };
+    let releaseOlder!: () => void;
+    let releaseNewer!: () => void;
+    let enterOlder!: () => void;
+    let enterNewer!: () => void;
+    const olderGate = new Promise<void>(resolve => { releaseOlder = resolve; });
+    const newerGate = new Promise<void>(resolve => { releaseNewer = resolve; });
+    const olderEntered = new Promise<void>(resolve => { enterOlder = resolve; });
+    const newerEntered = new Promise<void>(resolve => { enterNewer = resolve; });
+    try {
+      mkdirSync(dirname(recordPath(root)), { recursive: true });
+      writeFileSync(recordPath(root), JSON.stringify(record));
+      seedRun('hb-overlap-older', '2026-10-05T00:15:00.000Z');
+      seedRun('hb-overlap-newer', '2026-10-05T00:20:00.000Z');
+      const report = (runId: string, at: string, entered: () => void, gate: Promise<void>) => runOrchestratorNode('report', {
+        root, runId, window: '08', mode: 'shadow', now: () => new Date(at), print: () => {},
+        coordinatorInbox: async () => { entered(); await gate; return { replied: 0, acknowledged: 0 }; },
+      });
+      const older = report('hb-overlap-older', '2026-10-05T00:30:00.000Z', enterOlder, olderGate);
+      await olderEntered;
+      const newer = report('hb-overlap-newer', '2026-10-05T00:40:00.000Z', enterNewer, newerGate);
+      await newerEntered;
+      releaseNewer();
+      await newer;
+      releaseOlder();
+      await older;
+      expect(readCompletionHeartbeat(root)).toEqual({ runId: 'hb-overlap-newer', node: 'report', window: '08', mode: 'shadow',
+        boardWrittenAt: '2026-10-05T00:20:00.000Z', tickCompletedAt: '2026-10-05T00:40:00.000Z' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('a full shadow tick records the completion heartbeat of its last node through the standard path', async () => fixture(async (root, _id, logged) => {
     const state = await invoke(root, 'hb-full', '08', { mode: 'shadow',
       split: () => [{ id: 'C1', title: '칸', seat: 'MK' }], placeCell: () => null }, logged);

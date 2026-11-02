@@ -1,4 +1,4 @@
-import { createCdpClientFromEndpoint, type CdpClient, type CdpNavigationResult } from '../browser-cdp/client.js';
+import { CdpUnavailable, createCdpClientFromEndpoint, type CdpClient, type CdpNavigationResult } from '../browser-cdp/client.js';
 import { saveAttachmentBlob, type SaveAttachmentResult } from '../boot/attachment-store.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -35,7 +35,13 @@ export interface BrowserActionObserved {
 
 export type BrowserActionResult =
   | { ok: true; url: string; target: string; observed?: BrowserActionObserved }
-  | { ok: false; url: string; target: string; reason: 'unarmed' | 'load-unavailable' | 'load-timeout' | 'execution-failed'; error?: string };
+  | { ok: false; url: string; target: string; reason: 'unarmed' | 'load-unavailable' | 'load-timeout' | 'session-unavailable' | 'execution-failed'; error?: string };
+
+function isBrowserSessionUnavailable(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error instanceof CdpUnavailable || ['AsideSessionUnavailableError', 'BrowserSessionUnavailableError'].includes(error.name)) return true;
+  return /^aside\s+session\b[\s\S]{0,40}\b(?:unavailable|blocked|disconnected|closed|refused|timed?\s*out)\b/i.test(error.message);
+}
 
 /**
  * 🔬⭐⭐⭐ **누가 이 조작을 했나** — ⛔ `probe` 가 2026-08-30(37차)에 «네 번째»로 붙었다.
@@ -699,8 +705,9 @@ export async function performBrowserAction(request: BrowserActionRequest, deps: 
     return { ok: true, url: request.url, target: request.target, observed };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await observeBrowserActionFailure(request, 'execution-failed', message, deps);
-    return { ok: false, url: request.url, target: request.target, reason: 'execution-failed', error: message };
+    const reason = isBrowserSessionUnavailable(error) ? 'session-unavailable' : 'execution-failed';
+    await observeBrowserActionFailure(request, reason, message, deps);
+    return { ok: false, url: request.url, target: request.target, reason, error: message };
   } finally {
     loadWait?.dispose();
     if (client) {

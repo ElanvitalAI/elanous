@@ -26,6 +26,7 @@ import { gateShardsPath, readGateShards } from '../../src/release-loop/gate-shar
 import { gateShardLedgerPath, latestGateShardLedger, readGateShardLedger } from '../../src/release-loop/gate-shard-ledger.js';
 import { gateShardReceiptPath, readGateShardManifest, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
 import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm-artifacts.js';
+import { readWarmReuseEvidence } from '../../src/task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { inspectReleaseGateHost } from '../../src/release-loop/gate-host-reservation.js';
 import { runGraph } from '../../src/graph-runner/runner.js';
 import { isGateSpawnLaneFile, planGateSpawnSeparatedShards } from './spawn-lane';
@@ -184,6 +185,121 @@ function fake(cut = [A, B, C], baseline = [A, D], cached = true) {
   return { root, instanceRoot, ledgerRoot, runner, calls };
 }
 const options = (instanceRoot: string) => ({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot, ledgerRoot: join(dirname(instanceRoot), 'machine-ledger') });
+
+test('B2 formal-receipt fallback is judgeGate-scoped to complete same-run evidence', async () => {
+  const { root, instanceRoot, ledgerRoot, runner } = fake([A, B], [A], false);
+  const repo = join(root, 'receipt-repo');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr || ('git ' + args.join(' ') + ' failed'));
+    return result.stdout.trim();
+  };
+  git('init', '-q');
+  git('config', 'user.name', 'Gate test');
+  git('config', 'user.email', 'gate-test@example.invalid');
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(join(repo, 'docker/harness'), { recursive: true });
+  mkdirSync(join(repo, 'graphs/release'), { recursive: true });
+  writeFileSync(join(repo, 'package.json'), '{"name":"gate-fixture","version":"1.0.0"}\n');
+  writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  writeFileSync(join(repo, 'apps/pwa/package.json'), '{"name":"gate-pwa-fixture","version":"1.0.0"}\n');
+  writeFileSync(join(repo, 'apps/pwa/bun.lock'), 'lockfileVersion = 1\n');
+  writeFileSync(join(repo, 'docker/harness/Dockerfile'), 'FROM ubuntu:24.04\nRUN install gate dependencies\n');
+  writeFileSync(join(repo, 'graphs/release/release-loop.yaml'), "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: { on: [fail] } }\n");
+  writeFileSync(join(repo, 'graphs/release/recipes.yaml'), "gate:\n  command: 'bun scripts/release-loop/gate-node.ts --json'\n  timeout_ms: 14400000\n");
+  writeFileSync(join(repo, 'src/a.ts'), 'export const a = 1;\n');
+  writeFileSync(join(repo, 'src/b.ts'), 'export const b = 1;\n');
+  writeFileSync(join(repo, 'src/a.test.ts'), "import { a } from './a';\nvoid a;\n");
+  writeFileSync(join(repo, 'src/b.test.ts'), "import { b } from './b';\nvoid b;\n");
+  git('add', '.'); git('-c', 'user.name=Gate test', '-c', 'user.email=gate-test@example.invalid', 'commit', '-qm', 'formal gate prior tip');
+  const prior = git('rev-parse', 'HEAD');
+  const pins = gateSourcePins(repo, prior)!;
+  const recipeIdentity = { graphEntry: "- { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: { on: [fail] } }", recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 };
+  const runPath = join(instanceRoot, 'graph-runs/release-loop', 'b2-integration-run.json');
+  mkdirSync(dirname(runPath), { recursive: true });
+  writeFileSync(runPath, JSON.stringify({ graphId: 'release-loop', runId: 'b2-integration-run',
+    graphSnapshot: { graphSha: pins.graphSha, recipesSha: pins.recipeSha } }));
+  writeFileSync(join(repo, 'src/a.ts'), 'export const a = 2;\n');
+  git('add', '.'); git('-c', 'user.name=Gate test', '-c', 'user.email=gate-test@example.invalid', 'commit', '-qm', 'move gate tip');
+  const tip = git('rev-parse', 'HEAD');
+  const files = ['src/a.test.ts', 'src/b.test.ts'];
+  const currentRun = 'b2-integration-run';
+  const imageDigest = 'sha256:' + 'e'.repeat(64);
+  const currentFingerprint = gateEnvFingerprint(process.env);
+  const runtime = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: currentFingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) };
+  const receiptRoot = join(ledgerRoot, 'release/0.2.46/gate-logs/cut/receipts');
+  const observed: Array<{ only?: readonly string[]; tree: string }> = [];
+  const sweep = runner.sweep.bind(runner);
+  runner.sweep = async (tree, logDir, pod, only) => {
+    if (tree.endsWith('/cut')) observed.push({ tree, ...(only ? { only: [...only] } : {}) });
+    return sweep(tree, logDir, pod, only);
+  };
+  const logRows: Array<{ reason?: string; action?: string }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'formal-receipt-fallback') logRows.push(data as { reason?: string; action?: string });
+  });
+  const saveReceiptSet = (caseId: string) => {
+    rmSync(receiptRoot, { recursive: true, force: true });
+    for (let index = 0; index < files.length; index++) {
+      if (caseId === 'incomplete' && index === 1) continue;
+      const fingerprint = caseId === 'environment' ? 'f'.repeat(64) : currentFingerprint;
+      const rowRun = caseId === 'cross-run' || (caseId === 'mixed' && index === 1) ? 'other-run'
+        : caseId === 'missing-run' ? undefined : currentRun;
+      const rowBase = caseId === 'base-mismatch' || (caseId === 'mixed-base' && index === 1) ? '9'.repeat(40) : BASE;
+      const rowGraphSha = caseId === 'graph-mismatch' || (caseId === 'mixed-graph' && index === 1) ? '8'.repeat(64) : pins.graphSha;
+      const rowRecipeCommand = caseId === 'recipe-identity-mismatch' || (caseId === 'mixed-recipe' && index === 1) ? 'bun wrong-gate.ts' : recipeIdentity.recipeCommand;
+      const rowRuntime = { ...runtime, envFingerprint: fingerprint, ...(caseId === 'dependency-image-mismatch' ? { baseImageDigest: 'sha256:' + '9'.repeat(64) } : {}) };
+      const shardFiles = [files[index]!];
+      const output = '1 pass\n0 fail\nRan 1 test across 1 files.\n';
+      saveGateShardResult(receiptRoot, { receipt: {
+        id: 'pod-' + index, files: shardFiles, version: '0.2.46', ...(rowRun ? { graphRunId: rowRun } : {}),
+        graphSha: rowGraphSha, recipeSha: caseId === 'recipe-sha-mismatch' ? '7'.repeat(64) : pins.recipeSha,
+        graphEntry: recipeIdentity.graphEntry, recipeCommand: rowRecipeCommand, recipeTimeoutMs: recipeIdentity.recipeTimeoutMs,
+        head40: prior, base40: rowBase, host: 'pool-test', envKey: fingerprint + ':' + imageDigest,
+        envFingerprint: fingerprint, imageDigest, runtimeIdentity: rowRuntime,
+        executions: [{ branch: '', attemptId: caseId + '-' + index, host: 'pool-test', imageDigest, runtimeIdentity: rowRuntime }],
+        status: 'complete', failureIds: [], errorIds: [], evidencePath: caseId + '-' + index + '.json',
+        evidenceSha256: '0'.repeat(64), measuredAt: new Date().toISOString(), attempt: 1,
+      }, runs: [{ output, rc: 0, pass: 1, fail: 0, errors: 0, ran: 1, files: 1, passedIds: [shardFiles[0] + ' > pass'] }] });
+    }
+  };
+  const runCase = async (caseId: string, currentTip = tip) => {
+    saveReceiptSet(caseId);
+    observed.length = 0; logRows.length = 0;
+    await judgeGate({ ...options(instanceRoot), commit: currentTip, version: '0.2.46', baselineVersion: '1.0.0',
+      baselineCommit: BASE, ledgerRoot, repo, graphRunId: currentRun, pod: { pool: 'pool-test', shards: 2 } }, runner,
+    () => 'sha256:' + 'f'.repeat(64), () => ({ ...runtime, imageDigest: 'sha256:' + 'f'.repeat(64) }));
+    return { only: observed[0]?.only, event: logRows[0] };
+  };
+  try {
+    const valid = await runCase('valid');
+    expect(valid.only).toEqual(['src/a.test.ts']);
+    expect(valid.event).toMatchObject({ reason: 'formal-receipt-radius-proven', action: 'radius-regate', selectedTests: 1, carriedTests: 1 });
+    for (const [caseId, reason] of [
+      ['missing-run', 'formal-receipt-run-id-missing-or-mismatch'],
+      ['mixed', 'formal-receipt-run-id-missing-or-mismatch'],
+      ['cross-run', 'formal-receipt-run-id-missing-or-mismatch'],
+      ['incomplete', 'formal-receipt-shard-inventory-incomplete'],
+      ['base-mismatch', 'formal-receipt-base40-mismatch'],
+      ['mixed-base', 'formal-receipt-base40-mismatch'],
+      ['mixed-graph', 'formal-receipt-graph-pins-missing-or-mixed'],
+      ['mixed-recipe', 'formal-receipt-recipe-identity-missing-or-mixed'],
+      ['environment', 'formal-receipt-environment-mismatch'],
+      ['dependency-image-mismatch', 'formal-receipt-environment-baseImageDigest-mismatch'],
+    ] as const) {
+      const rejected = await runCase(caseId);
+      expect(rejected.only).toBeUndefined();
+      expect(rejected.event).toMatchObject({ reason, action: 'full-sweep' });
+    }
+    writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 2\n');
+    git('add', 'bun.lock'); git('-c', 'user.name=Gate test', '-c', 'user.email=gate-test@example.invalid', 'commit', '-qm', 'dependency lock moved');
+    const runtimeTip = git('rev-parse', 'HEAD');
+    const runtimeMismatch = await runCase('valid', runtimeTip);
+    expect(runtimeMismatch.only).toBeUndefined();
+    expect(runtimeMismatch.event).toMatchObject({ reason: 'formal-receipt-runtime-fingerprint-mismatch', action: 'full-sweep', carriedTests: 0 });
+  } finally { log.mockRestore(); }
+}, 30_000);
 
 test('GATE-POD-IMAGE-STICKY: graph run pins one image, excludes drifted pools, and refuses an unavailable or missing resume pin', async () => {
   const f = fake([], [], false);
@@ -513,7 +629,7 @@ test('gate shard records the Pod runtime identity in its outbox before tests', (
   writeFileSync(join(dir, 'install.log'), '');
   writeFileSync(join(dir, 'part-0.rc'), '0\n');
   writeFileSync(join(dir, 'part-0.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: gateEnvFingerprint({}) };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: gateEnvFingerprint({}), baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   writeFileSync(join(dir, 'runtime-identity.json'), JSON.stringify(runtimeIdentity));
   expect(readShardArtifacts(dir, [['src/a.test.ts']]).runtimeIdentity).toEqual(runtimeIdentity);
   writeFileSync(join(dir, 'runtime-identity.json'), '{broken');
@@ -1854,17 +1970,19 @@ test('four shard sweep combines file failures and passes explicit CDP ignores', 
   for (const name of ['src-cli', 'src-rest', 'test', 'other']) expect(existsSync(join(logDir, `${name}.log`))).toBe(true);
 });
 
-test('gate receipt reuse proves shard graph and recipe provenance compatibility', () => {
+test('gate receipt reuse requires shard-local recipe and runtime provenance but ignores global pins and source image digest', () => {
   const fingerprint = 'a'.repeat(64), imageDigest = `sha256:${'b'.repeat(64)}`;
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'arm64', envFingerprint: fingerprint };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'arm64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) };
   const receipt = { version: '1.0.1', graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/a.test.ts'], head40: 'c'.repeat(40), base40: 'd'.repeat(40),
     host: 'aws2', envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity, status: 'complete' as const,
     failureIds: [], errorIds: [], evidencePath: 'pod-0.json', evidenceSha256: 'e'.repeat(64), measuredAt: new Date().toISOString(), attempt: 1 };
-  const current = { imageDigest, ...runtimeIdentity };
-  const shardPins = { graphSha: '9'.repeat(64), recipeSha: '8'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 };
-  // Whole-graph/recipe hashes can move; same shard entry and command retain compatibility.
-  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, shardPins).envKey)
-    .toBe(`${fingerprint}:${imageDigest}`);
+  const current = { imageDigest: `sha256:${'c'.repeat(64)}`, ...runtimeIdentity };
+  const shardPins = { graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 };
+  // Source-bearing image digests differ across appends; stable runtime identity and exact graph/recipe pins permit radius carry.
+  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, shardPins).envKey)
+    .toBe(receipt.envKey);
+  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current,
+    { ...shardPins, graphSha: '9'.repeat(64), recipeSha: '8'.repeat(64) }).envKey).toBe(receipt.envKey);
   expect(gateReceiptReuseKey({ ...receipt, graphEntry: 'changed-entry' }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, shardPins).reason)
     .toBe('graph-entry-mismatch');
   expect(gateReceiptReuseKey({ ...receipt, recipeCommand: 'changed-command' }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, shardPins).reason)
@@ -1875,27 +1993,27 @@ test('gate receipt reuse proves shard graph and recipe provenance compatibility'
 
 test('gate receipt reuse identity accepts another executor host when immutable runtime identity matches', () => {
   const fingerprint = 'a'.repeat(64), imageDigest = `sha256:${'b'.repeat(64)}`;
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'arm64', envFingerprint: fingerprint };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'arm64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) };
   const receipt = { version: '1.0.1', graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/a.test.ts'], head40: 'c'.repeat(40), base40: 'd'.repeat(40),
     host: 'aws2', envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity, status: 'complete' as const,
     failureIds: [], errorIds: [], evidencePath: 'pod-0.json', evidenceSha256: 'e'.repeat(64), measuredAt: new Date().toISOString(), attempt: 1 };
-  const current = { imageDigest, ...runtimeIdentity };
+  const current = { imageDigest: `sha256:${'c'.repeat(64)}`, ...runtimeIdentity };
   const graphPins = { graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 };
-  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, graphPins))
+  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, graphPins))
     .toEqual({ envKey: `${fingerprint}:${imageDigest}`, reason: 'environment-match; baseline=1.0.1@cccccccccccc; current=1.0.1@cccccccccccc' });
-  expect(gateReceiptReuseKey({ ...receipt, recipeSha: '' }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, graphPins))
+  expect(gateReceiptReuseKey({ ...receipt, recipeSha: '' }, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, graphPins))
     .toEqual({ reason: 'receipt-reuse-record-incomplete' });
   expect(gateReceiptReuseKey({ ...receipt, version: '1.0.2', head40: '9'.repeat(40), graphSha: '2'.repeat(64), recipeSha: '3'.repeat(64) },
-    '1.0.1', '8'.repeat(40), fingerprint, imageDigest, current, graphPins).envKey).toBe(fingerprint + ':' + imageDigest);
-  expect(gateReceiptReuseKey({ ...receipt, graphEntry: 'changed-entry' }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, graphPins).reason).toBe('graph-entry-mismatch');
-  expect(gateReceiptReuseKey({ ...receipt, recipeCommand: 'changed-command' }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, graphPins).reason).toBe('recipe-command-mismatch');
-  expect(gateReceiptReuseKey({ ...receipt, recipeTimeoutMs: 15000000 }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, graphPins).reason)
+    '1.0.1', '8'.repeat(40), fingerprint, current.imageDigest, current, graphPins).envKey).toBe(fingerprint + ':' + imageDigest);
+  expect(gateReceiptReuseKey({ ...receipt, graphEntry: 'changed-entry' }, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, graphPins).reason).toBe('graph-entry-mismatch');
+  expect(gateReceiptReuseKey({ ...receipt, recipeCommand: 'changed-command' }, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, graphPins).reason).toBe('recipe-command-mismatch');
+  expect(gateReceiptReuseKey({ ...receipt, recipeTimeoutMs: 15000000 }, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, graphPins).reason)
     .toBe('recipe-timeout-mismatch');
-  expect(gateReceiptReuseKey({ ...receipt, envFingerprint: '9'.repeat(64) }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, graphPins).reason)
+  expect(gateReceiptReuseKey({ ...receipt, envFingerprint: '9'.repeat(64) }, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, graphPins).reason)
     .toBe('environment-envFingerprint-mismatch');
-  for (const field of ['imageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const) {
-    const nextIdentity = { ...current, [field]: field === 'imageDigest' ? 'sha256:' + '4'.repeat(64) : field === 'envFingerprint' ? '5'.repeat(64) : 'changed' };
-    expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, nextIdentity, graphPins).reason)
+  for (const field of ['bunVersion', 'platform', 'architecture', 'envFingerprint', 'baseImageDigest'] as const) {
+    const nextIdentity = { ...current, [field]: field === 'baseImageDigest' ? 'sha256:' + '4'.repeat(64) : field === 'envFingerprint' ? '5'.repeat(64) : 'changed' };
+    expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, nextIdentity, graphPins).reason)
       .toBe('environment-' + field + '-mismatch');
   }
 });
@@ -1909,7 +2027,7 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
   const measuredReceiptRoot = join(dirname(instanceRoot), 'machine-ledger', 'release', '1.0.1', 'gate-logs', 'cut', 'receipts');
   const measuredFingerprint = gateEnvFingerprint(process.env);
   const measuredImageDigest = `sha256:${'e'.repeat(64)}`;
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: measuredFingerprint };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: measuredFingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   const repo = join(root, 'repo');
   mkdirSync(repo);
   const original = fixtureRunner.command;
@@ -2051,7 +2169,7 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     const receiptRoot = join(logs, 'receipts');
     const imageDigest = `sha256:${'e'.repeat(64)}`;
     const fingerprint = 'f'.repeat(64);
-    const reuseRuntime = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint };
+    const reuseRuntime = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) };
     const reuseExecutionIdentity = { imageDigest, ...reuseRuntime };
     const graphPins = { graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 };
     for (let i = 0; i < 3; i++) {
@@ -2059,7 +2177,7 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
       const { rc, output } = outputFor(shardFiles);
       saveGateShardResult(receiptRoot, { receipt: {
         id: `pod-${i}`, version: '1.0.1', graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, files: shardFiles, head40: treeHead, base40: BASE, host: 'pool-test',
-        envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint }, executions: [{ branch: '', attemptId: `attempt-${i}`, host: 'pool-test', imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint } }], status: 'complete', failureIds: rc ? [B] : [], errorIds: [],
+        envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) }, executions: [{ branch: '', attemptId: `attempt-${i}`, host: 'pool-test', imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) } }], status: 'complete', failureIds: rc ? [B] : [], errorIds: [],
         evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: new Date().toISOString(), attempt: 1,
       }, runs: [{ output, rc, pass: shardFiles.length - (rc ? 1 : 0), fail: rc ? 1 : 0, errors: 0,
         ran: shardFiles.length, files: shardFiles.length, passedIds: shardFiles.filter((_, index) => !(rc && index === 0)).map((file) => file + ' > passes') }] });
@@ -2103,7 +2221,7 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     const restored = outputFor(restoredFiles);
     saveGateShardResult(receiptRoot, { receipt: {
       id: 'pod-0', version: '1.0.1', graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, files: restoredFiles, head40: treeHead, base40: BASE, host: 'pool-test',
-      envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint }, executions: [{ branch: '', attemptId: 'attempt-restored', host: 'pool-test', imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint } }], status: 'complete', failureIds: [], errorIds: [],
+      envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) }, executions: [{ branch: '', attemptId: 'attempt-restored', host: 'pool-test', imageDigest, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) } }], status: 'complete', failureIds: [], errorIds: [],
       evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: new Date().toISOString(), attempt: 3,
     }, runs: [{ output: restored.output, rc: restored.rc, pass: restoredFiles.length, fail: 0, errors: 0,
       ran: restoredFiles.length, files: restoredFiles.length, passedIds: restoredFiles.map((file) => file + ' > passes') }] });
@@ -2567,7 +2685,7 @@ test('the Pod sweep never assigns an integration-only file and logs that it left
 test('nightly audit files keep their fixture cases in Pod and local gate sweeps', async () => {
   expect(POD_SWEEP_INTEGRATION_ONLY).toEqual(['scripts/install.test.ts', 'scripts/review-model-ab.test.ts']);
   expect(GATE_NIGHTLY_AUDITS).toEqual([
-    'test/f12-sweep.test.ts', 'scripts/unwired-exports.test.ts', 'test/pwa-build-typecheck.test.ts',
+    'test/f12-sweep.test.ts', 'scripts/unwired-exports.test.ts', 'test/pwa-build-typecheck.test.ts', 'scripts/resource-map-check.test.ts',
   ]);
   const { root } = fixture();
   const repo = join(root, 'repo');
@@ -4039,7 +4157,7 @@ for (const mode of ['clean', 'image-drift', 'selection-gap', 'missing-receipt', 
   const gateVersion = hardRehearsalGateVersion('1.0.1', runId);
   const imageDigest = `sha256:${'f'.repeat(64)}`;
   const envFingerprint = gateEnvFingerprint(process.env);
-  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint };
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   const executionIdentity = { imageDigest, ...runtimeIdentity };
   const stampDir = join(instanceRoot, 'release/1.0.1/rehearsal');
   const gateDir = join(instanceRoot, 'release', gateVersion);
@@ -4587,7 +4705,10 @@ test('WARM-GATE-EVIDENCE-PRECUT-CANARY: two real-match observations enable the s
     let call = 0;
     const source = warmReferenceRunner(root, file);
     source.localCommand = async (_cmd, args) => args[0] === 'show'
-      ? { rc: 0, output: 'cut lock bytes' } : { rc: 0, output: '' };
+      ? { rc: 0, output: 'cut lock bytes' }
+      : args[0] === 'rev-parse' ? { rc: 0, output: CUT }
+      : args[0] === 'ls-remote' ? { rc: 0, output: CUT + '\trefs/heads/main\n' }
+      : { rc: 0, output: '' };
     const hooks = { warmReplay: async (input: Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>) => {
         const command = { ...input, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key };
         return { command, transport: { status: 'observed' as const, reason: 'complete' as const, reply: { ...command,
@@ -4617,6 +4738,14 @@ test('WARM-GATE-EVIDENCE-PRECUT-CANARY: two real-match observations enable the s
     expect(call).toBe(2);
     expect(result.decision).toMatchObject(scenario.expected);
     const saved = JSON.parse(readFileSync(historyPath, 'utf8'));
+    const journal = readWarmReuseEvidence(join(instanceRoot, 'warm-reuse-evidence.jsonl'),
+      { consumer: 'gate-recheck', head: CUT, main: CUT });
+    expect(journal).toHaveLength(2);
+    expect(journal?.[0]).toMatchObject({ workerId: 'worker-1', leaseId: 'lease-1', generation: 1,
+      expectedLockHash: lockHash, workerLockHash: lockHash, leaseValid: true, canaryPassed: true, agree: true });
+    if (scenario.mismatch) expect(journal?.[1]).toMatchObject({ leaseValid: false, canaryPassed: false, agree: false });
+    else expect(journal?.[1]).toMatchObject({ leaseValid: true, canaryPassed: true, agree: true });
+    expect(saved.warmHistory.at(-1)?.warmShadow?.[0]).not.toHaveProperty('leaseEvidence');
     expect(saved.warmHistoryOnly).toBe(true);
     expect(saved.previousNote).toBe('preserve');
     expect(saved.warmHistory).toHaveLength(3);

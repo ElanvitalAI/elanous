@@ -25,9 +25,15 @@ export interface ClassicSidetabMissionResult {
   path?: string;
   content?: string;
   error?: string;
+  /** PTY process status when it exited before the result was finalized; null means signal/unknown. */
+  exitCode?: number | null;
   interactionId?: string;
   /** Final raw child PTY screen, retained in the parent comparison recording. */
   finalScreen?: string;
+  /** Child PTY exit status, if the session ended while the mission was observed. */
+  exitObservation?: 'natural-exit' | 'cleanup-exit' | 'cleanup-unobserved';
+  /** Whether the separate completion marker was observed after the result file. */
+  completionMarker?: boolean;
   /** First child PTY frame, retained to explain startup menus and input interception. */
   initialScreen?: string;
   failureStage?: string;
@@ -116,11 +122,12 @@ export function createClassicSidetabMissionTool(
         properties: {
           agent: { type: 'string', enum: ['codex', 'claude'], description: 'Visible coding agent to run.' },
           mission: { type: 'string', minLength: 1, description: 'The work to perform.' },
-          // Keep optional strings schema-valid when model output includes an empty placeholder.
-          // Dispatch treats empty Linear IDs as omitted and validates empty pair prompts itself.
-          linearIssueId: { type: 'string', minLength: 1, description: 'Optional non-empty Linear child issue ID for a single sidetab mission only; omit when parallelMission or withGrok is used.' },
-          parallelMission: { type: 'string', description: 'Optional second prompt for a two-hand Codex/Claude pair only; omit linearIssueId and do not combine with withGrok.' },
-          withGrok: { type: 'boolean', description: 'Run this exact mission concurrently with Codex, Claude Code, and Grok, then compare and adopt the strongest result; omit parallelMission and linearIssueId. Grok login failure degrades to Codex + Claude.' },
+          // Some strict tool callers materialize every optional property and
+          // use empty sentinels instead of omitting it. Accept those at the
+          // boundary; dispatch normalizes them before validating combinations.
+          linearIssueId: { anyOf: [{ type: 'string' }, { type: 'null' }, { type: 'array', items: { type: 'string' }, maxItems: 0 }], description: 'Optional Linear child issue ID for a single sidetab mission only; omit or send an empty value when parallelMission or withGrok is used.' },
+          parallelMission: { anyOf: [{ type: 'string' }, { type: 'null' }, { type: 'array', items: { type: 'string' }, maxItems: 0 }], description: 'Optional second prompt for a two-hand Codex/Claude pair only; omit or send an empty value when not pairing.' },
+          withGrok: { anyOf: [{ type: 'boolean' }, { type: 'null' }, { type: 'string', enum: [''] }, { type: 'array', items: { type: 'string' }, maxItems: 0 }], description: 'Run this exact mission concurrently with Codex, Claude Code, and Grok, then compare and adopt the strongest result; omit parallelMission and linearIssueId. Grok login failure degrades to Codex + Claude.' },
         },
         required: ['agent', 'mission'],
         additionalProperties: false,
@@ -138,29 +145,35 @@ export function createClassicSidetabMissionTool(
       if (Object.keys(input).some(key => key !== 'agent' && key !== 'mission' && key !== 'parallelMission' && key !== 'withGrok' && key !== 'linearIssueId')) {
         return output('error', 'arguments contain unsupported fields');
       }
+      const normalizeOptional = (value: unknown): unknown => {
+        if (value === undefined || value === null) return undefined;
+        if (typeof value === 'string') return value.trim() ? value.trim() : undefined;
+        if (Array.isArray(value) && value.length === 0) return undefined;
+        return value;
+      };
       const agent = input.agent;
       const mission = typeof input.mission === 'string' ? input.mission.trim() : '';
-      const requestedParallelMission = typeof input.parallelMission === 'string' ? input.parallelMission.trim() : '';
-      const linearIssueId = typeof input.linearIssueId === 'string' ? input.linearIssueId.trim() : '';
-      const withGrok = input.withGrok === true;
+      const normalizedParallelMission = normalizeOptional(input.parallelMission);
+      const normalizedLinearIssueId = normalizeOptional(input.linearIssueId);
+      const normalizedWithGrok = normalizeOptional(input.withGrok);
+      const requestedParallelMission = typeof normalizedParallelMission === 'string' ? normalizedParallelMission : '';
+      const linearIssueId = typeof normalizedLinearIssueId === 'string' ? normalizedLinearIssueId : '';
+      const withGrok = normalizedWithGrok === true;
       // Some parent tool callers duplicate the same prompt into both fields.
       // Treat that redundant pair field as omitted in trio mode; a distinct
       // second prompt remains an invalid combination below.
       const parallelMission = withGrok && requestedParallelMission === mission ? '' : requestedParallelMission;
       if (agent !== 'codex' && agent !== 'claude') return output('error', 'agent must be codex or claude');
       if (!mission) return output('error', 'mission text is required');
-      if (!withGrok && input.parallelMission !== undefined && !parallelMission) return output('error', 'parallelMission must contain prompt text');
-      if (input.withGrok !== undefined && typeof input.withGrok !== 'boolean') return output('error', 'withGrok must be a boolean');
-      if (input.linearIssueId !== undefined && typeof input.linearIssueId !== 'string') return output('error', 'linearIssueId must be omitted or contain a non-empty ID');
-      // Some tool callers emit an empty optional string despite the schema's
-      // minLength. In three-hand mode it means "no linked issue" (there is no
-      // progress-sync behavior there); keep explicit empty IDs invalid for the
-      // single-agent path where the ID is actionable.
-      if (input.linearIssueId !== undefined && !linearIssueId && !withGrok) return output('error', 'linearIssueId must be omitted or contain a non-empty ID');
+      if (normalizedParallelMission !== undefined && typeof normalizedParallelMission !== 'string') return output('error', 'parallelMission must contain prompt text');
+      if (normalizedLinearIssueId !== undefined && typeof normalizedLinearIssueId !== 'string') return output('error', 'linearIssueId must be omitted or contain a non-empty ID');
+      if (normalizedWithGrok !== undefined && typeof normalizedWithGrok !== 'boolean') return output('error', 'withGrok must be a boolean');
+      // Non-empty IDs remain single-agent only because parallel runs do not
+      // support Linear progress sync.
       debug.log('agent-mission.sidetab', 'guard-input', {
         hasLinearIssueId: Boolean(linearIssueId),
         parallelMission: Boolean(parallelMission),
-        source: input.linearIssueId !== undefined
+        source: normalizedLinearIssueId !== undefined
           ? (context?.linearIssueId ? 'tool-input+linear-dispatch-context' : 'tool-input')
           : context?.linearIssueId ? 'dispatch-context' : 'none',
       });

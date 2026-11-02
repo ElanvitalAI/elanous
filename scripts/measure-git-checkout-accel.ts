@@ -28,6 +28,8 @@ export interface CheckoutProbeObservation {
   durationMs: number;
   bytesWritten: number;
   fileCount: number;
+  fseventCount?: number;
+  fseventUnavailableReason?: string;
   usesAlternates: boolean;
   alternatesGcSafe?: boolean;
   sparseCheckoutEnabled: boolean;
@@ -35,8 +37,8 @@ export interface CheckoutProbeObservation {
 }
 
 export type CheckoutProbeResult =
-  | Pick<CheckoutProbeObservation, 'bytesWritten' | 'fileCount' | 'usesAlternates' | 'alternatesGcSafe' | 'sparseCheckoutEnabled' | 'sparseDependenciesMet'>
-  | { unavailableReason: string; usesAlternates?: boolean; alternatesGcSafe?: boolean; sparseCheckoutEnabled?: boolean; sparseDependenciesMet?: boolean };
+  | Pick<CheckoutProbeObservation, 'bytesWritten' | 'fileCount' | 'fseventCount' | 'fseventUnavailableReason' | 'usesAlternates' | 'alternatesGcSafe' | 'sparseCheckoutEnabled' | 'sparseDependenciesMet'>
+  | { unavailableReason: string; fseventUnavailableReason?: string; usesAlternates?: boolean; alternatesGcSafe?: boolean; sparseCheckoutEnabled?: boolean; sparseDependenciesMet?: boolean };
 
 export interface CheckoutMeasurementRow {
   route: CheckoutRoute;
@@ -47,6 +49,8 @@ export interface CheckoutMeasurementRow {
   durationMs: number | null;
   bytesWritten: number | null;
   fileCount: number | null;
+  fseventCount: number | null;
+  fseventUnavailableReason: string | null;
   usesAlternates: boolean | null;
   alternatesGcSafe: boolean | null;
   sparseCheckoutEnabled: boolean | null;
@@ -104,13 +108,16 @@ export async function measureCheckoutAcceleration(options: {
       };
       const reasons = reasonsFor(fields);
       rows.push({ route, candidate, condition, cutSha: cutSha.toLowerCase(), measurementStatus: 'unavailable', durationMs: null,
-        bytesWritten: null, fileCount: null, usesAlternates: fields.usesAlternates, alternatesGcSafe: fields.alternatesGcSafe,
+        bytesWritten: null, fileCount: null, fseventCount: null, fseventUnavailableReason: result.fseventUnavailableReason ?? result.unavailableReason, usesAlternates: fields.usesAlternates, alternatesGcSafe: fields.alternatesGcSafe,
         sparseCheckoutEnabled: fields.sparseCheckoutEnabled, sparseDependenciesMet: fields.sparseDependenciesMet,
         usable: false, unusableReasons: reasons });
       continue;
     }
     if (!VALID(elapsed) || !Number.isSafeInteger(result.bytesWritten) || result.bytesWritten < 0 ||
-        !Number.isSafeInteger(result.fileCount) || result.fileCount < 0) {
+        !Number.isSafeInteger(result.fileCount) || result.fileCount < 0 ||
+        (result.fseventCount !== undefined && (!Number.isSafeInteger(result.fseventCount) || result.fseventCount < 0)) ||
+        (result.fseventUnavailableReason !== undefined && !result.fseventUnavailableReason.trim()) ||
+        (result.fseventCount !== undefined && result.fseventUnavailableReason !== undefined)) {
       throw new Error(`invalid probe measurement: ${matrixKey(route, candidate, condition)}`);
     }
     const fields = {
@@ -120,7 +127,8 @@ export async function measureCheckoutAcceleration(options: {
     };
     const reasons = reasonsFor(fields);
     rows.push({ route, candidate, condition, cutSha: cutSha.toLowerCase(), measurementStatus: 'measured', durationMs: elapsed,
-      bytesWritten: result.bytesWritten, fileCount: result.fileCount, usesAlternates: result.usesAlternates,
+      bytesWritten: result.bytesWritten, fileCount: result.fileCount, fseventCount: result.fseventCount ?? null,
+      fseventUnavailableReason: result.fseventUnavailableReason ?? (result.fseventCount === undefined ? 'fsevent counter not supplied by probe' : null), usesAlternates: result.usesAlternates,
       alternatesGcSafe: result.alternatesGcSafe ?? null, sparseCheckoutEnabled: result.sparseCheckoutEnabled,
       sparseDependenciesMet: result.sparseDependenciesMet ?? null, usable: reasons.length === 0, unusableReasons: reasons });
   }
@@ -138,6 +146,8 @@ interface FixtureObservation {
   alternatesGcSafe?: boolean;
   sparseCheckoutEnabled?: boolean;
   sparseDependenciesMet?: boolean;
+  fseventCount?: number;
+  fseventUnavailableReason?: string;
   unavailableReason?: string;
 }
 
@@ -160,8 +170,13 @@ function fixtureProbe(value: unknown): { cutSha: string; probe: CheckoutProbe; c
     }
     if (typeof row.unavailableReason === 'string') {
       if (!row.unavailableReason.trim()) throw new Error(`unavailable observation needs a reason: ${key}`);
-    } else if (!VALID(row.durationMs!) || !Number.isSafeInteger(row.bytesWritten) || row.bytesWritten! < 0 || !Number.isSafeInteger(row.fileCount) || row.fileCount! < 0 || typeof row.usesAlternates !== 'boolean' || typeof row.sparseCheckoutEnabled !== 'boolean') {
-      throw new Error(`invalid observation costs or route facts: ${key}`);
+    } else {
+      const hasFseventCount = Number.isSafeInteger(row.fseventCount) && row.fseventCount! >= 0;
+      const hasFseventReason = typeof row.fseventUnavailableReason === 'string' && Boolean(row.fseventUnavailableReason.trim());
+      if (hasFseventCount === hasFseventReason || !VALID(row.durationMs!) || !Number.isSafeInteger(row.bytesWritten) || row.bytesWritten! < 0 ||
+          !Number.isSafeInteger(row.fileCount) || row.fileCount! < 0 || typeof row.usesAlternates !== 'boolean' || typeof row.sparseCheckoutEnabled !== 'boolean') {
+        throw new Error(`invalid observation costs or route facts: ${key}`);
+      }
     }
     observations.set(key, row);
   }
@@ -182,19 +197,19 @@ function fixtureProbe(value: unknown): { cutSha: string; probe: CheckoutProbe; c
       const row = observations.get(matrixKey(route, candidate, condition))!;
       if (row.unavailableReason) {
         pendingDuration = 0;
-        return { unavailableReason: row.unavailableReason, usesAlternates: row.usesAlternates,
+        return { unavailableReason: row.unavailableReason, fseventUnavailableReason: row.fseventUnavailableReason, usesAlternates: row.usesAlternates,
           alternatesGcSafe: row.alternatesGcSafe, sparseCheckoutEnabled: row.sparseCheckoutEnabled, sparseDependenciesMet: row.sparseDependenciesMet };
       }
       pendingDuration = row.durationMs!;
-      return { bytesWritten: row.bytesWritten!, fileCount: row.fileCount!, usesAlternates: row.usesAlternates!,
+      return { bytesWritten: row.bytesWritten!, fileCount: row.fileCount!, fseventCount: row.fseventCount, fseventUnavailableReason: row.fseventUnavailableReason, usesAlternates: row.usesAlternates!,
         alternatesGcSafe: row.alternatesGcSafe, sparseCheckoutEnabled: row.sparseCheckoutEnabled!, sparseDependenciesMet: row.sparseDependenciesMet };
     } },
   };
 }
 
 export function formatCheckoutMeasurementTable(rows: readonly CheckoutMeasurementRow[]): string {
-  const header = ['route', 'candidate', 'condition', 'cutSha', 'status', 'durationMs', 'bytesWritten', 'fileCount', 'usesAlternates', 'alternatesGcSafe', 'sparseCheckoutEnabled', 'sparseDependenciesMet', 'usable', 'unusableReasons'];
-  const values = rows.map((row) => [row.route, row.candidate, row.condition, row.cutSha, row.measurementStatus, String(row.durationMs ?? ''), String(row.bytesWritten ?? ''), String(row.fileCount ?? ''), String(row.usesAlternates ?? ''), String(row.alternatesGcSafe ?? ''), String(row.sparseCheckoutEnabled ?? ''), String(row.sparseDependenciesMet ?? ''), String(row.usable), row.unusableReasons.join(',')]);
+  const header = ['route', 'candidate', 'condition', 'cutSha', 'status', 'durationMs', 'bytesWritten', 'fileCount', 'fseventCount', 'fseventUnavailableReason', 'usesAlternates', 'alternatesGcSafe', 'sparseCheckoutEnabled', 'sparseDependenciesMet', 'usable', 'unusableReasons'];
+  const values = rows.map((row) => [row.route, row.candidate, row.condition, row.cutSha, row.measurementStatus, String(row.durationMs ?? ''), String(row.bytesWritten ?? ''), String(row.fileCount ?? ''), String(row.fseventCount ?? ''), row.fseventUnavailableReason ?? '', String(row.usesAlternates ?? ''), String(row.alternatesGcSafe ?? ''), String(row.sparseCheckoutEnabled ?? ''), String(row.sparseDependenciesMet ?? ''), String(row.usable), row.unusableReasons.join(',')]);
   const widths = header.map((name, index) => Math.max(name.length, ...values.map((row) => row[index]!.length)));
   const line = (row: string[]) => `| ${row.map((cell, index) => cell.padEnd(widths[index]!)).join(' | ')} |`;
   return [line(header), line(widths.map((width) => '-'.repeat(width))), ...values.map(line)].join('\n');
@@ -206,7 +221,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     if (inputAt < 0 || !args[inputAt + 1]) throw new Error('usage: bun scripts/measure-git-checkout-accel.ts --input <probe-fixture.json> [--table]');
     const fixture = fixtureProbe(JSON.parse(readFileSync(args[inputAt + 1]!, 'utf8')) as unknown);
     const rows = await measureCheckoutAcceleration(fixture);
-    process.stdout.write(args.includes('--table') ? `${formatCheckoutMeasurementTable(rows)}\n` : `${JSON.stringify(rows)}\n`);
+    process.stdout.write(args.includes('--table') ? `Measurement source: deterministic fixture; durations and byte/file costs are supplied inputs, not live host measurements.\n${formatCheckoutMeasurementTable(rows)}\n` : `${JSON.stringify(rows)}\n`);
     return 0;
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

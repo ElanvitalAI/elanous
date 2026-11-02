@@ -14,7 +14,7 @@
 //
 // index.ts 의 액션은 옵션 파싱과 실제 의존 배선만 남는다(얇은 껍데기).
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -250,13 +250,31 @@ function reviewLoopBreakerLockPath(pr: string, root = effectiveInstanceRoot()): 
 }
 
 function readReviewLoopBreakerLock(pr: string, root = effectiveInstanceRoot()): Record<string, unknown> | undefined {
+  const corrupt = (): Record<string, unknown> => ({
+    pr, state: 'waiver-needed', reason: 'review-loop-lock-corrupt',
+  });
+  const path = reviewLoopBreakerLockPath(pr, root);
+  let raw: string;
   try {
-    const value: unknown = JSON.parse(readFileSync(reviewLoopBreakerLockPath(pr, root), 'utf8'));
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    const record = value as Record<string, unknown>;
-    return record.pr === pr && typeof record.head === 'string' && COMMIT_OID.test(record.head)
-      && record.state === 'waiver-needed' ? record : undefined;
-  } catch { return undefined; }
+    raw = readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') return corrupt();
+    // Distinguish an absent lock from an existing dangling symlink (lstat
+    // sees the link itself even when readFileSync cannot resolve its target).
+    try { lstatSync(path); return corrupt(); }
+    catch (statError) {
+      return (statError as NodeJS.ErrnoException)?.code === 'ENOENT' ? undefined : corrupt();
+    }
+  }
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return corrupt(); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return corrupt();
+  const record = value as Record<string, unknown>;
+  const validReason = record.reason === 'two-consecutive-stale-reopen-rounds'
+    || record.reason === 'review-cap-exceeded';
+  return record.pr === pr && record.state === 'waiver-needed'
+    && typeof record.head === 'string' && COMMIT_OID.test(record.head)
+    && validReason ? record : corrupt();
 }
 
 function writeReviewLoopBreakerLock(pr: string, head: string, reason: string, root = effectiveInstanceRoot()): void {
@@ -2189,8 +2207,15 @@ async function runSelfReviewCliCommandPinned(
     // lock; other loop-breaker reasons remain an unconditional stop.
     const opAuthorizedCapRetry = loopLock?.reason === 'review-cap-exceeded'
       && previousRoundCount >= 5 && opAllowsReviewOverCap(pr) && Boolean(reason);
-    if (loopLock && !opAuthorizedCapRetry) {
-      const message = `PR ${pr}: 반복 리뷰 중단 (${String(loopLock.reason ?? 'waiver-needed')}); OP 웨이버가 필요합니다.`;
+    // Stale-reopen locks belong to the exact head that produced them. Other
+    // waiver-needed reasons retain their existing global stop/OP-cap semantics.
+    const sameHeadLoopLock = loopLock?.reason === 'two-consecutive-stale-reopen-rounds'
+      && (!COMMIT_OID.test(diffRead.headCommit) || loopLock.head === diffRead.headCommit);
+    if (loopLock && (loopLock.reason !== 'two-consecutive-stale-reopen-rounds' || sameHeadLoopLock)
+      && !opAuthorizedCapRetry) {
+      const message = loopLock.reason === 'review-loop-lock-corrupt'
+        ? `PR ${pr}: 반복 리뷰 lock 파일이 손상됐거나 신원이 맞지 않아 fail-closed 했습니다. lock 파일 점검이 필요합니다.`
+        : `PR ${pr}: 반복 리뷰 중단 (${String(loopLock.reason ?? 'waiver-needed')}); OP 웨이버가 필요합니다.`;
       deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
       deps.log('review.loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
       if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,

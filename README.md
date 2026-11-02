@@ -2,13 +2,13 @@
 
 # Elanous
 
-> **Public beta** — install it today; provided as is (Apache-2.0). The big update lands on October 28, 2026 — news at [elanous.ai](https://elanous.ai).
-> **공개 베타** — 지금 설치해 쓸 수 있습니다. 정식판 전까지 있는 그대로(Apache-2.0) 제공합니다. 2026년 10월 28일 대규모 업데이트 — 소식은 [elanous.ai](https://elanous.ai). <!-- announce:allow B11 -->
+> **Generally available** — open source (Apache-2.0), provided as is. Install it today; release news at [elanous.ai](https://elanous.ai).
+> **정식 출시** — 오픈소스(Apache-2.0)로, 있는 그대로 제공합니다. 지금 설치해 쓸 수 있고, 릴리스 소식은 [elanous.ai](https://elanous.ai). <!-- announce:allow B11 -->
 
 > **élan, and nous** — The red point at the center is *élan* — the drive to move on its own. The three white blades around it are *nous* — the mind that brings order. They turn one way — observe, understand, heal — widening a little with every turn. A spark meets a mind and keeps widening itself. That is Elanous.
 
 **Elanous is the conductor that coordinates many AI agents and brings back only finished results.**
-It works with supported coding agents (beta) — and gives them wings.
+Today it conducts Codex and Claude Code — and gives them wings.
 
 - **Loop agents** — a team of AI on duty for the work that repeats, kept at it until it is done.
 - **Graph engineering** — work you hand over runs as an execution graph: a work manual you can see, edit and share.

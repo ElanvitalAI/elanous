@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
-import { enqueueClassicSidetabMissionPairCompletion } from './classic-sidetab-mission-job.js';
+import { enqueueClassicSidetabMissionPairCompletion, prepareClassicSidetabMissionOutputDirectory, runPreparedClassicSidetabVisibleMission } from './classic-sidetab-mission-job.js';
+import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
+import { createClassicSidetabMissionPairSessionRegistry } from './classic-sidetab-mission.js';
 
 const workspaces: string[] = [];
 function createWorkspace(): string {
@@ -14,6 +16,66 @@ function createWorkspace(): string {
 
 afterEach(() => {
   for (const workspace of workspaces.splice(0)) rmSync(workspace, { recursive: true, force: true });
+});
+
+test('production pair runner prepares output before the real visible-agent writes', async () => {
+  const workspace = createWorkspace();
+  const started = startClassicSidetabMissionPair({
+    agent: 'codex', mission: 'write a visible result', parallelMission: 'write another visible result',
+    spawnVisible: (agent) => {
+      const cwd = join(workspace, agent);
+      mkdirSync(cwd, { recursive: true });
+      return { id: agent + '-first-run', cwd };
+    },
+    runVisible: async (agent, prompt, session) => {
+      const outputPath = join(session!.cwd, '.elanous', 'mission-results', 'actual-' + agent + '.md.tmp');
+      let screen = '\n› Ask Codex to do anything\n';
+      let typed = '';
+      let enterCount = 0;
+      expect(existsSync(join(session!.cwd, '.elanous', 'mission-results'))).toBe(false);
+      const result = await runPreparedClassicSidetabVisibleMission({
+        agent, mission: prompt, outputPath,
+        pty: {
+          snapshot: () => screen,
+          isAlive: () => true,
+          write: (bytes) => {
+            if (bytes !== '\r') { typed += bytes; screen += bytes; return; }
+            enterCount += 1;
+            if (enterCount === 1) {
+              expect(existsSync(join(session!.cwd, '.elanous', 'mission-results'))).toBe(true);
+              expect(statSync(join(session!.cwd, '.elanous', 'mission-results')).mode & 0o777).toBe(0o700);
+              writeFileSync(outputPath, '# ' + agent + ' first-run result\n');
+              screen = '\n› Ask Codex to do anything\n';
+            } else {
+              const marker = typed.match(/Say (M-[a-f0-9]{12}) alone and write it to the exact file path (.+)\./);
+              expect(marker).not.toBeNull();
+              writeFileSync(marker![2]!, marker![1]! + '\n');
+              screen += '\n└ ' + marker![1] + '\n';
+            }
+            typed = '';
+          },
+        },
+        handleTrust: () => false, sleep: async () => {}, pollMs: 0,
+        readyTimeoutMs: 100, visibilityTimeoutMs: 100, completionTimeoutMs: 100,
+      });
+      expect(result).toMatchObject({ ok: true, missionTyped: true, missionSubmitted: true, completionMarker: true });
+      expect(readFileSync(outputPath, 'utf8')).toBe('# ' + agent + ' first-run result\n');
+      return result;
+    },
+    registry: createClassicSidetabMissionPairSessionRegistry(), hasSession: () => true, killSession: () => {}, enqueue: () => {},
+    createId: (() => { let id = 0; return () => 'actual-' + (++id); })(),
+  });
+  await started.completion;
+});
+
+test('pair output preparation preserves permissions on an existing result directory', () => {
+  const workspace = createWorkspace();
+  const dir = join(workspace, '.elanous', 'mission-results');
+  mkdirSync(dir, { recursive: true });
+  chmodSync(dir, 0o750);
+
+  prepareClassicSidetabMissionOutputDirectory(join(dir, 'classic-pair-pty-1.md.tmp'));
+  expect(statSync(dir).mode & 0o777).toBe(0o750);
 });
 
 test('pair completion is one parent-scoped notification with both answers and redacted result paths', async () => {

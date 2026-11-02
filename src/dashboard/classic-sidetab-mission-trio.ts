@@ -2,15 +2,77 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { findGitDir } from '../git-fs/locate.js';
+import { runVisibleAgentMission, type VisibleMissionPty, type VisibleMissionResult } from '../sidetab-core/visible-agent-mission.js';
 import type { ClassicSidetabMissionDispatchContext, ClassicSidetabMissionPairSessionRegistry, ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
 import { redactMissionResultPath } from './mission-cli-consumer.js';
 import type { ClassicMissionNotificationEnqueue } from './classic-sidetab-mission-job.js';
 
 export type ClassicMissionAgent = 'codex' | 'claude' | 'grok';
 
+/** Run one visible hand through the same identity/trust policy used by the classic trio entrypoint. */
+export function runClassicSidetabMissionTrioMember(input: {
+  member: ClassicMissionAgent;
+  cwd: string;
+  pty: VisibleMissionPty;
+  mission: string;
+  outputPath: string;
+  handleTrust: (screen: string, write: (bytes: string) => void) => boolean;
+}): Promise<VisibleMissionResult> {
+  return runVisibleAgentMission({
+    agent: input.member,
+    pty: input.pty,
+    mission: input.mission,
+    outputPath: input.outputPath,
+    handleTrust: input.handleTrust,
+    allowWorkspaceTrustOnce: input.member === 'grok' && findGitDir(input.cwd)?.isWorktree === true,
+    allowDemoStartupDismissalsOnce: true,
+  });
+}
+
+/** Production adapter shared by the dashboard dispatch and the trio integration test.
+ * The only replaceable boundary is the PTY/session adapter; member driving, trust
+ * handling, exit-code capture, and result decoration stay on this path. */
+export function createClassicSidetabMissionTrioVisibleRunner<Session extends TrioSession>(deps: {
+  ptyForSession: (session: Session) => VisibleMissionPty;
+  outputPath: (agent: ClassicMissionAgent, session: Session) => string;
+  handleTrust: (agent: ClassicMissionAgent, screen: string, write: (bytes: string) => void) => boolean;
+  onFailure?: (agent: ClassicMissionAgent, result: VisibleMissionResult, missionId?: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+}): StartClassicSidetabMissionTrioDeps<Session>['runVisible'] {
+  return async (agent, mission, session, missionId) => {
+    const outputPath = session ? deps.outputPath(agent, session) : '';
+    if (!session) return { ok: false, status: 'failed', path: outputPath, error: `${agent} sidetab PTY could not start` };
+    try {
+      const pty = deps.ptyForSession(session);
+      const result = await runClassicSidetabMissionTrioMember({
+        member: agent, cwd: session.cwd, pty, mission, outputPath,
+        handleTrust: (screen, write) => deps.handleTrust(agent, screen, write),
+        ...(deps.sleep ? { sleep: deps.sleep } : {}),
+      });
+      deps.onFailure?.(agent, result, missionId);
+      return { ...result, status: result.ok ? 'completed' : 'failed', interactionId: missionId, finalScreen: pty.snapshot() };
+    } catch (error) {
+      let finalScreen: string | undefined;
+      try { finalScreen = deps.ptyForSession(session).snapshot(); } catch { /* detached PTY */ }
+      return {
+        ok: false, status: 'failed', path: outputPath, interactionId: missionId,
+        error: error instanceof Error ? error.message : String(error), ...(finalScreen ? { finalScreen } : {}),
+      };
+    }
+  };
+}
+
 interface TrioSession { id: string; cwd: string }
-interface MissionOutcome extends ClassicSidetabMissionResult { content?: string }
+interface MissionOutcome extends ClassicSidetabMissionResult { content?: string; completionMarker?: boolean; exitCode?: number | null }
 const MAX_FINAL_SCREEN_CHARS = 4_000;
+
+export function captureClassicMissionExitObservation(
+  sessionExited: boolean,
+  sessionExitCode: number | null,
+): Partial<Pick<ClassicSidetabMissionResult, 'exitCode' | 'exitObservation'>> {
+  return sessionExited ? { exitCode: sessionExitCode, exitObservation: 'natural-exit' } : {};
+}
 
 export interface StartClassicSidetabMissionTrioDeps<Session extends TrioSession> {
   mission: string;
@@ -19,8 +81,6 @@ export interface StartClassicSidetabMissionTrioDeps<Session extends TrioSession>
   spawnVisible: (agent: ClassicMissionAgent, missionId: string, attemptId: string) => Session | null;
   runVisible: (agent: ClassicMissionAgent, mission: string, session: Session | null, missionId?: string) => Promise<MissionOutcome>;
   registry: ClassicSidetabMissionPairSessionRegistry;
-  hasSession: (sessionId: string) => boolean;
-  killSession: (sessionId: string) => void;
   enqueue: ClassicMissionNotificationEnqueue;
   now?: () => number;
   createId?: () => string;
@@ -36,6 +96,10 @@ export interface ClassicSidetabMissionTrioStart {
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_ANSWER_CHARS = 8_000;
 
+function missionForHand(mission: string, agent: ClassicMissionAgent): string {
+  return mission.replaceAll('<hand>', agent);
+}
+
 function markdownCell(value: string | undefined): string {
   return (value ?? '—').replaceAll('|', '\\|').replace(/\r?\n/g, '<br>');
 }
@@ -50,11 +114,19 @@ function renderTrioSynthesis(mission: string, results: Record<ClassicMissionAgen
   const agents: ClassicMissionAgent[] = ['codex', 'claude', 'grok'];
   const rows = agents.map((agent) => {
     const result = results[agent];
-    return `| ${agent} | ${markdownCell(mission)} | ${markdownCell(result.path)} | ${result.ok ? '완료' : markdownCell(result.error ?? result.status ?? '실패')} |  |`;
+    const exitCode = result.exitObservation === 'cleanup-exit'
+      ? '정리 종료 관측 (미션 코드 아님)'
+      : result.exitObservation === 'cleanup-unobserved'
+        ? '정리 요청 · 종료 미관측 (코드 미상)'
+        : result.exitObservation === 'natural-exit'
+          ? `자연 종료 (${result.exitCode === null ? '코드 미상' : `코드 ${result.exitCode}`})`
+          : result.exitCode === undefined ? '미수집' : result.exitCode === null ? '미상' : String(result.exitCode);
+    const marker = result.completionMarker === undefined ? '미수집' : result.completionMarker ? '확인' : '없음';
+    return `| ${agent} | ${markdownCell(mission)} | ${markdownCell(result.path)} | ${result.ok ? '완료' : markdownCell(result.error ?? result.status ?? '실패')} | ${exitCode} | ${marker} |`;
   });
   const candidates = agents.map((agent) => {
     const result = results[agent];
-    return [`### ${agent}`, `- 결과 경로: ${result.path ?? '없음'}`, `- 상태: ${result.ok ? '완료' : result.error ?? result.status ?? '실패'}`, '', result.content?.trim() ? fenced(result.content.trim()) : '_결과 내용 없음_'].join('\n');
+    return [`### ${agent}`, `- 결과 경로: ${result.path ?? '없음'}`, `- 상태: ${result.ok ? '완료' : result.error ?? result.status ?? '실패'}`, `- 종료 코드: ${result.exitCode === undefined ? '미확인' : result.exitCode === null ? '알 수 없음' : result.exitCode}`, '', result.content?.trim() ? fenced(result.content.trim()) : '_결과 내용 없음_'].join('\n');
   });
   return [
     '# Sidetab mission synthesis record',
@@ -63,8 +135,8 @@ function renderTrioSynthesis(mission: string, results: Record<ClassicMissionAgen
     fenced(mission),
     '',
     '## 손별 귀속',
-    '| 손 | 맡은 일 | 결과 파일 | 결과 상태 | 채택 여부 |',
-    '| --- | --- | --- | --- | --- |',
+    '| 손 | 맡은 일 | 결과 파일 | 결과 상태 | 종료 관측 | 완료 표식 |',
+    '| --- | --- | --- | --- | --- | --- |',
     ...rows,
     '',
     '## 후보 결과',
@@ -95,9 +167,8 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
   const createId = deps.createId ?? randomUUID;
   const now = deps.now ?? Date.now;
   const startedAt = now();
-  // Start the first hand before the bounded subscribed-access probe. The
-  // probe may need a network round-trip, but must not consume the whole
-  // 30-second three-hand startup budget before any visible work begins.
+  // Start the two available hands before probing Grok. A delayed or stuck
+  // login check must not hold Codex back from starting its demo work.
   const ids = new Map<ClassicMissionAgent, string>();
   const sessions = new Map<ClassicMissionAgent, Session | null>();
   const agents: ClassicMissionAgent[] = [];
@@ -129,7 +200,7 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
   for (const agent of agents) {
     const session = sessions.get(agent) ?? null;
     if (agent === 'grok' && !session) continue;
-    const outcome = Promise.resolve().then(() => deps.runVisible(agent, deps.mission, session, ids.get(agent))).catch((error): MissionOutcome => ({
+    const outcome = Promise.resolve().then(() => deps.runVisible(agent, missionForHand(deps.mission, agent), session, ids.get(agent))).catch((error): MissionOutcome => ({
       ok: false, status: 'failed', error: error instanceof Error ? error.message : String(error),
     }));
     outcomes.set(agent, outcome.then((result) => { completedOutcomes.set(agent, result); return result; }));
@@ -143,12 +214,15 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
   const timeoutMs = Math.max(1, deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<void>((resolve) => {
-    timeout = setTimeout(() => {
-      for (const sessionId of sessionIds) if (deps.hasSession(sessionId)) deps.killSession(sessionId);
-      resolve();
-    }, timeoutMs);
+    timeout = setTimeout(resolve, timeoutMs);
   });
-  const settled = Promise.all([...outcomes].map(async ([agent, promise]) => [agent, await promise] as const));
+  const settled = Promise.all([...outcomes].map(async ([agent, promise]) => [agent, await promise] as const))
+    .then((results) => {
+      // A timeout reports the partial evidence but leaves visible PTYs alive
+      // and cancellable. Release their mission mapping only after they settle.
+      deps.registry.clear(missionIds);
+      return results;
+    });
   const completion = Promise.race([settled.then((results) => ({ didTimeout: false, results })), timedOut.then(() => ({ didTimeout: true, results: [...completedOutcomes.entries()] as const }))]).then(({ didTimeout, results }) => {
     const finishedAt = now();
     const all: Record<ClassicMissionAgent, MissionOutcome> = {
@@ -211,6 +285,7 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
     const body = [
       `Three-hand comparison · same goal · ${grokFailed ? `Grok unavailable; continued with Codex + Claude (${all.grok.error ?? 'failed'})` : 'Codex + Claude + Grok results'}`,
       `Coverage: ${coverage}; successful candidates: ${candidateAgents.length ? candidateAgents.join(', ') : 'none'}; failed members: ${failedMembers.length ? failedMembers.map(({ agent, reason }) => `${agent} (${reason})`).join('; ') : 'none'}.`,
+      `Hand evidence: ${expectedAgents.map((agent) => { const result = all[agent]; const exit = result.exitObservation === 'cleanup-exit' ? 'cleanup-exit; mission exit=unknown' : result.exitObservation === 'cleanup-unobserved' ? 'cleanup-requested; exit-unobserved' : result.exitObservation === 'natural-exit' ? `natural-exit; exit=${result.exitCode === null ? 'unknown' : result.exitCode}` : result.exitCode === undefined ? 'not captured' : result.exitCode === null ? 'unknown' : String(result.exitCode); return `${agent} ${exit}, completion-marker=${result.completionMarker === undefined ? 'not captured' : result.completionMarker ? 'yes' : 'no'}`; }).join('; ')}.`,
       synthesisPath ? `Synthesis record: ${synthesisPath}` : `Synthesis record unavailable: ${synthesisError ?? 'unknown write failure'}`,
       candidateAgents.length > 0
         ? 'Adopt or synthesize the final answer from the successful candidates only. If exactly one candidate succeeded, adopt it directly. Name failed members and never imply they succeeded.'
@@ -234,8 +309,6 @@ export async function startClassicSidetabMissionTrio<Session extends TrioSession
     } catch { /* notification delivery cannot interrupt the missions */ }
   }).finally(() => {
     if (timeout) clearTimeout(timeout);
-    for (const sessionId of sessionIds) if (deps.hasSession(sessionId)) deps.killSession(sessionId);
-    deps.registry.clear(missionIds);
   });
 
   return { result: { trioId: `trio-${ids.get('codex') ?? ids.get('claude') ?? createId()}`, members, ...(grokFallback ? { grokFallback } : {}) }, completion };

@@ -48,6 +48,10 @@ export interface ResourceLadderDeps extends MissionResources {
   readonly installPlugin?: (request: { plugin: string; marketplace: string }) => Promise<unknown>;
   readonly decide?: (event: DecisionEvent) => unknown;
   readonly log?: (step: string, data: Record<string, unknown>) => void;
+  /** Test seam for deterministic deadline behavior; production defaults to the wall clock. */
+  readonly now?: () => number;
+  readonly scheduleTimeout?: typeof setTimeout;
+  readonly cancelTimeout?: typeof clearTimeout;
 }
 
 function safeMissionText(mission: string): string {
@@ -143,7 +147,10 @@ export async function planMissionResources(mission: string, deps: ResourceLadder
   const backend = options.backend ?? deps.backend;
   const plugin = options.plugin ?? deps.plugin;
   const budgetMs = options.deadlineMs ?? deps.deadlineMs;
-  const deadline = budgetMs === undefined ? undefined : Date.now() + budgetMs;
+  const now = deps.now ?? Date.now;
+  const scheduleTimeout = deps.scheduleTimeout ?? setTimeout;
+  const cancelTimeout = deps.cancelTimeout ?? clearTimeout;
+  const deadline = budgetMs === undefined ? undefined : now() + budgetMs;
   const decide = (step: string, kind: DecisionEvent['kind'], what: string, why: string) => {
     plan.decisions.push(`${step}: ${what} — ${why}`);
     (deps.decide ?? emitDecision)({ kind, what, reason: why, purpose: 'pre-mission resource selection', target: 'agent-mission', phase: 'dispatch' });
@@ -224,15 +231,15 @@ export async function planMissionResources(mission: string, deps: ResourceLadder
     let timer: ReturnType<typeof setTimeout> | undefined;
     const controller = new AbortController();
     try {
-      const remainingMs = deadline === undefined ? undefined : Math.max(0, deadline - Date.now() - 50);
+      const remainingMs = deadline === undefined ? undefined : Math.max(0, deadline - now() - 50);
       if (remainingMs === 0) throw new Error('discovery deadline');
       const discovery = (deps.discover ?? discoverCapability)(need, { community: false, signal: controller.signal });
       candidates = remainingMs === undefined ? await discovery : await Promise.race([
         discovery,
-        new Promise<CapabilityCandidate[]>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('discovery deadline')), remainingMs); }),
+        new Promise<CapabilityCandidate[]>((_resolve, reject) => { timer = scheduleTimeout(() => reject(new Error('discovery deadline')), remainingMs); }),
       ]);
     } catch { controller.abort(); decide('discover', 'ESCALATE', '발굴 실패', '후보 없음 — 자동 설치하지 않음'); }
-    finally { if (timer) clearTimeout(timer); }
+    finally { if (timer) cancelTimeout(timer); }
     decide('discover', 'ESCALATE', '미충족 능력 후보', `${candidates.length}개 후보 제안만 함`);
     return { need, candidates };
   }));

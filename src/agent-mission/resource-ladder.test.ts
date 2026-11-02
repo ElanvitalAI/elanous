@@ -145,14 +145,24 @@ describe('planMissionResources', () => {
     expect(plan.plugin?.plugin).toBe('pdfsift');
   });
 
+  // Production path: src/agent-mission/resource-ladder.ts. These tests inject discovery and
+  // clock effects; they do not write files or invoke the network.
   test('a slow parallel discovery respects the budget without discarding the signed plugin choice', async () => {
     const pending: string[] = [];
     const aborted: string[] = [];
     const decisions: string[] = [];
-    const started = Date.now();
+    const scheduledMs: number[] = [];
     const plan = await withFixtureKey(() => planMissionResources('Use pdfsift', fixture({
       inferNeeds: async () => '{"needs":["one","two"]}',
       log: (step, data) => { decisions.push(`${step}:${data.what}`); },
+      now: () => 1_000,
+      scheduleTimeout: ((callback: () => void, ms?: number) => {
+        scheduledMs.push(ms ?? 0);
+        const handle = {} as ReturnType<typeof setTimeout>;
+        queueMicrotask(callback);
+        return handle;
+      }) as typeof setTimeout,
+      cancelTimeout: (() => {}) as typeof clearTimeout,
       discover: async (need, opts) => {
         expect(decisions).toContain('official-index:공식 플러그인 선택');
         pending.push(need);
@@ -162,11 +172,32 @@ describe('planMissionResources', () => {
         });
       },
     }), { deadlineMs: 100 }));
-    expect(Date.now() - started).toBeLessThan(1000);
+    expect(scheduledMs).toEqual([50, 50, 50]);
     expect(plan.plugin?.plugin).toBe('pdfsift');
     expect(pending).toEqual(['one', 'two', 'pdfsift']);
     expect(aborted).toEqual(['one', 'two', 'pdfsift']);
     expect(plan.gaps).toEqual(['one', 'two', 'pdfsift'].map(need => ({ need, candidates: [] })));
+  });
+
+
+  test('discovery resolving before its budget returns candidates and cancels the pending timer', async () => {
+    const scheduled: Array<{ callback: () => void; delayMs: number; handle: ReturnType<typeof setTimeout> }> = [];
+    const cancelled: ReturnType<typeof setTimeout>[] = [];
+    const plan = await planMissionResources('Inspect resources', fixture({
+      inferNeeds: async () => '{"needs":["one"]}',
+      now: () => 5_000,
+      scheduleTimeout: ((callback: () => void, delayMs?: number) => {
+        const handle = {} as ReturnType<typeof setTimeout>;
+        scheduled.push({ callback, delayMs: delayMs ?? 0, handle });
+        return handle;
+      }) as typeof setTimeout,
+      cancelTimeout: ((handle: ReturnType<typeof setTimeout>) => { cancelled.push(handle); }) as typeof clearTimeout,
+      discover: async () => [candidate],
+    }), { deadlineMs: 200 });
+
+    expect(scheduled.map(timer => timer.delayMs)).toEqual([150]);
+    expect(plan.gaps).toEqual([{ need: 'one', candidates: [candidate] }]);
+    expect(cancelled).toEqual([scheduled[0]!.handle]);
   });
 
   test('a signed official capability containing a colon remains an exact label', async () => {

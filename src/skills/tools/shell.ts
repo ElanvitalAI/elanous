@@ -186,10 +186,11 @@ function rejectedCdResult(): RunShellDispatchResult {
 // src/skills/tools/ops-ledger.ts, registered for the same skill+tui hosts as
 // RunShell). Shelling out to the `elanous` CLI for exactly those covered ops
 // pays 1.3–2s of process startup for work the host process does in <300ms,
-// and the CLI's human-oriented stdout amplifies TUI screen defects — so the
-// call is steered to the native tool with a structured refusal naming it.
+// and the CLI's human-oriented stdout amplifies TUI screen defects — so covered
+// calls are steered to the native tool. The explicitly requested read-only msg list
+// command stays on the CLI path so the caller's named interface is honored.
 //
-// Deliberately NOT a blanket elanous-CLI ban: only the seven covered ops are
+// Deliberately NOT a blanket elanous-CLI ban: only covered write/list operations are
 // refused, and argv that explicitly scopes another universe (--test /
 // --config-dir / --state-dir) is allowed through because the native tools
 // always serve THIS process's instance.
@@ -258,7 +259,9 @@ export function matchLedgerCli(
       ? `release checklist ${args[i + 2]}`
       : '';
   const tool = covered ? LEDGER_CLI_NATIVE_TOOL[covered] : undefined;
-  if (!tool || !availableToolNames.includes(tool)) return null;
+  // RunShell argv is itself an explicit CLI request. Preserve read-only msg list;
+  // its native MsgList alternative remains available as a direct tool call.
+  if (!tool || covered === 'msg list' || !availableToolNames.includes(tool)) return null;
   return { covered, tool };
 }
 

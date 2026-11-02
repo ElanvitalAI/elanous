@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { activeGateTrainFingerprints, readActiveGateTrainFingerprints, resourceReconcileTick, startResourceReconcileLoop, RESOURCE_RECONCILE_INTERVAL_MS } from './guardian-reconcile.js';
+import { activeGateTrainFingerprints, getLatestResourceFailure, readActiveGateTrainFingerprints, resourceReconcileTick, setLatestResourceSnapshotForTest, startResourceReconcileLoop, RESOURCE_RECONCILE_INTERVAL_MS } from './guardian-reconcile.js';
 import type { ResourceLease } from './resource-ledger.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { LogStore } from '../mss/logging/log-store.js';
@@ -31,6 +31,15 @@ test('guardian resource tick sends measured findings and atomically reaps an abs
   expect(events).toMatchObject([{ event: 'resource-reconcile', data: { findingCounts: { stale: 1, 'reaped-candidate': 1 }, reaped: 1 } }]);
 });
 
+test('guardian dry-run uses injected read dependencies and never calls the reap writer', async () => {
+  let reapCalls = 0;
+  const report = await resourceReconcileTick({ events: () => [], hosts: () => [], run: () => { throw new Error('no hosts means no command'); },
+    fingerprints: () => [], releaseReservation: () => ({ status: 'free' }),
+    now: () => new Date('2026-11-01T00:00:02.000Z'), reap: () => { reapCalls++; return true; }, log: () => {} });
+  expect(report.cleanup).toMatchObject({ mode: 'dry-run', candidates: [], reaped: [], mutations: [] });
+  expect(reapCalls).toBe(0);
+});
+
 test('guardian resource loop ticks immediately, never overlaps, and cancels cleanly', async () => {
   let resolve!: () => void;
   let calls = 0;
@@ -42,6 +51,17 @@ test('guardian resource loop ticks immediately, never overlaps, and cancels clea
   resolve();
   await pending;
   expect(RESOURCE_RECONCILE_INTERVAL_MS).toBe(300_000);
+});
+
+test('first guardian reconcile failure is retained separately from the not-yet-run pending state', async () => {
+  setLatestResourceSnapshotForTest(null);
+  let reportError!: (error: unknown) => void;
+  const observed = new Promise<void>(resolve => { reportError = () => resolve(); });
+  const stop = startResourceReconcileLoop({ intervalMs: 60_000, tick: async () => { throw new Error('mock first tick failed'); }, onError: reportError });
+  await observed;
+  stop();
+  expect(getLatestResourceFailure()).toMatchObject({ reason: 'mock first tick failed' });
+  setLatestResourceSnapshotForTest(null);
 });
 
 test('guardian crosschecks active self-gate/train run fingerprints against measured ledger leases', async () => {

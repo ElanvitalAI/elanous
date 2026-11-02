@@ -1,6 +1,6 @@
 import { decisionListSince } from './decision-list-since.js';
 
-export type LightCliRoute = 'msg' | 'decisions' | 'release' | 'tasks' | 'tasks-read' | 'pty' | 'logs' | 'config';
+export type LightCliRoute = 'msg' | 'decisions' | 'release' | 'release-set' | 'release-landed' | 'tasks' | 'tasks-read' | 'tasks-advance' | 'pr-land' | 'pty' | 'logs' | 'config';
 
 const VALUE_FLAGS = new Set(['--config-dir', '--test-state-dir']);
 const HOT_ROOTS = new Set(['msg', 'decisions', 'pty', 'logs', 'tasks']);
@@ -83,13 +83,17 @@ export function selectLightCliRoute(args: readonly string[]): LightCliRoute | un
   if (command[0] === 'decisions' && command[1] === 'list') return hasValidDecisionsSince(args) ? 'decisions' : undefined;
   // --reveal has an audit-log contract owned by the full CLI.
   if (command[0] === 'config' && command[1] === 'get' && !args.some(arg => arg === '--reveal' || arg.startsWith('--reveal='))) return 'config';
+  if (command[0] === 'release' && command[1] === 'checklist' && command[2] === 'set') return 'release-set';
+  if (command[0] === 'release' && command[1] === 'checklist' && command[2] === 'landed-but-yellow') return 'release-landed';
   if (command[0] === 'release' && command[1] === 'checklist'
     && (command[2] === 'status' || command[2] === 'list')) return 'release';
   // CLI-ENTRY-LAZY — list·show 는 그 둘만 등록한다(tasks-read-cli.ts · board·shadow·mission 클러스터 0).
+  if (command[0] === 'tasks' && command[1] === 'advance') return 'tasks-advance';
   if (command[0] === 'tasks' && (command[1] === 'list' || command[1] === 'show')) return 'tasks-read';
   // 하위 목록 도움말은 전체 등록부가 그린다 — 무거운 모듈은 그 등록부 안에서 실행 때만 싣는다.
   if (command[0] === 'tasks' && ((command[1] === 'hand' && args.includes('--help'))
     || (command.length === 1 && args.length === 2 && (args[1] === '--help' || args[1] === '-h')))) return 'tasks';
+  if (command[0] === 'pr' && command[1] === 'land') return 'pr-land';
   if (command[0] === 'pty' && ['list', 'snapshot', 'text', 'state'].includes(command[1] ?? '')) return 'pty';
   if (command[0] === 'logs' && isSupportedLogsShape(args)) return 'logs';
   return undefined;

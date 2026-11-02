@@ -44,6 +44,67 @@ export interface ActualWarmLeaseEvidence {
   agree: boolean;
 }
 
+/** Persist a gate-recheck sample; an unmeasured/mismatched sample supersedes older success. */
+export function recordWarmGateEvidence(
+  input: { head?: string; main?: string; evidence?: ActualWarmLeaseEvidence; reason?: string; recordedAt?: string },
+  path = warmReuseEvidencePath(),
+  write: typeof recordWarmReuseEvidence = recordWarmReuseEvidence,
+): void {
+  if (!input.head || !SHA.test(input.head) || !input.main || !SHA.test(input.main)) {
+    invalidateWarmReuseEvidence(path);
+    throw new Error('warm gate evidence identity is unmeasured');
+  }
+  const identityMatches = input.head === input.main;
+  const evidence = input.evidence
+    ? { ...input.evidence, ...(identityMatches ? {} : { leaseValid: false, canaryPassed: false, agree: false }) }
+    : undefined;
+  try {
+    write(path, { schema: 1, consumer: 'gate-recheck', head: input.head, main: input.main,
+      recordedAt: input.recordedAt ?? new Date().toISOString(),
+      ...(evidence ? evidence : { reason: input.reason ?? (identityMatches ? 'warm-shadow-unmeasured' : 'head-main-mismatch') }) });
+  } catch (error) {
+    try { invalidateWarmReuseEvidence(path); }
+    catch (invalidateError) {
+      throw new Error('gate evidence write failed and prior evidence could not be invalidated: ' + String(invalidateError), { cause: error });
+    }
+    throw error;
+  }
+}
+
+/** Remove only gate-recheck rows; land and TA evidence belongs to independent consumers. */
+export function invalidateWarmReuseEvidence(path = warmReuseEvidencePath(), timeoutMs = 10_000): void {
+  if (!existsSync(path)) return;
+  const lock = `${path}.lock`;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error('invalid warm evidence lock timeout');
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { mkdirSync(lock); break; }
+    catch (lockError) {
+      if (Date.now() >= deadline) throw new Error('timed out locking warm reuse evidence invalidation', { cause: lockError });
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > 30_000) { rmdirSync(lock); continue; }
+      } catch (statError) {
+        if (Date.now() >= deadline) throw new Error('unable to inspect warm reuse evidence lock before timeout', { cause: statError });
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10, Math.max(1, deadline - Date.now())));
+    }
+  }
+  try {
+    const contents = readFileSync(path, 'utf8');
+    const keep = contents.split(/\r?\n/).filter(Boolean).filter((line) => {
+      try {
+        const row = JSON.parse(line) as { consumer?: unknown };
+        return row.consumer !== 'gate-recheck';
+      } catch { return true; }
+    });
+    const temp = `${path}.${process.pid}.${randomUUID()}.invalidate.tmp`;
+    try {
+      writeFileSync(temp, keep.length ? keep.join('\n') + '\n' : '', { mode: 0o600, flag: 'wx' });
+      renameSync(temp, path);
+    } finally { rmSync(temp, { force: true }); }
+  } finally { try { rmdirSync(lock); } catch { /* best-effort release */ } }
+}
+
 export function warmReuseEvidencePath(root = effectiveInstanceRoot()): string {
   return join(root, 'warm-reuse-evidence.jsonl');
 }

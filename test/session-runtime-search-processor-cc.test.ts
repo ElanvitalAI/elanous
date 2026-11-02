@@ -21,6 +21,21 @@ describe('handleRepeatedCandidateListing — CC turn-aware fan-out', () => {
     return { pattern: 'foo|bar', path, glob, output_mode: 'files_with_matches' };
   }
 
+  test('first candidate listing is allowed after an earlier Read; later repeats stay guarded', () => {
+    const planner = createSearchPlannerState();
+    expect(handleRepeatedCandidateListing('Read', { file_path: 'src/a.ts' }, true, undefined, planner, 0).kind).toBe('none');
+    expect(planner.phase).toBe('inspecting');
+    expect(planner.pendingCandidateScopeKey).toBeNull();
+
+    const first = handleRepeatedCandidateListing('Grep', grepListingArgs('src', '*.ts'), true, undefined, planner, 1);
+    expect(first.kind).toBe('none');
+    expect(planner.phase).toBe('listed');
+    expect(planner.scopeOpenedAtTurn).toBe(1);
+
+    const repeat = handleRepeatedCandidateListing('Grep', grepListingArgs('test', '*.test.ts'), true, undefined, planner, 2);
+    expect(repeat.kind).toBe('block');
+  });
+
   test('same-turn parallel fan-out with different scopes all pass through', () => {
     const planner = createSearchPlannerState();
 

@@ -13,6 +13,7 @@ import {
   type SetupKeysIO,
 } from './setup-keys.js';
 import { startFakeOpenAiCompatibleApi } from '../ux-sim/service-key-setup.js';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 
 test('first-run no-provider flow reaches ready through the production Codex OAuth fetch seam', async () => {
   const root = mkdtempSync(join(tmpdir(), 'setup-keys-oauth-'));
@@ -147,6 +148,163 @@ test('first-run setup menu re-asks parser misses, then asks for setup without re
     expect(skipResult).toEqual({ outcome: 'ready', inputs: 1 });
     expect(buildUserConfig(skipPath).onboarding.ready).toBe(true);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test('production first-run shows fake-clock headless progress and aborts the real OAuth poll', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'headless-login-cancel-'));
+  const oldXdg = process.env.XDG_CONFIG_HOME;
+  const oldCodexHome = process.env.CODEX_HOME;
+  process.env.XDG_CONFIG_HOME = join(root, 'xdg');
+  process.env.CODEX_HOME = join(root, 'codex');
+  const printed: string[] = [];
+  const updates: string[] = [];
+  let interrupt: (() => void) | undefined;
+  let signal: AbortSignal | undefined;
+  let pollStarted = false;
+  let pollAborted = false;
+  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
+    const url = String(input);
+    if (url.endsWith('/deviceauth/usercode')) {
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100));
+      return Response.json({ user_code: 'ABCD-1234', device_auth_id: 'device-fixture', interval: 0 });
+    }
+    if (url.endsWith('/deviceauth/token')) {
+      pollStarted = true;
+      return new Promise<Response>((_resolve, reject) => {
+        const pollSignal = init?.signal;
+        if (pollSignal?.aborted) {
+          pollAborted = true;
+          reject(pollSignal.reason ?? new DOMException('Aborted', 'AbortError'));
+          return;
+        }
+        pollSignal?.addEventListener('abort', () => {
+          pollAborted = true;
+          reject(pollSignal.reason ?? new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      });
+    }
+    throw new Error('unexpected OAuth endpoint');
+  }) as unknown as typeof fetch;
+  const io: SetupKeysIO = {
+    ask: async () => '1',
+    print: (line: string) => printed.push(line),
+    updateLine: (line: string) => updates.push(line),
+    finishLine: () => {},
+    onInterrupt: (handler: () => void) => { interrupt = handler; return () => { interrupt = undefined; }; },
+  };
+  try {
+    const configPath = join(root, 'config.json');
+    await withSimClock(Date.parse('2026-11-02T00:00:00Z'), async clock => {
+      const resultPromise = runFirstRun({
+        path: configPath,
+        config: buildUserConfig(configPath),
+        isTTY: true,
+        detectProviders: async () => [],
+        setupWhenNoProvider: config => runFirstRunProviderSetup(io, {
+          config,
+          isHeadless: () => true,
+          loginWithCodex: options => {
+            signal = options?.signal;
+            return loginWithCodex({
+              ...options,
+              fetchImpl,
+              pollIntervalMs: 1_000,
+              maxWaitMs: 10_000,
+              mirrorCodex: false,
+            });
+          },
+        }),
+        print: line => printed.push(line),
+      });
+      for (let turn = 0; turn < 8 && !signal; turn++) await Promise.resolve();
+      expect(updates).toEqual([]);
+      expect(printed.some(line => line.includes('ABCD-1234'))).toBe(false);
+      clock.tick(1_100);
+      for (let turn = 0; turn < 8 && updates.length === 0; turn++) await Promise.resolve();
+      expect(updates.length).toBeGreaterThan(0);
+      expect(updates[0]).toContain('0초');
+      expect(updates[0]).toContain('Ctrl-C');
+      expect(printed.filter(line => line.includes('ABCD-1234'))).toHaveLength(1);
+      clock.tick(1_000);
+      for (let turn = 0; turn < 8 && !pollStarted; turn++) await Promise.resolve();
+      expect(pollStarted).toBe(true);
+      expect(updates.at(-1)).toContain('1초');
+      interrupt?.();
+      const result = await resultPromise;
+      expect(result.outcome).toBe('ready');
+      expect(signal?.aborted).toBe(true);
+      expect(pollAborted).toBe(true);
+      expect(buildUserConfig(configPath).onboarding.ready).toBe(true);
+      expect(printed.some(line => line.includes('Codex 로그인을 건너뛰었습니다'))).toBe(true);
+      expect(printed.some(line => line.includes('elanous login openai-codex'))).toBe(true);
+      expect(printed.some(line => line.includes('완료하지 못했습니다'))).toBe(false);
+      expect(clock.pendingTimers()).toBe(0);
+    });
+  } finally {
+    if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = oldXdg;
+    if (oldCodexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodexHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test('headless setup stops refreshing elapsed wait when token exchange begins', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'headless-login-exchange-'));
+  const oldXdg = process.env.XDG_CONFIG_HOME;
+  const oldCodexHome = process.env.CODEX_HOME;
+  process.env.XDG_CONFIG_HOME = join(root, 'xdg');
+  process.env.CODEX_HOME = join(root, 'codex');
+  const updates: string[] = [];
+  let interrupt: (() => void) | undefined;
+  let signal: AbortSignal | undefined;
+  type LoginProgress = NonNullable<NonNullable<Parameters<typeof loginWithCodex>[0]>['onProgress']>;
+  let reportProgress: LoginProgress | undefined;
+  const io: SetupKeysIO = {
+    ask: async () => '1',
+    print: () => {},
+    updateLine: line => updates.push(line),
+    finishLine: () => {},
+    onInterrupt: handler => { interrupt = handler; return () => { interrupt = undefined; }; },
+  };
+  try {
+    await withSimClock(Date.parse('2026-11-02T00:00:00Z'), async clock => {
+      const resultPromise = runFirstRunProviderSetup(io, {
+        config: buildUserConfig(join(root, 'config.json')),
+        isHeadless: () => true,
+        loginWithCodex: async options => {
+          signal = options?.signal;
+          reportProgress = options?.onProgress;
+          reportProgress?.({ type: 'user_code', userCode: 'ABCD-1234', loginUrl: 'https://auth.openai.com/codex/device' });
+          reportProgress?.({ type: 'polling', pollAttempt: 1 });
+          return new Promise(resolve => {
+            if (signal?.aborted) return resolve({} as never);
+            signal?.addEventListener('abort', () => resolve({} as never), { once: true });
+          });
+        },
+      });
+      for (let turn = 0; turn < 8 && updates.length < 2; turn++) await Promise.resolve();
+      expect(updates[0]).toContain('0초');
+      expect(updates[0]).toContain('Ctrl-C');
+      clock.tick(1_000);
+      expect(updates.at(-1)).toContain('1초');
+      const beforeExchange = updates.length;
+      reportProgress?.({ type: 'exchanging' });
+      expect(updates.length).toBe(beforeExchange + 1);
+      expect(updates.at(-1)).toContain('로그인 확인 중');
+      const afterExchange = updates.length;
+      clock.tick(2_000);
+      expect(updates).toHaveLength(afterExchange);
+      expect(clock.pendingTimers()).toBe(0);
+      interrupt?.();
+      expect(await resultPromise).toBeNull();
+      expect(signal?.aborted).toBe(true);
+    });
+  } finally {
+    if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = oldXdg;
+    if (oldCodexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodexHome;
     rmSync(root, { recursive: true, force: true });
   }
 });

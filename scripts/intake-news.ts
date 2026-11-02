@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { buildIntakeCheckInvocation } from './lib/intake-check-cli.js';
 import { judge } from '../src/llm/judge-layer.js';
 import { effectiveInstanceRoot } from '../src/instance/resolve.js';
 import { canonicalUrl } from '../src/intake-plane/items.js';
@@ -61,15 +62,14 @@ async function classifyAmbiguous(article: NewsArticle): Promise<boolean> {
 }
 
 /** The CLI, not a local imitation of the checker, is the implication authority. No --author or release mutation. */
-export function intakeCheckArgs(facts: readonly string[], options: { testMode?: boolean } = {}): string[] {
-  // Installed production collectors may have no git tree, so only an explicitly isolated
-  // caller asks the CLI to resolve --test.
-  return ['bin/elanous.mjs', ...(options.testMode ? ['--test'] : []), 'intake', 'check', ...facts.flatMap((fact) => ['--fact', fact]), '--json'];
+export function intakeCheckInvocation(facts: readonly string[]) {
+  return buildIntakeCheckInvocation(facts, resolve(import.meta.dir, '..'));
 }
 
-export async function runIntakeCheckCli(facts: readonly string[], options: { testMode?: boolean } = {}): Promise<NewsCheck> {
-  const result = spawnSync('bun', intakeCheckArgs(facts, options), {
-    cwd: resolve(import.meta.dir, '..'), encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
+export async function runIntakeCheckCli(facts: readonly string[]): Promise<NewsCheck> {
+  const invocation = intakeCheckInvocation(facts);
+  const result = spawnSync(invocation.command, invocation.args, {
+    encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
   });
   if (result.error || result.status !== 0) throw new Error(result.error?.message ?? result.stderr?.trim() ?? `intake check exited ${result.status}`);
   // Standalone notifications may precede JSON on stdout.

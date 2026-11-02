@@ -21,9 +21,11 @@ export function handleResourceLedgerApi(): Response {
     })))();
     // Machine-local paths are not part of the operator-facing API contract.
     const { ledgerPath: _ledgerPath, ...publicSnapshot } = snapshot;
-    const safeText = (text: string) => redactSecretText(text).split(/(\s+)/u).map(part => part.includes('/') ? '[path]' : part).join('');
+    const safeText = (text: string) => redactSecretText(text).split(/(\s+)/u).map(part => part.includes('/') || part.includes('\\') ? '[path]' : part).join('');
     return jsonResponse({ ...publicSnapshot,
       findings: publicSnapshot.findings.map(finding => ({ ...finding, detail: safeText(finding.detail) })),
+      recentReclaims: publicSnapshot.recentReclaims.map(reclaim => ({ ...reclaim, reason: safeText(reclaim.reason),
+        ...(reclaim.stoppedBy === undefined ? {} : { stoppedBy: safeText(reclaim.stoppedBy) }) })),
       measurements: publicSnapshot.measurements.map(measurement => ({ ...measurement, errors: measurement.errors.map(safeText),
         processes: measurement.processes.map(({ id, fp, lane, mission }) => ({ id, ...(fp ? { fp } : {}),
           ...(lane ? { lane } : {}), ...(mission ? { mission } : {}) })) })),

@@ -1,5 +1,4 @@
 import { expect, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +6,8 @@ import { debug } from '../debug/log.js';
 import { runSelfImplement } from './orchestrator.js';
 import { classifyPodReviewBudgetResidue } from './review-finding-recurrence.js';
 import { seams } from './test-seams.js';
+import { TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, testFakeLlmProvider } from '../ux-sim/fake-llm.js';
+import { withFakeBins, type FakeBinCall } from '../ux-sim/fake-bin.js';
 import { repairInputsFromBody } from '../harness/helper-repair.js';
 
 const f = (id: string, item: string) => ({ id, item });
@@ -29,12 +30,6 @@ test('residue compares prior ids or nonempty keys, with no previous round remain
   });
 });
 
-const git = (cwd: string, ...args: string[]) => {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_NAME: "Test", GIT_COMMITTER_EMAIL: "test@example.com" } });
-  if (result.status !== 0) throw new Error(result.stderr);
-  return result.stdout.trim();
-};
-
 async function runPod(reviews: string[][], gatePassed = true) {
   const root = mkdtempSync(join(tmpdir(), 'pod-budget-'));
   const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
@@ -46,49 +41,62 @@ async function runPod(reviews: string[][], gatePassed = true) {
       events.push({ category, event, data: data as Record<string, unknown> });
     }
   } });
-  const prior = process.env.ELANOUS_SUBSTRATE;
+  const envKeys = ['ELANOUS_SUBSTRATE', TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV] as const;
+  const priorEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   process.env.ELANOUS_SUBSTRATE = 'pod';
   try {
-    git(root, 'init', '-b', 'main');
-    git(root, 'config', 'user.name', 'Test');
-    git(root, 'config', 'user.email', 'test@example.com');
     writeFileSync(join(root, 'README.md'), 'base\n');
-    git(root, 'add', 'README.md');
-    git(root, 'commit', '-m', 'base');
     let index = 0;
-    const result = await runSelfImplement({
-      feature: 'Fix the target', maxReworkRounds: reviews.length - 1, memory: false, autoMerge: true,
-      seams: seams({
-        createWorktree: async () => ({ path: root, branch: "main", resolvedBase: git(root, "rev-parse", "HEAD") }),
-        implement: async () => {
-          writeFileSync(join(root, 'change.ts'), 'export const fixed = true;\n');
-          return { ok: true, summary: 'implemented' };
-        },
-        changedFilesForGateRoute: () => ['change.ts'],
-        gate: async () => ({ passed: gatePassed, log: gatePassed ? 'ok' : 'failed' }),
-        reviewDiff: async () => ({ verdict: 'fail', mustFix: reviews[Math.min(index++, reviews.length - 1)]!, shouldFix: [], reviewed: true, summary: 'blocked' }),
-        preservationHasChanges: () => true,
-        writeRunLedger: (entry) => { ledger.push({ event: entry.event, data: entry.data as Record<string, unknown> }); },
-        mergePr: async () => { mergeCalls += 1; return { merged: true }; },
-        openPr: async (input) => {
-          opened.push({ draft: input.draft, body: input.body });
-          return { url: 'https://example.test/pr/7', number: 7 };
-        },
-      }),
+    let fakeGitCalls: FakeBinCall[] = [];
+    const result = await withFakeBins({ git: {} }, async (fakeBins) => {
+      process.env[TEST_FAKE_LLM_ENV] = '1';
+      return runSelfImplement({
+        feature: 'Fix the target', maxReworkRounds: reviews.length - 1, memory: false, autoMerge: true,
+        seams: seams({
+          createWorktree: async () => ({ path: root, branch: 'main', resolvedBase: 'a'.repeat(40) }),
+          headCommit: () => 'a'.repeat(40),
+          implement: async () => {
+            writeFileSync(join(root, 'change.ts'), 'export const fixed = true;\n');
+            return { ok: true, summary: 'implemented' };
+          },
+          changedFilesForGateRoute: () => ['change.ts'],
+          gate: async () => ({ passed: gatePassed, log: gatePassed ? 'ok' : 'failed' }),
+          reviewDiff: async () => {
+            const mustFix = reviews[Math.min(index++, reviews.length - 1)]!;
+            process.env[TEST_FAKE_LLM_RESPONSE_ENV] = JSON.stringify({ verdict: 'fail', mustFix, shouldFix: [], reviewed: true, summary: 'blocked' });
+            const response = await Array.fromAsync(testFakeLlmProvider.chat([{ role: 'user', content: 'Return the scripted review decision.' }]));
+            return JSON.parse(response.join('')) as { verdict: 'fail'; mustFix: string[]; shouldFix: string[]; reviewed: true; summary: string };
+          },
+          preservationHasChanges: () => true,
+          writeRunLedger: (entry) => { ledger.push({ event: entry.event, data: entry.data as Record<string, unknown> }); },
+          mergePr: async () => { mergeCalls += 1; return { merged: true }; },
+          openPr: async (input) => {
+            opened.push({ draft: input.draft, body: input.body });
+            return { url: 'https://example.test/pr/7', number: 7 };
+          },
+        }),
+      }).then((value) => {
+        fakeGitCalls = [...fakeBins.calls()];
+        return value;
+      });
     });
-    return { result, opened, events, ledger, mergeCalls };
+    return { result, opened, events, ledger, mergeCalls, fakeGitCalls };
   } finally {
     off();
-    if (prior === undefined) delete process.env.ELANOUS_SUBSTRATE;
-    else process.env.ELANOUS_SUBSTRATE = prior;
+    for (const key of envKeys) {
+      const prior = priorEnv[key];
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
     rmSync(root, { recursive: true, force: true });
   }
 }
 
 test('Pod repeated residue accepts gate-passing review budget with non-draft follow-up, HITL merge decision and no merge', async () => {
-  const { result, opened, events, ledger, mergeCalls } = await runPod([[a], [a]]);
+  const { result, opened, events, ledger, mergeCalls, fakeGitCalls } = await runPod([[a], [a]]);
   expect(result).toMatchObject({ ok: true, stage: 'pr-opened', mergeReason: 'review-budget-follow-up-required', followUpMustFix: [a], followUpMustFixCount: 1 });
   expect(opened).toHaveLength(1);
+  expect(fakeGitCalls.some((call) => call.name === 'git' && call.argv[0] === 'status')).toBe(true);
   expect(opened[0]!.draft).toBe(false);
   expect(opened[0]!.body).toContain(`## Follow-up must-fix (1)\n- [repeated] ${a}`);
   expect(events).toContainEqual(expect.objectContaining({ event: 'pod-accept-decision', data: expect.objectContaining({ runId: result.runId, status: 'all-repeated', repeatedCount: 1, newCount: 0, keyOnlyRepeatedCount: 0, accepted: true, merge: 'hitl' }) }));

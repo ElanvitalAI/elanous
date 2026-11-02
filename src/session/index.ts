@@ -730,6 +730,40 @@ export function rewriteSessionMessages(
   return meta;
 }
 
+/** Replace the persisted transcript used by TUI resume. Request-size
+ *  compaction writes through this path before the compacted request is sent. */
+export function replaceSessionHistory(
+  id: string,
+  messages: SerializedMessage[],
+  root: string = sessionRoot(),
+): SessionMeta {
+  adoptSession(id, { source: 'tui', transport: 'acp' }, root);
+  return rewriteSessionMessages(id, messages, root);
+}
+
+/** TUI history writer used by ACP compaction. Keep the active user turn out of
+ *  the rewrite because the ACP completion path appends it with its answer. */
+export function replaceTuiSessionHistory(
+  id: string,
+  messages: readonly { role: string; content: string | ContentBlock[]; transientTurnUser?: true }[],
+  currentUserText: string,
+  root: string = sessionRoot(),
+): SessionMeta {
+  const persisted = messages
+    .filter(message => message.transientTurnUser !== true && !(message.role === 'user'
+      && messages.at(-1) === message && (typeof message.content === 'string'
+        ? message.content === currentUserText
+        : message.content.some((block) => Boolean(block && typeof block === 'object' && 'text' in block
+          && typeof (block as { text?: unknown }).text === 'string'
+          && (block as { text: string }).text === currentUserText)))))
+    .map(message => ({
+      role: message.role as SerializedMessage['role'],
+      content: persistMessageContent(message.content),
+      ts: new Date().toISOString(),
+    }));
+  return replaceSessionHistory(id, persisted, root);
+}
+
 export interface LoadedSession {
   meta: SessionMeta;
   messages: SerializedMessage[];

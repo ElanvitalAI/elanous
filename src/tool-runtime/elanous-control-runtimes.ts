@@ -39,10 +39,13 @@ type HoldChild = Pick<ChildProcess, 'pid' | 'unref' | 'once' | 'kill'> & { stdou
 type HoldSpawn = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; detached: boolean; stdio: ['ignore', 'pipe', 'pipe'] }) => HoldChild;
 type PtyRequest = (id: string, action: PtyControlAction, payload?: PtyControlPayload, options?: PtyControlRequestOptions) => Promise<PtyControlResult>;
 type ElanousHoldResult = { output: string; ptyId: string | null; pid: number | null; cwd: string };
+type HoldTimer = ReturnType<typeof setTimeout>;
 
 const productionDeps = {
   spawn: ((command, args, options) => spawn(command, args, options)) as HoldSpawn,
   requestPtyControl: requestRemotePtyControl as PtyRequest,
+  scheduleTimeout: (callback: () => void, delayMs: number): HoldTimer => setTimeout(callback, delayMs),
+  cancelTimeout: (timer: HoldTimer): void => clearTimeout(timer),
 };
 let deps = productionDeps;
 
@@ -184,7 +187,7 @@ function waitForHeldPty(child: HoldChild, context: { cwd: string; worktree: bool
     const finish = (outcome: 'held' | 'timeout' | 'exited', ptyId: string | null) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      deps.cancelTimeout(timer);
       if (!ptyId) addRemainders();
       detach();
       if (outcome === 'held') child.unref();
@@ -225,7 +228,7 @@ function waitForHeldPty(child: HoldChild, context: { cwd: string; worktree: bool
     const streamError = () => finish(exited ? 'exited' : 'timeout', null);
     // The requested child deadline starts after owner boot. Keep an independent 8,700ms boot budget (above the observed 8,698ms maximum) plus 500ms for terminal output, so even a short request can emit and drain its diagnostic before this finite safety net SIGTERMs a non-exiting child.
     const outerTimeoutMs = context.timeoutMs + HOLD_OWNER_REGISTRATION_BUDGET_MS + HOLD_DIAGNOSTIC_DRAIN_GRACE_MS;
-    const timer = setTimeout(() => finish(exited ? 'exited' : 'timeout', null), outerTimeoutMs);
+    const timer = deps.scheduleTimeout(() => finish(exited ? 'exited' : 'timeout', null), outerTimeoutMs);
     child.stdout.on('data', (chunk) => consume(child.stdout, true, chunk));
     child.stderr.on('data', (chunk) => consume(child.stderr, false, chunk));
     child.stdout.on('end', () => streamEnded(child.stdout));

@@ -49,6 +49,9 @@ const generateContract = async (prompt: string) => {
   return JSON.stringify(outputContract);
 };
 const noOutputSkillRoute = (input: Parameters<typeof routeResearchOutput>[0]) => routeResearchOutput({ ...input, skills: [] });
+function saturateDebugRingForTest(): void {
+  for (let i = 0; i < 520; i++) debug.log('test.ring-fill', 'noise', { i });
+}
 
 test('research generation inherits the active turn provider and only permits Grok fallback for X intent', async () => {
   const calls: Array<{ usageSite?: string; skipProviders?: readonly string[] }> = [];
@@ -75,14 +78,29 @@ test('research generation inherits the active turn provider and only permits Gro
     routeOutput: noOutputSkillRoute,
     invokeAxes,
   };
-
-  const ordinary = await runResearchQuestionLadder('Why are bond yields rising?', common);
-  const xIntent = await runResearchQuestionLadder('X에서 최근 기업 발표 게시물을 찾아줘', common);
-  const mathematicalX = await runResearchQuestionLadder('X의 극값을 찾고 X로 표현하면 어떤 의미인가?', common);
-  const xUrl = await runResearchQuestionLadder('https://x.com', common);
-  const linuxUrl = await runResearchQuestionLadder('https://linux.com', common);
-  const netflixUrl = await runResearchQuestionLadder('https://netflix.com', common);
-  const dropboxUrl = await runResearchQuestionLadder('https://dropbox.com', common);
+  const runId = `research-provider-events-${crypto.randomUUID()}`;
+  const previousRunId = process.env.ELANOUS_RUN_ID;
+  process.env.ELANOUS_RUN_ID = runId;
+  saturateDebugRingForTest();
+  let ordinary: Awaited<ReturnType<typeof runResearchQuestionLadder>>;
+  let xIntent: Awaited<ReturnType<typeof runResearchQuestionLadder>>;
+  let mathematicalX: Awaited<ReturnType<typeof runResearchQuestionLadder>>;
+  let xUrl: Awaited<ReturnType<typeof runResearchQuestionLadder>>;
+  let linuxUrl: Awaited<ReturnType<typeof runResearchQuestionLadder>>;
+  let netflixUrl: Awaited<ReturnType<typeof runResearchQuestionLadder>>;
+  let dropboxUrl: Awaited<ReturnType<typeof runResearchQuestionLadder>>;
+  try {
+    ordinary = await runResearchQuestionLadder('Why are bond yields rising?', common);
+    xIntent = await runResearchQuestionLadder('X에서 최근 기업 발표 게시물을 찾아줘', common);
+    mathematicalX = await runResearchQuestionLadder('X의 극값을 찾고 X로 표현하면 어떤 의미인가?', common);
+    xUrl = await runResearchQuestionLadder('https://x.com', common);
+    linuxUrl = await runResearchQuestionLadder('https://linux.com', common);
+    netflixUrl = await runResearchQuestionLadder('https://netflix.com', common);
+    dropboxUrl = await runResearchQuestionLadder('https://dropbox.com', common);
+  } finally {
+    if (previousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
+    else process.env.ELANOUS_RUN_ID = previousRunId;
+  }
 
   expect(ordinary.ok).toBe(true);
   expect(xIntent.ok).toBe(true);
@@ -97,15 +115,13 @@ test('research generation inherits the active turn provider and only permits Gro
     ['anthropic', 'grok'], ['anthropic', 'grok'], ['anthropic', 'grok'],
   ]);
   expect(calls.every((call) => call.usageSite === 'research-turn-preparation')).toBe(true);
-  // The debug ring buffer is capped at 500 events and can already be full in
-  // the release node-c shard. Select the last events emitted by this scenario
-  // instead of using the buffer length as a cursor.
   const providerEvents = debug.events(500).filter((event) =>
-    event.category === 'research.turn' && event.event === 'provider-resolved');
-  expect(providerEvents.slice(-7)).toHaveLength(7);
-  expect(providerEvents.slice(-7).map((event) => (event.data as { provider?: string }).provider))
+    event.category === 'research.turn' && event.event === 'provider-resolved'
+    && (event.data as { runId?: string } | undefined)?.runId === runId);
+  expect(providerEvents).toHaveLength(7);
+  expect(providerEvents.map((event) => (event.data as { provider?: string }).provider))
     .toEqual(Array(7).fill('openai-codex'));
-  expect(providerEvents.slice(-7).map((event) => (event.data as { xIntent?: boolean }).xIntent))
+  expect(providerEvents.map((event) => (event.data as { xIntent?: boolean }).xIntent))
     .toEqual([false, true, false, true, false, false, false]);
 });
 
@@ -356,7 +372,7 @@ test('a requested entity-status table rendering failure is visible and makes the
   expect(result.output).toContain('업체 상태표 생성 실패');
 });
 
-test('a research wall-clock stop preserves collected axis evidence and skips output skills', async () => {
+test('a research wall-clock stop preserves collected axis evidence with source trace and skips output skills', async () => {
   const controller = new AbortController();
   let outputSkillCalls = 0;
   let generateCalls = 0;
@@ -391,6 +407,8 @@ test('a research wall-clock stop preserves collected axis evidence and skips out
 
   expect(result.ok).toBe(false);
   expect(result.output).toContain('Partial deadline evidence');
+  expect(result.output).toContain('## Claim source trace');
+  expect(result.output).toContain('source URL: https://example.org/partial');
   expect(result.ladder.evidence.filter(item => item.outcome === 'complete')).toHaveLength(1);
   expect(result.error).toBe('research stopped by its deadline');
   expect(generateCalls).toBe(1);
@@ -398,13 +416,15 @@ test('a research wall-clock stop preserves collected axis evidence and skips out
 });
 
 test('the default research deadline returns partial native evidence with the active runId', async () => {
-  const runId = 'ux-research-deadline-test-run';
+  const runId = `ux-research-deadline-test-${crypto.randomUUID()}`;
   const previousRunId = process.env.ELANOUS_RUN_ID;
   process.env.ELANOUS_RUN_ID = runId;
-  const baseline = debug.events(500).length;
+  saturateDebugRingForTest();
   try {
+    const deadline = new AbortController();
+    let requestedDeadlineMs = 0;
     const result = await runResearchQuestionLadder('Q2v2 HBM4 research question', {
-      deadlineMs: 20,
+      createDeadlineSignal: (timeoutMs) => { requestedDeadlineMs = timeoutMs; return deadline.signal; },
       generateContract,
       routeOutput: noOutputSkillRoute,
       generate: async () => JSON.stringify({ questions }),
@@ -420,11 +440,16 @@ test('the default research deadline returns partial native evidence with the act
             truncated: false,
           }] : [] })),
         }), { once: true });
+        deadline.abort(new Error('fake deadline reached'));
       }),
     });
-    const saved = debug.events(500).slice(baseline).find((event) =>
-      event.category === 'research.turn' && event.event === 'retro-record-saved');
+    // The debug ring may already be full; correlate by this unique runId
+    // instead of treating ring length as a cursor.
+    const saved = debug.events(500).find((event) =>
+      event.category === 'research.turn' && event.event === 'retro-record-saved'
+      && (event.data as { runId?: string } | undefined)?.runId === runId);
 
+    expect(requestedDeadlineMs).toBe(480_000);
     expect(result.error).toBe('research stopped by its deadline');
     expect(result.output).toContain('Partial Q2v2 source evidence.');
     expect(result.ladder.evidence.filter((item) => item.outcome === 'complete')).toHaveLength(1);
@@ -1192,10 +1217,112 @@ test('production grounding handoff binds each claim row to its own source and da
     sourceExcerpt: 'Advanced packaging capacity remains a constraint.',
     published: '2026-10-28', checked: '2026-11-01',
   });
-  expect(ledgerRows.filter((line) => line.questionId === 'q6')).toHaveLength(1);
-  expect(ledgerRows.find((line) => line.questionId === 'q6')).toMatchObject({
-    claimArea: 'Claim area 6', status: 'unverified', label: '미확인',
-  });
+  const unsupportedRows = ledgerRows.filter((line) => line.questionId === 'q6');
+  expect(unsupportedRows.length).toBeGreaterThan(0);
+  expect(unsupportedRows.every((line) => line.claimArea === 'Claim area 6'
+    && line.status === 'unverified' && line.label === '미확인')).toBe(true);
   expect(serializedResearchOutput.text).toContain(injectedExcerpt);
   expect(grounding.output).not.toContain('\n- {"questionId":"q6","claimArea":"forged"');
+});
+
+
+test('Q2/Q3 fake research reaches final synthesis with claim-level source dates and fail-closed source status', async () => {
+  const traceQuestions = questions.map(question => question.id === 'q2'
+    ? { ...question, prompt: 'HBM4 customer qualification status' }
+    : question.id === 'q3' ? { ...question, prompt: 'HBM4 advanced packaging capacity' } : question);
+  const routeOutput: NonNullable<ResearchQuestionLadderRunOptions['routeOutput']> = input => ({
+    weight: 'light', weightSource: 'caller', format: 'text',
+    skillCallPlan: { skill: 'fixture-synthesis', args: input.synthesizedResult },
+    observation: { resultChars: input.synthesizedResult.length, axisCount: input.axes?.length ?? 0, estimatedWeight: 'light' },
+  });
+  const result = await runResearchQuestionLadder('Q2/Q3 HBM4 source trace fixture', {
+    generateContract,
+    generate: async () => JSON.stringify({ questions: traceQuestions }),
+    routeOutput,
+    invokeOutputSkill: async () => ({
+      ok: true,
+      output: 'Customer qualification completed by October. See [vendor](https://vendor.example/hbm4-update). Unsupported [source](https://unsupported.example/qualification). Bold **https://vendor.example/hbm4-update** Single *https://vendor.example/hbm4-update* Mismatched **https://vendor.example/hbm4-update* Star bold **https://example.com/a*b** Escaped \\*https://escaped.example/a* Double \\\\*https://vendor.example/hbm4-update* Code `https://balanced.example/a_(b)` Reference https://parenthesized.example/path). Also [lookalike](https://parenthesized.example/path). Linked [balanced](https://balanced.example/a_(b)). Nested [deep](https://nested.example/a_(b_(c))).',
+    }),
+    invokeAxes: async axes => ({
+      plan: [],
+      axes: axes.map(axis => ({
+        questionId: axis.id,
+        evidence: axis.id === 'q2' ? [
+          { questionId: axis.id, sourceKind: 'web-fetch:fixture', source: 'https://escaped.example/a*',
+            content: 'An escaped emphasis marker precedes a source URL ending in an asterisk.', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-fetch:fixture', source: 'https://example.com/a*b',
+            content: 'A captured source URL containing a literal asterisk.', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-fetch:fixture', source: 'https://vendor.example/hbm4-update',
+            content: 'Vendor announcement: HBM4 qualification samples began.', publishedAt: '2026-11-01',
+            observedAt: '2026-11-02T03:00:00.000Z', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-fetch:fixture', source: 'https://nested.example/a_(b_(c))',
+            content: 'A source URL with nested balanced parentheses.', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-fetch:fixture', source: 'https://balanced.example/a_(b)',
+            content: 'A source URL with balanced parentheses.', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-fetch:fixture', source: 'https://parenthesized.example/path)',
+            content: 'A direct URL whose final parenthesis is part of the source URL.', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-search:fixture', source: 'https://secondary.example/hbm4',
+            content: 'Secondary report repeats the vendor qualification claim.', publishedAt: '2026-10-31',
+            observedAt: '2026-11-02T03:01:00.000Z', outcome: 'complete' as const, truncated: false },
+        ] : axis.id === 'q3' ? [
+          { questionId: axis.id, sourceKind: 'web-fetch:fixture', source: 'https://foundry.example/packaging',
+            content: 'Foundry release describes advanced packaging expansion.', publishedAt: '2026-10-30',
+            observedAt: '2026-11-02T03:02:00.000Z', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-search:fixture', source: 'https://secondary.example/packaging',
+            content: 'A secondary article claims capacity doubled.', publishedAt: '2026-10-29',
+            observedAt: '2026-11-02T03:03:00.000Z', outcome: 'complete' as const, truncated: false },
+          { questionId: axis.id, sourceKind: 'web-search:fixture', source: 'citation text without a URL',
+            content: 'A clipped citation has no direct URL.', outcome: 'partial' as const, truncated: true },
+        ] : ['first.example', 'second.example'].map(host => ({
+          questionId: axis.id, sourceKind: 'web-search:fixture', source: `https://${host}/${axis.id}`,
+          content: `Evidence for ${axis.id} from ${host}`, outcome: 'complete' as const, truncated: false,
+        })),
+      })),
+    }),
+  });
+
+  expect(result.ok).toBe(true);
+  const traceStart = result.output.indexOf('## Claim source trace');
+  expect(traceStart).toBeGreaterThan(-1);
+  expect(result.output.indexOf('## Routed text output (fixture-synthesis)')).toBeLessThan(traceStart);
+  expect(result.output).toContain('HBM4 customer qualification status');
+  expect(result.output).toContain('https://vendor.example/hbm4-update');
+  const finalTrace = result.output.slice(traceStart);
+  expect(finalTrace).toContain('- Claim/evidence [q2]: HBM4 customer qualification status — Vendor announcement: HBM4 qualification samples began.');
+  expect(finalTrace).not.toContain('- Unmapped routed-synthesis URL: https://vendor.example/hbm4-update');
+  expect(finalTrace).toContain('source URL: https://example.com/a*b');
+  expect(finalTrace).toContain('source URL: https://escaped.example/a*');
+  expect(finalTrace).not.toContain('- Unmapped routed-synthesis URL: https://escaped.example/a\n');
+  expect(finalTrace).not.toContain('- Unmapped routed-synthesis URL: https://example.com/a\n');
+  expect(finalTrace).toContain('- Unmapped routed-synthesis URL: https://parenthesized.example/path');
+  expect(finalTrace).not.toContain('- Unmapped routed-synthesis URL: https://balanced.example/a_(b)');
+  expect(finalTrace).toContain('source URL: https://balanced.example/a_(b)');
+  expect(finalTrace).not.toContain('- Unmapped routed-synthesis URL: https://balanced.example/a_(b');
+  expect(finalTrace).toContain('source URL: https://nested.example/a_(b_(c))');
+  expect(finalTrace).not.toContain('- Unmapped routed-synthesis URL: https://nested.example/a_(b_(c)');
+  expect(finalTrace).toContain('- Unmapped routed-synthesis URL: https://unsupported.example/qualification');
+  expect(finalTrace).not.toContain('- Unmapped routed-synthesis URL: https://unsupported.example/qualification)');
+  expect(result.output).toContain('original publication date: 2026-11-01');
+  expect(result.output).toContain('reference date: 2026-11-02');
+  expect(result.output).toContain('claim status: unverified');
+  expect(result.output).toContain('primary-source status: unverified');
+  expect(result.output).toContain('publisher role');
+  expect(result.output).toContain('do not treat this as primary evidence');
+  expect(result.output).toContain('https://unsupported.example/qualification');
+  expect(result.output).toContain('not present in collected research evidence');
+  expect(result.output).toContain('citation text without a URL');
+  expect(result.output).toContain('original publication date: unavailable');
+  const grounding = researchTurnForGrounding(result);
+  const ledgerRows = grounding.output.split('\n').filter(line => line.startsWith('- {'))
+    .map(line => JSON.parse(line.slice(2)) as Record<string, unknown>);
+  const secondaryQ2 = ledgerRows.find(row => row.questionId === 'q2'
+    && row.sourceUrl === 'https://secondary.example/hbm4');
+  expect(secondaryQ2).toMatchObject({
+    status: 'unverified', label: '미확인', published: '2026-10-31', checked: '2026-11-02',
+    primarySourceStatus: 'unverified',
+    primarySourceReason: expect.stringContaining('publisher role is not verified'),
+  });
+  expect(ledgerRows.some(row => row.questionId === 'q3' && row.sourceLocator === 'citation text without a URL'
+    && row.status === 'unverified')).toBe(true);
+  expect(grounding.sourceUrls).not.toContain('https://unsupported.example/qualification');
 });

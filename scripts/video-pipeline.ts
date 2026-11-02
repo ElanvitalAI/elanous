@@ -28,6 +28,7 @@ import { parseGraphTemplateYaml } from '../src/self-implement/graph-yaml.js';
 import { ALL_RECIPES, exitCodeOf, findTemplate, formatStep, loadWalker, walkLine, type GraphSpecLike } from '../src/video-pipeline/walk-line.js';
 import { parseArgv, type FlagKind } from './lib/argv.js';
 import { SPINE, segmentOf } from '../src/video-pipeline/spine.js';
+import { configureTelegramVideoDelivery } from '../src/video-pipeline/telegram-video-sender.js';
 import {
   loadConfig, effectiveCapabilitiesWithShadowed, findConfigPath, STARTER_CONFIG,
   type MachineProfile,
@@ -1494,26 +1495,10 @@ async function walk(): Promise<number> {
     told[kv.slice(0, at)] = n;
   }
   if (Object.keys(told).length) state.told = told;
-  const telegramChatId = state.telegram_chat_id;
-  const telegramToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  if (graphId === 'explainer-line' && (typeof telegramChatId === 'string' || typeof telegramChatId === 'number') && telegramToken) {
-    state.sendTelegramVideo = async (file: string, briefing: unknown): Promise<string> => {
-      const form = new FormData();
-      form.set('chat_id', String(telegramChatId));
-      form.set('video', new Blob([readFileSync(file)], { type: 'video/mp4' }), 'briefing.mp4');
-      const title = briefing && typeof briefing === 'object' && 'title' in briefing
-        ? String((briefing as { title: unknown }).title)
-        : '60초 브리핑 영상';
-      form.set('caption', title);
-      const apiBase = (process.env.TELEGRAM_API_BASE ?? 'https://api.telegram.org').replace(/\/$/, '');
-      const response = await fetch(`${apiBase}/bot${telegramToken}/sendVideo`, { method: 'POST', body: form });
-      const payload = await response.json() as { ok?: boolean; result?: { message_id?: number | string }; description?: string };
-      if (!response.ok || payload.ok !== true || payload.result?.message_id === undefined) {
-        throw new Error(`Telegram sendVideo failed: ${payload.description ?? `HTTP ${response.status}`}`);
-      }
-      return String(payload.result.message_id);
-    };
-  }
+  configureTelegramVideoDelivery(state, graphId, {
+    TELEGRAM_API_BASE: process.env.TELEGRAM_API_BASE,
+    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+  });
   const workdir = opt('out') || join(tmpdir(), `walk-${graphId}-${Date.now()}`);
   mkdirSync(workdir, { recursive: true });
   const quiet = flag('json');

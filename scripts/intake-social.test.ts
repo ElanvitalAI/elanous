@@ -4,19 +4,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { buildIntakeDigest, renderDigestMarkdown } from '../src/intake-plane/digest.js';
-import { intakeCheckArgs, parseCommunityReport, parseOmniCrawlPayload, runIntakeCheckCli, runIntakeSocial } from './intake-social.js';
+import { intakeCheckInvocation, parseCommunityReport, parseOmniCrawlPayload, runIntakeCheckCli, runIntakeSocial } from './intake-social.js';
 
 // INTAKE-SOCIAL(0.2.31) 판정선: 하루 커뮤니티 동향 N건이 흡수 요약에 흐른다.
 // grok-community 엔진을 실제로 부르지 않고(시험은 몸 주입) 같은 길 — lens 줄 → buildIntakeDigest → renderDigestMarkdown — 을 증명한다.
 
 setDefaultTimeout(20_000);
 
-test('production social check uses installed CLI without git-tree test mode', () => {
-  expect(intakeCheckArgs(['사실 A'])).toEqual([
-    'bin/elanous.mjs', 'intake', 'check', '--fact', '사실 A', '--json',
+test('checkout social check uses local CLI entrypoint without overriding caller universe', () => {
+  const invocation = intakeCheckInvocation(['사실 A']);
+  expect(invocation.command).toBe('bun');
+  expect(invocation.args).toEqual([
+    join(import.meta.dir, '..', 'bin', 'elanous.mjs'), 'intake', 'check', '--fact', '사실 A', '--json',
   ]);
-  expect(intakeCheckArgs(['사실 A'])).not.toContain('--test');
-  expect(intakeCheckArgs(['사실 A'], { testMode: true })).toContain('--test');
+  expect(invocation.args).not.toContain('--test');
 });
 
 const NOW = new Date('2026-10-06T07:00:00.000Z');
@@ -79,7 +80,7 @@ test('INTAKE-SOCIAL: 실제 intake check 에 커뮤니티 동향을 보내도 le
   try {
     expect(await runIntakeSocial({ root: dir, deps: {
       now: () => NOW, crawl: async () => [{ title: text, text, url: REDDIT }],
-      check: (facts) => runIntakeCheckCli(facts, { testMode: true }),
+      check: (facts) => runIntakeCheckCli(facts),
     } })).toEqual({ written: 1, failed: 0 });
     const rows = readFileSync(join(dir, 'intake', 'outbox', 'lens', '2026-10-06.jsonl'), 'utf8')
       .trim().split('\n').map((line) => JSON.parse(line));

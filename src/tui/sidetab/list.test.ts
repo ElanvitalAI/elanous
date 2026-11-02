@@ -132,12 +132,20 @@ describe('next TUI sidetab', () => {
       { id: 'pty:1', label: 'first › marker', kind: 'shell', badge: 'idle', previewSource: 'first-output' },
       { id: 'pty:2', label: 'second', kind: 'agent', badge: 'busy', previewSource: 'old\nlatest-output' },
     ];
+    const firstSelection = listCompatibility.formatSidetabLines(rows, 0, 28, 12);
+    expect(firstSelection.some((line) => line.includes("first-output"))).toBe(true);
+    expect(firstSelection.some((line) => line.includes("old"))).toBe(false);
+    expect(firstSelection.some((line) => line.includes("latest-output"))).toBe(false);
+
     const lines = listCompatibility.formatSidetabLines(rows, 1, 28, 12);
     const selectedLine = lines.findIndex((line) => line.includes('› busy second'));
     expect(selectedLine).toBeGreaterThanOrEqual(0);
     expect(lines[selectedLine + 1]).toBe(' '.repeat(28));
     expect(lines[selectedLine + 2]).toContain('old');
     expect(lines[selectedLine + 3]).toContain('latest-output');
+    expect(lines.some((line) => line.includes("old"))).toBe(true);
+    expect(lines.some((line) => line.includes("latest-output"))).toBe(true);
+    expect(lines.some((line) => line.includes("first-output"))).toBe(false);
     expect(lines.join('\n')).not.toContain('first-output');
   });
 

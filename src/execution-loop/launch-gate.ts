@@ -21,9 +21,10 @@ export interface LaunchDoorEnv {
 /** Environment interpretation stays at this adapter; the launch decision itself remains pure. */
 export function resolveLaunchDoorEnv(env: Readonly<Record<string, string | undefined>> = process.env): LaunchDoorEnv {
   const rawMode = env.ELANOUS_LAUNCH_DOOR_MODE;
+  const modeSource = rawMode === undefined || rawMode === '' ? 'default' : rawMode === 'enforce' || rawMode === 'shadow' ? 'env' : 'invalid';
   return {
-    mode: rawMode === 'enforce' ? 'enforce' : 'shadow',
-    modeSource: rawMode === undefined || rawMode === '' ? 'default' : rawMode === 'enforce' || rawMode === 'shadow' ? 'env' : 'invalid',
+    mode: rawMode === 'enforce' || modeSource === 'default' ? 'enforce' : 'shadow',
+    modeSource,
     permission: env.ELANOUS_LAUNCH_DOOR_PERMISSION === 'allow' ? 'allow' : 'deny',
     signal: env.ELANOUS_LAUNCH_DOOR_SIGNAL === 'green' || env.ELANOUS_LAUNCH_DOOR_SIGNAL === 'red'
       ? env.ELANOUS_LAUNCH_DOOR_SIGNAL : 'unknown',
@@ -380,8 +381,25 @@ export interface LaunchRequestLedgerSummary {
 
 /** A read-only count over append-only request rows. */
 export function summarizeLaunchRequestRows(all: readonly LaunchRequestLedgerRow[]): LaunchRequestLedgerSummary {
-  const byId = new Map<string, LaunchRequestLedgerRow[]>();
-  for (const row of all) byId.set(row.requestId, [...(byId.get(row.requestId) ?? []), row]);
+  const byId = new Map<string, {
+    readonly events: Set<LaunchRequestLedgerEvent>;
+    requestedCount: number;
+    firstRequest?: LaunchRequestLedgerRow;
+  }>();
+  let requests = 0;
+  for (const row of all) {
+    let request = byId.get(row.requestId);
+    if (!request) {
+      request = { events: new Set(), requestedCount: 0 };
+      byId.set(row.requestId, request);
+    }
+    request.events.add(row.event);
+    if (row.event === 'requested') {
+      requests += 1;
+      request.requestedCount += 1;
+      request.firstRequest ??= row;
+    }
+  }
   let unconsumed = 0;
   let consumed = 0;
   let failed = 0;
@@ -389,23 +407,22 @@ export function summarizeLaunchRequestRows(all: readonly LaunchRequestLedgerRow[
   let doorUnavailable = 0;
   let retries = 0;
   const logicalRequests = new Map<string, number>();
-  for (const entries of byId.values()) {
-    const events = entries.map((row) => row.event);
-    if (events.includes('consumed')) consumed += 1;
-    else if (events.includes('requested')) unconsumed += 1;
-    if (events.includes('launch-failed')) failed += 1;
-    if (events.includes('refused-duplicate')) refused += 1;
-    if (events.includes('door-unavailable')) doorUnavailable += 1;
-    const requestRow = entries.find((row) => row.event === 'requested');
+  for (const request of byId.values()) {
+    if (request.events.has('consumed')) consumed += 1;
+    else if (request.events.has('requested')) unconsumed += 1;
+    if (request.events.has('launch-failed')) failed += 1;
+    if (request.events.has('refused-duplicate')) refused += 1;
+    if (request.events.has('door-unavailable')) doorUnavailable += 1;
+    const requestRow = request.firstRequest;
     if (requestRow) {
       const logicalId = requestRow.retryGroup
         ? `${requestRow.source ?? '-'}:${requestRow.retryGroup}`
         : requestRow.requestId;
-      logicalRequests.set(logicalId, (logicalRequests.get(logicalId) ?? 0) + events.filter((event) => event === 'requested').length);
+      logicalRequests.set(logicalId, (logicalRequests.get(logicalId) ?? 0) + request.requestedCount);
     }
   }
   for (const count of logicalRequests.values()) retries += Math.max(0, count - 1);
-  return { requests: all.filter((row) => row.event === 'requested').length, uniqueRequests: byId.size,
+  return { requests, uniqueRequests: byId.size,
     unconsumed, consumed, retries, failed, refused, doorUnavailable };
 }
 

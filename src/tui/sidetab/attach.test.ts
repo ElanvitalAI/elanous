@@ -298,10 +298,9 @@ describe('next TUI sidetab attachments', () => {
         const content = readFileSync(result.path, 'utf8');
         expect(content).toContain(`# ${agent} fake result`);
         expect(content).toContain(mission);
-        const deadline = Date.now() + 2_000;
-        while (registry.list().at(-1)?.state !== 'exited' && Date.now() < deadline) {
-          await new Promise(resolve => setTimeout(resolve, 10));
-        }
+        // The fake PTY writes the completion marker and changes session state synchronously.
+        // Assert that event contract directly instead of polling wall-clock time.
+        expect(registry.list().at(-1)?.state).toBe('exited');
         expect(registry.list().at(-1)?.exitCode).toBe(exitCode);
         expect(result.exitCode).toBe(exitCode);
       }
@@ -597,6 +596,214 @@ describe('next TUI sidetab attachments', () => {
       releaseFirst();
       controller.close();
     }
+  });
+
+  test('releases a remote takeover that succeeds after the selected host and PTY changed', async () => {
+    const calls: string[] = [];
+    let finishTakeover: () => void = () => {};
+    let markTakeoverStarted: () => void = () => {};
+    const takeoverStarted = new Promise<void>((resolve) => { markTakeoverStarted = resolve; });
+    const takeover = new Promise<void>((resolve) => { finishTakeover = resolve; });
+    const controller = createSidetabAttachmentController({
+      drawBase: () => {}, termSize: () => ({ cols: 80, rows: 24 }), setStatus: () => {}, drawRemoteFrame: () => {},
+      remotePtyCommand: async (host, args) => {
+        calls.push(`${host}:${args.join('|')}`);
+        if (args[1] === 'takeover') { markTakeoverStarted(); await takeover; }
+        return args[1] === 'snapshot' ? 'remote screen' : '';
+      },
+    });
+    const first = { id: 'remote:aws1:pty-a', ptyId: 'pty-a', remoteHost: 'aws1', host: 'aws1', label: 'aws1:a', kind: 'tui' as const, badge: 'idle' as const };
+    const second = { id: 'remote:gcp1:pty-a', ptyId: 'pty-a', remoteHost: 'gcp1', host: 'gcp1', label: 'gcp1:a', kind: 'tui' as const, badge: 'idle' as const };
+    try {
+      expect(controller.select(first)).toBe(true);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      await takeoverStarted;
+      expect(controller.select(second)).toBe(true);
+      finishTakeover();
+      for (let attempt = 0; attempt < 100 && !calls.some((call) => call === 'aws1:pty|release|pty-a'); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      expect(calls).toContain('aws1:pty|release|pty-a');
+      expect(calls).not.toContain('gcp1:pty|release|pty-a');
+    } finally { finishTakeover(); controller.close(); }
+  });
+
+  test('serializes same-target takeover after stale takeover release on reselect', async () => {
+    const calls: string[] = [];
+    let finishFirstTakeover: () => void = () => {};
+    let markFirstTakeoverStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => { markFirstTakeoverStarted = resolve; });
+    const firstTakeover = new Promise<void>((resolve) => { finishFirstTakeover = resolve; });
+    const controller = createSidetabAttachmentController({
+      drawBase: () => {}, termSize: () => ({ cols: 80, rows: 24 }), setStatus: () => {}, drawRemoteFrame: () => {},
+      remotePtyCommand: async (_host, args) => {
+        calls.push(args.join('|'));
+        if (args[1] === 'takeover' && calls.filter((call) => call === 'pty|takeover|pty-same').length === 1) {
+          markFirstTakeoverStarted(); await firstTakeover;
+        }
+        return args[1] === 'snapshot' ? 'screen' : '';
+      },
+    });
+    const same = { id: 'remote:aws1:pty-same', ptyId: 'pty-same', remoteHost: 'aws1', host: 'aws1', label: 'aws1:same', kind: 'tui' as const, badge: 'idle' as const };
+    const other = { id: 'remote:aws1:pty-other', ptyId: 'pty-other', remoteHost: 'aws1', host: 'aws1', label: 'aws1:other', kind: 'tui' as const, badge: 'idle' as const };
+    try {
+      controller.select(same);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      await firstStarted;
+      controller.select(other);
+      controller.select(same);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      finishFirstTakeover();
+      for (let attempt = 0; attempt < 100 && calls.filter((call) => call === 'pty|takeover|pty-same').length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      const controls = calls.filter((call) => call === 'pty|takeover|pty-same' || call === 'pty|release|pty-same');
+      expect(controls[0]).toBe('pty|takeover|pty-same');
+      expect(controls.at(-1)).toBe('pty|takeover|pty-same');
+      expect(controls.slice(1, -1).every((call) => call === 'pty|release|pty-same')).toBe(true);
+      controller.handleKey({ name: 'z', raw: 'z', ctrl: false, shift: false });
+      for (let attempt = 0; attempt < 100 && !calls.includes('pty|text|pty-same|z|--actor|human'); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      expect(calls.at(-1)).toBe('pty|text|pty-same|z|--actor|human');
+    } finally { finishFirstTakeover(); controller.close(); }
+  });
+
+  test('orders remote input before release and a fast same-target takeover', async () => {
+    const calls: string[] = [];
+    const statuses: string[] = [];
+    let finishText: () => void = () => {};
+    let markTextStarted: () => void = () => {};
+    const textStarted = new Promise<void>((resolve) => { markTextStarted = resolve; });
+    const textGate = new Promise<void>((resolve) => { finishText = resolve; });
+    const controller = createSidetabAttachmentController({
+      drawBase: () => {}, termSize: () => ({ cols: 80, rows: 24 }), setStatus: (status) => statuses.push(status), drawRemoteFrame: () => {},
+      remotePtyCommand: async (_host, args) => {
+        calls.push(args.join('|'));
+        if (args[1] === 'text' && args[3] === 'a') { markTextStarted(); await textGate; }
+        return args[1] === 'snapshot' ? 'screen' : '';
+      },
+    });
+    const same = { id: 'remote:aws1:pty-order', ptyId: 'pty-order', remoteHost: 'aws1', host: 'aws1', label: 'aws1:order', kind: 'tui' as const, badge: 'idle' as const };
+    const other = { id: 'remote:gcp1:pty-order-next', ptyId: 'pty-order-next', remoteHost: 'gcp1', host: 'gcp1', label: 'gcp1:next', kind: 'tui' as const, badge: 'idle' as const };
+    try {
+      controller.select(same);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      for (let attempt = 0; attempt < 100 && !statuses.some((status) => status.includes('takeover 완료')); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      controller.handleKey({ name: 'a', raw: 'a', ctrl: false, shift: false });
+      await textStarted;
+      controller.select(other);
+      controller.select(same);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      finishText();
+      for (let attempt = 0; attempt < 100 && calls.filter((call) => call === 'pty|takeover|pty-order').length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      const input = calls.indexOf('pty|text|pty-order|a|--actor|human');
+      const release = calls.indexOf('pty|release|pty-order');
+      const secondTakeover = calls.lastIndexOf('pty|takeover|pty-order');
+      expect(input).toBeGreaterThanOrEqual(0);
+      expect(release).toBeGreaterThan(input);
+      expect(secondTakeover).toBeGreaterThan(release);
+    } finally { finishText(); controller.close(); }
+  });
+
+  test('reports an in-flight input error even after switching away from its PTY', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const statuses: string[] = [];
+    let failText: () => void = () => {};
+    let markTextStarted: () => void = () => {};
+    const textStarted = new Promise<void>((resolve) => { markTextStarted = resolve; });
+    const textGate = new Promise<void>((_resolve, reject) => { failText = () => reject(new Error('remote timeout')); });
+    const controller = createSidetabAttachmentController({
+      drawBase: () => {}, termSize: () => ({ cols: 80, rows: 24 }), setStatus: (status) => statuses.push(status), drawRemoteFrame: () => {},
+      logEvent: (_category, event, data) => events.push({ event, data }),
+      remotePtyCommand: async (_host, args) => {
+        if (args[1] === 'snapshot' || args[1] === 'takeover') return 'screen';
+        if (args[1] === 'text') { markTextStarted(); await textGate; }
+        return '';
+      },
+    });
+    const row = { id: 'remote:aws1:pty-error', ptyId: 'pty-error', remoteHost: 'aws1', host: 'aws1', label: 'aws1:error', kind: 'tui' as const, badge: 'idle' as const };
+    const other = { id: 'remote:gcp1:pty-error-next', ptyId: 'pty-error-next', remoteHost: 'gcp1', host: 'gcp1', label: 'gcp1:next', kind: 'tui' as const, badge: 'idle' as const };
+    try {
+      controller.select(row);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      for (let attempt = 0; attempt < 100 && !statuses.some((status) => status.includes('takeover 완료')); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      controller.handleKey({ name: 'q', raw: 'q', ctrl: false, shift: false });
+      await textStarted;
+      controller.select(other);
+      failText();
+      for (let attempt = 0; attempt < 100 && !events.some((event) => event.event === 'send-failed'); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      expect(events.find((event) => event.event === 'send-failed')?.data).toMatchObject({ ptyId: 'pty-error', attachmentChanged: true, outcome: 'unknown' });
+      expect(statuses.some((status) => status.includes('결과 불명') && status.includes('pty-error'))).toBe(true);
+    } finally { failText(); controller.close(); }
+  });
+
+  test('serializes remote PTY text and sends Enter through the --enter option', async () => {
+    const started: string[][] = [];
+    const completed: string[][] = [];
+    let active = 0;
+    let maxActive = 0;
+    let finishFirst: () => void = () => {};
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const first = new Promise<void>((resolve) => { finishFirst = resolve; });
+    const controller = createSidetabAttachmentController({
+      drawBase: () => {}, termSize: () => ({ cols: 80, rows: 24 }), setStatus: () => {}, drawRemoteFrame: () => {},
+      remotePtyCommand: async (_host, args) => {
+        if (args[1] === 'snapshot' || args[1] === 'takeover') return 'screen';
+        if (args[1] !== 'text') return '';
+        started.push([...args]); active += 1; maxActive = Math.max(maxActive, active);
+        if (args[3] === 'a') { markFirstStarted(); await first; }
+        completed.push([...args]); active -= 1;
+        return '';
+      },
+    });
+    const row = { id: 'remote:aws1:pty-input', ptyId: 'pty-input', remoteHost: 'aws1', host: 'aws1', label: 'aws1:input', kind: 'tui' as const, badge: 'idle' as const };
+    try {
+      expect(controller.select(row)).toBe(true);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      controller.handleKey({ name: 'a', raw: 'a', ctrl: false, shift: false });
+      controller.handleKey({ name: 'b', raw: 'b', ctrl: false, shift: false });
+      controller.handleKey({ name: 'return', raw: '\r', ctrl: false, shift: false });
+      await firstStarted;
+      expect(started).toHaveLength(1);
+      finishFirst();
+      for (let attempt = 0; attempt < 100 && completed.length < 3; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      expect(started).toEqual([
+        ['pty', 'text', 'pty-input', 'a', '--actor', 'human'],
+        ['pty', 'text', 'pty-input', 'b', '--actor', 'human'],
+        ['pty', 'text', 'pty-input', '', '--enter', '--actor', 'human'],
+      ]);
+      expect(completed).toEqual(started);
+      expect(maxActive).toBe(1);
+    } finally { finishFirst(); controller.close(); }
+  });
+
+  test('reports queued remote input cancelled when its attachment changes', async () => {
+    const calls: string[][] = [];
+    const statuses: string[] = [];
+    let finishFirst: () => void = () => {};
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const first = new Promise<void>((resolve) => { finishFirst = resolve; });
+    const controller = createSidetabAttachmentController({
+      drawBase: () => {}, termSize: () => ({ cols: 80, rows: 24 }), setStatus: (status) => statuses.push(status), drawRemoteFrame: () => {},
+      remotePtyCommand: async (_host, args) => {
+        if (args[1] === 'snapshot' || args[1] === 'takeover') return 'screen';
+        if (args[1] === 'text') { calls.push([...args]); if (args[3] === 'a') { markFirstStarted(); await first; } }
+        return '';
+      },
+    });
+    const row = { id: 'remote:aws1:pty-cancel', ptyId: 'pty-cancel', remoteHost: 'aws1', host: 'aws1', label: 'aws1:cancel', kind: 'tui' as const, badge: 'idle' as const };
+    const other = { id: 'remote:gcp1:pty-next', ptyId: 'pty-next', remoteHost: 'gcp1', host: 'gcp1', label: 'gcp1:next', kind: 'tui' as const, badge: 'idle' as const };
+    try {
+      controller.select(row);
+      controller.handleKey({ name: 't', raw: 't', ctrl: false, shift: false });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      controller.handleKey({ name: 'a', raw: 'a', ctrl: false, shift: false });
+      controller.handleKey({ name: 'b', raw: 'b', ctrl: false, shift: false });
+      await firstStarted;
+      controller.select(other);
+      finishFirst();
+      for (let attempt = 0; attempt < 100 && !statuses.some((status) => status.includes('입력 취소')); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      expect(calls.map((args) => args[3])).toEqual(['a']);
+      expect(statuses.some((status) => status.includes('대상 전환') && status.includes('pty-cancel'))).toBe(true);
+    } finally { finishFirst(); controller.close(); }
   });
 
   test('showMain stops the Herdr snapshot view', async () => {

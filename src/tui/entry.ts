@@ -100,6 +100,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let sidetabRemoteFrame: string | null = null;
   let sidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
   let herdrSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
+  let remoteSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
+  let remoteSidetabRefreshPending = false;
   let herdrSidetabRefreshPending = false;
   let herdrSidetabPortal: import('./sidetab/herdr-portal.js').HerdrSidetabPortal | null = null;
   let sidetabApi: typeof import('./sidetab/list.js') | null = null;
@@ -411,10 +413,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabMode = 'list';
     if (sidetabOpen && sidetabRefreshTimer === null) {
       void refreshHerdrSidetabRows();
+      if (process.env.ELANOUS_REMOTE_SIDETAB === '1') void refreshRemoteSidetabRows();
       sidetabRefreshTimer = setInterval(() => {
         if (!sidetabOpen || !sidetabApi) return;
         refreshSidetabRows();
         void refreshHerdrSidetabRows();
+        if (process.env.ELANOUS_REMOTE_SIDETAB === '1') void refreshRemoteSidetabRows();
         render();
       }, 1000);
     } else if (!sidetabOpen && sidetabRefreshTimer !== null) {
@@ -426,7 +430,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const refreshSidetabRows = (): void => {
     if (!sidetabApi) return;
     const selectedId = sidetabRows[sidetabSelected]?.id;
-    sidetabRows = [...sidetabApi.loadSidetabRows(sidetabAll), ...herdrSidetabRows];
+    sidetabRows = [...sidetabApi.loadSidetabRows(sidetabAll), ...herdrSidetabRows, ...remoteSidetabRows];
     const preservedIndex = selectedId ? sidetabRows.findIndex((row) => row.id === selectedId) : -1;
     sidetabSelected = preservedIndex >= 0
       ? preservedIndex
@@ -443,6 +447,29 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       refreshSidetabRows();
     } catch { /* Herdr is optional; TUI rows remain available. */ }
     finally { herdrSidetabRefreshPending = false; }
+  };
+  const refreshRemoteSidetabRows = async (): Promise<void> => {
+    if (remoteSidetabRefreshPending) return;
+    remoteSidetabRefreshPending = true;
+    try {
+      const remote = await import('./sidetab/remote.js');
+      const hosts = remote.configuredRemoteSidetabHosts();
+      const results = await remote.fetchRegisteredRemoteSidetabRows(hosts);
+      const next = new Map<string, import('./sidetab/list.js').SidetabRow>();
+      for (const row of remoteSidetabRows) if (row.remoteHost) next.set(row.id, row);
+      for (const result of results) {
+        for (const [key, row] of next) if (row.remoteHost === result.host) next.delete(key);
+        if (result.error) {
+          const stale = remote.markRemoteHostUnavailable(remoteSidetabRows, result.host, result.error);
+          for (const row of stale) if (row.remoteHost === result.host) next.set(row.id, row);
+        } else {
+          for (const row of result.rows) next.set(row.id, row);
+        }
+      }
+      remoteSidetabRows = [...next.values()];
+      refreshSidetabRows();
+    } catch { /* Remote sidetab is opt-in; local rows remain available. */ }
+    finally { remoteSidetabRefreshPending = false; }
   };
   const switchSidetabSession = async (requestedSessionId?: string): Promise<void> => {
     const selected = sidetabRows[sidetabSelected];

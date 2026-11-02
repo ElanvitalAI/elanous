@@ -9,6 +9,9 @@ import { leaseTestPort, releaseTestPort, transferTestPort, RESERVED, TEST_BAND }
 
 const dirs: string[] = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'lease-test-')); dirs.push(dir); return dir; };
+function saturateDebugRingForTest(): void {
+  for (let i = 0; i < 520; i++) debug.log('test.ring-fill', 'noise', { i });
+}
 async function isPortOccupied(port: number): Promise<boolean> {
   return new Promise((resolve, reject) => {
     const probe = createServer();
@@ -24,16 +27,27 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 describe('local test-port lease', () => {
   test('sequential claims use the lowest free ports; dead PID is reclaimed and decisions logged', async () => {
     const dir = temp();
-    const before = debug.events(500).length;
-    const opts = { dir, now: () => 1234567890000, isAlive: (pid: number) => pid === process.pid, inUse: () => false };
-    const first = await leaseTestPort({ ...opts, owner: 'tree-a' });
-    const second = await leaseTestPort({ ...opts, owner: 'tree-b' });
-    expect(first).toEqual({ port: 31450, pid: process.pid, owner: 'tree-a', startedAt: new Date(1234567890000).toISOString() });
-    expect(second).toMatchObject({ port: 31451, owner: 'tree-b' });
-    writeFileSync(join(dir, '31450.json'), JSON.stringify({ ...first, pid: 999999999 }));
-    const third = await leaseTestPort({ ...opts, owner: 'tree-c' });
-    expect(third).toMatchObject({ port: 31450, owner: 'tree-c' });
-    expect(debug.events(500).slice(before).filter(e => e.category === 'nexus.port-lease').map(e => e.event)).toEqual(['leased', 'leased', 'skipped-stale', 'leased']);
+    const runId = `port-lease-events-${crypto.randomUUID()}`;
+    const previousRunId = process.env.ELANOUS_RUN_ID;
+    process.env.ELANOUS_RUN_ID = runId;
+    saturateDebugRingForTest();
+    try {
+      const opts = { dir, now: () => 1234567890000, isAlive: (pid: number) => pid === process.pid, inUse: () => false };
+      const first = await leaseTestPort({ ...opts, owner: 'tree-a' });
+      const second = await leaseTestPort({ ...opts, owner: 'tree-b' });
+      expect(first).toEqual({ port: 31450, pid: process.pid, owner: 'tree-a', startedAt: new Date(1234567890000).toISOString() });
+      expect(second).toMatchObject({ port: 31451, owner: 'tree-b' });
+      writeFileSync(join(dir, '31450.json'), JSON.stringify({ ...first, pid: 999999999 }));
+      const third = await leaseTestPort({ ...opts, owner: 'tree-c' });
+      expect(third).toMatchObject({ port: 31450, owner: 'tree-c' });
+      const leaseEvents = debug.events(500).filter(event =>
+        event.category === 'nexus.port-lease'
+        && (event.data as { runId?: string } | undefined)?.runId === runId);
+      expect(leaseEvents.map(event => event.event)).toEqual(['leased', 'leased', 'skipped-stale', 'leased']);
+    } finally {
+      if (previousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
+      else process.env.ELANOUS_RUN_ID = previousRunId;
+    }
   });
 
   test('parallel contenders never claim the same port', async () => {

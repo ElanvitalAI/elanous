@@ -1,10 +1,90 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TaskNotificationQueue, type PendingTaskNotification } from '../agent/task-notification.js';
 import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, createClassicSidetabMissionPairSessionRegistry, createClassicSidetabMissionTool } from './classic-sidetab-mission.js';
-import { startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
+import { captureClassicMissionExitObservation, createClassicSidetabMissionTrioVisibleRunner, runClassicSidetabMissionTrioMember, startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
+import { findGitDir } from '../git-fs/locate.js';
+
+test('trio exit evidence reports natural status without initiating cleanup', () => {
+  expect(captureClassicMissionExitObservation(true, 0)).toEqual({ exitCode: 0, exitObservation: 'natural-exit' });
+  expect(captureClassicMissionExitObservation(false, null)).toEqual({});
+});
+
+test('classic trio entrypoint sends exactly one Grok trust response through the PTY', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'classic-trio-grok-trust-'));
+  const mainRepo = join(tempRoot, 'main');
+  const cwd = join(tempRoot, 'worktree');
+  try {
+    mkdirSync(mainRepo, { recursive: true });
+    execFileSync('git', ['init', '--quiet', mainRepo]);
+    writeFileSync(join(mainRepo, 'fixture.txt'), 'linked worktree fixture\n');
+    execFileSync('git', ['-C', mainRepo, 'add', 'fixture.txt']);
+    execFileSync('git', ['-C', mainRepo, '-c', 'user.name=Test Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'fixture']);
+    execFileSync('git', ['-C', mainRepo, 'worktree', 'add', '--quiet', '--detach', cwd, 'HEAD']);
+    expect(findGitDir(cwd)?.isWorktree).toBe(true);
+    const outputPath = join(cwd, 'grok-trust-entrypoint.md');
+    const writes: string[] = [];
+    const trustScreen = [
+      'Do you trust the contents of this directory?',
+      cwd,
+      'Grok Build may run or modify contents in this directory.',
+      'Yes, proceed y / No, quit n',
+    ].join('\n');
+    let screen = trustScreen;
+    let markerValue: string | undefined;
+    let grokResult: Awaited<ReturnType<typeof runClassicSidetabMissionTrioMember>> | undefined;
+    const trio = await startClassicSidetabMissionTrio({
+      mission: 'Read package.json and report its version.',
+      checkGrokAuth: () => ({ ok: true }),
+      spawnVisible: (agent) => ({ id: `${agent}-pty`, cwd }),
+      runVisible: async (agent, mission, session) => {
+        if (agent !== 'grok') return { ok: true, status: 'completed', path: join(cwd, `${agent}.md`), exitCode: 0 };
+        const result = await runClassicSidetabMissionTrioMember({
+          member: agent, cwd: session!.cwd, mission, outputPath,
+          pty: {
+            snapshot: () => screen,
+            write: bytes => {
+              writes.push(bytes);
+              if (bytes === 'y\r') { screen = '❯ Ask Grok to do anything'; return true; }
+              if (bytes === '\r') {
+                if (screen.includes('Say M-')) {
+                  markerValue = screen.match(/M-[a-f0-9]{12}/)?.[0];
+                  if (markerValue) writeFileSync(`${outputPath}.completion-${markerValue}`, markerValue);
+                  screen = `└ ${markerValue ?? ''}`;
+                } else if (screen.includes('Write the result to the exact file path')) {
+                  writeFileSync(outputPath, '# package version 1.2.3\n');
+                  screen = '❯ Ask Grok to do anything';
+                }
+              } else {
+                screen += bytes;
+              }
+              return true;
+            },
+            isAlive: () => true,
+          },
+          handleTrust: () => false,
+        });
+        grokResult = result;
+        return { ...result, path: outputPath, exitCode: 0 };
+      },
+      registry: createClassicSidetabMissionPairSessionRegistry(),
+      enqueue: () => {},
+    });
+
+    await trio.completion;
+    expect(grokResult).toMatchObject({ ok: true, promptReady: true, missionSubmitted: true, completionMarker: true });
+    expect(grokResult?.initialScreen).toContain('Do you trust the contents of this directory?');
+    expect(writes.filter(write => write === 'y\r')).toHaveLength(1);
+  } finally {
+    if (findGitDir(mainRepo)) {
+      try { execFileSync('git', ['-C', mainRepo, 'worktree', 'remove', '--force', cwd]); } catch { /* temp tree cleanup below is authoritative */ }
+    }
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
 
 test('two completed hands write one synthesis record with attribution rows and notify its path', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'sidetab-trio-synthesis-'));
@@ -18,12 +98,11 @@ test('two completed hands write one synthesis record with attribution rows and n
       runVisible: async (agent) => ({
         ok: true,
         status: 'completed',
+        exitCode: agent === 'codex' ? 0 : null,
         path: join(cwd, `${agent}.md`),
         content: `${agent} candidate result`,
       }),
       registry: createClassicSidetabMissionPairSessionRegistry(),
-      hasSession: () => true,
-      killSession: () => {},
       enqueue: (notification) => notifications.push(notification),
       createId: (() => { let id = 0; return () => `synthesis-${++id}`; })(),
     });
@@ -37,8 +116,8 @@ test('two completed hands write one synthesis record with attribution rows and n
     const contents = readFileSync(synthesisPath, 'utf8');
     expect(contents).toContain('| codex | Compare the candidates for the demo. |');
     expect(contents).toContain('| claude | Compare the candidates for the demo. |');
-    expect(contents).toContain('| codex | Compare the candidates for the demo. | ' + join(cwd, 'codex.md') + ' | 완료 |  |');
-    expect(contents).toContain('| claude | Compare the candidates for the demo. | ' + join(cwd, 'claude.md') + ' | 완료 |  |');
+    expect(contents).toContain('| codex | Compare the candidates for the demo. | ' + join(cwd, 'codex.md') + ' | 완료 | 0 | 미수집 |');
+    expect(contents).toContain('| claude | Compare the candidates for the demo. | ' + join(cwd, 'claude.md') + ' | 완료 | 미상 | 미수집 |');
     expect(contents).toContain('codex candidate result');
     expect(contents).toContain('claude candidate result');
     expect(contents).toContain('## 채택 결과\n_최종 채택문은 알림을 받은 부모 응답에서 작성한다.');
@@ -48,6 +127,27 @@ test('two completed hands write one synthesis record with attribution rows and n
     const payload = JSON.parse(notification.output) as { artifacts: string[]; body: string };
     expect(payload.artifacts).toEqual([synthesisPath]);
     expect(payload.body).toContain(`Synthesis record: ${synthesisPath}`);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('synthesis labels an omitted exit code as unconfirmed', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'sidetab-trio-unconfirmed-exit-'));
+  const notifications: PendingTaskNotification[] = [];
+  try {
+    const started = await startClassicSidetabMissionTrio({
+      mission: 'Inspect the demo.',
+      checkGrokAuth: () => ({ ok: false }),
+      spawnVisible: (agent) => agent === 'grok' ? null : { id: `${agent}-pty`, cwd },
+      runVisible: async (agent) => ({ ok: true, status: 'completed', path: join(cwd, `${agent}.md`) }),
+      registry: createClassicSidetabMissionPairSessionRegistry(),
+      enqueue: (notification) => notifications.push(notification),
+    });
+    await started.completion;
+    const contents = readFileSync(notifications[0]!.resultPath!, 'utf8');
+    expect(contents).toContain('| codex | Inspect the demo. | ' + join(cwd, 'codex.md') + ' | 완료 | 미수집 | 미수집 |');
+    expect(contents).toContain('- 종료 코드: 미확인');
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -72,8 +172,6 @@ test('trio launches three visible agents with the same prompt and enqueues one c
       return { ok: true, status: 'completed', content: `${agent} candidate`, finalScreen: `${agent} raw final frame` };
     },
     registry,
-    hasSession: (sessionId) => liveSessions.has(sessionId),
-    killSession: (sessionId) => { liveSessions.delete(sessionId); },
     enqueue: (notification) => { delivered.push(notification); queue.enqueue(notification); },
     createId: () => `id-${++id}`,
     now: () => 100,
@@ -82,8 +180,8 @@ test('trio launches three visible agents with the same prompt and enqueues one c
   expect(spawned).toEqual(['claude', 'codex', 'grok']);
   expect(started.result.members.grok.status).toBe('running');
   await started.completion;
-  expect(liveSessions.size).toBe(0);
-  expect([...liveSessions]).toEqual([]);
+  expect(liveSessions.size).toBe(3);
+  expect([...liveSessions].sort()).toEqual(["claude-pty", "codex-pty", "grok-pty"]);
   expect(missions).toHaveLength(3);
   expect(new Set(missions.map((entry) => entry.mission))).toEqual(new Set(['Inspect and fix the graph demo.']));
   expect(queue.drainForParentSession('other-parent')).toEqual([]);
@@ -107,14 +205,12 @@ test('trio launches three visible agents with the same prompt and enqueues one c
       return { ok: true, status: 'completed', content: `${agent} second candidate` };
     },
     registry,
-    hasSession: (sessionId) => liveSessions.has(sessionId),
-    killSession: (sessionId) => { liveSessions.delete(sessionId); },
     enqueue: (notification) => { delivered.push(notification); queue.enqueue(notification); },
     createId: () => `id-${++id}`,
   });
   expect(second.result.members.grok.status).toBe('running');
   await second.completion;
-  expect(liveSessions.size).toBe(0);
+  expect(liveSessions.size).toBe(3);
   expect(spawned).toEqual(['claude', 'codex', 'grok', 'claude', 'codex', 'grok']);
   expect(delivered).toHaveLength(2);
   expect(queue.drainForParentSession('parent-trio')).toHaveLength(1);
@@ -132,8 +228,6 @@ test('partial trio completion stays actionable and aligns notification and JSON 
         ? { ok: false, status: 'failed', error: 'Mission text was not visible', path: '' }
         : { ok: true, status: 'completed', content: `${agent} reports elanous` },
       registry: createClassicSidetabMissionPairSessionRegistry(),
-      hasSession: () => true,
-      killSession: () => {},
       enqueue: notification => delivered.push(notification),
       createId: (() => { let id = 0; return () => `partial-${++id}`; })(),
     });
@@ -167,8 +261,6 @@ test('all failed trio hands produce an error notification with no fabricated ado
     spawnVisible: agent => ({ id: `${agent}-pty`, cwd: '/work' }),
     runVisible: async agent => ({ ok: false, status: 'failed', error: `${agent} failed`, path: '' }),
     registry: createClassicSidetabMissionPairSessionRegistry(),
-    hasSession: () => true,
-    killSession: () => {},
     enqueue: notification => delivered.push(notification),
     createId: (() => { let id = 0; return () => `failed-${++id}`; })(),
   });
@@ -192,8 +284,6 @@ test('timeout preserves already completed candidates for parent synthesis', asyn
     spawnVisible: agent => ({ id: `${agent}-pty`, cwd }),
     runVisible: agent => new Promise(resolve => resolveRun.set(agent, resolve)),
     registry: createClassicSidetabMissionPairSessionRegistry(),
-    hasSession: () => true,
-    killSession: () => {},
     enqueue: notification => delivered.push(notification),
     createId: (() => { let id = 0; return () => `timeout-${++id}`; })(),
     timeoutMs: 150,
@@ -228,8 +318,6 @@ test('unavailable Grok falls back to two hands and discloses why in one notifica
     spawnVisible: (agent) => { spawned.push(agent); return { id: `${agent}-pty`, cwd: '/work' }; },
     runVisible: async (agent, mission) => { ran.push(`${agent}:${mission}`); return { ok: true, status: 'completed', content: `${agent} candidate` }; },
     registry: createClassicSidetabMissionPairSessionRegistry(),
-    hasSession: () => true,
-    killSession: () => {},
     enqueue: (notification) => { delivered.push(notification); queue.enqueue(notification); },
     createId: () => `fallback-${++id}`,
   });
@@ -260,8 +348,6 @@ test('Grok PTY spawn failure still keeps the Codex and Claude missions running',
     spawnVisible: (agent) => { spawned.push(agent); return agent === 'grok' ? null : { id: `${agent}-pty`, cwd: '/work' }; },
     runVisible: async (agent) => { ran.push(agent); return { ok: true, status: 'completed', content: 'done' }; },
     registry: createClassicSidetabMissionPairSessionRegistry(),
-    hasSession: () => true,
-    killSession: () => {},
     enqueue: () => {},
     createId: () => `spawn-${++id}`,
   });
@@ -306,7 +392,7 @@ test('sidetab mission tool opts into one same-goal three-hand comparison and rej
   expect(linkedIssueIds.at(-1)).toBeUndefined();
   const emptySingleLinearIssue = await tool.dispatch({ agent: 'codex', mission: 'same task', linearIssueId: '' });
   expect(emptySingleLinearIssue.status).toBe('error');
-  expect(emptySingleLinearIssue.body).toContain('non-empty ID');
+  expect(emptySingleLinearIssue.body).toContain('completed without an answer');
   const linkedLinearIssue = await tool.dispatch({ agent: 'codex', mission: 'same task', linearIssueId: 'DEMO-123', withGrok: true });
   expect(linkedLinearIssue.status).toBe('running');
   expect(linkedLinearIssue.body).toContain('Linked Linear progress is not synchronized');
@@ -316,53 +402,98 @@ test('sidetab mission tool opts into one same-goal three-hand comparison and rej
   expect(rejected).toMatchObject({ status: 'error' });
   expect(rejected.body).toContain('omit parallelMission');
   expect(tool.spec.name).toBe(CLASSIC_SIDETAB_MISSION_TOOL_NAME);
-  expect(tool.spec.parameters).toMatchObject({ properties: { withGrok: { type: 'boolean' } } });
+  expect((tool.spec.parameters.properties as Record<string, unknown>).withGrok).toHaveProperty('anyOf');
   const properties = tool.spec.parameters.properties as Record<string, { minLength?: number }>;
-  expect(properties.linearIssueId?.minLength).toBe(1);
+  expect(properties.linearIssueId?.minLength).toBeUndefined();
   expect(properties.parallelMission?.minLength).toBeUndefined();
 });
 
-test('RunSidetabMission production dispatch reaches the visible three-hand driver seam', async () => {
+test('RunSidetabMission production adapter drives all three fake PTYs through trust, results, synthesis, and one notification', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'classic-trio-production-pty-'));
+  const mainRepo = join(tempRoot, 'main');
+  const cwd = join(tempRoot, 'worktree');
+  mkdirSync(mainRepo, { recursive: true });
+  execFileSync('git', ['init', '--quiet', mainRepo]);
+  writeFileSync(join(mainRepo, 'fixture.txt'), 'linked worktree fixture\n');
+  execFileSync('git', ['-C', mainRepo, 'add', 'fixture.txt']);
+  execFileSync('git', ['-C', mainRepo, '-c', 'user.name=Test Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'fixture']);
+  execFileSync('git', ['-C', mainRepo, 'worktree', 'add', '--quiet', '--detach', cwd, 'HEAD']);
   const spawned: string[] = [];
   const delivered: PendingTaskNotification[] = [];
-  let resolveAuth!: (value: { ok: boolean }) => void;
   let completion: Promise<void> | undefined;
-  const integration = createClassicSidetabMissionIntegration(
-    async () => ({ ok: false, status: 'failed' }),
-    undefined,
-    undefined,
-    undefined,
-    async (mission, context) => {
-      const started = await startClassicSidetabMissionTrio({
-        mission,
-        context,
-        checkGrokAuth: () => new Promise(resolve => { resolveAuth = resolve; }),
-        spawnVisible: agent => { spawned.push(agent); return { id: `${agent}-pty`, cwd: '/work' }; },
-        runVisible: async (agent, childMission) => ({ ok: true, status: 'completed', content: `${agent}:${childMission}`, finalScreen: `${agent} raw PTY frame` }),
-        registry: createClassicSidetabMissionPairSessionRegistry(),
-        hasSession: () => true,
-        killSession: () => {},
-        enqueue: notification => delivered.push(notification),
-        createId: (() => { let n = 0; return () => `production-${++n}`; })(),
-      });
-      completion = started.completion;
-      void started.completion;
-      return started.result;
+  const ptys = new Map<string, { screen: string; writes: string[] }>();
+  const runVisible = createClassicSidetabMissionTrioVisibleRunner({
+    ptyForSession: session => {
+      const state = ptys.get(session.id)!;
+      return {
+        snapshot: () => state.screen,
+        isAlive: () => true,
+        exitCode: () => 0,
+        write: bytes => {
+          state.writes.push(bytes);
+          if (bytes === 'y\r') { state.screen = '❯ Ask Grok to do anything'; return true; }
+          if (bytes === '\r') {
+            const marker = state.screen.match(/Say (M-[a-f0-9]{12}) alone and write it to the exact file path (\S+)/);
+            if (marker) {
+              mkdirSync(join(cwd, '.elanous', 'mission-results'), { recursive: true });
+              writeFileSync(marker[2]!, `${marker[1]}\n`);
+              state.screen = `└ ${marker[1]}`;
+            } else {
+              const target = state.screen.match(/Write the result to the exact file path (\S+)/)?.[1];
+              if (!target) return false;
+              mkdirSync(join(cwd, '.elanous', 'mission-results'), { recursive: true });
+              writeFileSync(target, `# ${session.id} candidate\n`);
+              state.screen = session.id === 'grok-pty' ? '❯ Ask Grok to do anything' : `❯ Ask ${session.id.replace('-pty', '')} to do anything`;
+            }
+          } else {
+            state.screen += bytes;
+          }
+          return true;
+        },
+      };
     },
-  );
-  const specs = integration.getTools([]);
-  expect(specs.some(spec => spec.name === CLASSIC_SIDETAB_MISSION_TOOL_NAME)).toBe(true);
-  const dispatched = integration.dispatchTool(CLASSIC_SIDETAB_MISSION_TOOL_NAME, {
-    agent: 'codex', mission: 'same graph task', withGrok: true,
-  }, { callId: 'production-call', parentSessionId: 'production-parent' });
-  await new Promise(resolve => setTimeout(resolve, 0));
-  expect(spawned).toEqual(['claude', 'codex']);
-  resolveAuth({ ok: true });
-  await expect(dispatched).resolves.toMatchObject({ status: 'running', id: 'production-3' });
-  await completion;
-  expect(spawned).toEqual(['claude', 'codex', 'grok']);
-  expect(delivered).toHaveLength(1);
-  const body = JSON.parse(delivered[0]!.output).body as string;
-  expect(body).toContain('same graph task');
-  expect(body).toContain('grok final raw PTY screen:\ngrok raw PTY frame');
+    outputPath: (agent, session) => join(session.cwd, '.elanous', 'mission-results', `classic-trio-${agent}-${session.id}.md`),
+    handleTrust: () => false,
+    sleep: async () => {},
+  });
+  try {
+    const started = await startClassicSidetabMissionTrio({
+      mission: 'same graph task',
+      context: { callId: 'production-call', parentSessionId: 'production-parent' },
+      checkGrokAuth: () => ({ ok: true }),
+      spawnVisible: agent => {
+        spawned.push(agent);
+        const id = `${agent}-pty`;
+        ptys.set(id, { screen: agent === 'grok' ? [
+          'Do you trust the contents of this directory?', cwd,
+          'Grok Build may run or modify contents in this directory.',
+          'Yes, proceed y / No, quit n',
+        ].join('\n') : `❯ Ask ${agent} to do anything`, writes: [] });
+        return { id, cwd };
+      },
+      runVisible,
+      registry: createClassicSidetabMissionPairSessionRegistry(),
+      enqueue: notification => delivered.push(notification),
+      createId: (() => { let n = 0; return () => `production-${++n}`; })(),
+      timeoutMs: 5_000,
+    });
+    completion = started.completion;
+    await completion;
+    expect(spawned).toEqual(['claude', 'codex', 'grok']);
+    expect(ptys.get('grok-pty')?.writes.filter(value => value === 'y\r')).toHaveLength(1);
+    expect(delivered).toHaveLength(1);
+    const payload = JSON.parse(delivered[0]!.output) as { coverage: string; successfulMembers: string[]; body: string; artifacts: string[] };
+    expect(payload.coverage).toBe('complete');
+    expect(payload.successfulMembers).toEqual(['codex', 'claude', 'grok']);
+    expect(payload.body).toContain('Codex + Claude + Grok results');
+    expect(payload.body).toContain('Synthesis record:');
+    expect(payload.body).toContain('grok candidate:');
+    expect(payload.artifacts).toHaveLength(1);
+    expect(readFileSync(payload.artifacts[0]!, 'utf8')).toContain('| grok | same graph task |');
+  } finally {
+    if (findGitDir(mainRepo)) {
+      try { execFileSync('git', ['-C', mainRepo, 'worktree', 'remove', '--force', cwd]); } catch { /* temp tree cleanup below is authoritative */ }
+    }
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
 });

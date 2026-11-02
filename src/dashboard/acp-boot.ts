@@ -24,6 +24,7 @@
 
 import type { ChatMessage } from '../chat/index.js';
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { RunCompactPipeline } from '../session/request-size-guard.js';
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import {
   DashboardSession,
@@ -138,9 +139,14 @@ export interface DashboardAcpBootDeps {
   /** TUI-TOKEN-GUARD-WIRE — replace the chat history store in place after the
    *  request-size cap compacted it, so the next prompt reads the compacted
    *  history (not the original 400+ messages). Absent = no write-back. */
-  replaceChatHistory?(messages: readonly ChatMessage[]): void;
+  replaceChatHistory?(messages: readonly ChatMessage[], ctx: { sessionId: string; userText: string }): void | Promise<void>;
+  /** Persisted chat-session id used by TUI resume. Defaults to the ACP id only
+   *  for hosts whose persisted history is keyed by ACP session id. */
+  getPersistentSessionId?(ctx: { sessionId: string; userText: string }): string | null;
   /** Test seam — request-size cap override (defaults to 400k chars). */
   requestSizeMaxChars?: number;
+  /** Test seam for the live request compaction boundary. */
+  requestSizeRunCompactPipeline?: RunCompactPipeline;
   /** Test seam — the live compactor used for the history write-back. */
   compactHistoryMessages?: (
     messages: LLMMessage[],
@@ -228,26 +234,70 @@ export async function bootDashboardAcpSession(
 
   recordDashboardAcpBootBranch('in-process', true);
   const gateway = deps.approvalGateway;
+  const clearActiveTurnMarker = () => {
+    const history = deps.getChatHistory() as (ChatMessage & { transientTurnUser?: true })[];
+    for (let index = 0; index < history.length; index += 1) {
+      const message = history[index]!;
+      if (message.transientTurnUser !== true) continue;
+      const { transientTurnUser: _transientTurnUser, ...persistable } = message;
+      history[index] = persistable as ChatMessage;
+    }
+  };
+  const turnPreambles = new Map<string, LLMMessage[]>();
+  const turnKey = (sessionId: string, userText: string) => `${sessionId}\0${userText}`;
+  const clearTurnPreambles = (sessionId: string) => {
+    const prefix = `${sessionId}\0`;
+    for (const key of turnPreambles.keys()) {
+      if (key.startsWith(prefix)) turnPreambles.delete(key);
+    }
+  };
   const opts: DashboardSessionOptions = {
     cwd: deps.getCwd(),
     tuiRouting: true,
-    getMessages: ({ sessionId, userText }) => buildTurnMessages(deps, sessionId, userText),
+    getMessages: ({ sessionId, userText }) => {
+      // Failed/canceled turns can skip completion. Retire both transient
+      // user markers and per-turn preambles before the next serialized turn.
+      clearActiveTurnMarker();
+      clearTurnPreambles(sessionId);
+      const preamble = deps.getPreamble({ sessionId, userText })
+        .map(message => ({ ...message, transientPreamble: true as const }));
+      turnPreambles.set(turnKey(sessionId, userText), preamble);
+      return buildTurnMessages(deps, sessionId, userText, preamble);
+    },
     getTools: ({ sessionId, userText }) => {
       const tools = [...deps.getTools({ userText })];
       recordDashboardToolCatalog(sessionId, tools);
       return tools;
     },
     dispatchTool: deps.dispatchTool,
-    onTurnComplete: ({ newMessages }) => {
-      deps.pushTurnToolHistory(newMessages);
+    onTurnComplete: ({ sessionId, newMessages }) => {
+      try {
+        deps.pushTurnToolHistory(newMessages);
+      } finally {
+        clearActiveTurnMarker();
+        clearTurnPreambles(sessionId);
+      }
     },
     ...(deps.replaceChatHistory
       ? {
           compactPersistedHistory: ({ sessionId, userText }: { sessionId: string; userText: string }) =>
             compactDashboardChatHistory(deps, { sessionId, userText }),
+          persistCompactedHistory: async ({ sessionId, userText, messages }: { sessionId: string; userText: string; messages: LLMMessage[] }) => {
+            // Strip by provenance, never by content equality: a historical
+            // system message may intentionally have the same text as today's preamble.
+            const persistedMessages = messages
+              .filter(message => message.transientPreamble !== true)
+              .map(({ transientPreamble: _transientPreamble, ...message }) => message);
+            const context = {
+              sessionId: deps.getPersistentSessionId?.({ sessionId, userText }) ?? sessionId,
+              userText,
+            };
+            await deps.replaceChatHistory!(persistedMessages as unknown as ChatMessage[], context);
+          },
         }
       : {}),
     ...(deps.requestSizeMaxChars !== undefined ? { requestSizeMaxChars: deps.requestSizeMaxChars } : {}),
+    ...(deps.requestSizeRunCompactPipeline ? { requestSizeRunCompactPipeline: deps.requestSizeRunCompactPipeline } : {}),
     resolveModel: ({ userText }) => {
       const model = deps.getActiveModel({ userText });
       return model ?? undefined;
@@ -436,7 +486,7 @@ export function createDefaultRequestPermissionHandler(
  *  Keeps a trailing current-turn user message verbatim (buildTurnMessages
  *  detects it) and writes the result back through `replaceChatHistory`. */
 export async function compactDashboardChatHistory(
-  deps: Pick<DashboardAcpBootDeps, 'getChatHistory' | 'replaceChatHistory' | 'getActiveModel' | 'compactHistoryMessages'>,
+  deps: Pick<DashboardAcpBootDeps, 'getChatHistory' | 'replaceChatHistory' | 'getActiveModel' | 'compactHistoryMessages' | 'getPersistentSessionId'>,
   ctx: { sessionId: string; userText: string },
 ): Promise<{ fired: boolean; reason: string }> {
   if (!deps.replaceChatHistory) return { fired: false, reason: 'no-history-writer' };
@@ -462,9 +512,10 @@ export async function compactDashboardChatHistory(
   if (!compacted) return { fired: false, reason: 'compaction-no-op' };
   const next = [
     ...(compacted.messages as unknown as ChatMessage[]),
-    ...(trailingUser ? [trailingUser] : []),
+    ...(trailingUser ? [{ ...trailingUser, transientTurnUser: true } as ChatMessage] : []),
   ];
-  deps.replaceChatHistory(next);
+  const persistentSessionId = deps.getPersistentSessionId?.(ctx) ?? ctx.sessionId;
+  await deps.replaceChatHistory(next, { ...ctx, sessionId: persistentSessionId });
   debug.log('dashboard.acp', 'chat-history-compacted', {
     before: history.length,
     after: next.length,
@@ -488,8 +539,9 @@ function buildTurnMessages(
   deps: DashboardAcpBootDeps,
   sessionId: string,
   userText: string,
+  turnPreamble?: readonly LLMMessage[],
 ): LLMMessage[] {
-  const preamble = [...deps.getPreamble({ sessionId, userText })];
+  const preamble = [...(turnPreamble ?? deps.getPreamble({ sessionId, userText }))];
   const history = [...deps.getChatHistory()] as unknown as LLMMessage[];
   // If the caller already appended the current user text to history,
   // the last entry IS `{ role:'user', content: userText }` and we
@@ -498,11 +550,15 @@ function buildTurnMessages(
   const last = history[history.length - 1];
   const hasTrailingUser = isCurrentDashboardUser(last as ChatMessage | undefined, userText);
   if (hasTrailingUser) {
-    return [...preamble, ...history];
+    return [
+      ...preamble,
+      ...history.slice(0, -1),
+      { ...history[history.length - 1]!, transientTurnUser: true },
+    ];
   }
   return [
     ...preamble,
     ...history,
-    { role: 'user', content: userText },
+    { role: 'user', content: userText, transientTurnUser: true },
   ];
 }

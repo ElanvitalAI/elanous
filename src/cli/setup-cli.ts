@@ -348,6 +348,48 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         return;
       }
       const isFirstRun = isFirstRunSetup();
+      if (isFirstRun) {
+        let approved = opts.yes;
+        if (!approved) {
+          try { approved = (await prompt('첫 설정을 적용할까요? [y/N] '))?.trim().toLowerCase() === 'y'; }
+          catch {
+            out.log('First setup unchanged because consent could not be read.');
+            setExitCode(1);
+            return;
+          }
+        }
+        if (!approved) {
+          out.log('First setup unchanged. Provider/GitHub authentication and OS security approvals remain manual.');
+          setExitCode(0);
+          return;
+        }
+        try {
+          const initialSteps = setupSteps(deps);
+          if (!initialSteps[1]!.complete) {
+            const config = (deps.getUserConfig ?? getUserConfig)();
+            (deps.saveUserConfig ?? saveUserConfig)({ ...config, llm: { ...config.llm, provider: 'openai-codex' } });
+          }
+          const runDoctorFix = deps.runDoctorFix ?? (async (args: readonly string[]) => {
+            const doctorProgram = new Command();
+            let exitCode = 0;
+            const quietOut = { log: () => undefined, error: () => undefined };
+            registerDoctorCommand(doctorProgram, {
+              out: quietOut,
+              err: quietOut,
+              setExitCode: (code) => { exitCode = code; },
+            });
+            await doctorProgram.parseAsync([...args], { from: 'user' });
+            return exitCode;
+          });
+          const fixCode = await runDoctorFix(['doctor', '--fix', '--yes']);
+          out.log(`First setup ${fixCode === 0 ? 'complete' : 'incomplete'}; provider/GitHub authentication and OS security approvals remain manual.`);
+          setExitCode(fixCode);
+        } catch {
+          out.log('First setup incomplete; provider/GitHub authentication and OS security approvals remain manual.');
+          setExitCode(1);
+        }
+        return;
+      }
       let steps = setupSteps(deps);
       const provider = steps[1]!;
       if (!provider.complete) {

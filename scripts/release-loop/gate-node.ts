@@ -15,11 +15,12 @@ import { loadGateBatchSafe } from './gate-batch-safe';
 import { observeGatePrewarmCutShadow, type GatePrewarmInput } from './gate-prewarm-plan.js';
 import { gateHistory } from './gate-history.js';
 import { baselineFromCutLogs } from './baseline-from-logs';
-import { mergePartialFailures, readPartialPlanResult, testFileOfId, verifyDocsOnlyCarry } from './gate-partial';
+import { changedFilesBetween, mergePartialFailures, readPartialPlanResult, testFileOfId, verifyDocsOnlyCarry } from './gate-partial';
 import { planGateRadiusShadow, shadowActual, writeGateRadiusShadow, type GateRadiusShadowPlan } from './gate-radius-shadow';
 import { planHardRehearsalRadius, partialGateImagesMatch, preflightGateExecutionIdentity, preflightGateImageDigest } from './gate-radius-live';
+import { gitClosureTree, testsReachingChanged } from './gate-closure.js';
 import { actualGatePodImageDigest, gateBaselineReceipt, gateEnvFingerprint, gateGraphPins, gateShardRecipeIdentityAtCommit, gateSourcePins, parseGatePodRuntimeIdentity,
-  POD_SWEEP_INTEGRATION_ONLY } from './gate-baseline-receipt';
+  POD_SWEEP_INTEGRATION_ONLY, gateAssignableTestsAtCommit } from './gate-baseline-receipt';
 import { gateImagePinPath, normalizeGateImageDigest, pinnedGateImageSync as buildPinnedGateImageSync, readGateImagePin,
   readGateImagePinForRun, replaceGateImagePin, resolveGateImagePin, writeGateImagePin } from './gate-image-pin.js';
 import { gateReceiptRegistryPath, planGateTrainReceiptCarry } from './gate-train-receipts.js';
@@ -48,6 +49,7 @@ import { DEFAULT_CONTROL_PORT } from '../../src/control-plane/server.js';
 import { createRunScopedWarmControlForward, startWarmControlPortForward } from './warm-control-forward.js';
 import { resolveWarmPoolProfile } from '../../src/self-implement/pod-warm-pool-profile.js';
 import { decideWarmReuse, type WarmReuseSwitchConfig, type WarmReuseEvidence } from '../../src/task-orchestrator/surfaces/pod-warm-switch.js';
+import { invalidateWarmReuseEvidence, recordWarmGateEvidence, type ActualWarmLeaseEvidence } from '../../src/task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { getUserConfig, userConfigPath } from '../../src/user-config.js';
 import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateJobTerminal, type GateShard } from '../../src/release-loop/gate-shards.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
@@ -74,6 +76,8 @@ export interface WarmShadowObservation {
   cutSha?: string;
   baselineSha?: string;
   workerKey?: WarmWorkerKey;
+  /** Transient lease evidence; stripped before verdict persistence. */
+  leaseEvidence?: ActualWarmLeaseEvidence;
 }
 
 /** A provider may fill only lease identity; it cannot rewrite the Job attempt being compared. */
@@ -639,16 +643,26 @@ export async function runWarmPrecutCanary(input: { opts: GateOptions; runner: Ga
         || attemptIds.has(observation.attemptId)
         || (observation.reason === 'match' && (observation.finalized !== true || observation.quarantined !== 'no'))) {
         failure = new Error(`pre-cut warm comparison was not measured on attempt ${index + 1}: ${observation.reason}`);
+        observation = { ...observation, status: 'unmeasured', reason: observation.reason || 'warm-shadow-unmeasured' };
       }
     } catch (error) {
       observation = { files: [input.file], attemptId: `precut-error-${index + 1}-${randomUUID()}`,
         status: 'unmeasured', reason: String(error), quarantined: 'unavailable' };
       failure = error instanceof Error ? error : new Error(String(error));
     }
+    const journalObservation = observation;
+    const { leaseEvidence: _leaseEvidence, ...persistedObservation } = observation;
+    observation = persistedObservation;
     attemptIds.add(observation.attemptId);
     observations.push(observation);
-    recordWarmPrecutCanarySample(input.historyPath, { version: opts.version, commit: opts.commit,
-      baselineCommit: opts.baselineCommit, warmShadow: [observation] });
+    try {
+      recordWarmPrecutCanarySample(input.historyPath, { version: opts.version, commit: opts.commit,
+        baselineCommit: opts.baselineCommit, warmShadow: [observation] });
+    } catch (error) {
+      invalidateWarmReuseEvidence();
+      throw error;
+    }
+    await journalWarmGateShadow(journalObservation, opts.commit, runner, opts.repo ?? process.cwd());
     if (failure) throw failure;
   }
   const history = readWarmVerdictHistory(input.historyPath);
@@ -659,6 +673,37 @@ export async function runWarmPrecutCanary(input: { opts: GateOptions; runner: Ga
     evidence ? { 'gate-recheck': evidence } : undefined) };
 }
 /** Every counted match has a measured, finalized worker with this exact cut, baseline and lock. */
+async function journalWarmGateShadow(shadow: WarmShadowObservation, commit: string, runner: GateRunner, repo: string): Promise<void> {
+  let head = '';
+  let main = '';
+  try {
+    const headResult = await runner.localCommand('git', ['rev-parse', `${commit}^{commit}`], repo);
+    const mainResult = await runner.localCommand('git', ['ls-remote', 'origin', 'refs/heads/main'], repo);
+    head = headResult.rc === 0 ? headResult.output.trim() : '';
+    const match = mainResult.rc === 0 ? /^(?:[0-9a-f]{40})\s+refs\/heads\/main\s*$/im.exec(mainResult.output) : null;
+    main = match?.[0].trim().split(/\s+/)[0] ?? '';
+  } catch (error) {
+    invalidateWarmReuseEvidence();
+    debug.log('pod.warm', 'evidence-journal-write-failed', { consumer: 'gate-recheck', reason: 'head-main-lookup-failed' }, { level: 'warn' });
+    return;
+  }
+  if (!/^[0-9a-f]{40}$/i.test(head) || !/^[0-9a-f]{40}$/i.test(main)) {
+    invalidateWarmReuseEvidence();
+    debug.log('pod.warm', 'evidence-journal-write-failed', { consumer: 'gate-recheck', reason: 'head-main-unmeasured' }, { level: 'warn' });
+    return;
+  }
+  const accepted = head === main && shadow.status === 'observed' && shadow.reason === 'match'
+    && shadow.finalized === true && shadow.quarantined === 'no' && !!shadow.leaseEvidence;
+  try {
+    recordWarmGateEvidence({ head, main, evidence: shadow.leaseEvidence
+      ? { ...shadow.leaseEvidence, leaseValid: accepted && shadow.leaseEvidence.leaseValid,
+        canaryPassed: accepted && shadow.leaseEvidence.canaryPassed, agree: accepted && shadow.leaseEvidence.agree }
+      : undefined, reason: head === main ? (shadow.reason || shadow.status) : 'head-main-mismatch' });
+  } catch (error) {
+    debug.log('pod.warm', 'evidence-journal-write-failed', { consumer: 'gate-recheck', reason: String(error) }, { level: 'warn' });
+  }
+}
+
 export function warmEvidenceFromVerdicts(history: readonly WarmVerdictSample[] | undefined,
   version: string, head: string, baseline: string, lock: string): WarmReuseEvidence | undefined {
   if (!history?.length || !lock) return undefined;
@@ -1068,7 +1113,7 @@ export function gateShardShell(o: { parts: readonly (readonly string[])[]; cdpPa
     ...(o.beatSeconds ? gateBeatScript(o.beatSeconds, o.installSlots > 0) : []),
     ...(o.cachePrefix ? [o.cachePrefix] : []),
     gateEnvBaselineLine(),
-    `bun -e ${quote("const {createHash}=require('node:crypto');const keys=['ELANOUS_TEST_FAKE_LLM','LANG','LC_ALL','TZ'];const e=Object.fromEntries(keys.sort().map(k=>[k,process.env[k]??'']));const envFingerprint=createHash('sha256').update(JSON.stringify(e)).digest('hex');console.log(JSON.stringify({bunVersion:Bun.version,platform:process.platform,architecture:process.arch,envFingerprint}));")} > "$O/runtime-identity.json" 2> "$O/runtime-identity.err" || rm -f "$O/runtime-identity.json"`,
+    `bun -e ${quote("const {createHash}=require('node:crypto');const keys=['ELANOUS_TEST_FAKE_LLM','LANG','LC_ALL','TZ'];const e=Object.fromEntries(keys.sort().map(k=>[k,process.env[k]??'']));const envFingerprint=createHash('sha256').update(JSON.stringify(e)).digest('hex');console.log(JSON.stringify({bunVersion:Bun.version,platform:process.platform,architecture:process.arch,envFingerprint,baseImageDigest:process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST??''}));")} > "$O/runtime-identity.json" 2> "$O/runtime-identity.err" || rm -f "$O/runtime-identity.json"`,
     ...(o.rulesBaseSha ? [`export ELANOUS_GATE_BASE_SHA=${quote(o.rulesBaseSha)}`] : []),
     // Seconds since this container's PID 1 started (the clone ran before this shell) — 0 when /proc cannot tell.
     `pod_age=$(awk -v t="$(cut -d' ' -f22 /proc/1/stat 2>/dev/null)" -v hz="$(getconf CLK_TCK 2>/dev/null)" '{ if (t > 0 && hz > 0) print int($1 - t / hz); else print 0 }' /proc/uptime 2>/dev/null)`,
@@ -1545,6 +1590,8 @@ export const GATE_NIGHTLY_AUDITS: readonly string[] = [
   'scripts/unwired-exports.test.ts',
   // Replaces pwa-build-typecheck's full root tsc and PWA tsc sweeps (PWA build also runs in the release loop).
   'test/pwa-build-typecheck.test.ts',
+  // Whole-repository credential scan runs through test-diet's nightly audit flag; gate uses bounded fixtures.
+  'scripts/resource-map-check.test.ts',
 ];
 const tail40 = (output: string) => output.trimEnd().split(/\r?\n/).slice(-40).join('\n');
 const lastStartedTestFile = (output: string, paths: string[]): string | undefined => {
@@ -1870,6 +1917,21 @@ export function createGateRootLimiter(slots: number): <T>(run: () => Promise<T>)
   };
 }
 /** A direct gate has no preflight image pin. Its measured receipt still carries its own image digest. */
+function gateRuntimeSourceFingerprint(repo: string, commit: string, identity: { bunVersion: string; platform: string; architecture: string; envFingerprint: string; baseImageDigest?: string } | null | undefined): string | null {
+  if (!identity || typeof identity.baseImageDigest !== "string" || !/^[a-f0-9]{40}$/i.test(commit) || !/^sha256:[a-f0-9]{64}$/i.test(identity.baseImageDigest)) return null;
+  const files = ['bun.lock', 'apps/pwa/bun.lock', 'package.json', 'apps/pwa/package.json', 'docker/harness/Dockerfile'];
+  const inputs: Array<[string, string]> = [];
+  for (const file of files) {
+    const result = spawnSync('git', ['show', commit + ':' + file], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    if (result.status !== 0 || result.error) return null;
+    inputs.push([file, result.stdout]);
+  }
+  const lockfileHash = createHash('sha256').update(inputs.filter(([file]) => file.endsWith('.lock')).map(([, value]) => value).join('\0')).digest('hex');
+  const dependencyLayerHash = createHash('sha256').update(JSON.stringify(inputs)).digest('hex');
+  return createHash('sha256').update(JSON.stringify({ envFingerprint: identity.envFingerprint, bunVersion: identity.bunVersion,
+    platform: identity.platform, architecture: identity.architecture, baseImageDigest: identity.baseImageDigest, lockfileHash, dependencyLayerHash })).digest('hex');
+}
+
 export function gateReceiptReuseKey(receipt: GateShardReceipt | null, version: string, head40: string, fingerprint: string,
   expectedImageDigest: string | null | undefined, currentIdentity: import('./gate-radius-live.js').GatePodExecutionIdentity | null,
   graphPins: ({ graphSha: string; recipeSha: string } & { graphEntry?: string; recipeCommand?: string; recipeTimeoutMs?: number }) | null): { envKey?: string; reason: string } {
@@ -1882,8 +1944,8 @@ export function gateReceiptReuseKey(receipt: GateShardReceipt | null, version: s
   if (receipt.graphEntry !== graphPins.graphEntry) return { reason: 'graph-entry-mismatch' };
   if (receipt.recipeCommand !== graphPins.recipeCommand) return { reason: 'recipe-command-mismatch' };
   if (receipt.recipeTimeoutMs !== graphPins.recipeTimeoutMs) return { reason: 'recipe-timeout-mismatch' };
-  const environmentFields = ['imageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const;
-  const stored: Record<string, string> = { imageDigest: receipt.imageDigest, ...receipt.runtimeIdentity, envFingerprint: receipt.envFingerprint };
+  const environmentFields = ['bunVersion', 'platform', 'architecture', 'envFingerprint', 'baseImageDigest'] as const;
+  const stored: Record<string, string> = { ...receipt.runtimeIdentity, envFingerprint: receipt.envFingerprint };
   const current: Record<string, string> = { ...currentIdentity };
   for (const field of environmentFields) {
     if (!stored[field] || !current[field]) return { reason: `environment-${field}-unmeasured` };
@@ -2065,6 +2127,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const missing = only?.filter((file) => !allFiles.includes(file)) ?? [];
     if (missing.length) throw new Error(`partial plan file missing at this commit: ${missing.slice(0, 5).join(', ')}`);
     let files = onlySet ? allFiles.filter((file) => onlySet.has(file)) : allFiles;
+    // An empty, closure-proven radius means every prior formal shard is carried; load the receipt inventory for dispatch.
     const rulesBaseSha = await rulesGateBaseFor(commit, files);
     if (files.some((file) => file.startsWith('-') || file.startsWith('/') || file.startsWith('./')
       || file.split('/').some((part) => !part || part === '.' || part === '..') || /[\r\n]/.test(file))) throw new Error('unsafe pod test path');
@@ -2096,7 +2159,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const priorReceiptRows = only && receiptRoot && existsSync(receiptRoot) ? readdirSync(receiptRoot).filter((name) => /^pod-\d+\.receipt\.json$/.test(name))
       .sort((a, b) => Number(a.slice(4).split('.')[0]) - Number(b.slice(4).split('.')[0]))
       .map((name) => readGateShardManifest(receiptRoot, name.replace('.receipt.json', ''))).filter((row): row is GateShardReceipt => !!row) : [];
-    const radiusReceiptPlan = only && priorReceiptRows.length ? planGateReceiptRadius({ receipts: priorReceiptRows, tests: allAssignable, selectedFiles: files, priorCommit: pod.shardsFile?.radiusPriorCommit ?? '' }) : null;
+    const radiusReceiptPlan = only && priorReceiptRows.length ? planGateReceiptRadius({ receipts: priorReceiptRows, tests: allAssignable, selectedFiles: only ?? files, priorCommit: pod.shardsFile?.radiusPriorCommit ?? '' }) : null;
     const radiusUnchangedShardIds = radiusReceiptPlan?.unchangedShardIds ?? [];
     const radiusInvalidatedShardIds = radiusReceiptPlan?.invalidatedShardIds ?? [];
     if (radiusReceiptPlan) { assignable = allAssignable; shards = radiusReceiptPlan.shards.map((shard) => ({ ...shard, plannedSeconds: shard.files.reduce((total, file) => total + (durations.get(file) ?? 0), 0) })); shardCount = shards.length; }
@@ -2140,7 +2203,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (pod.freshShards) return { reason: 'fresh-shards' };
       if (!receiptRoot || !base40 || !envFingerprint) return { reason: 'receipt-context-missing' };
       const prior = readGateShardManifest(receiptRoot, `pod-${shard}`);
-      const key = gateReceiptReuseKey(prior, pod.shardsFile!.version, commit, envFingerprint, expectedImageDigest, currentExecutionIdentity, currentGraphPins);
+      const sameHead = prior?.head40 === commit;
+      const priorRuntime = sameHead ? null : prior && gateRuntimeSourceFingerprint(repo, prior.head40, prior.runtimeIdentity);
+      const currentRuntime = sameHead ? null : currentExecutionIdentity && gateRuntimeSourceFingerprint(repo, commit, currentExecutionIdentity);
+      const key = prior?.base40 !== base40 ? { reason: 'base40-mismatch' }
+        : !sameHead && (!priorRuntime || !currentRuntime) ? { reason: 'runtime-fingerprint-unmeasured' }
+          : !sameHead && priorRuntime !== currentRuntime ? { reason: 'runtime-fingerprint-mismatch' }
+            : gateReceiptReuseKey(prior, pod.shardsFile!.version, commit, envFingerprint, expectedImageDigest, currentExecutionIdentity, currentGraphPins);
       if (!key.envKey) {
         return { reason: key.reason };
       }
@@ -3091,7 +3160,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             if (executionEvidenceComplete && imageDigest && runtimeIdentity && executedHost && currentGraphPins && attribution === 'complete') {
               try {
                 saveGateShardResult(receiptRoot, { receipt: { id: shardId, files: [...item.files], head40: commit, base40,
-                  version: pod.shardsFile!.version, graphSha: currentGraphPins!.graphSha, recipeSha: currentGraphPins!.recipeSha,
+                  version: pod.shardsFile!.version, graphRunId: tools.graphRunId ?? undefined, graphSha: currentGraphPins!.graphSha, recipeSha: currentGraphPins!.recipeSha,
                   graphEntry: currentGraphPins?.graphEntry, recipeCommand: currentGraphPins?.recipeCommand, recipeTimeoutMs: currentGraphPins?.recipeTimeoutMs,
                   host: executedHost, envKey: `${envFingerprint}:${imageDigest}`, envFingerprint, imageDigest, runtimeIdentity,
                   executions: executionRows.map((execution) => ({ branch: execution.branch, attemptId: execution.attemptId,
@@ -3414,7 +3483,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
               }
             }
             observation = { files: [...files], attemptId, status, reason, quarantined, finalized,
-              cutSha: replay.command.cutSha, baselineSha: replay.command.baselineSha, workerKey: replay.command.key };
+              cutSha: replay.command.cutSha, baselineSha: replay.command.baselineSha, workerKey: replay.command.key,
+              leaseEvidence: { workerId: replay.command.workerId, leaseId: replay.command.leaseId, generation: replay.command.generation,
+                expectedLockHash: replay.command.key.lockHash, workerLockHash: replay.transport.reply?.key?.lockHash ?? '',
+                leaseValid: finalized, canaryPassed: decision.reason === 'match' && finalized, agree: decision.reason === 'match' } };
           }
         } catch (error) {
           observation = { files: [...files], attemptId, status: 'unmeasured', reason: String(error), quarantined: 'unavailable' };
@@ -3857,10 +3929,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     const explicitPartial = opts.full ? null : partialRead.plan;
     const rehearsalStampPresent = ['hard-5h', 'hard-mid'].some((step) =>
       existsSync(join(root, 'release', opts.version, 'rehearsal', `${step}.json`)));
-    const currentIdentity = !opts.full && !explicitPartial && opts.graphRunId && opts.pod && rehearsalStampPresent
+    const currentIdentity = !opts.full && !explicitPartial && opts.graphRunId && opts.pod
       ? identityProbe(opts.pod.pool, process.env, opts.commit) : null;
     const currentImage = currentIdentity?.imageDigest ?? (!opts.full && !explicitPartial
-      && opts.graphRunId && opts.pod && rehearsalStampPresent ? imageProbe(opts.pod.pool, opts.commit) : null);
+      && opts.graphRunId && opts.pod ? imageProbe(opts.pod.pool, opts.commit) : null);
     const receiptImage = currentImage ?? (opts.graphRunId && opts.pod && process.env.ELANOUS_GRAPH_CONTEXT
       ? imageProbe(opts.pod.pool, opts.commit) : null);
     const receiptBase = opts.baselineCommit ?? (roots.some((location) =>
@@ -3888,18 +3960,100 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           debug.log('release-loop.gate', 'train-receipt-plan-failed', { version: opts.version, reason: String(error).slice(0, 240) });
         }
       }
+      // The same graph run's previous formal gate is the fallback when train receipts cannot carry.
+      // Diff paths are resolved through imports and literal file consumers; unverifiable closure fails closed.
+      let formalReceiptFallback: { priorCommit: string; files: string[]; priorFailures: string[]; priorErrors: string[] } | null = null;
+      const formalReceiptRoot = join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts');
+      const formalNames = existsSync(formalReceiptRoot) ? readdirSync(formalReceiptRoot).filter((name) => /^pod-\d+\.receipt\.json$/.test(name)) : [];
+      const formalRows = formalNames.sort((a, b) => Number(a.slice(4).split('.')[0]) - Number(b.slice(4).split('.')[0]))
+        .map((name) => readGateShardManifest(formalReceiptRoot, name.replace('.receipt.json', '')));
+      const priorHead = formalRows[0]?.head40;
+      let formalInventoryReason = 'formal-receipt-test-inventory-unreadable';
+      let formalInventoryComplete = false;
+      let formalPayloadComplete = false;
+      if (priorHead && formalRows.length) {
+        try {
+          const priorTests = gateAssignableTestsAtCommit(repo, priorHead);
+          const receiptFiles = formalRows.flatMap((row) => row?.files ?? []);
+          formalInventoryComplete = !!priorTests
+            && formalRows.every((row, index) => row?.id === 'pod-' + index && row.status === 'complete')
+            && new Set(receiptFiles).size === receiptFiles.length
+            && JSON.stringify([...receiptFiles].sort()) === JSON.stringify([...(priorTests ?? [])].sort());
+          formalInventoryReason = priorTests ? 'formal-receipt-shard-inventory-incomplete' : formalInventoryReason;
+          formalPayloadComplete = formalInventoryComplete && formalRows.every((row) => !!row
+            && !!readGateShardResult(formalReceiptRoot, { shard: row, head40: row.head40, base40: row.base40, envKey: row.envKey }));
+        } catch { formalInventoryComplete = false; formalPayloadComplete = false; }
+      }
+      const formalIdentity = currentIdentity && currentImage ? { ...currentIdentity, imageDigest: currentImage } : null;
+      let formalReason = !formalRows.length ? 'formal-receipt-set-absent'
+        : formalRows.some((row) => !row || row.status !== 'complete') ? 'formal-receipt-set-incomplete'
+        : formalRows.some((row) => row!.version !== opts.version) ? 'formal-receipt-version-mismatch'
+        : !formalInventoryComplete ? formalInventoryReason
+        : !formalPayloadComplete ? 'formal-receipt-payload-incomplete'
+        : formalRows.some((row) => row!.graphRunId !== opts.graphRunId) ? 'formal-receipt-run-id-missing-or-mismatch'
+        : !receiptBase ? 'formal-receipt-base40-unmeasured'
+        : formalRows.some((row) => row!.base40 !== receiptBase) ? 'formal-receipt-base40-mismatch'
+        : !gateGraphPins(root, opts.graphRunId) ? 'formal-receipt-graph-pins-unmeasured'
+        : formalRows.some((row) => !/^[a-f0-9]{64}$/i.test(row!.graphSha) || !/^[a-f0-9]{64}$/i.test(row!.recipeSha)
+          || row!.graphSha !== formalRows[0]!.graphSha || row!.recipeSha !== formalRows[0]!.recipeSha) ? 'formal-receipt-graph-pins-missing-or-mixed'
+        : !gateShardRecipeIdentityAtCommit(repo, opts.commit) ? 'formal-receipt-recipe-identity-unmeasured'
+        : formalRows.some((row) => !row!.graphEntry || !row!.recipeCommand || !Number.isSafeInteger(row!.recipeTimeoutMs)
+          || row!.graphEntry !== formalRows[0]!.graphEntry || row!.recipeCommand !== formalRows[0]!.recipeCommand
+          || row!.recipeTimeoutMs !== formalRows[0]!.recipeTimeoutMs) ? 'formal-receipt-recipe-identity-missing-or-mixed'
+        : !formalIdentity ? 'current-image-or-runtime-unmeasured'
+        : formalRows.some((row) => row!.head40 !== priorHead) ? 'formal-receipt-heads-mixed'
+        : formalRows.some((row) => row!.runtimeIdentity?.baseImageDigest !== formalIdentity.baseImageDigest) ? 'formal-receipt-environment-baseImageDigest-mismatch'
+        : formalRows.some((row) => row!.envFingerprint !== formalIdentity.envFingerprint
+          || JSON.stringify(row!.runtimeIdentity) !== JSON.stringify({ bunVersion: formalIdentity.bunVersion, platform: formalIdentity.platform,
+            architecture: formalIdentity.architecture, envFingerprint: formalIdentity.envFingerprint, baseImageDigest: formalIdentity.baseImageDigest })) ? 'formal-receipt-environment-mismatch'
+        : formalRows.some((row) => row!.imageDigest !== formalRows[0]!.imageDigest) ? 'formal-receipt-image-set-mixed'
+        : formalRows.some((row) => !gateRuntimeSourceFingerprint(repo, row!.head40, row!.runtimeIdentity)
+          || gateRuntimeSourceFingerprint(repo, row!.head40, row!.runtimeIdentity) !== gateRuntimeSourceFingerprint(repo, opts.commit, formalIdentity))
+          ? 'formal-receipt-runtime-fingerprint-mismatch'
+        : 'formal-receipt-radius-unmeasured';
+      if (formalReason === 'formal-receipt-radius-unmeasured' && priorHead && priorHead !== opts.commit) {
+        try {
+          const tests = gateAssignableTestsAtCommit(repo, opts.commit);
+          const changed = changedFilesBetween(repo, priorHead, opts.commit);
+          if (!tests) formalReason = 'formal-receipt-test-inventory-unreadable';
+          else {
+            const closure = testsReachingChanged(gitClosureTree(repo, opts.commit), changed, tests);
+            if (!closure.ok) formalReason = 'formal-receipt-radius-opaque:' + closure.reason;
+            else if (!closure.tests.length) formalReason = 'formal-receipt-no-consumers';
+            else {
+              formalReceiptFallback = { priorCommit: priorHead, files: closure.tests,
+                priorFailures: formalRows.flatMap((row) => row?.failureIds ?? []), priorErrors: formalRows.flatMap((row) => row?.errorIds ?? []) };
+              formalReason = 'formal-receipt-radius-proven';
+            }
+          }
+        } catch (error) { formalReason = 'formal-receipt-radius-error:' + String(error).slice(0, 160); }
+      }
+      const formalFallbackSelected = !partial && formalReceiptFallback !== null;
+      if (formalFallbackSelected && formalReceiptFallback) {
+        partial = { version: opts.version, priorCommit: formalReceiptFallback.priorCommit, forCommit: opts.commit,
+          files: formalReceiptFallback.files, priorFailures: formalReceiptFallback.priorFailures, priorErrors: formalReceiptFallback.priorErrors };
+      }
+      debug.log('release-loop.gate', 'formal-receipt-fallback', { runId: opts.graphRunId, version: opts.version,
+        priorCommit: priorHead ?? null, commit: opts.commit, reason: formalReason,
+        changedFiles: priorHead && priorHead !== opts.commit ? (() => { try { return changedFilesBetween(repo, priorHead, opts.commit).length; } catch { return null; } })() : 0,
+        selectedTests: formalReceiptFallback?.files.length ?? 0,
+        carriedTests: formalReceiptFallback ? Math.max(0, formalRows.reduce((sum, row) => sum + (row?.files.length ?? 0), 0) - formalReceiptFallback.files.length) : 0,
+        action: formalFallbackSelected ? 'radius-regate' : partial ? 'existing-plan-preserved' : 'full-sweep' });
       if (trainReceiptPlan) {
         result.trainReceiptReuse = { carried: trainReceiptPlan.carriedFiles.length, total: trainReceiptPlan.totalFiles,
-          receipts: trainReceiptPlan.receipts.length, reasons: trainReceiptPlan.reasons };
+          receipts: trainReceiptPlan.receipts.length, reasons: [...trainReceiptPlan.reasons, ...(formalReceiptFallback ? [formalReason] : [])] };
         debug.log('release-loop.gate', 'train-receipt-plan', { version: opts.version, commit: opts.commit,
           carried: trainReceiptPlan.carriedFiles.length, total: trainReceiptPlan.totalFiles,
           ratio: trainReceiptPlan.carriedFiles.length / trainReceiptPlan.totalFiles,
           receipts: trainReceiptPlan.receipts, selectedFiles: trainReceiptPlan.files.length,
-          reasons: trainReceiptPlan.reasons, action: trainReceiptPlan.carriedFiles.length ? 'run-remaining-tests' : 'full-sweep' });
+          reasons: [...trainReceiptPlan.reasons, ...(formalReceiptFallback ? [formalReason] : [])], action: formalFallbackSelected ? 'formal-receipt-radius-regate' : partial ? 'existing-plan-preserved' : trainReceiptPlan.carriedFiles.length ? 'run-remaining-tests' : 'full-sweep' });
       } else if (!opts.full && !explicitPartial && !radius?.plan) {
         debug.log('release-loop.gate', 'train-receipt-plan', { version: opts.version, commit: opts.commit,
-          carried: 0, total: null, ratio: 0, receipts: [], selectedFiles: null,
-          reasons: ['no safe receipt coverage'], action: 'full-sweep' });
+          carried: formalReceiptFallback ? Math.max(0, formalRows.reduce((sum, row) => sum + (row?.files.length ?? 0), 0) - formalReceiptFallback.files.length) : 0,
+          total: formalReceiptFallback ? formalRows.reduce((sum, row) => sum + (row?.files.length ?? 0), 0) : null,
+          ratio: formalReceiptFallback ? (formalRows.reduce((sum, row) => sum + (row?.files.length ?? 0), 0) - formalReceiptFallback.files.length) / Math.max(1, formalRows.reduce((sum, row) => sum + (row?.files.length ?? 0), 0)) : 0,
+          receipts: formalReceiptFallback ? formalRows.length : [], selectedFiles: formalReceiptFallback?.files.length ?? null,
+          reasons: formalReceiptFallback ? [formalReason] : ['no safe receipt coverage'], action: formalFallbackSelected ? 'formal-receipt-radius-regate' : partial ? 'existing-plan-preserved' : 'full-sweep' });
       }
     }
     const explicitPodPlan = !!explicitPartial && explicitPartial.kind !== 'recheck' && !!opts.pod;
@@ -4254,9 +4408,15 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       concurrency: opts.pod && runner.recheckPod ? recheckConcurrency : 1, executor: opts.pod && runner.recheckPod ? 'pod' : 'host',
       remote: opts.remote ?? null, podBatchFiles: opts.pod && runner.recheckPod && runner.recheckPodBatch ? GATE_RECHECK_POD_BATCH_FILES : 1 });
     const recheckStartedAt = clock();
-    const recordWarmShadow = (shadow?: WarmShadowObservation) => {
-      if (shadow && !result.warmShadow?.some((entry) => entry.attemptId === shadow.attemptId))
-        (result.warmShadow ??= []).push(shadow);
+    const recordedWarmAttemptIds = new Set((result.warmShadow ?? []).map((entry) => entry.attemptId));
+    const recordWarmShadow = async (shadow?: WarmShadowObservation) => {
+      if (!shadow || recordedWarmAttemptIds.has(shadow.attemptId)) return;
+      recordedWarmAttemptIds.add(shadow.attemptId);
+      await journalWarmGateShadow(shadow, opts.commit, runner, opts.repo ?? process.cwd());
+      {
+        const { leaseEvidence: _leaseEvidence, ...persistedShadow } = shadow;
+        (result.warmShadow ??= []).push(persistedShadow);
+      }
     };
     const recheckFile = async (file: string, index: number) => {
       debug.log('release-loop.gate', 'isolated-recheck-progress',
@@ -4266,7 +4426,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           ? await runner.recheckPod(file, opts.commit, { ...opts.pod, warmCutSha: opts.commit, warmBaselineSha: baseSha,
             warmEligible: warmEligibleFiles.has(file) }, GATE_ISOLATED_TIMEOUT_MS)
         : await runner.command('bun', ['run', 'test:deterministic', asPath(file)], cutTree, GATE_ISOLATED_TIMEOUT_MS));
-      recordWarmShadow(cutCheck?.warmShadow);
+      await recordWarmShadow(cutCheck?.warmShadow);
       if (cutCheck?.timedOut) {
         debug.log('release-loop.gate', 'isolated-timeout', { file, label: 'cut isolated', limitMs: GATE_ISOLATED_TIMEOUT_MS });
         result.stalledEnv.push({ file, reason: 'isolated-timeout', local: 'timeout' });
@@ -4292,7 +4452,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           ? await runner.recheckPod(file, opts.commit, { ...opts.pod, warmCutSha: opts.commit, warmBaselineSha: baseSha,
             warmEligible: warmEligibleFiles.has(file) }, GATE_ISOLATED_TIMEOUT_MS, true)
           : await runner.command('bun', ['run', 'test:deterministic', asPath(file), '--timeout', String(GATE_TIMEOUT_RECHECK_MS)], cutTree, GATE_ISOLATED_TIMEOUT_MS);
-        recordWarmShadow(relaxed.warmShadow);
+        await recordWarmShadow(relaxed.warmShadow);
         let flaky: string[] = [];
         let recheck: 'read' | 'timeout' | 'unreadable' = 'read';
         if (relaxed.timedOut) recheck = 'timeout';
@@ -4387,7 +4547,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         }
       }
       for (const [file, run] of completed) {
-        recordWarmShadow(run.warmShadow);
+        await recordWarmShadow(run.warmShadow);
         prefetchedCut.set(file, run);
       }
       if (failures.length) throw new SettledRecheckFailures(failures);

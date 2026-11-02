@@ -1,8 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { renderSeminarRehearsal, SEMINAR_SCENES, seminarRehearsalSweep, simSeminarRehearsal, type SeminarSceneRecord } from './seminar-rehearsal.js';
+import { recordSeminarRehearsal, renderSeminarRehearsal, SEMINAR_SCENES, seminarRehearsalSweep, simSeminarRehearsal, type SeminarSceneRecord } from './seminar-rehearsal.js';
+import { withSimClock } from './fake-clock.js';
+import { createSimWorld, destroySimWorld, listSimWorlds } from './world-store.js';
+import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 
 function fullPassRecords(): SeminarSceneRecord[] {
   return SEMINAR_SCENES.map((scene) => ({
@@ -88,4 +92,122 @@ describe('simSeminarRehearsal', () => {
     const mixed = spawnSync(process.execPath, [script, '--seminar-rehearsal', '--fault', 'pool-cap'], { encoding: 'utf8', timeout: 90_000 });
     expect(mixed.status).toBe(2);
   }, 120_000);
+});
+
+describe('seminar same-build freeze device', () => {
+  test('serializes a third pass against an unapproved build change across processes', async () => {
+    const previousRoot = getTestStateRoot();
+    const root = mkdtempSync(join(tmpdir(), 'sim-seminar-freeze-race-'));
+    const worlds = join(root, 'sim', 'worlds');
+    mkdirSync(worlds, { recursive: true, mode: 0o700 });
+    setTestStateRoot(root);
+    try {
+      const world = createSimWorld('seminar-freeze-race', { worldsDir: worlds });
+      const passes = fullPassRecords();
+      recordSeminarRehearsal(world, { buildId: 'build-a', records: passes });
+      recordSeminarRehearsal(world, { buildId: 'build-a', records: passes });
+      const childCode = `
+        import { setTestStateRoot } from './src/nexus/paths.js';
+        import { listSimWorlds } from './src/ux-sim/world-store.js';
+        import { recordSeminarRehearsal } from './src/ux-sim/seminar-rehearsal.js';
+        import { existsSync, writeFileSync } from 'node:fs';
+        writeFileSync(process.env.SIM_READY, 'ready');
+        const cell = new Int32Array(new SharedArrayBuffer(4));
+        while (!existsSync(process.env.SIM_START)) Atomics.wait(cell, 0, 0, 5);
+        setTestStateRoot(process.env.SIM_TEST_ROOT);
+        const world = listSimWorlds({ worldsDir: process.env.SIM_WORLDS }).find((item) => item.id === process.env.SIM_WORLD_ID);
+        const attempt = recordSeminarRehearsal(world, { buildId: process.env.SIM_BUILD_ID, records: JSON.parse(process.env.SIM_RECORDS) });
+        process.stdout.write(JSON.stringify({ accepted: attempt.accepted, decision: attempt.decision, requestedBuildId: process.env.SIM_BUILD_ID, stateBuildId: attempt.state.buildId, frozen: attempt.state.frozen }));
+      `;
+      const startFile = join(root, 'start');
+      const runChild = (buildId: string, side: string) => Bun.spawn([process.execPath, '-e', childCode], {
+        cwd: join(import.meta.dir, '../..'),
+        env: { ...process.env, SIM_TEST_ROOT: root, SIM_WORLDS: worlds, SIM_WORLD_ID: world.id, SIM_BUILD_ID: buildId, SIM_READY: join(root, side + '.ready'), SIM_START: startFile, SIM_RECORDS: JSON.stringify(passes) },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      const children = [runChild('build-a', 'a'), runChild('build-b', 'b')];
+      const readyDeadline = Date.now() + 5_000;
+      while ((!existsSync(join(root, 'a.ready')) || !existsSync(join(root, 'b.ready'))) && Date.now() < readyDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(existsSync(join(root, 'a.ready')) && existsSync(join(root, 'b.ready'))).toBe(true);
+      writeFileSync(startFile, 'go');
+      const results = await Promise.all(children.map(async (child) => {
+        const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+        expect(exitCode, stderr).toBe(0);
+        return JSON.parse(stdout) as { accepted: boolean; decision: string; requestedBuildId: string; stateBuildId: string; frozen: boolean };
+      }));
+      const buildA = results.find((result) => result.requestedBuildId === 'build-a')!;
+      const buildB = results.find((result) => result.requestedBuildId === 'build-b')!;
+      if (buildA.frozen) expect(buildB).toMatchObject({ accepted: false, decision: 'owner-approval-required', stateBuildId: 'build-a' });
+      else expect(buildB.accepted).toBe(true);
+      const finalWorld = listSimWorlds({ worldsDir: worlds }).find((candidate) => candidate.id === world.id)!;
+      if (buildA.frozen) {
+        expect(recordSeminarRehearsal(finalWorld, { buildId: "build-b", records: passes })).toMatchObject({ accepted: false, state: { buildId: "build-a", consecutivePasses: 3, frozen: true } });
+      } else {
+        expect(JSON.parse(readFileSync(join(finalWorld.stateDir, 'seminar-rehearsal-freeze.json'), 'utf8'))).toMatchObject({ buildId: 'build-a', consecutivePasses: 1, frozen: false });
+      }
+      expect(destroySimWorld(world.id, { worldsDir: worlds })).toBe(true);
+    } finally {
+      setTestStateRoot(previousRoot ?? null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('persists three consecutive passes, refuses an unapproved build change, and resumes on owner approval', async () => {
+    const previousRoot = getTestStateRoot();
+    const root = mkdtempSync(join(tmpdir(), 'sim-seminar-freeze-'));
+    const worlds = join(root, 'sim', 'worlds');
+    mkdirSync(worlds, { recursive: true, mode: 0o700 });
+    setTestStateRoot(root);
+    try {
+      const world = createSimWorld('seminar-freeze', { worldsDir: worlds, now: () => new Date('2026-11-03T00:00:00.000Z') });
+      const passes = fullPassRecords();
+      const passesSeen: number[] = [];
+      const passTimestamps: string[] = [];
+      let laterFailure!: ReturnType<typeof recordSeminarRehearsal>;
+      let refusal!: ReturnType<typeof recordSeminarRehearsal>;
+      let mismatchedApproval!: ReturnType<typeof recordSeminarRehearsal>;
+      let approved!: ReturnType<typeof recordSeminarRehearsal>;
+      let persistedAtRefusal: unknown;
+      let simulatedNow = 0;
+      await withSimClock(new Date('2026-11-03T00:00:00.000Z'), (clock) => {
+        const firstPass = recordSeminarRehearsal(world, { buildId: 'build-a', records: passes });
+        passesSeen.push(firstPass.state.consecutivePasses);
+        passTimestamps.push(firstPass.state.updatedAt);
+        clock.tick(1_000);
+        const interrupted = recordSeminarRehearsal(world, { buildId: 'build-a', records: [{ ...passes[0]!, outcome: 'fail' }, ...passes.slice(1)] });
+        passesSeen.push(interrupted.state.consecutivePasses);
+        clock.tick(1_000);
+        for (let expected = 1; expected <= 3; expected += 1) {
+          const attempt = recordSeminarRehearsal(world, { buildId: 'build-a', records: passes });
+          passesSeen.push(attempt.state.consecutivePasses);
+          passTimestamps.push(attempt.state.updatedAt);
+          clock.tick(1_000);
+        }
+        const reopenedWorld = listSimWorlds({ worldsDir: worlds }).find((candidate) => candidate.id === world.id)!;
+        laterFailure = recordSeminarRehearsal(reopenedWorld, { buildId: 'build-a', records: [{ ...passes[0]!, outcome: 'fail' }, ...passes.slice(1)] });
+        refusal = recordSeminarRehearsal(reopenedWorld, { buildId: 'build-b', records: passes });
+        mismatchedApproval = recordSeminarRehearsal(reopenedWorld, { buildId: 'build-b', records: passes, approval: { owner: 'OP', buildId: 'build-a', receiptId: 'wrong-build' } });
+        const receiptPath = join(world.stateDir, 'seminar-rehearsal-freeze.json');
+        persistedAtRefusal = JSON.parse(readFileSync(receiptPath, 'utf8'));
+        approved = recordSeminarRehearsal(reopenedWorld, {
+          buildId: 'build-b', records: passes, approval: { owner: 'OP', buildId: 'build-b', receiptId: 'approval-0301-1' },
+        });
+        simulatedNow = clock.now();
+      });
+      expect(passesSeen).toEqual([1, 0, 1, 2, 3]);
+      expect(passTimestamps).toEqual(['2026-11-03T00:00:00.000Z', '2026-11-03T00:00:02.000Z', '2026-11-03T00:00:03.000Z', '2026-11-03T00:00:04.000Z']);
+      expect(laterFailure.state).toMatchObject({ consecutivePasses: 3, frozen: true });
+      expect(refusal).toMatchObject({ accepted: false, decision: 'owner-approval-required', rehearsal: null, state: { buildId: 'build-a', consecutivePasses: 3, frozen: true, lastDeniedBuildId: 'build-b' } });
+      expect(mismatchedApproval).toMatchObject({ accepted: false, decision: 'owner-approval-required', rehearsal: null });
+      expect(persistedAtRefusal).toMatchObject({ buildId: 'build-a', frozen: true, lastDeniedBuildId: 'build-b' });
+      expect(approved).toMatchObject({ accepted: true, decision: 'recorded', rehearsal: { verdict: 'pass' }, state: { buildId: 'build-b', consecutivePasses: 1, frozen: false, approvedBy: 'OP' } });
+      expect(simulatedNow).toBe(Date.parse('2026-11-03T00:00:05.000Z'));
+      const reset = recordSeminarRehearsal(world, { buildId: 'build-b', records: [{ ...passes[0]!, outcome: 'fail' }, ...passes.slice(1)] });
+      expect(reset.state).toMatchObject({ buildId: 'build-b', consecutivePasses: 0, frozen: false });
+      expect(destroySimWorld(world.id, { worldsDir: worlds })).toBe(true);
+    } finally {
+      setTestStateRoot(previousRoot ?? null);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

@@ -25,6 +25,228 @@ test('visible agent readiness recognizes Grok Build bordered composer, not its b
   expect(isAgentInputPrompt('Grok Build  1.0.70 [stable]')).toBe(false);
 });
 
+test('Grok directory trust screen is classified before a predetermined response is enabled', () => {
+  const fakeHerdrTrustScreen = [
+    'Do you trust the contents of this directory?',
+    '/worktrees/demo-a4',
+    'Grok Build may run or modify contents in this directory.',
+    'Yes, proceed y / No, quit n',
+  ].join('\n');
+  expect(classifyAgentStartupScreen('grok', fakeHerdrTrustScreen)).toBe('grok-workspace-trust');
+  expect(classifyAgentStartupScreen('grok', 'Do you trust the contents of this directory?\nGrok Build may run or modify contents in this directory.')).toBeUndefined();
+  expect(classifyAgentStartupScreen('grok', 'Yes, proceed y / No, quit n')).toBeUndefined();
+});
+
+test('approved Grok worktree trust receives one response and does not consume startup readiness time', async () => {
+  let now = 0;
+  let screen = [
+    'Do you trust the contents of this directory?',
+    '/worktrees/demo-a4',
+    'Grok Build may run or modify contents in this directory.',
+    'Yes, proceed y / No, quit n',
+  ].join('\n');
+  let trustAcceptedAt: number | undefined;
+  let submitted = 0;
+  let resultReady = false;
+  let markerReady = false;
+  const writes: string[] = [];
+  const startupScreens: string[] = [];
+  const markerText = (): string | undefined => writes.find(write => write.startsWith('Say M-'))?.match(/M-[a-f0-9]{12}/)?.[0];
+  const result = await runVisibleAgentMission({
+    agent: 'grok', allowWorkspaceTrustOnce: true, now: () => now,
+    pty: {
+      snapshot: () => screen,
+      write: bytes => {
+        writes.push(bytes);
+        if (bytes === 'y\r') { trustAcceptedAt = now; return; }
+        if (bytes === '\r') {
+          submitted++;
+          if (submitted === 1) { resultReady = true; screen = '❯ Ask Grok to do anything'; }
+          else { markerReady = true; screen = `└ ${markerText()}`; }
+          return;
+        }
+        screen += bytes;
+      },
+      isAlive: () => true,
+    },
+    mission: 'Write the demo result.', outputPath: '/tmp/grok-trust-once.md',
+    handleTrust: () => false,
+    onStartupScreen: startup => startupScreens.push(startup),
+    readFile: path => {
+      const marker = markerText();
+      if (marker && path.endsWith(`.completion-${marker}`)) {
+        if (markerReady) return marker;
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      }
+      if (resultReady) return '# candidate\n';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    },
+    sleep: async () => {
+      now += 10;
+      if (trustAcceptedAt !== undefined && now - trustAcceptedAt >= 30) screen = '❯ Ask Grok to do anything';
+    },
+    readyTimeoutMs: 20, workspaceTrustTimeoutMs: 100, pollMs: 10,
+  });
+
+  expect(result.ok).toBe(true);
+  expect(writes.filter(write => write === 'y\r')).toHaveLength(1);
+  expect(startupScreens).toEqual(['grok-workspace-trust']);
+});
+
+test('demo Codex hook review chooses continue-without-trusting exactly once', async () => {
+  const writes: string[] = [];
+  let screen = "Hooks need review\n1 hook is new or changed.\n1. Review hooks\n2. Trust all and continue\n3. Continue without trusting (hooks won't run)\nenter confirm · esc skip";
+  let enterCount = 0;
+  let fileReady = false;
+  let markerReady = false;
+  let trustHandlerCalls = 0;
+  const markerText = (): string | undefined => writes.find(write => write.startsWith('Say M-'))?.match(/M-[a-f0-9]{12}/)?.[0];
+  const result = await runVisibleAgentMission({
+    agent: 'codex', allowDemoStartupDismissalsOnce: true,
+    pty: {
+      snapshot: () => screen,
+      write: bytes => {
+        writes.push(bytes);
+        if (bytes === '3') { screen = '› Ask Codex to do anything'; return; }
+        if (bytes === '\r') {
+          enterCount++;
+          if (enterCount === 1) { fileReady = true; screen = '› Ask Codex to do anything'; }
+          else { markerReady = true; screen = `└ ${markerText()}`; }
+          return;
+        }
+        screen += bytes;
+      },
+      isAlive: () => true,
+    },
+    mission: 'Write a note.', outputPath: '/tmp/codex-hooks-review.md',
+    handleTrust: () => { if (screen.includes('Hooks need review')) trustHandlerCalls++; return false; },
+    readFile: path => {
+      const marker = markerText();
+      if (marker && path.endsWith(`.completion-${marker}`)) {
+        if (markerReady) return marker;
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      }
+      if (fileReady) return '# Result\n';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    },
+    sleep: async () => {}, pollMs: 0,
+  });
+
+  expect(result).toMatchObject({ ok: true, promptReady: true, missionVisible: true, promptReturned: true, completionMarker: true });
+  expect(writes.filter(write => write === '3')).toHaveLength(1);
+  expect(writes).not.toContain('2');
+  expect(trustHandlerCalls).toBe(0);
+});
+
+test('non-demo Codex hook review remains available to the existing trust handler', async () => {
+  let now = 0;
+  let trustHandlerCalls = 0;
+  const writes: string[] = [];
+  const result = await runVisibleAgentMission({
+    agent: 'codex', now: () => now,
+    pty: {
+      snapshot: () => "Hooks need review\n1 hook is new or changed.\n1. Review hooks\n2. Trust all and continue\n3. Continue without trusting (hooks won't run)",
+      write: bytes => { writes.push(bytes); return true; },
+      isAlive: () => true,
+    },
+    mission: 'Write a note.', outputPath: '/tmp/non-demo-codex-hooks.md',
+    handleTrust: () => { trustHandlerCalls++; return true; },
+    sleep: async ms => { now += ms || 1; }, pollMs: 0, readyTimeoutMs: 20,
+  });
+
+  expect(result).toMatchObject({ ok: false, failureStage: 'prompt-readiness' });
+  expect(trustHandlerCalls).toBe(1);
+  expect(writes).not.toContain('3');
+});
+
+test.each([
+  { label: 'workspace-trust wait cap', workspaceTrustTimeoutMs: 15, completionTimeoutMs: 100 },
+  { label: 'overall completion cap', workspaceTrustTimeoutMs: 100, completionTimeoutMs: 15 },
+])('Grok trust prompt clearing after the $label still fails closed', async ({ workspaceTrustTimeoutMs, completionTimeoutMs }) => {
+  let now = 0;
+  let screen = 'Do you trust the contents of this directory?\nGrok Build may run or modify contents in this directory.\nYes, proceed y / No, quit n';
+  const writes: string[] = [];
+  const result = await runVisibleAgentMission({
+    agent: 'grok', allowWorkspaceTrustOnce: true, now: () => now,
+    pty: {
+      snapshot: () => screen,
+      write: bytes => { writes.push(bytes); return true; },
+      isAlive: () => true,
+    },
+    mission: 'Write the demo result.', outputPath: '/tmp/grok-trust-deadline.md',
+    handleTrust: () => false,
+    sleep: async ms => {
+      now += ms || 1;
+      if (now >= Math.min(workspaceTrustTimeoutMs, completionTimeoutMs)) screen = '❯ Ask Grok to do anything';
+    },
+    readyTimeoutMs: 10, workspaceTrustTimeoutMs, completionTimeoutMs, pollMs: 0,
+  });
+
+  expect(result).toMatchObject({
+    ok: false, failureStage: 'prompt-readiness',
+    error: 'Grok workspace-trust screen did not clear before its bounded wait expired',
+    initialScreen: expect.stringContaining('Do you trust the contents of this directory?'),
+  });
+  expect(writes).toContain('y\r');
+  expect(writes.some(write => write.includes('Write the result to the exact file path'))).toBe(false);
+});
+
+test('demo Claude update notice receives one Escape dismissal before mission input', async () => {
+  const writes: string[] = [];
+  let screen = 'Updated to latest. Got 5 features, 88 bugfixes, and 29 other changes.';
+  let enterCount = 0;
+  let fileReady = false;
+  let markerReady = false;
+  const markerText = (): string | undefined => writes.find(write => write.startsWith('Say M-'))?.match(/M-[a-f0-9]{12}/)?.[0];
+  const result = await runVisibleAgentMission({
+    agent: 'claude', allowDemoStartupDismissalsOnce: true,
+    pty: {
+      snapshot: () => screen,
+      write: bytes => {
+        writes.push(bytes);
+        if (bytes === '\u001b') { screen = '❯ '; return; }
+        if (bytes === '\r') {
+          enterCount++;
+          if (enterCount === 1) { fileReady = true; screen = '❯ Ask Claude Code to do anything'; }
+          else { markerReady = true; screen = `└ ${markerText()}`; }
+          return;
+        }
+        screen += bytes;
+      },
+      isAlive: () => true,
+    },
+    mission: 'Write a note.', outputPath: '/tmp/claude-update-notice.md',
+    handleTrust: () => false,
+    readFile: path => {
+      const marker = markerText();
+      if (marker && path.endsWith(`.completion-${marker}`)) {
+        if (markerReady) return marker;
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      }
+      if (fileReady) return '# Result\n';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    },
+    sleep: async () => {}, pollMs: 0,
+  });
+
+  expect(result).toMatchObject({ ok: true, promptReady: true, missionVisible: true, promptReturned: true, completionMarker: true });
+  expect(writes.filter(write => write === '\u001b')).toHaveLength(1);
+});
+
+test('Grok directory trust is not answered outside an approved worktree', async () => {
+  const writes: string[] = [];
+  let now = 0;
+  const screen = 'Do you trust the contents of this directory?\nGrok Build may run or modify contents in this directory.\nYes, proceed y / No, quit n';
+  const result = await runVisibleAgentMission({
+    agent: 'grok', allowWorkspaceTrustOnce: false, now: () => now,
+    pty: { snapshot: () => screen, write: bytes => { writes.push(bytes); }, isAlive: () => true },
+    mission: 'Write the demo result.', outputPath: '/tmp/grok-trust-not-approved.md', handleTrust: () => false,
+    sleep: async ms => { now += ms || 1; }, readyTimeoutMs: 20, pollMs: 10,
+  });
+  expect(result).toMatchObject({ ok: false, failureStage: 'prompt-readiness', startupScreen: 'grok-workspace-trust' });
+  expect(writes).not.toContain('y\r');
+});
+
 test('visible mission lets backend skip a Codex update modal before waiting for its prompt', async () => {
   const writes: string[] = [];
   const detected: string[] = [];

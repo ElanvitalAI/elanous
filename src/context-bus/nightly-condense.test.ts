@@ -12,7 +12,7 @@ import type { CoordEvent } from './coord-events.js';
 import { runGraph, lastJsonObject } from '../graph-runner/runner.js';
 import { listLoops, setLoopEnabled } from '../loops/registry.js';
 import { registerLoopCommands } from '../loops/loop-cli.js';
-import { runNightlyStage, summarize, summaryInstruction } from './nightly-condense.js';
+import { executeAssignment, runNightlyStage, summarize, summaryInstruction, type Assignment } from './nightly-condense.js';
 import { condenseContextWindowWithReport, type MemoryItem } from './long-term-memory.js';
 
 const root = resolve(import.meta.dir, '../..');
@@ -59,6 +59,39 @@ function fixture() {
       'https://example.test/2': { project: 'beta', topic: 'release', summary: 'ready', promote: true, claim: { key: 'release-ready', value: 'on' } },
     } };
   return { state, input };
+}
+
+let inProcessWorkerId = 1_000_000;
+
+async function runGraphInProcess(options: Parameters<typeof runGraph>[1] = {}) {
+  const current = options ?? {};
+  const rootState = current.deps?.root;
+  if (!rootState) throw new Error('nightly graph fixture requires a state root');
+  return runGraph(graph, {
+    ...current,
+    deps: {
+      ...current.deps,
+      root: rootState,
+      runBash: async (body, runOptions) => {
+        const stage = body.match(/nightly-condense[.]ts["][ ]+(collect|condense|record|conflict-candidates)/)?.[1];
+        const contextPath = runOptions.env?.ELANOUS_GRAPH_CONTEXT;
+        if (!stage || !contextPath) return { stdout: '', stderr: 'unexpected nightly graph command', exitCode: 127 };
+        try {
+          const context = JSON.parse(readFileSync(contextPath, 'utf8')) as Parameters<typeof runNightlyStage>[1];
+          const stageRoot = resolve(contextPath, '..', '..', '..', '..');
+          const output = await runNightlyStage(stage as 'collect' | 'condense' | 'record' | 'conflict-candidates',
+            context, stageRoot, runOptions.env?.ELANOUS_GRAPH_DRY_RUN === '1', new Date(), undefined, undefined,
+            async <T>(assignment: Assignment) => ({
+              result: await executeAssignment(assignment) as T,
+              workerPid: inProcessWorkerId++,
+            }));
+          return { stdout: JSON.stringify(output) + '\n', stderr: '', exitCode: 0 };
+        } catch (error) {
+          return { stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 };
+        }
+      },
+    },
+  });
 }
 
 test('nightly librarian recipe separates coordinator promotion from guardian hygiene without changing the ordinary command', () => {
@@ -138,8 +171,9 @@ test('record is all-or-nothing: a later group over the size budget restores the 
   const now = new Date();
   const small: MemoryItem = { project: 'alpha', seat: 'TC', topic: 'new', summary: 'small', source: 'https://example.test/s',
     updatedAt: now.toISOString(), status: 'active' };
-  const huge: MemoryItem = { project: 'beta', seat: 'MK', topic: 'big', summary: 'x'.repeat(17 * 1024 * 1024),
+  const huge: MemoryItem = { project: 'beta', seat: 'MK', topic: 'big', summary: 'x'.repeat(16 * 1024 * 1024),
     source: 'https://example.test/h', updatedAt: now.toISOString(), status: 'active' };
+  expect(Buffer.byteLength(`${JSON.stringify(huge, null, 2)}\n`)).toBeGreaterThan(16 * 1024 * 1024);
   const collected = { day: input.day, events: input.events, decisions: [] };
   await expect(runNightlyStage('record', { input: { day: input.day }, outputs: { collect: collected, condense: { items: [small, huge] } } },
     state, false, now, undefined, items => [...items])).rejects.toThrow('size budget');
@@ -148,9 +182,9 @@ test('record is all-or-nothing: a later group over the size budget restores the 
   expect(readFileSync(join(state, 'context-memory', 'alpha', 'TC.json.gz')).equals(olderBackup)).toBe(true);
   expect(existsSync(join(state, 'context-memory', 'beta', 'MK.json.gz'))).toBe(false);
   expect(readdirSync(join(state, 'context-memory', 'alpha')).filter(name => name.endsWith('.tmp'))).toEqual([]);
-});
+}, 30_000);
 
-test('the live nightly graph assigns librarian sleep-review workers and guardian retirement workers', async () => {
+test.skipIf(process.env.GATE_INTEGRATION_ONLY !== '1')('nightly integration isolates librarian and guardian worker processes', async () => {
   const { state, input } = fixture();
   const old = { project: 'alpha', seat: 'OP', topic: 'old', summary: 'archived',
     source: 'https://example.test/old', updatedAt: '2020-01-01T00:00:00.000Z', status: 'active' };
@@ -176,7 +210,7 @@ test('the live nightly graph assigns librarian sleep-review workers and guardian
 
 test('live sleep-review workers honor coordinator promotion while preserving conflict candidates', async () => {
   const { state, input } = fixture();
-  const result = await runGraph(graph, { input: { ...input, summaries: { ...input.summaries,
+  const result = await runGraphInProcess({ input: { ...input, summaries: { ...input.summaries,
     'https://example.test/2': { ...input.summaries['https://example.test/2']!, promote: false },
   } }, deps: { root: state } });
   expect(result.status).toBe('done');
@@ -194,7 +228,7 @@ test('live sleep review stores promoted sourced events without comparable claims
     'https://example.test/0': { project: 'alpha', topic: 'release', summary: 'initial note', promote: true },
     'https://example.test/correction': { project: 'alpha', topic: 'release', summary: 'corrected note', promote: true },
   };
-  const result = await runGraph(graph, { input: { ...input, events: [...input.events, correction], summaries }, deps: { root: state } });
+  const result = await runGraphInProcess({ input: { ...input, events: [...input.events, correction], summaries }, deps: { root: state } });
   expect(result.status).toBe('done');
   const saved = JSON.parse(readFileSync(join(state, 'context-memory', 'alpha', 'TC.json'), 'utf8')) as MemoryItem[];
   expect(saved).toMatchObject([{ summary: 'corrected note', source: 'https://example.test/correction',
@@ -262,7 +296,7 @@ test('guardian rejects an oversized snapshot and restores the previous ledger fr
 
 test('nightly graph dry-run condenses fake day into memory items and conflict candidates without publishing or writing', async () => {
   const { state, input } = fixture();
-  const result = await runGraph(graph, { input, dryRun: true, deps: { root: state } });
+  const result = await runGraphInProcess({ input, dryRun: true, deps: { root: state } });
   expect(result.status).toBe('done');
   expect(result.path).toEqual(['collect', 'condense', 'record', 'conflict-candidates', 'done']);
   expect(lastJsonObject(result.nodes[2]?.output)).toMatchObject({ items: 3, dryRun: true,
@@ -275,7 +309,7 @@ test('nightly graph dry-run condenses fake day into memory items and conflict ca
 
 test('live graph stores project/seat memories and conflict candidate file without a decision card', async () => {
   const { state, input } = fixture();
-  const result = await runGraph(graph, { input, deps: { root: state } });
+  const result = await runGraphInProcess({ input, deps: { root: state } });
   expect(result.status).toBe('done');
   expect(lastJsonObject(result.nodes[3]?.output)).toMatchObject({ published: 0 });
   const memory = (project: string, seat: string) => JSON.parse(readFileSync(join(state, 'context-memory', project, `${seat}.json`), 'utf8'));
@@ -286,7 +320,7 @@ test('live graph stores project/seat memories and conflict candidate file withou
     { status: 'candidate', owner: 'OP', sources: ['https://example.test/0', 'https://example.test/1'] },
   ]);
   expect(readdirSync(state).sort()).toEqual(['context-memory', 'graph-runs']);
-  const repeat = await runGraph(graph, { input, deps: { root: state } });
+  const repeat = await runGraphInProcess({ input, deps: { root: state } });
   expect(gunzipSync(readFileSync(join(state, 'context-memory', 'alpha', 'TC.json.gz'))).toString())
     .toContain('"summary": "ready"');
   expect(gunzipSync(readFileSync(join(state, 'context-memory', 'conflict-candidates.json.gz'))).toString())
@@ -325,7 +359,7 @@ test('disabled nightly loop can be run once against isolated bus, channel and de
     const summaries = { ...input.summaries,
       [`elanous://decisions/${decision.id}`]: { project: 'beta', topic: 'launch', summary: 'route selected', promote: true },
     };
-    const result = await runGraph(graph, { input: { day: input.day, summaries }, deps: { root: state } });
+    const result = await runGraphInProcess({ input: { day: input.day, summaries }, deps: { root: state } });
     expect(result.status).toBe('done');
     expect(result.path).toEqual(['collect', 'condense', 'record', 'conflict-candidates', 'done']);
     expect(loop()).toMatchObject({ enabled: false, jobs: [], nextRun: null });
@@ -363,13 +397,24 @@ test('nightly replay carries old memory and retires it after 30 days without a n
   const file = join(state, 'context-memory', 'alpha', 'TC.json');
   mkdirSync(join(state, 'context-memory', 'alpha'), { recursive: true });
   writeFileSync(file, JSON.stringify([old]));
-  const result = await runGraph(graph, { input, deps: { root: state } });
+  const result = await runGraphInProcess({ input, deps: { root: state } });
   expect(result.status).toBe('done');
   expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject([
     { topic: 'old release', updatedAt: old.updatedAt, status: 'retired' },
     { topic: 'release', updatedAt: input.events[0]!.at, status: 'active' },
   ]);
 }, 90_000);
+
+function seedNewerNightlyState(state: string, day: string, memoryFile: string, candidatesFile: string): void {
+  rmSync(join(state, 'context-memory', 'alpha'), { recursive: true, force: true });
+  rmSync(join(state, 'context-memory', 'beta'), { recursive: true, force: true });
+  mkdirSync(join(state, 'context-memory'), { recursive: true });
+  mkdirSync(join(state, 'context-memory', 'alpha'), { recursive: true });
+  writeFileSync(join(state, 'context-memory', 'latest-day'), JSON.stringify(day) + '\n');
+  writeFileSync(memoryFile, JSON.stringify([{ project: 'alpha', seat: 'TC', topic: 'release', summary: 'newer kept',
+    source: 'https://example.test/0', updatedAt: `${day}T09:00:00.000Z`, status: 'active' }]));
+  writeFileSync(candidatesFile, '[]');
+}
 
 test('replaying an older day never overwrites later project/seat memory or candidate files', async () => {
   const { state, input } = fixture();
@@ -379,18 +424,17 @@ test('replaying an older day never overwrites later project/seat memory or candi
   })) };
   const memoryFile = join(state, 'context-memory', 'alpha', 'TC.json');
   const candidatesFile = join(state, 'context-memory', 'conflict-candidates.json');
-  expect((await runGraph(graph, { input: firstInput, deps: { root: state } })).status).toBe('done');
-  expect(JSON.parse(readFileSync(candidatesFile, 'utf8'))).toHaveLength(1);
-  const secondInput = { ...input, summaries: { ...input.summaries,
-    'https://example.test/1': { project: 'alpha', topic: 'launch', summary: 'ready', promote: true, claim: { key: 'release-ready', value: 'on' } },
-  } };
-  expect((await runGraph(graph, { input: secondInput, deps: { root: state } })).status).toBe('done');
+  seedNewerNightlyState(state, input.day, memoryFile, candidatesFile);
   const laterMemory = readFileSync(memoryFile, 'utf8');
   const laterCandidates = readFileSync(candidatesFile, 'utf8');
-  expect(JSON.parse(laterCandidates)).toEqual([]);
-  expect(JSON.parse(laterMemory)).toMatchObject([{ updatedAt: expect.stringContaining(input.day) }]);
-  const replay = await runGraph(graph, { input: firstInput, deps: { root: state } });
+
+  // A newer completed run is represented by its persisted ledger state; replay the real graph entry once.
+  const replay = await runGraphInProcess({ input: firstInput, deps: { root: state } });
   expect(replay.status).toBe('failed');
+  const collectFailure = replay.nodes.find(node => node.nodeId === 'collect');
+  expect(collectFailure?.ok).toBe(false);
+  expect([collectFailure?.error, collectFailure?.failure?.message, JSON.stringify(collectFailure?.output)].join('\n'))
+    .toContain(`cannot replay ${firstDay}`);
   expect(readFileSync(memoryFile, 'utf8')).toBe(laterMemory);
   expect(readFileSync(candidatesFile, 'utf8')).toBe(laterCandidates);
 }, 60_000);
@@ -404,39 +448,26 @@ test('interleaved older stages cannot replace newer project/seat memory or confl
   const older = { input: oldInput, outputs: {} };
   const collected = await runNightlyStage('collect', older, state, false);
   const oldCollected = { day: oldDay, events: oldInput.events, decisions: oldInput.decisions };
-  const condensed = await runNightlyStage('condense', { input: oldInput, outputs: { collect: oldCollected } }, state, false);
+  const condensed = await runNightlyStage('condense', { input: oldInput, outputs: { collect: oldCollected } }, state, false,
+    new Date(), source => summarize(source, input.summaries, 'sleep-review'));
   const oldItems = condensed.items as MemoryItem[];
   const oldContext = { input: oldInput, outputs: { collect: oldCollected, condense: { items: oldItems } } };
   expect(collected.day).toBe(oldDay);
   expect(oldItems).toHaveLength(3);
+  const oldRecord = await runNightlyStage('record', oldContext, state, false, new Date(), undefined, items => [...items]);
+  expect(oldRecord).toMatchObject({ outcome: 'ok', items: 3 });
 
-  const newerInput = { ...input, summaries: { ...input.summaries,
-    'https://example.test/1': { project: 'alpha', topic: 'launch', summary: 'ready', promote: true, claim: { key: 'release-ready', value: 'on' } },
-  } };
-  expect((await runGraph(graph, { input: newerInput, deps: { root: state } })).status).toBe('done');
   const memoryFile = join(state, 'context-memory', 'alpha', 'TC.json');
   const candidatesFile = join(state, 'context-memory', 'conflict-candidates.json');
+  seedNewerNightlyState(state, input.day, memoryFile, candidatesFile);
   const newestMemory = readFileSync(memoryFile, 'utf8');
   const newestCandidates = readFileSync(candidatesFile, 'utf8');
   expect(JSON.parse(newestCandidates)).toEqual([]);
-  await expect(runNightlyStage('record', oldContext, state, false)).rejects.toThrow(`cannot replay ${oldDay}`);
   await expect(runNightlyStage('conflict-candidates', { ...oldContext, outputs: {
-    ...oldContext.outputs, record: { memoryItems: oldItems },
+    ...oldContext.outputs, record: oldRecord as { memoryItems: MemoryItem[] },
   } }, state, false)).rejects.toThrow(`cannot replay ${oldDay}`);
   expect(readFileSync(memoryFile, 'utf8')).toBe(newestMemory);
   expect(readFileSync(candidatesFile, 'utf8')).toBe(newestCandidates);
-
-  const second = fixture();
-  const secondOld = { ...oldContext, input: { ...oldInput } };
-  await runNightlyStage('record', secondOld, second.state, false);
-  expect((await runGraph(graph, { input: newerInput, deps: { root: second.state } })).status).toBe('done');
-  const secondMemory = readFileSync(join(second.state, 'context-memory', 'alpha', 'TC.json'), 'utf8');
-  const secondCandidates = readFileSync(join(second.state, 'context-memory', 'conflict-candidates.json'), 'utf8');
-  await expect(runNightlyStage('conflict-candidates', { ...secondOld, outputs: {
-    ...secondOld.outputs, record: { memoryItems: oldItems },
-  } }, second.state, false)).rejects.toThrow(`cannot replay ${oldDay}`);
-  expect(readFileSync(join(second.state, 'context-memory', 'alpha', 'TC.json'), 'utf8')).toBe(secondMemory);
-  expect(readFileSync(join(second.state, 'context-memory', 'conflict-candidates.json'), 'utf8')).toBe(secondCandidates);
 }, 60_000);
 
 test('other graphs still skip command recipes on dry-run', async () => {

@@ -20,10 +20,16 @@ describe('warm-pool profile', () => {
     expect(resolveWarmPoolProfile({ pod: {}, raw: { pod: { warmPoolProfile: 'feature' } } })).toBe('feature');
   });
 
-  test('uses only measured physical host and tier caps', () => {
+  test('applies standard host caps across profiles and keeps other tiers closed', () => {
     expect(resolveWarmPoolQuota('fixed', 'node-b', 'standard')).toBe(16);
     expect(resolveWarmPoolQuota('gate', 'node-c', 'standard')).toBe(4);
     expect(resolveWarmPoolQuota('landing', 'host-e-wsl', 'standard')).toBe(5);
+    for (const host of ['gcp1', 'aws1', 'aws2']) {
+      for (const profile of ['fixed', 'gate', 'landing', 'feature'] as const) {
+        expect(resolveWarmPoolQuota(profile, host, 'standard')).toBe(2);
+      }
+      expect(resolveWarmPoolQuota('feature', host, 'lite')).toBe(0);
+    }
     expect(resolveWarmPoolQuota('fixed', 'mbp', 'lite')).toBe(7);
     expect(resolveWarmPoolQuota('fixed', 'mbp', 'standard')).toBe(0);
     expect(resolveWarmPoolQuota('fixed', 'node-c', 'lite')).toBe(0);

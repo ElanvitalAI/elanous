@@ -9,9 +9,10 @@ import { actualGatePodImageDigest, gateBaselineReceipt, gateEnvFingerprint, gate
 const roots: string[] = [];
 const sha = 'a'.repeat(40);
 const digest = `sha256:${'b'.repeat(64)}`;
+const baseImageDigest = `sha256:${'e'.repeat(64)}`;
 const pins = { graphSha: 'c'.repeat(64), recipeSha: 'd'.repeat(64) };
 const testEnvFingerprint = gateEnvFingerprint({ ELANOUS_TEST_FAKE_LLM: '1' });
-const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: testEnvFingerprint };
+const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: testEnvFingerprint, baseImageDigest };
 const root = () => { const dir = mkdtempSync(join(tmpdir(), 'gate-receipt-')); roots.push(dir); return dir; };
 afterEach(() => { for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 

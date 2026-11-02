@@ -152,6 +152,134 @@ describe('BrowserHand (DEMO1104-BROWSER-INTERACTION)', () => {
     expect(result).toMatchObject({ ok: true, blocked: true, detoured: true, repairNode: { outcome: 'detoured' } });
   });
 
+  test('a thrown browser-session error retries one allowlisted alternate and records repair', async () => {
+    const path = capture();
+    const urls: string[] = [];
+    const repairNodes: unknown[] = [];
+    const reflected: Array<{ issueId: string; body: string }> = [];
+    const result = await dispatchBrowserHand({
+      url: 'https://ir.example.test/report', target: 'body', armed: true,
+      linearSubtaskId: ISSUE, persona: PERSONA.personaId, alternateUrl: 'https://archive.example.test/report',
+      includeThisToo: true, selection: { tab: 'Archive report', text: 'Revenue rose 12%' },
+    }, undefined, {
+      confirmHuman: async () => true,
+      browserAct: async (request, deps) => {
+        urls.push(request.url);
+        if (urls.length === 1) throw new Error('Aside session is blocked');
+        return actionWithCapture(request, deps, path);
+      },
+      browserActDeps: { observe: (event, data) => { if (event === 'repair-node') repairNodes.push(data); } },
+      getApiKey: async () => 'test-key',
+      resolvePersona: async () => ({ ...PERSONA, actionHosts: ['ir.example.test', 'archive.example.test'] }),
+      readPageText: async () => undefined,
+      upload: async () => 'https://uploads.example.test/capture.png',
+      attach: async () => 'attachment-1',
+      reflectSelection: async input => { reflected.push(input); return true; },
+    });
+
+    expect(urls).toEqual(['https://ir.example.test/report', 'https://archive.example.test/report']);
+    expect(result).toMatchObject({
+      ok: true, blocked: true, detoured: true, selectionReflected: true,
+      repairNode: { blockedOn: 'session:https://ir.example.test/report', detourUrl: 'https://archive.example.test/report', outcome: 'detoured' },
+    });
+    expect(repairNodes).toHaveLength(1);
+    expect(reflected).toEqual([{ issueId: ISSUE, body: '이것도 반영: Archive report — Revenue rose 12%' }]);
+  });
+
+  test('a non-session network-coded browser exception does not trigger an alternate retry', async () => {
+    const urls: string[] = [];
+    const result = await dispatchBrowserHand({
+      url: 'https://ir.example.test/report', target: 'body', armed: true,
+      linearSubtaskId: ISSUE, persona: PERSONA.personaId, alternateUrl: 'https://archive.example.test/report',
+    }, undefined, {
+      confirmHuman: async () => true,
+      browserAct: async request => {
+        urls.push(request.url);
+        throw Object.assign(new Error('observer operation timed out'), { code: 'ETIMEDOUT' });
+      },
+      resolvePersona: async () => ({ ...PERSONA, actionHosts: ['ir.example.test', 'archive.example.test'] }),
+      readPageText: async () => undefined,
+    });
+
+    expect(urls).toEqual(['https://ir.example.test/report']);
+    expect(result).toMatchObject({ ok: false, blocked: false, detoured: false, reason: 'execution-failed' });
+    expect(result.repairNode).toBeUndefined();
+  });
+
+  test('an observer session-shaped exception cannot trigger an alternate retry', async () => {
+    const urls: string[] = [];
+    const result = await dispatchBrowserHand({
+      url: 'https://ir.example.test/report', target: 'body', armed: true,
+      linearSubtaskId: ISSUE, persona: PERSONA.personaId, alternateUrl: 'https://archive.example.test/report',
+    }, undefined, {
+      confirmHuman: async () => true,
+      browserAct: async (request, deps) => {
+        urls.push(request.url);
+        deps?.observe?.('probe', {});
+        return { ok: false, url: request.url, target: request.target, reason: 'execution-failed', error: 'action failed' };
+      },
+      browserActDeps: { observe: () => { throw Object.assign(new Error('Aside session is closed'), { name: 'CdpUnavailable' }); } },
+      resolvePersona: async () => ({ ...PERSONA, actionHosts: ['ir.example.test', 'archive.example.test'] }),
+      readPageText: async () => undefined,
+    });
+
+    expect(urls).toEqual(['https://ir.example.test/report']);
+    expect(result).toMatchObject({ ok: false, blocked: false, detoured: false, reason: 'execution-failed' });
+  });
+
+  test('production browser-act preserves an Aside session failure and retries one allowed alternate', async () => {
+    const connections: string[] = [];
+    const result = await dispatchBrowserHand({
+      url: 'https://ir.example.test/report', target: 'body', armed: true,
+      linearSubtaskId: ISSUE, persona: PERSONA.personaId, alternateUrl: 'https://archive.example.test/report',
+    }, undefined, {
+      confirmHuman: async () => true,
+      browserActDeps: {
+        connect: async port => {
+          connections.push(String(port));
+          if (connections.length === 1) throw Object.assign(new Error('Aside session is closed'), { name: 'AsideSessionUnavailableError' });
+          throw new Error('ordinary browser action failed');
+        },
+      },
+      resolvePersona: async () => ({ ...PERSONA, actionHosts: ['ir.example.test', 'archive.example.test'] }),
+      readPageText: async () => undefined,
+    });
+
+    expect(connections).toEqual(['9222', '9222']);
+    expect(result).toMatchObject({
+      ok: false, blocked: true, detoured: true, reason: 'execution-failed',
+      repairNode: { blockedOn: 'session:https://ir.example.test/report', detourUrl: 'https://archive.example.test/report', outcome: 'detour-failed' },
+    });
+  });
+
+  test('a load-unavailable result retries one allowed alternate and records failure if it also fails', async () => {
+    const urls: string[] = [];
+    const repairNodes: unknown[] = [];
+    const result = await dispatchBrowserHand({
+      url: 'https://ir.example.test/report', target: 'body', armed: true,
+      linearSubtaskId: ISSUE, persona: PERSONA.personaId, alternateUrl: 'https://archive.example.test/report',
+    }, undefined, {
+      confirmHuman: async () => true,
+      browserAct: async request => {
+        urls.push(request.url);
+        return urls.length === 1
+          ? { ok: false, url: request.url, target: request.target, reason: 'load-unavailable', error: 'CDP session unavailable' }
+          : { ok: false, url: request.url, target: request.target, reason: 'execution-failed', error: 'click failed' };
+      },
+      browserActDeps: { observe: (event, data) => { if (event === 'repair-node') repairNodes.push(data); } },
+      resolvePersona: async () => ({ ...PERSONA, actionHosts: ['ir.example.test', 'archive.example.test'] }),
+      readPageText: async () => undefined,
+    });
+
+    expect(urls).toEqual(['https://ir.example.test/report', 'https://archive.example.test/report']);
+    expect(result).toMatchObject({
+      ok: false, blocked: true, detoured: true, reason: 'execution-failed',
+      repairNode: { blockedOn: 'session:https://ir.example.test/report', detourUrl: 'https://archive.example.test/report', outcome: 'detour-failed' },
+      output: expect.stringContaining('대체 경로도 완료하지 못해'),
+    });
+    expect(repairNodes).toHaveLength(1);
+  });
+
   test('records the attempted alternate URL when its action fails', async () => {
     const urls: string[] = [];
     const result = await dispatchBrowserHand({

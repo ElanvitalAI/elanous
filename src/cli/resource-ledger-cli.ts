@@ -161,6 +161,16 @@ export function buildResourceLedgerSnapshot(deps: Required<Pick<ResourceLedgerCl
     }
   }
   const leases = activeResourceLeases(events);
+  const leaseById = new Map(events.flatMap(event => event.event === 'lease-created' ? [[event.lease.id, event.lease] as const] : []));
+  const recentReclaims = events.flatMap(event => {
+    if (event.event !== 'lease-ended' && event.event !== 'lease-reaped') return [];
+    const lease = leaseById.get(event.id);
+    if (!lease || (filters.host && lease.host !== filters.host) || (filters.lane && lease.lane !== filters.lane)
+      || (filters.mission && lease.mission.cell !== filters.mission && lease.mission.goalId !== filters.mission
+        && (lease.mission.pr === undefined || String(lease.mission.pr) !== filters.mission))) return [];
+    return [{ id: event.id, fp: lease.fp, host: lease.host, lane: lease.lane, at: event.at,
+      kind: event.event, reason: event.reason, stoppedBy: event.event === 'lease-reaped' ? 'guardian-reconcile' : event.stoppedBy }];
+  }).sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 20);
   for (const lease of leases) if (!hosts.some(row => row.host === lease.host)) hosts.push({ host: lease.host, poolMapped: true });
   const selectedHosts = hosts.filter(row => !filters.host || row.host === filters.host);
   const contextCounts = new Map<string, number>();
@@ -188,7 +198,7 @@ export function buildResourceLedgerSnapshot(deps: Required<Pick<ResourceLedgerCl
     .filter(row => !filters.lane || row.lane === filters.lane);
   const findings = [...reconcileResourceLeases({ leases: selectedLeases, measurements: scopedMeasurements, now: deps.now() }),
     ...remoteLedgerErrors.map(error => ({ kind: 'measurement-unavailable' as const, host: error.host, id: `${error.host}:resource-ledger`, detail: error.detail, action: 'report-only' as const }))];
-  return { ledgerPath: resourceLedgerPath(), observedAt: deps.now().toISOString(), readStatus: 'ok' as const, matrix, leases: selectedLeases, measurements: selectedMeasurements, findings };
+  return { ledgerPath: resourceLedgerPath(), observedAt: deps.now().toISOString(), readStatus: 'ok' as const, matrix, leases: selectedLeases, recentReclaims, measurements: selectedMeasurements, findings };
 }
 
 export function registerResourceLedgerCommands(resources: Command, overrides: ResourceLedgerCliDeps = {}): void {

@@ -12,6 +12,10 @@ import { NexusEventBus } from './event-bus.js';
 import { routeRequest } from './http-server.js';
 import { readReleaseRuns, setOverviewCacheForTest } from './ops-api.js';
 import { setResourceLedgerSnapshotForTest } from './resource-ledger.js';
+import * as guardianReconcile from '../../resource-ledger/guardian-reconcile.js';
+import { setLatestResourceSnapshotForTest, type ResourceReconcileSnapshot } from '../../resource-ledger/guardian-reconcile.js';
+import * as resourceCli from '../../cli/resource-ledger-cli.js';
+import * as resourceLedger from '../../resource-ledger/resource-ledger.js';
 import { buildResourceLedgerSnapshot } from '../../cli/resource-ledger-cli.js';
 import { createOverviewCache } from '../../ops/overview-cache.js';
 import { okCell, unmeasured, type OverviewSnapshot } from '../../ops/overview.js';
@@ -27,6 +31,7 @@ const originalXdgConfig = process.env.XDG_CONFIG_HOME;
 afterEach(() => {
   setOverviewCacheForTest(null);
   setResourceLedgerSnapshotForTest(null);
+  setLatestResourceSnapshotForTest(null);
   if (originalXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdgConfig;
   resetUserConfig();
@@ -71,7 +76,12 @@ test('resource ledger: operator-gated handler returns the mocked host/lane snaps
   setResourceLedgerSnapshotForTest(() => {
     reads++;
     const snapshot = buildResourceLedgerSnapshot({
-      events: () => [],
+      events: () => [
+        { event: 'lease-created', at, lease: { id: 'fp_ledger1234', fp: 'fp_ledger1234', host: 'gcp2', lane: 'gate', resources: {}, mission: {},
+          ttlMs: 60_000, heartbeatAt: at, startedAt: at } },
+        { event: 'lease-ended', at, id: 'fp_ledger1234', reason: 'open:/private/config C:\\Users\\secret Bearer ' + API_KEY,
+          stoppedBy: 'guardian-reconcile /var/lib/private Bearer ' + API_KEY },
+      ],
       hosts: () => [{ host: 'gcp2', poolMapped: true, capacity: { gate: 4 } }],
       now: () => new Date(at),
       run: (command, args) => {
@@ -103,7 +113,7 @@ test('resource ledger: operator-gated handler returns the mocked host/lane snaps
   expect(response?.headers.get('cache-control')).toBe('no-store');
   const responseText = await response?.text() ?? '';
   const body = JSON.parse(responseText) as { ledgerPath?: string; observedAt: string; matrix: Array<{ host: string; lane: string; leases: number; measuredPods: number | null }>;
-    findings: Array<{ detail: string }>; measurements: Array<{ host: string; pods: Array<{ phase: string }>; processes: Array<{ id: string; command?: string }>;
+    findings: Array<{ detail: string }>; measurements: Array<{ host: string; pods: Array<{ phase: string }>; processes: Array<{ id: string; fp?: string; command?: string }>;
       errors: string[] }> };
   expect(body.ledgerPath).toBeUndefined();
   expect(responseText).not.toContain('/tmp/kubeconfig');
@@ -112,6 +122,10 @@ test('resource ledger: operator-gated handler returns the mocked host/lane snaps
   expect(responseText).not.toContain('//비밀');
   expect(responseText).not.toContain(API_KEY);
   expect(responseText).not.toContain('kubectl --token');
+  expect(responseText).not.toContain('open:/비밀/설정');
+  expect(responseText).not.toContain('C:\\Users\\secret');
+  expect(responseText).toContain("\"reason\":\"[path] [path] Bearer sk-***\"");
+  expect(responseText).toContain("\"stoppedBy\":\"guardian-reconcile [path] Bearer sk-***\"");
   expect(body.measurements[0]?.processes).toEqual([{ id: 'pid:123', fp: 'fp_ledger1234' }]);
   expect(body.observedAt).toBe(at);
   expect(body.matrix).toContainEqual(expect.objectContaining({ host: 'gcp2', lane: 'gate', leases: 0, measuredPods: 1 }));
@@ -119,6 +133,45 @@ test('resource ledger: operator-gated handler returns the mocked host/lane snaps
   expect(reads).toBe(1);
   expect((await send('/v1/ops/resources/ledger', { 'x-elanous-operator': SECRET }, 'POST'))?.status).toBe(405);
   expect(reads).toBe(1);
+});
+
+test('guardian resource route is a read-only projection of the cached snapshot', async () => {
+  const { send } = fixture(true);
+  setLatestResourceSnapshotForTest(null);
+  const headers = { 'x-elanous-operator': SECRET };
+  expect((await send('/v1/ops/resources/guardian'))?.status).toBe(401);
+  expect((await send('/v1/ops/resources/guardian', { 'x-elanous-operator': 'forged-forged-forged-forged' }))?.status).toBe(403);
+  const pending = await (await send('/v1/ops/resources/guardian', headers))?.json() as { state: string; observedAt: string | null };
+  expect(pending).toMatchObject({ state: 'pending', observedAt: null });
+
+  const at = '2026-11-02T00:00:00.000Z';
+  const lease = { id: 'fp_guardian01', fp: 'fp_guardian01', host: 'aws2', lane: 'gate' as const, resources: {}, mission: {},
+    ttlMs: 60_000, heartbeatAt: at, startedAt: at };
+  setLatestResourceSnapshotForTest({ observedAt: at, matrix: [], leases: [lease], measurements: [],
+    findings: [{ kind: 'drift', host: 'gcp2', id: lease.fp, fp: lease.fp, detail: 'self-gate expected=gcp2/gate lease=aws2/gate', action: 'report-only' }],
+    cleanup: { mode: 'dry-run', candidates: [], reaped: [], skipped: [], errors: [], mutations: [] },
+    releaseReservation: { status: 'free' }, stale: false } as unknown as ResourceReconcileSnapshot);
+  const tick = spyOn(guardianReconcile, 'resourceReconcileTick');
+  const collect = spyOn(resourceCli, 'defaultResourceRun');
+  const reap = spyOn(resourceLedger, 'reapResourceLeaseIfCurrent');
+  try {
+    const response = await send('/v1/ops/resources/guardian', headers);
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get('cache-control')).toBe('no-store');
+    const body = await response?.json() as { state: string; observedAt: string; findings: Array<{ kind: string; id: string }>; cleanup: { reaped: number }; releaseReservation: { status: string; reason: string } };
+    expect(body).toMatchObject({ state: 'ready', observedAt: at, cleanup: { reaped: 0 } });
+    expect(body.findings).toContainEqual(expect.objectContaining({ kind: 'drift', id: lease.fp }));
+    await send('/v1/ops/resources/guardian', headers);
+    await send('/v1/ops/resources/guardian', headers);
+    expect((await send('/v1/ops/resources/guardian', headers))?.status).toBe(200);
+    expect(body.releaseReservation).toEqual(expect.objectContaining({ status: expect.any(String), reason: expect.any(String) }));
+    expect(tick).not.toHaveBeenCalled();
+    expect(collect).not.toHaveBeenCalled();
+    expect(reap).not.toHaveBeenCalled();
+    expect((await send('/v1/ops/resources/guardian', headers, 'POST'))?.status).toBe(405);
+  } finally {
+    tick.mockRestore(); collect.mockRestore(); reap.mockRestore();
+  }
 });
 
 test('overview: routeRequest reuses operator gate, no-store, snapshot memo and background-only Pod measurement', async () => {

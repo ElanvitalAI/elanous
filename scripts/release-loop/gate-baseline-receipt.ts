@@ -45,16 +45,19 @@ export interface GatePodRuntimeIdentity {
   platform: string;
   architecture: string;
   envFingerprint: string;
+  baseImageDigest?: string;
 }
 
 const validRuntimeIdentity = (value: unknown): value is GatePodRuntimeIdentity => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const row = value as Partial<GatePodRuntimeIdentity>;
-  return Object.keys(value).sort().join(',') === 'architecture,bunVersion,envFingerprint,platform'
+  const keys = Object.keys(value).sort().join(',');
+  return keys === 'architecture,baseImageDigest,bunVersion,envFingerprint,platform'
     && typeof row.bunVersion === 'string' && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(row.bunVersion)
     && typeof row.platform === 'string' && /^[a-z0-9_-]{1,32}$/.test(row.platform)
     && typeof row.architecture === 'string' && /^[a-z0-9_-]{1,32}$/.test(row.architecture)
-    && typeof row.envFingerprint === 'string' && SHA256.test(row.envFingerprint);
+    && typeof row.envFingerprint === 'string' && SHA256.test(row.envFingerprint)
+    && typeof row.baseImageDigest === 'string' && IMAGE_DIGEST.test(row.baseImageDigest);
 };
 
 /** Parse runtime facts written by the gate Pod before its tests start. */

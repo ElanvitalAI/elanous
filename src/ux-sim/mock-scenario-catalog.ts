@@ -57,6 +57,7 @@ export interface MockScenarioCatalog {
     existingPaths: number;
     excludedPaths: number;
     sourceExclusions: Array<{ path: string; reason: string }>;
+    catalogAdditions: Array<{ path: string; reason: string }>;
     omissionCheck: { requiredPaths: string[]; missingPaths: string[] };
     candidates: MockScenarioCandidate[];
   };
@@ -219,6 +220,22 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
       ...(excludeReason ? { excludeReason } : {}),
     };
   });
+  const rawCatalogAdditions = value.candidateAudit.catalogAdditions ?? [];
+  if (!Array.isArray(rawCatalogAdditions)) throw new Error('candidateAudit.catalogAdditions must be an array');
+  const catalogAdditions = rawCatalogAdditions.map((row) => {
+    if (!isRecord(row)) throw new Error('candidateAudit.catalogAdditions rows must be objects');
+    return {
+      path: requireString(row.path, 'candidateAudit.catalogAdditions.path'),
+      reason: requireString(row.reason, 'candidateAudit.catalogAdditions.reason'),
+    };
+  });
+  const additionPaths = new Set<string>();
+  const candidatePathSet = new Set(candidates.map((candidate) => candidate.path));
+  for (const addition of catalogAdditions) {
+    if (additionPaths.has(addition.path)) throw new Error('candidateAudit.catalogAdditions contains duplicate path: ' + addition.path);
+    if (!candidatePathSet.has(addition.path)) throw new Error('candidateAudit.catalogAdditions path is not a current candidate: ' + addition.path);
+    additionPaths.add(addition.path);
+  }
   const omissionCheck = value.candidateAudit.omissionCheck;
   if (!isRecord(omissionCheck)) throw new Error('candidateAudit.omissionCheck is required');
   const requiredPaths = requireStringArray(omissionCheck.requiredPaths, 'candidateAudit.omissionCheck.requiredPaths');
@@ -236,10 +253,12 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
   if (![sourceRows, existingPaths, excludedPaths].every((n) => Number.isInteger(n) && Number(n) >= 0)) {
     throw new Error('candidateAudit counts must be non-negative integers');
   }
-  if (sourceRows !== candidates.length + sourceExclusions.length || excludedPaths !== candidates.filter((candidate) => candidate.disposition === 'excluded').length) {
+  const baselineCandidateCount = candidates.length - catalogAdditions.length;
+  const baselineExcludedCount = candidates.filter((candidate) => candidate.disposition === 'excluded' && !additionPaths.has(candidate.path)).length;
+  if (sourceRows !== baselineCandidateCount + sourceExclusions.length || excludedPaths !== baselineExcludedCount) {
     throw new Error('candidateAudit counts do not match the candidate rows');
   }
-  if (Number(existingPaths) !== candidates.length) throw new Error('candidateAudit.existingPaths must equal the current candidate count');
+  if (Number(existingPaths) !== baselineCandidateCount) throw new Error('candidateAudit.existingPaths must equal the baseline candidate count after catalog additions');
   const runEvidence = value.runEvidence;
   if (!isRecord(runEvidence) || !isRecord(runEvidence.event)) throw new Error('runEvidence and runEvidence.event are required');
   if (!isRecord(value.discovery)) throw new Error('discovery is required');
@@ -257,6 +276,7 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
       existingPaths: Number(existingPaths),
       excludedPaths: Number(excludedPaths),
       sourceExclusions,
+      catalogAdditions,
       omissionCheck: { requiredPaths, missingPaths },
       candidates,
     },
@@ -281,11 +301,13 @@ export function loadMockScenarioCatalog(): MockScenarioCatalog {
 }
 
 export function renderMockScenarioList(catalog: MockScenarioCatalog): string[] {
+  const reviewedRows = catalog.candidateAudit.sourceRows + catalog.candidateAudit.catalogAdditions.length;
+  const reviewedPaths = catalog.candidateAudit.existingPaths + catalog.candidateAudit.catalogAdditions.length;
   return [
     'Mock scenario catalog · reusable devices and scenario references',
     ...catalog.scenarios.map((scenario) => `${scenario.id}\t${scenario.kind}\t${scenario.name}`),
     `장치 ${catalog.devices.length} · 시나리오 ${catalog.scenarios.length} · 자세히: bun scripts/ux-sim.ts show <MS-id>`,
-    `후보 감사 ${catalog.candidateAudit.existingPaths}/${catalog.candidateAudit.sourceRows} 경로 확인 · 제외 ${catalog.candidateAudit.excludedPaths} · entry/logs 근거는 mock-scenario-catalog.json`,
+    '후보 감사 ' + reviewedPaths + '/' + reviewedRows + ' 경로 확인 · 제외 ' + catalog.candidateAudit.excludedPaths + ' · entry/logs 근거는 mock-scenario-catalog.json',
   ];
 }
 

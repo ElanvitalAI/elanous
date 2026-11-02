@@ -1,4 +1,7 @@
-import { parseWorkOrder, type WorkOrder } from './work-order.js';
+import { createHash } from 'node:crypto';
+import { parseWorkOrder, WORK_ORDER_FIELDS, type WorkOrder } from './work-order.js';
+
+export type WorkOrderRevision = string;
 
 export interface BuildWorkOrderInput {
   cellId: string;
@@ -21,4 +24,22 @@ export function buildWorkOrder(input: BuildWorkOrderInput): WorkOrder {
   }));
   if (!parsed.ok) throw new Error(parsed.reason);
   return parsed.order;
+}
+
+
+/** Hash only normalized work-order fields and their source revision; callers log the digest, never the directive body. */
+export function hashWorkOrderContent(order: WorkOrder, sourceRevision: WorkOrderRevision): string {
+  const canonical = {
+    cellId: order.cellId.trim(),
+    sourceRevision: sourceRevision.trim(),
+    fields: WORK_ORDER_FIELDS.map((field) => [field, order[field].trim()] as const),
+    dependencies: (order.dependencies ?? []).map(({ cell, state, observedAt }) => ({
+      cell: cell.trim(), state: state.trim(), observedAt: observedAt.trim(),
+    })).sort((left, right) => {
+      const leftKey = JSON.stringify([left.cell, left.state, left.observedAt]);
+      const rightKey = JSON.stringify([right.cell, right.state, right.observedAt]);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    }),
+  };
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }

@@ -439,6 +439,7 @@ async function run(args: string[], deps: TasksCliDeps, readRealGoalLedgers = fal
   } finally { process.exitCode = previous ?? 0; }
 }
 
+
 test('MAPREDUCE-FANOUT 첫 조각으로 읽기 전용 tasks map dry-run CLI 뼈대와 집중 시험을 구현한다', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-map-dry-run-'));
   const inventoryPath = join(dir, 'inventory.json');

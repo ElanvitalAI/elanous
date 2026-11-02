@@ -610,10 +610,10 @@ describe('first run', () => {
       expect(timedOut).toBe(false);
       expect(child.status).toBe(0);
       expect(child.stdout).toContain('[elanous] provider: openai-codex');
-      expect(child.stdout).toContain('오프라인 모드');
+      expect(child.stdout).toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
       expect(child.stdout).toContain('오류 보고 안내:');
       expect(child.stdout.indexOf('오류 보고 안내:')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
-      expect(child.stdout.indexOf('오프라인 모드')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
+      expect(child.stdout.indexOf('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
       expect(child.stdout.indexOf('\x1b[?1049h')).toBeGreaterThan(child.stdout.indexOf('[elanous] provider: openai-codex'));
       expect(child.stdout + child.stderr).not.toContain('eln setup llm');
       expect(child.stdout + child.stderr).not.toContain('Step 1');
@@ -712,7 +712,7 @@ describe('first run', () => {
       const run = { stdout: '', stderr: '', status: null as number | null, error: undefined as Error | undefined };
       proc.stdout.setEncoding('utf8').on('data', (chunk: string) => {
         run.stdout += chunk;
-        if (offlineAt < 0 && run.stdout.includes('오프라인 모드')) offlineAt = Date.now() - began;
+        if (offlineAt < 0 && run.stdout.includes('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다')) offlineAt = Date.now() - began;
       });
       proc.stderr.setEncoding('utf8').on('data', (chunk: string) => { run.stderr += chunk; });
       const killer = setTimeout(() => proc.kill('SIGTERM'), 30000);
@@ -729,7 +729,7 @@ describe('first run', () => {
       // Whole path to the first-screen gate: far below the old 12s wait (measured 1.3–3.2s at load 12;
       // the variance is first-run provider detection after the decision, outside this cell).
       expect(elapsed).toBeLessThan(6000);
-      expect(run.stdout).toContain('오프라인 모드');
+      expect(run.stdout).toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
       expect(run.stdout + run.stderr).not.toContain('웹 셋업을 위해 데몬을 시작');
       // No TTY → no dashboard → nobody saw a notice: it is neither printed nor recorded as shown.
       expect(run.stdout).not.toContain('오류 보고 안내:');
@@ -853,9 +853,9 @@ describe('first run', () => {
         { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60000 });
       const text = child.stdout + child.stderr;
       expect(child.error).toBeUndefined();
-      expect(text).toContain('offline mode');
+      expect(text).toContain('web setup daemon is not running yet; continuing in terminal setup');
       expect(text).toContain('pick a provider via eln setup llm');
-      expect(text).not.toContain('오프라인 모드');
+      expect(text).not.toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
       expect(text).not.toContain('eln setup llm 으로 고르세요');
       expect(buildUserConfig(join(configDir, 'config.json')).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }
@@ -874,9 +874,9 @@ describe('first run', () => {
         { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60000 });
       const text = child.stdout + child.stderr;
       expect(child.error).toBeUndefined();
-      expect(text).toContain('오프라인 모드');
+      expect(text).toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
       expect(text).toContain('eln setup llm 으로 고르세요');
-      expect(text).not.toContain('offline mode');
+      expect(text).not.toContain('web setup daemon is not running yet; continuing in terminal setup');
       expect(text).not.toContain('pick a provider via eln setup llm');
       expect(buildUserConfig(join(configDir, 'config.json')).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }

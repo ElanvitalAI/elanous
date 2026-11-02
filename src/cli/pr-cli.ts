@@ -58,22 +58,17 @@ import {
 } from './pr-granularity.js';
 import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
+import { registerPrLandOptions } from './pr-land-options.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
-import { admitLandingMerge } from '../self-implement/frozen-merges.js';
-import { resolveOverlapEvidencePath, verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence, verifyOverlapEvidenceVirtualRebase } from './pr-land-overlap-evidence.js';
 import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
-import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
 import { classifyPrLandRefusal, observeDirectPrLandRefusal, observePrLandRefusal } from './pr-land-refusal.js';
 import { bindPrLandRefusalToRecover, PR_LAND_CARD_ID_ENV } from './pr-land-recovery.js';
-import { ensurePrLandHeavyRemote, type HeavyRemoteInput, type HeavyRemoteResult } from './pr-land-heavy-remote.js';
+import type { HeavyRemoteInput, HeavyRemoteResult } from './pr-land-heavy-remote.js';
 import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
-import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
 import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
-import { recordWarmReuseEvidence, warmReuseEvidencePath } from '../task-orchestrator/surfaces/warm-reuse-evidence.js';
-import { readTaskAgentState, taskAgentStatePath, type TaskCard } from '../task-agent/task-hand.js';
+import type { TaskCard } from '../task-agent/task-hand.js';
 import { INFLIGHT_REGISTRY_FILE, removeInflightForPr } from '../pr-tool/inflight-registry.js';
-import { PR_LABEL_NAMES } from '../github/pr-labels.js';
-import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
+import type { L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, sharedCensusDiffCache, type Seat } from '../pr-tool/census.js';
 
 export { branchLineageSlug, findSiblingPrs };
@@ -1074,7 +1069,7 @@ function emitLandingOverlapAdvisory(
 }
 
 /** The pinned overlap evidence decision is shared by landing and its read-only preview. */
-export function verifyPinnedOverlapDecision(input: {
+export async function verifyPinnedOverlapDecision(input: {
   opts: PrLandOpts;
   deps: PrLandDeps;
   run: CmdRunner;
@@ -1085,21 +1080,24 @@ export function verifyPinnedOverlapDecision(input: {
   decision: OverlapLandingDecisionOutcome | undefined;
   out: { log: (message: string) => void; error: (message: string) => void };
   refuse: (message: string) => void;
-}): boolean {
+}): Promise<boolean> {
   const { opts, deps, run, cwd, base, readFile, overlappingLandings, decision, out, refuse } = input;
   if (decision === undefined || decision === 'user-merge') return true;
+  const taskState = await import('../task-agent/task-card-state.js');
+  const reviewResultsDir = deps.reviewResultsDir ?? join(dirname(taskState.taskAgentStatePath()), 'review-results');
   let accepted = false;
   let ancestorResyncNeeded = false;
   if (decision === 'unavailable' && opts.overlapEvidence !== undefined) {
+    const overlap = require('./pr-land-overlap-evidence.js') as typeof import('./pr-land-overlap-evidence.js');
     const ref = resolveRemoteBranchRef(run, cwd, base);
     const evidenceInput: VerifyOverlapEvidenceInput = {
-      evidencePath: resolveOverlapEvidencePath(opts.overlapEvidence, cwd), pr: Number(opts.pr), expectedHead: opts.expectedHead!,
+      evidencePath: overlap.resolveOverlapEvidencePath(opts.overlapEvidence, cwd), pr: Number(opts.pr), expectedHead: opts.expectedHead!,
       remote: ref.remote, branch: ref.branch, cwd, run, readFile,
-      reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
+      reviewResultsDir: reviewResultsDir,
       listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
       reviewRealPath: (path) => realpathSync(path), overlappingLandings,
     };
-    const verdict = verifyOverlapEvidence(evidenceInput);
+    const verdict = overlap.verifyOverlapEvidence(evidenceInput);
     accepted = verdict.ok;
     if (verdict.ok) {
       out.log(verdict.mode === 'already-ancestor'
@@ -1112,7 +1110,7 @@ export function verifyPinnedOverlapDecision(input: {
         `not-rebased: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} is not an ancestor of ${opts.expectedHead!.slice(0, 12)}`;
       const measuredOverlap = verdict.baseTip !== undefined && verdict.reason.startsWith('base-stale-overlap:');
       if (pureNotRebased || measuredOverlap) {
-        const patch = verifyOverlapEvidenceVirtualRebase(evidenceInput, verdict.baseTip!);
+        const patch = overlap.verifyOverlapEvidenceVirtualRebase(evidenceInput, verdict.baseTip!);
         accepted = patch.ok;
         record('virtual-rebase', patch.ok, {
           pr: Number(opts.pr), head: opts.expectedHead, baseTip: verdict.baseTip,
@@ -1126,9 +1124,10 @@ export function verifyPinnedOverlapDecision(input: {
       } else refuse(`✗ overlap-evidence: ${verdict.reason}`);
     }
   } else if (decision === 'unavailable') {
-    const verdict = verifyAncestorAutoPass({
+    const overlap = require('./pr-land-overlap-evidence.js') as typeof import('./pr-land-overlap-evidence.js');
+    const verdict = overlap.verifyAncestorAutoPass({
       pr: Number(opts.pr), expectedHead: opts.expectedHead!, cwd, run, readFile, overlappingLandings,
-      reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
+      reviewResultsDir: reviewResultsDir,
       listDir: (dir) => readdirSync(dir),
     });
     accepted = verdict.ok;
@@ -1141,13 +1140,13 @@ export function verifyPinnedOverlapDecision(input: {
         const remote = run('git', ['ls-remote', ref.remote, `refs/heads/${ref.branch}`], { cwd });
         const baseTip = remote.ok ? remote.out.trim().split(/\s+/u, 1)[0] ?? '' : '';
         const local = run('git', ['rev-parse', '--verify', `refs/remotes/${ref.remote}/${ref.branch}`], { cwd });
-        const reviews = verifyAllSameHeadReviews({
+        const reviews = overlap.verifyAllSameHeadReviews({
           pr: Number(opts.pr), expectedHead: opts.expectedHead!, readFile,
-          reviewResultsDir: deps.reviewResultsDir ?? join(dirname(taskAgentStatePath()), 'review-results'),
+          reviewResultsDir: reviewResultsDir,
           listDir: (dir) => readdirSync(dir),
         });
         const patch = reviews.ok && /^[a-f0-9]{40}$/iu.test(baseTip) && local.ok && local.out.trim() === baseTip
-          ? verifyVirtualRebasePatch({ cwd, baseTip, head: opts.expectedHead! })
+          ? (require('./pr-land-virtual-rebase.js') as typeof import('./pr-land-virtual-rebase.js')).verifyVirtualRebasePatch({ cwd, baseTip, head: opts.expectedHead! })
           : { ok: false as const, reason: reviews.ok ? 'base-stale-or-unmeasured' : reviews.reason };
         accepted = patch.ok;
         ancestorResyncNeeded = !accepted;
@@ -1164,7 +1163,8 @@ export function verifyPinnedOverlapDecision(input: {
   }
   if (!accepted) {
     if (ancestorResyncNeeded && !opts.dryRun) {
-      const marked = run('gh', ['pr', 'edit', String(opts.pr), '--add-label', PR_LABEL_NAMES.needsRebase], { cwd });
+      const labels = await import('../github/pr-labels.js');
+      const marked = run('gh', ['pr', 'edit', String(opts.pr), '--add-label', labels.PR_LABEL_NAMES.needsRebase], { cwd });
       record('resync-marker', marked.ok, { pr: Number(opts.pr), reason: 'ancestor-auto-not-ancestor' });
       if (!marked.ok) out.error('⚠ resync-marker: needs-rebase 라벨을 남기지 못했습니다');
     }
@@ -1527,7 +1527,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     const overlappingLandings: string[] = [];
     const overlapFound = emitLandingOverlapAdvisory(readOnlyRun, cwd, measuredBase, changedPaths, out, overlappingLandings, landings);
     emitSiblingPrAdvisory(branch!, deps.listOpenPrs ?? (() => lookupOpenPrs(readOnlyRun, cwd)), out);
-    if (overlapFound && !verifyPinnedOverlapDecision({
+    if (overlapFound && !await verifyPinnedOverlapDecision({
       opts, deps, run: readOnlyRun, cwd, base, readFile, overlappingLandings,
       decision: 'unavailable', out, refuse: out.error,
     })) {
@@ -1845,7 +1845,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       });
     }
     hold = !!opts.hold || overlapDecision?.outcome === 'user-hold';
-    if (pinned && !verifyPinnedOverlapDecision({ opts, deps, run, cwd, base, readFile, overlappingLandings, decision: overlapDecision?.outcome, out, refuse })) return 1;
+    if (pinned && !await verifyPinnedOverlapDecision({ opts, deps, run, cwd, base, readFile, overlappingLandings, decision: overlapDecision?.outcome, out, refuse })) return 1;
     return undefined;
   };
   if (pinned && (await checkOverlap()) !== undefined) return 1;
@@ -1858,10 +1858,11 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   const HEAVY_BASE_STABILITY_RETRIES = 3;
   let heavyInterferenceMeasured: boolean | null = null;
   let heavyGateHost: string | undefined;
-  const heavyGate = (main: string, phase: 'initial' | 'late-recheck' | 'post-merge'): HeavyRemoteResult | undefined => {
+  const heavyGate = async (main: string, phase: 'initial' | 'late-recheck' | 'post-merge'): Promise<HeavyRemoteResult | undefined> => {
     const before = readLoad();
     const started = Date.now();
-    const verdict = (deps.runHeavyRemote ?? ensurePrLandHeavyRemote)({
+    const ensureHeavyRemote = deps.runHeavyRemote ?? (await import('./pr-land-heavy-remote.js')).ensurePrLandHeavyRemote;
+    const verdict = ensureHeavyRemote({
       pr: Number(opts.pr), head: opts.expectedHead!, main, repo: cwd,
     });
     if (verdict.ok) {
@@ -1890,12 +1891,14 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   let verifiedHeavyBase: string | undefined;
   if (opts.heavyRemote) {
     const main = overlapCheckedBase!;
-    const verdict = heavyGate(main, 'initial');
+    const verdict = await heavyGate(main, 'initial');
     if (!verdict?.ok) { refuseDirect(`✗ heavy-remote: 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`); return 1; }
     verifiedHeavyBase = main;
     out.log(`✓ heavy-remote: host=${verdict.host ?? 'unknown'} head=${opts.expectedHead!.slice(0, 12)} main=${main.slice(0, 12)} source=${verdict.source} elapsed=${verdict.elapsedMs}ms`);
     out.log(`✓ typecheck-roots: ${JSON.stringify(verdict.rootPlan ?? { mode: 'not-applicable', roots: null, promoted: false, reason: 'no-root-plan-in-gate-output' })}`);
     if (opts.heavyOnPodShadow) {
+      const { runHeavyOnPodShadow } = await import('./pr-land-pod-shadow.js');
+      const warmReuse = await import('../task-orchestrator/surfaces/warm-reuse-evidence.js');
       await runHeavyOnPodShadow({
         enabled: true, pr: Number(opts.pr), head: opts.expectedHead!,
         local: { measured: verdict.rootPlan != null, ok: verdict.ok, rootPlan: verdict.rootPlan ?? null },
@@ -1908,7 +1911,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
         onShadow: ({ pod, agree }) => {
           const shadow = pod && typeof pod === 'object' ? pod as LandingPodShadowVerdict : undefined;
           const warm = shadow?.warmEvidence;
-          recordWarmReuseEvidence(warmReuseEvidencePath(), {
+          warmReuse.recordWarmReuseEvidence(warmReuse.warmReuseEvidencePath(), {
             schema: 1, consumer: 'land', pr: Number(opts.pr), head: opts.expectedHead!, main, recordedAt: new Date().toISOString(),
             ...(warm ? { ...warm, agree: warm.agree && agree } : {}),
             ...(!warm ? { reason: shadow?.warmReason ?? 'warm-shadow-unmeasured' } : {}),
@@ -1973,7 +1976,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       // before spending another remote gate on a pair that cannot land.
       const staleOverlap = await recheckOverlapAtBase(main);
       if (staleOverlap !== undefined) return staleOverlap;
-      const verdict = heavyGate(main, 'late-recheck');
+      const verdict = await heavyGate(main, 'late-recheck');
       if (!verdict?.ok) {
         refuseDirect(`✗ heavy-remote: 병합 직전 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`);
         return 1;
@@ -2306,6 +2309,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   const headCommit = landedHead.ok && /^[a-f0-9]{40}$/i.test(landedHead.out.trim()) ? landedHead.out.trim() : undefined;
   const validPr = Number.isSafeInteger(prNumber) && prNumber > 0;
   const heldEntry = validPr && headCommit ? { prNumber, headCommit, repoRoot: cwd } : null;
+  const { admitLandingMerge } = await import('../self-implement/frozen-merges.js');
   const admission = admitLandingMerge(heldEntry, undefined, {}, validPr ? { prNumber, repoRoot: cwd, ...(headCommit ? { headCommit } : {}) } : undefined,
     { prodFreezeRoot: deps.prodFreezeRoot, forceReason: opts.forceFreeze });
   if (admission.kind === 'held' && !heldEntry) {
@@ -2433,8 +2437,9 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   // INFLIGHT-REGISTRY — 착지하면 비행 중 등록부의 그 런 줄을 지운다(색인 실패는 착지를 막지 않는다).
   try {
-    const statePath = deps.taskStatePath ?? taskAgentStatePath();
-    const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {});
+    const taskState = await import('../task-agent/task-card-state.js');
+    const statePath = deps.taskStatePath ?? taskState.taskAgentStatePath();
+    const cards = Object.values(taskState.readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {});
     removeInflightForPr(prNumber, cards, { path: join(dirname(statePath), INFLIGHT_REGISTRY_FILE) });
   } catch (error) {
     try { debug.log('pr-tool.inflight', 'remove-failed', { pr: prNumber, error: String((error as Error)?.message ?? error).slice(0, 200) }, { level: 'warn' }); } catch { /* fail-soft */ }
@@ -2485,7 +2490,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
         out.log(`✓ merge: squash ${upsert.url} → ${base}`);
         return 1;
       }
-      const post = heavyGate(firstParent, 'post-merge');
+      const post = await heavyGate(firstParent, 'post-merge');
       if (!post?.ok) {
         out.error(`✗ heavy-remote: post-merge 원격 게이트 ${post?.reason ?? 'unmeasured'} — 병합은 되돌리지 않는다.`);
         out.log(`✓ merge: squash ${upsert.url} → ${base}`);
@@ -2594,34 +2599,13 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
       (deps.setExitCode ?? ((code: number) => { process.exitCode = code; }))(1);
     }
   };
-  queue.command('status').description('Show pending PRs and shadow verdicts').action(() => queueAction(() => statusL8ShadowQueue(process.cwd(), queueDeps)));
-  queue.command('enqueue <pr>').description('Pin a ready PR at the tail of the shadow queue').action((prNumber: string) => queueAction(() => enqueueL8ShadowQueue(process.cwd(), shadowPrNumber(prNumber), queueDeps)));
-  queue.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land').action(() => queueAction(() => runL8ShadowQueue(process.cwd(), queueDeps)));
+  queue.command('status').description('Show pending PRs and shadow verdicts').action(() => queueAction(async () => (await import('../self-implement/l8-merge-queue.js')).statusL8ShadowQueue(process.cwd(), queueDeps)));
+  queue.command('enqueue <pr>').description('Pin a ready PR at the tail of the shadow queue').action(async (prNumber: string) => queueAction(async () => { const queueMod = await import('../self-implement/l8-merge-queue.js'); return queueMod.enqueueL8ShadowQueue(process.cwd(), queueMod.shadowPrNumber(prNumber), queueDeps); }));
+  queue.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land').action(() => queueAction(async () => (await import('../self-implement/l8-merge-queue.js')).runL8ShadowQueue(process.cwd(), queueDeps)));
 
-  pr.command('land')
-    .description('현재 브랜치 PR을 생성 또는 갱신해 ready 상태로 만들고 squash merge')
-    .option('--base <branch>', 'PR base branch')
-    .option('--cwd <path>', '작업 트리 경로')
-    .option('--pr <number>', '기존 PR 번호 고정 (--expected-head 와 함께)')
-    .option('--expected-head <sha>', '리뷰된 PR 머리 SHA 고정 (--pr 와 함께)')
-    .option('--heavy-remote', '머리 고정 착지의 무거운 게이트를 node-b·node-c 중 빈 호스트에서 실행; head⊕main 증거가 없거나 실패하면 거부(로컬 폴백 없음)')
-    .option('--heavy-on-pod-shadow', '--heavy-remote 판정을 유지하고 같은 head/main의 Pod 타입·변경 시험 결과를 비교만 한다')
-    .option('--dry-run', '변경 없이 landing 계획만 출력')
-    .option('--hold', 'PR을 생성 또는 갱신한 뒤 병합하지 않고 쌓아 둔다')
-    .option('--title <title>', 'PR title')
-    .option('--title-file <path>', 'PR title file')
-    .option('--body <body>', 'PR body')
-    .option('--body-file <path>', 'PR body file')
-    .option('--commit-message <message>', 'upsert commit message')
-    .option('--commit-message-file <path>', 'upsert commit message file (takes precedence over --commit-message)')
-    .option('--include-active-run-files', '도는 런 파일을 이번 착지에 포함 (기본 동작)')
-    .option('--exclude-active-run-files', '도는 런과 겹친 파일을 이번 착지에서 제외')
-    .option('--exclude-active-run-sources', '⚠ 위험: --exclude-active-run-files 가 골 문서가 아닌 파일(소스)을 빼도 착지를 강행')
-    .option('--land-reason <text>', '권고를 보고도 지금 내는 이유(예: 남이 기다리는 차단 해제)')
-    .option('--force-freeze <reason>', '동결을 넘겨 병합할 명시적 이유(필수)')
-    .option('--allow-public-leak', '바뀐 파일이 공개본에 사적 흔적을 실어도 착지(이유는 --land-reason)')
-    .option('--overlap-evidence <file>', '머리 고정 착지 전용: 비대화형 겹침 승인을 대신할 증거 JSON {pr, head, gate:{head,baseCommit,passed}, reviewResult} — 재기반·재게이트·리뷰를 CLI 가 다시 잰다(겹친 착지가 전부 머리의 조상이면 리뷰만 · gate 생략 가능)')
-    .action(async (opts: PrLandOpts) => {
+  const land = pr.command('land');
+  registerPrLandOptions(land);
+  land.action(async (opts: PrLandOpts) => {
       // ⛔⭐⭐⭐ **관측 sink 를 먼저 건다** — 라이브 도그푸드가 잡은 결함(2026-08-03).
       //   단위 테스트는 `debug.log` 가 **불렸다**를 단언하지만, standalone CLI 는 sink 를 등록하지
       //   않으면 그 로그가 **`logs.db` 에 안 닿는다** ⇒ `elanous logs --category pr.land` 가 0건이었다.

@@ -15,7 +15,7 @@ import { pairMoveId, repairNextMove } from './repair-next-move.js';
 import type { SupervisorGoalDeficit } from '../self-implement/goal-supervisor-fill.js';
 import { loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { parseRepairWorkerResult, repairFailureSignature } from './repair-worker.js';
-import { TASK_SEATS, readTaskCard, updateTaskCard, type TaskCard, type TaskChildLlm, type TaskSeat } from './task-hand.js';
+import { TASK_SEATS, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard, type TaskChildLlm, type TaskSeat } from './task-hand.js';
 
 const WAIT_MS = 90 * 60_000;
 const ESCALATE_MS = 6 * 60 * 60_000;
@@ -92,6 +92,80 @@ export function resolveRepairOwner(card: TaskCard, deps: {
 }
 
 export interface RepairModelAvailability { codexSubscription: boolean; grokSubscription: boolean }
+
+export type RepairTierModelSource = {
+  taskId: string;
+  tier?: TaskCard['tier'];
+  repairs?: readonly Pick<NonNullable<TaskCard['repairs']>[number], 'pr' | 'at' | 'runId' | 'fromModel' | 'toModel' | 'status'>[];
+};
+type RepairTierModelRepair = NonNullable<RepairTierModelSource['repairs']>[number];
+
+export interface RepairTierModelAggregate {
+  status: 'measured' | 'unmeasured';
+  reason?: 'invalid-timestamp' | 'no-post-merge-repair' | 'window-incomplete';
+  window?: { from: string; until: string };
+  n: number;
+  byTierModel: Array<{ tier: NonNullable<TaskCard['tier']> | 'unknown'; model: string; n: number }>;
+  /** repair ledger's requested target model, not proof that the provider actually ran. */
+  solTargets: Array<{ taskId: string; pr: number; runId: string; at: string; tier: NonNullable<TaskCard['tier']> | 'unknown'; fromModel: string; toModel: string; status: string }>;
+}
+
+/** Pure, read-only first-post-merge 24h aggregation over an injected repair ledger snapshot. */
+export function aggregateRepairTierModel(input: {
+  cards: readonly RepairTierModelSource[];
+  mergedAt: string;
+  observedAt: string;
+}): RepairTierModelAggregate {
+  const mergedMs = Date.parse(input.mergedAt);
+  const observedMs = Date.parse(input.observedAt);
+  if (!Number.isFinite(mergedMs) || !Number.isFinite(observedMs) || observedMs < mergedMs) {
+    return { status: 'unmeasured', reason: 'invalid-timestamp', n: 0, byTierModel: [], solTargets: [] };
+  }
+
+  const postMerge: Array<{ taskId: string; tier: NonNullable<TaskCard['tier']> | 'unknown'; repair: RepairTierModelRepair; atMs: number }> = [];
+  for (const card of input.cards) {
+    const tier = card.tier ?? 'unknown';
+    for (const repair of card.repairs ?? []) {
+      const atMs = Date.parse(repair.at);
+      if (!Number.isFinite(atMs)) return { status: 'unmeasured', reason: 'invalid-timestamp', n: 0, byTierModel: [], solTargets: [] };
+      if (atMs >= mergedMs && atMs < observedMs) postMerge.push({ taskId: card.taskId, tier, repair, atMs });
+    }
+  }
+  postMerge.sort((a, b) => a.atMs - b.atMs || a.taskId.localeCompare(b.taskId) || a.repair.runId.localeCompare(b.repair.runId));
+  const first = postMerge[0];
+  if (!first) return { status: 'unmeasured', reason: 'no-post-merge-repair', n: 0, byTierModel: [], solTargets: [] };
+
+  const untilMs = first.atMs + 24 * 60 * 60_000;
+  const rows = postMerge.filter((row) => row.atMs < untilMs);
+  const counts = new Map<string, { tier: NonNullable<TaskCard['tier']> | 'unknown'; model: string; n: number }>();
+  const solTargets: RepairTierModelAggregate['solTargets'] = [];
+  for (const { taskId, tier, repair } of rows) {
+    const model = repair.toModel || 'unknown';
+    const key = JSON.stringify([tier, model]);
+    const bucket = counts.get(key) ?? { tier, model, n: 0 };
+    bucket.n++;
+    counts.set(key, bucket);
+    if (/gpt-6-sol/i.test(repair.toModel)) solTargets.push({ taskId, pr: repair.pr, runId: repair.runId, at: repair.at,
+      tier, fromModel: repair.fromModel, toModel: repair.toModel, status: repair.status });
+  }
+  return { status: observedMs >= untilMs ? 'measured' : 'unmeasured',
+    ...(observedMs >= untilMs ? {} : { reason: 'window-incomplete' as const }),
+    window: { from: new Date(first.atMs).toISOString(), until: new Date(untilMs).toISOString() },
+    n: rows.length, byTierModel: [...counts.values()].sort((a, b) => a.tier.localeCompare(b.tier) || a.model.localeCompare(b.model)), solTargets };
+}
+
+
+export function consumeRepairTierModelWindow(cards: readonly TaskCard[], input: {
+  mergedAt: string;
+  observedAt: string;
+}): RepairTierModelAggregate {
+  const sources: RepairTierModelSource[] = cards.map((card) => ({
+    taskId: card.id,
+    ...(card.tier ? { tier: card.tier } : {}),
+    repairs: card.repairs ?? [],
+  }));
+  return aggregateRepairTierModel({ cards: sources, mergedAt: input.mergedAt, observedAt: input.observedAt });
+}
 
 export async function repairModelAvailability(readInputs: () => Promise<Pick<BudgetInputs, 'codexCandidates' | 'grokUsedPercent' | 'maxUsedPercent'>> = readBudgetInputsLive): Promise<RepairModelAvailability> {
   try {

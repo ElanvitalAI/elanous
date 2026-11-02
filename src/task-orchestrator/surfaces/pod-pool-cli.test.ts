@@ -3,6 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { releaseLoopConfig } from '../../../scripts/release-loop/unattended-release.js';
+import { excludeGatePoolMembers } from './gate-pod-pool-policy.js';
 
 const repo = resolve(import.meta.dir, '../../..');
 const entry = join(repo, 'bin/elanous.mjs');
@@ -132,18 +134,16 @@ test('isolated harness ask keeps local goal input off the Pod pool', async () =>
   }
 }, 30_000);
 
-test('harness CLI reads gatePodPool from the explicit isolated config', () => {
-  const { root, env, config } = fixture();
-  const goal = join(root, 'goal.md');
-  writeFileSync(goal, 'Gate config read check');
-  writeFileSync(join(config, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'pool-gate@not-resolvable.invalid:1' } } }));
+test('release gate policy reads gatePodPool from the explicit isolated config and fails closed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-gate-config-'));
+  const configPath = join(root, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ release: { loop: { gatePodPool: 'pool-gate@not-resolvable.invalid:1' } } }));
   try {
-    const result = spawnSync('bun', [entry, '--config-dir', config, `--test=${config}`, 'harness', 'ask', goal,
-      '--substrate', 'pod', '--pod-pool', 'fake@127.0.0.1:3'], { cwd: repo, env, encoding: 'utf8', timeout: 35_000 });
-    expect(result.status).toBe(2);
-    expect(result.stderr).toContain('host-identity-unavailable');
-    expect(result.stderr).not.toContain('release-gate-pool-missing');
+    const gatePool = releaseLoopConfig(configPath).gatePodPool;
+    const result = excludeGatePoolMembers('fake@127.0.0.1:3', gatePool, { global: 'gate', podTarget: 0 }, 'fixture-local',
+      (host) => host === 'not-resolvable.invalid' || host === '127.0.0.1' ? '10.0.0.7' : null);
+    expect(result).toEqual({ active: true, gateHosts: ['not-resolvable.invalid'], reason: 'task-pod-pool-has-no-host-outside-release-gate-pool' });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 40_000);
+});

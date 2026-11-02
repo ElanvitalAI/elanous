@@ -13,9 +13,10 @@ interface DirectiveRow {
 import type { IntakeItem } from '../intake-plane/items.js';
 import type { TaskCard } from '../task-cards/card-store.js';
 import { ingestIntakeItems, markIntakeItem, listIntakeItems } from '../intake-plane/items.js';
-import { buildIntakeDigest } from '../intake-plane/digest.js';
+import { buildIntakeDigest, seatBriefFile } from '../intake-plane/digest.js';
 import { addSource } from '../intake-plane/intake-sources.js';
 import { debug } from '../debug/log.js';
+import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import { readSavedCursor, type SavedMessage } from '../intake-plane/collect-telegram-saved.js';
 import { CHANNEL_PUBLISH_CROWN_OWNER, ChannelPublishQueue } from '../intake-plane/intake-to-tasks.js';
 
@@ -299,6 +300,53 @@ test('intake digest --seat user sends only two user notes and sends an empty arr
       expect(log).toHaveBeenCalledWith('watch.default', 'brief', { topics: 1, items: 0, sent: true });
     } finally { log.mockRestore(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('production intake digest handler without --test records exactly the mocked Telegram arrival in its isolated state root', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'intake-prod-handler-'));
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  const previousConfigDir = process.env.ELANOUS_CONFIG_DIR;
+  const day = '2026-11-02';
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    delete process.env.ELANOUS_CONFIG_DIR;
+    resetEffectiveInstanceRoot();
+    addSource({ id: 'brief-topic', kind: 'github-query', seat: 'user', spec: 'agent', every: '1d' }, root);
+    ingestIntakeItems(root, 'github', [{ seat: 'user', url: 'https://example.com/arrived', title: 'arrival note', kind: 'repo' }], '2026-11-02T01:00:00Z');
+    const item = listIntakeItems(root).find((entry) => entry.title === 'arrival note')!;
+    expect(markIntakeItem(root, item.id, { status: 'absorbed', output: { kind: 'note', ref: '/notes/arrival-note.md' } }, '2026-11-02T01:01:00Z')).toBe(true);
+
+    const mockArrivals: { id: number; text: string }[] = [];
+    let commandResult: Awaited<ReturnType<typeof runIntakeDigestCli>> | undefined;
+    const program = new Command().name('elanous').exitOverride();
+    registerIntakeCommands(program, { digest: {
+      annotateLens: async () => {},
+      sendTelegram: async (text) => { mockArrivals.push({ id: 2047, text }); return { messageId: 2047 }; },
+      onResult: (result) => { commandResult = result; },
+    } });
+    const commandArgs = ['node', 'elanous', 'intake', 'digest', '--telegram', '--seat', 'user', '--day', day];
+    expect(commandArgs).not.toContain('--test');
+    await program.parseAsync(commandArgs);
+
+    expect(mockArrivals).toHaveLength(1);
+    expect(mockArrivals[0]?.id).toBe(2047);
+    expect(mockArrivals[0]?.text).toContain('arrival-note');
+    expect(commandResult).toEqual({ sent: true, arrival: { messageId: 2047, absorbedIds: [item.id] } });
+    const returnedIds = commandResult?.arrival?.absorbedIds;
+    expect(returnedIds).toEqual([item.id]);
+    const receipts = readFileSync(seatBriefFile(root, 'user'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(receipts).toEqual([{ id: item.id, day }]);
+    expect(receipts.map((receipt) => receipt.id)).toEqual(returnedIds ?? []);
+    expect(buildIntakeDigest(root, day, undefined, undefined, 'user').absorbed.map((entry) => entry.id)).toEqual([item.id]);
+    expect(mockArrivals[0]?.text).toContain(`[[arrival-note]]`);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    if (previousConfigDir === undefined) delete process.env.ELANOUS_CONFIG_DIR;
+    else process.env.ELANOUS_CONFIG_DIR = previousConfigDir;
+    resetEffectiveInstanceRoot();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('a seat briefing does not resend yesterday\'s items when the same search result is collected again', async () => {

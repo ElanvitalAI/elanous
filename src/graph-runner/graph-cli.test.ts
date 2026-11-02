@@ -7,6 +7,7 @@ import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { Command } from 'commander';
 import { registerGraphCommands } from './graph-cli.js';
 import { runGraph } from './runner.js';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -24,6 +25,13 @@ function spawnGraphAt(stateRoot: string, cwd: string, ...args: string[]): { code
 
 function spawnGraph(stateRoot: string, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
   return spawnGraphAt(stateRoot, root, ...args);
+}
+
+async function runGraphInProcess(stateRoot: string, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  const result = await simInProcessCli(['graph', ...args], {
+    allowPaths: [['graph', 'run'], ['graph', 'status'], ['graph', 'approve']], stateRoot,
+  });
+  return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
 }
 
 test('graph adapt-report measures same-goal A/A/B ledger paths, adaptations, landings and exclusions', () => {
@@ -455,7 +463,7 @@ test('graph notify --dry-run prints the target events without sending or writing
   expect(repeated.stdout).toBe(preview.stdout);
 }, 30000);
 
-test('real CLI awaits approval, reports message, records decision and resumes without replay', () => {
+test('in-process CLI awaits approval, reports message, records decision and resumes without replay', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-cli-approval-'));
   dirs.push(dir);
   const stateRoot = join(dir, 'state');
@@ -478,49 +486,49 @@ edges:
     map: { ok: b, fail: failed }
   - { from: b, to: done }
 `);
-  const first = spawnGraph(stateRoot, 'run', graph, '--json');
+  const first = await runGraphInProcess(stateRoot, 'run', graph, '--json');
   expect(first.code).toBe(0);
   const pending = JSON.parse(first.stdout);
   expect(pending).toMatchObject({ graphId: 'cli-approval', status: 'awaiting-approval', pending: { nodeId: 'gate', message: 'Publish now?' } });
   expect(readFileSync(join(dir, 'executions'), 'utf8')).toBe('a');
-  const status = spawnGraph(stateRoot, 'status', pending.graphId);
+  const status = await runGraphInProcess(stateRoot, 'status', pending.graphId);
   expect(status.stdout).toContain('awaiting-approval');
   expect(status.stdout).toContain('Publish now?');
-  const undecided = spawnGraph(stateRoot, 'run', graph, '--resume', pending.runId, '--json');
+  const undecided = await runGraphInProcess(stateRoot, 'run', graph, '--resume', pending.runId, '--json');
   expect(JSON.parse(undecided.stdout).status).toBe('awaiting-approval');
   expect(readFileSync(join(dir, 'executions'), 'utf8')).toBe('a');
-  const approved = spawnGraph(stateRoot, 'approve', pending.graphId, pending.runId, '--by', 'operator');
+  const approved = await runGraphInProcess(stateRoot, 'approve', pending.graphId, pending.runId, '--by', 'operator');
   expect(approved.code).toBe(0);
-  const duplicate = spawnGraph(stateRoot, 'approve', pending.graphId, pending.runId);
+  const duplicate = await runGraphInProcess(stateRoot, 'approve', pending.graphId, pending.runId);
   expect(duplicate.code).toBe(1);
   expect(duplicate.stderr).toContain('not awaiting an undecided approval');
-  const resumed = spawnGraph(stateRoot, 'run', graph, '--resume', pending.runId, '--json');
+  const resumed = await runGraphInProcess(stateRoot, 'run', graph, '--resume', pending.runId, '--json');
   expect(resumed.code).toBe(0);
   expect(JSON.parse(resumed.stdout)).toMatchObject({ status: 'done', runId: pending.runId, executed: 2 });
   expect(readFileSync(join(dir, 'executions'), 'utf8')).toBe('ab');
-  const after = spawnGraph(stateRoot, 'approve', pending.graphId, pending.runId);
+  const after = await runGraphInProcess(stateRoot, 'approve', pending.graphId, pending.runId);
   expect(after.code).toBe(1);
   expect(after.stderr).toContain('not awaiting');
-  const rejectedFirst = spawnGraph(stateRoot, 'run', graph, '--json');
+  const rejectedFirst = await runGraphInProcess(stateRoot, 'run', graph, '--json');
   expect(rejectedFirst.code).toBe(0);
   const rejectedId = JSON.parse(rejectedFirst.stdout).runId as string;
-  const rejection = spawnGraph(stateRoot, 'approve', 'cli-approval', rejectedId, '--reject', '--by', 'reviewer');
+  const rejection = await runGraphInProcess(stateRoot, 'approve', 'cli-approval', rejectedId, '--reject', '--by', 'reviewer');
   expect(rejection.code).toBe(0);
-  const failed = spawnGraph(stateRoot, 'run', graph, '--resume', rejectedId, '--json');
+  const failed = await runGraphInProcess(stateRoot, 'run', graph, '--resume', rejectedId, '--json');
   expect(failed.code).toBe(1);
   expect(JSON.parse(failed.stdout).status).toBe('failed');
   expect(JSON.parse(failed.stdout).nodes[1]).toMatchObject({ nodeId: 'gate', ok: false, decidedBy: 'reviewer' });
   expect(readFileSync(join(dir, 'executions'), 'utf8')).toBe('aba');
-  const unnamedFirst = spawnGraph(stateRoot, 'run', graph, '--json');
+  const unnamedFirst = await runGraphInProcess(stateRoot, 'run', graph, '--json');
   expect(unnamedFirst.code).toBe(0);
   const unnamedId = JSON.parse(unnamedFirst.stdout).runId as string;
-  const unnamedApproval = spawnGraph(stateRoot, 'approve', 'cli-approval', unnamedId);
+  const unnamedApproval = await runGraphInProcess(stateRoot, 'approve', 'cli-approval', unnamedId);
   expect(unnamedApproval.code).toBe(0);
-  const unnamedStatus = spawnGraph(stateRoot, 'status', 'cli-approval', '--json');
+  const unnamedStatus = await runGraphInProcess(stateRoot, 'status', 'cli-approval', '--json');
   expect(unnamedStatus.code).toBe(0);
   expect(JSON.parse(unnamedStatus.stdout).pending).toMatchObject({ decision: 'approved' });
   expect(JSON.parse(unnamedStatus.stdout).pending).not.toHaveProperty('decidedBy');
-  const unnamedResumed = spawnGraph(stateRoot, 'run', graph, '--resume', unnamedId, '--json');
+  const unnamedResumed = await runGraphInProcess(stateRoot, 'run', graph, '--resume', unnamedId, '--json');
   expect(unnamedResumed.code).toBe(0);
   expect(JSON.parse(unnamedResumed.stdout).nodes[1]).toMatchObject({ nodeId: 'gate', ok: true });
   expect(JSON.parse(unnamedResumed.stdout).nodes[1]).not.toHaveProperty('decidedBy');

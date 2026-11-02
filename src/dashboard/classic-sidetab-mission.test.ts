@@ -126,6 +126,74 @@ test('linear mission binding stays single-only while pairs skip sync with a warn
   }
 });
 
+test('strict-schema empty optional sentinels normalize before trio exclusivity checks', async () => {
+  const started: Array<{ mission: string; context?: unknown }> = [];
+  const singles: string[] = [];
+  const tool = createClassicSidetabMissionTool(
+    async (_agent, mission) => {
+      singles.push(mission);
+      return { ok: true, status: 'running', interactionId: 'single-1' };
+    },
+    undefined,
+    async (mission, context) => {
+      started.push({ mission, context });
+      return {
+        trioId: 'trio-1',
+        members: {
+          codex: { ok: true, status: 'running', interactionId: 'codex-1' },
+          claude: { ok: true, status: 'running', interactionId: 'claude-1' },
+          grok: { ok: true, status: 'running', interactionId: 'grok-1' },
+        },
+      };
+    },
+  );
+  const properties = (tool.spec.parameters as { properties: Record<string, unknown> }).properties;
+  const parallelSchema = properties.parallelMission as { anyOf: Array<Record<string, unknown>> };
+  const linearSchema = properties.linearIssueId as { anyOf: Array<Record<string, unknown>> };
+  expect(parallelSchema.anyOf).toContainEqual({ type: 'null' });
+  expect(parallelSchema.anyOf.some((schema) => schema.type === 'array' && schema.maxItems === 0)).toBe(true);
+  expect(linearSchema.anyOf).toContainEqual({ type: 'null' });
+  expect(linearSchema.anyOf.some((schema) => schema.type === 'array' && schema.maxItems === 0)).toBe(true);
+
+  let turn = 0;
+  let toolResult: unknown;
+  const provider: LLMProvider = {
+    name: 'local-test',
+    defaultModel: 'local-test',
+    available: () => true,
+    async *chat() { yield 'done'; },
+    async *streamChat(_messages, options) {
+      const missionTool = options?.tools?.find(({ name }) => name === CLASSIC_SIDETAB_MISSION_TOOL_NAME);
+      expect(missionTool?.parameters).toMatchObject(tool.spec.parameters);
+      if (turn++ === 0) {
+        yield {
+          type: 'tool_call', id: 'strict-shaped-call', name: CLASSIC_SIDETAB_MISSION_TOOL_NAME,
+          args: { agent: 'codex', mission: 'same task', parallelMission: null, linearIssueId: [], withGrok: true },
+        };
+      } else {
+        yield { type: 'text', delta: 'started' };
+      }
+    },
+  };
+  await streamLLMWithTools([{ role: 'user', content: 'start a three-hand mission' }], {
+    onText: () => {},
+    onToolResult: (call) => { toolResult = call.result; },
+    dispatchTool: async (_name, args) => tool.dispatch(args),
+  }, { provider, tools: [tool.spec], maxTurns: 2 });
+  expect(toolResult).toMatchObject({ status: 'running', id: 'codex-1' });
+  expect(started).toEqual([{ mission: 'same task', context: undefined }]);
+  await expect(tool.dispatch({
+    agent: 'codex', mission: 'same task', parallelMission: 'different task', linearIssueId: '', withGrok: true,
+  })).resolves.toMatchObject({ status: 'error', body: 'withGrok compares the same mission; omit parallelMission' });
+  expect(started).toHaveLength(1);
+
+  const placeholdersOnly = await tool.dispatch({
+    agent: 'codex', mission: 'single', parallelMission: '', linearIssueId: null, withGrok: '',
+  });
+  expect(placeholdersOnly).toMatchObject({ status: 'running', id: 'single-1' });
+  expect(singles).toEqual(['single']);
+});
+
 test('HandReply tool is present only with its runtime seam and validates correction identity inputs', async () => {
   const called: unknown[] = [];
   const mission = createDashboardClassicSidetabMissionCallbacks(

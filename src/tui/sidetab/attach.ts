@@ -7,6 +7,7 @@ import { createTerminalModalRouter } from '../../terminal/terminal-modal-router.
 import { getSessionCwd } from '../../session/working-dir.js';
 import { TerminalSessionRegistry, type TerminalSession } from '../../terminal/session-registry.js';
 import { requestRemotePtyControl } from '../../pty-shell/pty-control-ipc.js';
+import { debug } from '../../debug/log.js';
 import { runVisibleAgentMission, type VisibleAgentCli, type VisibleMissionPty, type VisibleMissionResult } from '../../sidetab-core/visible-agent-mission.js';
 import { runVisibleAgentMissionPair } from '../../sidetab-core/visible-agent-mission-pair.js';
 import type { Key } from '../../tui.js';
@@ -81,6 +82,8 @@ export function createSidetabAttachmentController(deps: {
   visibleMissionRunner?: typeof runVisibleAgentMission;
   /** Test seam for exercising real session-exit propagation through the controller. */
   terminalRegistry?: TerminalSessionRegistry;
+  /** Test seam for remote PTY transport and takeover races. */
+  remotePtyCommand?(host: string, args: readonly string[]): Promise<string>;
 }): SidetabAttachmentController {
   const eventBus = createDisplayEventBus();
   const coordinator = new DisplayCoordinator({
@@ -156,7 +159,9 @@ export function createSidetabAttachmentController(deps: {
   let attachedSessionId: string | null = null;
   let detachPrefixPending = false;
   let remotePtyId: string | null = null;
+  let remoteHost: string | null = null;
   let remoteTakenOver = false;
+  let remoteAttachmentToken = 0;
   let remoteFrameTimer: ReturnType<typeof setInterval> | null = null;
   let remoteFramePending = false;
   let remoteHasFrame = false;
@@ -166,6 +171,55 @@ export function createSidetabAttachmentController(deps: {
   let herdrFrameTimer: ReturnType<typeof setInterval> | null = null;
   let herdrFramePending = false;
   const herdrInputQueues = new Map<string, Promise<void>>();
+  const remoteOperationQueues = new Map<string, Promise<void>>();
+  const runRemotePtyCommand = async (host: string, args: readonly string[]): Promise<string> => {
+    if (deps.remotePtyCommand) return deps.remotePtyCommand(host, args);
+    const { runRemoteElnPty } = await import('./remote.js');
+    return runRemoteElnPty(host, args);
+  };
+  const runRemotePtyControl = async (host: string | null, id: string, action: 'takeover' | 'release'): Promise<void> => {
+    if (host) { await runRemotePtyCommand(host, ['pty', action, id]); return; }
+    const result = await requestRemotePtyControl(id, action, undefined, { timeoutMs: action === 'takeover' ? 1_000 : 500 });
+    if (result.status !== 'success') throw new Error(result.reason ?? result.status);
+  };
+  const enqueueRemoteOperation = (host: string | null, id: string, operation: () => Promise<void>): Promise<void> => {
+    const key = (host ?? 'local') + '\0' + id;
+    const previous = remoteOperationQueues.get(key) ?? Promise.resolve();
+    let current: Promise<void>;
+    current = previous.catch(() => {}).then(operation).finally(() => {
+      if (remoteOperationQueues.get(key) === current) remoteOperationQueues.delete(key);
+    });
+    remoteOperationQueues.set(key, current);
+    return current;
+  };
+  const releaseRemotePty = (host: string | null, id: string): void => {
+    void enqueueRemoteOperation(host, id, () => runRemotePtyControl(host, id, 'release')).catch((error: unknown) => {
+      deps.logEvent?.('sidetab.remote', 'release-failed', { host, ptyId: id, error: error instanceof Error ? error.message : String(error) });
+      deps.setStatus('PTY 해제 실패 · ' + (host ?? 'local') + ':' + id);
+    });
+  };
+  const enqueueRemoteInput = (host: string | null, id: string, token: number, send: () => Promise<void>): void => {
+    void enqueueRemoteOperation(host, id, async () => {
+      if (remotePtyId !== id || remoteHost !== host || remoteAttachmentToken !== token || !remoteTakenOver) {
+        deps.logEvent?.('sidetab.remote', 'send-cancelled', { host, ptyId: id, reason: 'attachment-changed-before-send' });
+        deps.setStatus('PTY 입력 취소 · 대상 전환으로 ' + (host ?? 'local') + ':' + id + '에 보내지 않았습니다');
+        return;
+      }
+      try {
+        await send();
+        deps.logEvent?.('sidetab.remote', 'send-result', { host, ptyId: id, result: 'sent' });
+      } catch (error) {
+        const attachmentChanged = remotePtyId !== id || remoteHost !== host || remoteAttachmentToken !== token;
+        const reason = error instanceof Error ? error.message : String(error);
+        deps.logEvent?.('sidetab.remote', 'send-failed', { host, ptyId: id, reason, attachmentChanged, outcome: 'unknown', userVisible: true });
+        deps.setStatus('PTY 입력 결과 불명(전송 여부 확인 불가) · ' + (host ?? 'local') + ':' + id + ' · ' + reason);
+      }
+    }).catch((error: unknown) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      deps.logEvent?.('sidetab.remote', 'operation-failed', { host, ptyId: id, reason });
+      deps.setStatus('PTY 원격 작업 실패 · ' + (host ?? 'local') + ':' + id + ' · ' + reason);
+    });
+  };
 
   const enqueueHerdrInput = (paneId: string, send: () => Promise<void>): void => {
     const previous = herdrInputQueues.get(paneId) ?? Promise.resolve();
@@ -183,8 +237,11 @@ export function createSidetabAttachmentController(deps: {
     if (remoteFrameTimer !== null) clearInterval(remoteFrameTimer);
     remoteFrameTimer = null;
     const previous = remotePtyId;
+    const previousHost = remoteHost;
+    remoteAttachmentToken += 1;
     remotePtyId = null;
-    if (previous && remoteTakenOver) void requestRemotePtyControl(previous, 'release', undefined, { timeoutMs: 500 }).catch(() => {});
+    remoteHost = null;
+    if (previous && remoteTakenOver) releaseRemotePty(previousHost, previous);
     remoteTakenOver = false;
     remoteHasFrame = false;
     deps.drawRemoteFrame('');
@@ -228,13 +285,20 @@ export function createSidetabAttachmentController(deps: {
     stopHerdr();
     stopRemote();
     remotePtyId = row.ptyId;
+    remoteHost = row.remoteHost ?? null;
+    const host = remoteHost;
     const id = row.ptyId;
+    const token = ++remoteAttachmentToken;
+    const isCurrentAttachment = (): boolean => remotePtyId === id && remoteHost === host && remoteAttachmentToken === token;
     const refresh = async (): Promise<void> => {
-      if (remoteFramePending || remotePtyId !== id) return;
+      if (remoteFramePending || !isCurrentAttachment()) return;
       remoteFramePending = true;
       try {
-        const result = await requestRemotePtyControl(id, 'snapshot', { ansi: true }, { timeoutMs: 450 });
-        if (remotePtyId === id && result.status === 'success') {
+        if (host) debug.log('sidetab.remote', 'peek', { host, ptyId: id });
+        const result = host
+          ? { status: 'success' as const, screen: await runRemotePtyCommand(host, ['pty', 'snapshot', id, '--ansi']) }
+          : await requestRemotePtyControl(id, 'snapshot', { ansi: true }, { timeoutMs: 450 });
+        if (isCurrentAttachment() && result.status === 'success') {
           if (!result.screen?.trim()) {
             stopRemote();
             deps.setStatus('PTY 화면이 비어 있어 채팅 화면을 유지합니다');
@@ -243,12 +307,13 @@ export function createSidetabAttachmentController(deps: {
           remoteHasFrame = true;
           deps.drawRemoteFrame(result.screen ?? '');
         }
-        else if (remotePtyId === id && result.status !== 'success') {
+        else if (isCurrentAttachment() && result.status !== 'success') {
           if (!remoteHasFrame) stopRemote();
           deps.setStatus(`PTY 화면 읽기 실패 · ${result.status}`);
         }
       } catch (error) {
-        if (remotePtyId === id) {
+        if (isCurrentAttachment()) {
+          if (host) debug.log('sidetab.remote', 'host-unreachable', { host, ptyId: id, reason: error instanceof Error ? error.message : String(error) });
           if (!remoteHasFrame) stopRemote();
           deps.setStatus(`PTY 화면 읽기 오류 · ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -257,7 +322,7 @@ export function createSidetabAttachmentController(deps: {
       }
     };
     void refresh();
-    remoteFrameTimer = setInterval(() => { void refresh(); }, 75);
+    remoteFrameTimer = setInterval(() => { void refresh(); }, host ? 1_000 : 75);
     deps.setStatus('원격 PTY 화면 · t takeover · Ctrl+\\ 후 ↑/↓ 전환');
     return true;
   };
@@ -408,7 +473,7 @@ export function createSidetabAttachmentController(deps: {
         modal = visibleMissionPtyForTerminalSession(session);
         cwd = session.cwd;
       }
-      const outputPath = join(cwd, '.elanous', 'mission-results', `sidetab-${Date.now()}.md`);
+      const outputPath = join(cwd, '.elanous', 'mission-results', `sidetab-${Date.now()}-${randomUUID()}.md`);
       const backend = visibleAgentBackend(agent);
       const result = await (deps.visibleMissionRunner ?? runVisibleAgentMission)({
         pty: modal,
@@ -605,22 +670,41 @@ export function createSidetabAttachmentController(deps: {
         if (key.ctrl && key.name.toLowerCase() === 'q') return false;
         if (key.name.toLowerCase() === 't' && !remoteTakenOver) {
           const id = remotePtyId;
-          void requestRemotePtyControl(id, 'takeover', undefined, { timeoutMs: 1_000 }).then((result) => {
-            if (remotePtyId !== id) return;
-            remoteTakenOver = result.status === 'success';
-            deps.setStatus(remoteTakenOver ? '사람 입력 takeover 완료 · 전환 때 release' : `takeover 거부 · ${result.reason ?? result.status}`);
+          const host = remoteHost;
+          const token = remoteAttachmentToken;
+          void enqueueRemoteOperation(host, id, async () => {
+            const isCurrent = (): boolean => remotePtyId === id && remoteHost === host && remoteAttachmentToken === token;
+            if (!isCurrent()) return;
+            await runRemotePtyControl(host, id, 'takeover');
+            if (!isCurrent()) {
+              // This operation is serialized with a later takeover for the same target.
+              await runRemotePtyControl(host, id, 'release');
+              return;
+            }
+            remoteTakenOver = true;
+            deps.setStatus('사람 입력 takeover 완료 · 전환 때 release');
           }).catch((error: unknown) => {
-            if (remotePtyId === id) deps.setStatus(`takeover 오류 · ${error instanceof Error ? error.message : String(error)}`);
+            if (remotePtyId === id && remoteHost === host && remoteAttachmentToken === token) deps.setStatus(`takeover 오류 · ${error instanceof Error ? error.message : String(error)}`);
           });
           return true;
         }
         if (remoteTakenOver && key.raw) {
-          const id = remotePtyId;
-          void requestRemotePtyControl(id, 'input-key', { chars: key.raw }, { timeoutMs: 500 }).then((result) => {
-            if (remotePtyId === id && result.status !== 'success') deps.setStatus(`PTY 입력 실패 · ${result.status}`);
-          }).catch((error: unknown) => {
-            if (remotePtyId === id) deps.setStatus(`PTY 입력 오류 · ${error instanceof Error ? error.message : String(error)}`);
-          });
+          const id = remotePtyId!;
+          const raw = key.raw!;
+          const host = remoteHost;
+          const token = remoteAttachmentToken;
+          if (host) debug.log('sidetab.remote', 'send', { host, ptyId: id, chars: raw.length });
+          const send = async (): Promise<void> => {
+            if (host) {
+              const enter = raw === '\r' || raw === '\n';
+              const args = ['pty', 'text', id, enter ? '' : raw, ...(enter ? ['--enter'] : []), '--actor', 'human'];
+              await runRemotePtyCommand(host, args);
+              return;
+            }
+            const result = await requestRemotePtyControl(id, 'input-key', { chars: raw }, { timeoutMs: 500 });
+            if (result.status !== 'success') throw new Error(result.status);
+          };
+          enqueueRemoteInput(host, id, token, send);
           return true;
         }
         return true;

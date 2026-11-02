@@ -12,6 +12,8 @@ interface FakeSshHost {
   activeSessions: number;
   /** Deterministic MaxStartups full threshold; a connection at/above it is refused. */
   maxStartups: number;
+  /** MaxSessions threshold for the broker channel simulator. */
+  maxSessions?: number;
   /** At/above this session count, inject the configured banner delay/deadline outcome. */
   bannerTimeoutAt?: number;
   /** Virtual banner-exchange delay after the session threshold is reached. */
@@ -30,6 +32,9 @@ interface FakeSshCall {
 }
 
 interface FakeSshDevice {
+  /** Open a bounded concurrent channel and release it when the returned promise settles. */
+  openChannel(host: string, script: string, holdMs?: number): Promise<{ rc: number; output: string }>;
+  channelStats(host: string): { active: number; peak: number; refused: number };
   /** Compatible with the existing GateTools.ssh seam; no SSH process or network call is made. */
   ssh: GateSshTransport;
   calls: FakeSshCall[];
@@ -40,6 +45,8 @@ function validateHost(host: string, config: FakeSshHost): void {
     throw new Error(`fake-ssh ${host}: activeSessions must be a nonnegative integer`);
   if (!Number.isInteger(config.maxStartups) || config.maxStartups < 1)
     throw new Error(`fake-ssh ${host}: maxStartups must be a positive integer`);
+  if (config.maxSessions !== undefined && (!Number.isInteger(config.maxSessions) || config.maxSessions < 1))
+    throw new Error(`fake-ssh ${host}: maxSessions must be a positive integer`);
   if (config.bannerTimeoutAt !== undefined && (!Number.isInteger(config.bannerTimeoutAt) || config.bannerTimeoutAt < 0))
     throw new Error(`fake-ssh ${host}: bannerTimeoutAt must be a nonnegative integer`);
   if (config.bannerDelayMs !== undefined && (!Number.isFinite(config.bannerDelayMs) || config.bannerDelayMs < 0))
@@ -66,6 +73,8 @@ export function createFakeSsh(input: { hosts: Record<string, FakeSshHost>; clock
     hosts.set(host, { ...config });
   }
   const calls: FakeSshCall[] = [];
+  const channelState = new Map<string, { active: number; peak: number; refused: number }>();
+  for (const host of hosts.keys()) channelState.set(host, { active: 0, peak: 0, refused: 0 });
   const ssh: GateSshTransport = (host, script, limitMs) => {
     const config = hosts.get(host);
     calls.push({ host, script, activeSessions: config?.activeSessions ?? null, ...(limitMs === undefined ? {} : { limitMs }) });
@@ -94,5 +103,23 @@ export function createFakeSsh(input: { hosts: Record<string, FakeSshHost>; clock
       return { rc: 255, output: `scp: Connection reset by peer (${host})` };
     return { rc: 0, output: `fake-ssh: connected ${host}` };
   };
-  return { ssh, calls };
+  const openChannel: FakeSshDevice['openChannel'] = async (host, script, holdMs = 0) => {
+    const config = hosts.get(host);
+    const state = channelState.get(host);
+    if (!config || !state) return { rc: 255, output: 'fake-ssh: unconfigured fake-ssh host: ' + host };
+    const maxSessions = config.maxSessions ?? 10;
+    if (config.activeSessions + state.active >= maxSessions) {
+      state.refused += 1;
+      return { rc: 255, output: 'channel 3: open failed: Session open refused by peer (' + host + ')' };
+    }
+    state.active += 1;
+    state.peak = Math.max(state.peak, state.active);
+    calls.push({ host, script, activeSessions: config.activeSessions });
+    try {
+      if (holdMs > 0) await new Promise(resolve => setTimeout(resolve, holdMs));
+      return { rc: 0, output: 'fake-ssh: channel ' + host };
+    } finally { state.active -= 1; }
+  };
+  const channelStats = (host: string) => ({ ...(channelState.get(host) ?? { active: 0, peak: 0, refused: 0 }) });
+  return { ssh, calls, openChannel, channelStats };
 }

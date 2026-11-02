@@ -66,6 +66,7 @@ import {
   estimateRequestChars,
   formatRequestSizeStatus,
   type RequestSizeGuard,
+  type RunCompactPipeline,
 } from '../session/request-size-guard.js';
 
 const FACT_QUESTION_INSTRUCTION = '사실·최신 정보 질문이다. WebSearch 를 1~2회 쓰고 검색 결과(제목·스니펫·URL)로 답하라. 출처 링크를 붙여라. 셸·브라우저·파일 도구는 검색 결과로 부족할 때만. 도구 예산에 닿으면 지금까지 근거로 답하고 끝에 «더 찾아볼까요?»를 붙여라.';
@@ -163,6 +164,16 @@ export interface CoreTurnBridgeDeps {
     requestChars: number;
     maxChars: number;
   }) => Promise<{ fired: boolean; reason: string }>;
+  /** Write back the canonical live-compacted provider history to the host
+   *  session store before the compacted request is sent. Hosts that support
+   *  resume must persist this replacement, not merely the first preflight pass. */
+  persistCompactedHistory?: (ctx: {
+    sessionId: string;
+    userText: string;
+    messages: LLMMessage[];
+  }) => void | Promise<void>;
+  /** Test seam for the live compaction boundary. */
+  requestSizeRunCompactPipeline?: RunCompactPipeline;
   /** Override the request-size cap (tests). Defaults to `REQUEST_SIZE_MAX_CHARS`. */
   requestSizeMaxChars?: number;
 }
@@ -394,6 +405,7 @@ export function bridgeCoreTurnToAcp(
               ...(guardModel ? { activeModelId: guardModel } : {}),
               ...(preserveLastN !== undefined ? { preserveLastN } : {}),
               ...(archiveEnabled !== undefined ? { archiveEnabled } : {}),
+              ...(deps.requestSizeRunCompactPipeline ? { runCompactPipeline: deps.requestSizeRunCompactPipeline } : {}),
             };
           },
           // The preflight estimate missed (wire over cap, seed under): still write the
@@ -401,6 +413,24 @@ export function bridgeCoreTurnToAcp(
           compactFirstRequest: async (_current, info) => {
             await compactHistory(info.requestChars, 'first-request');
             return null;
+          },
+          onCompacted: async (messages) => {
+            if (!deps.persistCompactedHistory) return;
+            try {
+              await deps.persistCompactedHistory({
+                sessionId: turnCtx.sessionId,
+                userText: turnCtx.userText,
+                messages,
+              });
+            } catch (error) {
+              debug.log('llm.request', 'request-size-compact-persist-error', {
+                sessionId: turnCtx.sessionId,
+                message: error instanceof Error ? error.message : String(error),
+              }, { level: 'error' });
+              // A compacted request must not proceed when its replacement
+              // transcript could not be committed for later turns/resume.
+              throw error;
+            }
           },
           onMeasured: (measurement) => {
             if (!measurement.compacted) return;

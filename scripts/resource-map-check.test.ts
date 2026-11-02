@@ -80,16 +80,22 @@ describe('resource-map-check', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  test('uses the repository resource map by default without falsely reporting registered names', () => {
+  test('uses the repository resource map by default on a bounded source fixture', () => {
     const registeredNames = ['ELEVENLABS_API_KEY', 'FIRECRAWL_API_KEY', 'GITHUB_TOKEN', 'SUPADATA_API_KEY'];
-    const result = checkResourceMap({});
-    expect(result.unreadable).toEqual([]);
-    const uncoveredNames = result.uncovered.flatMap(({ envNames }) => envNames);
-    expect(uncoveredNames).not.toEqual(expect.arrayContaining(registeredNames));
-    for (const registeredName of registeredNames) expect(uncoveredNames).not.toContain(registeredName);
-  }, 60_000);
+    const source = registeredNames.map((name) => `process.env.${name};`).join('\n');
+    const catalog = readFileSync(join(import.meta.dir, '..', 'catalog', 'resources.yaml'), 'utf8');
+    const root = fixture(source, catalog);
+    try {
+      const result = checkResourceMap({ root });
+      expect(result.unreadable).toEqual([]);
+      const uncoveredNames = result.uncovered.flatMap(({ envNames }) => envNames);
+      expect(uncoveredNames).not.toEqual(expect.arrayContaining(registeredNames));
+      for (const registeredName of registeredNames) expect(uncoveredNames).not.toContain(registeredName);
+      expect(result.covered.flatMap(({ envNames }) => envNames)).toEqual(expect.arrayContaining(registeredNames));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 
-  test('no-argument repository CLI never reports a registered name as uncovered, and its exit code follows its own findings', () => {
+  test.skipIf(process.env.GATE_INTEGRATION_ONLY !== '1')('[GATE_INTEGRATION_ONLY] full-repository no-argument CLI scan preserves registered-name and exit-status contracts', () => {
     const registeredNames = ['ELEVENLABS_API_KEY', 'FIRECRAWL_API_KEY', 'GITHUB_TOKEN', 'SUPADATA_API_KEY'];
     const result = runEntrypoint(process.cwd());
     const output = JSON.parse(result.output);
@@ -106,7 +112,7 @@ describe('resource-map-check', () => {
     for (const registeredName of registeredNames) expect(uncoveredNames).not.toContain(registeredName);
     const shouldFail = output.uncovered.length > 0 || output.unreadable.length > 0;
     expect(result.exitCode).toBe(shouldFail ? 1 : 0);
-  }, 30_000);
+  }, 120_000);
 
   test('reports malformed default resource maps through the no-argument entrypoint without false uncovered findings', () => {
     const root = fixture('const key = process.env.TAVILY_API_KEY;', 'resources: [');
@@ -280,29 +286,36 @@ describe('resource-map-check', () => {
   });
 
   test('checkResourceMap wires catalog entries through credentialIdsWithEmptyFreeFallback', () => {
-    const result = checkResourceMap({});
-    const document = parseYaml(readFileSync(join(process.cwd(), 'catalog/resources.yaml'), 'utf8')) as { resources?: unknown };
-    const entries = Array.isArray(document.resources) ? document.resources : [];
-    expect(result.emptyFreeFallbackIds).toEqual(credentialIdsWithEmptyFreeFallback(entries));
-    // ⛔⭐ «수»도 «어느 id 가 빈칸인가»도 박지 않는다 — 빈칸을 채우는 것이 «의도된 작업»이다.
-    //    📏 이 줄은 2026-09-22 에 ***두 번*** 깨졌다:
-    //      ⑴ reddit 의 RSS 폴백을 채우자 16→15 로 `toHaveLength(16)` 이 깨졌고,
-    //      ⑵ 그것을 `toBeGreaterThan(0)` ⊕ `toContain('apify')` 로 바꿨는데
-    //         빈칸을 «전부» 채우자(16→0) 그 둘이 «또» 깨졌다.
-    //    🔑 두 번 다 원인이 같다 — ***카탈로그의 «내용»을 자가 박은 것***이다.
-    //    ⇒ 배선은 바로 위 toEqual 이 이미 «성질»로 문다. 탐지기 자체는 픽스처로 누른다
-    //      (위 'credentialIdsWithEmptyFreeFallback' 시험이 absent/null/empty/whitespace 넷을 문다).
-    expect(Array.isArray(result.emptyFreeFallbackIds)).toBe(true);
-    // ⛔ 같은 이유로 «수»를 박지 않는다 — covered 가 28→32 로 늘자 이 줄이 깨졌다(2026-09-23).
-    //    성질로 문다: 세 갈래는 서로 겹치지 않고, covered 는 비어 있지 않다.
-    expect(result.covered.length).toBeGreaterThan(0);
-    const coveredSet = new Set(result.covered.map((c: { id?: string }) => c.id ?? String(c)));
-    for (const u of result.uncovered) expect(coveredSet.has((u as { id?: string }).id ?? String(u))).toBe(false);
-  }, 60_000);
+    const catalog = readFileSync(join(import.meta.dir, '..', 'catalog', 'resources.yaml'), 'utf8');
+    const root = fixture('process.env.ANTHROPIC_API_KEY;', catalog);
+    try {
+      const result = checkResourceMap({ root });
+      const document = parseYaml(catalog) as { resources?: unknown };
+      const entries = Array.isArray(document.resources) ? document.resources : [];
+      expect(result.emptyFreeFallbackIds).toEqual(credentialIdsWithEmptyFreeFallback(entries));
+      // ⛔⭐ «수»도 «어느 id 가 빈칸인가»도 박지 않는다 — 빈칸을 채우는 것이 «의도된 작업»이다.
+      //    📏 이 줄은 2026-09-22 에 ***두 번*** 깨졌다:
+      //      ⑴ reddit 의 RSS 폴백을 채우자 16→15 로 `toHaveLength(16)` 이 깨졌고,
+      //      ⑵ 그것을 `toBeGreaterThan(0)` ⊕ `toContain('apify')` 로 바꿨는데
+      //         빈칸을 «전부» 채우자(16→0) 그 둘이 «또» 깨졌다.
+      //    🔑 두 번 다 원인이 같다 — ***카탈로그의 «내용»을 자가 박은 것***이다.
+      //    ⇒ 배선은 바로 위 toEqual 이 이미 «성질»로 문다. 탐지기 자체는 픽스처로 누른다
+      //      (위 'credentialIdsWithEmptyFreeFallback' 시험이 absent/null/empty/whitespace 넷을 문다).
+      expect(Array.isArray(result.emptyFreeFallbackIds)).toBe(true);
+      // ⛔ 같은 이유로 «수»를 박지 않는다 — covered 가 28→32 로 늘자 이 줄이 깨졌다(2026-09-23).
+      //    성질로 문다: 세 갈래는 서로 겹치지 않고, covered 는 비어 있지 않다.
+      expect(result.covered.length).toBeGreaterThan(0);
+      const coveredSet = new Set(result.covered.map((c: { id?: string }) => c.id ?? String(c)));
+      for (const u of result.uncovered) expect(coveredSet.has((u as { id?: string }).id ?? String(u))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 
   test('runResourceMapCheckCli JSON output includes emptyFreeFallbackIds', () => {
-    const output: string[] = [];
-    runResourceMapCheckCli({ write: (text) => output.push(text), setExitCode: () => {} });
-    expect(JSON.parse(output[0]!)).toHaveProperty('emptyFreeFallbackIds');
-  }, 60_000);
+    const root = fixture('export const fixture = true;');
+    try {
+      const output: string[] = [];
+      runResourceMapCheckCli({ root, write: (text) => output.push(text), setExitCode: () => {} });
+      expect(JSON.parse(output[0]!)).toHaveProperty('emptyFreeFallbackIds');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

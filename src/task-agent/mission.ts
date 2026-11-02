@@ -12,24 +12,10 @@
 import { randomBytes } from 'node:crypto';
 import { debug } from '../debug/log.js';
 import type { SelfDevDecomposition } from '../self-dev/decompose.js';
-import { refreshCardRunBinding, type CardRunEvidenceDeps } from './card-evidence.js';
-import {
-  cardPrNumber,
-  handTask,
-  nextMoveFor,
-  readTaskAgentState,
-  readTaskCard,
-  TaskCardSupersededError,
-  TASK_CARD_PREFIX,
-  TASK_SEATS,
-  taskAgentStatePath,
-  updateTaskCard,
-  writeTaskCards,
-  type TaskCard,
-  type TaskCardMove,
-  type TaskLauncher,
-  type TaskSeat,
-} from './task-hand.js';
+import type { CardRunEvidenceDeps } from './card-evidence.js';
+import { cardPrNumber, readTaskAgentState, readTaskCard, TaskCardSupersededError, TASK_SEATS, taskAgentStatePath, updateTaskCard, writeTaskCards } from './task-card-state.js';
+import { TASK_CARD_PREFIX } from './task-card-prefix.js';
+import type { TaskCard, TaskCardMove, TaskLauncher, TaskSeat } from './task-hand.js';
 
 /** 쪼갠 조각 — `after` 는 같은 목록 안의 0-기반 위치. */
 export interface MissionPieceDraft { text: string; after: number[] }
@@ -206,9 +192,11 @@ export async function handMission(opts: HandMissionOptions): Promise<HandMission
   for (const draft of drafts) {
     let result: MissionPieceResult;
     if (!ready.has(draft.id)) {
+      const { nextMoveFor } = await import('./task-hand.js');
       result = { card: draft, move: nextMoveFor(draft, landedNone), launched: false };
     } else {
       try {
+        const { handTask } = await import('./task-hand.js');
         const handed = await handTask({
           text: draft.text, id: draft.id, mission: missionId, after: draft.after ?? [],
           ...(opts.seat ? { seat: opts.seat } : {}), ...(opts.checklistId ? { checklistId: opts.checklistId } : {}),
@@ -218,6 +206,7 @@ export async function handMission(opts: HandMissionOptions): Promise<HandMission
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         const card = readTaskCard(draft.id, path) ?? draft; // launch-failed 면 handTask 가 이미 적었다
+        const { nextMoveFor } = await import('./task-hand.js');
         result = { card, move: nextMoveFor(card, landedNone), launched: false, error: reason };
       }
     }
@@ -386,7 +375,7 @@ async function advanceMissionOnce(missionId: string, opts: AdvanceMissionOptions
     for (const id of before[missionId]!.pieces!) {
       const piece = before[id];
       if (!piece?.runId || piece.refSource === 'manual' || (piece.pr !== undefined && piece.goalId !== undefined)) continue;
-      try { await refreshCardRunBinding(id, path, opts.runEvidence ?? {}); } catch (error) {
+      try { const { refreshCardRunBinding } = await import('./card-evidence.js'); await refreshCardRunBinding(id, path, opts.runEvidence ?? {}); } catch (error) {
         // 근거 없음으로 본다(미착지) — 원장 부재와 갈리게 실패는 남긴다.
         try { debug.log('task-agent', 'card-bind-failed', { card: id, runId: piece.runId, via: 'advance', error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
       }
@@ -422,6 +411,7 @@ async function advanceMissionOnce(missionId: string, opts: AdvanceMissionOptions
     if (!claimed) { skipped.push(pieceId); continue; }
     let result: AdvancedPiece;
     try {
+      const { handTask } = await import('./task-hand.js');
       const out = await handTask({
         text: claimed.text, id: pieceId, mission: missionId, after: claimed.after ?? [], landed,
         ...(claimed.seat ? { seat: claimed.seat } : {}), ...(claimed.checklistId ? { checklistId: claimed.checklistId } : {}),

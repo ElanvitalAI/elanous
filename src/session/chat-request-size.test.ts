@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -125,5 +126,87 @@ describe('Codex TUI request-size compact', () => {
     const measuredChars = Number(measuredLine!.match(/^ctx ([\d,]+)/)?.[1]?.replaceAll(',', ''));
     expect(measuredChars).toBe(request!.wireJson.length);
     expect(measuredChars).toBeLessThanOrEqual(2_000);
+  });
+
+  test('blocks a reduced Codex wire body that still exceeds the cap', async () => {
+    const model = 'gpt-5.6-terra';
+    const codex = PROVIDERS['openai-codex']!;
+    const provider: LLMProvider = {
+      ...codex,
+      streamChat(messages, opts = {}) {
+        const guard = opts.requestSizeGuard;
+        if (!guard) throw new Error('runTurn did not attach the Codex request-size guard');
+        guard.maxChars = 100;
+        guard.compactMessages = async () => ({
+          messages: [{ role: 'user', content: 'reduced but still over cap '.repeat(12) }],
+          reason: 'test-still-over-cap',
+        });
+        return codex.streamChat!(messages, opts);
+      },
+    };
+    const session = createSession({ provider: provider.name, model, source: 'tui' });
+    const userConfig = {
+      llm: { provider: 'openai-codex', model, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      chat: {
+        autoCompact: {
+          enabled: true, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0,
+          partial: true, workingBudgetTokens: 128_000,
+        },
+        compact: { archiveEnabled: false },
+      },
+    } as never;
+    const log = spyOn(debug, 'log');
+
+    try {
+      await expect(runTurn({
+        userConfig,
+        sessionId: session.id,
+        userText: 'x'.repeat(2_000),
+        systemPrompt: 'request-size still-over-cap test',
+        skipMemoryInjection: true,
+        provider,
+      })).rejects.toThrow('Codex request remains over the 100-character limit');
+      expect(captures).toHaveLength(0);
+      const blocked = log.mock.calls.find(call => call[0] === 'llm.request' && call[1] === 'request-size-limit-blocked');
+      expect(blocked?.[2]).toMatchObject({ compacted: true, reason: 'compaction-still-over-cap:test-still-over-cap' });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('does not send a Codex request when compaction cannot bring the wire body under the cap', async () => {
+    const model = 'gpt-5.6-terra';
+    const codex = PROVIDERS['openai-codex']!;
+    const provider: LLMProvider = {
+      ...codex,
+      streamChat(messages, opts = {}) {
+        const guard = opts.requestSizeGuard;
+        if (!guard) throw new Error('runTurn did not attach the Codex request-size guard');
+        guard.maxChars = 100;
+        guard.compactMessages = async () => null;
+        return codex.streamChat!(messages, opts);
+      },
+    };
+    const session = createSession({ provider: provider.name, model, source: 'tui' });
+    const userConfig = {
+      llm: { provider: 'openai-codex', model, goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+      chat: {
+        autoCompact: {
+          enabled: true, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0,
+          partial: true, workingBudgetTokens: 128_000,
+        },
+        compact: { archiveEnabled: false },
+      },
+    } as never;
+
+    await expect(runTurn({
+      userConfig,
+      sessionId: session.id,
+      userText: 'x'.repeat(2_000),
+      systemPrompt: 'request-size hard-cap test',
+      skipMemoryInjection: true,
+      provider,
+    })).rejects.toThrow('Codex request remains over the 100-character limit');
+    expect(captures).toHaveLength(0);
   });
 });

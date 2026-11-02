@@ -74,6 +74,8 @@ export interface ReviewResult {
   verdict: ReviewVerdict;
   mustFix: string[];
   shouldFix: string[];
+  /** Diff로 검증할 수 없는 finding. MUST-FIX와 접을 때는 출력 상한 전에 전체를 비교한다. */
+  unverified?: string[];
   /** SCOPE-ESCAPE-AS-REFINE — 리뷰어가 must-fix 로 냈지만 «범위 밖이니 되돌려라» 라서 shouldFix 로 내린 원문(관측용). */
   scopeRevertDemoted?: string[];
   /** 리뷰어가 판정에 앞서 더 보아야 한다고 관측한 저장소 맥락. 소비·판정에는 아직 쓰지 않는다. */
@@ -103,6 +105,34 @@ export interface ReviewResult {
 
 /** Invalid reauthor classifications travel from parsing to chunk folding without entering public review JSON. */
 const invalidReauthorFindingsByResult = new WeakMap<ReviewResult, ReadonlySet<string>>();
+/** Keep all parsed blockers available to the fold while preserving the public six-item cap. */
+const allMustFixByResult = new WeakMap<ReviewResult, readonly string[]>();
+const REVIEW_PATH = /(?:[\w.-]+\/)+[\w.-]+\.[a-z0-9_-]+(?::\d+(?::\d+)?)?/i;
+
+function reviewFindingIdentity(value: string): { location?: string; core: string } {
+  const raw = value.trim().toLowerCase().replace(/```[\s\S]*?```/g, ' ');
+  const location = raw.match(REVIEW_PATH)?.[0];
+  const text = raw.replace(/\s+[—–-]\s+(?:omitted|truncated|생략|절단).*/i, ' ');
+  const pathPattern = new RegExp(REVIEW_PATH.source, 'gi');
+  const pathless = text.replace(pathPattern, ' ');
+  const words = pathless
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter(Boolean);
+  const core = words.join(' ') || pathless.replace(/\s+/g, ' ').trim();
+  return { ...(location ? { location } : {}), core };
+}
+
+function sameReviewFinding(left: string, right: string): boolean {
+  const a = reviewFindingIdentity(left);
+  const b = reviewFindingIdentity(right);
+  return Boolean(a.location) === Boolean(b.location) && a.location === b.location && a.core === b.core;
+}
+
+function dedupeReviewFindings(values: readonly string[]): string[] {
+  const unique: string[] = [];
+  for (const value of values) if (!unique.some((candidate) => sameReviewFinding(candidate, value))) unique.push(value);
+  return unique;
+}
 
 /** 모든 리뷰 관측 생산자가 공유하는 diff 예산 필드 계약. 예산 부재는 빈 객체로 보존한다.
  *  ⚠️ 내부 타입 — 소비자는 `...reviewDiffBudgetObservation(r)` 로 스프레드만 하므로 이름을 참조하지
@@ -345,14 +375,23 @@ export function planReviewChunks(
  */
 export function foldReviewResults(
   results: readonly ReviewResult[],
-): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'scopeRevertDemoted' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback' | 'reauthorClassifications'> {
+): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'unverified' | 'scopeRevertDemoted' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback' | 'reauthorClassifications'> {
   const dedupe = (values: readonly string[]): string[] => [...new Set(values)];
   const collect = (pick: (r: ReviewResult) => readonly string[] | undefined): string[] =>
     dedupe(results.flatMap((r) => [...(pick(r) ?? [])]));
-  const verdict: ReviewVerdict = results.some((r) => r.verdict === 'fail') ? 'fail'
+  let verdict: ReviewVerdict = results.some((r) => r.verdict === 'fail') ? 'fail'
     : results.some((r) => r.verdict === 'warn') ? 'warn'
       : 'pass';
-  const mustFix = collect((r) => r.mustFix).slice(0, 6);
+  const allMustFix = dedupeReviewFindings(results.flatMap((r) => [...(allMustFixByResult.get(r) ?? r.mustFix)]));
+  const unverified = dedupeReviewFindings(results.flatMap((r) => [...(r.unverified ?? [])]));
+  const mustFix = allMustFix.filter((finding) => !unverified.some((item) => sameReviewFinding(finding, item)));
+  const independentFail = results.some((result) => result.verdict === 'fail'
+    && ((allMustFixByResult.get(result) ?? result.mustFix).length === 0)
+      || (result.verdict === 'fail'
+        && (allMustFixByResult.get(result) ?? result.mustFix)
+          .some((finding) => !unverified.some((item) => sameReviewFinding(finding, item)))));
+  if (verdict === 'fail' && mustFix.length === 0 && unverified.length > 0 && !independentFail) verdict = 'warn';
+  const boundedMustFix = mustFix.slice(0, 6);
   const shouldFix = collect((r) => r.shouldFix).slice(0, 6);
   const requirements = collect((r) => r.requirements);
   const scopeRevertDemoted = collect((r) => r.scopeRevertDemoted);
@@ -369,8 +408,9 @@ export function foldReviewResults(
     && (candidate.class === 'code-defect' || hasReauthorFuRecommendation(candidate)));
   return {
     verdict,
-    mustFix,
+    mustFix: boundedMustFix,
     shouldFix,
+    ...(unverified.length ? { unverified } : {}),
     ...(scopeRevertDemoted.length ? { scopeRevertDemoted } : {}),
     ...(requirements.length ? { requirements } : {}),
     reviewed: results.length > 0 && failed === undefined,
@@ -835,15 +875,17 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
   const lines = text.split('\n').map((l) => l.trim());
   const mustFix: string[] = [];
   const shouldFix: string[] = [];
+  const unverified: string[] = [];
   const requirements: string[] = [];
   const reauthorCandidates: ReauthorClassification[] = [];
   const reauthorRawLines: string[] = [];
   let fallbackFinding: string | undefined;
   let droppedNonePlaceholders = 0;
-  let section: 'must' | 'should' | 'requirements' | 'reauthor' | null = null;
+  let section: 'must' | 'should' | 'unverified' | 'requirements' | 'reauthor' | null = null;
   for (const l of lines) {
     if (/^MUST-?FIX/i.test(l)) { section = 'must'; continue; }
     if (/^SHOULD-?FIX/i.test(l)) { section = 'should'; continue; }
+    if (/^UNVERIFIED:\s*$/i.test(l)) { section = 'unverified'; continue; }
     if (/^REQUIREMENTS:\s*$/i.test(l)) { section = 'requirements'; continue; }
     if (/^REAUTHOR-CLASSIFICATION:/i.test(l)) { section = 'reauthor'; continue; }
     if (/^(WATCH|VERDICT)/i.test(l)) { section = null; continue; }
@@ -854,6 +896,7 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
         if (isNoneSentinelFinding(f)) droppedNonePlaceholders++;
         else mustFix.push(f);
       } else if (section === 'should') shouldFix.push(f);
+      else if (section === 'unverified') unverified.push(f);
       else if (section === 'requirements') requirements.push(f);
       else if (section === 'reauthor') {
         reauthorRawLines.push(f);
@@ -870,12 +913,18 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
       else fallbackFinding ??= f;
     }
   }
+  const mustFixBeforeUnverified = mustFix.length;
+  const verifiedMustFix = mustFix.filter((finding) => !unverified.some((item) => sameReviewFinding(finding, item)));
+  const uniqueMustFix = verifiedMustFix.filter((finding, index) =>
+    verifiedMustFix.findIndex((candidate) => sameReviewFinding(candidate, finding)) === index);
+  mustFix.splice(0, mustFix.length, ...uniqueMustFix);
+  const mustFixRemovedAsUnverified = mustFixBeforeUnverified > 0 && verifiedMustFix.length === 0;
   if (droppedNonePlaceholders > 0) {
     try {
       debug.log('review.parse', 'none-placeholder-dropped', { count: droppedNonePlaceholders });
     } catch { /* observation must not change parsed review data */ }
   }
-  if (verdict === 'fail' && mustFix.length === 0) {
+  if (verdict === 'fail' && mustFix.length === 0 && !mustFixRemovedAsUnverified) {
     const first = shouldFix.shift() ?? fallbackFinding;
     mustFix.push(first ?? 'PR 리뷰 FAIL — 재작업 필요(구체 지적 미파싱).');
   }
@@ -883,6 +932,7 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
   //   삭제·보호 경로 지적은 블로커로 남긴다. 남은 블로커가 없으면 FAIL → WARN(위 «FAIL 인데 must-fix 없음» 승격을 다시 타지 않는다).
   const scopeRevertDemoted = mustFix.filter(isDemotableScopeRevertMustFix);
   let finalVerdict = verdict;
+  if (verdict === 'fail' && mustFixRemovedAsUnverified && mustFix.length === 0) finalVerdict = 'warn';
   if (scopeRevertDemoted.length > 0) {
     const kept = mustFix.filter((finding) => !isDemotableScopeRevertMustFix(finding));
     mustFix.splice(0, mustFix.length, ...kept);
@@ -914,6 +964,7 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
     verdict: finalVerdict,
     mustFix: mustFix.slice(0, 6),
     shouldFix: shouldFix.slice(0, 6),
+    ...(unverified.length ? { unverified } : {}),
     ...(scopeRevertDemoted.length ? { scopeRevertDemoted } : {}),
     ...(fallback ? { reviewerFallback: fallback[1] } : {}),
     ...(requirements.length ? { requirements } : {}),
@@ -922,6 +973,7 @@ export function parseReviewResult(text: string, round?: number): ReviewResult {
   if (round !== undefined && round >= 3 && reauthorInvalidFindings.length) {
     invalidReauthorFindingsByResult.set(result, new Set(reauthorInvalidFindings));
   }
+  allMustFixByResult.set(result, [...mustFix]);
   return result;
 }
 
@@ -954,13 +1006,12 @@ function reviewedResultFromRaw(
 ): ReviewResult {
   if (VERDICT_LINE.test(raw)) {
     const parsed = parseReviewResult(raw, round);
-    if (round !== undefined && round >= 3) {
-      const result = { ...parsed, reviewed: true };
-      const invalid = invalidReauthorFindingsByResult.get(parsed);
-      if (invalid) invalidReauthorFindingsByResult.set(result, invalid);
-      return result;
-    }
-    return { ...parsed, reviewed: true };
+    const result = { ...parsed, reviewed: true };
+    const invalid = invalidReauthorFindingsByResult.get(parsed);
+    if (invalid) invalidReauthorFindingsByResult.set(result, invalid);
+    const allMustFix = allMustFixByResult.get(parsed);
+    if (allMustFix) allMustFixByResult.set(result, allMustFix);
+    return result;
   }
   try {
     debug.log('review.verdict', NO_VERDICT_LINE_REASON, {

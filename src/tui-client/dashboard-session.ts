@@ -213,6 +213,8 @@ export class DashboardSession {
       ...(opts.abortPollMs !== undefined ? { abortPollMs: opts.abortPollMs } : {}),
       // TUI-TOKEN-GUARD-WIRE — the host history write-back for the request-size cap.
       ...(opts.compactPersistedHistory ? { compactPersistedHistory: opts.compactPersistedHistory } : {}),
+      ...(opts.persistCompactedHistory ? { persistCompactedHistory: opts.persistCompactedHistory } : {}),
+      ...(opts.requestSizeRunCompactPipeline ? { requestSizeRunCompactPipeline: opts.requestSizeRunCompactPipeline } : {}),
       ...(opts.requestSizeMaxChars !== undefined ? { requestSizeMaxChars: opts.requestSizeMaxChars } : {}),
     });
 

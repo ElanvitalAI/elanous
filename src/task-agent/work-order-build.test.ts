@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
-import { buildWorkOrder } from './work-order-build.js';
+import { buildWorkOrder, hashWorkOrderContent } from './work-order-build.js';
 
 test('ENTRANCE-WORK-ORDER-BUILD core fills the nine fields and lists unknown values', () => {
   const order = buildWorkOrder({ cellId: 'ENTRANCE-WORK-ORDER-BUILD', version: '0.2.35' });
@@ -91,3 +91,34 @@ test('isolated production elanous entry reads the on-disk checklist and writes a
     expect(order.unknownFields).toEqual(['lifeId', 'landBy', 'identityTags', 'verdictSignal', 'contract', 'budget', 'peers', 'precedents', 'escalation']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 120_000);
+
+
+test('ENTRANCE-WORKORDER-REPLAY-HASH: equivalent producers share a revision-scoped content hash', () => {
+  const dispatcherOrder = buildWorkOrder({
+    cellId: 'ENTRANCE-WORKORDER-REPLAY-HASH', version: '0.2.46', priority: 'P1',
+    boundary: 'src/task-agent/work-order-build.ts',
+  });
+  const coordinatorOrder = buildWorkOrder({
+    boundary: ' src/task-agent/work-order-build.ts ', priority: ' P1 ',
+    version: '0.2.46', cellId: 'ENTRANCE-WORKORDER-REPLAY-HASH',
+  });
+  const revision = '2026-11-02T12:00:00.000Z';
+  const dispatcherHash = hashWorkOrderContent(dispatcherOrder, revision);
+  const coordinatorHash = hashWorkOrderContent(coordinatorOrder, revision);
+
+  expect(dispatcherHash).toBe(coordinatorHash);
+  expect(dispatcherHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(dispatcherHash).not.toContain('src/task-agent/work-order-build.ts');
+  expect(hashWorkOrderContent(buildWorkOrder({
+    cellId: 'ENTRANCE-WORKORDER-REPLAY-HASH', version: '0.2.46', priority: 'P0',
+    boundary: 'src/task-agent/work-order-build.ts',
+  }), revision)).not.toBe(dispatcherHash);
+  expect(hashWorkOrderContent(dispatcherOrder, `${revision}-changed`)).not.toBe(dispatcherHash);
+
+  const withDependencies = (dependencies: NonNullable<typeof dispatcherOrder.dependencies>) => ({ ...dispatcherOrder, dependencies });
+  const first = { cell: 'CELL-A', state: 'green', observedAt: '2026-11-02T10:00:00Z' };
+  const second = { cell: 'CELL-B', state: 'yellow', observedAt: '2026-11-02T11:00:00Z' };
+  const orderedHash = hashWorkOrderContent(withDependencies([first, second]), revision);
+  expect(hashWorkOrderContent(withDependencies([second, first]), revision)).toBe(orderedHash);
+  expect(hashWorkOrderContent(withDependencies([{ ...second, state: 'green' }, first]), revision)).not.toBe(orderedHash);
+});

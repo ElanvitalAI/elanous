@@ -7,6 +7,9 @@ const STANDARD_HOST_MAX: Readonly<Record<string, number>> = {
   'node-c': 4,
   'elangram-wsl': 5,
   'host-e-wsl': 5,
+  'gcp1': 2,
+  'aws1': 2,
+  'aws2': 2,
 };
 
 // Only this host/tier pair has a measured lite allocation. Other pairs fail closed to zero.

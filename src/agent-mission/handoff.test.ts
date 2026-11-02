@@ -1,12 +1,24 @@
 import { test, expect } from 'bun:test';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync, lstatSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handoffMission, loginCard, missionDiff, waitForHumanLogin, type HandoffOperations } from './handoff.js';
 import { runPtyControlLoop } from '../autopilot/pty-control-loop.js';
-import { runAgentMission, codexBackend, createMissionControlBrain } from './driver.js';
+import { runAgentMission, codexBackend, createMissionControlBrain, setAgentMissionTimingForTest } from './driver.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
+
+// Bun runs tests in this file serially; the fake clock and mission timing are process-global.
+async function withFakeMissionClock<T>(run: () => Promise<T>): Promise<T> {
+  return withSimClock(new Date('2026-11-02T12:00:00Z'), async (clock) => {
+    const restore = setAgentMissionTimingForTest({
+      readyQuietMs: 20, pollMs: 5, keystrokeGapMs: 250,
+      sleep: async (ms) => { clock.tick(ms); },
+    });
+    try { return await run(); } finally { restore(); }
+  });
+}
 
 function fakeOps(events: string[], worktree: string): HandoffOperations {
   return {
@@ -148,7 +160,7 @@ test('real control loop routes handoff and resumes login without killing the PTY
   expect(events).toEqual(['card:{"text":"로그인해 주세요","url":"https://claude.ai/login"}', 'gate/PR']);
 });
 
-test('runAgentMission uses real control loops across three fake PTYs and gates actual worktree changes', async () => {
+test('runAgentMission uses real control loops across three fake PTYs and gates actual worktree changes', async () => withFakeMissionClock(async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-integrated-'));
   try {
     execFileSync('git', ['init', '-q', wt]);
@@ -204,9 +216,9 @@ test('runAgentMission uses real control loops across three fake PTYs and gates a
     expect(events.filter((event) => event.startsWith('pty:') || event === 'gate/PR')).toEqual(['pty:codex', 'pty:claude', 'pty:repair', 'gate/PR']);
     expect(events.some((event) => event.includes('Previous controller summary: Missing assertion'))).toBe(true);
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 90_000);
+}), 10_000);
 
-test('explicit four-stage chain delivers Claude screen review findings after a generic completion reason', async () => {
+test('explicit four-stage chain delivers Claude screen review findings after a generic completion reason', async () => withFakeMissionClock(async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-four-stage-'));
   try {
     execFileSync('git', ['init', '-q', wt]);
@@ -242,9 +254,9 @@ test('explicit four-stage chain delivers Claude screen review findings after a g
     // The repair stage must carry the original mission text, not only «finish the original mission».
     expect(events.some((event) => event.startsWith('input:repair:') && event.includes('Original mission:') && event.includes('Build'))).toBe(true);
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 90_000);
+}), 10_000);
 
-test('explicit chain rejects a brain handoff that skips Claude review', async () => {
+test('explicit chain rejects a brain handoff that skips Claude review', async () => withFakeMissionClock(async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-skip-review-'));
   try {
     await expect(runAgentMission({ mission: 'Build', repo: wt, branch: 'fixture', agent: codexBackend,
@@ -261,9 +273,9 @@ test('explicit chain rejects a brain handoff that skips Claude review', async ()
       handoffOperations: { gateAndPr: async () => { throw new Error('must not gate'); } },
     })).rejects.toThrow('chain order violation: expected claude, got elanous');
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 30000);
+}), 10_000);
 
-test('runtime handoff launches Claude login PTY, sends its URL instead of Codex screen, then resumes review', async () => {
+test('runtime handoff launches Claude login PTY, sends its URL instead of Codex screen, then resumes review', async () => withFakeMissionClock(async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-login-runtime-'));
   const events: string[] = [];
   let loggedIn = false;
@@ -301,7 +313,7 @@ test('runtime handoff launches Claude login PTY, sends its URL instead of Codex 
     ]);
     expect(events.indexOf('kill:login')).toBeGreaterThan(events.indexOf('card:{"text":"로그인해 주세요","url":"https://claude.ai/device"}'));
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 30000);
+}), 10_000);
 
 test('login card accepts only URL and device code from the visible screen, never a claimed credential', async () => {
   const events: string[] = [];
@@ -368,14 +380,14 @@ test('diff carry handles a tracked change larger than the default 1 MiB exec buf
     writeFileSync(join(wt, 'big.txt'), 'seed\n');
     execFileSync('git', ['add', 'big.txt'], { cwd: wt });
     execFileSync('git', ['-c', 'user.email=test@test', '-c', 'user.name=test', 'commit', '-qm', 'base'], { cwd: wt });
-    writeFileSync(join(wt, 'big.txt'), Array.from({ length: 60_000 }, (_, i) => `line ${i} ${'x'.repeat(20)}`).join('\n'));
+    writeFileSync(join(wt, 'big.txt'), `line ${'x'.repeat(1024 * 1024 + 64 * 1024)}\nTAIL-HANDOFF-LARGE\n`);
     const patch = missionDiff(wt);
     expect(patch.length).toBeGreaterThan(1024 * 1024);
-    expect(patch).toContain('+line 59999');
+    expect(patch).toContain('+TAIL-HANDOFF-LARGE');
   } finally { rmSync(wt, { recursive: true, force: true }); }
 });
 
-test('a gate/PR handoff does not turn a control loop that ended in error into success', async () => {
+test('a gate/PR handoff does not turn a control loop that ended in error into success', async () => withFakeMissionClock(async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-gated-error-'));
   try {
     execFileSync('git', ['init', '-q', wt]);
@@ -401,9 +413,9 @@ test('a gate/PR handoff does not turn a control loop that ended in error into su
     expect(events).toContain('gate/PR');
     expect(result.ok).toBe(false);
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 30000);
+}), 10_000);
 
-test('a codex «Trust this folder?» prompt that appears after launch is answered in the loop, not typed over', async () => {
+test('a codex «Trust this folder?» prompt that appears after launch is answered in the loop, not typed over', async () => withFakeMissionClock(async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-late-trust-'));
   try {
     execFileSync('git', ['init', '-q', wt]);
@@ -429,4 +441,4 @@ test('a codex «Trust this folder?» prompt that appears after launch is answere
     }).catch(() => undefined);
     expect(decisions[0]).toEqual({ action: 'input', text: '1\r' });
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 30000);
+}), 10_000);

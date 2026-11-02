@@ -9,7 +9,7 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const receipt = (): GateShardReceipt => ({ version: '1.0.1', graphSha: 'e'.repeat(64), recipeSha: 'f'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/a.test.ts'], head40: 'a'.repeat(40), base40: 'b'.repeat(40),
   host: 'node-b', envKey: `${'d'.repeat(64)}:sha256:${'c'.repeat(64)}`, envFingerprint: 'd'.repeat(64), imageDigest: `sha256:${'c'.repeat(64)}`,
-  runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'd'.repeat(64) }, executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest: `sha256:${'c'.repeat(64)}`, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'd'.repeat(64) } }], status: 'complete', failureIds: [], errorIds: [], evidencePath: 'pending',
+  runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'd'.repeat(64), baseImageDigest: `sha256:${'b'.repeat(64)}` }, executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest: `sha256:${'c'.repeat(64)}`, runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'd'.repeat(64), baseImageDigest: `sha256:${'b'.repeat(64)}` } }], status: 'complete', failureIds: [], errorIds: [], evidencePath: 'pending',
   evidenceSha256: '0'.repeat(64), measuredAt: '2026-10-27T00:00:00.000Z', attempt: 1 });
 
 test('receipt reads require the exact recorded baseline; moved heads need radius planning', () => {

@@ -218,6 +218,13 @@ export function migratePtyManifestSchema(d: Database): void {
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_sha TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_source TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_code_root TEXT'); } catch { /* already exists */ }
+  d.run(`CREATE TABLE IF NOT EXISTS pty_sidetab_registration (
+    pty_id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    name TEXT NOT NULL,
+    registered_by TEXT NOT NULL,
+    registered_at INTEGER NOT NULL
+  )`);
   try { d.run('ALTER TABLE pty_manifest DROP COLUMN chain_depth'); } catch { /* legacy schema has no duplicate column */ }
   try { d.run('UPDATE pty_manifest SET closed_at=updated_at WHERE alive=0 AND closed_at=0'); } catch { /* fail-soft */ }
   } finally {
@@ -972,4 +979,73 @@ function mapBuild(r: Record<string, unknown>): PtyBuildIdentity {
     source,
     ...(typeof r.build_code_root === 'string' && r.build_code_root ? { codeRoot: r.build_code_root } : {}),
   };
+}
+
+export interface PtySidetabRegistration {
+  readonly ptyId: string;
+  readonly host: string;
+  readonly name: string;
+  readonly registeredBy: string;
+  readonly registeredAt: number;
+}
+
+const SIDETAB_HOST_ALIAS = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/** Explicitly mark one live TUI for a remote side-tab; ordinary PTYs are not eligible. */
+export function registerPtySidetabEntry(entry: PtySidetabRegistration): boolean {
+  if (!entry.ptyId.trim() || !SIDETAB_HOST_ALIAS.test(entry.host.trim())
+    || !entry.name.trim() || !entry.registeredBy.trim() || !Number.isFinite(entry.registeredAt)) return false;
+  const d = db();
+  if (!d) return false;
+  try {
+    d.query(`INSERT INTO pty_sidetab_registration (pty_id, host, name, registered_by, registered_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(pty_id) DO UPDATE SET host=excluded.host, name=excluded.name,
+        registered_by=excluded.registered_by, registered_at=excluded.registered_at`)
+      .run(entry.ptyId.trim(), entry.host.trim(), entry.name.trim(), entry.registeredBy.trim(), Math.trunc(entry.registeredAt));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function unregisterPtySidetabEntry(ptyId: string): boolean {
+  if (!ptyId.trim()) return false;
+  const d = db();
+  if (!d) return false;
+  try {
+    return d.query('DELETE FROM pty_sidetab_registration WHERE pty_id = ?').run(ptyId.trim()).changes > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function listPtySidetabRegistrations(): PtySidetabRegistration[] {
+  const d = db();
+  if (!d) return [];
+  try {
+    return (d.query('SELECT pty_id, host, name, registered_by, registered_at FROM pty_sidetab_registration ORDER BY registered_at, pty_id').all() as Array<Record<string, unknown>>)
+      .map((row) => ({
+        ptyId: String(row.pty_id),
+        host: String(row.host),
+        name: String(row.name),
+        registeredBy: String(row.registered_by),
+        registeredAt: Number(row.registered_at),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/** Read the registration ledger without opening the writer, creating directories, or migrating schema.
+ * Errors are intentionally propagated: an unreadable ledger is not an empty inventory. */
+export function readPtySidetabRegistrationsReadOnly(dbPath = ptyManifestDbPath()): PtySidetabRegistration[] {
+  if (!existsSync(dbPath)) return [];
+  const d = new Database(dbPath, { readonly: true });
+  try {
+    const exists = d.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pty_sidetab_registration'").get();
+    if (!exists) throw new Error('pty sidetab registration table is unavailable');
+    return (d.query('SELECT pty_id, host, name, registered_by, registered_at FROM pty_sidetab_registration ORDER BY registered_at, pty_id').all() as Array<Record<string, unknown>>)
+      .map((row) => ({ ptyId: String(row.pty_id), host: String(row.host), name: String(row.name), registeredBy: String(row.registered_by), registeredAt: Number(row.registered_at) }));
+  } finally { d.close(); }
 }

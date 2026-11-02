@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { buildIntakeDigest, renderDigestMarkdown, renderDigestTelegram } from '../src/intake-plane/digest.js';
 import { canonicalUrl } from '../src/intake-plane/items.js';
-import { intakeCheckArgs, newsInterest, runIntakeCheckCli, runIntakeNews } from './intake-news.js';
+import { intakeCheckInvocation, newsInterest, runIntakeCheckCli, runIntakeNews } from './intake-news.js';
 
 setDefaultTimeout(20000);
 const NOW = new Date('2026-10-06T07:00:00.000Z');
@@ -21,12 +21,13 @@ function response(url: string): Response {
   return new Response(url === sources[0]!.rss ? FEED : '<article><p>구글 RRSI는 하니스만 고쳐 에이전트 성능을 향상시켰다. 기존 모델 가중치는 바꾸지 않았다고 연구진이 밝혔다. 프롬프트와 도구 사용 방식을 반복적으로 고쳤다. 하위 에이전트와 메모리 관리도 수정 대상에 포함됐다. 연구진은 여러 벤치마크에서 성능이 올랐다고 설명했다. 코드는 아직 공개되지 않았다.</p></article>');
 }
 
-test('production news check uses installed CLI without git-tree test mode', () => {
-  expect(intakeCheckArgs(['사실 A', '사실 B'])).toEqual([
-    'bin/elanous.mjs', 'intake', 'check', '--fact', '사실 A', '--fact', '사실 B', '--json',
+test('checkout news check uses local CLI entrypoint without overriding caller universe', () => {
+  const invocation = intakeCheckInvocation(['사실 A', '사실 B']);
+  expect(invocation.command).toBe('bun');
+  expect(invocation.args).toEqual([
+    join(import.meta.dir, '..', 'bin', 'elanous.mjs'), 'intake', 'check', '--fact', '사실 A', '--fact', '사실 B', '--json',
   ]);
-  expect(intakeCheckArgs(['사실 A'])).not.toContain('--test');
-  expect(intakeCheckArgs(['사실 A'], { testMode: true })).toContain('--test');
+  expect(invocation.args).not.toContain('--test');
 });
 
 test('fixed RSS filters 24 hours and interest, writes five lines and shadow suggestion, rerun skips URL hash', async () => {

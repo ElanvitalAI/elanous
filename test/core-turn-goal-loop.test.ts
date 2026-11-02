@@ -5,7 +5,7 @@
 // 승격. 마커는 deprecated fallback(read-back 게이트)로만 감지. context-pressure bail 추가.
 
 import { describe, it, expect, spyOn, afterEach, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -28,6 +28,19 @@ import { getChannelBus, resetTerminalMatrix } from '../src/terminal-matrix/index
 import { publishLifecycleRecord, snapshotRunLifecycle, subscribeRunLifecycle, validateLifecycleRecord } from '../src/signal/lifecycle-record.js';
 import { readRunLifecycle, resetLifecycleBridgeForTesting } from '../src/signal/lifecycle-bridge.js';
 import { controlInboxPath, drainControlInbox, drainSoftStopControlInbox, enqueueControlMemo, enqueueSoftStop } from '../src/harness/control-inbox.js';
+
+describe('control inbox module isolation', () => {
+  it('retains the real enqueue implementation after earlier test-file mocks are restored', () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'core-turn-control-inbox-module-'));
+    const io = { env: { ELANOUS_STATE_DIR: isolated }, log: () => {} };
+    try {
+      const recordPath = enqueueControlMemo('module-isolation', 'probe memo', io);
+      expect(readFileSync(recordPath, 'utf8')).toBe('memo:probe memo\n');
+    } finally {
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('getToolLoopPhaseRejectedTools', () => {
   it('canonical rejection stub만 rejected tool names로 판정한다', () => {

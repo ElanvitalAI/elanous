@@ -59,7 +59,7 @@ function evidenceFixture(cwd: string, head: string, baseTip: string, reviewHead 
 }
 
 describe('LAND-VIRTUAL-REBASE patch proof', () => {
-  test('evidence with a stale overlapping base reuses its exact-head review after a clean same-patch virtual rebase', () => {
+  test('evidence with a stale overlapping base reuses its exact-head review after a clean same-patch virtual rebase', async () => {
     const f = fixture();
     try {
       git(f.cwd, 'switch', '-c', 'feature');
@@ -81,7 +81,7 @@ describe('LAND-VIRTUAL-REBASE patch proof', () => {
         out: { log: (line) => messages.push(line), error: (line) => messages.push(line) },
         refuse: (line) => messages.push(line),
       });
-      expect(decision()).toBe(true);
+      expect(await decision()).toBe(true);
       expect(messages.filter((line) => line.startsWith('✓ overlap-evidence: virtual-rebase'))).toHaveLength(1);
       const validEvidence = JSON.parse(readFileSync(evidence.evidencePath, 'utf8'));
       for (const [gate, reason] of [
@@ -91,16 +91,16 @@ describe('LAND-VIRTUAL-REBASE patch proof', () => {
       ] as const) {
         writeFileSync(evidence.evidencePath, JSON.stringify({ ...validEvidence, gate }));
         expect(verifyOverlapEvidenceVirtualRebase(evidence, baseTip)).toEqual({ ok: false, reason });
-        expect(decision()).toBe(false);
+        expect(await decision()).toBe(false);
       }
       writeFileSync(evidence.evidencePath, JSON.stringify(validEvidence));
       const badReview = evidenceFixture(f.cwd, head, baseTip, f.base);
       expect(verifyOverlapEvidenceVirtualRebase(badReview, baseTip)).toEqual({ ok: false, reason: 'review-head-mismatch', baseTip });
-      expect(decision()).toBe(false);
+      expect(await decision()).toBe(false);
     } finally { f.clean(); }
   }, 30_000);
 
-  test('evidence virtual rebase refuses a changed patch and a stale local base', () => {
+  test('evidence virtual rebase refuses a changed patch and a stale local base', async () => {
     const f = fixture();
     try {
       git(f.cwd, 'switch', '-c', 'feature');
@@ -112,7 +112,7 @@ describe('LAND-VIRTUAL-REBASE patch proof', () => {
       const evidence = evidenceFixture(f.cwd, head, baseTip);
       expect(verifyOverlapEvidenceVirtualRebase(evidence, baseTip)).toEqual({ ok: false, reason: 'patch-id-different' });
       const refusals: string[] = [];
-      expect(verifyPinnedOverlapDecision({
+      expect(await verifyPinnedOverlapDecision({
         opts: { pr: String(evidence.pr), expectedHead: head, overlapEvidence: evidence.evidencePath, dryRun: true },
         deps: { reviewResultsDir: evidence.reviewResultsDir } as PrLandDeps,
         run: evidence.run, cwd: f.cwd, base: 'main', readFile: evidence.readFile,

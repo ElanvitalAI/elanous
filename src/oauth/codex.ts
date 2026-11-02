@@ -154,7 +154,7 @@ export interface CodexLoginProgress {
 export interface CodexLoginOpts {
   fetchImpl?: typeof fetch;
   /** Sleep fn — tests inject a pass-through / fast stub. Default uses setTimeout. */
-  sleepImpl?: (ms: number) => Promise<void>;
+  sleepImpl?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Observer for stage transitions (user_code shown, polling, etc.). */
   onProgress?: (p: CodexLoginProgress) => void;
   /** Override polling cap (ms). */
@@ -163,45 +163,78 @@ export interface CodexLoginOpts {
   pollIntervalMs?: number;
   /** For tests — skip the Codex CLI dual-write. */
   mirrorCodex?: boolean;
+  /** Abort the interactive device-code flow (for example, Ctrl-C in first-run setup). */
+  signal?: AbortSignal;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-async function postJson<T>(fetchImpl: typeof fetch, url: string, body: Record<string, unknown>): Promise<{ status: number; body: T | null }> {
+async function postJson<T>(fetchImpl: typeof fetch, url: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<{ status: number; body: T | null }> {
   const res = await fetchImpl(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
   let parsed: T | null = null;
   try { parsed = await res.json() as T; } catch { parsed = null; }
   return { status: res.status, body: parsed };
 }
 
-async function postForm<T>(fetchImpl: typeof fetch, url: string, fields: Record<string, string>): Promise<{ status: number; body: T | null }> {
+async function postForm<T>(fetchImpl: typeof fetch, url: string, fields: Record<string, string>, signal?: AbortSignal): Promise<{ status: number; body: T | null }> {
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(fields)) params.append(k, v);
   const res = await fetchImpl(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
     body: params.toString(),
+    ...(signal ? { signal } : {}),
   });
   let parsed: T | null = null;
   try { parsed = await res.json() as T; } catch { parsed = null; }
   return { status: res.status, body: parsed };
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  const activeSignal = signal;
+  if (!activeSignal) return new Promise(resolve => setTimeout(resolve, ms));
+  const requiredSignal = activeSignal;
+  requiredSignal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      requiredSignal.removeEventListener('abort', abort);
+      reject(requiredSignal.reason ?? new DOMException('Aborted', 'AbortError'));
+    };
+    function done() {
+      requiredSignal.removeEventListener('abort', abort);
+      resolve();
+    }
+    requiredSignal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function withAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', abort, { once: true });
+    work.then(
+      (value) => { signal.removeEventListener('abort', abort); resolve(value); },
+      (error: unknown) => { signal.removeEventListener('abort', abort); reject(error); },
+    );
+  });
 }
 
 // ── Primitives (exported for tests + custom flows) ───────────────────
 
-export async function requestDeviceCode(opts: { fetchImpl?: typeof fetch } = {}): Promise<UserCodeResponse> {
+export async function requestDeviceCode(opts: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {}): Promise<UserCodeResponse> {
   const f = opts.fetchImpl ?? fetch;
   const { status, body } = await postJson<UserCodeResponse>(f, CODEX_DEVICE_USERCODE_URL, {
     client_id: CODEX_OAUTH_CLIENT_ID,
-  });
+  }, opts.signal);
   if (status !== 200 || !body || !body.device_auth_id || !body.user_code) {
     throw new Error(`codex deviceauth/usercode failed: status=${status}`);
   }
@@ -213,13 +246,13 @@ export async function requestDeviceCode(opts: { fetchImpl?: typeof fetch } = {})
 export async function pollDeviceCode(
   deviceAuthId: string,
   userCode: string,
-  opts: { fetchImpl?: typeof fetch } = {},
+  opts: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {},
 ): Promise<PollSuccessResponse | null> {
   const f = opts.fetchImpl ?? fetch;
   const { status, body } = await postJson<PollSuccessResponse>(f, CODEX_DEVICE_TOKEN_URL, {
     device_auth_id: deviceAuthId,
     user_code: userCode,
-  });
+  }, opts.signal);
   if (status === 200 && body && body.authorization_code && body.code_verifier) return body;
   // 403 / 404 mean "pending" per hermes's observed behaviour; any
   // other unexpected code is an error.
@@ -234,7 +267,7 @@ export async function pollDeviceCode(
 export async function exchangeDeviceAuthCode(
   authorizationCode: string,
   codeVerifier: string,
-  opts: { fetchImpl?: typeof fetch } = {},
+  opts: { fetchImpl?: typeof fetch; signal?: AbortSignal } = {},
 ): Promise<TokenResponse> {
   const f = opts.fetchImpl ?? fetch;
   const { status, body } = await postForm<TokenResponse>(f, CODEX_OAUTH_TOKEN_URL, {
@@ -243,7 +276,7 @@ export async function exchangeDeviceAuthCode(
     redirect_uri: CODEX_REDIRECT_URI,
     client_id: CODEX_OAUTH_CLIENT_ID,
     code_verifier: codeVerifier,
-  });
+  }, opts.signal);
   if (status !== 200 || !body || !body.access_token || !body.refresh_token) {
     throw new Error(`codex oauth/token exchange failed: status=${status}`);
   }
@@ -280,7 +313,8 @@ export async function loginWithCodex(opts: CodexLoginOpts = {}): Promise<Provide
   const onProgress = opts.onProgress ?? (() => {});
 
   // 1) Request user_code.
-  const userCode = await requestDeviceCode({ fetchImpl });
+  opts.signal?.throwIfAborted();
+  const userCode = await requestDeviceCode({ fetchImpl, signal: opts.signal });
   const serverInterval = typeof userCode.interval === 'number' ? userCode.interval * 1000 : 0;
   const pollInterval = Math.max(reportedInterval, serverInterval || 0);
   onProgress({ type: 'user_code', userCode: userCode.user_code,
@@ -292,9 +326,11 @@ export async function loginWithCodex(opts: CodexLoginOpts = {}): Promise<Provide
   let attempt = 0;
   while (Date.now() - startedAt < maxWait) {
     attempt++;
-    await sleep(pollInterval);
+    await withAbort(sleep(pollInterval, opts.signal), opts.signal);
+    opts.signal?.throwIfAborted();
     onProgress({ type: 'polling', pollAttempt: attempt });
-    pollResp = await pollDeviceCode(userCode.device_auth_id, userCode.user_code, { fetchImpl });
+    pollResp = await pollDeviceCode(userCode.device_auth_id, userCode.user_code, { fetchImpl, signal: opts.signal });
+    opts.signal?.throwIfAborted();
     if (pollResp) break;
   }
   if (!pollResp) {
@@ -303,7 +339,8 @@ export async function loginWithCodex(opts: CodexLoginOpts = {}): Promise<Provide
 
   // 3) Exchange auth code + verifier.
   onProgress({ type: 'exchanging' });
-  const tokenResp = await exchangeDeviceAuthCode(pollResp.authorization_code, pollResp.code_verifier, { fetchImpl });
+  const tokenResp = await exchangeDeviceAuthCode(pollResp.authorization_code, pollResp.code_verifier, { fetchImpl, signal: opts.signal });
+  opts.signal?.throwIfAborted();
 
   // 4) Persist.
   const tokens: OAuthTokens = {

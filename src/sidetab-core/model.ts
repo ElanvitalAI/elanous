@@ -39,6 +39,8 @@ export interface SidetabRow {
   readonly status?: string;
   readonly seat?: string;
   readonly host?: string;
+  readonly remoteHost?: string;
+  readonly lastActivityAt?: number;
   readonly cardId?: string;
   readonly version?: string;
 }

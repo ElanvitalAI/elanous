@@ -25,6 +25,7 @@ function fixtureObservations() {
     alternatesGcSafe: candidate === 'reference',
     sparseCheckoutEnabled: candidate === 'sparse',
     sparseDependenciesMet: false,
+    fseventUnavailableReason: 'fseventsd unavailable: fixture runs on Linux',
   }))));
 }
 
@@ -43,6 +44,7 @@ describe('git checkout acceleration measurement contract', () => {
           alternatesGcSafe: input.candidate === 'reference',
           sparseCheckoutEnabled: input.candidate === 'sparse',
           sparseDependenciesMet: false,
+          fseventCount: 3,
         };
       },
     };
@@ -56,6 +58,14 @@ describe('git checkout acceleration measurement contract', () => {
     expect(rows.find((row) => row.candidate === 'partial')).toMatchObject({ usable: false, usesAlternates: true, alternatesGcSafe: false, unusableReasons: ['alternates-gc-safety-unproven'] });
     expect(rows.find((row) => row.candidate === 'sparse')).toMatchObject({ usable: false, sparseCheckoutEnabled: true, sparseDependenciesMet: false, unusableReasons: ['sparse-dependencies-unmet'] });
     expect(rows.every((row) => row.bytesWritten !== null && row.fileCount !== null && row.cutSha === CUT)).toBe(true);
+    expect(rows.every((row) => row.fseventCount === 3 && row.fseventUnavailableReason === null)).toBe(true);
+  });
+
+  test('a probe that does not supply the fsevent counter records an explicit unavailable reason', async () => {
+    const rows = await measureCheckoutAcceleration({ cutSha: CUT, probe: {
+      async measure() { return { bytesWritten: 2, fileCount: 1, usesAlternates: false, sparseCheckoutEnabled: false }; },
+    }, clock: { now: (() => { let value = 0; return () => value++; })() } });
+    expect(rows.every((row) => row.fseventCount === null && row.fseventUnavailableReason === 'fsevent counter not supplied by probe')).toBe(true);
   });
 
   test('an unavailable measurement remains a reasoned matrix row instead of disappearing', async () => {
@@ -81,12 +91,12 @@ describe('git checkout acceleration measurement contract', () => {
       expect(await main(['--input', path])).toBe(0);
       const jsonRows = JSON.parse(String(write.mock.calls[0]?.[0])) as Array<Record<string, unknown>>;
       expect(jsonRows).toHaveLength(18);
-      expect(jsonRows[0]).toMatchObject({ route: 'worktree-add', candidate: 'reference', condition: 'cold', durationMs: 17 });
+      expect(jsonRows[0]).toMatchObject({ route: 'worktree-add', candidate: 'reference', condition: 'cold', durationMs: 17, fseventCount: null, fseventUnavailableReason: 'fseventsd unavailable: fixture runs on Linux' });
       write.mockClear();
       expect(await main(['--input', path, '--table'])).toBe(0);
       expect(String(write.mock.calls[0]?.[0])).toContain('| route');
       expect(String(write.mock.calls[0]?.[0])).toContain('alternates-gc-safety-unproven');
-      for (const fact of ['usesAlternates', 'alternatesGcSafe', 'sparseCheckoutEnabled', 'sparseDependenciesMet']) {
+      for (const fact of ['usesAlternates', 'alternatesGcSafe', 'sparseCheckoutEnabled', 'sparseDependenciesMet', 'fseventUnavailableReason']) {
         expect(String(write.mock.calls[0]?.[0])).toContain(fact);
       }
       const executable = spawnSync(resolve('scripts/measure-git-checkout-accel.ts'), ['--input', path], { encoding: 'utf8' });
@@ -96,6 +106,19 @@ describe('git checkout acceleration measurement contract', () => {
       write.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test('catalog entry fixture emits all three routes and keeps Linux fseventd unavailable explicit', () => {
+    const executable = spawnSync(resolve('scripts/measure-git-checkout-accel.ts'), [
+      '--input', resolve('src/ux-sim/fixtures/git-worktree-accel-linux.json'), '--table',
+    ], { encoding: 'utf8' });
+    expect(executable.status).toBe(0);
+    expect(executable.stdout.match(/^\| (worktree-add|remote-gate-clone|pod-source-image)\s/gm)).toHaveLength(18);
+    expect(executable.stdout).toContain('Measurement source: deterministic fixture');
+    expect(executable.stdout).toContain('fseventsd is macOS-only');
+    expect(executable.stdout).toContain('alternates-gc-safety-unproven');
+    expect(executable.stdout).toContain('sparse-dependencies-unmet');
+    expect(new Set(executable.stdout.match(/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/g))).toEqual(new Set(['a'.repeat(40)]));
   });
 
   test('CLI rejects a fixture with missing route/candidate/condition combinations', async () => {
@@ -155,9 +178,10 @@ describe('git checkout acceleration measurement contract', () => {
     const formatted = formatCheckoutMeasurementTable([{
       route: 'worktree-add', candidate: 'sparse', condition: 'cold', cutSha: CUT, measurementStatus: 'unavailable',
       durationMs: null, bytesWritten: null, fileCount: null, usesAlternates: null, alternatesGcSafe: null,
-      sparseCheckoutEnabled: null, sparseDependenciesMet: null, usable: false, unusableReasons: ['no-probe'],
+      sparseCheckoutEnabled: null, sparseDependenciesMet: null, fseventCount: null, fseventUnavailableReason: 'fseventsd unavailable', usable: false, unusableReasons: ['no-probe'],
     }]);
     expect(formatted).toContain('no-probe');
     expect(formatted).toContain('unavailable');
+    expect(formatted).toContain('fseventsd unavailable');
   });
 });

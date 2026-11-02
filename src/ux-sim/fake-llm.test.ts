@@ -2,18 +2,18 @@ import { afterEach, expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { anyProviderAvailable, getProvider, getProviderForConfig } from '../llm.js';
+import { anyProviderAvailable, getProvider, getProviderForConfig, streamLLM } from '../llm.js';
 import type { UserConfig } from '../user-config.js';
 import { _resetKeyCacheForTests } from '../config.js';
 import * as grokCredential from '../grok/credential.js';
 import {
-  TEST_FAKE_LLM_400_MESSAGE, TEST_FAKE_LLM_CAPTURE_ENV, TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
+  TEST_FAKE_LLM_400_MESSAGE, TEST_FAKE_LLM_CAPTURE_ENV, TEST_FAKE_LLM_CHUNK_SIZE_ENV, TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
   resetTestFakeLlmScript, testFakeLlmEnabled, testFakeLlmProvider,
 } from './fake-llm.js';
 import { matchFailureText } from '../self-health/signatures.js';
 
 const names = [
-  'ELANOUS_TEST_FAKE_LLM', 'ELANOUS_TEST_FAKE_LLM_RESPONSE', 'ELANOUS_TEST_FAKE_LLM_SCRIPT', 'ELANOUS_TEST_FAKE_LLM_CAPTURE',
+  'ELANOUS_TEST_FAKE_LLM', 'ELANOUS_TEST_FAKE_LLM_RESPONSE', 'ELANOUS_TEST_FAKE_LLM_CHUNK_SIZE', 'ELANOUS_TEST_FAKE_LLM_SCRIPT', 'ELANOUS_TEST_FAKE_LLM_CAPTURE',
   'ELANOUS_TEST_FAKE_LLM_TOOL_CALL', 'ELANOUS_TEST_FAKE_LLM_DELAY_MS', 'ELANOUS_TEST_FAKE_LLM_DELAY_WHEN',
   'XAI_API_KEY', 'GROK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
   'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY', 'LOCAL_LLM_URL',
@@ -88,6 +88,35 @@ test('keyless auto routing selects fake only when test env is enabled', () => {
   process.env.ELANOUS_TEST_FAKE_LLM = '1';
   expect(getProviderForConfig(config).name).toBe('test-fake-llm');
   expect(getProvider().name).toBe('test-fake-llm');
+});
+
+test('streamLLM calls the selected fake provider boundary with Unicode-safe deltas and injected errors, without fetch', async () => {
+  keyless();
+  process.env.ELANOUS_TEST_FAKE_LLM = '1';
+  process.env.ELANOUS_TEST_FAKE_LLM_RESPONSE = '가🙂나다';
+  process.env[TEST_FAKE_LLM_CHUNK_SIZE_ENV] = '2';
+  resetTestFakeLlmScript();
+  const provider = getProviderForConfig({ llm: { provider: 'auto' } } as UserConfig);
+  const fetchSpy = spyOn(globalThis, 'fetch');
+  try {
+    const chunks: string[] = [];
+    const result = await streamLLM([{ role: 'user', content: 'boundary check' }], (delta) => chunks.push(delta), { provider });
+    expect(provider.name).toBe('test-fake-llm');
+    expect(chunks).toEqual(['가🙂', '나다']);
+    expect(result).toBe('가🙂나다');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    process.env.ELANOUS_TEST_FAKE_LLM_SCRIPT = '400';
+    resetTestFakeLlmScript();
+    const errorChunks: string[] = [];
+    await expect(streamLLM([{ role: 'user', content: 'inject error' }], (delta) => errorChunks.push(delta), { provider }))
+      .rejects.toThrow(TEST_FAKE_LLM_400_MESSAGE);
+    expect(errorChunks).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  } finally {
+    fetchSpy.mockRestore();
+    resetTestFakeLlmScript();
+  }
 });
 
 test('test env leaves real auto candidates and explicit providers ahead of fake', () => {

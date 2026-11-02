@@ -63,7 +63,7 @@ import { assessTypecheckExecution, tscEnv, type TypecheckError } from '../typech
 import { classifyAgainstBaseline } from '../self-implement/gate-baseline.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise<void>((r) => setTimeout(r, ms));
 
 /** PTY 미션의 «벽시계» 상수 — 기본값이 운영 동작이다.
  *  ⭐ GATE-SPEED ③(2026-10-08): 가짜 PTY 시험이 시험마다 준비 대기 1.5 s ⊕ 키 간격 0.8 s 를 «실제로» 잤다
@@ -78,12 +78,15 @@ interface AgentMissionTiming {
   keystrokeGapMs: number;
   /** 자원 사다리 시한 타이머 — 시험은 ms 를 기록하고 즉시 쏠 수 있다. */
   scheduleTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  /** PTY control-loop waits; tests may advance a fake clock instead of sleeping. */
+  sleep: (ms: number) => Promise<void>;
 }
 const DEFAULT_AGENT_MISSION_TIMING: AgentMissionTiming = {
   readyQuietMs: 1500,
   pollMs: 300,
   keystrokeGapMs: 800,
   scheduleTimeout: (fn, ms) => setTimeout(fn, ms),
+  sleep,
 };
 let missionTiming: AgentMissionTiming = DEFAULT_AGENT_MISSION_TIMING;
 /** 시험 전용 심 — 바꾼 값을 되돌리는 함수를 돌려준다. */
@@ -740,7 +743,7 @@ async function waitForQuiet(h: PtyHandle, quietMs: number, maxWaitMs: number): P
     const d = h.drainDelta();
     if (d.length > 0) last = Date.now();
     else if (Date.now() - last >= quietMs) return 'quiet';
-    await sleep(missionTiming.pollMs);
+    await missionTiming.sleep(missionTiming.pollMs);
   }
   return 'timeout';
 }
@@ -2131,11 +2134,11 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     debug.log('agent-mission', 'mission-send', { via: 'file', file: '.mission-prompt.md', chars: missionText.length, enhanced: enhanceActive });
     submittedCommand = note;
     submittedInputs.push(note);
-    drive(note); await sleep(missionTiming.keystrokeGapMs); drive('\r');
+    drive(note); await missionTiming.sleep(missionTiming.keystrokeGapMs); drive('\r');
   } else {
     debug.log('agent-mission', 'mission-send', { via: 'type', chars: spec.mission.length });
     submittedInputs.push(spec.mission);
-    drive(spec.mission); await sleep(missionTiming.keystrokeGapMs); drive('\r');
+    drive(spec.mission); await missionTiming.sleep(missionTiming.keystrokeGapMs); drive('\r');
   }
 
   let usedOmni = false;
@@ -2207,7 +2210,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       }));
       return { screen: () => handle.renderScreen(), alive: () => handle.isAlive(), close: () => handle.kill() };
     },
-    sleep: async (ms) => { await sleep(ms); },
+    sleep: (ms) => missionTiming.sleep(ms),
     notify: async (card) => {
       const { sendOutbound } = await import('../domains/outbound-alert.js');
       if (!sendOutbound([card.text, card.url, card.code].filter(Boolean).join('\n'), 'agent-mission')) {
