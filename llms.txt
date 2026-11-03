@@ -78,6 +78,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
 - [0.2.46](https://docs.elanous.ai/releases/0-2-46/): Release notes for 0.2.46.
+- [0.2.47](https://docs.elanous.ai/releases/0-2-47/): Release notes for 0.2.47.
 - [0.2.45](https://docs.elanous.ai/releases/0-2-45/): Reliability improvements across the CLI, isolated testing, research, and resource management.
 - [0.2.43](https://docs.elanous.ai/releases/0-2-43/): Changes in 0.2.43.
 - [0.2.42](https://docs.elanous.ai/releases/0-2-42/): Changes in 0.2.42.

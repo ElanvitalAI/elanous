@@ -5282,6 +5282,20 @@ Gate run 2cbfb687 reported 101 test regressions classified as test harness issue
 
 ---
 
+# 0.2.47
+
+Source: https://docs.elanous.ai/releases/0-2-47/
+
+## Fixes
+
+- Restored the shadow default for the harness launch door. Task launches are no longer denied when no launch-door mode is configured.
+
+## Known Issues
+
+- Version 0.2.46 denied harness task launches when no launch-door mode was set. Upgrade to 0.2.47 to resolve it.
+
+---
+
 # 0.2.45
 
 Source: https://docs.elanous.ai/releases/0-2-45/
