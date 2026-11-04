@@ -146,7 +146,7 @@ test('first-run setup menu re-asks parser misses, then asks for setup without re
       print: line => output.push(line),
     });
     expect(skipResult).toEqual({ outcome: 'ready', inputs: 1 });
-    expect(buildUserConfig(skipPath).onboarding.ready).toBe(true);
+    expect(buildUserConfig(skipPath).onboarding.ready).toBeUndefined();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -237,7 +237,7 @@ test('production first-run shows fake-clock headless progress and aborts the rea
       expect(result.outcome).toBe('ready');
       expect(signal?.aborted).toBe(true);
       expect(pollAborted).toBe(true);
-      expect(buildUserConfig(configPath).onboarding.ready).toBe(true);
+      expect(buildUserConfig(configPath).onboarding.ready).toBeUndefined();
       expect(printed.some(line => line.includes('Codex 로그인을 건너뛰었습니다'))).toBe(true);
       expect(printed.some(line => line.includes('elanous login openai-codex'))).toBe(true);
       expect(printed.some(line => line.includes('완료하지 못했습니다'))).toBe(false);

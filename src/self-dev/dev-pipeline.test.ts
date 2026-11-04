@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { describe, it, expect, spyOn } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -27,6 +28,7 @@ import { createRepositoryReferencedFileReader } from '../self-implement/goal-fil
 import { loadReviewerContext, reviewerContextArgs } from '../agent-substrate/self-review-cli.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE, resolveMainRepoRoot } from '../git-fs/worktree.js';
 import { loadSelfDevRun, selfDevRunsDir } from './run-store.js';
+import { loadRunLedger } from '../self-implement/run-ledger.js';
 import { ensureRunIdentity } from '../harness/harness-space.js';
 import { ROLE_MODEL_DEFAULTS, clearLaunchRoleLlmOverrides, getLaunchRoleLlmOverrides, resolveRoleModel, setLaunchRoleLlmOverrides, setUserConfigOverlay } from '../user-config.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
@@ -1119,12 +1121,13 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
   });
 
   it('pre-dispatch failure still dual-emits the fallback plan observation without inventing a dispatch or entrance', async () => {
+    const runId = `run-no-launch-${randomUUID()}`;
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
     const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
       events.push({ category: _category, event, data: data ?? {} });
     }) as never);
     try {
-      await expect(runDevPipeline({ input: { text: 'x' }, entrance: 'not-a-registered-entrance' as DevPipelineSpec['entrance'] }))
+      await expect(runDevPipeline({ input: { text: 'x' }, runId, entrance: 'not-a-registered-entrance' as DevPipelineSpec['entrance'] }))
         .rejects.toThrow(/알 수 없는 입구 id/);
     } finally {
       log.mockRestore();
@@ -1132,10 +1135,36 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
 
     const legacy = events.filter((entry) => entry.category === 'dev-pipeline' && entry.event === 'plan');
     const launches = events.filter((entry) => entry.category === 'dev-pipeline' && entry.event === 'harness.launch');
+    const noLaunch = events.filter((entry) => entry.category === 'dev-pipeline' && entry.event === 'no-launch');
     expect(legacy).toHaveLength(1);
+    expect(noLaunch).toHaveLength(1);
+    expect(noLaunch[0]!.data).toMatchObject({ runId, stage: 'plan', errorClass: 'Error' });
+    expect(String(noLaunch[0]!.data.reason)).toContain('not-a-registered-entrance');
+    const ledgerNoLaunch = loadRunLedger(runId)?.filter((entry) => entry.event === 'no-launch') ?? [];
+    expect(ledgerNoLaunch).toHaveLength(1);
+    expect(ledgerNoLaunch[0]!.data).toEqual(noLaunch[0]!.data);
     expect(launches).toEqual([{ category: 'dev-pipeline', event: 'harness.launch', data: { ...legacy[0]!.data, legacyEvent: 'plan' } }]);
     expect(legacy[0]!.data).not.toHaveProperty('dispatch');
     expect(launches[0]!.data).not.toHaveProperty('entrance');
+  });
+
+  it('does not label a failure from an entered dispatch as no-launch', async () => {
+    const runId = `run-dispatch-failed-${randomUUID()}`;
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
+      events.push({ category: _category, event, data: data ?? {} });
+    }) as never);
+    try {
+      await expect(runDevPipeline(T({ runId, completion: 'pr' }), {
+        runGit: presentRemote,
+        buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+        runSelfImplement: async () => { throw new Error('dispatched failure'); },
+      })).rejects.toThrow('dispatched failure');
+    } finally {
+      log.mockRestore();
+    }
+    expect(events.filter((entry) => entry.category === 'dev-pipeline' && entry.event === 'no-launch')).toEqual([]);
+    expect(loadRunLedger(runId)?.filter((entry) => entry.event === 'no-launch') ?? []).toEqual([]);
   });
 
   it('completion과 autoReview 선택은 축별 한 행으로 결정값·출처·요청값·입구를 관측한다', async () => {

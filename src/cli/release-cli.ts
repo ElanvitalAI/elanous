@@ -25,7 +25,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
@@ -1309,14 +1309,15 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--shard-concurrency <n>', '동시에 실행할 조각 묶음 수 (1–4, 기본 3)')
     .option('--fixed-shard-distribution', 'self gate 에 그대로 전달 — RSS 사전 측정 없이 --shards N 조각에 정렬 라운드로빈 고정 배정(opt-in · 원격 자식 전달)')
     .option('--rehearsal-tui', '리허설 전용 TUI 화면 점검(원격 자식 전달)')
+    .addOption(new Option('--legacy-self-gate').hideHelp())
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; shardConcurrency?: string; fixedShardDistribution?: boolean; rehearsalTui?: boolean; json?: boolean }) => {
+    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; shardConcurrency?: string; fixedShardDistribution?: boolean; rehearsalTui?: boolean; legacySelfGate?: boolean; json?: boolean }) => {
       // The root strips `--local` from argv (remote-bookmark attach) before Commander sees it — same read as `self gate`.
       const local = !!o.local || process.argv.slice(2).includes('--local');
       await jsonAction(o.json, async (log) => {
         if (o.remote !== undefined && local) throw new Error('release light-rc: --remote and --local cannot be combined');
         const shards = Number(o.shards);
-        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, ...(o.shardConcurrency !== undefined ? { shardConcurrency: Number(o.shardConcurrency) } : {}), ...(o.fixedShardDistribution ? { fixedShardDistribution: true } : {}), rehearsalTui: o.rehearsalTui, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
+        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, ...(o.shardConcurrency !== undefined ? { shardConcurrency: Number(o.shardConcurrency) } : {}), ...(o.fixedShardDistribution ? { fixedShardDistribution: true } : {}), rehearsalTui: o.rehearsalTui, legacySelfGate: o.legacySelfGate, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
         for (const line of formatLightRc(result)) log(line);
         return result;
       }, (r) => r.ok);

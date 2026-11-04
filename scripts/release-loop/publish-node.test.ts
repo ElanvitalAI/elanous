@@ -166,7 +166,7 @@ test('owner-waived 0.2.46 gate passes through measured auto approval and the pro
     const commit = 'b'.repeat(40);
     const context: GraphContext = {
       nodeId: 'publish', runId: 'owner-waive-publish-test', input: { version, previousVersion: '0.2.45' }, outputs: {
-        gate: { outcome: 'pass(owner-waived)', verdict: 'owner-waived', approvedBy: 'OP', reason: 'Known gate regression accepted.' },
+        gate: { outcome: 'ok', verdict: 'owner-waived', approvedBy: 'OP', reason: 'Known gate regression accepted.' },
         pwa: { outcome: 'ok' }, upgrade: { outcome: 'ok' },
         tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
           results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'passed' })) } },
@@ -174,11 +174,6 @@ test('owner-waived 0.2.46 gate passes through measured auto approval and the pro
         docs: { outcome: 'ok', notes: 'release notes', branch: `release-docs/${version}` },
       },
     };
-    const auto = runAutoApprove(context, { instanceRoot: root, repo });
-    expect(auto).toMatchObject({ outcome: 'ok', decidedBy: 'release-loop metrics' });
-    expect(auto.metrics[0]).toMatchObject({ name: BLOCKING_METRIC_NAMES[0], verdict: 'pass' });
-    context.outputs['auto-approve'] = auto;
-    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
     const calls: string[] = [];
     const run = (command: string, args: string[]) => {
       calls.push(`${command} ${args.join(' ')}`);
@@ -188,8 +183,17 @@ test('owner-waived 0.2.46 gate passes through measured auto approval and the pro
         return { status: 0, stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, publicRepo: 'elanous/elanous', assets: [] }), stderr: '' };
       return { status: 2, stdout: '', stderr: `unexpected ${command} ${args.join(' ')}` };
     };
-    expect(runPublish(run, root)).toMatchObject({ outcome: 'ok', verdict: 'pass', tag: `v${version}` });
-    expect(calls.some((call) => call.startsWith('bun bin/elanous.mjs release publish '))).toBe(true);
+    for (const outcome of ['ok', 'pass(owner-waived)']) {
+      context.outputs.gate!.outcome = outcome;
+      const auto = runAutoApprove(context, { instanceRoot: root, repo });
+      expect(auto).toMatchObject({ outcome: 'ok', decidedBy: 'release-loop metrics' });
+      expect(auto.metrics[0]).toMatchObject({ name: BLOCKING_METRIC_NAMES[0], verdict: 'pass' });
+      context.outputs['auto-approve'] = auto;
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+      calls.length = 0;
+      expect(runPublish(run, root)).toMatchObject({ outcome: 'ok', verdict: 'pass', tag: `v${version}` });
+      expect(calls.some((call) => call.startsWith('bun bin/elanous.mjs release publish '))).toBe(true);
+    }
   } finally {
     if (previousContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previousContext;
     rmSync(root, { recursive: true, force: true });

@@ -41,6 +41,38 @@ function fakeClient(tools: Array<{ name: string; description?: string }>, calls?
 }
 
 describe('registerAllDefaultToolRuntimes — 생산 진입점 배선', () => {
+  test('현재 aside 선택을 읽어 같은 TUI 턴의 tool result로 전달한다', async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    setMcpProxyBootstrapOptsForTest({
+      servers: [stdioServer('aside', ['repl'])],
+      handshakeTimeoutMs: 0,
+      createClient: () => ({
+        start: async () => {},
+        listTools: async () => [{ name: 'repl' }],
+        callTool: async (name: string, args: Record<string, unknown>) => {
+          calls.push({ name, args });
+          return { content: [{ type: 'text' as const, text: `opened tab\n\u001b[2mELANOUS_CURRENT_SELECTION:{"text":"HBM4 공급 확대 승인","url":"https://ir.example.test/notice/42"}\u001b[0m\n[ok | 4ms]` }] };
+        },
+        dispose: async () => {},
+      }),
+    });
+    registerAllDefaultToolRuntimes();
+    await getMcpProxyBootstrapHandle()!.ready;
+
+    const available = listToolRuntimes('tui').map(runtime => runtime.id);
+    expect(available).toContain('elanous_aside_selection');
+    expect(available).toContain('aside.repl');
+    const result = await dispatchToolByName('elanous_aside_selection', {}, ctx);
+
+    expect(result).toMatchObject({
+      selection: { text: 'HBM4 공급 확대 승인', url: 'https://ir.example.test/notice/42' },
+      output: expect.stringContaining('현재 TUI 요청에 사용할 브라우저 선택 문장'),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.name).toBe('repl');
+    expect(calls[0]?.args).toMatchObject({ title: expect.any(String), code: expect.stringContaining('window.getSelection()') });
+  });
+
   test('기본 부팅이 bootstrap 에 닿아 설정된 툴이 tui 에 뜨고 호출된다', async () => {
     const calls: string[] = [];
     setMcpProxyBootstrapOptsForTest({

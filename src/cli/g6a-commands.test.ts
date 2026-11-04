@@ -18,6 +18,7 @@ const expectedCommandTree = [
       '--include-test', '--recompute', '--run <id>', '--journey <key>', '--graph <id>', '-r', '--remote <name>',
     ],
     children: [
+      { name: 'federate', flags: [] },
       { name: 'instances', flags: ['--json'] },
       { name: 'level', flags: ['--json', '--render <on|off>'] },
       { name: 'timeline', flags: ['--session <id>', '--since <t>', '--until <t>', '--out <path>', '--test', '--instance <name>'] },
@@ -40,6 +41,7 @@ const expectedCommandTree = [
   {
     name: 'fleet', flags: [], children: [
       { name: 'list', flags: ['--json'] },
+      { name: 'resources', flags: ['--cost', '--json'] },
       { name: 'screen', flags: ['--all', '--include-test', '--json'] },
     ],
   },

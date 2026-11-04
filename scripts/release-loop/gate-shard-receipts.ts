@@ -64,6 +64,11 @@ export type GateShardReceiptInspection =
   | { kind: 'invalid'; reason: string }
   | { kind: 'valid'; images: Array<{ imageDigest: string }>; receipts: GateShardReceipt[] };
 
+/** The gate treats an empty formal receipt inventory as a full-sweep fallback reason. */
+export function formalReceiptSetPresenceReason(receiptCount: number): 'formal-receipt-set-absent' | undefined {
+  return receiptCount === 0 ? 'formal-receipt-set-absent' : undefined;
+}
+
 /** Validate the complete formal receipt set against independently recorded shard and test inventories. */
 export function inspectGateShardReceipts(root: string, expected: {
   version: string; commit: string; base40: string; envFingerprint: string; graphPins: { graphSha: string; recipeSha: string }; graphEntry: string; recipeCommand: string; recipeTimeoutMs: number;

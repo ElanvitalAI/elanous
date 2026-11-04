@@ -6,8 +6,8 @@ import type { WebSearchHit, WebSearchProvider } from '../web-search/provider.js'
 import { debug } from '../debug/log.js';
 import { dispatchWebFetch } from '../skills/tools/webfetch.js';
 
-const RESEARCH_SEARCH_ENGINES = ['exa', 'firecrawl'] as const;
-const RESEARCH_WEB_FALLBACK_IDS = ['exa', 'firecrawl'] as const;
+const RESEARCH_PAID_WEB_FALLBACK_IDS = ['exa', 'firecrawl'] as const;
+const RESEARCH_KEYLESS_WEB_FALLBACK_IDS = ['ddg-free'] as const;
 const RESEARCH_EXA_TIMEOUT_MS = 4_500;
 // Leave scheduler/logging headroom under the user-visible 15s aggregate cap.
 export const RESEARCH_SEARCH_BUDGET_MS = 14_500;
@@ -65,25 +65,32 @@ interface ProviderHealth {
   open: boolean;
 }
 
-/** Build one bounded searcher per research prepass. Research uses only the
- * sequential Exa → Firecrawl fallback; Grok is reserved for explicit X intent.
+/** Build one bounded searcher per research prepass. Paid Exa/Firecrawl routes
+ * take precedence; DDG is used only when neither paid route is available. Grok
+ * is reserved for explicit X intent.
  * Per-engine serialization lets a timeout open that engine's
  * breaker before queued Bloom axes start. */
 export function createResearchAxisSearcher(
   availableProviders: readonly WebSearchProvider[] = getAvailableResearchWebSearchProviders(),
   now: () => number = Date.now,
 ): AxisSearch {
-  const webFallback = RESEARCH_WEB_FALLBACK_IDS.flatMap(id => availableProviders.filter(provider => provider.id === id));
+  const paidProviders = RESEARCH_PAID_WEB_FALLBACK_IDS.flatMap(id => availableProviders.filter(provider => provider.id === id));
+  const webFallback = paidProviders.length > 0
+    ? paidProviders
+    : RESEARCH_KEYLESS_WEB_FALLBACK_IDS.flatMap(id => availableProviders.filter(provider => provider.id === id));
   const allowed = [...webFallback];
+  const keylessFallback = paidProviders.length === 0 && allowed.some(provider =>
+    (RESEARCH_KEYLESS_WEB_FALLBACK_IDS as readonly string[]).includes(provider.id));
   const health = new Map(allowed.map(provider => [provider.id, { failures: 0, open: false }]));
   const deadline = now() + RESEARCH_SEARCH_BUDGET_MS;
   let searchBudgetExhausted = false;
   const tails = new Map<string, Promise<void>>();
 
   debug.log('research.search', 'provider-preflight', {
-    allowed: RESEARCH_SEARCH_ENGINES,
+    allowed: allowed.map(provider => provider.id),
     available: allowed.map(provider => provider.id),
-    excluded: availableProviders.filter(provider => !(RESEARCH_SEARCH_ENGINES as readonly string[]).includes(provider.id))
+    keylessFallback: keylessFallback ? 'ddg-free' : null,
+    excluded: availableProviders.filter(provider => !allowed.some(allowedProvider => allowedProvider.id === provider.id))
       .map(provider => provider.id),
     budgetMs: RESEARCH_SEARCH_BUDGET_MS,
   });
@@ -167,7 +174,7 @@ export function createResearchAxisSearcher(
       }
     };
     await runWebFallback();
-    if (hits.length === 0 && errors.length === 0) errors.push('no healthy Exa/Firecrawl research provider');
+    if (hits.length === 0 && errors.length === 0) errors.push('no healthy research search provider');
     return { hits, errors, ...(budgetExhausted || searchBudgetExhausted ? { budgetExhausted: true } : {}) };
   };
 }

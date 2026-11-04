@@ -1523,7 +1523,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const nodeEndedAt = new Date(Math.max(Date.now(), Date.parse(nodeStartedAt))).toISOString();
     delete state.currentNode;
     if (waiving) {
-      output = JSON.stringify(options.releaseWaiver!.ownerWaived ? { outcome: 'pass(owner-waived)', verdict: 'owner-waived', summary: `owner waived ${current}`, reason: options.releaseWaiver!.reason, approvedBy: options.releaseWaiver!.approvedBy } : { outcome: 'ok', verdict: 'waived', summary: `waived ${current}`, reason: options.releaseWaiver!.reason });
+      // Keep the graph contract outcome stable for downstream nodes; the distinct verdict and waiver record carry
+      // the audit meaning. A waived gate is an approved continuation, not a new graph outcome value.
+      output = JSON.stringify(options.releaseWaiver!.ownerWaived ? { outcome: 'ok', verdict: 'owner-waived', summary: `owner waived ${current}`, reason: options.releaseWaiver!.reason, approvedBy: options.releaseWaiver!.approvedBy } : { outcome: 'ok', verdict: 'waived', summary: `waived ${current}`, reason: options.releaseWaiver!.reason });
       ok = true;
       exit = 0;
     }

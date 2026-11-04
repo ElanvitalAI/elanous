@@ -3,9 +3,45 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
-import { runReleaseSimRigIfFile, runReleaseSimRigScenario } from './release-sim-rig.js';
+import { runReleaseSimGateReceiptSeam, runReleaseSimRigIfFile, runReleaseSimRigScenario } from './release-sim-rig.js';
 import { resolveScenarioFilePath } from './scenario.js';
 
+test('receipt seam blocks fake publish when the final injected gate outcome fails', () => {
+  const commit = 'a'.repeat(40);
+  const stage = runReleaseSimGateReceiptSeam({ stage: 'injected-failure', tests: ['test/only.test.ts'], receipts: [],
+    priorCommit: commit, commit, selectedFiles: [] }, () => ({ gateOutcome: 'fail' }));
+  expect(stage).toMatchObject({ aggregate: 'complete', gateOutcome: 'fail', publishDecision: 'blocked',
+    plan: { fullSweep: true, carriedShardIds: [], rerunShardIds: ['pod-0'] } });
+});
+
+test('receipt seam blocks publish when production gate fails, errors, or contradicts receipt inspection', () => {
+  const commit = 'a'.repeat(40);
+  const common = { stage: 'gate-cut', tests: ['test/only.test.ts'], receipts: [], priorCommit: commit, commit,
+    selectedFiles: [], formalReceiptInspection: { kind: 'absent' as const } };
+  const failed = runReleaseSimGateReceiptSeam({ ...common, formalGateRun: {
+    outcome: 'regression', formalReceiptDecision: 'formal-receipt-set-absent', cutSweepCount: 1, fullSweep: true,
+  } });
+  expect(failed).toMatchObject({ aggregate: 'complete', gateOutcome: 'fail', publishDecision: 'blocked' });
+  const errored = runReleaseSimGateReceiptSeam({ ...common, formalGateRun: {
+    outcome: 'error', formalReceiptDecision: 'formal-receipt-set-absent', cutSweepCount: 0, fullSweep: false,
+  } });
+  expect(errored).toMatchObject({ gateOutcome: 'unmeasured', publishDecision: 'blocked' });
+  const failedWithoutInspection = runReleaseSimGateReceiptSeam({ ...common, formalReceiptInspection: undefined, formalGateRun: {
+    outcome: 'regression', cutSweepCount: 1, fullSweep: true,
+  } });
+  expect(failedWithoutInspection).toMatchObject({ gateOutcome: 'fail', publishDecision: 'blocked' });
+  const erroredWithoutInspection = runReleaseSimGateReceiptSeam({ ...common, formalReceiptInspection: undefined, formalGateRun: {
+    outcome: 'error', cutSweepCount: 0, fullSweep: false,
+  } });
+  expect(erroredWithoutInspection).toMatchObject({ gateOutcome: 'unmeasured', publishDecision: 'blocked' });
+  const inconsistent = runReleaseSimGateReceiptSeam({ ...common, formalGateRun: {
+    outcome: 'ok', cutSweepCount: 1, fullSweep: true,
+  } });
+  expect(inconsistent).toMatchObject({ gateOutcome: 'fail', publishDecision: 'blocked' });
+  const invalidInspection = runReleaseSimGateReceiptSeam({ ...common, formalReceiptInspection: { kind: 'invalid', reason: 'receipt mismatch' },
+    formalGateRun: { outcome: 'ok', cutSweepCount: 1, fullSweep: true } });
+  expect(invalidInspection).toMatchObject({ gateOutcome: 'fail', publishDecision: 'blocked' });
+});
 
 test('release simulation runs the real release graph with injected node outcomes in isolated test state', async () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'release-sim-rig-test-'));
@@ -21,11 +57,36 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(result.universe).toBe(root);
     expect(result.artifactPath).toBe(join(root, 'ux-sim', 'evidence', 'release-sim-rig-0241.json'));
     expect(existsSync(result.artifactPath)).toBe(true);
-    expect(result.cases).toHaveLength(15);
+    expect(result.cases).toHaveLength(16);
     expect(result.cases.every((item) => item.pass && item.unexpectedEdges.length === 0)).toBe(true);
     expect(result.cases.every((item) => item.dispatchedNodes.every((node) => item.path.includes(node) ||
       Object.values(item.fanOuts ?? {}).some((fanout) => Object.hasOwn(fanout.branches, node))))).toBe(true);
     expect(result.table.every((row) => row.unexpectedEdges === 'none')).toBe(true);
+    const appendReceiptCase = result.cases.find((item) => item.id === 'append-receipt-set-absent-and-continuous-radius')!;
+    expect(appendReceiptCase).toMatchObject({
+      pass: true, status: 'done', checks: { status: true, mustVisit: true, mustNotVisit: true, ledgerEvents: true },
+      path: ['cut', 'gate-cut', 'append-a', 'resume-a', 'gate-a', 'append-b', 'resume-b', 'gate-b', 'publish', 'done'],
+      injectedEvidence: { universe: 'test', releaseVersion: '0.3.1', appendedOnlyChangedTestRadius: true, fakePublish: 'eligible',
+        formalReceiptInspection: { kind: 'absent' }, receiptCase: {
+          formalReceiptDecision: { kind: 'absent', reason: 'formal-receipt-set-absent' },
+          formalGateRun: { outcome: 'ok', formalReceiptDecision: 'formal-receipt-set-absent', baselineVersion: '0.3.0', cutSweepCount: 1, fullSweep: true },
+        } },
+    });
+    const alternateBaselineScenario = readFileSync(scenarioPath, 'utf8')
+      .replace('id: release-sim-rig-0241', 'id: release-sim-alternate-baseline-34922')
+      .replace("previousVersion: '0.3.0'", "previousVersion: '0.2.99'");
+    const alternateBaseline = await runReleaseSimRigScenario(alternateBaselineScenario);
+    const alternateReceiptCase = alternateBaseline.cases.find((item) => item.id === 'append-receipt-set-absent-and-continuous-radius')!;
+    expect(alternateReceiptCase.injectedEvidence).toMatchObject({ receiptCase: { formalGateRun: { baselineVersion: '0.2.99' } } });
+    const appendEvidence = appendReceiptCase.injectedEvidence as { receiptCase: { plan: { rerunShardIds: string[] }; aggregate: string; receiptIds: string[] };
+      appendA: { plan: { carriedShardIds: string[]; rerunShardIds: string[] }; aggregate: string; receiptIds: string[] };
+      appendB: { plan: { carriedShardIds: string[]; rerunShardIds: string[] }; aggregate: string; receiptIds: string[] } };
+    expect(appendEvidence.receiptCase.plan.rerunShardIds).toHaveLength(81);
+    expect(appendEvidence.receiptCase).toMatchObject({ aggregate: 'complete', receiptIds: expect.arrayContaining(['pod-0', 'pod-80']) });
+    expect(appendEvidence.appendA.plan.carriedShardIds).toHaveLength(80);
+    expect(appendEvidence.appendA).toMatchObject({ aggregate: 'complete', plan: { rerunShardIds: ['pod-0'] }, receiptIds: expect.arrayContaining(['pod-1', 'pod-80']) });
+    expect(appendEvidence.appendB.plan.carriedShardIds).toHaveLength(80);
+    expect(appendEvidence.appendB).toMatchObject({ aggregate: 'complete', plan: { rerunShardIds: ['pod-1'] }, receiptIds: expect.arrayContaining(['pod-0', 'pod-80']) });
     expect(result.cases.find((item) => item.id === 'cut-tip-moved-after-resume')).toMatchObject({
       status: 'resume-refused', dispatchedNodes: ['version-release'], checks: { mustVisit: true, mustNotVisit: true },
     });

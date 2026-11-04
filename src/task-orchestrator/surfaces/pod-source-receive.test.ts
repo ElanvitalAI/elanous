@@ -516,6 +516,56 @@ describe('podSourceScript', () => {
     expect(pr).toContain('git checkout -B pr-7 "$pr_sha"');
   });
 
+  test('commit source fetches and proves the supplied gate base is an ancestor of the cut', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-commit-base-ancestor-'));
+    try {
+      const originWork = join(root, 'origin-work');
+      const origin = join(root, 'origin.git');
+      const cwd = join(root, 'job');
+      mkdirSync(originWork); mkdirSync(cwd);
+      execFileSync('git', ['init', '-q', '-b', 'main', originWork]);
+      execFileSync('git', ['-C', originWork, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', originWork, 'config', 'user.name', 'pod']);
+      writeFileSync(join(originWork, 'README'), 'base\n');
+      execFileSync('git', ['-C', originWork, 'add', 'README']);
+      execFileSync('git', ['-C', originWork, 'commit', '-qm', 'base']);
+      const baseSha = execFileSync('git', ['-C', originWork, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      for (let index = 1; index <= 3; index++) {
+        writeFileSync(join(originWork, `step-${index}.txt`), `step ${index}\n`);
+        execFileSync('git', ['-C', originWork, 'add', `step-${index}.txt`]);
+        execFileSync('git', ['-C', originWork, 'commit', '-qm', `step ${index}`]);
+      }
+      writeFileSync(join(originWork, 'cut.txt'), 'cut\n');
+      execFileSync('git', ['-C', originWork, 'add', 'cut.txt']);
+      execFileSync('git', ['-C', originWork, 'commit', '-qm', 'cut']);
+      const cutSha = execFileSync('git', ['-C', originWork, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', originWork, origin]);
+      const script = podSourceScript({ kind: 'commit', sha: cutSha, baseSha }, `file://${origin}`).replace('git clone -q --depth 50', 'git clone -q --depth 1');
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_ANCESTOR ${baseSha} ${cutSha}`);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'merge-base', '--is-ancestor', baseSha, cutSha], { encoding: 'utf8' })).toBe('');
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(cutSha);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', '--is-shallow-repository'], { encoding: 'utf8' }).trim()).toBe('false');
+
+      execFileSync('git', ['-C', originWork, 'checkout', '--orphan', 'unrelated']);
+      execFileSync('git', ['-C', originWork, 'rm', '-rf', '.']);
+      writeFileSync(join(originWork, 'other.txt'), 'other history\n');
+      execFileSync('git', ['-C', originWork, 'add', 'other.txt']);
+      execFileSync('git', ['-C', originWork, 'commit', '-qm', 'unrelated']);
+      const unrelatedSha = execFileSync('git', ['-C', originWork, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['--git-dir', origin, 'fetch', originWork, `+${unrelatedSha}:refs/heads/unrelated`]);
+      const unrelatedCwd = join(root, 'unrelated-job');
+      mkdirSync(unrelatedCwd);
+      const unrelatedScript = podSourceScript({ kind: 'commit', sha: cutSha, baseSha: unrelatedSha }, `file://${origin}`).replace('git clone -q --depth 50', 'git clone -q --depth 1');
+      const unrelated = Bun.spawnSync(['bash', '-c', `set -e\n${unrelatedScript}`], { cwd: unrelatedCwd });
+      expect(unrelated.exitCode).toBe(5);
+      expect(unrelated.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_ANCESTRY_MISSING base=${unrelatedSha} head=${cutSha}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test('mirror freshness and SHA membership select source fetches while PR base refreshes without writing to mirror', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-src-mirror-'));
     try {

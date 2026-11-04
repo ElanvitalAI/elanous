@@ -45,7 +45,16 @@ export function parseArgs(argv: readonly string[]): Options {
   return opts;
 }
 
-const NO_PROXY_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(https?|all)_proxy$/i.test(k)));
+export function releasePwaNodeEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string | undefined> {
+  const clean = Object.fromEntries(Object.entries(env).filter(([k]) => !/^(https?|all)_proxy$/i.test(k)));
+  const configured = env.ELANOUS_CDP_ATTACH_TIMEOUT_MS?.trim();
+  const timeout = configured && /^\d+$/.test(configured) && Number.isSafeInteger(Number(configured)) && Number(configured) > 0
+    ? configured
+    : '30000';
+  return { ...clean, ELANOUS_CDP_ATTACH_TIMEOUT_MS: timeout };
+}
+
+const NO_PROXY_ENV = releasePwaNodeEnvironment();
 const log = (msg: string) => process.stderr.write(`[pwa-node] ${msg}\n`);
 
 function run(cmd: string, args: string[], cwd: string, timeoutMs = 600_000) {

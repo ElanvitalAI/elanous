@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, setDefaultTimeout, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,9 @@ import { resumeReleaseRun } from './resume-release.js';
 import { debug } from '../../src/debug/log.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
 import './resume-test-traffic.js';
+
+// End-to-end release graph fixtures can exceed Bun's default under parallel gate-test load.
+setDefaultTimeout(15_000);
 
 const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';
@@ -736,7 +739,11 @@ test('release resume CLI owner waiver runs a valid malformed-schema gate through
     expect(result).toMatchObject({ ok: true, status: 'done' });
     const saved = JSON.parse(readFileSync(first.statePath, 'utf8')) as GraphRunState;
     expect(saved.path).toContain('publish');
-    expect(saved.nodes.find((node) => node.nodeId === 'gate')).toMatchObject({ ok: true, executed: false, output: expect.stringContaining('pass(owner-waived)'), waiver: { ownerWaived: true, approvedBy: 'OP', reason } });
+    const gate = saved.nodes.find((node) => node.nodeId === 'gate');
+    expect(JSON.parse(String(gate?.output))).toMatchObject({ outcome: 'ok', verdict: 'owner-waived', approvedBy: 'OP', reason });
+    expect(gate).toMatchObject({ ok: true, executed: false, waiver: { ownerWaived: true, approvedBy: 'OP', reason } });
+    expect(saved.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa).toMatchObject({ status: 'done' });
+    expect(saved.nodes.find((node) => node.nodeId === 'prepare')).toMatchObject({ ok: true, executed: true });
   } finally { process.stdout.write = write; process.exitCode = 0; resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 }, 60_000);
 test('owner gate waiver accepts malformed introducedIds output only with explicit approver and reason', () => {

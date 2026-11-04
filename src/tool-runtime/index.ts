@@ -70,6 +70,7 @@ import { elanousFsReadRuntime } from './elanous-fs-read-runtime.js';
 import { elanousShowroomBroadcastRuntime } from './elanous-showroom-broadcast-runtime.js';
 import { elanousAutopilotLaunchRuntime } from './elanous-autopilot-launch-runtime.js';
 import { elanousTaskSubmitRuntime } from './elanous-task-submit-runtime.js';
+import { asideSelectionRuntime } from './aside-selection-runtime.js';
 import { GRAPH_MCP_RUNTIMES } from './graph-mcp-runtimes.js';
 import { persistentGroundingRuntime } from './persistent-grounding-runtime.js';
 import { goalAuthorRuntime } from './goal-author-runtime.js';
@@ -179,6 +180,7 @@ export function registerAllDefaultToolRuntimes(opts: RegisterAllDefaultToolRunti
   registerToolRuntime(elanousShowroomBroadcastRuntime);
   registerToolRuntime(elanousAutopilotLaunchRuntime);
   registerToolRuntime(elanousTaskSubmitRuntime);
+  registerToolRuntime(asideSelectionRuntime);
   for (const rt of GRAPH_MCP_RUNTIMES) registerToolRuntime(rt);
   for (const rt of SELF_COGNITION_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ELANOUS_CONTROL_RUNTIMES) registerToolRuntime(rt);

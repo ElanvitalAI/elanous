@@ -20,7 +20,10 @@ export async function firstChatGate(cfg: UserConfig, deps: FirstChatGateDeps): P
   if (deps.isTTY) {
     return decide(await deps.runInteractive() ? 'continue' : 'stop', 'interactive');
   }
-  if (!needsFirstRun(cfg)) return decide('continue', 'already-ready');
+  // This gate decides whether the chat can run without an LLM. `needsFirstRun`
+  // also keeps the CLI's web-first setup available until detailed onboarding
+  // completes, so a ready provider must bypass this chat-only gate.
+  if (cfg.onboarding.ready === true || !needsFirstRun(cfg)) return decide('continue', 'already-ready');
   const result = await deps.runFirstRun({ config: cfg, isTTY: false, print: () => {} });
   if (result.outcome === 'ready') return decide('continue', result.outcome);
   deps.print(`다음: elanous setup llm (또는 ${UNATTENDED_SETUP_COMMAND})`);

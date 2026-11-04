@@ -251,15 +251,52 @@ export function parseDiffHunks(patch: string): DiffHunk[] {
   return hunks;
 }
 
-/** `gh api --paginate --slurp` must return every REST page, including the last page. */
-function pagesArgs(endpoint: string): string[] { return ['api', '--paginate', '--slurp', endpoint]; }
+/** `gh api --paginate` emits one JSON document per page on older gh versions. */
+function pagesArgs(endpoint: string): string[] { return ['api', '--paginate', endpoint]; }
+function jsonDocuments(raw: string, endpoint: string): unknown[] {
+  const documents: unknown[] = [];
+  let start = -1, depth = 0, quoted = false, escaped = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const char = raw[i]!;
+    if (start < 0) {
+      if (/\s/.test(char)) continue;
+      if (char !== '[' && char !== '{') throw new Error(`gh api ${endpoint}: JSON 오류`);
+      start = i; depth = 1; continue;
+    }
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') quoted = true;
+    else if (char === '[' || char === '{') depth += 1;
+    else if (char === ']' || char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try { documents.push(JSON.parse(raw.slice(start, i + 1))); }
+        catch { throw new Error(`gh api ${endpoint}: JSON 오류`); }
+        start = -1;
+      }
+    }
+  }
+  if (start >= 0 || quoted || documents.length === 0) throw new Error(`gh api ${endpoint}: JSON 오류`);
+  return documents;
+}
 function parsePages(result: PrToolCommandResult, endpoint: string): readonly unknown[] {
   if (!result.ok) throw new Error(`gh api ${endpoint}: ${result.err || result.out || '조회 실패'}`);
-  let parsed: unknown;
-  try { parsed = JSON.parse(result.out); } catch { throw new Error(`gh api ${endpoint}: JSON 오류`); }
-  if (!Array.isArray(parsed) || parsed.length >= MAX_PAGES || !parsed.every(page => Array.isArray(page) && page.length <= 100)) {
+  let parsed: unknown[];
+  try { parsed = jsonDocuments(result.out, endpoint); } catch (error) { throw error; }
+  if (parsed.length >= MAX_PAGES || !parsed.every(Array.isArray)) {
     throw new Error(`gh api ${endpoint}: 페이지 형식·상한 판정 불가`);
   }
+  // gh 2.45 merges --paginate pages into one array without --slurp; newer builds
+  // may emit one JSON array per page. Accept either shape while keeping a hard cap.
+  if (parsed.length === 1 && (parsed[0] as unknown[]).every(row => !Array.isArray(row))) {
+    if ((parsed[0] as unknown[]).length > MAX_PAGES * 100) throw new Error(`gh api ${endpoint}: 페이지 형식·상한 판정 불가`);
+    return parsed[0] as unknown[];
+  }
+  if (!parsed.every(page => (page as unknown[]).length <= 100)) throw new Error(`gh api ${endpoint}: 페이지 형식·상한 판정 불가`);
   return parsed.flat();
 }
 function pages(run: PrToolCommand, endpoint: string, cwd?: string): readonly unknown[] {

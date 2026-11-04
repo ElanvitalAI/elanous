@@ -631,7 +631,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
     ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
   if (reservationRoot) {
     type ReservationObservation = { status: 'free'; probeFailed: boolean; probeFailure?: string }
-      | Exclude<ReturnType<typeof inspectReleaseGateHost>, { status: 'free' }>;
+      | { status: 'reserved' | 'unknown'; reason: string; runId?: string; reservedAt?: number; podReservations?: number };
     const resourceStatus = (target: string) => {
       if (!deps.readHostResources && deps.runner) return null; // fake runners keep tests hermetic unless the producer is explicitly exercised
       return (deps.readHostResources ?? ((selected) => readGateHostResourcesForHost(selected, env)))(target.split('@').at(-1)!);
@@ -646,7 +646,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
         if (claim.status !== 'free') return claim;
         return { status: 'free', probeFailed: true, probeFailure: resources.reason.trim() || 'unspecified' };
       }
-      if (!resources.empty) return { status: 'reserved' as const, reason: `Pod resource pool occupied (${resources.reservations} reservations)` };
+      if (!resources.empty) return { status: 'reserved' as const, reason: `Pod resource pool occupied (${resources.reservations} reservations)`, podReservations: resources.reservations };
       return claim.status === 'free' ? { status: 'free', probeFailed: false } : claim;
     };
     const warnProbeFailure = (target: string, reason: string) => {
@@ -661,6 +661,8 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
       // the owner and the observation stamp.
       const observedAt = formatReservationStamp(now());
       const owner = first.runId || 'unknown';
+      const podPoolReason = first.podReservations === undefined
+        ? undefined : `Pod resource pool occupied (${first.podReservations} reservations) on ${reservationHost}`;
       // Owner (runId) plus 시각: the claim's own reservedAt when recorded, else the moment this gate observed it.
       const stamp = first.reservedAt !== undefined
         ? `reserved-at=${formatReservationStamp(first.reservedAt)}`
@@ -679,8 +681,10 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
       });
       if (alternate) {
         const rerouted = host.includes('@') ? `${host.slice(0, host.lastIndexOf('@'))}@${alternate}` : alternate;
-        debug.log('gate.remote', 'host-reserved-reroute', { tool: opts.tool, from: host, to: rerouted, owner, reason: first.reason, reservedAt: first.reservedAt, observedAt });
-        write.err(`[gate.remote] host-reserved: ${host} (${first.reason}) owner=${owner} ${stamp} — rerouting to ${rerouted}\n`);
+        debug.log('gate.remote', 'host-reserved-reroute', { tool: opts.tool, from: host, to: rerouted, ...(podPoolReason ? { reason: podPoolReason, podReservations: first.podReservations } : { owner, reason: first.reason }), reservedAt: first.reservedAt, observedAt });
+        write.err(podPoolReason
+          ? `[gate.remote] ${podPoolReason} — rerouting to ${rerouted}\n`
+          : `[gate.remote] host-reserved: ${host} (${first.reason}) owner=${owner} ${stamp} — rerouting to ${rerouted}\n`);
         host = rerouted;
       } else {
         const waitSeconds = opts.tool === 'self-gate' ? opts.reservationWaitSeconds ?? settings.slotWaitSeconds : 0;
@@ -705,12 +709,14 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
             write.err(`[gate.remote] host-reserved released on ${host} after ${Math.floor(waitedMs / 1000)}s — proceeding remotely\n`);
           }
         } else {
-          const reason = `host-reserved: ${host} (${latest.reason})`;
+          const latestPodPoolReason = latest.podReservations === undefined
+            ? undefined : `Pod resource pool occupied (${latest.podReservations} reservations) on ${reservationHost}`;
+          const reason = latestPodPoolReason ?? `host-reserved: ${host} (${latest.reason})`;
           const manualAlternative = reservationHost === 'node-b'
             ? '; if available, non-PWA checks may explicitly select --remote host-e-wsl' : '';
-          debug.log('gate.remote', 'host-reserved-unmeasured', { host, reason, owner, reservedAt: latest.reservedAt ?? first.reservedAt, observedAt, waitedMs, alternates: alternates.length });
+          debug.log('gate.remote', 'host-reserved-unmeasured', { host, reason, ...(latestPodPoolReason ? { podReservations: latest.podReservations } : { owner }), reservedAt: latest.reservedAt ?? first.reservedAt, observedAt, waitedMs, alternates: alternates.length });
           write.err(opts.tool === 'self-gate'
-            ? `[gate.remote] remote unmeasured on ${host} (stage=host-reserved, rc=unknown) — ${reason}; owner=${owner} ${stamp} waited=${Math.floor(waitedMs / 1000)}s${manualAlternative}\n`
+            ? `[gate.remote] remote unmeasured on ${host} (stage=host-reserved, rc=unknown) — ${reason}${latestPodPoolReason ? '' : `; owner=${owner} ${stamp}`} waited=${Math.floor(waitedMs / 1000)}s${manualAlternative}\n`
             : `[gate.remote] remote unmeasured — ${reason}\n`);
           return 1;
         }

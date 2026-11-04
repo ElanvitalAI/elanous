@@ -56,6 +56,47 @@ test('real CLI first run waits for health before printing a claimable setup link
   }
 }, 35_000);
 
+test('stale ready marker without a provider still enters web-first', async () => {
+  const dir = mkdtempSync(join(resolve(import.meta.dir, '../..'), '.web-first-install-ready-'));
+  const events: string[] = [];
+  const server = Bun.serve({ port: 0, fetch(request) {
+    events.push(new URL(request.url).pathname);
+    return new Response('ok');
+  } });
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({
+    onboarding: { ready: true, completed: false },
+  }));
+  const env = { ...process.env, ELANOUS_HOME: dir, HOME: dir, XDG_CONFIG_HOME: dir,
+    ELANOUS_RUN_CONTEXT: 'production', DISPLAY: '', WAYLAND_DISPLAY: '' };
+  try {
+    registerPwaInstance({
+      pid: process.pid, ports: [server.port!], mode: 'static', kind: 'test',
+      cwd: resolve(import.meta.dir, '../..'), daemonDir: dir, shareMounted: false,
+      https: false, startedAt: new Date().toISOString(),
+    }, { registryPath: join(dir, 'pwa-registry.json') });
+    const child = Bun.spawn([process.execPath, cli, '--test', '--config-dir', dir], {
+      cwd: resolve(import.meta.dir, '../..'), env, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
+    });
+    const timer = setTimeout(() => child.kill(), 30_000);
+    try {
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+      ]);
+      const output = stdout + stderr;
+      expect(exitCode).toBe(0);
+      expect(events).toContain('/v1/health');
+      const link = output.match(new RegExp(`http://127\\.0\\.0\\.1:${server.port}/app/setup/#t=(els_[A-Za-z0-9_-]{43})`));
+      expect(link).not.toBeNull();
+      expect(claimSetupLinkToken(link![1]!, { dir }).ok).toBe(true);
+      expect(output).not.toContain('daemon: absent');
+    } finally { clearTimeout(timer); }
+  } finally {
+    server.stop(true);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 35_000);
+
 const configuredLlm = { llm: { provider: 'openai', apiKey: 'sk-test-not-a-real-key' } };
 
 // KNOWN-ISSUE(0.2.33): KI-0233-REGRESSIONS — restore this exact gate test after the 0.2.34 repair.

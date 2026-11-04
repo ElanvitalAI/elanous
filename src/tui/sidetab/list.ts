@@ -14,7 +14,8 @@ type PreviewSidetabRow = SidetabRow & { readonly previewSource?: string };
 /** Attach the latest manifest snapshot without changing the shared row contract. */
 export function loadSidetabRows(all = false, currentSessionId?: string, scopeOverrides?: Partial<SidetabScope>): SidetabRow[] {
   const snapshots = new Map<string, string>(listPtyManifestRows().map((row) => [row.id, row.snapshot || row.frame] as const));
-  return loadCoreSidetabRows(all, currentSessionId, scopeOverrides).map((row) => ({
+  const rows = loadCoreSidetabRows(all, currentSessionId, scopeOverrides);
+  return rows.map((row) => ({
     ...row,
     previewSource: snapshots.get(row.id) ?? '',
   }));

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { calculateSeatBaseShares, budgetTrafficTick, computeTrafficMetrics24h, decideSpawn, readTrafficSamples24h, recordTrafficSample24h, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from './budget.js';
+import { calculateSeatBaseShares, budgetTrafficTick, computeTrafficMetrics24h, decideResourceAdmission, decideSpawn, readTrafficSamples24h, recordTrafficSample24h, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from './budget.js';
 import type { TrafficSeatRow } from './orchestrator/traffic.js';
 
 test('configured seat caps and default four-per-seat gate both constrain spawn', () => {
@@ -65,6 +65,20 @@ test('injected cap is an independent candidate that cannot raise the configured 
 test('invalid cap inputs cannot permit a spawn', () => {
   expect(decideSpawn({ seat: 'TC', running: 0, caps: { TC: NaN } })).toEqual({ allow: false, reason: 'seat-cap', cap: 0 });
   expect(decideSpawn({ seat: 'TC', running: 0, gate: { TC: -1 } })).toEqual({ allow: false, reason: 'seat-cap', cap: 0 });
+});
+
+test('resource admission shadow distinguishes headroom, zero, saturation, and unmeasured inputs without changing policy', () => {
+  expect(decideResourceAdmission({ poolHeadroom: 2, hostLoad: 0.25 })).toEqual({ verdict: 'allow', reason: 'resource-headroom' });
+  expect(decideResourceAdmission({ poolHeadroom: 0, hostLoad: 0.25 })).toEqual({ verdict: 'deny', reason: 'pool-headroom-empty' });
+  expect(decideResourceAdmission({ poolHeadroom: 2, hostLoad: 1 })).toEqual({ verdict: 'deny', reason: 'host-load-saturated' });
+  for (const input of [
+    { poolHeadroom: null, hostLoad: 0.25 }, { poolHeadroom: 2, hostLoad: null },
+    { poolHeadroom: -1, hostLoad: 0.25 }, { poolHeadroom: 2, hostLoad: Number.NaN },
+  ]) expect(decideResourceAdmission(input)).toEqual({ verdict: 'unmeasured', reason: 'resource-input-unmeasured' });
+
+  const policy = decideSpawn({ seat: 'TC', running: 0, caps: { TC: 4 }, gate: { TC: 3 } });
+  decideResourceAdmission({ poolHeadroom: 0, hostLoad: 1 });
+  expect(policy).toEqual({ allow: true, reason: 'within-cap', cap: 3 });
 });
 
 test('shared resource loop assigns weighted shares and retains physical caps above the spawn default gate', () => {

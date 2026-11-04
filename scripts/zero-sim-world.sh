@@ -68,7 +68,7 @@ first_run_log_rc=${first_run_pipeline_rc[2]:-0}
 
 print "[S3] collect first-run logs"
 zero_tool "$VM" logs "$M" --since 15m --limit 100 2>&1 | tee "$EVIDENCE/zero-sim-$M-elanous-logs.log"
-logs_rc=$?
+logs_rc=${pipestatus[1]:-$?}
 if (( logs_rc != 0 )); then
   print -r -- "[S3] log collection unavailable rc=$logs_rc" | tee -a "$EVIDENCE/zero-sim-$M-elanous-logs.log"
 fi

@@ -19,6 +19,7 @@ export type CourierDeps = {
   config?: CourierConfig;
   now?: number;
   listComments?: () => Promise<Comment[]> | Comment[];
+  ghApi?: (args: string[]) => Promise<string>;
   post?: (body: string) => Promise<void> | void;
   trackAgent?: { enabled: boolean };
   agentRunner?: TrackAgentRunner;
@@ -26,6 +27,9 @@ export type CourierDeps = {
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const execFileAsync = promisify(execFile);
+const runGhApi = async (args: string[]): Promise<string> => (await execFileAsync('gh', args, {
+  cwd: repoRoot, encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024,
+})).stdout;
 const log = (event: string, data: Record<string, unknown>) => {
   try { debug.log('autopilot.track-courier', event, data); } catch { /* observation is fail-soft */ }
 };
@@ -33,15 +37,51 @@ const configFor = (deps: CourierDeps): CourierConfig => deps.config ?? getUserCo
 const minutesFor = (config: CourierConfig): number =>
   typeof config.handoffMinutes === 'number' && Number.isFinite(config.handoffMinutes) && config.handoffMinutes > 0 ? config.handoffMinutes : 60;
 
-async function defaultComments(channelPr: number, now: number, handoffMinutes: number): Promise<Comment[]> {
+function parseJsonDocuments(stdout: string): unknown[] {
+  const documents: unknown[] = [];
+  let start = -1;
+  const closing: string[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < stdout.length; index++) {
+    const char = stdout[index]!;
+    if (start < 0) {
+      if (/\s/.test(char)) continue;
+      if (char !== '[') throw new Error('comments page is not a JSON array');
+      start = index;
+      closing.push(']');
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; continue; }
+    if (char === '[') closing.push(']');
+    else if (char === '{') closing.push('}');
+    else if (char === ']' || char === '}') {
+      if (closing.pop() !== char) throw new Error('comments page has mismatched JSON delimiters');
+      if (closing.length === 0) {
+        documents.push(JSON.parse(stdout.slice(start, index + 1)) as unknown);
+        start = -1;
+      }
+    }
+  }
+  if (start >= 0 || inString || closing.length > 0) throw new Error('comments response contains incomplete JSON');
+  return documents;
+}
+
+async function defaultComments(channelPr: number, now: number, handoffMinutes: number, query = runGhApi): Promise<Comment[]> {
   const since = new Date(now - Math.max(120, handoffMinutes) * 60_000).toISOString();
   const repo = process.env.CH_REPO || 'ElanvitalAI/elanous';
-  const { stdout } = await execFileAsync('gh', ['api', '--paginate', '--slurp',
-    `repos/${repo}/issues/${channelPr}/comments?since=${encodeURIComponent(since)}`],
-  { cwd: repoRoot, encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024 });
-  const parsed: unknown = JSON.parse(stdout);
-  if (!Array.isArray(parsed) || !parsed.every(Array.isArray)) throw new Error('comments response is not paged arrays');
-  return parsed.flat() as Comment[];
+  const stdout = await query(['api', '--paginate',
+    `repos/${repo}/issues/${channelPr}/comments?since=${encodeURIComponent(since)}`]);
+  const pages = parseJsonDocuments(stdout);
+  if (!pages.length || !pages.every(Array.isArray)) throw new Error('comments response is not paged arrays');
+  return pages.flat() as Comment[];
 }
 
 async function defaultPost(body: string, channelPr: number): Promise<void> {
@@ -63,7 +103,7 @@ export async function trackAlive(track: string, deps: CourierDeps = {}): Promise
   const config = configFor(deps);
   try {
     if (!deps.listComments && !config.channelPr) return { alive: true, lastPostAt: null, reason: 'unmeasured' };
-    const comments = await (deps.listComments ?? (() => defaultComments(config.channelPr!, now, minutesFor(config))))();
+    const comments = await (deps.listComments ?? (() => defaultComments(config.channelPr!, now, minutesFor(config), deps.ghApi)))();
     if (!Array.isArray(comments)) throw new Error('comments response is not an array');
     const timestamps = comments
       .filter((c) => c && typeof c.body === 'string' && trackPostIds(track).some((id) => c.body.startsWith(`**[${id}]**`)))

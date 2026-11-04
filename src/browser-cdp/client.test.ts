@@ -7,6 +7,7 @@ import {
   createPageTarget,
   discoverChromeBinary,
   isWindowsInteropBinary,
+  resolveCdpAttachTimeoutMs,
   resolveDebuggerUrl,
   type CdpTransport,
 } from './client.js';
@@ -33,6 +34,22 @@ function headersThenHangingBodyFetch(): typeof fetch {
     json: () => new Promise<never>(() => {}),
   })) as unknown as typeof fetch;
 }
+
+describe('resolveCdpAttachTimeoutMs', () => {
+  test('uses explicit client config before the environment override', () => {
+    expect(resolveCdpAttachTimeoutMs(1_200, { ELANOUS_CDP_ATTACH_TIMEOUT_MS: '30000' })).toBe(1_200);
+  });
+
+  test('uses the environment override before the built-in default', () => {
+    expect(resolveCdpAttachTimeoutMs(undefined, { ELANOUS_CDP_ATTACH_TIMEOUT_MS: '30000' })).toBe(30_000);
+    expect(resolveCdpAttachTimeoutMs(undefined, {})).toBe(5_000);
+  });
+
+  test('ignores invalid environment values', () => {
+    expect(resolveCdpAttachTimeoutMs(undefined, { ELANOUS_CDP_ATTACH_TIMEOUT_MS: '0' })).toBe(5_000);
+    expect(resolveCdpAttachTimeoutMs(undefined, { ELANOUS_CDP_ATTACH_TIMEOUT_MS: 'soon' })).toBe(5_000);
+  });
+});
 
 describe('discoverChromeBinary', () => {
   test('prefers an existing ELANOUS_CHROME_BIN over platform candidates', () => {
@@ -252,6 +269,18 @@ describe('CDP client watchdog', () => {
       attachTimeoutMs: 120,
     }).catch(() => undefined);
     // ⛔ 옛 판이면 retries=1 로 «즉시» 끝났다 — 이제 예산(120ms)을 «쓴다»
+    expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+  });
+
+  test('environment-resolved attach budget still outlives the configured retry count', async () => {
+    const attachTimeoutMs = resolveCdpAttachTimeoutMs(undefined, { ELANOUS_CDP_ATTACH_TIMEOUT_MS: '120' });
+    const started = Date.now();
+    await resolveDebuggerUrl(9222, {
+      fetchImpl: (() => Promise.reject(new Error('ECONNREFUSED'))) as unknown as typeof fetch,
+      retries: 1,
+      intervalMs: 5,
+      attachTimeoutMs,
+    }).catch(() => undefined);
     expect(Date.now() - started).toBeGreaterThanOrEqual(100);
   });
 

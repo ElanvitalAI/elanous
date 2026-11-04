@@ -8,7 +8,7 @@ export interface InventoryResourceInput {
   hourlyCost?: number; startSignedAt: number; firstWorkAt?: number; expiresAt?: number; lastActivityAt?: number;
   state?: Record<string, unknown>; releaseConditions?: { expiresAt?: number; idleMinutes?: number };
 }
-export interface DiscoveredInventoryResource { id: string; machine: string; provider: string; name?: string }
+export interface DiscoveredInventoryResource { id: string; machine: string; provider: string; name?: string; aliases?: readonly string[] }
 export interface InventoryAlert { id: string; reason: 'unregistered' | 'expired' | 'missing-purpose' | 'idle-over-7-days'; message: string }
 export interface InventorySnapshot { resources: ResourceView[]; alerts: InventoryAlert[]; estimatedCostToday: number; estimatedCumulativeCost: number; unpricedResources: number }
 const NEVER_EXPIRES_MS = 100 * 365 * 24 * 60 * 60 * 1000;
@@ -86,7 +86,7 @@ export function inspectInventory(ledger = new ResourceLedger(), discovered: read
   const resources = ledgerRows.filter(row => row.attrs.inventory === true);
   const costRows = ledgerRows.filter(row => row.attrs.inventory === true || row.attrs.inventory === 'archived');
   const unpricedResources = costRows.filter(row => typeof row.attrs.hourlyCost !== 'number' || !Number.isFinite(row.attrs.hourlyCost)).length;
-  const registered = new Set(resources.map(row => row.id.slice('fleet:'.length)));
+  const registered = new Set(resources.map(row => `${String(row.attrs.provider)}\0${row.id.slice('fleet:'.length)}`));
   const alerts: InventoryAlert[] = [];
   for (const row of resources) {
     const id = row.id.slice('fleet:'.length);
@@ -95,7 +95,16 @@ export function inspectInventory(ledger = new ResourceLedger(), discovered: read
     const lastActivityAt = typeof row.attrs.lastActivityAt === 'number' ? row.attrs.lastActivityAt : row.observedAt;
     if (now - lastActivityAt > 7 * DAY_MS) alerts.push({ id, reason: 'idle-over-7-days', message: id + ' idle for more than 7 days' });
   }
-  for (const item of discovered) if (!registered.has(item.id)) alerts.push({ id: item.id, reason: 'unregistered', message: item.provider + ' resource ' + item.id + ' is outside the inventory' });
+  for (const item of discovered) {
+    const aliases = item.provider === 'gcp'
+      ? (item.aliases ?? []).filter(id => /^projects\/[^/]+\/zones\/[^/]+\/instances\/[^/]+$/.test(id))
+      : (item.aliases ?? []);
+    const identities = item.provider === 'gcp'
+      ? [...(/^\d+$/.test(item.id) ? [item.id] : []), ...aliases]
+      : [item.id, ...aliases];
+    if (!identities.some(id => registered.has(`${item.provider}\0${id}`))) alerts.push({ id: item.id, reason: 'unregistered',
+      message: item.provider + ' resource ' + (item.name ? item.name + ' (' + item.id + ')' : item.id) + ' is outside the inventory' });
+  }
   const estimatedCumulativeCost = costRows.reduce((sum, row) => {
     if (row.attrs.inventory === 'archived') {
       const stoppedAt = Number(row.attrs.stoppedAt) || now;

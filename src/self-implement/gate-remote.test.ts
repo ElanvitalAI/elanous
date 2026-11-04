@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withFakeBins } from '../ux-sim/fake-bin.js';
+import { debug } from '../debug/log.js';
 import {
   annotateJsonStdout, decideGateDispatch, dispatchHeavyCheck, extractGateRemoteFlags, GATE_REMOTE_DEFAULTS, relativizeArgs,
   gateRemoteHostCap, gateReservationAlternateHosts, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, remoteSupervisorScript, resolveGateRemoteSettings, resolveGatePrBase, runOnRemote, type GateRemoteRunner, type SshResult,
@@ -620,17 +621,46 @@ describe('self gate explicit remote placement', () => {
     const probed: string[] = [];
     const runner = fakeRunner();
     const io = sink();
-    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
-      reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } },
-    { runner, settings, env: {}, load1: 1, write: io.write, readHostResources: host => {
-      probed.push(host);
-      return host === 'node-b' ? occupied : free;
-    } });
-    expect(rc).toBe(0);
-    expect(probed).toEqual(['node-b', 'host-e-wsl']);
-    expect(runner.calls).toContainEqual(['ssh', 'host-e-wsl']);
-    expect(io.err.join('')).toContain('Pod resource pool occupied (1 reservations)');
-    expect(io.err.join('')).toContain('rerouting to host-e-wsl');
+    const observations: Array<{ event: string; data: unknown }> = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category === 'gate.remote') observations.push({ event, data });
+    }) as typeof debug.log;
+    try {
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+        reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } },
+      { runner, settings, env: {}, load1: 1, write: io.write, readHostResources: host => {
+        probed.push(host);
+        return host === 'node-b' ? occupied : free;
+      } });
+      expect(rc).toBe(0);
+      expect(probed).toEqual(['node-b', 'host-e-wsl']);
+      expect(runner.calls).toContainEqual(['ssh', 'host-e-wsl']);
+      expect(io.err.join('')).toContain('Pod resource pool occupied (1 reservations) on node-b');
+      expect(io.err.join('')).toContain('rerouting to host-e-wsl');
+      expect(observations).toContainEqual(expect.objectContaining({
+        event: 'host-reserved-reroute',
+        data: expect.objectContaining({ reason: 'Pod resource pool occupied (1 reservations) on node-b', podReservations: 1 }),
+      }));
+    } finally { debug.log = originalLog; }
+  });
+
+  test('a Pod pool reservation without a runId reports its measured count and host', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'resource-probe-seed', ['msb2']);
+    release();
+    const occupied = readGateHostResources({ leases: [
+      { pid: 44, startedAt: 'start', at: 'now', stage: 'authoring' },
+      { pid: 45, startedAt: 'start', at: 'now', stage: 'job', job: 'job-45', context: 'ctx', namespace: 'ns' },
+    ], activeJobs: [] });
+    const io = sink();
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'msb2' },
+      reservationRoot: root, reservationAltHosts: [], reservationWaitSeconds: 0, explicitRemoteOnly: true,
+      remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } },
+    { runner: fakeRunner(), settings, env: {}, load1: 1, write: io.write, readHostResources: () => occupied });
+    expect(rc).toBe(1);
+    expect(io.err.join('')).toContain('Pod resource pool occupied (2 reservations) on msb2');
+    expect(io.err.join('')).not.toContain('owner=unknown');
   });
 
   test('changed typecheck keeps node-b fixed and becomes unmeasured during a release reservation', async () => {

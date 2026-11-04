@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { graphFromSteps, liveRunPicks, mergeWalked, runStatusLabel } from './live-run-view';
+import { graphFromSteps, latestLiveRunId, liveRunPicks, mergeWalked, runStatusLabel } from './live-run-view';
 
 describe('live-run view helpers', () => {
   test('graphFromSteps draws only the walked path, keeping back edges', () => {
@@ -24,6 +24,27 @@ describe('live-run view helpers', () => {
       { runId: 'run-a', label: '대상 경로: a.ts · b.json', live: true, at: '2026-10-08T00:00:00Z' },
       { runId: 'run-b', label: '골 B', live: false, at: '2026-10-07T23:00:00Z' },
     ]);
+  });
+
+  test('auto-follow chooses the newest listed run and tracks list updates', () => {
+    const first = liveRunPicks([
+      { runId: 'run-old', status: 'running', lastActivityTimestamp: '2026-11-04T00:00:00Z' },
+    ], []);
+    expect(latestLiveRunId(first)).toBe('run-old');
+    const afterNewSessionStarts = liveRunPicks([
+      { runId: 'run-old', status: 'running', lastActivityTimestamp: '2026-11-04T00:00:00Z' },
+      { runId: 'run-new', status: 'running', lastActivityTimestamp: '2026-11-04T00:01:00Z' },
+    ], []);
+    expect(latestLiveRunId(afterNewSessionStarts)).toBe('run-new');
+    expect(latestLiveRunId([])).toBeNull();
+  });
+
+  test('finished runs are newest first for auto-follow', () => {
+    const picks = liveRunPicks([], [
+      { runId: 'run-old', status: 'completed', endedAt: '2026-11-03T23:00:00Z' },
+      { runId: 'run-new', status: 'completed', endedAt: '2026-11-04T00:00:00Z' },
+    ]);
+    expect(latestLiveRunId(picks)).toBe('run-new');
   });
 
   test('status labels are Korean', () => {

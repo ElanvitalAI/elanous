@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync } from 'node:fs';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { resolveInstanceName } from '../instance-identity.js';
-import { getHarnessRunId, getHarnessRunIdSource, normalizeRunIdSource, type RunIdSource } from '../harness/harness-space.js';
+import { getHarnessRunId, getHarnessRunIdSource, getHarnessSpace, normalizeRunIdSource, type HarnessSpaceKind, type RunIdSource } from '../harness/harness-space.js';
 import { getParentPtyId, getPtyChainOrigin } from '../agent/pty-identity.js';
 import { getNestDepth } from '../agent/nest-depth.js';
 import { originObservationFields } from '../agent/origin-observation.js';
@@ -86,6 +86,7 @@ export interface PtyManifestRow {
   runId: string;
   runIdSource: RunIdSource | '';
   spaceId: string;
+  spaceKind?: HarnessSpaceKind | '';
   sessionId: string;
   parentPtyId: string;
   parentPid: number;
@@ -191,6 +192,7 @@ export function migratePtyManifestSchema(d: Database): void {
   try { d.run(`ALTER TABLE pty_manifest ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
   try { d.run(`ALTER TABLE pty_manifest ADD COLUMN run_id_source TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
   try { d.run(`ALTER TABLE pty_manifest ADD COLUMN space_id TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
+  try { d.run(`ALTER TABLE pty_manifest ADD COLUMN space_kind TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
   try { d.run(`ALTER TABLE pty_manifest ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN closed_at INTEGER NOT NULL DEFAULT 0'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN pty_pid INTEGER NOT NULL DEFAULT 0'); } catch { /* already exists */ }
@@ -305,6 +307,7 @@ export function upsertPtyManifest(row: {
   origin?: { originRoot: string; controller?: string };
   identity?: {
     spaceId?: string;
+    spaceKind?: HarnessSpaceKind | '';
     parentPtyId?: string;
     parentPid?: number;
     controller?: string;
@@ -320,6 +323,7 @@ export function upsertPtyManifest(row: {
     const runId = getHarnessRunId(process.env);
     const runIdSource = getHarnessRunIdSource();
     const defaultSpaceId = process.env.ELANOUS_HARNESS_SPACE_ID?.trim() ?? '';
+    const defaultSpaceKind: HarnessSpaceKind | '' = getHarnessSpace()?.kind ?? '';
     const sessionId = process.env.ELANOUS_SESSION_ID?.trim() ?? '';
     const defaultParentPtyId = getParentPtyId() ?? '';
     const defaultParentPid = process.ppid;
@@ -334,14 +338,18 @@ export function upsertPtyManifest(row: {
     const codeSha = codeShaForWorkdir(row.workdir);
     d.run('BEGIN IMMEDIATE');
     try {
-      const previous = d.query('SELECT alive, space_id, parent_pty_id, parent_pid, controller FROM pty_manifest WHERE id=?').get(row.id) as {
+      const previous = d.query('SELECT alive, space_id, space_kind, parent_pty_id, parent_pid, controller FROM pty_manifest WHERE id=?').get(row.id) as {
         alive: number;
         space_id: string;
+        space_kind: HarnessSpaceKind | '';
         parent_pty_id: string;
         parent_pid: number;
         controller: string | null;
       } | null;
       const spaceId = row.identity?.spaceId ?? previous?.space_id ?? defaultSpaceId;
+      const previousSpaceKind = previous?.space_id === spaceId ? previous.space_kind : '';
+      const defaultKindForSpace = defaultSpaceId === spaceId ? defaultSpaceKind : '';
+      const spaceKind = row.identity?.spaceKind || previousSpaceKind || defaultKindForSpace;
       const parentPtyId = row.identity?.parentPtyId ?? previous?.parent_pty_id ?? defaultParentPtyId;
       const parentPid = row.identity?.parentPid ?? previous?.parent_pid ?? defaultParentPid;
       const manifestController = row.identity?.controller ?? controller ?? previous?.controller ?? undefined;
@@ -353,16 +361,16 @@ export function upsertPtyManifest(row: {
       const shouldRecordSpawned = previous === null || previous.alive === 0;
       const values = [
         row.id, row.kind, row.nickname ?? null, row.cmd, row.workdir ?? null, row.purpose ?? null, row.seat ?? null, process.pid, row.ptyPid ?? 0, resolveInstanceName(),
-        runId, runIdSource, spaceId, sessionId, codeSha, parentPtyId, parentPid, parentKind, chainOrigin ?? null, nestDepth ?? null,
+        runId, runIdSource, spaceId, spaceKind, sessionId, codeSha, parentPtyId, parentPid, parentKind, chainOrigin ?? null, nestDepth ?? null,
         originRoot ?? null, originAgent ?? null, originSession ?? null, manifestController ?? null, terminalOrigin.category, terminalOrigin.reason,
         terminalOrigin.externalToolName ?? null, row.startedAt, 1, null, '', 0, row.now,
       ];
       d.run(
-        `INSERT INTO pty_manifest (id, kind, nickname, cmd, workdir, purpose, seat, owner_pid, pty_pid, instance, run_id, run_id_source, space_id, session_id, code_sha, parent_pty_id, parent_pid, parent_kind, chain_origin, nest_depth, origin_root, origin_agent, origin_session, controller, terminal_origin_category, terminal_origin_reason, external_tool_name, started_at, alive, exit_code, snapshot, snapshot_at, updated_at)
+        `INSERT INTO pty_manifest (id, kind, nickname, cmd, workdir, purpose, seat, owner_pid, pty_pid, instance, run_id, run_id_source, space_id, space_kind, session_id, code_sha, parent_pty_id, parent_pid, parent_kind, chain_origin, nest_depth, origin_root, origin_agent, origin_session, controller, terminal_origin_category, terminal_origin_reason, external_tool_name, started_at, alive, exit_code, snapshot, snapshot_at, updated_at)
          VALUES (${values.map(() => '?').join(', ')})
          ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, nickname=excluded.nickname, cmd=excluded.cmd, workdir=excluded.workdir, purpose=excluded.purpose, seat=excluded.seat,
            owner_pid=excluded.owner_pid, pty_pid=excluded.pty_pid, instance=excluded.instance,
-           run_id=excluded.run_id, run_id_source=excluded.run_id_source, space_id=excluded.space_id, session_id=excluded.session_id, code_sha=excluded.code_sha,
+           run_id=excluded.run_id, run_id_source=excluded.run_id_source, space_id=excluded.space_id, space_kind=excluded.space_kind, session_id=excluded.session_id, code_sha=excluded.code_sha,
            parent_pty_id=excluded.parent_pty_id, parent_pid=excluded.parent_pid, parent_kind=excluded.parent_kind,
            chain_origin=excluded.chain_origin, nest_depth=excluded.nest_depth, origin_root=excluded.origin_root, origin_agent=excluded.origin_agent,
            origin_session=excluded.origin_session, controller=excluded.controller, terminal_origin_category=excluded.terminal_origin_category,
@@ -380,7 +388,7 @@ export function upsertPtyManifest(row: {
           ...(row.seat ? { seat: row.seat } : {}),
           ...(row.workdir ? { workdir: row.workdir } : {}), ownerPid: process.pid, ptyPid: row.ptyPid ?? 0, instance: resolveInstanceName(),
           startedAt: row.startedAt, alive: true, exitCode: null, snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: row.now,
-          frame: '', frameAt: 0, runId, runIdSource, spaceId, sessionId, parentPtyId, parentPid, parentKind,
+          frame: '', frameAt: 0, runId, runIdSource, spaceId, spaceKind, sessionId, parentPtyId, parentPid, parentKind,
           ...(chainOrigin === undefined ? {} : { chainOrigin }),
           ...(nestDepth === undefined ? {} : { nestDepth }),
           ...(originRoot === undefined ? {} : { originRoot }),
@@ -948,6 +956,7 @@ function mapRow(r: Record<string, unknown>): PtyManifestRow {
     runId: String(r.run_id ?? ''),
     runIdSource: normalizeRunIdSource(r.run_id_source),
     spaceId: String(r.space_id ?? ''),
+    spaceKind: String(r.space_kind ?? '') as HarnessSpaceKind | '',
     sessionId: String(r.session_id ?? ''),
     parentPtyId: String(r.parent_pty_id ?? ''),
     parentPid: Number(r.parent_pid ?? 0),

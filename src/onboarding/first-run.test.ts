@@ -102,6 +102,34 @@ describe('first run', () => {
     } finally { f.cleanup(); }
   });
 
+  test('choosing detected Codex subscription from the real first-run entrypoint skips API-key setup', async () => {
+    const f = fixture();
+    const output: string[] = [];
+    let secretPrompted = false;
+    try {
+      const result = await runFirstRun({
+        path: f.path,
+        config: buildUserConfig(f.path),
+        isTTY: true,
+        locale: 'ko',
+        detectProviders: async () => [detected('openai-codex'), detected('grok')],
+        chooseProvider: async (choices) => {
+          expect(choices[0]).toBe('openai-codex');
+          return 'openai-codex';
+        },
+        promptSecret: async () => { secretPrompted = true; return undefined; },
+        print: (line) => output.push(line),
+      });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openai-codex', inputs: 1 });
+      expect(secretPrompted).toBe(false);
+      expect(output.join('\n')).not.toContain('.env 형식 키를 붙여 넣으세요');
+      expect(output.join('\n')).not.toContain('eln setup llm 으로 고르세요');
+      expect(buildUserConfig(f.path).llm.provider).toBe('openai-codex');
+      expect(buildUserConfig(f.path).llm.apiKey).toBeUndefined();
+      expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
   test('failed SecretStore readback preserves the existing config key', async () => {
     const f = fixture();
     const original = buildUserConfig(f.path);
@@ -182,8 +210,21 @@ describe('first run', () => {
       expect(buildUserConfig(f.path).llm.provider).toBe('openai-codex');
       expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
       expect(buildUserConfig(f.path).onboarding.completed).toBe(false);
-      expect(needsFirstRun(buildUserConfig(f.path))).toBe(false);
+      expect(needsFirstRun(buildUserConfig(f.path))).toBe(true);
       expect(needsOnboarding(buildUserConfig(f.path))).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  test('provider-ready config keeps web-first available until onboarding completes or is disabled', () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.onboarding.ready = true;
+      expect(needsFirstRun(cfg)).toBe(true);
+      cfg.onboarding.webFirst = false;
+      expect(needsFirstRun(cfg)).toBe(false);
+      cfg.onboarding.completed = true;
+      expect(needsFirstRun(cfg)).toBe(false);
     } finally { f.cleanup(); }
   });
 
@@ -272,7 +313,9 @@ describe('first run', () => {
       expect(result).toEqual({ outcome: 'ready', inputs: 1 });
       expect(lines.join('\n')).toContain('LLM 기능은 사용할 수 없습니다');
       expect(lines.join('\n')).toContain('elanous setup keys');
-      expect(buildUserConfig(f.path).onboarding.ready).toBe(true);
+      const saved = buildUserConfig(f.path);
+      expect(saved.onboarding.ready).toBeUndefined();
+      expect(needsFirstRun(saved)).toBe(true);
     } finally { f.cleanup(); }
   });
 
@@ -611,7 +654,7 @@ describe('first run', () => {
       expect(child.status).toBe(0);
       expect(child.stdout).toContain('[elanous] provider: openai-codex');
       expect(child.stdout).toContain('웹 셋업을 위해 데몬을 시작합니다.');
-      expect(child.stdout).toContain('웹 셋업을 사용할 수 없습니다 (daemon-start-failed). 터미널 설정으로 전환합니다.');
+      expect(child.stdout).toMatch(/웹 셋업을 사용할 수 없습니다 \((?:daemon-start-failed|daemon-health-timeout)\)\. 터미널 설정으로 전환합니다\./);
       expect(child.stdout).toContain('오류 보고 안내:');
       expect(child.stdout.indexOf('오류 보고 안내:')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
       expect(child.stdout.indexOf('웹 셋업을 위해 데몬을 시작합니다.')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
@@ -623,6 +666,68 @@ describe('first run', () => {
       expect(saved.onboarding).toMatchObject({ ready: true, completed: false });
       expect(saved.llm.provider).toBe('openai-codex');
       expect(saved.errorReports?.noticeShown).toBe(true);
+    } finally { f.cleanup(); }
+  }, 60000);
+
+  test.skipIf(process.platform === 'darwin')('bare process: selecting detected Codex subscription reaches dashboard without an API-key prompt', async () => {
+    const f = fixture();
+    try {
+      const home = join(f.dir, 'home');
+      const configDir = join(f.dir, 'cfg');
+      const codexHome = join(home, '.codex');
+      const grokHome = join(home, '.grok');
+      mkdirSync(codexHome, { recursive: true });
+      mkdirSync(grokHome, { recursive: true });
+      mkdirSync(configDir);
+      writeFileSync(join(codexHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fixture-codex-token' } }));
+      writeFileSync(join(grokHome, 'auth.json'), JSON.stringify({ subscription: { refresh_token: 'fixture-grok-token' } }));
+      const env = { ...process.env, HOME: home, CODEX_HOME: codexHome,
+        CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
+        ELANOUS_LANG: 'ko', ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
+        ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '', XAI_API_KEY: '', GROK_API_KEY: '',
+        GROK_CODE_XAI_API_KEY: '', GEMINI_API_KEY: '', GOOGLE_API_KEY: '',
+        OPENROUTER_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '',
+        LOCAL_LLM_URL: '',
+      };
+      const command = `${process.execPath} ${resolve(import.meta.dir, '../../bin/elanous.mjs')} --test --config-dir ${configDir}`;
+      const child = spawn('sh', ['-c', 'script -q -e -c "$1" /dev/null', 'sh', `stty rows 40 cols 120; exec ${command}`],
+        { cwd: resolve(import.meta.dir, '../..'), env, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      let choseCodex = false;
+      let sentQuit = false;
+      let timedOut = false;
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+        stdout += chunk;
+        if (!choseCodex && stdout.includes('Choose LLM (')) {
+          choseCodex = true;
+          setTimeout(() => child.stdin.write('1\n'), 300);
+        }
+        if (!sentQuit && stdout.includes('\x1b[?1049h')) {
+          sentQuit = true;
+          setTimeout(() => child.stdin.write('\x11'), 300);
+        }
+      });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+      const timeout = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, 45000);
+      const status = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', (code) => resolve(code));
+      }).finally(() => clearTimeout(timeout));
+      expect(timedOut).toBe(false);
+      expect(status).toBe(0);
+      expect(choseCodex).toBe(true);
+      expect(sentQuit).toBe(true);
+      expect(stdout).toContain('codex 구독');
+      expect(stdout).toContain('grok 구독');
+      expect(stdout).toContain('[elanous] provider: openai-codex');
+      expect(stdout).toContain('\x1b[?1049h');
+      expect(stdout + stderr).not.toContain('.env 형식 키를 붙여 넣으세요');
+      expect(stdout + stderr).not.toContain('setup llm 으로 고르세요');
+      const saved = buildUserConfig(join(configDir, 'config.json'));
+      expect(saved.llm.provider).toBe('openai-codex');
+      expect(saved.llm.apiKey).toBeUndefined();
+      expect(saved.onboarding.ready).toBe(true);
     } finally { f.cleanup(); }
   }, 60000);
 

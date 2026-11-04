@@ -138,7 +138,8 @@ test('CHILD-UNIV-HOLD: an unreadable universe holds two ticks, then launches wit
     pool = { running: 1, pending: 0, reserved: 0, limit: 3 };
     const charged = await tickHarnessQueue(d, row.id);
     expect(charged).toMatchObject({ outcome: 'waiting', reason: 'pool: 1+0+0+0+못 읽음 2곳(보수 차감)/3' });
-    expect(events.at(-1)?.data).toMatchObject({ holding: false, penalty: 2 });
+    const universeStatus = events.filter((event) => event.event === 'unreadable-universe').at(-1);
+    expect(universeStatus?.data).toMatchObject({ holding: false, penalty: 2 });
     // 반증: 같은 풀에서 차감이 없었다면 1+0 < 3 이라 떴다. 여유가 생기면 발사한다.
     pool = { running: 0, pending: 0, reserved: 0, limit: 3 };
     expect(await tickHarnessQueue(d, row.id)).toMatchObject({ outcome: 'launched', item: { id: row.id } });

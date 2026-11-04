@@ -979,7 +979,10 @@ import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-c
 import { enqueueClassicSidetabMissionCompletion, runPreparedClassicSidetabVisibleMission } from './classic-sidetab-mission-job.js';
 import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
 import { captureClassicMissionExitObservation, createClassicSidetabMissionTrioVisibleRunner, startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
-import { createDashboardPluginWizardRuntime } from './plugin-wizard-runtime.js';
+import { createDashboardPluginWizardRuntimeFromSidetab } from './plugin-wizard-runtime.js';
+
+/** Public dashboard composition seam used by the TUI entrypoint and its integration test. */
+export const createDashboardTuiPluginWizard = createDashboardPluginWizardRuntimeFromSidetab;
 import { TUI_PLUGIN_WIZARD_TOOL_NAME } from './plugin-wizard-tool.js';
 import { probeGrokLogin } from '../agent-mission/grok-auth-status.js';
 import { loadSidetabRows } from '../sidetab-core/model.js';
@@ -14176,26 +14179,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       void started.completion;
       return started.result;
     });
-    const tuiPluginWizard = createDashboardPluginWizardRuntime({
+    const tuiPluginWizard = createDashboardTuiPluginWizard(classicSidetabMission, pluginWizardPairCompletions, {
       getWorkspace: () => getSessionCwd(),
-      runMissionPair: async ({ runId, prompt, context }) => {
-          const pairCallId = `plugin-wizard:${runId}`;
-          const started = await classicSidetabMission.dispatchTool('RunSidetabMission', {
-            agent: 'codex', mission: prompt, parallelMission: prompt,
-          }, { callId: pairCallId, ...(context?.parentSessionId ? { parentSessionId: context.parentSessionId } : {}) });
-          const completion = pluginWizardPairCompletions.get(pairCallId);
-          if (!completion || started?.status === 'error') {
-            pluginWizardPairCompletions.delete(pairCallId);
-            throw new Error(started?.body ?? 'Codex/Claude pair did not start');
-          }
-          try {
-            const result = await completion;
-            return {
-              codex: { ok: result.codex.ok, ...(result.codex.content ? { content: result.codex.content } : {}), ...(result.codex.error ? { error: result.codex.error } : {}) },
-              claude: { ok: result.claude.ok, ...(result.claude.content ? { content: result.claude.content } : {}), ...(result.claude.error ? { error: result.claude.error } : {}) },
-            };
-          } finally { pluginWizardPairCompletions.delete(pairCallId); }
-      },
     });
     disposeClassicSigquit = registerClassicSigquitHandler(() => {
       classicSidetabRuntime.beginPrefix();

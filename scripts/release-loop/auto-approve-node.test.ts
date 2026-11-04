@@ -64,10 +64,15 @@ test('absent gate is unmeasured, never approved', () => {
 test('explicit owner-waived gate is a measured approval only with its approver and reason', () => {
   const f = fixture();
   try {
-    f.context.outputs.gate = { outcome: 'pass(owner-waived)', verdict: 'owner-waived', approvedBy: 'OP', reason: 'Known gate regression accepted.' };
+    f.context.outputs.gate = { outcome: 'ok', verdict: 'owner-waived', approvedBy: 'OP', reason: 'Known gate regression accepted.' };
     const approved = f.run();
     expect(approved).toMatchObject({ outcome: 'ok', decidedBy: 'release-loop metrics' });
     expect(approved.metrics[0]).toMatchObject({ name: BLOCKING_METRIC_NAMES[0], verdict: 'pass' });
+
+    f.context.outputs.gate!.outcome = 'pass(owner-waived)';
+    const legacyApproved = f.run();
+    expect(legacyApproved).toMatchObject({ outcome: 'ok', decidedBy: 'release-loop metrics' });
+    expect(legacyApproved.metrics[0]).toMatchObject({ name: BLOCKING_METRIC_NAMES[0], verdict: 'pass' });
 
     for (const gate of [
       { outcome: 'pass(owner-waived)', verdict: 'owner-waived', approvedBy: ' ', reason: 'reason' },

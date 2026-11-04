@@ -2582,8 +2582,8 @@ test('gate stage-mail provenance comes from the graph context and dry-run marker
   expect(parseOptions(['--json'], { ELANOUS_GRAPH_CONTEXT: context, ELANOUS_GRAPH_DRY_RUN: '1' }))
     .toMatchObject({ graphId: 'release-loop', dryRun: true });
   const withoutContext = parseOptions(['--commit', CUT, '--version', '1.0.1'], {});
-  expect(withoutContext.graphId).toBeUndefined();
-  expect(withoutContext.dryRun).toBe(false);
+  expect(withoutContext === 'help' ? undefined : withoutContext.graphId).toBeUndefined();
+  expect(withoutContext === 'help' ? undefined : withoutContext.dryRun).toBe(false);
 });
 
 test('with no baseline cache, the baseline is swept on the same Pod pool as the cut (K9b)', async () => {
@@ -4795,7 +4795,7 @@ async function expectWarmCanaryPreflightRejects(verdict: unknown): Promise<void>
     const runner = { localCommand: async () => { calls++; return { rc: 0, output: '' }; },
       recheckPod: async () => { calls++; return { rc: 0, output: '' }; } } as unknown as GateRunner;
     const opts = { ...options(root), version: '1.0.1', commit: CUT, baselineCommit: BASE,
-      pod: { pool: 'test', warmReplay: async () => ({}), warmFinalize: async () => {}, warmQuarantine: async () => {} } };
+      pod: { pool: 'test', warmReplay: async () => ({}), warmFinalize: async () => {}, warmQuarantine: async () => {} } } as unknown as Parameters<typeof runWarmPrecutCanary>[0]['opts'];
     await expect(runWarmPrecutCanary({ opts, runner, file: 'src/a.test.ts', config: {}, historyPath })).rejects
       .toThrow('malformed warm history or current sample');
     expect(calls).toBe(0);
@@ -5146,7 +5146,9 @@ test('gate warm control failure logs a safe category without error path or confi
   writeFileSync(providerPath, JSON.stringify({ candidates: [{ spec: { kubectlContext: 'k3d-test', namespace: 'elanous-test' } }] }),
     { mode: 0o600 });
   process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG = providerPath;
-  const baseline = debug.events(500).length;
+  // Use the last ring timestamp as a sequence cursor; debug.log and its real sinks stay live.
+  const priorEventMs = Math.max(0, ...debug.events(500).map((event) => Date.parse(event.ts)));
+  await new Promise((resolve) => setTimeout(resolve, Math.max(1, priorEventMs - Date.now() + 1)));
   const hooks = withWarmGateHooks({ commit: CUT, version: '1.0.1', pod: { pool: 'pool-test' } },
     { pod: { warmPoolProfile: 'gate' } }, false, undefined, {
       loadProvider: () => { throw new Error(`${join(root, secretMarker)}: invalid ${secretMarker}`); },
@@ -5158,10 +5160,10 @@ test('gate warm control failure logs a safe category without error path or confi
     const replay = await hooks.pod!.warmReplay!({ protocol: 1, runId: 'config-redaction', attemptId: 'attempt-1',
       cutSha: CUT, deadlineAt: Date.now() + 1_000, files: ['src/a.test.ts'], envProfile: 'gate' });
     expect(replay.transport).toMatchObject({ status: 'fallback', reason: 'control-unavailable' });
-    const failure = debug.events(500).slice(baseline).find((event) =>
-      event.category === 'pod.warm.control-forward' && event.event === 'unavailable');
-    expect(failure?.data).toMatchObject({ reason: 'warm-control-setup-failed', fallback: 'fresh-job' });
-    expect(JSON.stringify(failure?.data)).not.toContain(secretMarker);
+    const failure = debug.events(500).find((event) => Date.parse(event.ts) > priorEventMs
+      && event.category === 'pod.warm.control-forward' && event.event === 'unavailable')?.data;
+    expect(failure).toMatchObject({ reason: 'warm-control-setup-failed', fallback: 'fresh-job' });
+    expect(JSON.stringify(failure)).not.toContain(secretMarker);
   } finally {
     if (previousEnv === undefined) delete process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG;
     else process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG = previousEnv;
@@ -5238,7 +5240,7 @@ test('gate adoption runs the fresh cut Job when warm provider config is absent',
     return hooks.pod!.warmReplay!(request);
   } };
   try {
-    const result = await judgeGate({ ...options(instanceRoot), repo: root, pod: { pool: 'test', ...podHooks } }, runner);
+    const result = await judgeGate({ ...options(instanceRoot), repo: root, pod: { ...podHooks, pool: 'test' } }, runner);
     expect(result.outcome).toBe('ok');
     expect(warmReplayCalls).toBe(1);
     expect(freshCutJobs).toBe(1);
@@ -7031,3 +7033,224 @@ test('GATE-RISK-LANE: A — 완료 경계 · 생산 진입점이 위험 shard를
     expect(events.find((entry) => entry.event === 'risk-lane-introduced')?.data).toMatchObject({ files: [risk], introduced: 0 });
   } finally { spy.mockRestore(); }
 }, 30_000);
+
+test('GATE-HOST-EXECUTOR: production runner sends a clean-tree sweep through bun without Pod or SSH execution', async () => {
+  const trail: string[] = [];
+  const runner = createGateRunner('/isolated/node-b/repository', 'node-b', async (cmd, args, cwd) => {
+    trail.push(`${cmd} ${args.join(' ')} @ ${cwd}`);
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: 'test/rules-contract.test.ts\n' };
+    if (cmd === 'bun') return { rc: 0, output: '1 pass\n0 fail\nRan 1 test across 1 file.\n' };
+    return { rc: 0, output: '' };
+  });
+  const result = await runner.sweep('/isolated/node-b/clean-tree', undefined, undefined, ['test/rules-contract.test.ts']);
+  expect(result).toMatchObject({ rc: 0 });
+  expect(trail.some((entry) => entry.startsWith('git ls-files'))).toBe(true);
+  expect(trail.some((entry) => entry.startsWith('bun run test:deterministic'))).toBe(true);
+  expect(trail.some((entry) => entry.includes('@ /isolated/node-b/clean-tree'))).toBe(true);
+  expect(trail.some((entry) => /^(?:ssh|kubectl)\b/.test(entry))).toBe(false);
+});
+
+test('rules-contract Pod entrypoint passes the source merge-base into checkout and shard env', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-rules-base-source-'));
+  try {
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(git('init', '-q', '-b', 'main').status).toBe(0);
+    expect(git('config', 'user.email', 'gate@example.invalid').status).toBe(0);
+    expect(git('config', 'user.name', 'gate-test').status).toBe(0);
+    mkdirSync(join(repo, 'test'));
+    writeFileSync(join(repo, 'test/rules-contract.test.ts'), 'export {};\n');
+    expect(git('add', 'test/rules-contract.test.ts').status).toBe(0);
+    expect(git('commit', '-qm', 'base').status).toBe(0);
+    const baseSha = git('rev-parse', 'HEAD').stdout.trim();
+    expect(git('update-ref', 'refs/remotes/origin/main', baseSha).status).toBe(0);
+    writeFileSync(join(repo, 'cut.txt'), 'cut\n');
+    expect(git('add', 'cut.txt').status).toBe(0);
+    expect(git('commit', '-qm', 'cut').status).toBe(0);
+    const cutSha = git('rev-parse', 'HEAD').stdout.trim();
+    const invoked: RunPodCommandOptions[] = [];
+    const command = async (cmd: string, args: string[], cwd: string) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: `${cutSha}\n` };
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: 'test/rules-contract.test.ts\n' };
+      if (cmd === 'bun') return { rc: 0, output: '1 pass\n0 fail\nRan 1 test across 1 file.\n' };
+      return { rc: 0, output: '' };
+    };
+    const runner = createGateRunner(repo, undefined, command, async (request) => {
+      invoked.push(request);
+      const artifactsDir = join(root, 'artifacts');
+      mkdirSync(artifactsDir);
+      writeFileSync(join(artifactsDir, 'shard.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: 'fake' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+    expect(result.rc).toBe(0);
+    expect(invoked).toHaveLength(1);
+    expect(invoked[0]!.source).toEqual({ kind: 'commit', sha: cutSha, baseSha });
+    expect(invoked[0]!.command[2]).toContain(`export ELANOUS_GATE_BASE_SHA='${baseSha}'`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rules-contract recheck Pod entrypoint carries the same source merge-base', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-rules-recheck-base-'));
+  try {
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(git('init', '-q', '-b', 'main').status).toBe(0);
+    expect(git('config', 'user.email', 'gate@example.invalid').status).toBe(0);
+    expect(git('config', 'user.name', 'gate-test').status).toBe(0);
+    mkdirSync(join(repo, 'test'));
+    writeFileSync(join(repo, 'test/rules-contract.test.ts'), 'export {};\n');
+    expect(git('add', 'test/rules-contract.test.ts').status).toBe(0);
+    expect(git('commit', '-qm', 'base').status).toBe(0);
+    const baseSha = git('rev-parse', 'HEAD').stdout.trim();
+    expect(git('update-ref', 'refs/remotes/origin/main', baseSha).status).toBe(0);
+    writeFileSync(join(repo, 'cut.txt'), 'cut\n');
+    expect(git('add', 'cut.txt').status).toBe(0);
+    expect(git('commit', '-qm', 'cut').status).toBe(0);
+    const cutSha = git('rev-parse', 'HEAD').stdout.trim();
+    let request: RunPodCommandOptions | undefined;
+    const runner = createGateRunner(repo, undefined, async () => ({ rc: 0, output: '' }), async (value) => {
+      request = value;
+      const artifactsDir = join(root, 'artifacts');
+      mkdirSync(artifactsDir);
+      writeFileSync(join(artifactsDir, 'part-0.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+      writeFileSync(join(artifactsDir, 'part-0.rc'), '0\n');
+      writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: 'fake-recheck' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    const result = await runner.recheckPod!('test/rules-contract.test.ts', cutSha, { pool: 'pool-test', installSlots: 0 }, 60_000);
+    expect(result.rc).toBe(0);
+    expect(request?.source).toEqual({ kind: 'commit', sha: cutSha, baseSha });
+    expect(request?.command[2]).toContain(`export ELANOUS_GATE_BASE_SHA='${baseSha}'`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('GATE-HOST-EXECUTOR: runGateNode CLI uses host sweep with the shared baseline attribution judge', async () => {
+  const failure = 'src/a.test.ts > baseline failure';
+  const fixtureRunner = fake([failure], [failure]);
+  setElanousConfigDir(fixtureRunner.instanceRoot);
+  const fixtureCommand = fixtureRunner.runner.command.bind(fixtureRunner.runner);
+  fixtureRunner.runner.command = async (cmd, args, cwd, limitMs) => cmd === 'mktemp'
+    ? { rc: 0, output: '/tmp/release-gate-host-test' } : fixtureCommand(cmd, args, cwd, limitMs);
+  const trail: string[] = [];
+  const hostRunner = createGateRunner(fixtureRunner.root, 'node-b', async (cmd, args, cwd) => {
+    trail.push(`${cmd} ${args.join(' ')} @ ${cwd}`);
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: 'src/a.test.ts\n' };
+    if (cmd === 'bun') return { rc: 1, output: ['src/a.test.ts:', '(fail) baseline failure', '0 pass', '1 fail', 'Ran 1 test across 1 file.', ''].join('\n') };
+    return { rc: 0, output: '' };
+  });
+  fixtureRunner.runner.sweep = (tree, logDir, pod, only, onProgress) => hostRunner.sweep(tree, logDir, pod, only, onProgress);
+  let resultLine = '';
+  const output = spyOn(console, 'log').mockImplementation((line) => { resultLine = String(line); });
+  let rc: number;
+  try {
+    rc = await runGateNode(['--commit', CUT, '--version', '1.0.1', '--baseline-version', '1.0.0',
+      '--baseline-commit', BASE, '--executor', 'host', '--remote', 'node-b', '--json'], {}, fixtureRunner.runner);
+  } finally { output.mockRestore(); }
+  expect(rc!).toBe(0);
+  expect(trail.some((entry) => entry.startsWith('git ls-files'))).toBe(true);
+  expect(trail.some((entry) => entry.startsWith('bun run test:deterministic'))).toBe(true);
+  expect(trail.some((entry) => entry.includes('@ /tmp/release-gate-host-test'))).toBe(true);
+  expect(trail.some((entry) => /^(?:ssh|kubectl)\b/.test(entry))).toBe(false);
+  const verdict = JSON.parse(resultLine) as { preexisting: number; introduced: string[]; executor: string; host: string; verdict: string; summary: string };
+  expect(verdict).toMatchObject({ preexisting: 1, introduced: [], executor: 'host', host: 'node-b', verdict: 'pass' });
+  expect(verdict.summary).toContain('새 회귀 0 · 기존 1');
+  expect(verdict.summary).toContain('실행기 host(node-b)');
+});
+
+test('GATE-HOST-EXECUTOR: runGateNode CLI preserves introduced attribution against a clean cached baseline', async () => {
+  const fixtureRunner = fake([A], [], true);
+  setElanousConfigDir(fixtureRunner.instanceRoot);
+  const fixtureCommand = fixtureRunner.runner.command.bind(fixtureRunner.runner);
+  const trail: string[] = [];
+  fixtureRunner.runner.command = async (cmd, args, cwd, limitMs) => {
+    trail.push(`${cmd} ${args.join(' ')} @ ${cwd}`);
+    if (cmd === 'mktemp') return { rc: 0, output: '/tmp/release-gate-host-introduced-test' };
+    if (cmd === 'bun' && cwd.endsWith('/baseline')) return { rc: 0, output: '1 pass\n0 fail\nRan 1 test across 1 file.\n' };
+    return fixtureCommand(cmd, args, cwd, limitMs);
+  };
+  let resultLine = '';
+  const output = spyOn(console, 'log').mockImplementation((line) => { resultLine = String(line); });
+  let rc: number;
+  try {
+    rc = await runGateNode(['--commit', CUT, '--version', '1.0.1', '--baseline-version', '1.0.0',
+      '--baseline-commit', BASE, '--executor', 'host', '--remote', 'node-b', '--json'], {}, fixtureRunner.runner);
+  } finally { output.mockRestore(); }
+  expect(rc!).toBe(1);
+  expect(trail.some((entry) => entry.startsWith('bun run test:deterministic'))).toBe(true);
+  expect(trail.some((entry) => /^(?:ssh|kubectl)\b/.test(entry))).toBe(false);
+  const verdict = JSON.parse(resultLine) as { introduced: string[]; preexisting: number; executor: string; host: string; verdict: string; summary: string };
+  expect(verdict).toMatchObject({ introduced: [A], preexisting: 0, executor: 'host', host: 'node-b', verdict: 'fail' });
+  expect(verdict.summary).toContain('실행기 host(node-b)');
+});
+
+test('GATE-HOST-EXECUTOR: real CLI process creates the host runner and judges remote sweep output', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-host-cli-process-'));
+  try {
+    const repo = join(root, 'repo');
+    const mirror = join(root, 'mirror.git');
+    const fakeBin = join(root, 'bin');
+    const isolatedBunBin = join(root, '.bun', 'bin');
+    mkdirSync(repo);
+    mkdirSync(fakeBin);
+    mkdirSync(isolatedBunBin, { recursive: true });
+    const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(git('init', '-q').status).toBe(0);
+    expect(git('config', 'user.name', 'Gate CLI Test').status).toBe(0);
+    expect(git('config', 'user.email', 'gate-cli@example.invalid').status).toBe(0);
+    mkdirSync(join(repo, 'src'));
+    writeFileSync(join(repo, 'src', 'a.test.ts'), 'export {}\n');
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ scripts: { 'test:deterministic': 'true' } }));
+    mkdirSync(join(repo, 'apps', 'pwa'), { recursive: true });
+    mkdirSync(join(repo, 'test'));
+    mkdirSync(join(repo, 'scripts'));
+    writeFileSync(join(repo, 'test', 'placeholder.txt'), 'fixture\n');
+    writeFileSync(join(repo, 'scripts', 'placeholder.ts'), 'export {}\n');
+    writeFileSync(join(repo, 'apps', 'pwa', 'package.json'), '{}');
+    expect(git('add', '.').status).toBe(0);
+    expect(git('commit', '-qm', 'base').status).toBe(0);
+    const base = git('rev-parse', 'HEAD').stdout.trim();
+    writeFileSync(join(repo, 'src', 'b.test.ts'), 'export {}\n');
+    expect(git('add', '.').status).toBe(0);
+    expect(git('commit', '-qm', 'cut').status).toBe(0);
+    const cut = git('rev-parse', 'HEAD').stdout.trim();
+    expect(spawnSync('git', ['init', '--bare', '-q', mirror], { encoding: 'utf8' }).status).toBe(0);
+
+    const sshLog = join(root, 'ssh.log');
+    const bunLog = join(root, 'bun.log');
+    const ssh = join(fakeBin, 'ssh');
+    const bun = join(fakeBin, 'bun');
+    writeFileSync(ssh, `#!/bin/sh\nprintf '%s\\n' "$2" >> ${JSON.stringify(sshLog)}\nexec sh -c "$2"\n`);
+    writeFileSync(bun, `#!/bin/sh\ncase "$*" in install*) exit 0 ;; esac\nprintf '%s|%s\\n' "$PWD" "$*" >> ${JSON.stringify(bunLog)}\ncase "$PWD" in *baseline*) printf 'src/a.test.ts:\\n(fail) stable failure\\n0 pass\\n1 fail\\nRan 1 test across 1 file.\\n'; exit 1 ;; esac\nprintf 'src/a.test.ts:\\n(fail) stable failure\\nsrc/b.test.ts:\\n(fail) introduced failure\\n0 pass\\n2 fail\\nRan 2 tests across 2 files.\\n'\nexit 1\n`);
+    chmodSync(ssh, 0o755);
+    chmodSync(bun, 0o755);
+    copyFileSync(bun, join(isolatedBunBin, 'bun'));
+    chmodSync(join(isolatedBunBin, 'bun'), 0o755);
+    const result = spawnSync(process.execPath, [resolve(import.meta.dir, 'gate-node.ts'), '--commit', cut, '--version', '1.0.1',
+      '--baseline-version', '1.0.0', '--baseline-commit', base, '--executor', 'host', '--remote', 'isolated-host',
+      '--remote-mirror', mirror, '--json'], {
+        cwd: repo, encoding: 'utf8', timeout: 90_000,
+        env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}`, HOME: root, ELANOUS_STATE_DIR: join(root, 'state'), ELANOUS_GRAPH_CONTEXT: '/nonexistent/context.json' },
+      });
+    if (result.status !== 1) throw new Error(JSON.stringify({ status: result.status, stdout: result.stdout, stderr: result.stderr, bun: readFileSync(bunLog, 'utf8') }));
+    const output = JSON.parse(result.stdout.trim().split('\n').at(-1)!) as { introduced: string[]; preexisting: number; executor: string; host: string; verdict: string };
+    expect(output).toMatchObject({ introduced: ['src/b.test.ts > introduced failure'], preexisting: 1, executor: 'host', host: 'isolated-host', verdict: 'fail' });
+    const remoteCalls = readFileSync(sshLog, 'utf8').split('\n');
+    const cleanClones = remoteCalls.filter((call) => call.includes("'git' 'clone' '--no-checkout'"));
+    expect(cleanClones).toHaveLength(2);
+    expect(cleanClones.some((call) => call.includes('/cut'))).toBe(true);
+    expect(cleanClones.some((call) => call.includes('/baseline'))).toBe(true);
+    const suiteRuns = readFileSync(bunLog, 'utf8').split('\n').filter((call) => call.includes('run test:deterministic'));
+    expect(suiteRuns.some((call) => call.includes('/cut|'))).toBe(true);
+    expect(suiteRuns.some((call) => call.includes('/baseline|'))).toBe(true);
+    expect(remoteCalls.join('\n')).not.toMatch(/kubectl|pod-command/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

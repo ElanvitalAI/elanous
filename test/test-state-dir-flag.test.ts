@@ -122,11 +122,11 @@ describe('applyTestStateDirFlagFromArgv · side-effecting bootstrap', () => {
     expect(cfg.telegram.channels).toBeUndefined();
   });
 
-  it('does not clobber an already-set ELANOUS_STATE_DIR', () => {
+  it('explicit test root overrides an inherited ELANOUS_STATE_DIR', () => {
     process.env.ELANOUS_STATE_DIR = '/tmp/preset';
     process.argv = ['bun', 'src/index.ts', '--test-state-dir', '/tmp/dstate', 'nexus', 'run'];
     applyTestStateDirFlagFromArgv();
-    expect(process.env.ELANOUS_STATE_DIR).toBe('/tmp/preset');
+    expect(process.env.ELANOUS_STATE_DIR).toBe('/tmp/dstate');
   });
 });
 

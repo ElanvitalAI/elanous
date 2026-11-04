@@ -114,7 +114,8 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
     return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: neither auto-approve nor approve-publish approved' };
   }
   const gate = context.outputs.gate;
-  const ownerWaivedGate = gate?.outcome === 'pass(owner-waived)' && gate.verdict === 'owner-waived'
+  const ownerWaivedGate = gate?.verdict === 'owner-waived'
+    && (gate.outcome === 'ok' || gate.outcome === 'pass(owner-waived)')
     && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
     && typeof gate.reason === 'string' && gate.reason.trim().length > 0;
   if (gate?.outcome !== 'ok' && !ownerWaivedGate)

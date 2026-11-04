@@ -180,7 +180,7 @@ mock.module('./chat/background-job-status.js', () => ({
   },
 }));
 
-const { showNextTui } = await import('./entry.js');
+const { atPickerHeaderLines, showNextTui } = await import('./entry.js');
 const { appendMessage, createSession, setActiveSessionId } = await import('../session/index.js');
 
 // 턴 경계 줄을 debug.log 진입에서 캡처한다 — 싱크 등록 여부와 무관하게 recorder 가 남긴 줄이 여기를 지난다.
@@ -234,6 +234,12 @@ afterAll(() => {
 });
 
 describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
+  test('file picker uses its last available row to identify the selected candidate', () => {
+    expect(atPickerHeaderLines([
+      { label: 'README.md', absPath: '/work/README.md', isDir: false },
+    ], 0, 1, (line) => line)).toEqual(['@ 1/1 · README.md']);
+  });
+
   test('추가 상태 행이 있어도 그래프 진행 줄과 입력 커서가 같은 화면 행을 쓰지 않는다', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
@@ -280,6 +286,118 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     }
   }, 10_000);
 
+  test('/side workspaces enter toggles a workspace group without attaching its parent row', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const original = createSession({ source: 'tui' });
+    const target = createSession({ source: 'tui' });
+    setActiveSessionId(original.id);
+    const now = Date.now();
+    upsertPtyManifest({
+      id: 'tui:81020', kind: 'tui', cmd: 'elanous', purpose: `next-tui-sidetab:${target.id}`,
+      startedAt: now, now, ptyPid: 81020, identity: { spaceId: 'mission-space', spaceKind: 'solve-mission' },
+    });
+    updatePtyManifestSession('tui:81020', target.id, now);
+    upsertPtyManifest({
+      id: 'agent:workspace-child', kind: 'agent', cmd: 'agent', nickname: 'WORKSPACE_CHILD',
+      startedAt: now, now, ptyPid: 81021,
+      identity: { spaceId: 'mission-space', spaceKind: 'solve-mission', parentPtyId: 'tui:81020' },
+    });
+    const output = process.stdout.write;
+    const originalLog = debug.log;
+    const attachRequests: unknown[] = [];
+    debug.log = ((category: string, event: string, data?: unknown) => {
+      if (category === 'sidetab.remote' && event === 'attach-request') attachRequests.push(data);
+      return originalLog.call(debug, category, event, data);
+    }) as typeof debug.log;
+    process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    submittedInputs.push('/side workspaces');
+    try {
+      await showNextTui({ resumeSessionId: original.id });
+      const workspaceFrames = transcript.filter((frame) => frame.includes('미션 ·'));
+      expect(workspaceFrames.some((frame) => !frame.includes('WORKSPACE_CHILD'))).toBe(true);
+      expect(workspaceFrames.some((frame) => frame.includes('WORKSPACE_CHILD'))).toBe(true);
+      expect([...workspaceFrames].reverse().find((frame) => frame.includes('미션 ·'))).not.toContain('WORKSPACE_CHILD');
+      expect(attachRequests).toEqual([]);
+    } finally {
+      debug.log = originalLog;
+      process.stdout.write = output;
+      removePtyManifest('tui:81020');
+      removePtyManifest('agent:workspace-child');
+    }
+  }, 10_000);
+
+  test('/side workspaces에서 매니페스트 PTY 멤버를 고르면 기존 세션 전환 경로를 탄다', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const original = createSession({ source: 'tui' });
+    const target = createSession({ source: 'tui' });
+    setActiveSessionId(original.id);
+    appendMessage(target.id, { role: 'assistant', content: 'WORKSPACE_SWITCH_TARGET_MARKER', ts: new Date().toISOString() });
+    const now = Date.now();
+    upsertPtyManifest({
+      id: 'tui:81001', kind: 'tui', cmd: 'elanous', purpose: `next-tui-sidetab:${target.id}`,
+      startedAt: now, now, ptyPid: 81001, identity: { spaceId: 'mission-space', spaceKind: 'solve-mission' },
+    });
+    updatePtyManifestSession('tui:81001', target.id, now);
+    upsertPtyManifest({
+      id: 'agent:mission-member', kind: 'agent', cmd: 'agent', nickname: 'MISSION_MEMBER',
+      startedAt: now + 1, now: now + 1, ptyPid: 81002,
+      identity: { spaceId: 'mission-space', spaceKind: 'solve-mission', parentPtyId: 'tui:81001' },
+    });
+    upsertPtyManifest({
+      id: 'agent:all-only', kind: 'agent', cmd: 'agent', nickname: 'ALL_ONLY',
+      startedAt: now + 2, now: now + 2, ptyPid: 81003, identity: { parentPtyId: 'tui:81001' },
+    });
+    const output = process.stdout.write;
+    const originalLog = debug.log;
+    const attachRequests: unknown[] = [];
+    debug.log = ((category: string, event: string, data?: unknown) => {
+      if (category === 'sidetab.remote' && event === 'attach-request') attachRequests.push(data);
+      return originalLog.call(debug, category, event, data);
+    }) as typeof debug.log;
+    process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'down', ctrl: false, shift: false, raw: '' },
+      { name: 'down', ctrl: false, shift: false, raw: '' },
+      { name: '\\', ctrl: true, shift: false, raw: '\x1c' },
+      { name: 'x', ctrl: false, shift: false, raw: 'x' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    submittedInputs.push('/side workspaces', '/side all');
+    try {
+      await showNextTui({ resumeSessionId: original.id });
+      const { getActiveSessionId } = await import('../session/index.js');
+      expect(getActiveSessionId()).toBe(target.id);
+      expect(attachRequests).toContainEqual({ ptyId: 'agent:mission-member', host: null });
+      expect(transcript.join('')).toContain('미션 ·');
+      expect(transcript.join('')).toContain('세션 전환됨');
+      const workspaceFrame = transcript.find((frame) => frame.includes('미션 ·'));
+      const allFrame = [...transcript].reverse().find((frame) => frame.includes('사이드탭 전체 목록'));
+      expect(workspaceFrame).toBeDefined();
+      expect(workspaceFrame).not.toContain('ALL_ONLY');
+      expect(allFrame).toContain('ALL_ONLY');
+      expect(transcript.join('')).toContain('WORKSPACE_SWITCH_TARGET_MARKER');
+    } finally {
+      debug.log = originalLog;
+      process.stdout.write = output;
+      removePtyManifest('tui:81001');
+      removePtyManifest('agent:mission-member');
+      removePtyManifest('agent:all-only');
+    }
+  }, 10_000);
+
   test('sidetab session switch during a turn waits for that turn before changing sessions', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
@@ -294,7 +412,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       startedAt: now, now, ptyPid: 81000,
     });
     updatePtyManifestSession('tui:81000', target.id, now);
-    let duringTurnSessionId: string | undefined;
+    let duringTurnSessionId: string | null | undefined;
     let switchResult: unknown;
     duringTurnHook = async () => {
       expect(nextSidetabHandler).not.toBeNull();

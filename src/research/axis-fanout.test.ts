@@ -1,9 +1,14 @@
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createResearchAxisSearcher, fanOutAxisEvidence, planAxisToolCalls, RESEARCH_SEARCH_BUDGET_MS } from './axis-fanout.js';
 import { invokeResearchAxes, setResearchInvoker } from '../research-bridge/invoke.js';
 import type { BloomResearchQuestion } from '../auto-research/question-ladder-contract.js';
 import type { WebSearchProvider } from '../web-search/provider.js';
 import { addWebSearchProvider, _resetWebSearchProvidersForTests } from '../web-search/index.js';
+import { debug } from '../debug/log.js';
 
 const axes = [
   { id: 'us-rate', level: 1, prompt: '미국 10년물 금리는?', requestedWindow: '2026-10', searchTerms: ['US 10 year Treasury yield October 2026'] },
@@ -340,6 +345,10 @@ describe('research axis fanout', () => {
         calls.push('firecrawl');
         return { providerName: 'firecrawl', durationMs: 1, hits: [] };
       }),
+      provider('ddg-free', async () => {
+        calls.push('ddg-free');
+        return { providerName: 'ddg-free', durationMs: 1, hits: [] };
+      }),
     ]);
 
     const result = await search('latest public opinion topic');
@@ -348,6 +357,93 @@ describe('research axis fanout', () => {
     expect(Array.isArray(result) ? result : result.hits).toMatchObject([
       { url: 'https://exa.example', engine: 'exa' },
     ]);
+  });
+
+  it('기본 registry의 test 격리 research 진입점은 DDG provenance와 fallback 로그를 남긴다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'axis-fanout-default-registry-'));
+    const home = join(root, 'home');
+    mkdirSync(home);
+    const stateRoot = join(root, 'state');
+    const script = `
+      const { applyIsolatedRoot } = await import(${JSON.stringify(join(process.cwd(), 'src/cli/test-state-dir-flag.ts'))});
+      applyIsolatedRoot(process.env.TEST_INSTANCE_ROOT);
+      const { debug } = await import(${JSON.stringify(join(process.cwd(), 'src/debug/log.ts'))});
+      const events = [];
+      debug.log = (category, event, data) => events.push({ category, event, data });
+      globalThis.fetch = async input => {
+        if (!String(input).includes('html.duckduckgo.com/html/')) throw new Error('unexpected fetch provider');
+        return new Response('<div class="result"><a class="result__a" href="https://example.org/ddg">DDG fallback result</a><a class="result__snippet">public snippet</a></div>', { status: 200 });
+      };
+      const { getAvailableResearchWebSearchProviders } = await import(${JSON.stringify(join(process.cwd(), 'src/web-search/index.ts'))});
+      const providers = getAvailableResearchWebSearchProviders();
+      if (providers.some(provider => ['exa', 'firecrawl'].includes(provider.id))) throw new Error('paid provider unexpectedly available');
+      const { invokeResearchAxes } = await import(${JSON.stringify(join(process.cwd(), 'src/research-bridge/invoke.ts'))});
+      const result = await invokeResearchAxes([{ id: 'ddg-default', level: 1, prompt: 'Find a public source.', searchTerms: ['public research source'] }], {
+        fetchPage: async url => ({ url, output: 'fetched test page' }),
+      });
+      const evidence = result.axes.flatMap(axis => axis.evidence);
+      console.log('AXIS_ENTRYPOINT_RESULT=' + JSON.stringify({
+        providerIds: providers.map(provider => provider.id),
+        sourceKinds: evidence.map(item => item.sourceKind),
+        fallbackLog: events.some(event => event.category === 'research.search' && event.event === 'provider-preflight' && event.data.keylessFallback === 'ddg-free'),
+        providerLog: events.some(event => event.category === 'research.search' && event.event === 'provider-complete' && event.data.provider === 'ddg-free'),
+      }));
+    `;
+    try {
+      const child = spawnSync('bun', ['-e', script], {
+        cwd: process.cwd(),
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          HOME: home,
+          TMPDIR: root,
+          NODE_ENV: 'test',
+          TEST_INSTANCE_ROOT: stateRoot,
+        },
+        encoding: 'utf8',
+        timeout: 15_000,
+      });
+      if (child.status !== 0) throw new Error(child.stderr || child.stdout);
+      expect(child.status).toBe(0);
+      const line = child.stdout.split('\n').find(item => item.startsWith('AXIS_ENTRYPOINT_RESULT='));
+      expect(line).toBeDefined();
+      const result = JSON.parse(line!.slice('AXIS_ENTRYPOINT_RESULT='.length));
+      expect(result.providerIds).toContain('ddg-free');
+      expect(result.sourceKinds).toContain('web-search:ddg-free');
+      expect(result.fallbackLog).toBe(true);
+      expect(result.providerLog).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('유료 provider가 없으면 DDG를 최후 폴백으로 쓰고 화면·로그에 출처를 남긴다', async () => {
+    const calls: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const ddg: WebSearchProvider = {
+      id: 'ddg-free', displayName: 'DuckDuckGo (keyless)', available: () => true,
+      search: async ({ query }) => {
+        calls.push('ddg-free');
+        return { providerName: 'ddg-free', durationMs: 1,
+          hits: [{ url: 'https://example.org/ddg', title: query, snippet: 'public result' }] };
+      },
+    };
+    try {
+      const result = await fanOutAxisEvidence([axes[0]!], {
+        search: createResearchAxisSearcher([ddg]),
+      });
+      expect(calls).toEqual(['ddg-free']);
+      expect(result.axes[0]!.evidence[0]).toMatchObject({
+        sourceKind: 'web-search:ddg-free', source: 'https://example.org/ddg', outcome: 'complete',
+      });
+      expect(log).toHaveBeenCalledWith('research.search', 'provider-preflight', expect.objectContaining({
+        allowed: ['ddg-free'], keylessFallback: 'ddg-free',
+      }));
+      expect(log).toHaveBeenCalledWith('research.search', 'provider-complete', expect.objectContaining({
+        provider: 'ddg-free', hits: 1,
+      }));
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('Exa 실패 뒤 Firecrawl만 폴백하며 Grok과 DDG는 호출하지 않는다', async () => {

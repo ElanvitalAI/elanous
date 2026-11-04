@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildUserConfig } from '../user-config.js';
+import { needsFirstRun } from '../onboarding.js';
 import { UNATTENDED_SETUP_COMMAND } from './entry-hints.js';
 import { firstChatGate, type FirstChatGateDeps } from './first-chat-gate.js';
 import { runFirstRun } from './first-run.js';
@@ -70,6 +71,7 @@ test('non-TTY already ready continues without running first run or wizard', asyn
   const f = fixture();
   try {
     f.cfg.onboarding.ready = true;
+    expect(needsFirstRun(f.cfg)).toBe(true);
     let firstRuns = 0;
     let interactive = 0;
     expect(await firstChatGate(f.cfg, {

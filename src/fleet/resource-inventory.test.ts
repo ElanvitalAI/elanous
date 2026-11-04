@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ResourceLedger } from '../control-plane/ledger.js';
 import { createFakeCloudVm } from '../ux-sim/fake-cloud-vm.js';
+import { discoverCloudResources } from './cloud-resource-discovery.js';
 import { createRegisteredInventoryResource, inspectInventory, registerInventoryResource, stopReleasedInventoryResources, unregisterInventoryResource } from './resource-inventory.js';
 
 const roots: string[] = [];
@@ -39,11 +40,67 @@ test('inventory flags outside-ledger VMs, expired resources, missing purpose, an
   registerInventoryResource(resource('idle', { lastActivityAt: now - 8 * 24 * 60 * 60 * 1000 }), ledger);
   const snapshot = inspectInventory(ledger, [{ id: 'orphan', machine: 'gcp1', provider: 'gcp' }], now);
   expect(snapshot.alerts).toEqual(expect.arrayContaining([
-    expect.objectContaining({ id: 'orphan', reason: 'unregistered' }),
+    expect.objectContaining({ id: 'orphan', reason: 'unregistered', message: 'gcp resource orphan is outside the inventory' }),
     expect.objectContaining({ id: 'expired', reason: 'expired' }),
     expect.objectContaining({ id: 'no-purpose', reason: 'missing-purpose' }),
     expect.objectContaining({ id: 'idle', reason: 'idle-over-7-days' }),
   ]));
+});
+
+test('read-only cloud discovery feeds named unregistered VM alerts without leaking provider stderr', async () => {
+  const ledger = setup();
+  const discovery = await discoverCloudResources(command => command === 'aws'
+    ? { status: 0, stdout: JSON.stringify({ Reservations: [{ Instances: [
+      { InstanceId: 'i-hackers-win-test', State: { Name: 'running' }, Tags: [{ Key: 'Name', Value: 'hackers-win-test' }] },
+      { InstanceId: 'i-terminated', State: { Name: 'terminated' } },
+    ] }] }) }
+    : { status: 0, stdout: JSON.stringify([{ id: '123123', name: 'n8n-guide-verify', status: 'RUNNING', zone: 'https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a', selfLink: 'https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instances/n8n-guide-verify' }]) });
+  const snapshot = inspectInventory(ledger, discovery.resources, Date.UTC(2026, 10, 4));
+
+  expect(snapshot.alerts).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: 'i-hackers-win-test', reason: 'unregistered', message: 'aws resource hackers-win-test (i-hackers-win-test) is outside the inventory' }),
+    expect.objectContaining({ id: '123123', reason: 'unregistered', message: 'gcp resource n8n-guide-verify (123123) is outside the inventory' }),
+  ]));
+});
+
+test('discovery IDs and aliases match existing AWS and GCP ledger identifiers', async () => {
+  const ledger = setup();
+  const awsId = 'i-registered-aws';
+  const gcpNumericId = '123456';
+  const gcpPath = 'projects/p/zones/us-central1-a/instances/registered-gcp-path';
+  registerInventoryResource(resource(awsId), ledger);
+  registerInventoryResource({ ...resource(gcpNumericId), machine: 'gcp1', provider: 'gcp' }, ledger);
+  registerInventoryResource({ ...resource(gcpPath), machine: 'gcp1', provider: 'gcp' }, ledger);
+  const discovery = await discoverCloudResources(command => command === 'aws'
+    ? { status: 0, stdout: JSON.stringify({ Reservations: [{ Instances: [
+      { InstanceId: awsId, State: { Name: 'running' }, Tags: [{ Key: 'Name', Value: 'registered-aws' }] },
+    ] }] }) }
+    : { status: 0, stdout: JSON.stringify([
+      { id: gcpNumericId, name: 'registered-gcp-id', status: 'RUNNING', zone: 'https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a', selfLink: `https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instances/${gcpNumericId}` },
+      { id: '123457', name: 'registered-gcp-path', status: 'RUNNING', zone: 'https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a', selfLink: 'https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instances/registered-gcp-path' },
+    ]) });
+
+  expect(inspectInventory(ledger, discovery.resources).alerts.filter(alert => alert.reason === 'unregistered')).toEqual([]);
+});
+
+test('cloud names remain display-only and same-name GCP instances in other zones stay unregistered', async () => {
+  const ledger = setup();
+  registerInventoryResource(resource('shared-name'), ledger);
+  registerInventoryResource(resource('aws-stable-id'), ledger);
+  registerInventoryResource({ ...resource('projects/p/zones/zone-a/instances/shared-name'), machine: 'gcp1', provider: 'gcp' }, ledger);
+  const discovery = await discoverCloudResources(command => command === 'aws'
+    ? { status: 0, stdout: JSON.stringify({ Reservations: [{ Instances: [
+      { InstanceId: 'i-orphan', State: { Name: 'running' }, Tags: [{ Key: 'Name', Value: 'shared-name' }] },
+      { InstanceId: 'i-rotated', State: { Name: 'running' }, Tags: [{ Key: 'Name', Value: 'friendly-name' }] },
+    ] }] }) }
+    : { status: 0, stdout: JSON.stringify([
+      { id: '100', name: 'shared-name', status: 'RUNNING', zone: 'https://compute.googleapis.com/compute/v1/projects/p/zones/zone-a', selfLink: 'https://compute.googleapis.com/compute/v1/projects/p/zones/zone-a/instances/shared-name' },
+      { id: '200', name: 'shared-name', status: 'RUNNING', zone: 'https://compute.googleapis.com/compute/v1/projects/p/zones/zone-b', selfLink: 'https://compute.googleapis.com/compute/v1/projects/p/zones/zone-b/instances/shared-name' },
+    ]) });
+
+  const withUnqualifiedNameAliases = discovery.resources.map(item => ({ ...item,
+    aliases: [...(item.aliases ?? []), ...(item.id === 'i-rotated' ? ['aws-stable-id'] : []), ...(item.provider === 'gcp' && item.name ? [item.name] : [])] }));
+  expect(inspectInventory(ledger, withUnqualifiedNameAliases).alerts.filter(alert => alert.reason === 'unregistered').map(alert => alert.id).sort()).toEqual(['200', 'i-orphan']);
 });
 
 test('fixed-time cost view bounds history at stop time and reports unknown prices', () => {

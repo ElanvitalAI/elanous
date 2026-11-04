@@ -1,4 +1,5 @@
 import { resolveInstanceName } from '../instance-identity.js';
+import type { HarnessSpaceKind } from '../harness/harness-space.js';
 import type { LLMToolSpec } from '../llm.js';
 import { listPtyManifestRows, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { describePtyRunState } from '../pty-shell/tui-run-state.js';
@@ -34,6 +35,8 @@ export interface SidetabRow {
   readonly currentProcess?: boolean;
   readonly controlState?: SidetabControlState;
   readonly runId?: string;
+  readonly spaceId?: string;
+  readonly spaceKind?: HarnessSpaceKind | '';
   readonly virtual?: boolean;
   readonly attention?: boolean;
   readonly status?: string;
@@ -52,7 +55,7 @@ export interface SidetabState {
 
 export interface SidetabScope {
   /** `all` is retained for existing callers; `mode` is the three-scope contract. */
-  readonly mode?: 'mine' | 'runs' | 'all';
+  readonly mode?: 'mine' | 'runs' | 'all' | 'workspaces';
   readonly all?: boolean;
   readonly currentPtyId?: string;
   readonly currentPid?: number;
@@ -62,6 +65,7 @@ export interface SidetabScope {
   readonly filters?: readonly string[];
   readonly crossInstanceParent?: readonly string[];
   readonly expandedRunIds?: readonly string[];
+  readonly expandedWorkspaceIds?: readonly string[];
   readonly podRows?: readonly SidetabPodRow[];
   readonly harnessRuns?: readonly SidetabHarnessRun[];
   readonly maxTabs?: number;
@@ -69,6 +73,8 @@ export interface SidetabScope {
 
 export interface SidetabHarnessRun {
   readonly runId: string;
+  readonly spaceId?: string;
+  readonly spaceKind?: HarnessSpaceKind | '';
   readonly label?: string;
   readonly instance?: string;
   readonly parentPtyId?: string;
@@ -208,6 +214,8 @@ export function sidetabRowsFromManifest(
           : {}),
         ...(sessionId ? { sessionId } : classicTerminalSessionId ? { sessionId: classicTerminalSessionId } : {}),
         ...(row.runId ? { runId: row.runId } : {}),
+        ...(row.spaceId ? { spaceId: row.spaceId } : {}),
+        ...(row.spaceKind ? { spaceKind: row.spaceKind } : {}),
       };
     });
   if (!scope) return basicRows;
@@ -222,6 +230,7 @@ export function sidetabRowsFromManifest(
     || scope.podRows !== undefined
     || scope.filters !== undefined
     || scope.expandedRunIds !== undefined
+    || scope.expandedWorkspaceIds !== undefined
     || scope.maxTabs !== undefined;
   if (!scopedRunView) return basicRows;
 
@@ -251,6 +260,8 @@ export function sidetabRowsFromManifest(
     const key = raw.slice(0, colon); const values = raw.slice(colon + 1).split('|').map((value) => value.trim().toLowerCase()).filter(Boolean);
     if (values.length === 0) return true;
     if (key === 'status') return values.some((value) => row.status?.toLowerCase() === value || row.badge === value);
+    if (key === 'label' || key === 'name') return values.some((value) => row.label.toLowerCase().includes(value));
+    if (key === 'id') return values.some((value) => row.id.toLowerCase().includes(value));
     if (key === 'seat') return values.includes(row.seat?.toLowerCase() ?? '');
     if (key === 'host') return values.includes(row.host?.toLowerCase() ?? '');
     if (key === 'card') return values.includes(row.cardId?.toLowerCase() ?? '');
@@ -258,7 +269,46 @@ export function sidetabRowsFromManifest(
     return true;
   }));
   let output: SidetabRow[];
-  if (mode === 'runs' || mode === 'all') {
+  let workspaceMembersForExpansion = new Map<string, SidetabRow[]>();
+  if (mode === 'workspaces') {
+    const workspaceMembers = new Map<string, { members: SidetabRow[]; spaceKinds: Set<HarnessSpaceKind>; attention: boolean }>();
+    const addWorkspaceMember = (spaceId: string, member?: SidetabRow, spaceKind?: HarnessSpaceKind | '') => {
+      const workspace = workspaceMembers.get(spaceId) ?? { members: [], spaceKinds: new Set<HarnessSpaceKind>(), attention: false };
+      if (member) workspace.members.push(member);
+      if (spaceKind) workspace.spaceKinds.add(spaceKind);
+      workspaceMembers.set(spaceId, workspace);
+    };
+    for (const row of basicRows) {
+      if (row.spaceId) addWorkspaceMember(row.spaceId, row, row.spaceKind);
+    }
+    for (const run of scope.harnessRuns ?? []) {
+      if (run.spaceId) {
+        addWorkspaceMember(run.spaceId, undefined, run.spaceKind);
+        if (run.attention) workspaceMembers.get(run.spaceId)!.attention = true;
+      }
+    }
+    workspaceMembersForExpansion = new Map([...workspaceMembers].map(([spaceId, workspace]) => [
+      spaceId,
+      filterRows(workspace.members),
+    ]));
+    const workspaceRows: SidetabRow[] = [...workspaceMembers].map(([spaceId, workspace]) => {
+      const spaceKind = workspace.spaceKinds.size === 1 ? [...workspace.spaceKinds][0] : undefined;
+      const label = spaceKind === 'solve-mission' ? '미션' : spaceKind ? '하니스 런' : '워크스페이스';
+      const matchingMembers = workspaceMembersForExpansion.get(spaceId) ?? [];
+      const attention = workspace.attention || workspace.members.some((row) => row.attention || row.badge === 'stale');
+      const badge: SidetabRow['badge'] = attention ? 'stale' : workspace.members.some((row) => row.badge === 'busy') ? 'busy' : 'unknown';
+      return {
+        id: `workspace:${spaceId}`, spaceId,
+        label: `${label} · ${spaceId}`,
+        kind: 'workspace', badge,
+        ...(attention ? { attention: true } : {}),
+        status: label === '미션' ? 'mission-workspace' : label === '하니스 런' ? 'harness-workspace' : 'workspace-unclassified',
+        sessionId: `${workspace.members.length} 항목`, nestDepth: 0,
+      };
+    }).filter((row) => (workspaceMembersForExpansion.get(row.spaceId!)?.length ?? 0) > 0
+      || filterRows([row]).length > 0);
+    output = workspaceRows.sort((a, b) => a.label.localeCompare(b.label));
+  } else if (mode === 'runs' || mode === 'all') {
     const orderedRuns = runs.sort((a, b) => Number(Boolean(b.attention)) - Number(Boolean(a.attention)) || a.label.localeCompare(b.label));
     output = mode === 'runs' ? orderedRuns : [...orderedRuns, ...basicRows.filter((row) => !row.runId)];
   } else {
@@ -273,11 +323,18 @@ export function sidetabRowsFromManifest(
       ...runs,
     ];
   }
-  output = filterRows(output);
+  if (mode !== 'workspaces') output = filterRows(output);
   const expanded = new Set(scope.expandedRunIds ?? []);
+  const expandedWorkspaces = new Set(scope.expandedWorkspaceIds ?? []);
   const expandedRows: SidetabRow[] = [];
   for (const row of output) {
     expandedRows.push(row);
+    if (row.kind === 'workspace' && (scope.expandedWorkspaceIds === undefined || expandedWorkspaces.has(row.id))) {
+      const spaceId = row.id.slice('workspace:'.length);
+      expandedRows.push(...(workspaceMembersForExpansion.get(spaceId) ?? basicRows.filter((child) => child.spaceId === spaceId))
+        .map((child) => ({ ...child, nestDepth: 1 })));
+      continue;
+    }
     if (row.kind !== 'harness-run' || !expanded.has(row.runId!)) continue;
     expandedRows.push(...filterRows(basicRows.filter((child) => child.runId === row.runId)).map((child) => ({ ...child, nestDepth: 1 })));
     expandedRows.push(...filterRows((scope.podRows ?? []).filter((pod) => pod.runId === row.runId).map((pod) => ({
@@ -287,7 +344,7 @@ export function sidetabRowsFromManifest(
     }))));
   }
   const maxTabs = Math.max(1, scope.maxTabs ?? 8);
-  if (expandedRows.length > maxTabs) {
+  if (mode !== 'workspaces' && expandedRows.length > maxTabs) {
     const visible = expandedRows.slice(0, Math.max(0, maxTabs - 1));
     visible.push({ id: 'more:tabs', label: `+${expandedRows.length - visible.length} 더`, kind: 'overflow', badge: 'unknown' });
     return visible;
@@ -336,7 +393,7 @@ export function formatSidetabLines(
     return result + ' '.repeat(Math.max(0, width - used));
   };
   const selectedControl = mode === 'list' ? rows[selected]?.controlState : undefined;
-  const titleLine = fit(selectedControl?.title || ' 세션 · PTY');
+  const titleLine = fit(selectedControl?.title || (rows.some((row) => row.kind === 'workspace') ? ' 워크스페이스 · PTY' : ' 세션 · PTY'));
   const emphasizedTitle = selectedControl?.emphasized ? `\u001b[1;36m${titleLine}\u001b[0m` : titleLine;
   const lines = mode === 'new'
     ? [fit(' 새 PTY'), fit(' s shell · e elanous'), fit(' c codex · l claude · Esc')]
@@ -356,7 +413,8 @@ export function formatSidetabLines(
     // classic PTY label truncate after adding the control badge. Keep the
     // known control actor and the complete selectable label visible.
     const runBadge = row.controlState && row.badge === 'unknown' ? '' : `${row.badge} `;
-    const rowLine = fit(` ${marker} ${controlBadge}${runBadge}${row.label}`);
+    const attentionBadge = row.attention ? '⚠ ' : '';
+    const rowLine = fit(` ${marker} ${attentionBadge}${controlBadge}${runBadge}${row.label}`);
     lines.push(row.controlState?.emphasized && index === selected ? `\u001b[1;36m${rowLine}\u001b[0m` : rowLine);
   }
   if (mode === 'list' && lines.length < Math.floor(height)) lines.push(fit(' + new · /side new'));

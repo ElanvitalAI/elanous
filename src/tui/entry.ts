@@ -57,6 +57,27 @@ interface AtPickerQuery {
   readonly end: number;
 }
 
+export function atPickerHeaderLines(
+  candidates: readonly AtPickerCandidate[],
+  selected: number,
+  availableRows: number,
+  fit: (text: string) => string,
+): string[] {
+  if (availableRows <= 0) return [];
+  const safeSelected = Math.max(0, Math.min(selected, candidates.length - 1));
+  if (availableRows === 1) {
+    const candidate = candidates[safeSelected];
+    return [fit(candidate ? `@ ${safeSelected + 1}/${candidates.length} · ${candidate.label}` : '@ 파일 후보 없음')];
+  }
+  const limit = Math.max(1, Math.min(6, availableRows - 1));
+  const start = Math.max(0, Math.min(safeSelected - limit + 1, candidates.length - limit));
+  const visible = candidates.slice(start, start + limit);
+  return [
+    fit(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음'),
+    ...visible.map((candidate, offset) => fit((start + offset === safeSelected ? '▸' : ' ') + ' ' + candidate.label)),
+  ];
+}
+
 /** Local chat entry: history and input are TUI-owned; turn execution stays shared. */
 export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   if (!process.stdin.isTTY) throw new Error('elanous --tui next requires stdin TTY');
@@ -90,7 +111,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let maxScroll = 0;
   let focus: 'input' | 'log' = 'input';
   let sidetabEnabled = options.sidetabMode !== 'off';
-  let sidetabAll = false;
+  let sidetabViewMode: 'current' | 'all' | 'workspaces' = 'current';
+  const expandedWorkspaceIds = new Set<string>();
   let sidetabOpen = sidetabEnabled && (session?.meta.uiState?.sidetabOpen ?? sidetabOpenBySession.get(id!) ?? options.sidetabMode === 'open');
   let sidetabSelected = 0;
   let sidetabMode: 'list' | 'new' = 'list';
@@ -105,6 +127,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let herdrSidetabRefreshPending = false;
   let herdrSidetabPortal: import('./sidetab/herdr-portal.js').HerdrSidetabPortal | null = null;
   let sidetabApi: typeof import('./sidetab/list.js') | null = null;
+  const getSidetabViewMode = (): 'current' | 'all' | 'workspaces' => sidetabViewMode;
+  const sidetabScope = () => getSidetabViewMode() === 'workspaces'
+    ? { mode: 'workspaces' as const, expandedWorkspaceIds: [...expandedWorkspaceIds] }
+    : undefined;
   // ⚠️ `as` 단언은 «null 로 좁혀지는» 흐름 분석을 푸는 것 — 값은 클로저(ensureSidetabAttachments) 안에서만 바뀐다.
   let sidetabAttachments: import('./sidetab/attach.js').SidetabAttachmentController | null = null as import('./sidetab/attach.js').SidetabAttachmentController | null;
   let pendingSidetabSwitch: string | null = null;
@@ -330,13 +356,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       // Reserve the prompt, footer, and picker heading before assigning candidate rows.
       const pickerRows = rows - header.length - footer.length - 1;
       if (pickerRows > 0) {
-        const limit = Math.max(0, Math.min(6, pickerRows - 1));
-        const start = Math.max(0, Math.min(atPicker.selected - limit + 1, atPicker.candidates.length - limit));
-        const visible = atPicker.candidates.slice(start, start + limit);
-        header.push(fitLogLine(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음', chatColumns));
-        for (const [offset, candidate] of visible.entries()) {
-          header.push(fitLogLine((start + offset === atPicker.selected ? '▸' : ' ') + ' ' + candidate.label, chatColumns));
-        }
+        header.push(...atPickerHeaderLines(atPicker.candidates, atPicker.selected, pickerRows, (line) => fitLogLine(line, chatColumns)));
       }
     }
     const history = [
@@ -412,7 +432,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       return;
     }
     if (!sidetabApi) sidetabApi = await import('./sidetab/list.js');
-    sidetabRows = sidetabApi.loadSidetabRows(sidetabAll);
+    sidetabRows = sidetabApi.loadSidetabRows(getSidetabViewMode() === 'all', undefined, sidetabScope());
     const current = sidetabRows.findIndex((row) => row.sessionId === id);
     const next = sidetabApi.applySidetabKey({ open: sidetabOpen, selected: current >= 0 ? current : sidetabSelected }, 'toggle', sidetabRows.length);
     sidetabOpen = next.open;
@@ -439,12 +459,20 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const refreshSidetabRows = (): void => {
     if (!sidetabApi) return;
     const selectedId = sidetabRows[sidetabSelected]?.id;
-    sidetabRows = [...sidetabApi.loadSidetabRows(sidetabAll), ...herdrSidetabRows, ...remoteSidetabRows];
+    sidetabRows = [...sidetabApi.loadSidetabRows(getSidetabViewMode() === 'all', undefined, sidetabScope()), ...herdrSidetabRows, ...remoteSidetabRows];
     const preservedIndex = selectedId ? sidetabRows.findIndex((row) => row.id === selectedId) : -1;
     sidetabSelected = preservedIndex >= 0
       ? preservedIndex
       : Math.min(sidetabSelected, Math.max(0, sidetabRows.length - 1));
   };
+  const toggleWorkspaceRow = (row: { id: string; kind: string }): boolean => {
+    if (sidetabViewMode !== 'workspaces' || row.kind !== 'workspace') return false;
+    if (expandedWorkspaceIds.has(row.id)) expandedWorkspaceIds.delete(row.id);
+    else expandedWorkspaceIds.add(row.id);
+    refreshSidetabRows();
+    return true;
+  };
+
   const refreshHerdrSidetabRows = async (): Promise<void> => {
     if (herdrSidetabRefreshPending) return;
     herdrSidetabRefreshPending = true;
@@ -480,10 +508,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     } catch { /* Remote sidetab is opt-in; local rows remain available. */ }
     finally { remoteSidetabRefreshPending = false; }
   };
-  const switchSidetabSession = async (requestedSessionId?: string): Promise<void> => {
+  const switchSidetabSession = async (requestedSessionId?: string, sourcePtyId?: string): Promise<void> => {
     const selected = sidetabRows[sidetabSelected];
     const targetId = requestedSessionId ?? (selected?.kind === 'tui' ? selected.sessionId : undefined);
     if (!targetId || targetId === id) return;
+    if (sourcePtyId && !sidetabRows.some((row) => row.ptyId === sourcePtyId && row.sessionId === targetId)) {
+      status = '세션 목록이 갱신되어 전환을 취소했습니다';
+      return;
+    }
     if (busy) {
       status = '응답 중에는 세션을 전환할 수 없습니다';
       return;
@@ -538,7 +570,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     sidetabSelected = index;
     const selected = sidetabRows[index]!;
-    if (selected.kind === 'tui') await switchSidetabSession();
+    if (toggleWorkspaceRow(selected)) render();
+    else if (selected.kind === 'tui') await switchSidetabSession(selected.sessionId, selected.ptyId);
     else {
       await ensureSidetabAttachments();
       sidetabAttachments?.select(selected);
@@ -756,7 +789,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
 
   if (sidetabOpen) {
     sidetabApi = await import('./sidetab/list.js');
-    sidetabRows = sidetabApi.loadSidetabRows(sidetabAll);
+    sidetabRows = sidetabApi.loadSidetabRows(getSidetabViewMode() === 'all', undefined, sidetabScope());
     void refreshHerdrSidetabRows();
     sidetabRefreshTimer = setInterval(() => {
       if (!sidetabApi || !sidetabOpen) return;
@@ -806,6 +839,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         rows: async () => { if (!sidetabApi) sidetabApi = await import('./sidetab/list.js'); refreshSidetabRows(); return sidetabRows; },
         selected: () => sidetabSelected,
         switchSession: async (row) => {
+          if (toggleWorkspaceRow(row)) { render(); return { ok: true, action: 'expand', target: row.id }; }
           if (!row.sessionId) return { error: '전환할 TUI 세션 id가 없습니다' };
           const index = sidetabRows.findIndex((item) => item.id === row.id);
           if (index < 0) return { error: '세션 목록이 갱신되어 전환을 취소했습니다' };
@@ -815,11 +849,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             return { ok: true, action: 'switch', target: row.id, scheduled: 'after-turn' };
           }
           sidetabSelected = index;
-          await switchSidetabSession(row.sessionId);
+          await switchSidetabSession(row.sessionId, row.ptyId);
           render();
           return { ok: true, action: 'switch', target: row.id };
         },
-        attach: async (row) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.select(row); render(); return { ok, action: 'attach', target: row.id }; },
+        attach: async (row) => {
+          if (toggleWorkspaceRow(row)) { render(); return { ok: true, action: 'expand', target: row.id }; }
+          await ensureSidetabAttachments();
+          const ok = sidetabAttachments!.select(row);
+          render();
+          return { ok, action: 'attach', target: row.id };
+        },
         detach: () => { if (sidetabAttachments?.hasRemoteView()) sidetabAttachments.showMain(); else if (sidetabAttachments?.hasModal()) { sidetabAttachments.handleKey({ name: '\\', ctrl: true, shift: false, raw: '' }); sidetabAttachments.handleKey({ name: 'd', ctrl: false, shift: false, raw: 'd' }); } render(); return { ok: true, action: 'detach' }; },
         spawn: async (character) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.spawn(character); refreshSidetabRows(); render(); return { ok, action: 'new', character }; },
         runMission: async (agent, mission) => { await ensureSidetabAttachments(); const result = await sidetabAttachments!.runMission(agent, mission); refreshSidetabRows(); render(); return result; },
@@ -910,7 +950,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           if (sidetabRows.length > 0) {
             const delta = key.name === 'up' ? -1 : 1;
             sidetabSelected = (sidetabSelected + delta + sidetabRows.length) % sidetabRows.length;
-            if (sidetabRows[sidetabSelected]!.kind === 'tui') await switchSidetabSession();
+            if (sidetabRows[sidetabSelected]!.kind === 'workspace') {
+              // Workspace parents are toggled with Enter; arrow selection never routes them to PTY attach.
+            } else if (sidetabRows[sidetabSelected]!.kind === 'tui') await switchSidetabSession(sidetabRows[sidetabSelected]!.sessionId, sidetabRows[sidetabSelected]!.ptyId);
             else {
               await ensureSidetabAttachments();
               sidetabAttachments?.select(sidetabRows[sidetabSelected]!);
@@ -1033,7 +1075,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const next = sidetabApi!.applySidetabKey({ open: sidetabOpen, selected: sidetabSelected }, key.name, sidetabRows.length);
         sidetabSelected = next.selected;
         if (sidetabRows[sidetabSelected]) {
-          if (sidetabRows[sidetabSelected]!.kind === 'tui') await switchSidetabSession();
+          if (sidetabRows[sidetabSelected]!.kind === 'workspace') { /* Workspace parents have no PTY target. */ }
+          else if (sidetabRows[sidetabSelected]!.kind === 'tui') await switchSidetabSession(sidetabRows[sidetabSelected]!.sessionId, sidetabRows[sidetabSelected]!.ptyId);
           else {
             await ensureSidetabAttachments();
             sidetabAttachments?.select(sidetabRows[sidetabSelected]!);
@@ -1045,7 +1088,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       if (sidetabOpen && editor.text.length === 0 && key.name === 'enter') {
         const selected = sidetabRows[sidetabSelected];
         if (selected) {
-          if (selected.kind === 'tui') await switchSidetabSession();
+          if (toggleWorkspaceRow(selected)) {
+            // The workspace parent has no PTY target; refresh to show or hide its member rows.
+          } else if (selected.kind === 'tui') await switchSidetabSession(selected.sessionId, selected.ptyId);
           else {
             await ensureSidetabAttachments();
             sidetabAttachments?.select(selected);
@@ -1380,7 +1425,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           const args = submitted.slice(1).trim().split(/\s+/);
           const action = args[1]?.toLowerCase();
           if (action === 'help') {
-            activity.push('/side [open|close|off|on|all|new|kill|help] · /sidetab 별칭', 'Ctrl+\\ 후 s=사이드탭 · p=부모 · 1–9=선택 · Esc=입력 · 목록 클릭=전환');
+            activity.push('/side [open|close|off|on|all|workspaces|new|kill|help] · /sidetab 별칭', 'Ctrl+\\ 후 s=사이드탭 · p=부모 · 1–9=선택 · Esc=입력 · 목록 클릭=전환');
             status = 'Enter 전송';
           } else if (action === 'off') {
             const restoreOpen = sidetabOpen;
@@ -1401,11 +1446,20 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           } else if (action === 'close') {
             if (sidetabOpen) await toggleSidetab();
           } else if (action === 'all') {
-            sidetabAll = !sidetabAll;
+            expandedWorkspaceIds.clear();
+            const nextViewMode: 'current' | 'all' = sidetabViewMode === 'all' ? 'current' : 'all';
+            sidetabViewMode = nextViewMode;
             sidetabEnabled = true;
             if (!sidetabOpen) await toggleSidetab();
             else refreshSidetabRows();
-            status = sidetabAll ? '사이드탭 전체 목록' : '사이드탭 현재 세션 목록';
+            status = nextViewMode === 'all' ? '사이드탭 전체 목록' : '사이드탭 현재 세션 목록';
+          } else if (action === 'workspaces') {
+            expandedWorkspaceIds.clear();
+            sidetabViewMode = sidetabViewMode === 'workspaces' ? 'current' : 'workspaces';
+            sidetabEnabled = true;
+            if (!sidetabOpen) await toggleSidetab();
+            else refreshSidetabRows();
+            status = sidetabViewMode === 'workspaces' ? '사이드탭 미션·하니스 워크스페이스' : '사이드탭 현재 세션 목록';
           } else if (action === 'kill') {
             if (!sidetabApi) sidetabApi = await import('./sidetab/list.js');
             refreshSidetabRows();

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -398,6 +399,16 @@ describe('next TUI sidetab attachments', () => {
   test('starts both visible agent PTYs before dispatch and routes both files through pair synthesis', async () => {
     const events: string[] = [];
     const cwd = mkdtempSync(join(tmpdir(), 'sidetab-pair-'));
+    writeFileSync(join(cwd, 'codex.md'), 'codex base\n');
+    writeFileSync(join(cwd, 'claude.md'), 'claude base\n');
+    execFileSync('git', ['-C', cwd, 'init', '--quiet']);
+    execFileSync('git', ['-C', cwd, 'add', 'codex.md', 'claude.md']);
+    execFileSync('git', ['-C', cwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--quiet', '-m', 'base']);
+    const baseSha = execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const candidate = (agent: 'codex' | 'claude', file: string, before: string) =>
+      `# ${agent}\n<SIDETAB-CANDIDATE-V1 base-sha="${baseSha}">\n` +
+      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-${before}\n+# ${agent}\n` +
+      '</SIDETAB-CANDIDATE-V1>';
     let releaseCodex: () => void = () => {};
     const codexGate = new Promise<void>((resolve) => { releaseCodex = resolve; });
     let markClaudeStarted: () => void = () => {};
@@ -413,8 +424,11 @@ describe('next TUI sidetab attachments', () => {
       visibleMissionRunner: async ({ agent, mission, outputPath }): Promise<VisibleMissionResult> => {
         events.push(`run:${agent}:${mission}`);
         if (agent === 'codex') await codexGate;
-        else markClaudeStarted();
-        return { ok: true, path: outputPath, content: `# ${agent}`, firstLine: `# ${agent}`, promptReady: true, missionVisible: true, promptReturned: true, completionMarker: true };
+        else if (agent === 'claude') markClaudeStarted();
+        else throw new Error(`unexpected pair agent: ${agent}`);
+        const pairAgent = agent;
+        const content = candidate(pairAgent, `${pairAgent}.md`, `${pairAgent} base`);
+        return { ok: true, path: outputPath, content, firstLine: content.split('\n')[0], promptReady: true, missionVisible: true, promptReturned: true, completionMarker: true };
       },
     });
 
@@ -432,7 +446,7 @@ describe('next TUI sidetab attachments', () => {
       expect(events.slice(0, 2)).toEqual(['spawn:codex', 'spawn:claude']);
       expect(events.slice(2)).toEqual(['run:codex:implement', 'run:claude:review']);
       const result = pair as { ok: boolean; pair: string; finalFile: string; graph: Array<{ id: string; state: string; resultFile?: string }> };
-      expect(result).toMatchObject({ ok: true, pair: 'codex+claude', graph: [
+      expect(result).toMatchObject({ pair: 'codex+claude', graph: [
         { id: 'plan', state: 'complete' },
         { id: 'codex', state: 'complete' },
         { id: 'claude', state: 'complete' },

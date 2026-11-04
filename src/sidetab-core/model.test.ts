@@ -38,6 +38,122 @@ describe('renderer-independent sidetab model and actions', () => {
     expect(legacyMine.filter((row) => row.kind === 'agent')).toHaveLength(10);
   });
 
+  test('SIDETAB-WORKSPACES: groups mission and harness PTYs by space and expands to selectable rows', () => {
+    const manifest = [
+      manifestRow({ id: 'mission:agent', kind: 'agent', spaceId: 'mission-1', spaceKind: 'solve-mission', runId: 'mission-run', parentPtyId: 'tui:11', nickname: 'mission agent', instance: 'project' }),
+      manifestRow({ id: 'mission:tool', kind: 'agent', spaceId: 'mission-1', spaceKind: 'solve-mission', runId: '', parentPtyId: 'tui:11', nickname: 'mission tool', instance: 'project' }),
+      manifestRow({ id: 'run:agent', kind: 'agent', runId: 'run-1', spaceId: 'harness-1', spaceKind: 'self-implement', parentPtyId: 'tui:11', nickname: 'harness child', instance: 'project' }),
+    ];
+    const collapsed = sidetabRowsFromManifest(manifest, 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
+    expect(collapsed.map(({ id, status }) => [id, status])).toEqual([
+      ['workspace:mission-1', 'mission-workspace'],
+      ['workspace:harness-1', 'harness-workspace'],
+    ]);
+    const expanded = sidetabRowsFromManifest(manifest, 'project', undefined, {
+      mode: 'workspaces', expandedWorkspaceIds: ['workspace:mission-1', 'workspace:harness-1'],
+    });
+    expect(expanded.map(({ id, kind, nestDepth }) => [id, kind, nestDepth ?? 0])).toEqual([
+      ['workspace:mission-1', 'workspace', 0],
+      ['mission:agent', 'agent', 1],
+      ['mission:tool', 'agent', 1],
+      ['workspace:harness-1', 'workspace', 0],
+      ['run:agent', 'agent', 1],
+    ]);
+    expect(formatSidetabLines(expanded, 0, 28)[0]).toContain('워크스페이스');
+  });
+
+  test('SIDETAB-WORKSPACES keeps same member labels distinct by space id', () => {
+    const manifest = [
+      manifestRow({ id: 'member:a', spaceId: 'space-a', spaceKind: 'solve-mission', nickname: 'same-member', parentPtyId: 'tui:root' }),
+      manifestRow({ id: 'member:b', spaceId: 'space-b', spaceKind: 'solve-mission', nickname: 'same-member', parentPtyId: 'tui:root' }),
+    ];
+    const grouped = sidetabRowsFromManifest(manifest, 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
+    expect(grouped.map(({ id, label }) => [id, label])).toEqual([
+      ['workspace:space-a', '미션 · space-a'],
+      ['workspace:space-b', '미션 · space-b'],
+    ]);
+  });
+
+  test('SIDETAB-WORKSPACES exposes 5×40 tabs, promotes attention, filters members, and keeps the viewport height bounded', () => {
+    const manifest = Array.from({ length: 5 * 40 }, (_, index) => manifestRow({
+      id: `workspace-${Math.floor(index / 40)}:tab-${index % 40}`,
+      kind: 'agent',
+      spaceId: `workspace-${Math.floor(index / 40)}`,
+      spaceKind: Math.floor(index / 40) === 0 ? 'solve-mission' : 'self-implement',
+      nickname: `tab-${index}`,
+      parentPtyId: 'tui:root',
+    }));
+    const expandedWorkspaceIds = Array.from({ length: 5 }, (_, index) => `workspace:workspace-${index}`);
+    const runState = (row: PtyManifestRow) => ({ turn: 'idle', stale: row.id === 'workspace-2:tab-1' });
+    const expanded = sidetabRowsFromManifest(manifest, 'project', runState, {
+      mode: 'workspaces', expandedWorkspaceIds,
+    });
+
+    expect(expanded).toHaveLength(205);
+    expect(expanded.filter((row) => row.kind === 'workspace')).toHaveLength(5);
+    expect(expanded.filter((row) => row.nestDepth === 1)).toHaveLength(200);
+    expect(expanded.find((row) => row.id === 'workspace:workspace-2')).toMatchObject({ attention: true, badge: 'stale' });
+    expect(expanded.some((row) => row.kind === 'overflow')).toBe(false);
+    expect(formatSidetabLines(expanded, 0, 80, 20)).toHaveLength(20);
+
+    const filtered = sidetabRowsFromManifest(manifest, 'project', runState, {
+      mode: 'workspaces', expandedWorkspaceIds, filters: ['status:stale', 'label:tab-81'],
+    });
+    expect(filtered.map((row) => row.id)).toEqual([
+      'workspace:workspace-2', 'workspace-2:tab-1',
+    ]);
+
+    const parentMatch = sidetabRowsFromManifest(manifest, 'project', runState, {
+      mode: 'workspaces', expandedWorkspaceIds: ['workspace:workspace-3'], filters: ['id:workspace:workspace-3'],
+    });
+    expect(parentMatch).toHaveLength(1);
+    expect(parentMatch[0]).toMatchObject({ id: 'workspace:workspace-3', sessionId: '40 항목', badge: 'unknown' });
+
+    const parentStatusMatch = sidetabRowsFromManifest(manifest, 'project', runState, {
+      mode: 'workspaces', expandedWorkspaceIds: [], filters: ['status:harness-workspace'],
+    });
+    expect(parentStatusMatch.filter((row) => row.kind === 'workspace')).toHaveLength(4);
+    expect(parentStatusMatch.find((row) => row.id === 'workspace:workspace-2')).toMatchObject({ sessionId: '40 항목', badge: 'stale', attention: true });
+  });
+
+  test('SIDETAB-WORKSPACES does not truncate an expanded list above 256 rows', () => {
+    const manifest = Array.from({ length: 300 }, (_, index) => manifestRow({
+      id: `large-space:tab-${index}`,
+      spaceId: 'large-space',
+      spaceKind: 'self-implement',
+      nickname: `tab-${index}`,
+      parentPtyId: 'tui:root',
+    }));
+    const rows = sidetabRowsFromManifest(manifest, 'project', undefined, {
+      mode: 'workspaces', expandedWorkspaceIds: ['workspace:large-space'],
+    });
+    expect(rows).toHaveLength(301);
+    expect(rows.at(-1)?.id).toBe('large-space:tab-299');
+    expect(rows.some((row) => row.kind === 'overflow')).toBe(false);
+  });
+
+  test('SIDETAB-WORKSPACES keeps mixed kinds unclassified regardless of member order', () => {
+    const kinds = ['solve-mission', 'self-implement', 'self-implement'] as const;
+    const permutations = [kinds, [kinds[1], kinds[0], kinds[2]], [kinds[1], kinds[2], kinds[0]]];
+    for (const [index, order] of permutations.entries()) {
+      const grouped = sidetabRowsFromManifest(order.map((spaceKind, member) => manifestRow({
+        id: `member:${index}:${member}`, spaceId: `space-${index}`, spaceKind, parentPtyId: 'tui:root',
+      })), 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
+      expect(grouped[0]).toMatchObject({
+        id: `workspace:space-${index}`, label: `워크스페이스 · space-${index}`, status: 'workspace-unclassified',
+      });
+    }
+  });
+
+  test('SIDETAB-WORKSPACES explicitly leaves legacy rows with no kind unclassified', () => {
+    const grouped = sidetabRowsFromManifest([
+      manifestRow({ id: 'legacy:member', spaceId: 'legacy-space', spaceKind: '', parentPtyId: 'tui:root' }),
+    ], 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
+    expect(grouped).toEqual([expect.objectContaining({
+      id: 'workspace:legacy-space', label: '워크스페이스 · legacy-space', status: 'workspace-unclassified',
+    })]);
+  });
+
   test('SIDETAB-HARNESS-CHILD-TABS: groups 50 runs, orders attention, filters metadata, expands children and read-only Pod rows, and caps tabs', () => {
     const manifest: PtyManifestRow[] = [];
     const harnessRuns = Array.from({ length: 50 }, (_, index) => ({

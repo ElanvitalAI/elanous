@@ -153,6 +153,26 @@ export function decideSpawn({ seat, running, caps, gate, injectedCap }: SpawnBud
     : { allow: false, reason: 'seat-cap', cap };
 }
 
+export type ResourceAdmissionVerdict = 'allow' | 'deny' | 'unmeasured';
+export interface ResourceAdmissionDecision {
+  verdict: ResourceAdmissionVerdict;
+  reason: 'resource-headroom' | 'pool-headroom-empty' | 'host-load-saturated' | 'resource-input-unmeasured';
+}
+
+/** Shadow-only resource signal. `hostLoad` is one-minute load normalized by logical cores. */
+export function decideResourceAdmission(input: {
+  poolHeadroom: number | null | undefined;
+  hostLoad: number | null | undefined;
+}): ResourceAdmissionDecision {
+  const { poolHeadroom, hostLoad } = input;
+  if (!Number.isSafeInteger(poolHeadroom) || poolHeadroom === null || poolHeadroom === undefined || poolHeadroom < 0
+    || typeof hostLoad !== 'number' || !Number.isFinite(hostLoad) || hostLoad < 0)
+    return { verdict: 'unmeasured', reason: 'resource-input-unmeasured' };
+  if (poolHeadroom === 0) return { verdict: 'deny', reason: 'pool-headroom-empty' };
+  if (hostLoad >= 1) return { verdict: 'deny', reason: 'host-load-saturated' };
+  return { verdict: 'allow', reason: 'resource-headroom' };
+}
+
 /** SEAT-CAP-STALE: why a run or a queue row is left out of a seat's running count (counting only — nothing is stopped). */
 export type SeatCapExclusionReason = 'stale' | 'soft-stopped' | 'unknown-seat' | 'dead-row';
 export const SEAT_CAP_STALE_RUN_MINUTES = 30;

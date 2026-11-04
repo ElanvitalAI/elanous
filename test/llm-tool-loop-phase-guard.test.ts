@@ -22,6 +22,7 @@ import {
 } from '../src/llm.js';
 import { ACTION_PHASE_OPS_TOOLS } from '../src/llm/tool-loop-steered-rejection.js';
 import { LEDGER_CLI_NATIVE_TOOL } from '../src/skills/tools/shell.js';
+import { clearPendingUserInput, drainPendingUserInput, enqueuePendingUserInput } from '../src/session/pending-input.js';
 
 const phases: Array<{
   phase: ToolLoopFollowupPhase;
@@ -799,5 +800,44 @@ describe('SUBAGENT-NO-NARROWING ④ incident 10-22 — ListDir show_hidden rejec
     expect(dispatched).toEqual(['Bash', 'ListDir', 'ListDir']);
     const results = toolResults(capturedMessagesAt(2)).slice(-2);
     expect(results.every((block) => !String(block.content).includes('REPAIR ACTION REQUIRED'))).toBe(true);
+  });
+});
+
+describe('fresh user interjection after a failed tool', () => {
+  test('clears the prior repair gate so schedule_manage runs without widening the repair allowlist', async () => {
+    const dispatched: string[] = [];
+    const sessionId = `repair-interjection-${Date.now()}`;
+    enqueuePendingUserInput(sessionId, 'schedule weekly topic collection');
+    const scheduleCall = { id: 'schedule', name: 'schedule_manage', args: { action: 'create', name: 'weekly topic collection' } };
+    expect(getToolLoopPhaseRejectedCalls('repair-action', [scheduleCall]).map((call) => call.name)).toEqual(['schedule_manage']);
+
+    const { provider, capturedMessagesAt } = scriptedProvider([
+      [{ type: 'tool_call', id: 'fail', name: 'Bash', args: { command: 'bun test broken.test.ts' } }],
+      [{ type: 'tool_call', ...scheduleCall }],
+      [{ type: 'text', delta: 'scheduled' }],
+    ]);
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'repair the failing test' }],
+      {
+        onText() {},
+        dispatchTool: async (name) => {
+          dispatched.push(name);
+          return name === 'Bash' ? { output: '1 failed', exitCode: 1, outcome: 'exit' } : { ok: true };
+        },
+      },
+      {
+        provider,
+        tools: [...TOOLS, { name: 'schedule_manage', description: 'd', parameters: { type: 'object' } }],
+        maxTurns: 30,
+        sessionId,
+        drainPendingUserInput: () => drainPendingUserInput(sessionId),
+      },
+    );
+
+    expect(result).toContain('scheduled');
+    expect(dispatched).toEqual(['Bash', 'schedule_manage']);
+    expect(capturedMessagesAt(1)?.some((message) => typeof message.content === 'string' && message.content.includes('<user_query>'))).toBe(true);
+    expect(toolResults(capturedMessagesAt(2)).every((block) => !String(block.content).includes('REPAIR ACTION REQUIRED'))).toBe(true);
+    clearPendingUserInput(sessionId);
   });
 });

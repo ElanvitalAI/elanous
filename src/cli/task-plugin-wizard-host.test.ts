@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { pluginWizardQuestions } from '../graph-wizard/mission-compose.js';
+import type { PluginMaker, PluginWizardPairDecomposition } from '../graph-wizard/mission-compose.js';
 import { registerTasksCommands } from './tasks-cli.js';
 import type { AskUserQuestionRequest } from '../ask-user-question/types.js';
 import { createTaskPluginWizardHostDeps } from './task-plugin-wizard-host.js';
@@ -138,7 +139,7 @@ describe('task plugin wizard host adapters', () => {
     const claudePath = join(workspace, 'claude-plugin');
     mkdirSync(codexPath, { recursive: true });
     mkdirSync(claudePath, { recursive: true });
-    let request: { makers: readonly string[]; prompt: string } | undefined;
+    let request: { makers: readonly PluginMaker[]; prompt: string; decomposition: PluginWizardPairDecomposition } | undefined;
     const deps = createTaskPluginWizardHostDeps({
       runMissionPair: async (value) => {
         request = value;
@@ -154,12 +155,41 @@ describe('task plugin wizard host adapters', () => {
 
       expect(request?.makers).toEqual(['claude', 'codex']);
       expect(typeof request?.prompt).toBe('string');
+      expect(request?.decomposition).toMatchObject({
+        status: 'ready',
+        codex: { scope: expect.stringContaining('codex-candidate'), deliverables: expect.stringContaining('PLUGIN_SPEC=') },
+        claude: { scope: expect.stringContaining('claude-candidate'), deliverables: expect.stringContaining('PLUGIN_SPEC=') },
+      });
+      expect(request?.decomposition.codex.scope).not.toBe(request?.decomposition.claude.scope);
       expect(JSON.stringify(request)).toContain(workspace);
       expect(JSON.stringify(request)).toContain('PLUGIN_SPEC=<absolute plugin directory>');
       expect(result).toEqual({ codex: { spec: realpathSync(codexPath) } });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('isolates overlapping wizard runs under unique candidate roots in the same workroom', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'plugin-host-pair-concurrent-'));
+    const workspace = join(root, 'workroom');
+    const runs: Array<{ wizardId: string; decomposition: PluginWizardPairDecomposition }> = [];
+    const createDeps = (wizardId: string) => createTaskPluginWizardHostDeps({
+      wizardId,
+      runMissionPair: async ({ decomposition }) => { runs.push({ wizardId, decomposition }); return {}; },
+    });
+    try {
+      const inputs = { makers: ['claude', 'codex'] as const, goal: 'Build scenario simulation.', workspace };
+      await Promise.all([
+        createDeps('wizard-run-shared').developPair?.(inputs),
+        createDeps('wizard-run-shared').developPair?.(inputs),
+      ]);
+
+      expect(runs).toHaveLength(2);
+      const candidateRoots = runs.map(({ decomposition }) => decomposition.codex.scope);
+      expect(candidateRoots[0]).not.toBe(candidateRoots[1]);
+      expect(runs.every(({ wizardId }) => wizardId === 'wizard-run-shared')).toBe(true);
+      expect(runs.every(({ decomposition }) => decomposition.codex.scope.includes('wizard-run-shared-'))).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('the tasks hand CLI uses fake host adapters for missing-tool wizard without outbound sends', async () => {

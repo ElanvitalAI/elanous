@@ -238,6 +238,12 @@ export async function composeMissionGraph(input: MissionComposeInput, deps: Miss
 
 export type PluginMaker = 'claude' | 'codex';
 
+export interface PluginWizardPairDecomposition {
+  status: 'ready';
+  codex: { scope: string; deliverables: string; dependsOn: string };
+  claude: { scope: string; deliverables: string; dependsOn: string };
+}
+
 export interface PluginWizardInput {
   /** The one-line mission the sub-assistant is working on. */
   mission: string;
@@ -303,7 +309,7 @@ export interface PluginWizardDeps {
   searchMarket?: (request: { missing: string; mission: string; query: string }) => Promise<PluginMarketSearchResult>;
   /** Side-tab maker contract (Claude Code / Codex): same goal text, same session workroom. */
   develop?: (request: { maker: PluginMaker; goal: string; workspace: string }) => Promise<{ spec: string }>;
-  /** Optional classic pair seam: one paired launch returns both maker artifacts from the same workroom. */
+  /** Optional classic pair seam: dispatches distinct maker briefs and returns both artifacts from the shared workroom. */
   developPair?: (request: { makers: readonly PluginMaker[]; goal: string; workspace: string }) => Promise<Partial<Record<PluginMaker, { spec: string }>>>;
   /** Resolved CLI path per maker; absent means the caller's `develop` owns it. */
   makerCli?: Partial<Record<PluginMaker, string>>;

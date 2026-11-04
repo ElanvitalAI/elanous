@@ -288,6 +288,7 @@ export function createSidetabAttachmentController(deps: {
     remoteHost = row.remoteHost ?? null;
     const host = remoteHost;
     const id = row.ptyId;
+    deps.logEvent?.('sidetab.remote', 'attach-request', { ptyId: id, host });
     const token = ++remoteAttachmentToken;
     const isCurrentAttachment = (): boolean => remotePtyId === id && remoteHost === host && remoteAttachmentToken === token;
     const refresh = async (): Promise<void> => {

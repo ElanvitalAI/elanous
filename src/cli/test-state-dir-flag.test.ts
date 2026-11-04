@@ -5,9 +5,10 @@
  * 여기서는 분기 코어(플래그 추출·config-dir 강제·state env)를 고정한다.
  */
 import { afterEach, describe, expect, it } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { applyTestStateDirFlagFromArgv, extractTestStateDirFlag } from './test-state-dir-flag.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -52,6 +53,29 @@ describe('applyTestStateDirFlagFromArgv — ISO-2 완전 분기', () => {
     applyTestStateDirFlagFromArgv();
     expect(getElanousConfigDirOverride()).toBe(dir);
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('명시한 test root가 오래된 부모 stamp를 덮어 자식 TUI 도구에 전파한다', () => {
+    const inherited = mkdtempSync(join(tmpdir(), 'elanous-testflag-parent-'));
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-testflag-child-'));
+    try {
+      process.env.ELANOUS_STATE_DIR = inherited;
+      process.argv = ['bun', 'index.ts', '--test-state-dir', dir, 'nexus', 'run'];
+
+      applyTestStateDirFlagFromArgv();
+
+      expect(process.env.ELANOUS_STATE_DIR).toBe(dir);
+      expect(getElanousConfigDirOverride()).toBe(dir);
+      const cli = resolve(import.meta.dir, '../../bin/elanous.mjs');
+      const child = spawnSync(process.execPath, [cli, 'where', '--json'], {
+        cwd: process.cwd(), env: process.env, encoding: 'utf8', timeout: 15_000,
+      });
+      expect(child.status).toBe(0);
+      expect(JSON.parse(child.stdout).actualRoot).toBe(dir);
+    } finally {
+      rmSync(inherited, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('플래그 없으면 아무것도 안 바꾼다', () => {

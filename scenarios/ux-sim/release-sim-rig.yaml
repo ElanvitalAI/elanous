@@ -3,8 +3,8 @@ kind: release-graph
 id: release-sim-rig-0241
 isolation: test
 input:
-  version: '0.2.41'
-  previousVersion: '0.2.40'
+  version: '0.3.1'
+  previousVersion: '0.3.0'
 cases:
   - id: baseline-full-graph
     mode: baseline
@@ -129,3 +129,9 @@ cases:
       status: done
       mustVisit: [gate, known-issues, publish, npm-publish, verify, done]
       mustNotVisit: [gate-triage, failed]
+  - id: append-receipt-set-absent-and-continuous-radius
+    mode: append-receipt-continuity
+    expect:
+      status: done
+      mustVisit: [cut, gate-cut, append-a, resume-a, gate-a, append-b, resume-b, gate-b, publish, done]
+      mustNotVisit: [failed]

@@ -171,7 +171,8 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
       provider = typeof setupResult === 'string' ? setupResult : null;
       if (!provider) {
         print('LLM 없이 첫 화면을 엽니다. LLM 기능은 사용할 수 없습니다. 다시 설정: `elanous setup keys` 또는 `elanous login openai-codex`.');
-        (deps.saveConfig ?? saveUserConfig)({ ...cfg, onboarding: { ...cfg.onboarding, ready: true } }, path);
+        // Skipping provider setup keeps this invocation reachable, but it must
+        // not persist `ready`: a later bare launch still needs web-first setup.
         observe('ready', inputs);
         return { outcome: 'ready', inputs };
       }
@@ -191,7 +192,13 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
         env: deps.env,
       }, deps.getSecretAsync)
     : undefined;
+  // OAuth and agent-CLI credentials are discovered above, outside the API-key
+  // resolver. A user who picked one of those detected subscriptions has a
+  // usable provider even when no API key exists; sending them into key setup
+  // would contradict the subscription choice and prompt for an irrelevant key.
+  const selectedSubscription = subscriptions.some((item) => item.provider === provider);
   if (inputs === 1 && credential?.source === 'none'
+    && !selectedSubscription
     && !(providerSetUpInPlace && provider === 'openai-codex')) {
     if ((deps.isTTY ?? process.stdin.isTTY) !== true) return needsLlm(inputs);
     try {

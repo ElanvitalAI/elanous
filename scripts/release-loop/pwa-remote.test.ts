@@ -1,15 +1,16 @@
 // RELEASE-PWA-NODE-RESILIENCE ① — the pwa node runs its suite on an SSH host and the host's JSON reaches the ledger.
 // Device: `withFakeBins` (src/ux-sim/fake-bin.ts) — a fake `ssh` and a fake `git push`; every other git call is real.
 import { expect, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withFakeBins } from '../../src/ux-sim/fake-bin.js';
 import { pwaNodeArgs } from './node-verdict.js';
 import { checkPwaRemote, PWA_REMOTE_LIMIT_SECONDS, PWA_REMOTE_TIMEOUT_MS, remoteRunScript, runPwaRemote, type PwaRemoteSpawn } from './pwa-remote.js';
 import { buildReleaseRunInput } from './unattended-release.js';
-import { parseArgs } from './pwa-scenarios-node.js';
+import { parseArgs, releasePwaNodeEnvironment } from './pwa-scenarios-node.js';
 
 const REPO = join(import.meta.dir, '../..');
 const REAL_GIT = Bun.which('git')!;
@@ -19,6 +20,85 @@ const HOST_JSON = JSON.stringify({ verdict: 'flaky', commit: SHA, withCostly: tr
   { id: 'N5a', first: 'pass', reruns: [], final: 'pass' },
 ] });
 const fakeGitPush = { whenArgsStartWith: ['push'], otherwise: REAL_GIT };
+
+test('release PWA node defaults the CDP attach budget to 30s and preserves a valid override', () => {
+  expect(releasePwaNodeEnvironment({ PATH: '/bin' })).toMatchObject({ ELANOUS_CDP_ATTACH_TIMEOUT_MS: '30000' });
+  expect(releasePwaNodeEnvironment({ PATH: '/bin', ELANOUS_CDP_ATTACH_TIMEOUT_MS: '45000' }))
+    .toMatchObject({ ELANOUS_CDP_ATTACH_TIMEOUT_MS: '45000' });
+  expect(releasePwaNodeEnvironment({ PATH: '/bin', ELANOUS_CDP_ATTACH_TIMEOUT_MS: 'invalid' }))
+    .toMatchObject({ ELANOUS_CDP_ATTACH_TIMEOUT_MS: '30000' });
+});
+
+test('PWA node entrypoint passes default, valid override, and invalid-value fallback to fake child CLI', async () => {
+  const commit = spawnSync(REAL_GIT, ['rev-parse', 'HEAD'], { cwd: REPO, encoding: 'utf8' }).stdout.trim();
+  const runNode = async (configured: string | undefined): Promise<{ verdict: string; timeouts: string[] }> => {
+    const root = mkdtempSync(join(tmpdir(), 'pwa-node-env-entry-'));
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const capture = join(root, 'child-env.tsv');
+    const fakeBun = join(bin, 'bun');
+    writeFileSync(fakeBun, [
+      '#!/bin/sh',
+      `printf '%s\\t%s\\n' "\${ELANOUS_CDP_ATTACH_TIMEOUT_MS-}" "$*" >> "$PWA_TEST_CAPTURE"`,
+      'case "$*" in',
+      '  *"nexus run --test --stop"*) exit 0 ;;',
+      '  *"nexus run --test"*) printf \'nexus :%s\\n\' "$PWA_TEST_PORT" ;;',
+      '  *"nexus build"*) exit 0 ;;',
+      '  *"createScenarios"*) printf \'[{"id":"PWA-TEST","costly":false}]\\n\' ;;',
+      '  *"scripts/pwa-scenarios.ts"*) printf \'{"results":[{"id":"PWA-TEST","pass":true}]}\\n\' ;;',
+      '  *) printf \'unexpected fake bun: %s\\n\' "$*" >&2; exit 2 ;;',
+      'esac',
+      '',
+    ].join('\n'));
+    chmodSync(fakeBun, 0o755);
+    const server = createServer((_request, response) => { response.writeHead(200).end('ok'); });
+    let listening = false;
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => { listening = true; resolve(); });
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('fake PWA server did not bind a port');
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      NODE_ENV: 'test',
+      TMPDIR: root,
+      PWA_TEST_CAPTURE: capture,
+      PWA_TEST_PORT: String(address.port),
+    };
+    if (configured === undefined) delete env.ELANOUS_CDP_ATTACH_TIMEOUT_MS;
+    else env.ELANOUS_CDP_ATTACH_TIMEOUT_MS = configured;
+
+    try {
+      const child = spawn(process.execPath, [join(REPO, 'scripts/release-loop/pwa-scenarios-node.ts'), '--commit', commit, '--reruns', '0', '--json'],
+        { cwd: REPO, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+      const result = await new Promise<{ status: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`PWA node entrypoint timed out: ${stderr}`)); }, 30_000);
+        child.once('error', (error) => { clearTimeout(timer); reject(error); });
+        child.once('close', (status, signal) => { clearTimeout(timer); resolve({ status, signal }); });
+      });
+      if (result.status !== 0) throw new Error(`PWA node entrypoint failed: ${stdout}\n${stderr}`);
+      const verdict = JSON.parse(stdout.trim().split('\n').at(-1)!) as { verdict: string };
+      const timeouts = readFileSync(capture, 'utf8').trim().split('\n').map((line) => line.split('\t', 1)[0]!);
+      expect(timeouts.length).toBeGreaterThan(0);
+      return { verdict: verdict.verdict, timeouts };
+    } finally {
+      if (listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  for (const [configured, expected] of [[undefined, '30000'], ['45000', '45000'], ['invalid', '30000']] as const) {
+    const result = await runNode(configured);
+    expect(result.verdict).toBe('pass');
+    expect(new Set(result.timeouts)).toEqual(new Set([expected]));
+  }
+}, 60_000);
 
 test('remote run: ssh → push → one ssh run; the host JSON is the node output (executor host)', async () => {
   await withFakeBins({ ssh: { stdout: `[pwa-node] build ${SHA}\n${HOST_JSON}\n`, stderr: 'remote progress\n' }, git: fakeGitPush }, (bins) => {
@@ -159,9 +239,14 @@ test('remote script really runs: the limit stops a hung node, the temp clone and
     // A distinct sleep duration makes a surviving grandchild visible after the shell exits.
     await withFakeBins({ bun: { whenArgsStartWith: ['scripts/release-loop/pwa-scenarios-node.ts'], otherwise: '/usr/bin/true', sleepSeconds: 3777 }, mktemp: { stdout: `${join(tmp, 'pwa-node-remote-x')}\n` } }, (bins) => {
       mkdirSync(join(tmp, 'pwa-node-remote-x'));
+      const homeBunBin = join(root, '.bun', 'bin');
+      mkdirSync(homeBunBin, { recursive: true });
+      symlinkSync(bins.bin('bun'), join(homeBunBin, 'bun'));
+      symlinkSync(bins.bin('mktemp'), join(homeBunBin, 'mktemp'));
       const script = remoteRunScript({ commit: sha, mirror, withCostly: false, reruns: 0, limitSeconds: 2 });
       const started = Date.now();
       const run = spawnSync('sh', ['-c', script], { cwd: root, env: { ...bins.env, HOME: root, PATH: `${bins.dir}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin` }, encoding: 'utf8', timeout: 40_000 });
+      if (run.status !== 124) throw new Error(`remote limit returned ${run.status}; stdout=${run.stdout}; stderr=${run.stderr}`);
       expect(run.status).toBe(124);
       expect(Date.now() - started).toBeLessThan(30_000);
       expect(existsSync(join(tmp, 'pwa-node-remote-x'))).toBe(false);

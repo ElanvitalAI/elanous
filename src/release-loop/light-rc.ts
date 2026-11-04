@@ -11,6 +11,7 @@ import { runSelfGateCliAsync, type SelfGateCliOptions, type SelfGateCliResult } 
 import { dispatchHeavyCheck, isValidGateHost, type DispatchDeps, type DispatchOptions } from '../self-implement/gate-remote.js';
 import { latestPublishedPreviousVersion } from '../../scripts/release-loop/unattended-release.js';
 import { baseVersion, isReleaseVersion } from '../../scripts/release-loop/release-version.js';
+import type { GateOptions, GateResult, GateRunner } from '../../scripts/release-loop/gate-node.js';
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from '../../scripts/release-loop/tui-node-checks.js';
 
 export const LIGHT_RC_ALWAYS_FILE = 'release/light-rc-always.txt';
@@ -26,6 +27,8 @@ export interface LightRcOptions {
   head?: string;
   /** Gate host; absent = config gateRemote.host (the dispatch's own default). */
   remote?: string;
+  /** Compare the pre-recipe remote path; intentionally hidden from normal CLI help. */
+  legacySelfGate?: boolean;
   /** Run on this machine (the remote child is re-invoked with it). */
   local?: boolean;
   shards?: number;
@@ -74,6 +77,10 @@ export interface LightRcDeps {
   previousVersion?: (version: string, ledgerRoot?: string) => string;
   readFile?: (path: string) => string | undefined;
   runGate?: (cwd: string, options: SelfGateCliOptions) => SelfGateCliResult | Promise<SelfGateCliResult>;
+  /** Release gate recipe seam for explicitly selected remote rehearsal hosts. */
+  runFormalHostGate?: (options: GateOptions, runner?: GateRunner) => Promise<GateResult>;
+  /** Optional runner injection for tests that exercise judgeGate itself without remote side effects. */
+  formalHostGateRunner?: GateRunner;
   dispatch?: (opts: DispatchOptions, deps?: DispatchDeps) => Promise<number>;
   /** Extra dispatch deps (runner · settings) — tests drive the real dispatch with a fake host. */
   dispatchDeps?: Omit<DispatchDeps, 'write'>;
@@ -189,6 +196,46 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
     return parseAlwaysIncludeList(text);
   };
   let alwaysInclude = readList(cwd);
+
+  // A named remote rehearsal must measure with the release graph's host gate recipe. The public light-rc result shape
+  // stays the same; only its execution path changes. Host gate shard assignment is currently the graph's four groups.
+  if (opts.remote !== undefined && !opts.legacySelfGate) {
+    if (shards !== LIGHT_RC_DEFAULT_SHARDS) return {
+      version, base, measuredCommit, worktreeHead, importerTests: null, introduced: null, preexisting: null,
+      unclassified: null, alwaysInclude: alwaysInclude.length, alwaysIncludeMissing: [], shards, remote: opts.remote,
+      gateExitCode: 2, ok: false, unmeasured: 'host-gate-shard-contract-mismatch',
+    };
+    const resolvedBase = (deps.git ?? defaultGit)(['rev-parse', '--verify', '--quiet', `${base}^{commit}`], cwd);
+    const base40 = resolvedBase.stdout.trim();
+    if (resolvedBase.rc !== 0 || !SHA_RE.test(base40)) throw new Error(`release light-rc: --base does not resolve to a commit (${base})`);
+    const scratch = mkdtempSync(join(tmpdir(), 'elanous-light-rc-host-gate-'));
+    try {
+      const previous = (() => { try { return (deps.previousVersion ?? latestPublishedPreviousVersion)(baseVersion(version), opts.ledgerRoot); } catch { return undefined; } })();
+      const options: GateOptions = {
+        commit: measuredCommit, version, baselineCommit: base40, ...(previous ? { baselineVersion: previous } : {}),
+        executor: 'host', remote: opts.remote, full: true, rehearsalTui: opts.rehearsalTui,
+        repo: cwd, instanceRoot: scratch, ledgerRoot: scratch,
+      };
+      const gate = deps.runFormalHostGate
+        ? await deps.runFormalHostGate(options, deps.formalHostGateRunner)
+        : await import('../../scripts/release-loop/gate-node.js').then(({ judgeGate }) => judgeGate(options, deps.formalHostGateRunner));
+      const unclassifiedCount = (gate.stalledShards?.length ?? 0) + (gate.unmeasuredErrors?.length ?? 0)
+        + (gate.unmeasuredRecheckFiles?.length ?? 0) + gate.stalledEnv.length;
+      const alwaysIncludeMissing = alwaysInclude.filter((path) => !existsSync(join(cwd, path)));
+      const rehearsalTui = opts.rehearsalTui ? gate.rehearsalTui ?? { outcome: 'unmeasured' as const, detail: 'release host gate runner did not return remote TUI evidence' } : undefined;
+      return {
+        version, base: base40, measuredCommit, worktreeHead, importerTests: null,
+        introduced: gate.outcome === 'error' ? null : gate.introduced.length,
+        preexisting: gate.outcome === 'error' ? null : gate.preexisting,
+        unclassified: gate.outcome === 'error' ? null : unclassifiedCount,
+        alwaysInclude: alwaysInclude.length, alwaysIncludeMissing, shards, remote: opts.remote,
+        gateExitCode: rehearsalTui && rehearsalTui.outcome !== 'ok' ? 2 : gate.outcome === 'ok' ? 0 : gate.outcome === 'regression' ? 1 : 2,
+        ok: gate.outcome === 'ok' && unclassifiedCount === 0 && (!rehearsalTui || rehearsalTui.outcome === 'ok'),
+        unmeasured: gate.outcome === 'error' ? gate.error ?? 'host-gate-unmeasured' : null,
+        ...(rehearsalTui ? { rehearsalTui } : {}),
+      };
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  }
 
   let local: SelfGateCliResult | undefined;
   let localTui: ExecutedTuiCheck | undefined;

@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
@@ -8,16 +8,20 @@ import { execFileSync } from 'node:child_process';
 import { listGraphRuns, runGraph, type GraphRunState } from '../graph-runner/runner.js';
 import { releaseResumeWaiver } from '../../scripts/release-loop/resume.js';
 import { runKnownIssues } from '../../scripts/release-loop/known-issues-node.js';
-import { graphGateResult, type GateResult } from '../../scripts/release-loop/gate-node.js';
+import { graphGateResult, judgeGate, type GateResult, type GateRunner } from '../../scripts/release-loop/gate-node.js';
 import { runNpmPublish } from '../../scripts/release-loop/npm-publish-node.js';
 import { runPublish } from '../../scripts/release-loop/publish-node.js';
 import { resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
 import { runAutoApprove } from '../../scripts/release-loop/auto-approve-node.js';
 import { runVerify } from '../../scripts/release-loop/verify-node.js';
 import { resolveScenarioFilePath } from './scenario.js';
+import { planGateReceiptRadius, reduceGateShardReceipts, type GateShardIdentity, type GateShardReceipt } from '../../scripts/release-loop/gate-shard-dispatch.js';
+import { inspectGateShardReceipts, type GateShardReceiptInspection } from '../../scripts/release-loop/gate-shard-receipts.js';
+import { gateEnvFingerprint, gateSourcePins } from '../../scripts/release-loop/gate-baseline-receipt.js';
 
 const REPOSITORY_ROOT = join(import.meta.dir, '../..');
 const RELEASE_GRAPH = join(REPOSITORY_ROOT, 'graphs/release/release-loop.yaml');
+const RECEIPT_SIM_NODE_IDS = ['cut', 'gate-cut', 'append-a', 'resume-a', 'gate-a', 'append-b', 'resume-b', 'gate-b', 'publish', 'done', 'failed'];
 let cachedCutTip: string | undefined;
 function cutTip(): string {
   // The sim command is registered for root help. Resolve Git only when a
@@ -29,10 +33,239 @@ function cutTip(): string {
 
 export interface ReleaseSimRigCase {
   id: string;
-  mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'gate-waive-introduced-regression' | 'owner-waive-missing-schema' | 'owner-waive-0246-fixture';
+  mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'gate-waive-introduced-regression' | 'owner-waive-missing-schema' | 'owner-waive-0246-fixture' | 'append-receipt-continuity';
   fault?: { node: string; outcome: 'fail' | 'error' | 'timeout'; evidence?: Record<string, unknown> };
   nodeOutcomes?: Record<string, { outcome: 'ok' | 'fail' | 'error'; delayMs?: number }>;
   expect: { status: 'done' | 'failed' | 'resume-refused'; mustVisit: string[]; mustNotVisit: string[]; overlap?: [string, string]; refusalIncludes?: string };
+}
+
+export interface ReleaseSimGateReceiptStage {
+  name: string;
+  commit: string;
+  selectedFiles: string[];
+  plan: { carriedShardIds: string[]; rerunShardIds: string[]; fullSweep: boolean };
+  receiptIds: string[];
+  aggregate: 'complete' | 'unmeasured';
+  formalReceiptDecision?: { kind: 'absent'; reason: 'formal-receipt-set-absent' };
+  formalGateRun?: { outcome: 'ok' | 'regression' | 'error'; formalReceiptDecision?: string; cutSweepCount: number; fullSweep: boolean; baselineVersion?: string };
+  gateOutcome: 'pass' | 'fail' | 'unmeasured';
+  publishDecision: 'eligible' | 'blocked';
+}
+
+/** Production receipt-radius planner seam. The optional final hook is reserved for p13's gate fault helper. */
+export function runReleaseSimGateReceiptSeam(input: {
+  tests: string[];
+  receipts: readonly GateShardReceipt[];
+  priorCommit: string;
+  commit: string;
+  selectedFiles: string[];
+  stage: string;
+  formalReceiptInspection?: GateShardReceiptInspection;
+  formalGateRun?: ReleaseSimGateReceiptStage['formalGateRun'];
+}, finalInjection?: (stage: ReleaseSimGateReceiptStage) => Pick<Partial<ReleaseSimGateReceiptStage>, 'gateOutcome'>): ReleaseSimGateReceiptStage {
+  const radius = planGateReceiptRadius({ receipts: input.receipts, tests: input.tests,
+    selectedFiles: input.selectedFiles, priorCommit: input.priorCommit });
+  const fullSweep = radius === null;
+  const carriedShardIds = fullSweep ? [] : radius.unchangedShardIds;
+  const rerunShardIds = fullSweep ? input.tests.map((_, index) => `pod-${index}`) : radius.invalidatedShardIds;
+  const shards: GateShardIdentity[] = input.tests.map((file, index) => ({ id: `pod-${index}`, files: [file] }));
+  const previousById = new Map(input.receipts.map((receipt) => [receipt.id, receipt]));
+  const nextReceipts = [
+    ...carriedShardIds.map((id) => {
+      const previous = previousById.get(id);
+      return previous ? { ...previous, head40: input.commit } : null;
+    }),
+    ...rerunShardIds.map((id) => {
+      const index = Number(id.slice(4));
+      const file = input.tests[index];
+      return file ? simulatedReceipt(id, file, input.commit) : null;
+    }),
+  ].filter((receipt): receipt is GateShardReceipt => receipt !== null);
+  const reduction = reduceGateShardReceipts({ head40: input.commit, base40: SIM_BASE_COMMIT, shards, receipts: nextReceipts });
+  const aggregate: ReleaseSimGateReceiptStage['aggregate'] = reduction.status;
+  const measuredOutcome: ReleaseSimGateReceiptStage['gateOutcome'] = reduction.status !== 'complete' ? 'unmeasured'
+    : reduction.failureIds.length || reduction.errorIds.length ? 'fail' : 'pass';
+  const formalGateOutcome: ReleaseSimGateReceiptStage['gateOutcome'] = input.formalGateRun?.outcome === 'regression' ? 'fail'
+    : input.formalGateRun?.outcome === 'error' ? 'unmeasured'
+      : !input.formalReceiptInspection ? 'pass'
+        : !input.formalGateRun ? 'unmeasured'
+          : input.formalReceiptInspection.kind === 'invalid'
+            || (input.formalReceiptInspection.kind === 'absent' && input.formalGateRun.formalReceiptDecision !== 'formal-receipt-set-absent')
+            || (input.formalReceiptInspection.kind === 'valid' && input.formalGateRun.formalReceiptDecision === 'formal-receipt-set-absent')
+            ? 'fail' : 'pass';
+  const combinedGateOutcome: ReleaseSimGateReceiptStage['gateOutcome'] = measuredOutcome === 'fail' || formalGateOutcome === 'fail' ? 'fail'
+    : measuredOutcome === 'unmeasured' || formalGateOutcome === 'unmeasured' ? 'unmeasured' : 'pass';
+  const planned: ReleaseSimGateReceiptStage = { name: input.stage, commit: input.commit,
+    selectedFiles: [...input.selectedFiles], plan: { carriedShardIds, rerunShardIds, fullSweep },
+    receiptIds: reduction.status === 'complete' ? reduction.receipts.map((receipt) => receipt.id) : [],
+    ...(input.formalGateRun ? { formalGateRun: input.formalGateRun } : {}),
+    ...(input.formalGateRun?.formalReceiptDecision === 'formal-receipt-set-absent'
+      ? { formalReceiptDecision: { kind: 'absent' as const, reason: input.formalGateRun.formalReceiptDecision } } : {}),
+    aggregate, gateOutcome: combinedGateOutcome, publishDecision: combinedGateOutcome === 'pass' ? 'eligible' : 'blocked' };
+  const injected = finalInjection?.(planned);
+  const gateOutcome = injected?.gateOutcome ?? planned.gateOutcome;
+  return { ...planned, ...injected, gateOutcome, publishDecision: gateOutcome === 'pass' ? 'eligible' : 'blocked' };
+}
+
+async function runProductionMissingReceiptGate(root: string, tests: string[], version: string, previousVersion: string): Promise<ReleaseSimGateReceiptStage['formalGateRun']> {
+  const repo = join(root, 'release-gate-fixture');
+  const instanceRoot = join(root, 'release-gate-instance');
+  const ledgerRoot = join(root, 'release-gate-ledger');
+  for (const path of [repo, instanceRoot, ledgerRoot]) rmSync(path, { recursive: true, force: true });
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(join(repo, 'docker/harness'), { recursive: true });
+  mkdirSync(join(repo, 'graphs/release'), { recursive: true });
+  writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'release-gate-sim', version }) + '\n');
+  writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  writeFileSync(join(repo, 'apps/pwa/package.json'), JSON.stringify({ name: 'release-gate-sim-pwa', version }) + '\n');
+  writeFileSync(join(repo, 'apps/pwa/bun.lock'), 'lockfileVersion = 1\n');
+  writeFileSync(join(repo, 'docker/harness/Dockerfile'), 'FROM ubuntu:24.04\n');
+  writeFileSync(join(repo, 'graphs/release/release-loop.yaml'), "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1 }\n");
+  writeFileSync(join(repo, 'graphs/release/recipes.yaml'), "gate:\n  command: 'bun scripts/release-loop/gate-node.ts --json'\n  timeout_ms: 14400000\n");
+  for (const file of tests) {
+    const path = join(repo, file);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, 'import { expect, test } from \'bun:test\'; test(\'simulated shard\', () => expect(true).toBe(true));\n');
+  }
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  git('init', '-q'); git('config', 'user.name', 'Release sim'); git('config', 'user.email', 'release-sim@example.invalid');
+  git('add', '.'); git('commit', '-qm', 'release simulation baseline');
+  const base = git('rev-parse', 'HEAD');
+  writeFileSync(join(repo, 'simulation-tip.txt'), 'append\n');
+  git('add', '.'); git('commit', '-qm', 'release simulation cut');
+  const commit = git('rev-parse', 'HEAD');
+  mkdirSync(join(instanceRoot, 'release', previousVersion), { recursive: true });
+  writeFileSync(join(instanceRoot, 'release', previousVersion, 'release.json'), JSON.stringify({ sourceCommit: base }));
+  const graphRunId = 'release-sim-formal-receipt-absent';
+  const pins = gateSourcePins(repo, commit);
+  if (!pins) throw new Error('release simulation gate graph pins unavailable');
+  mkdirSync(join(instanceRoot, 'graph-runs', 'release-loop'), { recursive: true });
+  writeFileSync(join(instanceRoot, 'graph-runs', 'release-loop', `${graphRunId}.json`), JSON.stringify({
+    graphId: 'release-loop', runId: graphRunId, graphSnapshot: { graphSha: pins.graphSha, recipeSha: pins.recipeSha },
+  }));
+  const cutSweeps: boolean[] = [];
+  const ok = { rc: 0, output: '' };
+  const runner: GateRunner = {
+    async command() { return ok; }, async localCommand() { return ok; },
+    async sweep(tree, _logDir, _pod, only) {
+      if (tree.endsWith('/cut')) cutSweeps.push(!only);
+      const count = only?.length ?? tests.length;
+      return { rc: 0, output: `${count} pass\n0 fail\nRan ${count} tests across ${count} files.\n` };
+    },
+    async add() {}, async remove() {}, async snapshot() {}, async removeSnapshot() {},
+  };
+  const previousConfig = getElanousConfigDirOverride();
+  if (previousConfig) resetElanousConfigDir();
+  try {
+    const runtime = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: gateEnvFingerprint(process.env),
+      baseImageDigest: 'sha256:' + 'd'.repeat(64) };
+    const result = await judgeGate({ commit, version, baselineVersion: previousVersion, baselineCommit: base, graphRunId,
+      repo, instanceRoot, ledgerRoot, pod: { pool: 'pool-test', shards: 1 } }, runner, () => SIM_IMAGE_DIGEST, () => ({ ...runtime, imageDigest: SIM_IMAGE_DIGEST }));
+    return { outcome: result.outcome, formalReceiptDecision: result.formalReceiptDecision, baselineVersion: previousVersion,
+      cutSweepCount: cutSweeps.length, fullSweep: cutSweeps.length === 1 && cutSweeps[0] === true };
+  } finally { if (previousConfig) setElanousConfigDir(previousConfig); }
+}
+
+const SIM_BASE_COMMIT = 'b'.repeat(40);
+const SIM_IMAGE_DIGEST = `sha256:${'a'.repeat(64)}`;
+const SIM_ENV_FINGERPRINT = 'c'.repeat(64);
+const SIM_RUNTIME_IDENTITY = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: SIM_ENV_FINGERPRINT,
+  baseImageDigest: `sha256:${'d'.repeat(64)}` };
+
+function simulatedReceipt(id: string, file: string, commit: string): GateShardReceipt {
+  return { id, files: [file], version: '0.3.1', graphSha: '0'.repeat(64), recipeSha: '1'.repeat(64),
+    graphEntry: 'release-sim-gate', recipeCommand: 'simulated gate receipt', recipeTimeoutMs: 1000,
+    head40: commit, base40: SIM_BASE_COMMIT, host: 'sim-host', imageDigest: SIM_IMAGE_DIGEST,
+    runtimeIdentity: SIM_RUNTIME_IDENTITY, envFingerprint: SIM_ENV_FINGERPRINT,
+    envKey: `${SIM_ENV_FINGERPRINT}:${SIM_IMAGE_DIGEST}`,
+    executions: [{ branch: 'test-release', attemptId: `sim-${id}-${commit.slice(0, 8)}`, host: 'sim-host',
+      imageDigest: SIM_IMAGE_DIGEST, runtimeIdentity: SIM_RUNTIME_IDENTITY }],
+    status: 'complete', failureIds: [], errorIds: [], evidencePath: `sim/${id}-${commit.slice(0, 8)}.json`,
+    evidenceSha256: '2'.repeat(64), measuredAt: '2026-11-04T00:00:00.000Z', attempt: 1 };
+}
+
+async function runAppendReceiptCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string): Promise<ReleaseSimRigCaseResult> {
+  const tests = Array.from({ length: 81 }, (_, index) => `test/shard-${String(index).padStart(2, '0')}.test.ts`);
+  const cut = 'a'.repeat(40), appendA = 'c'.repeat(40), appendB = 'd'.repeat(40);
+  const graphId = `release-sim-${scenario.id}-append-continuity`;
+  const nodeSequence = ['cut', 'gate-cut', 'append-a', 'resume-a', 'gate-a', 'append-b', 'resume-b', 'gate-b', 'publish', 'done'];
+  const graphPath = join(root, 'ux-sim', 'simulation-graphs', `${graphId}.yaml`);
+  mkdirSync(join(root, 'ux-sim', 'simulation-graphs'), { recursive: true });
+  const graph = `graph_id: ${graphId}\nversion: 1\nentry_node: cut\nterminal_nodes: [done, failed]\nnodes:\n`
+    + nodeSequence.map((nodeId) => `  - { node_id: ${nodeId}, kind: gate, recipe: 'cmd:simulated', max_visits: 1 }\n`).join('')
+    + '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges:\n'
+    + nodeSequence.slice(0, -1).map((from, index) => `  - { from: ${from}, on: outcome, map: { ok: ${nodeSequence[index + 1]}, fail: failed, error: failed } }\n`).join('');
+  writeFileSync(graphPath, graph);
+  writeFileSync(join(dirname(graphPath), 'recipes.yaml'), 'simulated:\n  command: "simulated release node"\n');
+  const edges = new Map<string, Record<string, unknown>>(nodeSequence.slice(0, -1).map((from, index) => [from,
+    { map: { ok: nodeSequence[index + 1], fail: 'failed', error: 'failed' } }]));
+  const ledgerEvents: Array<Record<string, unknown>> = [];
+  const formalReceiptDir = join(root, 'release', scenario.input.version, 'gate-logs', 'cut', 'receipts');
+  mkdirSync(formalReceiptDir, { recursive: true });
+  const formalReceiptInspection = inspectGateShardReceipts(formalReceiptDir, { version: scenario.input.version, commit: cut,
+    base40: SIM_BASE_COMMIT, envFingerprint: SIM_ENV_FINGERPRINT, graphPins: { graphSha: '0'.repeat(64), recipeSha: '1'.repeat(64) },
+    graphEntry: 'release-sim-gate', recipeCommand: 'simulated gate receipt', recipeTimeoutMs: 1000,
+    shards: tests.map((file, index) => ({ id: `pod-${index}`, files: [file] })), tests });
+  const formalGateRun = await runProductionMissingReceiptGate(root, tests, scenario.input.version, scenario.input.previousVersion);
+  let currentCommit = cut;
+  let previousCommit = cut;
+  let selectedFiles: string[] = [];
+  let receipts: GateShardReceipt[] = [];
+  const stages: ReleaseSimGateReceiptStage[] = [];
+  const runBash = async (_command: string, options: { env?: NodeJS.ProcessEnv }) => {
+    const { nodeId } = parseContext(options.env ?? process.env);
+    if (nodeId === 'append-a') { previousCommit = cut; currentCommit = appendA; selectedFiles = [tests[0]!]; }
+    if (nodeId === 'append-b') { previousCommit = appendA; currentCommit = appendB; selectedFiles = [tests[1]!]; }
+    if (nodeId === 'resume-a' || nodeId === 'resume-b') {
+      ledgerEvents.push({ event: 'resume', stage: nodeId, priorCommit: previousCommit, commit: currentCommit, selectedFiles: [...selectedFiles], radiusOnly: true });
+    }
+    if (nodeId.startsWith('gate-')) {
+      const stage = runReleaseSimGateReceiptSeam({ stage: nodeId, tests, receipts,
+      priorCommit: previousCommit, commit: currentCommit, selectedFiles,
+        ...(nodeId === 'gate-cut' ? { formalReceiptInspection, formalGateRun } : {}) });
+      stages.push(stage);
+      receipts = [...receipts.filter((receipt) => stage.plan.carriedShardIds.includes(receipt.id)).map((receipt) => ({ ...receipt, head40: currentCommit })),
+        ...stage.plan.rerunShardIds.map((id) => simulatedReceipt(id, tests[Number(id.slice(4))]!, currentCommit))];
+      const output = { outcome: stage.gateOutcome === 'pass' ? 'ok' : stage.gateOutcome === 'fail' ? 'fail' : 'error', stage };
+      ledgerEvents.push({ event: 'gate-result', stage });
+      return { exitCode: stage.gateOutcome === 'pass' ? 0 : stage.gateOutcome === 'fail' ? 1 : 2, stdout: `${JSON.stringify(output)}\n`, stderr: '' };
+    }
+    if (nodeId === 'publish') {
+      const eligible = stages.at(-1)?.publishDecision === 'eligible';
+      ledgerEvents.push({ event: 'fake-publish-decision', decision: eligible ? 'eligible' : 'blocked' });
+      return { exitCode: eligible ? 0 : 1, stdout: `${JSON.stringify({ outcome: eligible ? 'ok' : 'fail', decision: eligible ? 'eligible' : 'blocked' })}\n`, stderr: '' };
+    }
+    if (nodeId === 'append-a' || nodeId === 'append-b') ledgerEvents.push({ event: 'append', stage: nodeId, commit: currentCommit, selectedFiles: [...selectedFiles] });
+    return { exitCode: 0, stdout: `${JSON.stringify({ outcome: 'ok', nodeId, commit: currentCommit })}\n`, stderr: '' };
+  };
+  const capture = (event: string, data: Record<string, unknown>) => ledgerEvents.push({ event, ...data });
+  const state = await runGraph(graphPath, { runId: graphId, input: { version: scenario.input.version, previousVersion: scenario.input.previousVersion },
+    pinChildUniverse: true, quiet: true, deps: { root, runBash, log: capture } });
+  const path = state.path;
+  const visited = new Set([...path, ...Object.values(state.fanOuts ?? {}).flatMap((fanout) => Object.keys(fanout.branches))]);
+  const statusOk = state.status === item.expect.status;
+  const visitOk = item.expect.mustVisit.every((id) => visited.has(id));
+  const notVisitOk = item.expect.mustNotVisit.every((id) => !visited.has(id));
+  const edgeIssues = unexpectedEdges(path, state, edges);
+  const receiptCase = stages[0], appendStageA = stages[1], appendStageB = stages[2];
+  const receiptFlowOk = !!receiptCase && receiptCase.formalReceiptDecision?.reason === 'formal-receipt-set-absent'
+    && receiptCase.formalGateRun?.formalReceiptDecision === 'formal-receipt-set-absent'
+    && receiptCase.formalGateRun.outcome === 'ok' && receiptCase.formalGateRun.fullSweep
+    && formalReceiptInspection.kind === 'absent' && receiptCase.plan.fullSweep && receiptCase.plan.rerunShardIds.length === 81
+    && receiptCase.aggregate === 'complete' && receiptCase.receiptIds.length === 81
+    && appendStageA?.plan.carriedShardIds.length === 80 && appendStageA.plan.rerunShardIds.join() === 'pod-0'
+    && appendStageA.aggregate === 'complete' && appendStageA.receiptIds.length === 81
+    && appendStageB?.plan.carriedShardIds.length === 80 && appendStageB.plan.rerunShardIds.join() === 'pod-1'
+    && appendStageB.aggregate === 'complete' && appendStageB.receiptIds.length === 81;
+  const publishOk = stages.at(-1)?.publishDecision === 'eligible' && path.includes('publish');
+  const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
+    && ledgerEvents.some((row) => row.event === 'append') && ledgerEvents.filter((row) => row.event === 'resume').length === 2;
+  const pass = statusOk && visitOk && notVisitOk && receiptFlowOk && publishOk && ledgerOk && edgeIssues.length === 0;
+  return { id: item.id, pass, status: state.status, path, dispatchedNodes: path.filter((node) => nodeSequence.includes(node)),
+    unexpectedEdges: edgeIssues, checks: { status: statusOk, mustVisit: visitOk, mustNotVisit: notVisitOk, overlap: true, ledgerEvents: ledgerOk },
+    injectedEvidence: { universe: 'test', releaseVersion: scenario.input.version, formalReceiptInspection, receiptCase, appendA: appendStageA, appendB: appendStageB,
+      appendedOnlyChangedTestRadius: receiptFlowOk, fakePublish: stages.at(-1)?.publishDecision,
+      executionStatePath: state.statePath }, fanOuts: state.fanOuts, ledgerEvents, statePath: state.statePath };
 }
 
 export interface ReleaseSimRigScenario {
@@ -158,7 +391,7 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
     ids.add(row.id);
     let mode: ReleaseSimRigCase['mode'];
     if (row.mode !== undefined) {
-      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume' && row.mode !== 'gate-waive-introduced-regression' && row.mode !== 'owner-waive-missing-schema' && row.mode !== 'owner-waive-0246-fixture') throw new Error(`scenario.cases[${index}].mode is unregistered`);
+      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume' && row.mode !== 'gate-waive-introduced-regression' && row.mode !== 'owner-waive-missing-schema' && row.mode !== 'owner-waive-0246-fixture' && row.mode !== 'append-receipt-continuity') throw new Error(`scenario.cases[${index}].mode is unregistered`);
       mode = row.mode;
     }
     let fault: ReleaseSimRigCase['fault'];
@@ -195,7 +428,8 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
       if (pair.length !== 2 || pair[0] === pair[1] || pair.some((id) => !nodeIds.has(id))) throw new Error(`scenario.cases[${index}].expect.overlap must name two different release nodes`);
       overlap = [pair[0]!, pair[1]!];
     }
-    for (const id of [...mustVisit, ...mustNotVisit]) if (!nodeIds.has(id)) throw new Error(`scenario.cases[${index}] names unknown release node ${id}`);
+    const expectedNodeIds = mode === 'append-receipt-continuity' ? new Set([...nodeIds, ...RECEIPT_SIM_NODE_IDS]) : nodeIds;
+    for (const id of [...mustVisit, ...mustNotVisit]) if (!expectedNodeIds.has(id)) throw new Error(`scenario.cases[${index}] names unknown release node ${id}`);
     if (mustVisit.some((id) => mustNotVisit.includes(id))) throw new Error(`scenario.cases[${index}] visits and excludes the same node`);
     return { id: row.id, ...(mode ? { mode } : {}), ...(fault ? { fault } : {}), ...(Object.keys(nodeOutcomes).length ? { nodeOutcomes } : {}),
       expect: { status: expected.status, mustVisit, mustNotVisit, ...(overlap ? { overlap } : {}), ...(typeof refusalIncludes === 'string' ? { refusalIncludes } : {}) } };
@@ -478,7 +712,9 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
     && ledgerEvents.filter((row) => row.event === 'edge-observed').length === Math.max(0, path.length - 1);
   const waiverOk = gate?.ok === true && gate.executed === false && gate.waiver?.reason === reason
-    && gate.waiver.approvedBy === 'OP' && (ownerWaived ? gate.waiver.ownerWaived === true && JSON.stringify(JSON.parse(String(gate.output)).outcome) === JSON.stringify('pass(owner-waived)') : JSON.stringify(gate.waiver.introducedIds) === JSON.stringify([introducedId]));
+    && gate.waiver.approvedBy === 'OP' && (ownerWaived ? gate.waiver.ownerWaived === true
+      && JSON.parse(String(gate.output)).outcome === 'ok' && JSON.parse(String(gate.output)).verdict === 'owner-waived'
+      : JSON.stringify(gate.waiver.introducedIds) === JSON.stringify([introducedId]));
   const releaseTailOk = !fixtureOwnerWaiver || (dispatchedNodes.includes('publish') && dispatchedNodes.includes('npm-publish') && dispatchedNodes.includes('verify')
     && (npmPublishEvidence?.publishNodeResult as { outcome?: string } | undefined)?.outcome === 'ok'
     && Array.isArray(npmPublishEvidence?.publishNodeExternalCalls)
@@ -496,6 +732,7 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
 
 async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string,
   edges: Map<string, Record<string, unknown>>): Promise<ReleaseSimRigCaseResult> {
+  if (item.mode === 'append-receipt-continuity') return runAppendReceiptCase(scenario, item, root);
   const runId = `release-sim-${scenario.id}-${item.id}`;
   const ledgerEvents: Array<Record<string, unknown>> = [];
   const dispatchedNodes: string[] = [];

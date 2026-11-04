@@ -26,6 +26,7 @@ const {
 } = await import('./pty-manifest.js');
 const { readPtyEventsAfter, recordSurfaceStateTransition, latestSurfaceState, resetPtyEventLogForTesting } = await import('./pty-event-log.js');
 const { ensureRunIdentity } = await import('../harness/harness-space.js');
+const { sidetabRowsFromManifest } = await import('../sidetab-core/model.js');
 
 function lifecycleEvents(ptyId: string) {
   return readPtyEventsAfter(0, { surfaceId: ptyId, kind: 'lifecycle' });
@@ -118,6 +119,28 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     d.close();
   });
 
+  test('legacy workspace rows migrated without space_kind remain explicitly unclassified', async () => {
+    const path = join(stateDir, 'pre-space-kind-manifest.db');
+    const d = new Database(path);
+    d.run(`CREATE TABLE pty_manifest (id TEXT PRIMARY KEY, kind TEXT NOT NULL, cmd TEXT NOT NULL, workdir TEXT, owner_pid INTEGER NOT NULL, instance TEXT NOT NULL, started_at INTEGER NOT NULL, alive INTEGER NOT NULL, exit_code INTEGER, snapshot TEXT NOT NULL DEFAULT '', snapshot_at INTEGER NOT NULL DEFAULT 0, frame TEXT NOT NULL DEFAULT '', frame_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, space_id TEXT NOT NULL DEFAULT '', parent_pty_id TEXT NOT NULL DEFAULT '')`);
+    d.run(`INSERT INTO pty_manifest (id,kind,cmd,owner_pid,instance,started_at,alive,updated_at,space_id,parent_pty_id) VALUES ('legacy-space-member','agent','agent',11,'project',1,1,1,'legacy-space','tui:legacy')`);
+    migratePtyManifestSchema(d);
+    const row = listPtyManifestRowsAt(path).find((item) => item.id === 'legacy-space-member');
+    expect(row).toMatchObject({ spaceId: 'legacy-space', spaceKind: '', parentPtyId: 'tui:legacy' });
+    expect(sidetabRowsFromManifest([row!], 'project', undefined, {
+      mode: 'workspaces', expandedWorkspaceIds: [],
+    })).toMatchObject([{
+      id: 'workspace:legacy-space', label: '워크스페이스 · legacy-space', status: 'workspace-unclassified',
+    }]);
+    expect(sidetabRowsFromManifest([row!], 'project', undefined, {
+      mode: 'workspaces', expandedWorkspaceIds: ['workspace:legacy-space'],
+    }).map(({ id, kind, nestDepth }) => [id, kind, nestDepth ?? 0])).toEqual([
+      ['workspace:legacy-space', 'workspace', 0],
+      ['legacy-space-member', 'agent', 1],
+    ]);
+    d.close();
+  });
+
   test('seat, purpose, and workdir remain separate on new shell rows', () => {
     upsertPtyManifest({ id: 'shell-seat', kind: 'shell', cmd: '/bin/zsh', seat: 'UX', purpose: 'tui-shell:UX', workdir: '/hq/seats/UX', startedAt: 1, now: 1 });
     expect(getPtyManifest('shell-seat')).toMatchObject({ seat: 'UX', purpose: 'tui-shell:UX', workdir: '/hq/seats/UX' });
@@ -130,6 +153,61 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     const script = `const { Database } = require('bun:sqlite'); const d = new Database(process.argv.at(-1), { readonly: true }); console.log(d.query('SELECT id FROM pty_manifest WHERE id=?').get('fresh-wal').id); d.close();`;
     const output = execFileSync(process.execPath, ['-e', script, manifestDbPath], { encoding: 'utf8' }).trim();
     expect(output).toBe('fresh-wal');
+  });
+
+  test('PTY space kind is persisted from the harness-space identity for sidetab classification', () => {
+    const oldKind = process.env.ELANOUS_HARNESS_SPACE;
+    const oldId = process.env.ELANOUS_HARNESS_SPACE_ID;
+    process.env.ELANOUS_HARNESS_SPACE = 'solve-mission';
+    process.env.ELANOUS_HARNESS_SPACE_ID = 'mission-space';
+    try {
+      upsertPtyManifest({ id: 'mission-space-member', kind: 'agent', cmd: 'agent', startedAt: 1, now: 1 });
+      expect(getPtyManifest('mission-space-member')).toMatchObject({ spaceId: 'mission-space', spaceKind: 'solve-mission' });
+    } finally {
+      if (oldKind === undefined) delete process.env.ELANOUS_HARNESS_SPACE;
+      else process.env.ELANOUS_HARNESS_SPACE = oldKind;
+      if (oldId === undefined) delete process.env.ELANOUS_HARNESS_SPACE_ID;
+      else process.env.ELANOUS_HARNESS_SPACE_ID = oldId;
+    }
+  });
+
+  test('empty spaceKind on an update falls back to the prior manifest classification', () => {
+    upsertPtyManifest({
+      id: 'space-kind-fallback', kind: 'agent', cmd: 'agent', startedAt: 1, now: 1,
+      identity: { spaceId: 'mission-space', spaceKind: 'solve-mission' },
+    });
+    upsertPtyManifest({
+      id: 'space-kind-fallback', kind: 'agent', cmd: 'agent', startedAt: 2, now: 2,
+      identity: { spaceKind: '' },
+    });
+    expect(getPtyManifest('space-kind-fallback')).toMatchObject({
+      spaceId: 'mission-space', spaceKind: 'solve-mission',
+    });
+  });
+
+  test('identity change does not carry the prior workspace kind into the new space', () => {
+    const previousSpace = process.env.ELANOUS_HARNESS_SPACE;
+    const previousSpaceId = process.env.ELANOUS_HARNESS_SPACE_ID;
+    delete process.env.ELANOUS_HARNESS_SPACE;
+    delete process.env.ELANOUS_HARNESS_SPACE_ID;
+    try {
+      upsertPtyManifest({
+        id: 'space-kind-identity-change', kind: 'agent', cmd: 'agent', startedAt: 1, now: 1,
+        identity: { spaceId: 'mission-space', spaceKind: 'solve-mission' },
+      });
+      upsertPtyManifest({
+        id: 'space-kind-identity-change', kind: 'agent', cmd: 'agent', startedAt: 2, now: 2,
+        identity: { spaceId: 'harness-run' },
+      });
+      expect(getPtyManifest('space-kind-identity-change')).toMatchObject({
+        spaceId: 'harness-run', spaceKind: '',
+      });
+    } finally {
+      if (previousSpace === undefined) delete process.env.ELANOUS_HARNESS_SPACE;
+      else process.env.ELANOUS_HARNESS_SPACE = previousSpace;
+      if (previousSpaceId === undefined) delete process.env.ELANOUS_HARNESS_SPACE_ID;
+      else process.env.ELANOUS_HARNESS_SPACE_ID = previousSpaceId;
+    }
   });
 
   test('upsert → list 에 등록(owner_pid=현재 프로세스·alive)', () => {

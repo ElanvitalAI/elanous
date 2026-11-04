@@ -24,6 +24,7 @@ import { actualGatePodImageDigest, gateBaselineReceipt, gateEnvFingerprint, gate
 import { gateImagePinPath, normalizeGateImageDigest, pinnedGateImageSync as buildPinnedGateImageSync, readGateImagePin,
   readGateImagePinForRun, replaceGateImagePin, resolveGateImagePin, writeGateImagePin } from './gate-image-pin.js';
 import { gateReceiptRegistryPath, planGateTrainReceiptCarry } from './gate-train-receipts.js';
+import { formalReceiptSetPresenceReason } from './gate-shard-receipts.js';
 import { gateEnvFingerprint as gateReceiptEnvFingerprint, gateLockfileHash } from '../../src/self-implement/gate-receipt-registry.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 export { POD_SWEEP_INTEGRATION_ONLY } from './gate-baseline-receipt';
@@ -462,6 +463,8 @@ async function startWarmGateControl(config: unknown, dependencies: WarmGateContr
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
   commit: string;
+  /** Formal receipt fallback decision observed by the real graph-scoped gate. */
+  formalReceiptDecision?: string;
   introduced: string[];
   preexisting: number;
   /** null = not counted (GATE-SPEED A4: the swept baseline ran only the cut's failing files). */
@@ -2724,7 +2727,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           pool: pod.pool, poolScheduler: trackedPool(shard, branch, jobName, resultFile, attemptId, (member) => {
             stamp('poolPlaced'); jobContext = member.context; jobContextForCapture = member.context; placedOn = member.context; placed();
             if (branch === '-tail') tailPlacedHost = member.context;
-          }, skipMembers, depth === 0 && branch === '' && hostRetries === 0 && !retriedNoOutput && !batchIsolation && skipMembers.size === 0), clone: true, source: { kind: 'commit', sha: commit },
+          }, skipMembers, depth === 0 && branch === '' && hostRetries === 0 && !retriedNoOutput && !batchIsolation && skipMembers.size === 0), clone: true,
+          source: { kind: 'commit', sha: commit, ...(rulesBaseSha ? { baseSha: rulesBaseSha } : {}) },
           ...(pod.imagePin === 'cut-commit' || pod.pinnedImageDigest || pod.pinnedRunId ? { imageCommit: commit } : {}),
           ...(pod.pinnedImageDigest || pod.pinnedRunId ? { syncImages: pinnedGateImageSync(pod, commit)! } : {}), deadlineSeconds: shardDeadline,
           ...gateHostMirror(pod),
@@ -3397,7 +3401,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         run: process.env.ELANOUS_RUN_ID || attemptId, phase: 'release-gate', requestedAt: new Date().toISOString(),
         graphNode: 'gate-triage', commit, reason: `release gate recheck ${files.length} files`, pool: pod.pool,
         memReq: POD_ISOLATION_MEMORY_LIMIT, warmReused: !!producer },
-      source: { kind: 'commit', sha: commit }, deadlineSeconds, ...(producer ? { warmProducer: producer, image: producer.image } : {}),
+      source: { kind: 'commit', sha: commit, ...(rulesBaseSha ? { baseSha: rulesBaseSha } : {}) }, deadlineSeconds, ...(producer ? { warmProducer: producer, image: producer.image } : {}),
       ...(producer || pod.pinnedImageDigest || pod.pinnedRunId ? { imageCommit: commit } : {}),
       ...(pod.pinnedImageDigest || pod.pinnedRunId ? { syncImages: pinnedGateImageSync(pod, commit)! } : {}),
       ...(bunCache ? { bunCache } : {}), ...gateHostMirror(pod),
@@ -4050,8 +4054,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         } catch { formalInventoryComplete = false; formalPayloadComplete = false; }
       }
       const formalIdentity = currentIdentity && currentImage ? { ...currentIdentity, imageDigest: currentImage } : null;
-      let formalReason = !formalRows.length ? 'formal-receipt-set-absent'
-        : formalRows.some((row) => !row || row.status !== 'complete') ? 'formal-receipt-set-incomplete'
+      let formalReason = formalReceiptSetPresenceReason(formalRows.length)
+        ?? (formalRows.some((row) => !row || row.status !== 'complete') ? 'formal-receipt-set-incomplete'
         : formalRows.some((row) => row!.version !== opts.version) ? 'formal-receipt-version-mismatch'
         : !formalInventoryComplete ? formalInventoryReason
         : !formalPayloadComplete ? 'formal-receipt-payload-incomplete'
@@ -4075,7 +4079,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         : formalRows.some((row) => !gateRuntimeSourceFingerprint(repo, row!.head40, row!.runtimeIdentity)
           || gateRuntimeSourceFingerprint(repo, row!.head40, row!.runtimeIdentity) !== gateRuntimeSourceFingerprint(repo, opts.commit, formalIdentity))
           ? 'formal-receipt-runtime-fingerprint-mismatch'
-        : 'formal-receipt-radius-unmeasured';
+        : 'formal-receipt-radius-unmeasured');
+      result.formalReceiptDecision = formalReason;
       if (formalReason === 'formal-receipt-radius-unmeasured' && priorHead && priorHead !== opts.commit) {
         try {
           const tests = gateAssignableTestsAtCommit(repo, opts.commit);
@@ -5130,7 +5135,9 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
   }
   if (result.error) console.error(result.error);
   debug.log('release-loop.gate', 'result', { version, outcome: result.outcome, ...(placement ?? {}) });
-  emitNodeResult({ ...graphGateResult(result, !!env.ELANOUS_GRAPH_CONTEXT), ...(placement ?? {}) });
+  const nodeResult = graphGateResult(result, !!env.ELANOUS_GRAPH_CONTEXT);
+  emitNodeResult({ ...nodeResult, ...(placement ?? {}),
+    ...(placement?.executor === 'host' ? { summary: `${nodeResult.summary} · 실행기 host${placement.host ? `(${placement.host})` : ''}` } : {}) });
   return result.outcome === 'ok' ? 0 : result.outcome === 'regression' ? 1 : 2;
 }
 

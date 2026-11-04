@@ -235,10 +235,12 @@ edges:
       const gateRecord = run.nodes.find((node) => node.nodeId === 'gate')!;
       expect(gateRecord).toMatchObject({ nodeId: 'gate', ok: false, exit: 1, executed: true });
       const line = emitted.at(-1)!;
-      expect(line).toEqual({
+      const { autoheal: reportedAutoheal, formalReceiptDecision, ...reportedFields } = line;
+      const { signature, ...reportedAutohealFields } = reportedAutoheal as Record<string, unknown>;
+      expect(({ ...reportedFields, autoheal: reportedAutohealFields }) as Record<string, unknown>).toEqual({
         outcome: 'fail', verdict: 'fail', commit: CUT,
         introduced: [FAILURE], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [],
-        autoheal: { action: 'hitl', cause: 'true-regression', signature: expect.any(String), shardKey: 'gate', reason: 'measured regression requires a human decision', shardElapsedMs: POD_SECONDS * 1000 * 3, overallElapsedMs: POD_SECONDS * 1000 * 3 },
+        autoheal: { action: 'hitl', cause: 'true-regression', shardKey: 'gate', reason: 'measured regression requires a human decision', shardElapsedMs: POD_SECONDS * 1000 * 3, overallElapsedMs: POD_SECONDS * 1000 * 3 },
         stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], abortedShards: 0, rcNonzeroNoFailures: [],
         // ① exactly three Pods, each ninety seconds on the injected clock: no real (or global) clock produces this.
         durationMs: POD_SECONDS * 1000 * 3,
@@ -247,6 +249,8 @@ edges:
         summary: '게이트 regression: 1 new regressions · 환경 알려진 실패 0',
         executor: 'pod', host: null,
       });
+      expect(signature).toMatch(/^[0-9a-f]{64}$/);
+      expect(formalReceiptDecision).toBe('formal-receipt-set-absent');
       expect(JSON.parse(String(gateRecord.output))).toEqual(line);
       const progressPath = join(instanceRoot, 'graph-runs/release-loop', `${RUN_ID}.json.contexts/gate-progress.jsonl`);
       const progress = readFileSync(progressPath, 'utf8').trim().split('\n').map((row) => JSON.parse(row) as Record<string, unknown>);

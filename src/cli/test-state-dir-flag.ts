@@ -88,7 +88,10 @@ export function applyIsolatedRoot(dir: string): void {
   //     종전 in-memory overlay(buildTestSafeDaemonConfig 를 getUserConfig 에
   //     거는 방식)는 은퇴 — overlay 뷰가 디스크에 박제되는 오염 사건(#4029)과
   //     "공유 config write-through" 함정 클래스의 원천 제거.
-  if (!process.env.ELANOUS_STATE_DIR?.trim()) process.env.ELANOUS_STATE_DIR = dir;
+  // The explicit test root is the authority for this process and its children.
+  // Keeping an inherited stamp here makes child TUI tools fall back to the
+  // parent worktree's `.elanous-test` even though this process resolved `dir`.
+  process.env.ELANOUS_STATE_DIR = dir;
   try {
     const cfgDir = require('../elanous-config-dir.js') as typeof import('../elanous-config-dir.js');
     const current = cfgDir.getElanousConfigDirOverride();

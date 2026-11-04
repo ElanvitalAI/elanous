@@ -9211,6 +9211,10 @@ export async function streamLLMWithTools(
           const message = buildInterjectionMessage(pending, 'mid-turn');
           if (message) {
             history.push({ role: 'user', content: message });
+            // A queued user message begins a fresh request. Keep the repair
+            // allowlist narrow for the failed request, but do not let its
+            // one-turn gate reject tools requested by this new user turn.
+            repairActionArmed = false;
             debug.log('llm.interjection', 'drained-mid-turn', {
               turn, count: pending.length, chars: message.length,
             }, { level: 'info' });

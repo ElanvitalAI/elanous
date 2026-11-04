@@ -7,6 +7,7 @@ import { runSelfGateCli, selectGateTestFiles, type SelfGateCliOptions, type Self
 import { GATE_CALLER_TEST_LIMIT } from '../self-implement/gate-scope.js';
 import { GATE_REMOTE_DEFAULTS, type DispatchDeps, type DispatchOptions, type GateRemoteRunner } from '../self-implement/gate-remote.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
+import { judgeGate, type GateRunner } from '../../scripts/release-loop/gate-node.js';
 import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_UNKNOWN_HOST, formatLightRc, parseAlwaysIncludeList, resolveMeasuredCommit, runLightRc, type LightRcDeps } from './light-rc.js';
 
 const REPO = resolve(import.meta.dir, '../..');
@@ -123,6 +124,52 @@ function localDeps(over: Partial<LightRcDeps> = {}, gate: SelfGateCliResult = ga
 }
 
 describe('runLightRc (LIGHT-RC ⑶)', () => {
+  test('explicit --remote runs the release gate host recipe and keeps the public light-rc result shape', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const setup = localDeps({ runFormalHostGate: async (options) => {
+      calls.push(options as unknown as Record<string, unknown>);
+      return { outcome: 'ok', commit: MAIN_SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+    } });
+    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', log: () => {} }, setup.deps);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ commit: MAIN_SHA, baselineCommit: MAIN_SHA, executor: 'host', remote: 'minim5', full: true, repo: REPO });
+    expect(setup.dispatched).toHaveLength(0);
+    expect(result).toMatchObject({ version: '0.2.19', base: MAIN_SHA, measuredCommit: MAIN_SHA, introduced: 0,
+      preexisting: 0, unclassified: 0, remote: 'minim5', gateExitCode: 0, ok: true, unmeasured: null });
+  });
+
+  test('hidden legacy switch preserves the previous explicit-remote self-gate route for comparison', async () => {
+    const { dispatched, deps } = localDeps();
+    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', legacySelfGate: true, log: () => {} }, deps);
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]?.flags).toMatchObject({ remote: 'minim5' });
+    expect(result).toMatchObject({ remote: null, ok: true, introduced: 0 });
+  });
+
+  test('explicit remote reaches judgeGate host recipe and carries rehearsal TUI through the gate runner', async () => {
+    const ids = ['boot', 'prompt', 'status-bar', 'help-opens', 'help-closes', 'no-error-text'];
+    const runner: GateRunner = {
+      command: async (cmd, args) => cmd === 'sh' ? { rc: 0, output: '/home/remote\n' }
+        : cmd === 'test' ? { rc: 0, output: '' }
+          : cmd === 'mktemp' ? { rc: 0, output: '/tmp/release-gate-proof\n' }
+            : cmd === 'git' && args[0] === 'ls-files' ? { rc: 0, output: 'src/a.test.ts\0' }
+              : cmd === 'git' && args.includes('rev-parse') ? { rc: 0, output: 'true\n' }
+                : cmd === 'git' && args.includes('show-ref') ? { rc: 1, output: '' } : { rc: 0, output: '' },
+      localCommand: async (_cmd, args) => args[0] === 'scripts/release-loop/tui-sim-node.ts'
+        ? { rc: 0, output: JSON.stringify({ commit: MAIN_SHA, verdict: 'pass', attempts: 1,
+          checks: ids.map((id) => ({ id, pass: true, detail: 'ok' })), regress: { unmeasured: 'fixture' } }) }
+        : { rc: 0, output: '' },
+      sweep: async () => ({ rc: 0, output: 'src/a.test.ts:\n(pass) sample [1.00ms]\n\n1 pass\n0 fail\nRan 1 tests across 1 files.\n' }),
+      add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {},
+    };
+    const actualJudgeGate = judgeGate;
+    const deps: LightRcDeps = { ...localDeps().deps, formalHostGateRunner: runner,
+      runFormalHostGate: (options, injectedRunner) => actualJudgeGate(options, injectedRunner) };
+    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', rehearsalTui: true, log: () => {} }, deps);
+    expect(result).toMatchObject({ remote: 'minim5', gateExitCode: 0, ok: true, rehearsalTui: { outcome: 'ok' } });
+  });
+
   test('rehearsal opt-in invokes screen check on measured commit and blocks failed or unmeasured screens', async () => {
     const seen: string[] = [];
     const { deps } = localDeps({ tuiCheck: async (commit) => { seen.push(commit); return { outcome: 'fail', detail: 'help-closes failed' }; } });
@@ -248,19 +295,20 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     expect(calls[0]).toMatchObject({ base: 'deadbeef', shards: 2 });
   });
 
-  test('remote run: the host re-runs light-rc --local --json at the base sha and its JSON is the result', async () => {
-    let argv: string[] = [];
-    const { calls, deps } = localDeps({
-      dispatch: async (opts: DispatchOptions, dispatchDeps?: DispatchDeps) => {
-        argv = typeof opts.remoteArgv === 'function' ? opts.remoteArgv(() => 'f'.repeat(40)) : opts.remoteArgv;
-        dispatchDeps!.write!.out('{"ok":false,"introduced":2,"preexisting":3,"alwaysIncludeMissing":["x.test.ts"],"gateExitCode":1,"remote":null,"host":"node-b","remote":true}\n');
-        return 1;
+  test('explicit remote executes the host release gate directly instead of re-entering light-rc self-gate', async () => {
+    const formalCalls: Array<Record<string, unknown>> = [];
+    const { calls, dispatched, deps } = localDeps({
+      runFormalHostGate: async (options) => {
+        formalCalls.push(options as unknown as Record<string, unknown>);
+        return { outcome: 'regression', commit: MAIN_SHA, introduced: ['a.test.ts > new failure'], preexisting: 3,
+          fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
       },
     });
-    const result = await runLightRc('0.2.19', { base: 'abc123', remote: 'node-b', log: () => {} }, deps);
+    const result = await runLightRc('0.2.19', { base: 'abc123', remote: 'minim5', log: () => {} }, deps);
     expect(calls).toHaveLength(0);
-    expect(argv).toEqual(['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', '0.2.19', '--base', 'f'.repeat(40), '--head', MAIN_SHA, '--shards', '4', '--local', '--json']);
-    expect(result).toMatchObject({ introduced: 2, preexisting: 3, alwaysIncludeMissing: ['x.test.ts'], remote: 'node-b', ok: false });
+    expect(dispatched).toHaveLength(0);
+    expect(formalCalls[0]).toMatchObject({ commit: MAIN_SHA, baselineCommit: MAIN_SHA, executor: 'host', remote: 'minim5', full: true });
+    expect(result).toMatchObject({ introduced: 1, preexisting: 3, remote: 'minim5', ok: false, gateExitCode: 1 });
   });
 
   test('default host through the real dispatch: the result names the host the gate ran on, not local', async () => {

@@ -25,16 +25,19 @@ function fixture(rows: ReturnType<typeof pr>[], options: { failAt?: string; file
         files: row.files.map(path => ({ path })),
       }))) };
     }
-    const endpoint = args.includes('--slurp') ? args[args.indexOf('--slurp') + 1] ?? '' : args[1] ?? '';
+    const endpoint = args.find(arg => arg.startsWith('repos/')) ?? '';
     calls.push(endpoint);
     if (endpoint.includes(options.failAt ?? '\u0000')) return { ok: false, out: '', err: 'network unavailable' };
     if (endpoint.includes('/commits/')) return { ok: true, out: '2026-10-13T00:00:00Z' };
     if (endpoint.includes('/files?')) {
       const number = Number(endpoint.match(/pulls\/(\d+)\/files/)?.[1]);
       const paths = options.filePages?.[number] ?? [rows.find(row => row.number === number)?.files ?? []];
-      return { ok: true, out: JSON.stringify(paths.map(page => page.map(filename => ({ filename })))) };
+      return { ok: true, out: paths.map(page => JSON.stringify(page.map(filename => ({ filename })))).join('\n') };
     }
-    if (endpoint.includes('/pulls?')) return { ok: true, out: JSON.stringify([rows.slice(0, 2), rows.slice(2)].filter(page => page.length)) };
+    if (endpoint.includes('/pulls?')) {
+      const pageDocs = [rows.slice(0, 2), rows.slice(2)].filter(page => page.length).map(page => JSON.stringify(page));
+      return { ok: true, out: pageDocs.length ? pageDocs.join('\n') : '[]' };
+    }
     throw new Error(endpoint);
   };
   return { run, calls };
@@ -50,6 +53,35 @@ test('inventory traverses every page and all PR file pages; later-page file over
   expect(verdict.status).toBe('allow');
   expect(verdict.warnings).toContainEqual(expect.objectContaining({ code: 'file-overlap', prs: [3] }));
   expect(f.calls.some(endpoint => endpoint.includes('/pulls/3/files?'))).toBe(true);
+});
+
+test('gh api pagination works without --slurp and rejects a truncated later page', () => {
+  const f = fixture([pr(1, ['src/a.ts']), pr(2, ['src/b.ts']), pr(3, ['src/c.ts'])]);
+  const inventory = readOpenPrs(f.run);
+  expect(inventory).toMatchObject({ status: 'checked', prs: [{ number: 1 }, { number: 2 }, { number: 3 }] });
+  expect(f.calls).toContain('repos/{owner}/{repo}/pulls?state=open&per_page=100');
+
+  const truncated: PrToolCommand = (command, args, opts) => {
+    const result = f.run(command, args, opts);
+    if (args.some(arg => arg.endsWith('/pulls?state=open&per_page=100'))) return { ok: true, out: '[{"number":1}]\n[{"number":' };
+    return result;
+  };
+  expect(readOpenPrs(truncated).status).toBe('unknown');
+});
+
+test('gh 2.45 merged pagination accepts one combined array larger than one page', () => {
+  const rows = Array.from({ length: 150 }, (_, index) => pr(index + 1, []));
+  const base = fixture(rows);
+  const merged: PrToolCommand = (command, args, opts) => {
+    if (args.some(arg => arg.endsWith('/pulls?state=open&per_page=100'))) return { ok: true, out: JSON.stringify(rows) };
+    return base.run(command, args, opts);
+  };
+  const inventory = readOpenPrs(merged);
+  expect(inventory.status).toBe('checked');
+  if (inventory.status !== 'checked') throw new Error('merged pagination was not checked');
+  expect(inventory.prs).toHaveLength(150);
+  expect(inventory.prs[0]?.number).toBe(1);
+  expect(inventory.prs[149]?.number).toBe(150);
 });
 
 test('PR lineage reads explicit head and Supersedes facts while leaving close criteria unknown', () => {
@@ -443,17 +475,17 @@ function bigFixture(rows: ReturnType<typeof pr>[], options: { projection?: 'ok' 
       return { ok: true, out: JSON.stringify(rows.map(row => ({ number: row.number, changedFiles: row.files.length, files: row.files.map(path => ({ path })) }))) };
     }
     if (args[0] === 'pr' && args[1] === 'diff') { counts.diff += 1; return { ok: true, out: patchFor(Number(args[2])) }; }
-    const endpoint = args[args.indexOf('--slurp') + 1] ?? '';
+    const endpoint = args.find(arg => arg.startsWith('repos/')) ?? '';
     if (endpoint.includes('/files?')) {
       counts.files += 1;
       const number = Number(endpoint.match(/pulls\/(\d+)\/files/)?.[1]);
-      return { ok: true, out: JSON.stringify([(rows.find(row => row.number === number)?.files ?? []).map(filename => ({ filename }))]) };
+      return { ok: true, out: JSON.stringify((rows.find(row => row.number === number)?.files ?? []).map(filename => ({ filename }))) };
     }
     if (endpoint.includes('/pulls?')) {
       counts.pulls += 1;
       const chunks: unknown[][] = [];
       for (let i = 0; i < rows.length; i += 100) chunks.push(rows.slice(i, i + 100));
-      return { ok: true, out: JSON.stringify(chunks) };
+      return { ok: true, out: chunks.map(page => JSON.stringify(page)).join('\n') };
     }
     throw new Error(endpoint);
   };
@@ -500,7 +532,7 @@ test('PR-CENSUS-PARALLEL 2: one-shot list fails → 300 REST file reads go throu
     expect(parallel.counts).toEqual({ pulls: 1, list: 1, files: 300, diff: 5 });
     expect(seen.concurrency).toEqual([6, 6]);
     expect(seen.calls.map(batch => batch.length)).toEqual([300, 5]);
-    expect(seen.calls[0]![0]!.args).toEqual(['api', '--paginate', '--slurp', 'repos/{owner}/{repo}/pulls/1000/files?per_page=100']);
+    expect(seen.calls[0]![0]!.args).toEqual(['api', '--paginate', 'repos/{owner}/{repo}/pulls/1000/files?per_page=100']);
     expect(log).toHaveBeenCalledWith('pr-tool.census', 'diff-scan', expect.objectContaining({
       openPrs: 300, projected: 0, restFallback: 300, projectionFailed: true,
       projectionReason: expect.stringContaining('gh pr list 실패: GraphQL: API rate limit'), fileOverlap: 5, patchFetched: 5, status: 'checked' }));

@@ -34,7 +34,8 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   const root = deps.instanceRoot ?? effectiveInstanceRoot();
   const repo = deps.repo ?? resolve(import.meta.dir, '../..');
   const gate = context.outputs.gate;
-  const ownerWaivedGate = gate?.outcome === 'pass(owner-waived)' && gate.verdict === 'owner-waived'
+  const ownerWaivedGate = gate?.verdict === 'owner-waived'
+    && (gate.outcome === 'ok' || gate.outcome === 'pass(owner-waived)')
     && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
     && typeof gate.reason === 'string' && gate.reason.trim().length > 0;
   const prepare = context.outputs.prepare;

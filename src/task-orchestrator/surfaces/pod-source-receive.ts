@@ -7,7 +7,7 @@ import { decidePodReuseCleanup } from './pod-reuse-cleanup.js';
 
 export type PodSource =
   | { kind: 'default'; base?: string; baseSha?: string }
-  | { kind: 'commit'; sha: string }
+  | { kind: 'commit'; sha: string; baseSha?: string }
   | { kind: 'pr'; number: number }
   | { kind: 'bundle'; bundlePath: string; sha256: string; sizeBytes: number; headCommit: string }
   /** POD-REUSE-MIN-SYNC — 웜 Pod 재사용: 이미 있는 체크아웃을 지우지 않고 «이전 head → 새 base» 차이만 맞춘다.
@@ -289,11 +289,20 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
   }
   if (source.kind === 'commit') {
     const sha = assertSha(source.sha, 'sha');
+    const baseSha = source.baseSha ? assertSha(source.baseSha, 'base sha') : undefined;
     return [
       ...ioStart,
       ...start,
       `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 1 origin ${sha} || exit 5; fi`,
       `git checkout --detach ${sha} || exit 5`,
+      ...(baseSha ? [
+        `if ! git cat-file -e '${baseSha}^{commit}' 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 1 origin '${baseSha}' || exit 5; fi`,
+        `if ! git merge-base --is-ancestor '${baseSha}' HEAD; then`,
+        `  if [ "$(git rev-parse --is-shallow-repository)" = true ]; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --unshallow origin '${sha}' || exit 5; fi`,
+        `  git merge-base --is-ancestor '${baseSha}' HEAD || { printf 'ELANOUS_POD_SOURCE_BASE_ANCESTRY_MISSING base=%s head=%s\\n' '${baseSha}' '${sha}'; exit 5; }`,
+        'fi',
+        `printf 'ELANOUS_POD_SOURCE_BASE_ANCESTOR %s %s\\n' '${baseSha}' '${sha}'`,
+      ] : []),
       'head=$(git rev-parse HEAD)',
       'pod_source_io_measure',
       "printf 'ELANOUS_POD_SOURCE commit %s\\n' \"$head\"",

@@ -26,7 +26,7 @@ import { appendEvidenceLocationRequirement, extractVerbatimOriginalAsk, formatGo
 import { createRepositoryReferencedFileReader, type ReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { parseGoalDocumentClarifications } from '../self-implement/goal-author-clarification.js';
 import { requiredEvidenceFromGoal } from '../self-implement/off-diff-evidence.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { REVIEW_DEFERRED_TO_HOST_ENV, reviewDeferredToHostFromEnv } from '../self-implement/review-deferred-to-host.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { findGitDir } from '../git-fs/locate.js';
@@ -1883,6 +1883,19 @@ export function assertDispatchHonorsOptions(plan: ResolvedDevPlan): void {
 /** 최상단 관측이 `plan`·`goalId` 를 나중에 받아 적기 위한 통. 디스패치가 채운다. */
 type PlanObservationSink = { plan?: ReturnType<typeof planDevPipeline>; goalId?: string | null };
 
+function boundedNoLaunchReason(error: unknown): { errorClass: string; reason: string } {
+  try {
+    const isError = error instanceof Error;
+    const rawClass = isError ? error.name : typeof error;
+    const errorClass = redactSecretText(String(rawClass).replace(/\s+/g, ' ').trim()).slice(0, 80) || 'unknown';
+    const message = isError ? error.message : String(error);
+    const safe = redactSecretText(message.replace(/\s+/g, ' ').trim()).slice(0, 240);
+    return { errorClass, reason: safe || errorClass };
+  } catch {
+    return { errorClass: 'unknown', reason: 'unprintable thrown value' };
+  }
+}
+
 /**
  * ⛔⭐⭐⭐ **관측이 무엇보다 앞이어야 한다**(무인 리뷰 must-fix 3회 · 매번 다른 자리에서).
  *  종전엔 관측이 ⑴ 골 읽기·preflight 뒤 ⑵ `parallel` 조기 반환 뒤 ⑶ `planDevPipeline` 뒤에
@@ -1915,6 +1928,8 @@ export async function runDevPipeline(spec: DevPipelineSpec, deps: DevPipelineDep
   const seen: PlanObservationSink = {};
   let gitResidue: GitResidueObservation = { state: 'unreadable' };
   let emitted = false;
+  let dispatchAttempted = false;
+  let stage = 'git-residue';
 
   // ⭐ **정상 경로에서는 디스패치 前에 한 번 찍고**(run-start 의미 보존 — 긴 런 중에도 사전에
   //   보인다), 그 앞 단계가 던진 경우에만 `finally` 의 단회 fallback 이 찍는다.
@@ -1993,7 +2008,24 @@ export async function runDevPipeline(spec: DevPipelineSpec, deps: DevPipelineDep
   try {
     // ⛔ 조회도 `try` **안**이다 — 주입된 관측기가 던져도 행은 남아야 한다(무인 리뷰).
     gitResidue = spec.gitResidueSnapshot?.observation ?? await (deps.observeGitResidue ?? observeGitResidue)(gitResiduePath);
-    return await runDevPipelineDispatch(spec, deps, seen, emitPlanRow);
+    return await runDevPipelineDispatch(spec, deps, seen, emitPlanRow,
+      (next) => { stage = next; },
+      () => { stage = 'dispatch'; dispatchAttempted = true; });
+  } catch (error) {
+    if (!dispatchAttempted) {
+      const details = {
+        ...(spec.runId ? { runId: spec.runId } : {}),
+        ...(seen.plan ? { dispatch: seen.plan.dispatch, executor: seen.plan.executor.kind } : {}),
+        stage,
+        ...boundedNoLaunchReason(error),
+      };
+      try { debug.log('dev-pipeline', 'no-launch', details, { level: 'warn' }); } catch { /* preserve the launch failure */ }
+      if (spec.runId) {
+        try { appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: spec.runId, event: 'no-launch', data: details }); }
+        catch { /* incident observation must not replace the launch failure */ }
+      }
+    }
+    throw error;
   } finally {
     cancelResourceHeartbeat?.();
     if (resourceLeaseStarted && resourceFp) {
@@ -2086,9 +2118,13 @@ async function runDevPipelineDispatch(
   deps: DevPipelineDeps,
   seen: PlanObservationSink,
   emitPlanRow: () => Promise<void>,
+  setStage: (stage: string) => void,
+  markDispatchAttempt: () => void,
 ): Promise<DevPipelineRunResult> {
+  setStage('plan');
   const plan = planDevPipeline(spec);
   seen.plan = plan;
+  setStage('route-preflight');
   await observeDevTaskDispatch(spec, plan, deps);
   if (!plan.wired) {
     throw new DevPipelineError(
@@ -2110,10 +2146,14 @@ async function runDevPipelineDispatch(
     // ★ U4b — parallel → orchestrateSelfDev(TOX coordinator). goals/concurrency=spec·감독 콜백=orchestrateRuntime.
     //   input 텍스트는 parallel 에 무의미(goals 가 작업) → text 해석 前에 분기(빈 input 요구 회피).
     await emitPlanRow();   // ⭐ 이 경로는 골을 안 읽으므로 **디스패치 직전**이 사전 관측 자리다.
+    setStage('dispatch-setup');
     const run = deps.orchestrateSelfDev ?? (await import('./orchestrate.js')).orchestrateSelfDev;
-    return { plan, kind: 'parallel', result: await run(toOrchestrateOptions(plan, deps.orchestrateRuntime ?? {})) };
+    const options = toOrchestrateOptions(plan, deps.orchestrateRuntime ?? {});
+    markDispatchAttempt();
+    return { plan, kind: 'parallel', result: await run(options) };
   }
 
+  setStage('goal-preflight');
   const readFile = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
   const inputText = resolveDevInputText(plan.input, readFile);
   preflightGoalDoneBoundary(plan.input, inputText, process.env.ELANOUS_TASK_CARD_ID, plan.entrance);
@@ -2152,7 +2192,10 @@ async function runDevPipelineDispatch(
     if (!deps.runChatTurn) {
       throw new DevPipelineError('interactive dispatch 는 runChatTurn 주입 필요(chat 엔진은 CLI 레이어 소유·index.ts)');
     }
-    await deps.runChatTurn(text, plan.chat ?? {});
+    const options = plan.chat ?? {};
+    setStage('dispatch-setup');
+    markDispatchAttempt();
+    await deps.runChatTurn(text, options);
     return { plan, kind: 'interactive', result: null };
   }
 
@@ -2164,6 +2207,7 @@ async function runDevPipelineDispatch(
     // ★ T1 — self implement --plan → staged 하니스(Clarify→Plan→Execute→Review→Deploy). 기존 dispatchRunDevHarness
     //   위임(재발명 0). autoDrive 는 completion 에서 파생(pr/auto-merge=on·worktree-only=safe·원 액션 openPr||autoMerge 등가).
     const harness = plan.harness;
+    setStage('dispatch-setup');
     const dispatch = deps.dispatchRunDevHarness ?? (await import('../skills/tools/dev-harness.js')).dispatchRunDevHarness;
     const args: DevHarnessDispatchArgs = harness
       ? {
@@ -2187,18 +2231,25 @@ async function runDevPipelineDispatch(
           ...(plan.base ? { base: plan.base } : {}),
           ...(spec.runId ? { runId: spec.runId } : {}),
         };
+    setStage('dispatch-setup');
+    markDispatchAttempt();
     const res = await dispatch(args);
     return { plan, kind: 'plan-staged', result: { output: res.output } };
   }
 
   if (plan.dispatch === 'elanous-tui') {
+    setStage('dispatch-setup');
     const run = deps.runPtyDrive ?? (await import('../cli/pty-drive-cli.js')).runPtyDrive;
+    markDispatchAttempt();
     return { plan, kind: 'elanous-tui', result: await run({ elanous: true, ...plan.elanous! }) };
   }
   if (plan.dispatch === 'shell-drive') {
+    setStage('dispatch-setup');
     const run = deps.runPtyDrive ?? (await import('../cli/pty-drive-cli.js')).runPtyDrive;
+    markDispatchAttempt();
     return { plan, kind: 'shell-drive', result: await run(plan.drive!) };
   }
+  setStage('target-preparation');
   const confirmNonGit = async (target: string): Promise<void> => {
     const ask = deps.askNonGitInit ?? (async (prompt: string) => {
       const reader = createInterface({ input: process.stdin, output: process.stderr });
@@ -2324,12 +2375,15 @@ async function runDevPipelineDispatch(
     //   ⛔ 새 관을 만들지 않는다 — 이미 있는 이음매에 «소비자»를 붙인다.
     //   ⛔ 관측용이다 — 흐름을 바꾸지 않는다.
     const walk: { node: string; round: number }[] = [];
-    const result = await run({
+    const options: SelfImplementOptions = {
       ...toSelfImplementOptions(text, plan, seams),
       ...(spec.runId ? { runId: spec.runId } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
       onNodeEntry: (node, round) => { walk.push({ node, round }); },
-    });
+    };
+    setStage('dispatch-setup');
+    markDispatchAttempt();
+    const result = await run(options);
     // ⛔ 「걸음이 비었다」와 「안 걸었다」를 가른다 — 빈 배열은 «싣지 않는다».
     return { plan, kind: 'self', result: walk.length === 0 ? result : { ...result, walk } };
   }
@@ -2339,6 +2393,8 @@ async function runDevPipelineDispatch(
     const cwd = deps.cwd ?? process.cwd();
     const signal = deps.signal ?? new AbortController().signal; // 상위 취소 신호 전달(미제공 시 non-abort)
     const args = toAcpAgentArgs(text, plan, cwd);
+    setStage('dispatch-setup');
+    markDispatchAttempt();
     const raw = deps.dispatchAcpAgent ? await deps.dispatchAcpAgent(args, signal) : await defaultDispatchAcp(args, signal);
     // 결과 정규화 — {error}/{cancelled}를 성공으로 오판하지 않게 {ok} 계약으로(CLI exit-code 호환·fail-closed).
     return { plan, kind: 'acp', result: normalizeAcpResult(raw) };
@@ -2346,8 +2402,11 @@ async function runDevPipelineDispatch(
   // agent-mission-pty
   const run = deps.runAgentMission ?? (await import('../agent-mission/driver.js')).runAgentMission;
   const resolveBackend = deps.resolveBackend ?? (await import('../agent-mission/driver.js')).resolveBackend;
-  return { plan, kind: 'agent-mission', result: await run({
+  const mission = {
     ...toAgentMissionSpec(text, plan, resolveBackend),
     ...(deps.signal ? { signal: deps.signal } : {}),
-  }) };
+  };
+  setStage('dispatch-setup');
+  markDispatchAttempt();
+  return { plan, kind: 'agent-mission', result: await run(mission) };
 }

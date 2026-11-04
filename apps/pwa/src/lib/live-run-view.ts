@@ -78,6 +78,12 @@ export function liveRunPicks(entries: ReadonlyArray<HarnessRunEntry & { objectiv
     .map((entry) => ({ runId: entry.runId, label: line(entry.objective) || entry.runId, live: true, at: entry.lastActivityTimestamp ?? null }));
   const seen = new Set(running.map((pick) => pick.runId));
   const done = finished.filter((run) => !seen.has(run.runId))
+    .sort((a, b) => Date.parse(b.endedAt) - Date.parse(a.endedAt))
     .map((run) => ({ runId: run.runId, label: line(run.objective) || run.runId, live: false, at: run.endedAt }));
   return [...running, ...done];
+}
+
+/** In auto-follow mode the picker is already ordered newest active first, then newest finished. */
+export function latestLiveRunId(picks: readonly LiveRunPick[]): string | null {
+  return picks[0]?.runId ?? null;
 }

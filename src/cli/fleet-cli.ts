@@ -1,5 +1,6 @@
 import type { Command } from 'commander';
 import * as ui from '../ui.js';
+import { discoverCloudResources } from '../fleet/cloud-resource-discovery.js';
 import { writeStdoutJson } from './stdout-json.js';
 
 export function registerFleetCommands(program: Command): void {
@@ -33,10 +34,16 @@ export function registerFleetCommands(program: Command): void {
     .option('--cost', '오늘 추정 비용과 누적 등록 비용을 출력한다')
     .option('--json', '구조화된 자원·경보를 출력한다')
     .action(async (opts: { cost?: boolean; json?: boolean }) => {
+      const discovery = await discoverCloudResources();
       const { inspectInventory } = await import('../fleet/resource-inventory.js');
-      const snapshot = inspectInventory();
-      if (opts.json) { await writeStdoutJson(JSON.stringify({ ...snapshot, ...(opts.cost ? { cost: { today: snapshot.estimatedCostToday, cumulative: snapshot.estimatedCumulativeCost } } : {}) }, null, 2) + '\n'); return; }
+      const snapshot = inspectInventory(undefined, discovery.resources);
+      if (opts.json) {
+        await writeStdoutJson(JSON.stringify({ ...snapshot, discovery: discovery.providers,
+          ...(opts.cost ? { cost: { today: snapshot.estimatedCostToday, cumulative: snapshot.estimatedCumulativeCost } } : {}) }, null, 2) + '\n');
+        return;
+      }
       ui.header('Fleet resources (' + snapshot.resources.length + ' registered · ' + snapshot.alerts.length + ' alerts)');
+      for (const provider of discovery.providers) ui.info(`${provider.provider}: ${provider.status} · ${provider.resources} running`);
       for (const row of snapshot.resources) {
         const attrs = row.attrs;
         console.log('- ' + row.name + ' · ' + String(attrs.provider) + ' · ' + String(attrs.role) + ' · owner=' + String(attrs.ownerSeat) + ' · purpose=' + String(attrs.purpose || '(없음)') + (row.expired ? ' · EXPIRED' : ''));

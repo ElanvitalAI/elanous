@@ -36,6 +36,20 @@ export const DEFAULT_CDP_TIMEOUT_MS = 120_000;
 /** Short watchdog for local CDP HTTP endpoint discovery and target cleanup. */
 export const DEFAULT_CDP_ATTACH_TIMEOUT_MS = 5_000;
 
+/** Resolve the per-client setting, then the process-wide override, then the safe default. */
+export function resolveCdpAttachTimeoutMs(
+  configuredMs?: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  if (configuredMs !== undefined) return configuredMs;
+  const raw = env.ELANOUS_CDP_ATTACH_TIMEOUT_MS?.trim();
+  if (raw && /^\d+$/.test(raw)) {
+    const value = Number(raw);
+    if (Number.isSafeInteger(value) && value > 0) return value;
+  }
+  return DEFAULT_CDP_ATTACH_TIMEOUT_MS;
+}
+
 export type CdpEndpoint = number | string;
 
 function cdpEndpointUrl(endpoint: CdpEndpoint, path: string): string {
@@ -243,7 +257,7 @@ export async function resolveDebuggerUrl(
   const retries = opts.retries ?? 10;
   const interval = opts.intervalMs ?? 200;
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const attachTimeoutMs = opts.attachTimeoutMs ?? DEFAULT_CDP_ATTACH_TIMEOUT_MS;
+  const attachTimeoutMs = resolveCdpAttachTimeoutMs(opts.attachTimeoutMs);
   const startedAt = Date.now();
   let lastErr: unknown = null;
   let attempts = 0;
@@ -544,7 +558,7 @@ export async function createPageTarget(
   const url = opts.url ?? 'about:blank';
   const retries = opts.retries ?? 3;
   const interval = opts.intervalMs ?? 150;
-  const attachTimeoutMs = opts.attachTimeoutMs ?? DEFAULT_CDP_ATTACH_TIMEOUT_MS;
+  const attachTimeoutMs = resolveCdpAttachTimeoutMs(opts.attachTimeoutMs);
   let lastErr: unknown = null;
   for (let i = 0; i < retries; i++) {
     try {
@@ -585,7 +599,7 @@ export async function createCdpClientFromEndpoint(
   } = {},
 ): Promise<CdpClient> {
   const create = deps.createTransport ?? createCdpTransport;
-  const attachTimeoutMs = deps.attachTimeoutMs ?? DEFAULT_CDP_ATTACH_TIMEOUT_MS;
+  const attachTimeoutMs = resolveCdpAttachTimeoutMs(deps.attachTimeoutMs);
   const resolvePage = deps.resolvePage ?? ((targetEndpoint: CdpEndpoint) => createPageTarget(targetEndpoint, {
     ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
     attachTimeoutMs,

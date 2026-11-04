@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { cpus, loadavg } from 'node:os';
 import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
@@ -14,12 +15,14 @@ import { listSchedules } from '../release-loop/release-schedule.js';
 import { parseRubric, readRubricItems, rubricScore } from '../release-loop/rubric.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { trafficTick, TRAFFIC_SEATS, type TrafficCell } from '../loops/orchestrator/traffic.js';
-import { decideSpawn, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason } from '../loops/budget.js';
+import { decideResourceAdmission, decideSpawn, SEAT_CAP_STALE_RUN_MINUTES, SEAT_CAP_UNKNOWN_SEAT_CAP, seatCapDetails, seatCapExclusion, seatCapReason,
+  type ResourceAdmissionDecision, type SpawnBudgetDecision } from '../loops/budget.js';
 import { listSelfDevRuns, processBirthId, selfDevRunsDir } from '../self-dev/run-store.js';
 import { getUserConfig, userConfigPath, type OrchestratorLoopConfig } from '../user-config.js';
 import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js';
-import { leaseKubectl, measurePoolLease } from '../task-orchestrator/surfaces/pod-lease.js';
+import { leaseKubectl, measurePoolLease, recommendConcurrency } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, podPoolHostLease, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
+import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { writeHarnessQueueReceipt } from './harness-queue-child.js';
 import { detectReleaseGateActive, gateReserve } from './gate-reserve.js';
 import { adviseLaunch, compareLaunchAdvice, type LaunchAdvice } from './launch-advice.js';
@@ -34,7 +37,7 @@ export type QueueItem = {
   /** TASK-QUEUE: larger launches first within a seat; a row without it ranks below every prioritized row (FIFO among equals). */
   priority?: number;
 };
-export type QueuePool = { running: number; pending: number; reserved: number; limit: number };
+export type QueuePool = { running: number; pending: number; reserved: number; limit: number; recommended?: number | null };
 export type QueueTick = { outcome: 'launched' | 'waiting' | 'skipped'; item?: QueueItem; reason: string;
   /** QUEUE-BURST: every row this tick launched, first one = `item` (present only on a scheduled tick that launched). */ launched?: QueueItem[] };
 /** progressAt = newest run-ledger updatedAt among the tree's members; stopReason = the ledger's supervisor stop (SEAT-CAP-STALE).
@@ -84,6 +87,8 @@ export interface HarnessQueueDeps {
    *  Tests assert this option instead of inferring the boundary from which seams are injected. */
   needsOwnerGate?: boolean;
   pool?: () => QueuePool;
+  /** Resource shadow input only; normalized one-minute load per logical core. */
+  resourceHostLoad?: () => number | null;
   /** Shadow-only advice seam; exceptions must not affect the queue decision. */
   advice?: typeof adviseLaunch;
   /** Gate-reserve observation only; never changes seatCapDetails or decideSpawn inputs. */
@@ -542,12 +547,72 @@ export function readHarnessQueuePool(): QueuePool {
   if (observed.members.some((member) => member.running === null || member.pending === null)) throw new Error('pod lease status: incomplete running/pending measurement');
   const pendingJobs = observed.members.flatMap((member) => member.pendingJobs ?? []);
   const records = podPoolHostLease(members).live();
-  return {
+  const limit = members.reduce((sum, member) => sum + member.capacity, 0);
+  const pool: QueuePool = {
     running: observed.members.reduce((sum, member) => sum + member.running!, 0),
     pending: observed.members.reduce((sum, member) => sum + member.pending!, 0),
     reserved: hostLeaseCounts(records).reserved + records.filter((row) => row.stage === 'job' && !leaseHasPendingPod(row, pendingJobs)).length,
-    limit: members.reduce((sum, member) => sum + member.capacity, 0),
+    limit,
   };
+  // The recommendation is shadow-only: config/account/recommendation failures must
+  // leave the established pool fields usable by the queue's real policy checks.
+  return withQueueRecommendation(pool, () => {
+    let accounts = -1;
+    try { accounts = listCodexAccountsInStore().length; } catch { /* Account count is observed only, never a bound. */ }
+    return recommendConcurrency(observed, {
+      capacity: limit,
+      accounts,
+      perAccount: getUserConfig().pod?.lease?.perAccount ?? 4,
+    }).recommended;
+  });
+}
+
+/** Attach an optional shadow value without allowing its reader to invalidate required pool measurements. */
+export function withQueueRecommendation(pool: Omit<QueuePool, 'recommended'>, read: () => number | null): QueuePool {
+  let recommended: number | null = null;
+  try {
+    const value = read();
+    if (value === null || (Number.isSafeInteger(value) && value >= 0)) recommended = value;
+  } catch { /* The resource recommendation is unmeasured; required pool fields remain available. */ }
+  return { ...pool, recommended };
+}
+
+function logResourceAdmissionShadow(input: {
+  id: string;
+  seat: QueueSeat;
+  policy: SpawnBudgetDecision;
+  pool: QueuePool | undefined;
+  queueLaunching: number;
+  unreadablePenalty: number;
+  readHostLoad: () => number | null;
+}): void {
+  let poolHeadroom: number | null = null;
+  let hostLoad: number | null = null;
+  let resource: ResourceAdmissionDecision = { verdict: 'unmeasured', reason: 'resource-input-unmeasured' };
+  try {
+    poolHeadroom = typeof input.pool?.recommended === 'number' && Number.isSafeInteger(input.pool.recommended) && input.pool.recommended >= 0
+      ? Math.max(0, input.pool.recommended - (input.pool.reserved ?? 0) - input.queueLaunching - input.unreadablePenalty) : null;
+    try {
+      hostLoad = input.readHostLoad();
+      resource = decideResourceAdmission({ poolHeadroom, hostLoad });
+    } catch { /* An incomplete or throwing shadow observation is unmeasured. */ }
+    debug.log('harness.queue', 'admission-shadow', {
+      id: input.id,
+      seat: input.seat,
+      policy: { allow: input.policy.allow, reason: input.policy.reason, cap: input.policy.cap },
+      resource: resource.verdict,
+      resourceReason: resource.reason,
+      poolHeadroom,
+      hostLoad,
+      agree: resource.verdict === 'unmeasured' ? null : (resource.verdict === 'allow') === input.policy.allow,
+    });
+  } catch { /* Resource shadow work never changes queue approval. */ }
+}
+
+function readQueueHostLoadPerCore(): number | null {
+  const cores = cpus().length;
+  const oneMinute = loadavg()[0];
+  return cores > 0 && Number.isFinite(oneMinute) && oneMinute >= 0 ? oneMinute / cores : null;
 }
 
 /** Same sanitizing as `k8sLabelValue` (self-implement-pod.ts), which writes the `elanous.run` label value. */
@@ -1548,8 +1613,11 @@ async function tickHarnessQueueOnce(deps: HarnessQueueDeps, requestedId: string 
           }
         }
       }
-      if (poolReason) { blocked.set(item.seat, { reason: poolReason, active }); continue; }
       const budget = decideSpawn({ seat: item.seat, running: active, caps, gate, injectedCap });
+      const queueLaunching = current.filter((row) => row.status === 'launching' || row.status === 'launched').length;
+      logResourceAdmissionShadow({ id: item.id, seat: item.seat, policy: budget, pool, queueLaunching,
+        unreadablePenalty: unreadableState.penalty, readHostLoad: deps.resourceHostLoad ?? readQueueHostLoadPerCore });
+      if (poolReason) { blocked.set(item.seat, { reason: poolReason, active }); continue; }
       if (!budget.allow) {
         blocked.set(item.seat, { reason: `${budget.reason}: ${seatLine(item.seat, active, details)}`, active });
         continue;

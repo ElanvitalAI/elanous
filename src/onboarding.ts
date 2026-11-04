@@ -1688,7 +1688,11 @@ export function needsOnboarding(cfg: UserConfig): boolean {
 }
 
 export function needsFirstRun(cfg: UserConfig): boolean {
-  return !cfg.onboarding.completed && cfg.onboarding.ready !== true;
+  // `ready` means first-run provider setup can open the dashboard; it does not
+  // mean the default web-first setup was completed. Keep offering web-first
+  // until onboarding completes, unless the user explicitly disabled it.
+  return !cfg.onboarding.completed
+    && (cfg.onboarding.ready !== true || cfg.onboarding.webFirst !== false);
 }
 
 /** γ (2026-04-28) · per-step wizard. Runs ONE of the 5 steps,

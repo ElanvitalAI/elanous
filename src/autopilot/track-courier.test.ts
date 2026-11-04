@@ -58,6 +58,41 @@ describe('track courier', () => {
     } finally { store.close(); }
   });
 
+  test('old gh paginated JSON documents are merged without --slurp', async () => {
+    const argsSeen: string[][] = [];
+    const olderAt = new Date(now - 90 * 60_000).toISOString();
+    const recentAt = new Date(now - 12 * 60_000).toISOString();
+    const pages = [
+      [{ body: '**[T]** older page', created_at: olderAt }],
+      [{ body: '**[T]** recent page contains ] } and \\"quoted\\" text', created_at: recentAt }],
+    ];
+    const stdout = pages.map((page) => JSON.stringify(page, null, 2)).join('\n');
+
+    const result = await trackAlive('T', { config, now, ghApi: async (args) => { argsSeen.push(args); return stdout; } });
+
+    expect(argsSeen).toEqual([['api', '--paginate', `repos/ElanvitalAI/elanous/issues/20798/comments?since=${encodeURIComponent(new Date(now - 120 * 60_000).toISOString())}`]]);
+    expect(argsSeen[0]).not.toContain('--slurp');
+    expect(result).toEqual({ alive: true, lastPostAt: recentAt, reason: 'recent-post' });
+  });
+
+  test('gh query failure or a truncated later page stays unmeasured and routes to humans', async () => {
+    const { store, mission } = fixture();
+    const incompletePages = `${JSON.stringify([{ body: '**[T]** older page', created_at: new Date(now - 90 * 60_000).toISOString() }])}\n[{"body":"**[T]** truncated`;
+    const queries: Array<() => Promise<string>> = [
+      async () => { throw new Error('gh API unavailable'); },
+      async () => incompletePages,
+    ];
+    try {
+      for (const ghApi of queries) {
+        const routes = await routeMissionPhases(mission.id, { store, config, now, ghApi });
+        expect(routes.filter(({ track }) => track !== null).map(({ track, route, reason }) => ({ track, route, reason }))).toEqual([
+          { track: 'UX', route: 'human', reason: 'unmeasured' },
+          { track: 'MK', route: 'human', reason: 'unmeasured' },
+        ]);
+      }
+    } finally { store.close(); }
+  });
+
   test('one comment has courier header, phase routes and claim instructions with task IDs', async () => {
     const { store, mission, tasks } = fixture();
     const sent: string[] = [];
