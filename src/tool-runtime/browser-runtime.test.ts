@@ -165,7 +165,7 @@ describe('BrowserHand (DEMO1104-BROWSER-INTERACTION)', () => {
       confirmHuman: async () => true,
       browserAct: async (request, deps) => {
         urls.push(request.url);
-        if (urls.length === 1) throw new Error('Aside session is blocked');
+        if (urls.length === 1) throw Object.assign(new Error('Aside session is closed'), { name: 'AsideSessionUnavailableError' });
         return actionWithCapture(request, deps, path);
       },
       browserActDeps: { observe: (event, data) => { if (event === 'repair-node') repairNodes.push(data); } },
@@ -186,7 +186,7 @@ describe('BrowserHand (DEMO1104-BROWSER-INTERACTION)', () => {
     expect(reflected).toEqual([{ issueId: ISSUE, body: '이것도 반영: Archive report — Revenue rose 12%' }]);
   });
 
-  test('a non-session network-coded browser exception does not trigger an alternate retry', async () => {
+  test('a selector/action error that mentions a blocked Aside session does not trigger an alternate retry', async () => {
     const urls: string[] = [];
     const result = await dispatchBrowserHand({
       url: 'https://ir.example.test/report', target: 'body', armed: true,
@@ -195,7 +195,7 @@ describe('BrowserHand (DEMO1104-BROWSER-INTERACTION)', () => {
       confirmHuman: async () => true,
       browserAct: async request => {
         urls.push(request.url);
-        throw Object.assign(new Error('observer operation timed out'), { code: 'ETIMEDOUT' });
+        throw new Error('Aside session action blocked by invalid selector');
       },
       resolvePersona: async () => ({ ...PERSONA, actionHosts: ['ir.example.test', 'archive.example.test'] }),
       readPageText: async () => undefined,
@@ -248,7 +248,7 @@ describe('BrowserHand (DEMO1104-BROWSER-INTERACTION)', () => {
     expect(connections).toEqual(['9222', '9222']);
     expect(result).toMatchObject({
       ok: false, blocked: true, detoured: true, reason: 'execution-failed',
-      repairNode: { blockedOn: 'session:https://ir.example.test/report', detourUrl: 'https://archive.example.test/report', outcome: 'detour-failed' },
+      repairNode: { blockedOn: 'session:https://ir.example.test/report', detourUrl: 'https://archive.example.test/report', outcome: 'detour-failed', graphEvent: { reason: expect.stringContaining('session-unavailable') } },
     });
   });
 

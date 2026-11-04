@@ -572,7 +572,7 @@ describe('harness API handlers', () => {
     const shared = { entries: [], counts: { running: 0 }, total: 0 };
     const response = await handleHarnessRunsGet(new Request('http://nexus.test/v1/harness/runs'), {}, {
       queryRunningRuns: ((options: unknown) => {
-        expect(options).toEqual({ includeTest: false });
+        expect(options).toEqual({ includeTest: false, timeBudgetMs: 3_000 });
         return shared;
       }) as never,
     });
@@ -580,7 +580,7 @@ describe('harness API handlers', () => {
     expect(await response.json()).toEqual(shared);
   });
 
-  test('runs handler reuses same-process ledger facts and invalidates the changed file by mtime', async () => {
+  test('runs handler reuses an immediate TTL response and refreshes changed ledger facts after expiry', async () => {
     const root = mkdtempSync(join(tmpdir(), 'harness-runs-cache-'));
     const directory = join(root, 'run-ledger');
     mkdirSync(directory);
@@ -590,6 +590,7 @@ describe('harness API handlers', () => {
       `${JSON.stringify({ timestamp: '2026-10-09T00:00:00.000Z', runId, event, data })}\n`;
     const observations: Array<{ caller?: string | null; cacheHits?: number; cacheMisses?: number }> = [];
     const options: Array<{ includeTest?: boolean; noCache?: boolean; caller?: string }> = [];
+    let now = 1_000;
     const deps = {
       ledgerDirectories: () => [directory],
       ptyTargets: () => [],
@@ -604,24 +605,29 @@ describe('harness API handlers', () => {
     }) as typeof queryRunningRuns;
     try {
       writeFileSync(file, entry('run-status', { runStatus: 'completed' }));
-      const coldResponse = await handleHarnessRunsGet(request, {}, { queryRunningRuns: query });
+      const coldResponse = await handleHarnessRunsGet(request, {}, { queryRunningRuns: query, now: () => now });
       const cold = await coldResponse.json() as Record<string, unknown>;
-      const warmResponse = await handleHarnessRunsGet(request, {}, { queryRunningRuns: query });
+      const warmStarted = performance.now();
+      const warmResponse = handleHarnessRunsGet(request, {}, { queryRunningRuns: query, now: () => now });
+      expect(warmResponse).toBeInstanceOf(Response);
+      if (!(warmResponse instanceof Response)) throw new Error('warm runs response must be synchronous');
+      expect(performance.now() - warmStarted).toBeLessThan(500);
       const warm = await warmResponse.json() as Record<string, unknown>;
       expect(coldResponse.status).toBe(200);
       expect(warmResponse.status).toBe(200);
       expect(observations.map(({ caller, cacheHits, cacheMisses }) => ({ caller, cacheHits, cacheMisses }))).toEqual([
         { caller: null, cacheHits: 0, cacheMisses: 1 },
-        { caller: null, cacheHits: 1, cacheMisses: 0 },
       ]);
-      expect({ ...warm, ledger: { ...(warm.ledger as object), cacheHits: 0, cacheMisses: 1 } } as unknown).toEqual(cold);
-      expect(options).toEqual([{ includeTest: false }, { includeTest: false }]);
+      expect(warm).toEqual(cold);
+      expect(options).toEqual([{ includeTest: false, timeBudgetMs: 3_000 }]);
 
       writeFileSync(file, entry('start', { feature: 'now running' }));
       utimesSync(file, new Date('2026-10-09T00:00:02.000Z'), new Date('2026-10-09T00:00:02.000Z'));
-      const changed = await (await handleHarnessRunsGet(request, {}, { queryRunningRuns: query })).json() as { entries: Array<{ runId: string }> };
+      now += 120_001;
+      const changed = await (await handleHarnessRunsGet(request, {}, { queryRunningRuns: query, now: () => now })).json() as { entries: Array<{ runId: string }> };
       expect(changed.entries.map((row) => row.runId)).toEqual([runId]);
-      expect(observations[2]).toMatchObject({ caller: null, cacheHits: 0, cacheMisses: 1 });
+      expect(observations[1]).toMatchObject({ caller: null, cacheHits: 0, cacheMisses: 1 });
+      expect(options).toEqual([{ includeTest: false, timeBudgetMs: 3_000 }, { includeTest: false, timeBudgetMs: 3_000 }]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

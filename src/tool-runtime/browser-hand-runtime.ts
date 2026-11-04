@@ -109,7 +109,7 @@ function blockedKind(value: string | undefined): 'login' | 'paywall' | undefined
 function isBrowserSessionUnavailableError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (['CdpUnavailable', 'AsideSessionUnavailableError', 'BrowserSessionUnavailableError'].includes(error.name)) return true;
-  return /^aside\s+session\b[\s\S]{0,40}\b(?:unavailable|blocked|disconnected|closed|refused|timed?\s*out)\b/i.test(error.message);
+  return /^aside\s+session\s+(?:is\s+)?(?:unavailable|disconnected|closed|refused|timed?\s*out)\b/i.test(error.message);
 }
 
 function failureBlockKind(action: BrowserActionResult): 'login' | 'paywall' | 'session' | undefined {
@@ -157,6 +157,7 @@ function recordRepairNode(node: BrowserHandRepairNode, deps: BrowserHandDeps): v
 
 function createRepairNode(input: {
   block: 'login' | 'paywall' | 'session';
+  failureReason?: string;
   sourceUrl: string;
   detourUrl: string;
   outcome: 'detoured' | 'detour-failed';
@@ -174,7 +175,7 @@ function createRepairNode(input: {
     kind: 'hand' as const,
     decider: 'browser-hand' as const,
     reason: input.block === 'session'
-      ? 'browser session unavailable; one alternate source checked'
+      ? `browser session unavailable${input.failureReason ? ` (${input.failureReason})` : ''}; one alternate source checked`
       : `${input.block} blocked source; one alternate source checked`,
     who: 'Elanous' as const,
     what: input.outcome === 'detoured' ? `Continue browser work from ${input.detourUrl}` : 'Stop after blocked browser source',
@@ -273,7 +274,9 @@ export async function dispatchBrowserHand(args: BrowserHandArgs, _ctx?: ToolRunt
         url: actionUrl,
         target,
         reason: sessionUnavailable ? 'load-unavailable' as const : 'execution-failed' as const,
-        error: sessionUnavailable ? 'browser session unavailable' : 'browser action failed',
+        error: sessionUnavailable
+          ? (error instanceof Error ? error.message : String(error))
+          : 'browser action failed',
       };
     }
   };
@@ -307,17 +310,24 @@ export async function dispatchBrowserHand(args: BrowserHandArgs, _ctx?: ToolRunt
   let action = await runBrowserAction(actionUrl);
   if (!action.ok && !blocked) {
     block = failureBlockKind(action);
+    const failureReason = block === 'session' ? action.reason : undefined;
     const alternate = args.alternateUrl?.trim() ?? '';
     let alternateParsed: URL | undefined;
     try { alternateParsed = new URL(alternate); } catch { /* no valid fallback */ }
     let alternateText: string | undefined;
-    if (block && alternateParsed && ['http:', 'https:'].includes(alternateParsed.protocol)
-      && decideActionBoundary({ hosts: persona.actionHosts, url: alternate, href: null }).allowed) {
+    const alternateAllowed = !!block && !!alternateParsed && ['http:', 'https:'].includes(alternateParsed.protocol)
+      && decideActionBoundary({ hosts: persona.actionHosts, url: alternate, href: null }).allowed;
+    if (alternateAllowed) {
       try { alternateText = await inspect(alternate, pagePort); } catch { /* unknown is allowed after an explicit login/paywall error */ }
     }
-    if (block && alternateParsed && ['http:', 'https:'].includes(alternateParsed.protocol)
-      && decideActionBoundary({ hosts: persona.actionHosts, url: alternate, href: null }).allowed
-      && !blockedKind(alternateText)) {
+    if (block === 'session' && alternateAllowed && !blockedKind(alternateText)) {
+      // A session loss selects the production hand adapter (BrowserHand on the
+      // explicitly allowlisted alternate); ordinary action errors never enter here.
+      action = await runBrowserAction(alternate);
+      blocked = true;
+      actionUrl = alternate;
+      detoured = true;
+    } else if (block && alternateAllowed && !blockedKind(alternateText)) {
       blocked = true;
       actionUrl = alternate;
       action = await runBrowserAction(actionUrl);
@@ -326,7 +336,7 @@ export async function dispatchBrowserHand(args: BrowserHandArgs, _ctx?: ToolRunt
       blocked = true;
     }
     if (block) {
-      repairNode = createRepairNode({ block, sourceUrl: url, detourUrl: detoured ? alternate : '', outcome: detoured && action.ok ? 'detoured' : 'detour-failed', issueId, deps });
+      repairNode = createRepairNode({ block, ...(failureReason ? { failureReason } : {}), sourceUrl: url, detourUrl: detoured ? alternate : '', outcome: detoured && action.ok ? 'detoured' : 'detour-failed', issueId, deps });
       recordRepairNode(repairNode, deps);
     }
   }

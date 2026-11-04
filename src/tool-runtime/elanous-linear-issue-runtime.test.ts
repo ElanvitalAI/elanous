@@ -15,6 +15,7 @@ test('routes only the selected create, comment and complete action', async () =>
   const calls: string[] = [];
   const runtime = createElanousLinearIssueRuntime({
     getApiKey: async id => { calls.push(`key:${id}`); return 'secret'; },
+    getConfig: () => ({ connector: { linear: { team: 'DEFAULT' } } }),
     create: async input => { calls.push(`create:${input.teamKey}:${input.title}`); return 'issue-1'; },
     comment: async input => { calls.push(`comment:${input.issueId}:${input.body}`); },
     complete: async input => { calls.push(`complete:${input.issueId}:${input.type}`); },
@@ -30,6 +31,30 @@ test('routes only the selected create, comment and complete action', async () =>
     'key:connector.linear.apiKey', 'comment:issue-1:done',
     'key:connector.linear.apiKey', 'complete:issue-1:completed',
   ]);
+});
+
+test('uses the configured Linear default team when create omits teamKey', async () => {
+  const teams: string[] = [];
+  const runtime = createElanousLinearIssueRuntime({
+    getApiKey: async () => 'secret',
+    getConfig: () => ({ connector: { linear: { team: ' DEMO ' } } }),
+    create: async input => { teams.push(input.teamKey); return 'issue-1'; },
+  });
+  expect(await runtime.run({ action: 'create', title: 'example' }, { surface: 'tui' } as never))
+    .toMatchObject({ ok: true, issueId: 'issue-1' });
+  expect(teams).toEqual(['DEMO']);
+});
+
+test('rejects create without an explicit or configured Linear team', async () => {
+  let mutations = 0;
+  const runtime = createElanousLinearIssueRuntime({
+    getApiKey: async () => 'secret',
+    getConfig: () => ({ connector: { linear: {} } }),
+    create: async () => { mutations++; return 'issue-1'; },
+  });
+  expect(await runtime.run({ action: 'create', title: 'example' }, { surface: 'tui' } as never))
+    .toMatchObject({ ok: false });
+  expect(mutations).toBe(0);
 });
 
 test('rejects incomplete inputs before making a Linear mutation', async () => {

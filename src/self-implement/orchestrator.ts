@@ -5663,6 +5663,19 @@ async function runSelfImplementInner(
     ...(opts.childLlm ? { configuredProvider: configuredProvider.provider ?? null, configuredModel: configuredProvider.model ?? null, modelSelectionSource: 'child' } : {}),
     ...(opts.correlationId !== undefined ? { correlationId: opts.correlationId } : {}),
   });
+  // The traversal resource panel is scoped to the node window. Record the selected
+  // implementation model there as an explicit consume event, using the same provider
+  // resolved for this run (after child selection), rather than the requested/default model.
+  observe('llm-consume-start', {
+    provider: activeProvider.provider ?? null,
+    model: activeProvider.model ?? null,
+    childProvider: activeProvider.provider ?? null,
+    childModel: activeProvider.model ?? null,
+    llmConsumeStart: {
+      ...(activeProvider.provider ? { provider: activeProvider.provider } : {}),
+      ...(activeProvider.model ? { model: activeProvider.model } : {}),
+    },
+  });
   try {
     await (s.refreshCodexQuotaSignals ?? refreshCodexQuotaSignals)();
     observe('quota-refresh', { status: 'completed' });

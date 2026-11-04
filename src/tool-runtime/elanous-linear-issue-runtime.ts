@@ -2,16 +2,18 @@ import { debug } from '../debug/log.js';
 import { commentLinearIssue, createLinearTeamIssue, moveLinearIssueToStateType } from '../connectors/linear.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import type { LLMToolSpec } from '../llm.js';
+import { getUserConfig } from '../user-config.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
 export type ElanousLinearIssueArgs =
-  | { action: 'create'; teamKey: string; title: string; description?: string }
+  | { action: 'create'; teamKey?: string; title: string; description?: string }
   | { action: 'comment'; issueId: string; body: string }
   | { action: 'complete'; issueId: string };
 export interface ElanousLinearIssueResult extends Record<string, unknown> { ok: boolean; output: string }
 
 type Deps = {
   getApiKey?: (id: string) => Promise<string | undefined>;
+  getConfig?: () => Record<string, unknown>;
   create?: typeof createLinearTeamIssue;
   comment?: typeof commentLinearIssue;
   complete?: typeof moveLinearIssueToStateType;
@@ -29,7 +31,7 @@ export function createElanousLinearIssueRuntime(deps: Deps = {}): ToolRuntime<El
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['create', 'comment', 'complete'] },
-          teamKey: { type: 'string', description: 'Required only for create; Linear team key, such as DEMO.' },
+          teamKey: { type: 'string', description: 'Optional for create; defaults to connector.linear.team or connector.linear.teamKey.' },
           title: { type: 'string', description: 'Required only for create.' },
           description: { type: 'string', description: 'Optional create description.' },
           issueId: { type: 'string', description: 'Required for comment and complete.' },
@@ -45,7 +47,15 @@ export function createElanousLinearIssueRuntime(deps: Deps = {}): ToolRuntime<El
       const fetch = deps.fetch ?? globalThis.fetch;
       try {
         if (args?.action === 'create') {
-          const teamKey = typeof args.teamKey === 'string' ? args.teamKey.trim() : '';
+          const connector = (deps.getConfig ?? (() => getUserConfig().raw))().connector;
+          const linear = connector && typeof connector === 'object'
+            ? (connector as Record<string, unknown>).linear
+            : undefined;
+          const linearConfig = linear && typeof linear === 'object' ? linear as Record<string, unknown> : {};
+          const configuredTeam = [linearConfig.team, linearConfig.teamKey]
+            .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+          const explicitTeam = typeof args.teamKey === 'string' ? args.teamKey.trim() : '';
+          const teamKey = explicitTeam || (typeof configuredTeam === 'string' ? configuredTeam.trim() : '');
           const title = typeof args.title === 'string' ? args.title.trim() : '';
           if (!teamKey || !title) return { ok: false, output: 'Linear issue 생성에는 teamKey와 title이 필요합니다.' };
           const issueId = await (deps.create ?? createLinearTeamIssue)({ apiKey, teamKey, title,

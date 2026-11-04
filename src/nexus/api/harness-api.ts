@@ -37,6 +37,8 @@ const ASK_STATUS_EVENT_TO_PHASE = {
 const ASK_STATUS_EVENTS = new Set<string>(Object.keys(ASK_STATUS_EVENT_TO_PHASE));
 const ACCEPTED_ASK_REGISTRY_LIMIT = 1_000;
 const acceptedAskIssuedAt = new Map<string, number>();
+const RUNNING_RUNS_HTTP_CACHE_TTL_MS = 120_000; // 0.3.4: federated 스캔 25~34초 — 3초는 매번 놓쳤다
+const runningRunsHttpCache = new WeakMap<typeof queryRunningRuns, { at: number; result: RunningRunsResult; body: string }>();
 
 export function rememberAcceptedAsk(acceptanceId: string, issuedAt = Date.now()): void {
   acceptedAskIssuedAt.delete(acceptanceId);
@@ -111,6 +113,8 @@ export interface HarnessApiDeps {
   readonly ledgerDir?: string;
   /** 시험 심 — `?finishedSince=` 의 `landed`(gh 실행기·저장소·시간 초과). */
   readonly landed?: LandedPrsDeps;
+  /** 시계 주입 — `GET /v1/harness/runs`의 3초 스냅샷 TTL 시험용. */
+  readonly now?: () => number;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -119,6 +123,16 @@ function json(body: unknown, status = 200): Response {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function cachedRunningRuns(query: typeof queryRunningRuns, now: () => number): { result: RunningRunsResult; body: string } {
+  const cached = runningRunsHttpCache.get(query);
+  const requestedAt = now();
+  if (cached && requestedAt - cached.at < RUNNING_RUNS_HTTP_CACHE_TTL_MS) return cached;
+  const result = query({ includeTest: false, timeBudgetMs: 3_000 }); // PWA 런 목록 — federated 스캔이 25~34초라 3초 예산 안의 부분 결과로 답한다
+  const snapshot = { at: now(), result, body: JSON.stringify(result) };
+  runningRunsHttpCache.set(query, snapshot);
+  return snapshot;
 }
 
 export function queryHarnessAskLifecycle(store: Pick<LogStore, 'query'>, acceptanceId: string) {
@@ -533,10 +547,11 @@ export async function listLandedPrs(sinceMs: number, deps: LandedPrsDeps = {}): 
 export function handleHarnessRunsGet(req: Request, _metaApi: HarnessMetaApi, deps: HarnessApiDeps = {}): Response | Promise<Response> {
   const totalStarted = performance.now();
   const runningStarted = performance.now();
-  const runs: RunningRunsResult = (deps.queryRunningRuns ?? queryRunningRuns)({ includeTest: false });
+  const runningRuns = cachedRunningRuns(deps.queryRunningRuns ?? queryRunningRuns, deps.now ?? Date.now);
+  const runs = runningRuns.result;
   const runningMs = Math.max(0, Math.round(performance.now() - runningStarted));
   const raw = new URL(req.url).searchParams.get('finishedSince');
-  if (raw === null) return json(runs);
+  if (raw === null) return new Response(runningRuns.body, { status: 200, headers: JSON_HEADERS });
   const sinceMs = Number(raw);
   if (!raw.trim() || !Number.isFinite(sinceMs) || sinceMs < 0) {
     return json({ error: 'usage: GET /v1/harness/runs?finishedSince=<epoch ms>' }, 400);

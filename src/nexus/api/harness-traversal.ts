@@ -84,11 +84,11 @@ function safeResource(value: unknown): string | undefined {
 function resourcesFor(window: readonly RunLedgerEntry[], origin: RunLedgerEntry | undefined) {
   const resources: NonNullable<TraversalStepWire['resources']> = {};
   const models = new Set<string>();
+  const plugins = new Set<string>();
   const originData = origin?.data ?? {};
   resources.host = safeResource(originData.hostname) ?? safeResource(originData.hostId);
   resources.pod = safeResource(originData.podName);
   const requestedModel = safeResource(originData.childModel);
-  if (requestedModel) models.add(requestedModel);
   const events = window;
   for (const entry of events) {
     const data = entry.data;
@@ -107,8 +107,18 @@ function resourcesFor(window: readonly RunLedgerEntry[], origin: RunLedgerEntry 
       const model = safeResource(value);
       if (model) models.add(model);
     }
+    if (entry.event === 'plugin-tool-call') {
+      const plugin = safeResource(data.plugin);
+      const tool = safeResource(data.tool);
+      const name = plugin && tool ? `${plugin}/${tool}` : plugin ?? tool;
+      if (name) plugins.add(name);
+    }
   }
+  // Prefer the model consumed during this node over the launch request. The latter
+  // remains a compatibility fallback for older ledgers without consume events.
+  if (!models.size && requestedModel) models.add(requestedModel);
   if (models.size) resources.models = [...models];
+  if (plugins.size) resources.plugins = [...plugins];
   return Object.values(resources).some(Boolean) ? resources : undefined;
 }
 

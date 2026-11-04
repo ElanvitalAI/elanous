@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { PluginHost, USER_DIR, type HostHooks } from './host.js';
 import { installPlugin, removePlugin } from '../install/plugin-install.js';
+import { loadRunLedger } from '../../self-implement/run-ledger.js';
 
 const tempDirs: string[] = [];
 
@@ -52,6 +53,37 @@ afterEach(() => {
 });
 
 describe('PluginHost user-dir contract vs Claude package management', () => {
+  test('records an actual host tool dispatch against its run without persisting arguments', async () => {
+    const original = {
+      state: process.env.ELANOUS_STATE_DIR,
+      run: process.env.ELANOUS_RUN_ID,
+    };
+    const stateDir = createDir('elanous-host-tool-ledger-');
+    const runId = 'run-plugin-tool-call-test';
+    try {
+      process.env.ELANOUS_STATE_DIR = stateDir;
+      process.env.ELANOUS_RUN_ID = runId;
+      const host = new PluginHost(hooks, null, { userDir: createDir('elanous-host-tool-user-') });
+      host.registerHostTool({
+        name: 'test_actual_tool',
+        description: 'test tool',
+        parameters: { type: 'object', properties: { secret: { type: 'string' } } },
+        handler: async () => 'ok',
+      });
+
+      await expect(host.dispatchTool('test_actual_tool', { secret: 'must-not-persist' })).resolves.toEqual({ ok: true, result: 'ok' });
+      expect(loadRunLedger(runId)).toContainEqual(expect.objectContaining({
+        event: 'plugin-tool-call', data: { plugin: null, tool: 'test_actual_tool' },
+      }));
+      expect(JSON.stringify(loadRunLedger(runId))).not.toContain('must-not-persist');
+    } finally {
+      if (original.state === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = original.state;
+      if (original.run === undefined) delete process.env.ELANOUS_RUN_ID;
+      else process.env.ELANOUS_RUN_ID = original.run;
+    }
+  });
+
   test('USER_DIR stays at ~/.claude/plugins and the header names that same path', () => {
     expect(USER_DIR).toBe(join(homedir(), '.claude', 'plugins'));
     const src = readFileSync(join(import.meta.dir, 'host.ts'), 'utf8');

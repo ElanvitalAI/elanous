@@ -1,7 +1,7 @@
 {
   "id": "elanous",
   "name": "Elanous",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Elanous is a self-healing coding agent with an ACP server for editor integration.",
   "repository": "https://github.com/ElanvitalAI/elanous",
   "authors": [

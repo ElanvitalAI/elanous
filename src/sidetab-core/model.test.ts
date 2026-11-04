@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  createNextSidetabHostHandler, createReplNextSidetabTool, formatSidetabLines, isNextSidetabCall, nextSidetabToolSpec,
+  applySidetabKey, createNextSidetabHostHandler, createReplNextSidetabTool, formatSidetabLines, isNextSidetabCall, nextSidetabToolSpec,
   type SidetabRow,
   sidetabRowsFromManifest,
 } from './model.js';
@@ -60,6 +60,38 @@ describe('renderer-independent sidetab model and actions', () => {
       ['run:agent', 'agent', 1],
     ]);
     expect(formatSidetabLines(expanded, 0, 28)[0]).toContain('워크스페이스');
+  });
+
+  test('SIDETAB-WORKSPACES-S1 gives mission and harness workspaces stable selectable rows without reordering classic sessions', () => {
+    const manifest = [
+      manifestRow({ id: 'classic:z', kind: 'tui', sessionId: 'session-z', nickname: 'classic z', instance: 'project' }),
+      manifestRow({ id: 'mission:agent', kind: 'agent', spaceId: 'mission-1', spaceKind: 'solve-mission', runId: 'mission-run', parentPtyId: 'tui:11', nickname: 'mission agent', instance: 'project' }),
+      manifestRow({ id: 'classic:a', kind: 'tui', sessionId: 'session-a', nickname: 'classic a', instance: 'project' }),
+      manifestRow({ id: 'mission:agent:2', kind: 'agent', spaceId: 'mission-2', spaceKind: 'solve-mission', runId: 'mission-run-2', parentPtyId: 'tui:11', nickname: 'second mission agent', instance: 'project' }),
+      manifestRow({ id: 'run:agent', kind: 'agent', runId: 'run-1', spaceId: 'harness-1', spaceKind: 'self-implement', parentPtyId: 'tui:11', nickname: 'harness child', instance: 'project' }),
+      manifestRow({ id: 'classic:m', kind: 'tui', sessionId: 'session-m', nickname: 'classic m', instance: 'project' }),
+    ];
+
+    const classicRows = sidetabRowsFromManifest(manifest, 'project');
+    expect(classicRows.map(({ id }) => id)).toEqual(manifest.map(({ id }) => id));
+
+    const workspaceRows = sidetabRowsFromManifest(manifest, 'project', undefined, {
+      mode: 'workspaces', expandedWorkspaceIds: [],
+    });
+    expect(workspaceRows.map(({ id, label, kind }) => [id, label, kind])).toEqual([
+      ['workspace:mission-1', '미션 · mission-1', 'workspace'],
+      ['workspace:mission-2', '미션 · mission-2', 'workspace'],
+      ['workspace:harness-1', '하니스 런 · harness-1', 'workspace'],
+    ]);
+    expect(new Set(workspaceRows.map(({ id }) => id)).size).toBe(workspaceRows.length);
+    expect(new Set(workspaceRows.map(({ label }) => label)).size).toBe(workspaceRows.length);
+    const movedSelection = applySidetabKey({ open: true, selected: 0 }, 'down', workspaceRows.length);
+    expect(workspaceRows[movedSelection.selected]?.id).toBe('workspace:mission-2');
+
+    const reordered = sidetabRowsFromManifest([...manifest].reverse(), 'project', undefined, {
+      mode: 'workspaces', expandedWorkspaceIds: [],
+    });
+    expect(reordered.map(({ id, label }) => [id, label])).toEqual(workspaceRows.map(({ id, label }) => [id, label]));
   });
 
   test('SIDETAB-WORKSPACES keeps same member labels distinct by space id', () => {
