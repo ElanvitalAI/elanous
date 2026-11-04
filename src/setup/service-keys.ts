@@ -95,6 +95,10 @@ export interface ServiceKeyStatus {
   label: string;
   envNames: string[];
   configured: boolean;
+  /** Names of sources that currently contain a usable value; secret values are never returned. */
+  sources: string[];
+  /** True when at least one secret-store source could not be checked. */
+  sourceCheckFailed: boolean;
   kind: string;
 }
 
@@ -113,20 +117,40 @@ function cachedValue(name: string, cacheDir: string): string | undefined {
   } catch { return undefined; }
 }
 
-export function serviceKeyStatus(options: {
+export async function serviceKeyStatus(options: {
   env?: NodeJS.ProcessEnv;
   cacheDir?: string;
-} = {}): ServiceKeyStatus[] {
+  getSecret?: (id: string) => Promise<string | undefined>;
+} = {}): Promise<ServiceKeyStatus[]> {
   const env = options.env ?? process.env;
   const cacheDir = options.cacheDir ?? (process.env.ELANOUS_KEY_CACHE_DIR?.trim() || join(homedir(), '.cache'));
-  return SERVICE_KEY_CATALOG.map(item => ({
-    id: item.id,
-    label: item.label,
-    envNames: [...item.envNames],
-    kind: item.kind,
-    configured: item.kind === 'api-key'
-      ? item.envNames.some(name => Boolean(env[name]?.trim() || cachedValue(name, cacheDir)))
-      : false,
+  // Keep bare CLI startup independent of the NEXUS secret backend; load it
+  // only when explicit status inspection needs a secret-store entry.
+  const getSecret = options.getSecret ?? (async (id: string) => {
+    const { getSecretAsync } = await import('../nexus/config/secrets/index.js');
+    return getSecretAsync(id);
+  });
+  return Promise.all(SERVICE_KEY_CATALOG.map(async item => {
+    const envSources = item.envNames.filter(name => Boolean(env[name]?.trim()));
+    const cacheSources = item.storeIds?.length
+      ? [] // A cached LINEAR_API_KEY is not one of the runtime credential sources.
+      : item.envNames.filter(name => Boolean(cachedValue(name, cacheDir))).map(name => `cache:${name}`);
+    const secretSources: string[] = [];
+    let sourceCheckFailed = false;
+    for (const id of item.storeIds ?? []) {
+      try { if ((await getSecret(id))?.trim()) secretSources.push(id); }
+      catch { sourceCheckFailed = true; }
+    }
+    const sources = [...envSources, ...cacheSources, ...secretSources];
+    return {
+      id: item.id,
+      label: item.label,
+      envNames: [...item.envNames],
+      kind: item.kind,
+      sources,
+      sourceCheckFailed,
+      configured: item.kind === 'api-key' && sources.length > 0,
+    };
   }));
 }
 

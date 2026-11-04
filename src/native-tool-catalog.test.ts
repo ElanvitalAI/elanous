@@ -30,6 +30,8 @@ test('virtual-window control and context tools are absent while essential tools 
     host: ['tui', 'mcp'], safety: ['mutating', 'network'], supportsParallel: false, defaultEnabled: true,
   });
   expect(nativeToolCatalog.find(tool => tool.id === 'elanous_linear_secretary')).toMatchObject({
+    alwaysLoad: false,
+    shouldDefer: true,
     host: ['tui', 'mcp'], safety: ['mutating', 'network'], supportsParallel: false, defaultEnabled: true,
   });
 });

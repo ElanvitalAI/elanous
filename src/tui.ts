@@ -445,7 +445,27 @@ let _cancelReadKey: (() => void) | undefined;
 /** TUI-SIGTTIN-SUSPEND — stops the tty-foreground guard (src/tty-foreground.ts). */
 let _stopForegroundGuard: (() => void) | undefined;
 
+/**
+ * TUI-CONSOLE-ERROR-LEAK (0.3.3 · 11-04 대표 라이브 실물) — 화면을 TUI 가 쥔 동안 console.error·warn 이
+ * 그대로 터미널에 쓰여 하단이 깨졌다([outbound] 폴백·Codex 회전 알림). 그 구간에는 로그로만 보내고 cleanup 에서 원복한다.
+ */
+let _restoreConsole: (() => void) | undefined;
+export function muteConsoleWhileTui(target: Pick<Console, 'error' | 'warn'> = console): () => void {
+  const origError = target.error;
+  const origWarn = target.warn;
+  const route = (kind: 'error' | 'warn') => (...args: unknown[]): void => {
+    try {
+      debug.log('tui.console', kind, { text: args.map(a => (a instanceof Error ? a.message : String(a))).join(' ').slice(0, 2000) });
+    } catch { /* 로그 실패가 화면을 깨지 않는다 */ }
+  };
+  target.error = route('error') as typeof console.error;
+  target.warn = route('warn') as typeof console.warn;
+  return () => { target.error = origError; target.warn = origWarn; };
+}
+
 function cleanup(): void {
+  _restoreConsole?.();
+  _restoreConsole = undefined;
   _stopForegroundGuard?.();
   _stopForegroundGuard = undefined;
   resetRenderCache();
@@ -537,6 +557,7 @@ export function initTui(altScreen = true): void {
   // this is safe to turn on globally. Cleanup in `cleanup()` writes
   // the matching "off" sequences.
   process.stdout.write(ansi.mouseOn + ansi.pasteOn + ansi.kittyKbOn + ansi.modKeysOn);
+  _restoreConsole ??= muteConsoleWhileTui();
   if (altScreen) {
     process.stdout.write(ansi.altOn + ansi.hideCursor);
     _alt = true;
@@ -1081,6 +1102,9 @@ export interface RenderOptions {
   /** Absolute-positioned draw commands emitted after changed base rows.
   *  Used for modal overlays so the whole frame flushes as one write. */
   overlay?: string;
+  /** Modal cells are painted by `overlay`; base-row updates must leave
+   *  these columns resident so an uncovered frame never exposes the base. */
+  preserveBounds?: { row: number; col: number; width: number; height: number };
   /** Drop the cached frame and repaint every row. Use after resize or
   *  when an overlay closes and the covered rows must be restored. */
   force?: boolean;
@@ -1137,18 +1161,38 @@ export function render(lines: string[], opts: RenderOptions = {}): void {
   const { rows, cols } = termSize();
   const resized = rows !== _lastFrameRows || cols !== _lastFrameCols;
   const force = opts.force || resized || _lastFrameLines.length === 0;
+  const preserveBounds = opts.preserveBounds;
   const maxRows = Math.max(0, rows);
   const lineCount = Math.min(lines.length, maxRows);
   const dirtyRows = Math.max(lineCount, Math.min(_lastFrameLines.length, maxRows));
 
-  let buf = force ? (ansi.hideCursor + ansi.moveTo(1, 1) + ansi.eraseDown) : ansi.hideCursor;
+  // A forced dashboard repaint still keeps an active modal's cells intact:
+  // its overlay is appended below in this same write. Once the modal closes,
+  // preserveBounds is absent and the normal full reset restores the base.
+  let buf = force && !preserveBounds
+    ? (ansi.hideCursor + ansi.moveTo(1, 1) + ansi.eraseDown)
+    : ansi.hideCursor;
   for (let i = 0; i < dirtyRows; i++) {
     const next = i < lineCount ? lines[i]! : '';
     const prev = _lastFrameLines[i] ?? '';
     if (force || next !== prev) {
-      // Clear only rows that changed. tmux shows full-screen erase/repaint
-      // as visible flicker, so keep unchanged rows resident.
-      buf += ansi.moveTo(i + 1, 1) + ansi.clearLine + next;
+      const bounds = preserveBounds;
+      const row = i + 1;
+      if (bounds && row >= bounds.row && row < bounds.row + bounds.height) {
+        const leftWidth = Math.max(0, bounds.col - 1);
+        const rightStart = Math.max(0, bounds.col - 1 + bounds.width);
+        const rightWidth = Math.max(0, cols - rightStart);
+        const left = padAnsiToColumns(sliceAnsiByColumns(next, 0, leftWidth), leftWidth);
+        const right = padAnsiToColumns(sliceAnsiByColumns(next, rightStart, rightStart + rightWidth), rightWidth);
+        // Update only visible base columns. The popup overlay is appended
+        // below and paints the preserved middle cells last in this frame.
+        if (leftWidth > 0) buf += ansi.moveTo(row, 1) + left;
+        if (rightWidth > 0) buf += ansi.moveTo(row, rightStart + 1) + right;
+      } else {
+        // Clear only rows that changed. tmux shows full-screen erase/repaint
+        // as visible flicker, so keep unchanged rows resident.
+        buf += ansi.moveTo(row, 1) + ansi.clearLine + next;
+      }
     }
   }
   if (opts.overlay) buf += opts.overlay;
@@ -1195,6 +1239,55 @@ export function render(lines: string[], opts: RenderOptions = {}): void {
 /** Strip ANSI escape codes from a string */
 export function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+/** Return an ANSI SGR-preserving slice by terminal columns. Wide graphemes
+ *  crossing a slice edge become spaces so the neighboring overlay keeps
+ *  ownership of those cells. */
+export function sliceAnsiByColumns(text: string, start: number, end: number): string {
+  const lo = Math.max(0, start);
+  const hi = Math.max(lo, end);
+  const sgr = /\x1b\[[0-9;]*m/g;
+  let out = '';
+  let activeSgr = '';
+  let offset = 0;
+  let column = 0;
+  let started = false;
+  let match: RegExpExecArray | null;
+  const appendText = (chunk: string): void => {
+    for (const grapheme of graphemeSegments(chunk)) {
+      const width = Math.max(0, visibleWidth(grapheme));
+      const nextColumn = column + width;
+      const overlapStart = Math.max(column, lo);
+      const overlapEnd = Math.min(nextColumn, hi);
+      if (overlapEnd > overlapStart) {
+        if (!started) {
+          out += activeSgr;
+          started = true;
+        }
+        out += overlapStart === column && overlapEnd === nextColumn
+          ? grapheme
+          : ' '.repeat(overlapEnd - overlapStart);
+      }
+      column = nextColumn;
+    }
+  };
+  while ((match = sgr.exec(text)) !== null) {
+    if (column >= hi) break;
+    if (match.index > offset) appendText(text.slice(offset, match.index));
+    const sequence = match[0];
+    if (sequence === '\x1b[m' || sequence === '\x1b[0m') activeSgr = '';
+    else activeSgr += sequence;
+    if (started) out += sequence;
+    offset = match.index + sequence.length;
+  }
+  if (column < hi && offset < text.length) appendText(text.slice(offset));
+  if (started && activeSgr) out += '\x1b[0m';
+  return out;
+}
+
+function padAnsiToColumns(text: string, width: number): string {
+  return text + ' '.repeat(Math.max(0, width - visibleWidth(text)));
 }
 
 /**

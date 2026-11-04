@@ -1,4 +1,6 @@
 import { expect, test } from 'bun:test';
+import { applyRunGraphEvents, runGraphToFlow } from '../../apps/pwa/src/lib/run-graph-flow.js';
+import type { RunGraphDetail } from '../../apps/pwa/src/nexus/client.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +15,11 @@ import type { BloomResearchQuestion } from './question-ladder-contract.js';
 import type { ResearchOutputRouteDecision } from '../research/output-router.js';
 import { createResearchAxisSearcher, fanOutAxisEvidence, RESEARCH_SEARCH_BUDGET_MS } from '../research/axis-fanout.js';
 import type { WebSearchProvider } from '../web-search/provider.js';
+
+type ResearchGraphEvent = Parameters<NonNullable<ResearchQuestionLadderRunOptions['onGraphEvent']>>[0];
+function isNodeGraphEvent(event: ResearchGraphEvent): event is Extract<ResearchGraphEvent, { node: string }> {
+  return 'node' in event;
+}
 
 // Gate shards set an isolated state root and may also provide a separate config
 // root. Install that override before importing modules that read config state.
@@ -767,6 +774,114 @@ test('default gap completion searches natively instead of invoking the shell-bac
   expect(result.ladder.evidence.some((item) => item.sourceKind === 'skill:omni-crawl')).toBe(false);
 });
 
+test('the actual research ladder records adaptive nodes, reroutes, and reordered follow-up priority', async () => {
+  const events: Parameters<NonNullable<ResearchQuestionLadderRunOptions['onGraphEvent']>>[0][] = [];
+  const axisCalls: string[][] = [];
+  await runResearchQuestionLadder('Why are bond yields rising?', {
+    generateContract,
+    generate: async () => JSON.stringify({ questions }),
+    allowOutputSkill: false,
+    onGraphEvent: (event) => events.push(event),
+    invokeAxes: async (axes) => {
+      axisCalls.push(axes.map(({ id }) => id));
+      const followup = axisCalls.length > 1;
+      return { plan: [], axes: axes.map((axis) => ({ questionId: axis.id, evidence:
+        followup || !['q5', 'q6'].includes(axis.id)
+          ? ['example.org', 'example.net'].map((host) => ({ questionId: axis.id, sourceKind: 'web-search:test', source: `https://${host}/${axis.id}`, content: `Evidence ${axis.id}`, outcome: 'complete' as const, truncated: false }))
+          : [{ questionId: axis.id, sourceKind: 'web-search:test', source: `https://example.org/${axis.id}`, content: `Partial ${axis.id}`, outcome: 'partial' as const, truncated: false }],
+      })) };
+    },
+    planGapFollowup: () => ({ rounds: 1, timeBudgetMs: 120_000,
+      classifications: [5, 6].map((n) => ({ questionId: `q${n}`, gap: 'missing section evidence', action: 'auto-fill' as const, reason: 'auto-fill-eligible' as const, skill: 'omni-crawl' })),
+      followups: [6, 5].map((n) => ({ questionId: `q${n}`, skill: 'omni-crawl', query: `evidence q${n}` })),
+    }),
+  });
+
+  expect(axisCalls).toEqual([['q1', 'q2', 'q3', 'q4', 'q5', 'q6'], ['q5', 'q6']]);
+  expect(events.filter((event) => isNodeGraphEvent(event) && (event.type === 'enter' || event.type === 'exit') && event.node === 'axes')).toEqual([
+    { type: 'enter', node: 'axes' }, { type: 'exit', node: 'axes', outcome: 'ok' },
+  ]);
+  expect(events.filter((event) => isNodeGraphEvent(event) && (event.type === 'enter' || event.type === 'exit') && event.node.startsWith('followup-'))).toEqual([
+    { type: 'enter', node: 'followup-q5' }, { type: 'enter', node: 'followup-q6' },
+    { type: 'exit', node: 'followup-q5', outcome: 'ok' }, { type: 'exit', node: 'followup-q6', outcome: 'ok' },
+  ]);
+  expect(events.filter((event) => isNodeGraphEvent(event) && (event.type === 'enter' || event.type === 'exit') && event.node.startsWith('axis-'))).toHaveLength(12);
+  expect(events.flatMap((event) => isNodeGraphEvent(event) && event.type === 'node-added' && event.node.startsWith('followup-') ? [event.node] : []))
+    .toEqual(['followup-q5', 'followup-q6']);
+  expect(events.filter((event) => event.type === 'edge-rerouted' && (event.from === 'evidence-check' || event.from === 'followup' || event.from.startsWith('followup-')))).toEqual([
+    {
+      type: 'edge-rerouted', from: 'evidence-check', outcome: 'gap', to: 'followup', was: 'synthesis',
+      reason: 'Missing contract evidence routes the run through follow-up fanout',
+    },
+    {
+      type: 'edge-rerouted', from: 'followup', outcome: 'q5', to: 'followup-q5', was: '$absent',
+      reason: 'Follow-up fanout dispatches prioritized evidence questions concurrently',
+    },
+    {
+      type: 'edge-rerouted', from: 'followup-q5', outcome: '$default', to: 'synthesis', was: '$absent',
+      reason: 'Follow-up evidence returns to answer synthesis',
+    },
+    {
+      type: 'edge-rerouted', from: 'followup', outcome: 'q6', to: 'followup-q6', was: '$absent',
+      reason: 'Follow-up fanout dispatches prioritized evidence questions concurrently',
+    },
+    {
+      type: 'edge-rerouted', from: 'followup-q6', outcome: '$default', to: 'synthesis', was: '$absent',
+      reason: 'Follow-up evidence returns to answer synthesis',
+    },
+  ]);
+  expect(events.filter((event) => event.type === 'priority-changed')).toEqual([
+    { type: 'priority-changed', node: 'followup-q5', from: 2, to: 1, reason: 'Follow-up order now follows the unfilled output-contract sections' },
+    { type: 'priority-changed', node: 'followup-q6', from: 1, to: 2, reason: 'Follow-up order now follows the unfilled output-contract sections' },
+  ]);
+
+  const runtimeGraph: RunGraphDetail = {
+    id: 'natural-language-research', source: 'core', editable: false,
+    entry_node: 'question-plan', terminal_nodes: ['synthesis'],
+    nodes: [
+      { node_id: 'question-plan', kind: 'agent', recipe: 'planner', max_visits: 1 },
+      { node_id: 'axes', kind: 'agent', recipe: 'axes', max_visits: 1 },
+      { node_id: 'evidence-check', kind: 'gate', recipe: 'check', max_visits: 1 },
+      { node_id: 'followup', kind: 'agent', recipe: 'followup', max_visits: 1 },
+      { node_id: 'synthesis', kind: 'agent', recipe: 'synthesis', max_visits: 1 },
+    ],
+    edges: [
+      { from: 'question-plan', to: 'axes' }, { from: 'axes', to: 'evidence-check' },
+      { from: 'evidence-check', on: 'outcome', map: { complete: 'synthesis', gap: 'synthesis' } },
+      { from: 'followup', to: 'synthesis' },
+    ],
+  };
+  const graphEvents = events.flatMap((event, index) =>
+    event.type === 'node-added' || event.type === 'edge-rerouted' || event.type === 'priority-changed'
+      ? [{ ...event, seq: index + 1, ts: new Date(index * 1000).toISOString(), decider: 'research-runtime' }]
+      : [],
+  );
+  const projectedFlow = runGraphToFlow(applyRunGraphEvents(runtimeGraph, graphEvents));
+  expect(projectedFlow.edges).toEqual(expect.arrayContaining([
+    expect.objectContaining({ source: 'axes', target: 'axis-q1' }),
+    expect.objectContaining({ source: 'axes', target: 'axis-q6' }),
+    expect.objectContaining({ source: 'axis-q1', target: 'evidence-check' }),
+    expect.objectContaining({ source: 'evidence-check', target: 'followup' }),
+    expect.objectContaining({ source: 'followup', target: 'followup-q5' }),
+    expect.objectContaining({ source: 'followup', target: 'followup-q6' }),
+    expect.objectContaining({ source: 'followup-q5', target: 'synthesis' }),
+    expect.objectContaining({ source: 'followup-q6', target: 'synthesis' }),
+  ]));
+});
+
+test('question-plan records failure when contract parsing rejects the generated questions', async () => {
+  const events: Parameters<NonNullable<ResearchQuestionLadderRunOptions['onGraphEvent']>>[0][] = [];
+  const result = await runResearchQuestionLadder('Why are bond yields rising?', {
+    generateContract: async () => JSON.stringify({ sections: [], completionCriteria: [] }),
+    onGraphEvent: (event) => events.push(event),
+  });
+  expect(result.ok).toBe(false);
+  expect(events.filter((event) => isNodeGraphEvent(event) && event.node === 'question-plan')).toEqual([
+    { type: 'enter', node: 'question-plan' },
+    { type: 'exit', node: 'question-plan', outcome: 'fail' },
+  ]);
+});
+
 test('native gap completion aborts its axis call at the plan time budget', async () => {
   let gapSignalAborted = false;
   const result = await runResearchQuestionLadder('Why are bond yields rising?', {
@@ -820,6 +935,23 @@ test('a follow-up runner failure preserves the already collected research eviden
   expect(result.ok).toBe(false);
   expect(result.ladder.evidence).toHaveLength(6);
   expect(result.output).toContain('Evidence q1');
+});
+
+test('an initial axis fanout failure closes each live axis exactly once', async () => {
+  const events: Parameters<NonNullable<ResearchQuestionLadderRunOptions['onGraphEvent']>>[0][] = [];
+  await runResearchQuestionLadder('bond yields', {
+    generateContract,
+    generate: async () => JSON.stringify({ questions }),
+    invokeAxes: async () => { throw new Error('fanout unavailable'); },
+    onGraphEvent: (event) => events.push(event),
+  });
+  for (const question of questions) {
+    const node = `axis-${question.id}`;
+    expect(events.filter((event) => isNodeGraphEvent(event) && event.type === 'enter' && event.node === node)).toHaveLength(1);
+    expect(events.filter((event) => isNodeGraphEvent(event) && event.type === 'exit' && event.node === node)).toEqual([
+      { type: 'exit', node, outcome: 'fail' },
+    ]);
+  }
 });
 
 test('grounding rejects the research result when all six axes fail', async () => {

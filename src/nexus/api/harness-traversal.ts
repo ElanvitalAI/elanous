@@ -49,7 +49,7 @@ export interface RunTraversalWire {
   substrate: string | null;
   steps: TraversalStepWire[];
   /** Structural graph changes in the same per-run sequence domain as `steps[].sourceSeq`. */
-  graphEvents?: Extract<RunStep, { type: 'node-added' | 'edge-rerouted' | 'unit-expanded' | 'unit-collapsed' }>[];
+  graphEvents?: Extract<RunStep, { type: 'node-added' | 'edge-rerouted' | 'priority-changed' | 'unit-expanded' | 'unit-collapsed' }>[];
   /** Outcome edges read from this run's graph.path ledger rows, including injected fixture provenance. */
   journeyEdges?: Array<{ seq?: number; from: string; label: string; taken: string; source: 'graph' | 'code-default'; injected?: boolean; mockOutcome?: string; scene?: string; demo1104Scene?: string }>;
   ledgerEvents: number;
@@ -220,8 +220,8 @@ export function buildRunTraversal(runId: string, entries: readonly RunLedgerEntr
   const contract = sorted.find((entry) => entry.event === 'graph-run-contract-resolved')?.data;
   const pr = [...sorted].reverse().find((entry) => entry.event === 'pr-opened')?.data;
   const projected = projectRunLedgerSteps(runId, sorted);
-  const graphEvents = projected.steps.filter((step): step is Extract<RunStep, { type: 'node-added' | 'edge-rerouted' | 'unit-expanded' | 'unit-collapsed' }> =>
-    step.type === 'node-added' || step.type === 'edge-rerouted' || step.type === 'unit-expanded' || step.type === 'unit-collapsed');
+  const graphEvents = projected.steps.filter((step): step is Extract<RunStep, { type: 'node-added' | 'edge-rerouted' | 'priority-changed' | 'unit-expanded' | 'unit-collapsed' }> =>
+    step.type === 'node-added' || step.type === 'edge-rerouted' || step.type === 'priority-changed' || step.type === 'unit-expanded' || step.type === 'unit-collapsed');
   const journeyEdges = sorted.flatMap((entry) => {
     const source = entry.data.source;
     if (entry.event !== 'graph.path' || entry.data.event !== 'edge-taken'

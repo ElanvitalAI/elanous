@@ -24,6 +24,7 @@ export interface FirstRunDoctorResult {
 
 /** 첫 실행에서는 동의가 필요 없는 수리만 실행하고, 셸 시작 파일은 손대지 않는다. */
 export function runFirstRunDoctor(deps: DoctorFixDeps): FirstRunDoctorResult {
+  try { debug.log('doctor.first-run', 'started', {}); } catch { /* observation must not block setup */ }
   const result: FirstRunDoctorResult = { fixed: [], skipped: [], failed: [], later: [], lines: [] };
   const record = (id: string, outcome: 'fixed' | 'skipped' | 'failed', reason?: string) => {
     result[outcome].push(id);

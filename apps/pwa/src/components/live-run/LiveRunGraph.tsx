@@ -300,6 +300,7 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
       if (event.type === 'node-added') labels.set(event.node, event.kind === 'hand' ? '손 노드' : '새 노드');
       else if (event.type === 'unit-expanded') labels.set(event.node, '깊이 상승');
       else if (event.type === 'edge-rerouted') { labels.set(event.from, '경로 수리'); labels.set(event.to, '경로 수리'); }
+      else if (event.type === 'priority-changed') labels.set(event.node, `우선순위 ${event.from}→${event.to}`);
     }
     // A visited step absent from the declared snapshot is visible structural growth even
     // when its graph event was not captured in the traversal response.

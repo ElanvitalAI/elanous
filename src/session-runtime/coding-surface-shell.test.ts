@@ -210,6 +210,21 @@ describe('coding surface — shell 실행 tool 노출', () => {
     }
   });
 
+  it('classic research dashboard 는 순서 요청의 첫 native 도구로 Linear issue runtime 을 싣는다', () => {
+    const linearIssue = {
+      id: 'elanous_linear_issue',
+      spec: { name: 'elanous_linear_issue', description: 'Create a Linear issue', input_schema: { type: 'object', properties: {} } },
+    } as never;
+    const specs = buildSessionRuntimeToolSpecs({
+      userText: '먼저 Linear 이슈를 만들고, 그다음 리서치해줘',
+      hostTools: [],
+      runtimeTools: [linearIssue],
+      preferredSurfaceId: 'research/agent',
+    });
+
+    expect(specs[0]?.name).toBe('elanous_linear_issue');
+  });
+
   it('T1 runtime substrate 는 availability-gated — 미배선 surface 는 phantom 없음', () => {
     // runtimeTools 를 안 넘기면(available 0) shell 이 상시여도 안 뜬다.
     const names = buildSessionRuntimeToolSpecs({

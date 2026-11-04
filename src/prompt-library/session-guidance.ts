@@ -86,13 +86,14 @@ export function buildSessionGuidanceAddendum(
     );
   }
 
-  // TaskCreate / UpdatePlan — multi-step planning discipline. ref
-  // pattern (prompts.ts:308). When active, instruct the model to
-  // break work into discrete tasks and mark each completed as soon
-  // as done — don't batch.
-  if (hasTool(active, 'TaskCreate', 'task_create', 'UpdatePlan', 'update_plan')) {
+  // Name the progress tool that is actually active. Ordered requests
+  // keep the user's sequence intact and start at step one.
+  const updatePlanTool = enabledTools.find((name) => ['update_plan', 'updateplan'].includes(name.toLowerCase()));
+  const taskCreateTool = enabledTools.find((name) => ['taskcreate', 'task_create'].includes(name.toLowerCase()));
+  const planTool = updatePlanTool ?? taskCreateTool;
+  if (planTool) {
     items.push(
-      'Use `TaskCreate` to plan and track work. Mark each task completed as soon as it\'s done; don\'t batch.',
+      `When the user lists steps in order, use \`${planTool}\` with those steps in the same order before starting; begin with step one and update progress as you go.`,
     );
   }
 

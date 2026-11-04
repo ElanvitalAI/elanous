@@ -750,6 +750,9 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     description: 'DEMO-only grounded Linear secretary. Create a dated evidence-backed parent with 3–5 subtasks, record a child progress/Done transition using actual intake records and approved browser evidence, or open one local pending approval per parent. Repeated approval calls return the existing card state; no external notifications are sent.',
     promptSummary: '`elanous_linear_secretary` (DEMO create/progress/Done/evidence/approval; approval is local and sends nothing externally)',
     host: ['tui', 'mcp'], safety: ['mutating', 'network'], supportsParallel: false, defaultEnabled: true,
+    // Multi-step secretary workflow is discoverable on demand; direct action tools stay in the TUI catalog.
+    alwaysLoad: false,
+    shouldDefer: true,
     intentScope: 'ops-fleet',
   },
   {

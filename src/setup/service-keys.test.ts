@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseServiceKeyEnv, serviceKeyStatus, storeServiceKeys, verifyServiceKey } from './service-keys.js';
 import { buildUserConfig } from '../user-config.js';
-import { importServiceKeys } from '../cli/setup-keys.js';
+import { importServiceKeys, renderServiceKeyStatus } from '../cli/setup-keys.js';
 
 const roots: string[] = [];
 function cacheDir(): string {
@@ -15,7 +15,7 @@ function cacheDir(): string {
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
 
 describe('service key setup storage boundary', () => {
-  test('imports only catalogued .env names and never returns values in the write result', () => {
+  test('imports only catalogued .env names and never returns values in the write result', async () => {
     const root = cacheDir();
     const secret = 'sentinel-value-never-render';
     const parsed = parseServiceKeyEnv(`# optional\nexport XAI_API_KEY="${secret}"\nOPENROUTER_API_KEY=second-value # note`);
@@ -24,7 +24,7 @@ describe('service key setup storage boundary', () => {
     expect(env.XAI_API_KEY).toBe(secret);
     expect(readFileSync(join(root, 'xai_api_key'), 'utf8')).toBe(`${secret}\n`);
     expect(statSync(join(root, 'xai_api_key')).mode & 0o777).toBe(0o600);
-    const status = serviceKeyStatus({ env, cacheDir: root });
+    const status = await serviceKeyStatus({ env, cacheDir: root });
     expect(JSON.stringify(status)).not.toContain(secret);
     expect(JSON.stringify({ stored: ['OPENROUTER_API_KEY', 'XAI_API_KEY'] })).not.toContain(secret);
   });
@@ -37,13 +37,40 @@ describe('service key setup storage boundary', () => {
     expect(() => parseServiceKeyEnv('XAI_API_KEY=')).toThrow('empty or invalid value for XAI_API_KEY');
   });
 
-  test('status is metadata-only and reports cache presence without returning cached values', () => {
+  test('status is metadata-only and reports cache presence without returning cached values', async () => {
     const root = cacheDir();
     const sentinel = 'status-must-not-leak-this';
     storeServiceKeys(parseServiceKeyEnv(`EXA_API_KEY=${sentinel}`), { cacheDir: root, env: {} });
-    const status = serviceKeyStatus({ env: {}, cacheDir: root });
+    const status = await serviceKeyStatus({ env: {}, cacheDir: root });
     expect(status.find(item => item.id === 'exa')).toMatchObject({ id: 'exa', configured: true, envNames: ['EXA_API_KEY'] });
     expect(JSON.stringify(status)).not.toContain(sentinel);
+  });
+
+  test('Linear reports only credential sources with a value and never returns secret contents', async () => {
+    const secret = 'linear-secret-never-render';
+    const envOnly = await serviceKeyStatus({ env: { LINEAR_API_KEY: 'env-secret' }, cacheDir: cacheDir(), getSecret: async () => undefined });
+    expect(envOnly.find(item => item.id === 'linear')).toMatchObject({ configured: true, sources: ['LINEAR_API_KEY'] });
+
+    const secretOnly = await serviceKeyStatus({ env: {}, cacheDir: cacheDir(), getSecret: async id => id === 'connector.linear.apiKey' ? secret : undefined });
+    expect(secretOnly.find(item => item.id === 'linear')).toMatchObject({ configured: true, sources: ['connector.linear.apiKey'] });
+    expect(JSON.stringify(secretOnly)).not.toContain(secret);
+
+    const noSource = await serviceKeyStatus({ env: {}, cacheDir: cacheDir(), getSecret: async () => undefined });
+    expect(noSource.find(item => item.id === 'linear')).toMatchObject({ configured: false, sources: [] });
+
+    const failedLookup = await serviceKeyStatus({ env: {}, cacheDir: cacheDir(), getSecret: async () => { throw new Error('store unavailable'); } });
+    expect(failedLookup.find(item => item.id === 'linear')).toMatchObject({ configured: false, sourceCheckFailed: true, sources: [] });
+    const failedLines = await renderServiceKeyStatus({ env: {}, cacheDir: cacheDir(), getSecret: async () => { throw new Error('store unavailable'); } });
+    expect(failedLines.find(line => line.startsWith('Linear API:'))).toContain('상태 확인 불가');
+
+    const rendered = await renderServiceKeyStatus({
+      env: { LINEAR_API_KEY: 'env-secret' }, cacheDir: cacheDir(),
+      getSecret: async id => id === 'connector.linear.apiKey' ? secret : undefined,
+    });
+    const linearLine = rendered.find(line => line.startsWith('Linear API:'));
+    expect(linearLine).toContain('LINEAR_API_KEY, connector.linear.apiKey');
+    expect(linearLine).not.toContain('env-secret');
+    expect(linearLine).not.toContain(secret);
   });
 
   test('stores catalogued keys without a verifier only with an explicit unverified notice', async () => {
@@ -115,11 +142,11 @@ describe('service key setup storage boundary', () => {
     let requestedUrl = '';
     let requestHeaders: HeadersInit | undefined;
     const result = await verifyServiceKey('gemini-api', secret, {
-      fetchImpl: async (input, init) => {
+      fetchImpl: (async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
         requestedUrl = String(input);
         requestHeaders = init?.headers;
         return new Response('{}', { status: 200 });
-      },
+      }) as unknown as typeof fetch,
     });
     expect(result).toEqual({ result: 'verified', httpStatus: 200 });
     expect(requestedUrl).not.toContain(secret);

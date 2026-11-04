@@ -7,9 +7,17 @@ import { join } from 'node:path';
 import type { LLMToolSpec } from '../src/llm.js';
 import type { LLMToolDef } from '../src/plugins/core/types.js';
 import type { ToolRuntime } from '../src/tool-runtime/types.js';
-import { buildSessionRuntimeToolSpecs } from '../src/session-runtime/index.js';
+import { buildSessionRuntimeToolSpecs, filterAvailableToolSpecs } from '../src/session-runtime/index.js';
 import { resetUserConfig } from '../src/user-config.js';
 import { debug } from '../src/debug/log.js';
+
+test('available-tool guard excludes explicitly unavailable specs from caller search pools', () => {
+  const specs = [
+    { name: 'ToolSearch', description: 'search', parameters: { type: 'object' } },
+    { name: 'elanous_linear_issue', description: 'linear', parameters: { type: 'object' } },
+  ] as LLMToolSpec[];
+  expect(filterAvailableToolSpecs(specs, { elanous_linear_issue: false }).map(spec => spec.name)).toEqual(['ToolSearch']);
+});
 
 // ⛔ 별도 파일인 이유 — 이 파일을 «만든» PR 은 기존 기대값을 건드리지 않았다.
 //   ⚠️ 그 문장은 「이 파일의 기대값이 영영 안 바뀐다」는 뜻이 아니다. 고정 목록이 바뀌면
@@ -44,7 +52,7 @@ describe('essential dashboard catalog', () => {
       ['bash', 'Bash'], ['run_shell', 'RunShell'], ['pty_shell_start', 'PtyShellStart'],
       ['pty_shell_poll', 'PtyShellPoll'], ['pty_shell_send', 'PtyShellSend'],
       ['pty_shell_kill', 'PtyShellKill'], ['pty_shell_list', 'PtyShellList'], ['run_tests', 'run_tests'],
-      ['elanous_skills_list', 'elanous_skills_list'], ['skill_exec', 'skill_exec'],
+      ['elanous_skills_list', 'elanous_skills_list'], ['skill_exec', 'skill_exec'], ['tool_search', 'ToolSearch'],
     ].map(([id, name]) => ({ id, spec: { name, description: name, parameters: { type: 'object' } }, run: async () => ({ output: 'ok' }) }));
     const optionalTools = [
       'GetDashboardState',
@@ -63,7 +71,7 @@ describe('essential dashboard catalog', () => {
       'schedule_manage', 'fact_check', 'se_build', 'logs_query',
       'Bash', 'RunShell',
       'PtyShellStart', 'PtyShellPoll', 'PtyShellSend', 'PtyShellKill', 'PtyShellList',
-      'run_tests', 'elanous_skills_list', 'skill_exec', 'GetDashboardState',
+      'run_tests', 'elanous_skills_list', 'skill_exec', 'ToolSearch', 'GetDashboardState',
       'TerminalModalList', 'TerminalModalObserve', 'TerminalModalFocus', 'TerminalModalDetach', 'TerminalModalKill',
     ];
 

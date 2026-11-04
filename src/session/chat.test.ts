@@ -675,6 +675,7 @@ describe('Next TUI research turn routing', () => {
       });
       expect(core).toHaveBeenCalledTimes(1);
       expect(core.mock.calls[0]?.[0].userText).toBe('이번 주 한국 시장과 업계 변화를 조사해 비교해줘');
+      expect(core.mock.calls[0]?.[0].runId).toMatch(/^[0-9a-f-]{36}$/);
       expect(core.mock.calls[0]?.[0].reasoningEffort).toBe('high');
       expect(result.text).toBe('fast research answer');
     } finally {

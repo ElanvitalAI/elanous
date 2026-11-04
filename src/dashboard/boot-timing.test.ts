@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, spyOn } from 'bun:test';
 import { createBootTimer } from './boot-timing.js';
 import { debug } from '../debug/log.js';
 import { render, setFrameObserver } from '../tui.js';
-import { renderDashboardFrame } from './index.js';
+import type { RenderOptions } from '../tui.js';
+import { composeDashboardFrameWithCoordinatorModal, renderDashboardFrame } from './index.js';
+import type { DisplaySnapshot } from '../display/types.js';
 
 const dashboardFrame = (onFrameWriteComplete: (error?: Error | null) => void) =>
   renderDashboardFrame(['dashboard screen'], {
@@ -55,6 +57,49 @@ describe('createBootTimer', () => {
     expect(() => timer.phase('log-sink')).not.toThrow();
     time = 20;
     expect(() => timer.done()).not.toThrow();
+  });
+
+  it('forwards coordinator modal bounds into the single dashboard frame render', () => {
+    let options: RenderOptions | undefined;
+    renderDashboardFrame(['screen'], {
+      overlay: 'modal', preserveBounds: { row: 3, col: 4, width: 8, height: 5 },
+      force: false, cursorOwner: 'none', claimedCursor: null,
+      promptCaret: null, suppressPromptArea: false,
+    }, (_lines, renderOptions) => { options = renderOptions; });
+
+    expect(options?.preserveBounds).toEqual({ row: 3, col: 4, width: 8, height: 5 });
+    expect(options?.overlay).toBe('modal');
+  });
+
+  it('composes the top modal last and carries its bounds into row rendering', () => {
+    const modal = {
+      id: 'terminal-modal', kind: 'modal',
+      bounds: { row: 3, col: 4, width: 8, height: 5 },
+      paint: () => 'POPUP',
+    };
+    const snapshot = {
+      surfaces: new Map([['terminal-modal', modal]]),
+      focus: { active: 'terminal-modal', stack: ['terminal-modal'] },
+    } as unknown as DisplaySnapshot;
+    const composed = composeDashboardFrameWithCoordinatorModal(
+      { snapshot: () => snapshot },
+      { overlay: 'base-overlay', force: false, cursorOwner: 'none', claimedCursor: null,
+        promptCaret: null, suppressPromptArea: false },
+    );
+
+    expect(composed.preserveBounds).toEqual(modal.bounds);
+    expect(composed.overlay).toEndWith('POPUP');
+
+    const closed = composeDashboardFrameWithCoordinatorModal(
+      { snapshot: () => ({
+        ...snapshot,
+        surfaces: new Map(),
+        focus: { active: null, stack: [] },
+      }) },
+      { overlay: '', force: true, cursorOwner: 'none', claimedCursor: null,
+        promptCaret: null, suppressPromptArea: false },
+    );
+    expect(closed.preserveBounds).toBeUndefined();
   });
 
   it('records a dashboard frame only after its own write settles and keeps self-report', () => {

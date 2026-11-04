@@ -6,6 +6,7 @@ import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 const applyDeferredToolsActual = deferredModule.applyDeferredTools;
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
+import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
 import { researchTurnForGrounding, runResearchQuestionLadder } from '../auto-research/research-turn.js';
 import { fanOutAxisEvidence } from '../research/axis-fanout.js';
 import { routeResearchOutput } from '../research/output-router.js';
@@ -43,6 +44,53 @@ test('deep research answer deadline stays below its parent abort timer; shallow 
   expect(RESEARCH_TURN_DEEP_BUDGET_MS).toBeGreaterThan(RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS);
   expect(RESEARCH_TURN_SHALLOW_BUDGET_MS).toBe(180_000);
   expect(RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS).toBeLessThan(RESEARCH_TURN_SHALLOW_BUDGET_MS);
+});
+
+test('ordered Linear → research → aside workflow dispatches native Linear before research', async () => {
+  const request = '먼저 리니어 이슈를 만들고, 그다음 리서치하고, aside 캡처한 뒤 마지막에 정리해 주세요.';
+  const preamble = buildUniversalPreamble({ cwd: process.cwd(), enabledTools: ['update_plan'] });
+  const calls: string[] = [];
+  let toolsSeen: string[] = [];
+  let researchTurn: boolean | undefined;
+  let researchCalls = 0;
+  let firstToolResult: unknown;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, handlers, options) => {
+    if (toolsSeen.length === 0) {
+      toolsSeen = options?.tools?.map(candidate => candidate.name) ?? [];
+      researchTurn = options?.researchTurn;
+    }
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'system',
+        content: expect.stringContaining('use `update_plan` with those steps in the same order before starting'),
+      }),
+      expect.objectContaining({
+        role: 'system',
+        content: expect.stringContaining('begin with step one'),
+      }),
+      expect.objectContaining({ role: 'user', content: request }),
+    ]));
+    expect(options?.tools?.map(candidate => candidate.name)).toContain('elanous_linear_issue');
+    firstToolResult = await handlers.dispatchTool('elanous_linear_issue', { action: 'create' });
+    return 'done';
+  });
+  const linearIssueTool: LLMToolSpec = { ...tool, name: 'elanous_linear_issue' };
+  const updatePlanTool: LLMToolSpec = { ...tool, name: 'update_plan' };
+  const asideTool: LLMToolSpec = { ...tool, name: 'aside.repl' };
+  await runCoreTurn({
+    sessionId: 'ordered-linear-research-aside',
+    messages: [...preamble, { role: 'user', content: request }],
+    tools: [linearIssueTool, updatePlanTool, asideTool, webSearchTool, webFetchTool, omniSearchTool],
+    dispatchTool: async (name) => { calls.push(name); return 'issue created'; },
+    signal,
+    userText: request,
+  }, { runResearch: async () => { researchCalls += 1; return { ok: true, output: 'unexpected research prepass' }; } });
+
+  expect(toolsSeen).toEqual(expect.arrayContaining(['elanous_linear_issue', 'update_plan', 'aside.repl', 'WebSearch']));
+  expect(researchTurn).toBe(true);
+  expect(calls[0]).toBe('elanous_linear_issue');
+  expect(firstToolResult).toBe('issue created');
+  expect(researchCalls).toBe(1);
 });
 
 function createManualTimers() {

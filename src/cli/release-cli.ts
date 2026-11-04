@@ -71,6 +71,11 @@ export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
 export interface RunResult { status: number | null; stdout: string; stderr: string }
 export type Runner = (command: string, args: readonly string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv; input?: string }) => RunResult;
 
+/** Installers require explicit consent even in isolated local release verification. */
+export function runReleaseInstaller(script: string, cwd: string, env: NodeJS.ProcessEnv, run: Runner): RunResult {
+  return run('bash', ['-s', '--', '--yes', '--no-modify-path'], cwd, { env, input: script });
+}
+
 export const defaultRunner: Runner = (command, args, cwd, opts = {}) => {
   const r = spawnSync(command, [...args], { cwd, encoding: 'utf8', env: opts.env ?? process.env, input: opts.input, maxBuffer: 256 * 1024 * 1024 });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.error ? String(r.error) : (r.stderr ?? '') };
@@ -203,7 +208,7 @@ export async function prepareRelease(opts: PrepareOptions, run: Runner = default
       const prefix = join(out, 'e2e-prefix');
       mkdirSync(home);
       const env = { ...process.env, HOME: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_RELEASE_BASE: `file://${join(out, 'e2e-release')}`, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: '', SHELL: '/bin/zsh' };
-      const install = run('bash', ['-s', '--', '--no-modify-path'], home, { env, input: readFileSync(join(distDir, 'install.sh'), 'utf8') });
+      const install = runReleaseInstaller(readFileSync(join(distDir, 'install.sh'), 'utf8'), home, env, run);
       const version = run(join(prefix, 'bin', 'elanous'), ['--version'], home, { env });
       const versionLine = version.stdout.trim();
       const ok = install.status === 0 && versionLine.startsWith(`${opts.version} ${publicCommit}`);
@@ -467,7 +472,7 @@ export async function verifyRelease(opts: { version?: string; publicRepo?: strin
     const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ELANOUS_') && !key.startsWith('XDG_')));
     const env = envLiteral({ ...inherited, HOME: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: opts.version ?? '', SHELL: '/bin/zsh' });
     const script = must(run('curl', ['-fsSL', installerUrl], home), `설치기 받기 ${installerUrl}`);
-    const install = run('bash', ['-s', '--', '--no-modify-path'], home, { env, input: script });
+    const install = runReleaseInstaller(script, home, env, run);
     const versionLine = run(join(prefix, 'bin', 'elanous'), ['--version'], home, { env }).stdout.trim();
     const state = stateRoundTrip(join(prefix, 'bin', 'elanous'), home, env, run, startedAtMs);
     const update = run(join(prefix, 'bin', 'elanous'), ['self-update', '--json'], home, { env });

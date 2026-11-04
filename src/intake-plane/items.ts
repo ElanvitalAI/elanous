@@ -8,7 +8,7 @@ import { findTrack } from '../autopilot/mission-phase-track.js';
 import { wasIntakeEventScheduled } from './route.js';
 
 export const INTAKE_SOURCES = ['x', 'youtube', 'github', 'telegram-saved', 'telegram-bot', 'memo', 'pwa'] as const;
-export type RegisteredIntakeSourceKind = 'rss' | 'command' | 'topic-search';
+export type RegisteredIntakeSourceKind = 'rss' | 'command' | 'topic-search' | 'markdown';
 export type IntakeSource = typeof INTAKE_SOURCES[number];
 export type IntakeKind = 'video' | 'repo' | 'post' | 'article' | 'note' | 'rss';
 export type IntakePrivacy = 'public' | 'user-private';

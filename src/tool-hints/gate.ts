@@ -199,14 +199,18 @@ export function evaluateGate(
       const requiredResearchTools = signals.intentResearch
         ? ['web_search', 'web_fetch'].filter(id => enabled.has(id))
         : [];
-      const required = new Set(requiredResearchTools);
+      const requiredLinearTools = signals.intentLinearIssue && enabled.has('elanous_linear_issue')
+        ? ['elanous_linear_issue']
+        : [];
+      const requiredTools = [...requiredResearchTools, ...requiredLinearTools];
+      const required = new Set(requiredTools);
       const ranked = keep
         .filter(id => !required.has(id))
         .map(id => ({ id, score: boost.get(id) ?? 0 }))
         .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
-        .slice(0, Math.max(0, cap - requiredResearchTools.length))
+        .slice(0, Math.max(0, cap - requiredTools.length))
         .map(x => x.id);
-      keep = [...requiredResearchTools, ...ranked];
+      keep = [...requiredTools, ...ranked];
       const selectedBeforeStableSort = new Set(keep);
       for (const id of enabled) {
         if (!selectedBeforeStableSort.has(id)) excludedReasons.set(id, 'model-family-cap');

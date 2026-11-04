@@ -26,6 +26,41 @@ afterEach(() => {
 });
 
 describe('MCP native runtime exposure', () => {
+  test('Aside client name matching is case-insensitive for same-run return calls', async () => {
+    const runId = 'aside-roundtrip-run';
+    const received: Array<{ mcpClient?: string; runId?: string }> = [];
+    registerToolRuntime({
+      id: 'aside.roundtrip',
+      spec: {
+        name: 'aside.roundtrip',
+        description: 'Mock Aside roundtrip receiver',
+        parameters: { type: 'object', properties: {} },
+      },
+      surfaces: ['mcp'],
+      run: async (_args, ctx) => {
+        received.push({ mcpClient: ctx.mcpClient, runId: ctx.runId });
+        return { output: 'result returned to Aside' };
+      },
+    });
+
+    const ctx: Parameters<typeof handleMcpRequest>[1] = {};
+    await handleMcpRequest({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { clientInfo: { name: 'Aside' } },
+    }, ctx);
+    const response = await handleMcpRequest({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: {
+        name: 'aside.roundtrip',
+        arguments: {},
+        _meta: { elanousRunId: runId },
+      },
+    }, ctx);
+
+    expect(response.error).toBeUndefined();
+    expect(received).toEqual([{ mcpClient: 'Aside', runId }]);
+  });
+
   test('tools/list retains external runtimes while lazily exposing first-party harness runtime', async () => {
     const asideRepl: ToolRuntime = {
       id: 'aside.repl',

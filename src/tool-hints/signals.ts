@@ -43,6 +43,8 @@ export interface SignalSnapshot {
   /** Arc H follow-up — remote/fleet management intent (acp · agent
    *  room · iphone · budget · policy · llm nodes · team · hitl). */
   intentOpsFleet: boolean;
+  /** Explicit Linear issue action; keeps the native issue tool in capped pools. */
+  intentLinearIssue?: boolean;
   /** Arc H follow-up — local dashboard UI intent (windows · panes ·
    *  terminal matrix/modal · context inspector · layout · vw ·
    *  widget · scenario). */
@@ -145,6 +147,43 @@ export function isResearchAgentIntent(text: string | undefined): boolean {
   if (RESEARCH_CODING_RE.test(text)) return false;
   return RESEARCH_SKILL_RE.test(text)
     || (RESEARCH_EXPLANATION_RE.test(text) && RESEARCH_TOPIC_RE.test(text));
+}
+
+const ORDERED_WORKFLOW_STEP_RE = /(?:\bfirst\b|\bthen\b|\bfinally\b|먼저|그\s*다음|다음으로|마지막(?:에|으로)?)/i;
+const ORDERED_WORKFLOW_SPLIT_RE = /\b(?:first|then|finally|and)\b|먼저|그\s*다음|다음으로|마지막(?:에|으로)?|그리고|및/i;
+const RESEARCH_STEP_RE = /\b(?:research|investigate|search)\b|리서치|조사|검색/i;
+const NON_RESEARCH_STEP_ACTIONS = [
+  /\b(?:send|email|message)\s+(?:(?:an?|the)\s+)?(?:e-?mail|message|issue|ticket|report|post)\b/i,
+  /\b(?:deploy|restart|reboot|start|stop|install|launch|publish|register|schedule|book|submit|delete|remove|update|change|modify)\b/i,
+  /\b(?:capture|screenshot|take)\s+(?:(?:an?|the)\s+)?(?:screenshot|aside|browser|page|screen)\b/i,
+  /\b(?:aside|browser|page|screen)\b.{0,20}\b(?:capture|screenshot)\b/i,
+  /\b(?:create|open|file|submit|update|close)\s+(?:(?:an?|the)\s+)?(?:linear\s+)?(?:issue|ticket)\b/i,
+  /(?:리니어|linear).{0,18}(?:이슈|issue|ticket).{0,12}(?:만들|생성|열|등록|추가)|(?:만들|생성|열|등록|추가).{0,12}(?:리니어|linear).{0,18}(?:이슈|issue|ticket)/i,
+  /(?:이메일|메일).{0,12}(?:보내|발송)|(?:보내|발송).{0,12}(?:이메일|메일)/,
+  /(?:캡처|촬영).{0,12}(?:aside|화면|브라우저|페이지)|(?:aside|브라우저|페이지).{0,12}(?:캡처|촬영)/i,
+  /(?:배포|재시작|다시\s*시작|중지|설치|실행|등록)/,
+];
+const LINEAR_ISSUE_ASCII_RE = /\b(?:linear|linear\.app)\b.{0,48}(?:\b(?:issue|ticket)\b|이슈|티켓).{0,32}(?:\b(?:create|open|file|make)\b|만들|생성|작성|등록|열어)|\b(?:create|open|file|make)\b.{0,32}\b(?:a\s+)?linear\s+(?:issue|ticket)\b/i;
+const LINEAR_ISSUE_KO_RE = /리니어.{0,24}(?:이슈|티켓).{0,16}(?:만들|생성|작성|등록|열어)/;
+
+/** Keep ordered operational workflows on the normal tool pool even when they mention research. */
+export function isOrderedNonResearchWorkflow(text: string | undefined): boolean {
+  if (!text || !ORDERED_WORKFLOW_STEP_RE.test(text)) return false;
+  return text.split(ORDERED_WORKFLOW_SPLIT_RE)
+    .some((step) => !RESEARCH_STEP_RE.test(step) && NON_RESEARCH_STEP_ACTIONS.some((pattern) => pattern.test(step)));
+}
+
+/** An ordered Linear action needs its native tool before any later stage. */
+export function isOrderedLinearIssueStep(text: string | undefined): boolean {
+  if (!text || !ORDERED_WORKFLOW_STEP_RE.test(text)) return false;
+  return /(?:\blinear\b|리니어)/i.test(text)
+    && /(?:\bissue\b|\bticket\b|이슈|티켓)/i.test(text)
+    && /(?:\bcreate\b|\bopen\b|\bfile\b|\bmake\b|만들|생성|작성|등록|열어)/i.test(text);
+}
+
+/** Mixed ordered issue-creation plus research must keep both native and research routes. */
+export function isOrderedLinearResearchWorkflow(text: string | undefined): boolean {
+  return isOrderedLinearIssueStep(text) && isResearchAgentIntent(text);
 }
 const DIAGRAM_ASCII_RE = /\b(diagrams?|flowcharts?|sequence|mermaid|graphs?|charts?|visuali[sz]e|architecture)\b/i;
 const DIAGRAM_KO_RE = /(시퀀스|플로우|다이어그램|도식|그래프|시각화|아키텍처|구조도)/;
@@ -254,7 +293,9 @@ export function collectSignals(ctx: SignalContext = {}): SignalSnapshot {
       && (CODING_ASCII_RE.test(ctx.recentUserText) || koCodingIntent(ctx.recentUserText)),
     intentViz: matchesIntent(ctx.recentUserText, VIZ_ASCII_RE, VIZ_KO_RE),
     intentCapture: matchesIntent(ctx.recentUserText, CAPTURE_ASCII_RE, CAPTURE_KO_RE),
-    intentOpsFleet: matchesIntent(ctx.recentUserText, OPS_FLEET_ASCII_RE, OPS_FLEET_KO_RE),
+    intentOpsFleet: matchesIntent(ctx.recentUserText, OPS_FLEET_ASCII_RE, OPS_FLEET_KO_RE)
+      || matchesIntent(ctx.recentUserText, LINEAR_ISSUE_ASCII_RE, LINEAR_ISSUE_KO_RE),
+    intentLinearIssue: matchesIntent(ctx.recentUserText, LINEAR_ISSUE_ASCII_RE, LINEAR_ISSUE_KO_RE),
     intentOpsUi: matchesIntent(ctx.recentUserText, OPS_UI_ASCII_RE, OPS_UI_KO_RE),
 
     modelFamily: ctx.modelFamily,
@@ -330,6 +371,7 @@ function fingerprintOf(s: SignalSnapshot): string {
     s.intentViz ? 'viz' : '-',
     s.intentCapture ? 'capture' : '-',
     s.intentOpsFleet ? 'ops-fleet' : '-',
+    s.intentLinearIssue ? 'linear-issue' : '-',
     s.intentOpsUi ? 'ops-ui' : '-',
   ].join('|');
   return createHash('sha1').update(pieces).digest('hex').slice(0, 12);

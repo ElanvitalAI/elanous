@@ -74,8 +74,17 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     expect(screen).toContain(finalReply);
   });
   test('scenario list is the CLI contract', () => {
-    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
+    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
   });
+
+  test('classic-first-screen-noise: first-run internals stay out of the screen and Enter skips without Doctor', async () => {
+    const r = await run('classic-first-screen-noise');
+    expect(r.checks).toEqual({
+      initialScreenCaptured: true, promptBankInternalLineHidden: true, daemonSetupCommandHidden: true,
+      humanWebSetupMessage: true, enterSkipReachedChat: true, firstRunDoctorNotInvoked: true,
+      doctorStartPositiveControl: true, exitedClean: true,
+    });
+  }, 150_000);
 
   test('classic-400-heal: a 400 (history mismatch) turn heals with a new session and answers', async () => {
     const r = await run('classic-400-heal');

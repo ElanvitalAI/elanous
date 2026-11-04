@@ -144,6 +144,8 @@ export function applyCanvasRunStep(model: CanvasRunModel, step: RunStep): Canvas
         ...graph, edges: graph.edges.map((edge) => edge.from === step.from && edge.outcome === step.outcome && edge.to === step.was
           ? { ...edge, to: step.to } : edge),
       } };
+    case 'priority-changed':
+      return { ...model, lastSeq: step.seq };
     case 'unit-expanded':
       return { ...model, lastSeq: step.seq, units: [
         ...units.filter((unit) => unit.node !== step.node || unit.unit !== step.unit),

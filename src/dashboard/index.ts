@@ -14,6 +14,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { $ } from 'bun';
 import { LOCAL_SKILLS_DIR, DATA_DIR, OBSIDIAN_VAULT } from '../config.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
+import { dispatchToolSearch } from '../skills/tools/tool-search.js';
 import { nextChatScrollOffset } from '../chat/log-scroll-key.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
 import { createProjectSuggester } from '../project/project-suggestion.js';
@@ -975,11 +976,13 @@ import { createDashboardTerminalPopupRuntime } from './terminal-popup-runtime.js
 import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAgentMission } from './sidetab-runtime.js';
 import { visibleMissionFailureLogData } from './visible-mission-diagnostics.js';
 import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, createClassicSidetabMissionPairSessionRegistry, type ClassicSidetabHandReplyInput, type ClassicSidetabMissionAgent, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionPairResult, type ClassicSidetabMissionResult, type ClassicSidetabMissionTrioResult } from './classic-sidetab-mission.js';
+import type { ClassicSidetabMissionPairCompletionResult } from './classic-sidetab-mission-job.js';
+import type { HandTaskOptions } from '../task-agent/task-hand.js';
 import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
 import { enqueueClassicSidetabMissionCompletion, runPreparedClassicSidetabVisibleMission } from './classic-sidetab-mission-job.js';
 import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
 import { captureClassicMissionExitObservation, createClassicSidetabMissionTrioVisibleRunner, startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
-import { createDashboardPluginWizardRuntimeFromSidetab } from './plugin-wizard-runtime.js';
+import { createDashboardPluginWizardRuntimeFromSidetab, searchAvailablePluginWizardTools } from './plugin-wizard-runtime.js';
 
 /** Public dashboard composition seam used by the TUI entrypoint and its integration test. */
 export const createDashboardTuiPluginWizard = createDashboardPluginWizardRuntimeFromSidetab;
@@ -1646,6 +1649,16 @@ export interface ShowDashboardOptions {
    *  effect in in-process mode (use TUI's `/session load` for that
    *  path). */
   resumeSessionId?: string;
+  /** Internal integration-test seam. Exercises showDashboard boot and the registered RunSidetabMission dispatcher
+   *  while replacing only visible child-process execution and the downstream task hand. Never set by the CLI. */
+  pluginWizardTestOverrides?: {
+    findAvailableTools?: (capability: string) => readonly string[];
+    runPair: (agent: 'codex' | 'claude', mission: string, parallelMission: string, context?: ClassicSidetabMissionDispatchContext) => Promise<{
+      result: ClassicSidetabMissionPairResult;
+      completion: Promise<ClassicSidetabMissionPairCompletionResult>;
+    }>;
+    taskHand: (options: HandTaskOptions) => Promise<unknown>;
+  };
 }
 
 // FileIndex cache keyed by absolute cwd. A single elanous session can
@@ -1711,6 +1724,7 @@ export function renderDashboardCoordinatorModalOverlay(display: Pick<DisplayCoor
  *  그 값을 쓰고, 아니면 **프롬프트 caret** 을 쓴다. 프롬프트가 감춰졌으면 숨긴다. */
 export interface DashboardFrameInput {
   overlay: string;
+  preserveBounds?: { row: number; col: number; width: number; height: number };
   force: boolean;
   /** ⭐ Z축이 **실제로 누구에게** 커서를 준 결정. essential 은 `modal`·`terminal` 일 때만
    *  그 값에 양보한다 — `coordinator` fallback 은 소유자가 없다는 뜻이지 claim 이 아니다. */
@@ -1765,6 +1779,7 @@ export function renderDashboardFrame(
   });
   renderFrame(lines, {
     overlay: input.overlay,
+    preserveBounds: input.preserveBounds,
     force: input.force,
     cursor: paintCursor(essentialDecision.cursor ?? input.coordinatorCursor ?? null),
     onWriteComplete: input.onFrameWriteComplete,
@@ -1783,9 +1798,15 @@ export function composeDashboardFrameWithCoordinatorModal(
   display: Pick<DisplayCoordinator, 'snapshot'>,
   input: DashboardFrameInput,
 ): DashboardFrameInput {
+  const snapshot = display.snapshot();
+  const modal = topModalSurface({
+    focusStack: snapshot.focus.stack,
+    surfaceAt: (id) => snapshot.surfaces.get(id) ?? null,
+  });
   return {
     ...input,
-    overlay: input.overlay + renderDashboardCoordinatorModalOverlay(display),
+    overlay: input.overlay + renderDashboardCoordinatorModalOverlay({ snapshot: () => snapshot }),
+    ...(modal ? { preserveBounds: modal.bounds } : {}),
   };
 }
 
@@ -4375,20 +4396,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
   // AU7 — seed the prompt bank with the three default fragments
   // (ambiguous / destructive / multi-file). Idempotent: re-boot
-  // refreshes content in place, doesn't duplicate. Silent on a
-  // clean run; one muted chat line when something was created /
-  // updated so the user knows their prompt bank gained shipped
-  // fragments.
+  // refreshes content in place, doesn't duplicate. Internal seed details belong in debug.log,
+  // never in the user's conversation transcript.
   try {
     const { seedAu7Fragments } = await import('../prompt-bank/index.js');
     const seedRes = seedAu7Fragments(getPromptBankStore());
-    if (seedRes.created > 0 || seedRes.updated > 0) {
-      const parts: string[] = [];
-      if (seedRes.created > 0) parts.push(`${seedRes.created} created`);
-      if (seedRes.updated > 0) parts.push(`${seedRes.updated} updated`);
-      chatLines.push(C.muted(`  [prompt-bank] AU7 fragments: ${parts.join(', ')}`));
-      chatScrollOffset = -1;
-    }
+    debug.log('dashboard.prompt-bank', 'seeded', { created: seedRes.created, updated: seedRes.updated });
   } catch { /* non-fatal — prompt bank may be disabled / locked */ }
 
   // Periodic dirty refresh — every 5s the pill picks up any
@@ -13996,6 +14009,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         content: 'Independent sidetab job started; this conversation can continue.',
       };
     }, cancelClassicSidetabMission, async (agent, mission, parallelMission, context) => {
+      const testPair = opts.pluginWizardTestOverrides?.runPair;
+      if (testPair) {
+        const started = await testPair(agent, mission, parallelMission, context);
+        if (context?.callId?.startsWith('plugin-wizard:')) {
+          pluginWizardPairCompletions.set(context.callId, started.completion);
+        }
+        return started.result;
+      }
       for (const member of ['codex', 'claude'] as const) {
         const prepared = await prepareClassicSidetabAgentCli(member);
         if (!prepared.ready) {
@@ -14181,6 +14202,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     });
     const tuiPluginWizard = createDashboardTuiPluginWizard(classicSidetabMission, pluginWizardPairCompletions, {
       getWorkspace: () => getSessionCwd(),
+      findAvailableTools: opts.pluginWizardTestOverrides?.findAvailableTools ?? ((capability) => {
+        const runtimeSpecs = acpToolRuntime?.listToolRuntimes('tui').map(runtime => runtime.spec) ?? [];
+        const hostSpecs = pluginHost.hostLLMTools();
+        return searchAvailablePluginWizardTools(capability, [...new Map([...runtimeSpecs, ...hostSpecs]
+          .map(spec => [spec.name, spec] as const)).values()]);
+      }),
+      ...(opts.pluginWizardTestOverrides ? { taskHand: opts.pluginWizardTestOverrides.taskHand } : {}),
     });
     disposeClassicSigquit = registerClassicSigquitHandler(() => {
       classicSidetabRuntime.beginPrefix();

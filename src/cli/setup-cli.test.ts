@@ -590,13 +590,15 @@ describe('setup CLI', () => {
   test('실제 격리 CLI 첫 실행: 기본 묶음 제안 출력 뒤 설치 원장·자격 저장소는 없다', () => {
     const root = mkdtempSync(join(tmpdir(), 'setup-cli-live-'));
     const home = join(root, 'home');
+    const temp = join(root, 'tmp');
     mkdirSync(home, { recursive: true });
+    mkdirSync(temp, { recursive: true });
     try {
       const env: NodeJS.ProcessEnv = {
         PATH: process.env.PATH ?? '',
         HOME: home,
         USERPROFILE: home,
-        TMPDIR: root,
+        TMPDIR: temp,
         LANG: 'C.UTF-8',
         ELANOUS_SUPPRESS_XDG_WARNING: '1',
       };
@@ -617,6 +619,7 @@ describe('setup CLI', () => {
       expect(existsSync(join(root, 'instance', 'plugins', 'installed.json'))).toBe(false);
       expect(existsSync(join(root, 'instance', 'config.json'))).toBe(false);
       expect(existsSync(join(root, 'instance', 'secrets.json'))).toBe(false);
+      expect(existsSync(join(home, '.elanous', 'secrets.json'))).toBe(false);
       expect(existsSync(join(home, '.elanous', 'auth.json'))).toBe(false);
       expect(existsSync(join(home, '.codex', 'auth.json'))).toBe(false);
     } finally {
@@ -701,7 +704,7 @@ describe('setup CLI', () => {
         setExitCode: code => exitCodes.push(code),
       });
       await program.parseAsync(['setup', 'keys', '--status'], { from: 'user' });
-      expect(output.join('\n')).toContain('OpenAI API: 키 필요 (OPENAI_API_KEY)');
+      expect(output.join('\n')).toContain('OpenAI API: 키 필요 (감지된 출처 없음)');
       expect(output.join('\n')).not.toMatch(/sentinel|secret-value/i);
       expect(errors).toEqual([]);
       expect(exitCodes).toEqual([0]);

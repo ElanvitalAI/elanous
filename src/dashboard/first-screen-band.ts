@@ -207,12 +207,8 @@ export function buildFirstScreenBand(input: FirstScreenBandInput): string[] {
     if (link.status === 'error') {
       return linkKorean ? `elanous | 데몬: ${link.stage} 조회 오류` : `elanous | daemon: ${link.stage} lookup error`;
     }
-    const bare = linkKorean
-      ? `elanous | 데몬: ${link.status === 'absent' ? '없음' : '응답 없음'}`
-      : `elanous | daemon: ${link.status === 'absent' ? 'absent' : 'unhealthy'}`;
-    if (!link.startCommand || CONTROL_CHARS.test(link.startCommand)) return bare;
-    const line = `${bare} · ${linkKorean ? '시작' : 'start'}: ${link.startCommand}`;
-    return cellWidth(line) <= width ? line : bare;
+    // Startup commands are operator detail. Keep the first screen focused on the user's next step.
+    return linkKorean ? '웹 화면을 여는 중…' : 'Opening web setup…';
   })();
 
   const hintLine = 'Type a message to begin | /help for commands';

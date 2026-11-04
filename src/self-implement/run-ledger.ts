@@ -39,7 +39,7 @@ export function pathSignatureOf(steps: readonly { readonly from: string; readonl
 }
 
 const RUN_GRAPH_STEP_EVENTS = new Set([
-  'node-enter', 'node-exit', 'edge-taken', 'node-skipped', 'node-added', 'edge-rerouted',
+  'node-enter', 'node-exit', 'edge-taken', 'node-skipped', 'node-added', 'edge-rerouted', 'priority-changed',
   'unit-expanded', 'unit-collapsed', 'pipeline-node-entry', 'pipeline-node-exit', 'graph-edge-taken',
   'graph.path',
 ]);

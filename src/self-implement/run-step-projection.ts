@@ -7,6 +7,7 @@ export type RunStep =
   | { seq: number; ts: string; type: 'node-skipped'; node: string; reason: string; condition?: string }
   | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; trigger?: unknown; undo?: unknown; source?: string; injected?: boolean; scene?: string; demo1104Scene?: string; mockOutcome?: string }
   | { seq: number; ts: string; type: 'edge-rerouted'; from: string; outcome: string; to: string; was: string; decider: string; reason: string; source?: string; injected?: boolean; scene?: string; demo1104Scene?: string; mockOutcome?: string }
+  | { seq: number; ts: string; type: 'priority-changed'; node: string; from: number; to: number; decider: string; reason: string }
   | { seq: number; ts: string; type: 'unit-expanded'; node: string; unit: string; childRunId: string; resolution: number; decider: string; reason: string }
   | { seq: number; ts: string; type: 'unit-collapsed'; node: string; resolution: number; decider: string; reason: string };
 
@@ -23,10 +24,10 @@ export interface RunStepProjection {
 
 const STEP_EVENTS = new Set([
   'node-enter', 'node-exit', 'edge-taken', 'node-skipped',
-  'node-added', 'edge-rerouted', 'unit-expanded', 'unit-collapsed',
+  'node-added', 'edge-rerouted', 'priority-changed', 'unit-expanded', 'unit-collapsed',
   'pipeline-node-entry', 'pipeline-node-exit', 'graph-edge-taken',
 ]);
-const STRUCTURAL_EVENTS = new Set(['node-added', 'edge-rerouted', 'unit-expanded', 'unit-collapsed']);
+const STRUCTURAL_EVENTS = new Set(['node-added', 'edge-rerouted', 'priority-changed', 'unit-expanded', 'unit-collapsed']);
 
 function text(data: Record<string, unknown>, key: string): string | null {
   const value = data[key];
@@ -103,6 +104,13 @@ function projectStep(entry: RunLedgerEntry, type: string, seq: number): RunStep 
       const to = text(data, 'to');
       const was = text(data, 'was');
       return from && outcome && to && was ? { seq, ts, type, from, outcome, to, was, decider: text(data, 'decider')!, reason: text(data, 'reason')!, ...structuralProvenance(data) } : 'edge-rerouted requires from, outcome, to and was';
+    }
+    case 'priority-changed': {
+      const from = data.from;
+      const to = data.to;
+      return node && typeof from === 'number' && Number.isFinite(from) && typeof to === 'number' && Number.isFinite(to)
+        ? { seq, ts, type, node, from, to, decider: text(data, 'decider')!, reason: text(data, 'reason')! }
+        : 'priority-changed requires node and numeric from/to';
     }
     case 'unit-expanded': {
       const unit = text(data, 'unit') ?? text(data, 'into');

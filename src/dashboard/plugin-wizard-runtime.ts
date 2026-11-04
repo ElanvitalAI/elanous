@@ -9,7 +9,20 @@ import type { ClassicSidetabMissionPairCompletionResult } from './classic-sideta
 import type { PluginMaker, PluginWizardDeps, PluginWizardPairDecomposition } from '../graph-wizard/mission-compose.js';
 import { createTuiPluginWizardTool, type TuiPluginWizardTool } from './plugin-wizard-tool.js';
 import type { TuiPluginWizardRequest } from './plugin-wizard-tool.js';
+import { dispatchToolSearch } from '../skills/tools/tool-search.js';
+import { filterAvailableToolSpecs } from '../session-runtime/index.js';
+import type { LLMToolSpec } from '../llm.js';
 
+/** Search only the tools that pass the session runtime's availability guard. */
+export function searchAvailablePluginWizardTools(
+  capability: string,
+  specs: readonly LLMToolSpec[],
+  toolAvailability?: Readonly<Record<string, boolean>>,
+): string[] {
+  const searchable = filterAvailableToolSpecs(specs, toolAvailability)
+    .filter(spec => spec.name !== 'ToolSearch' && spec.name !== 'StartPluginWizard');
+  return dispatchToolSearch({ query: capability, max_results: 25 }, { specs: searchable }).matched;
+}
 export interface DashboardPluginWizardRuntimePorts {
   pair: {
     dispatchTool: ClassicSidetabMissionIntegration['dispatchTool'];
@@ -19,6 +32,7 @@ export interface DashboardPluginWizardRuntimePorts {
   taskHand?: (options: HandTaskOptions) => Promise<unknown>;
   launcher?: HandTaskOptions['launcher'];
   onEvent?: PluginWizardDeps['onEvent'];
+  findAvailableTools?: (capability: string) => readonly string[];
 }
 
 type PluginWizardPairRequest = {
@@ -81,7 +95,7 @@ export function createDashboardPluginWizardRuntime(ports: DashboardPluginWizardR
       },
       pluginWizardDeps,
     });
-  });
+  }, { findAvailableTools: ports.findAvailableTools });
 }
 
 /** Build the dashboard wizard with the same classic sidetab wiring used by the TUI entrypoint. */

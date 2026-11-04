@@ -113,6 +113,10 @@ function mcpRunId(params: Record<string, unknown> | undefined): string | undefin
   return normalized === value ? value : undefined;
 }
 
+function isAsideMcpClient(clientName: string | undefined): boolean {
+  return clientName?.trim().toLowerCase() === 'aside';
+}
+
 function logAsideRunIdDrop(toolName: string, params: Record<string, unknown> | undefined): void {
   const meta = params?._meta;
   const raw = meta && typeof meta === 'object' && !Array.isArray(meta)
@@ -202,8 +206,9 @@ export async function handleMcpRequest(
         const args = (req.params?.arguments as Record<string, unknown>) ?? {};
         const surface = ctx.surface ?? 'mcp';
         const rt = getToolRuntime(name);
-        const runId = ctx.clientName === 'aside' ? mcpRunId(req.params) : undefined;
-        if (ctx.clientName === 'aside' && !runId) logAsideRunIdDrop(name, req.params);
+        const isAsideClient = isAsideMcpClient(ctx.clientName);
+        const runId = isAsideClient ? mcpRunId(req.params) : undefined;
+        if (isAsideClient && !runId) logAsideRunIdDrop(name, req.params);
         const asideReturn = runId !== undefined;
         const isExposedOnSurface = listToolRuntimes(surface).some(runtime => runtime.id === rt?.id);
         if (!rt || !isExposedOnSurface) {

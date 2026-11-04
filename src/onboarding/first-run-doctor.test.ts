@@ -79,10 +79,12 @@ test('applies only three unattended ids, defers fixable shell edits, and logs id
     expect(f.files.get('/home/test/.bashrc')?.text).toBe('original startup');
     expect(f.files.get('/service')?.text).toBe('original service');
     const events = log.mock.calls.filter(([category]) => category === 'doctor.first-run');
-    expect(events).toHaveLength(result.fixed.length + result.skipped.length);
-    expect(events.every(([, event, data]) =>
+    expect(events.filter(([, event]) => event === 'started')).toHaveLength(1);
+    const outcomes = events.filter(([, event]) => event !== 'started');
+    expect(outcomes).toHaveLength(result.fixed.length + result.skipped.length);
+    expect(outcomes.every(([, event, data]) =>
       ['fixed', 'skipped', 'failed'].includes(String(event)) && Object.keys(data as object).join() === 'id')).toBe(true);
-    expect(events.map(([, event, data]) => [event, (data as { id: string }).id])).toContainEqual(['skipped', 'service-secrets']);
+    expect(outcomes.map(([, event, data]) => [event, (data as { id: string }).id])).toContainEqual(['skipped', 'service-secrets']);
   } finally { log.mockRestore(); }
 });
 

@@ -21,6 +21,7 @@ import {
   failTarget,
   fromYaml,
   isBackEdge,
+  initialCanvasRunModel,
   mapServerIssues,
   removeNode,
   setEntry,
@@ -301,6 +302,16 @@ describe('canvas run steps', () => {
     expect(result.graph).toBe(source);
     expect(toYaml(source)).toBe(before);
     expect(applyCanvasRunStep(result, steps[0]!)).toBe(result);
+  });
+
+  test('records a priority change on its node without changing the declared graph', () => {
+    const source = threeNodeLine();
+    const result = applyCanvasRunStep(initialCanvasRunModel(source), {
+      seq: 1, ts, type: 'priority-changed', node: 'B', from: 2, to: 1, decider: 'research-runtime', reason: 'missing section evidence',
+    });
+    expect(result.lastSeq).toBe(1);
+    expect(result.graph).toBe(source);
+    expect(result.nodes).toEqual({});
   });
 
   test('structural changes and childRunId-linked units apply in order; static positions and loader fields survive', () => {

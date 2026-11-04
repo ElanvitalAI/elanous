@@ -96,6 +96,13 @@ export function isDecisionImpactingTopicEvidence(items: readonly BriefItem[]): b
   return items.some(item => decisionTerms.test(item.text));
 }
 
+function formatRelatedIssueBriefing(input: { linearIssueId: string; issueLabel?: string; summary: string; items: readonly BriefItem[] }): string {
+  const related = input.items.filter(item => item.linearIssueId?.toLowerCase() === input.linearIssueId.toLowerCase());
+  if (related.length === 0) return '';
+  const sources = related.map(item => item.evidence).filter((url): url is string => !!url);
+  return `관련 이슈: ${input.issueLabel?.trim() || input.linearIssueId}\n\n${input.summary.trim()}${sources.length ? `\n\n출처\n${sources.map(url => `- ${url}`).join('\n')}` : ''}`;
+}
+
 /** Project only issue-linked findings; scheduled callers may invoke this after every run, including after Done. */
 export async function deliverTopicBriefing(input: {
   linearIssueId: string;
@@ -105,15 +112,14 @@ export async function deliverTopicBriefing(input: {
 }, deps: TopicBriefingDeliveryDeps): Promise<{ related: number; reopened: boolean }> {
   const related = input.items.filter(item => item.linearIssueId?.toLowerCase() === input.linearIssueId.toLowerCase());
   if (related.length === 0) return { related: 0, reopened: false };
-  const sources = related.map(item => item.evidence).filter((url): url is string => !!url);
-  const text = `관련 이슈 · ${input.issueLabel?.trim() || input.linearIssueId}\n\n${input.summary.trim()}${sources.length ? `\n\n출처\n${sources.map(url => `- ${url}`).join('\n')}` : ''}`;
+  const text = formatRelatedIssueBriefing(input);
   await deps.sendIssueCard({ linearIssueId: input.linearIssueId, text });
   await deps.commentIssue(input.linearIssueId, text);
   const reopened = await deps.issueIsDone(input.linearIssueId) && await deps.isDecisionImpacting(related);
   if (reopened) {
     await deps.reopenIssue(input.linearIssueId);
     await deps.sendMemoUpdateCard({ linearIssueId: input.linearIssueId,
-      text: `관련 이슈 · ${input.issueLabel?.trim() || input.linearIssueId}\n메모 갱신?\n\n${input.summary.trim()}` });
+      text: `관련 이슈: ${input.issueLabel?.trim() || input.linearIssueId}\n메모 갱신?\n\n${input.summary.trim()}` });
   }
   return { related: related.length, reopened };
 }
@@ -127,31 +133,33 @@ export function appendTopicBriefingTelegramDryRun(file: string, input: { linearI
 export async function projectTopicBriefing(source: RegisteredIntakeSource, items: BriefItem[], stateDir = effectiveInstanceRoot(),
   options: { telegramDryRunFile?: string } = {}): Promise<void> {
   if (!source.linearIssueId || items.length === 0) return;
+  const input = { linearIssueId: source.linearIssueId, issueLabel: source.briefingTopic ?? source.spec,
+    summary: items.map(item => item.text).join('\n'), items };
+  if (options.telegramDryRunFile) {
+    const text = formatRelatedIssueBriefing(input);
+    if (text) appendTopicBriefingTelegramDryRun(options.telegramDryRunFile, { linearIssueId: source.linearIssueId, text, kind: 'issue' });
+    return;
+  }
   const [{ getSecretAsync }, { commentLinearIssue, fetchLinearIssueStateType, moveLinearIssueToStateType },
     { kindRouteTarget }, { getUserConfig }, { sendTelegramTo }] = await Promise.all([
     import('../nexus/config/secrets/index.js'), import('../connectors/linear.js'), import('../domains/telegram-kind-route.js'),
     import('../user-config.js'), import('../autopilot/mission-notify.js'),
   ]);
-  const target = options.telegramDryRunFile ? undefined : kindRouteTarget(getUserConfig(), 'ops-report');
-  if (!options.telegramDryRunFile && !target) throw new Error('관련 이슈 브리핑 Telegram ops-report 대상이 없습니다');
+  const target = kindRouteTarget(getUserConfig(), 'ops-report');
+  if (!target) throw new Error('관련 이슈 브리핑 Telegram ops-report 대상이 없습니다');
   const send = async (text: string, kind: 'issue' | 'memo'): Promise<void> => {
-    if (options.telegramDryRunFile) {
-      appendTopicBriefingTelegramDryRun(options.telegramDryRunFile, { linearIssueId: source.linearIssueId!, text, kind });
-      return;
-    }
     if (!target || !sendTelegramTo(target.botToken, target.chatId, text)) throw new Error('관련 이슈 브리핑 Telegram 발송 실패');
   };
   const apiKey = await getSecretAsync('connector.linear.apiKey');
   if (!apiKey) throw new Error('Linear 키가 없습니다');
-  await deliverTopicBriefingWithReceipts({ linearIssueId: source.linearIssueId, issueLabel: source.spec,
-    summary: items.map(item => item.text).join('\n'), items }, stateDir, {
+  await deliverTopicBriefingWithReceipts(input, stateDir, {
     sendIssueCard: async ({ text }) => send(text, 'issue'),
     commentIssue: async (issueId, body) => commentLinearIssue({ apiKey, issueId, body }),
     issueIsDone: async issueId => await fetchLinearIssueStateType({ apiKey, issueId }) === 'completed',
     isDecisionImpacting: async related => isDecisionImpactingTopicEvidence(related),
     reopenIssue: async issueId => moveLinearIssueToStateType({ apiKey, issueId, type: 'started' }),
     sendMemoUpdateCard: async ({ text }) => send(text, 'memo'),
-  }, options.telegramDryRunFile ? 'telegram-dry-run' : 'live');
+  }, 'live');
 }
 
 export interface SubscribeTopicSearchInput {

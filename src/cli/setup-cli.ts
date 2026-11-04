@@ -294,7 +294,7 @@ function formatDefaultPluginStatuses(statuses: readonly DefaultPluginStatus[]): 
 async function readDefaultPluginStatuses(deps: SetupCliDeps): Promise<DefaultPluginStatus[]> {
   const catalogErrors = validateDefaultPluginServiceKeys();
   if (catalogErrors.length) throw new Error(`기본 플러그인 서비스 카탈로그 오류: ${catalogErrors.join('; ')}`);
-  const keys = (deps.getServiceKeyStatus ?? serviceKeyStatus)()
+  const keys = (await (deps.getServiceKeyStatus ?? serviceKeyStatus)())
     .filter(item => item.configured).map(item => item.id);
   const providers = await (deps.detectProviders ?? detectProviders)();
   const prerequisites = new Set<string>();
@@ -528,7 +528,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       try {
         if (opts.status) {
           if (opts.all) throw new Error('--status already shows the full catalog; omit --all');
-          for (const line of renderServiceKeyStatus()) out.log(line);
+          for (const line of await renderServiceKeyStatus()) out.log(line);
           for (const line of formatDefaultPluginStatuses(await readDefaultPluginStatuses(deps))) out.log(line);
           setExitCode(0);
           return;

@@ -80,12 +80,15 @@ function renderProviderProposal(config: UserConfig, providers: Awaited<ReturnTyp
   ];
 }
 
-export function renderServiceKeyStatus(options: { env?: NodeJS.ProcessEnv; cacheDir?: string } = {}): string[] {
-  const status = serviceKeyStatus(options);
+export async function renderServiceKeyStatus(options: { env?: NodeJS.ProcessEnv; cacheDir?: string; getSecret?: (id: string) => Promise<string | undefined> } = {}): Promise<string[]> {
+  const status = await serviceKeyStatus(options);
   return SERVICE_KEY_CATALOG.map(item => {
     const row = status.find(candidate => candidate.id === item.id);
     if (!row) return `${item.label}: 상태 확인 불가`;
-    if (item.kind === 'api-key') return `${item.label}: ${row.configured ? '키 있음' : '키 필요'} (${item.envNames.join(', ')})`;
+    if (item.kind === 'api-key') {
+      const state = row.sourceCheckFailed && !row.configured ? '상태 확인 불가' : row.configured ? '키 있음' : '키 필요';
+      return `${item.label}: ${state} (${row.sources.join(', ') || '감지된 출처 없음'})`;
+    }
     return `${item.label}: ${item.kind === 'subscription' || item.kind === 'oauth' || item.kind === 'cli' ? '로그인/설치 상태는 별도 감지' : '로컬 도구 확인 필요'}`;
   });
 }
@@ -130,7 +133,7 @@ export async function runSetupKeys(io: SetupKeysIO, options: SetupKeysOptions): 
   const { listCodexAccountsInStore } = await import('../oauth/codex-account-store.js');
   const codexAccounts = listCodexAccountsInStore().map(account => account.name);
   io.print(`Codex 계정: ${codexAccounts.length ? codexAccounts.join(', ') : '없음'} · 추가: 별도 CODEX_HOME에서 codex login 후 elanous provider codex account import <이름> --home <홈>`);
-  const statuses = serviceKeyStatus({ env: options.env, cacheDir: options.cacheDir });
+  const statuses = await serviceKeyStatus({ env: options.env, cacheDir: options.cacheDir });
   const entries = SERVICE_KEY_CATALOG.filter(item => item.kind === 'api-key' && (item.demoRequired || options.includeOptional));
   const stored: string[] = [];
   const skipped: string[] = [];
@@ -152,7 +155,7 @@ export async function runSetupKeys(io: SetupKeysIO, options: SetupKeysOptions): 
     if (result.stored.includes(envName)) stored.push(envName);
     else skipped.push(item.id);
   }
-  for (const line of renderServiceKeyStatus({ env: options.env, cacheDir: options.cacheDir })) io.print(line);
+  for (const line of await renderServiceKeyStatus({ env: options.env, cacheDir: options.cacheDir })) io.print(line);
   return { stored, skipped };
 }
 

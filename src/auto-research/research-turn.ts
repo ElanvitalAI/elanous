@@ -7,6 +7,7 @@ import { formatResearchEvidenceAttribution, researchEvidenceSourceUrls } from '.
 import { routeResearchOutput } from '../research/output-router.js';
 import { planGapFollowup } from '../research/gap-followup.js';
 import type { ResearchGapFollowupInput, ResearchGapFollowupPlan, ResearchGapFollowupResult } from '../research/gap-followup.js';
+import type { ResearchGraphEvent } from '../nexus/api/research-run-observer.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import {
   buildWorkingBackwardsContractPrompt,
@@ -37,6 +38,8 @@ import {
 export interface ResearchQuestionLadderRunOptions {
   /** Explicit inherited run identity for diagnostics; omitted values are never fabricated here. */
   runId?: string;
+  /** Persist the actual adaptive research steps to the active Nexus run, when the caller owns a run. */
+  onGraphEvent?: (event: ResearchGraphEvent) => void;
   signal?: AbortSignal;
   /** Inherit the active turn's provider route; research must not pick its own default. */
   initialProvider?: LLMProvider;
@@ -76,6 +79,34 @@ export interface ResearchQuestionLadderRunOptions {
   bloomExemplarPackPath?: string;
   /** Host hook for private trigger calibration; public default stays conservative. */
   secondOrderTriggerClassifier?: SecondOrderTriggerClassifier;
+}
+
+function emitGraphEvent(options: ResearchQuestionLadderRunOptions, event: ResearchGraphEvent): void {
+  try { options.onGraphEvent?.(event); } catch { /* visualization is observational and fail-soft */ }
+}
+
+function researchNodeId(prefix: 'axis' | 'followup', questionId: string): string {
+  const safeId = questionId.replace(/[^A-Za-z0-9_-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'unknown';
+  return `${prefix}-${safeId}`;
+}
+
+function prioritizeGapFollowups(
+  plan: ResearchGapFollowupPlan,
+  input: ResearchGapFollowupInput,
+): { plan: ResearchGapFollowupPlan; changes: Array<{ node: string; from: number; to: number }> } {
+  const questionById = new Map(input.questions.map((question) => [question.id, question]));
+  const slotRank = new Map((input.blankSlots ?? []).map((slot, index) => [slot.id, index]));
+  const ranked = plan.followups.map((call, index) => ({ call, index })).sort((a, b) => {
+    const aSection = questionById.get(a.call.questionId)?.sectionId;
+    const bSection = questionById.get(b.call.questionId)?.sectionId;
+    return (slotRank.get(aSection ?? '') ?? Number.MAX_SAFE_INTEGER)
+      - (slotRank.get(bSection ?? '') ?? Number.MAX_SAFE_INTEGER)
+      || a.index - b.index;
+  });
+  const changes = ranked.flatMap(({ call, index }, nextIndex) => index === nextIndex ? [] : [{
+    node: researchNodeId('followup', call.questionId), from: index + 1, to: nextIndex + 1,
+  }]);
+  return { plan: { ...plan, followups: ranked.map(({ call }) => call) }, changes };
 }
 
 export interface ResearchGroundingResult {
@@ -156,12 +187,27 @@ async function runNativeResearchGapFollowup(
   }
   const budgetSignal = AbortSignal.timeout(plan.timeBudgetMs);
   const signal = input.signal ? AbortSignal.any([input.signal, budgetSignal]) : budgetSignal;
-  const result = await (options.invokeAxes ?? invokeProductionResearchAxes)(
-    planned, signal, options.admitToolCall,
-  );
+  const followupEvidence: ResearchEvidenceEnvelope[] = [];
+  const followupNodes = planned.map((question) => researchNodeId('followup', question.id));
+  emitGraphEvent(options, { type: 'enter', node: 'followup' });
+  for (const node of followupNodes) emitGraphEvent(options, { type: 'enter', node });
+  try {
+    const result = await (options.invokeAxes ?? invokeProductionResearchAxes)(planned, signal, options.admitToolCall);
+    const byQuestion = new Map(result.axes.map((axis) => [axis.questionId, axis]));
+    for (const question of planned) {
+      const evidence = byQuestion.get(question.id)?.evidence ?? [];
+      followupEvidence.push(...evidence);
+      emitGraphEvent(options, { type: 'exit', node: researchNodeId('followup', question.id), outcome: evidence.some((item) => item.outcome !== 'failed') ? 'ok' : 'fail' });
+    }
+    emitGraphEvent(options, { type: 'exit', node: 'followup', outcome: result.axes.some((axis) => axis.evidence.some((item) => item.outcome !== 'failed')) ? 'ok' : 'fail' });
+  } catch (error) {
+    for (const node of followupNodes) emitGraphEvent(options, { type: 'exit', node, outcome: 'fail' });
+    emitGraphEvent(options, { type: 'exit', node: 'followup', outcome: 'fail' });
+    throw error;
+  }
   return {
     ...plan,
-    followupEvidence: result.axes.flatMap((axis) => axis.evidence),
+    followupEvidence,
     discoveryCards: [],
   };
 }
@@ -478,6 +524,13 @@ export async function runResearchQuestionLadder(
   };
   const singlePreparation = Boolean(options.generatePreparation)
     || (!options.generateContract && !options.generate);
+  emitGraphEvent(options, { type: 'enter', node: 'question-plan' });
+  let questionPlanFinished = false;
+  const finishQuestionPlan = (outcome: string): void => {
+    if (questionPlanFinished) return;
+    questionPlanFinished = true;
+    emitGraphEvent(options, { type: 'exit', node: 'question-plan', outcome });
+  };
   let contractRaw: string;
   let raw = '';
   try {
@@ -512,12 +565,14 @@ export async function runResearchQuestionLadder(
       );
     }
     if (signal.aborted) {
+      finishQuestionPlan('aborted');
       return shouldReturnPartial()
         ? { ok: false, ladder: initial, output: partialResearchOutput(request, initial, 'before question generation'), error: RESEARCH_TURN_DEADLINE_STOP_ERROR }
         : { ok: false, ladder: initial, output: '', error: 'research aborted' };
     }
   } catch (error) {
     const reason = errorText(error);
+    finishQuestionPlan(signal.aborted ? 'aborted' : 'fail');
     if (signal.aborted) {
       return {
         ok: false, ladder: initial,
@@ -534,11 +589,13 @@ export async function runResearchQuestionLadder(
     generatedContract = JSON.parse(extractJson(contractRaw));
   } catch (error) {
     const reason = errorText(error);
+    finishQuestionPlan('fail');
     debug.log('research.lens', 'working-backwards-contract-invalid', { reason }, { level: 'warn' });
     return { ok: false, ladder: initial, output: '', error: `output contract returned invalid JSON: ${reason}` };
   }
   const parsedContract = parseWorkingBackwardsContract(generatedContract);
   if (!parsedContract.ok) {
+    finishQuestionPlan('fail');
     debug.log('research.lens', 'working-backwards-contract-invalid', { reason: parsedContract.reason }, { level: 'warn' });
     return { ok: false, ladder: initial, output: '', error: parsedContract.reason };
   }
@@ -568,12 +625,14 @@ export async function runResearchQuestionLadder(
       signal,
     );
     if (signal.aborted) {
+      finishQuestionPlan('aborted');
       return shouldReturnPartial()
         ? { ok: false, ladder: initial, outputContract, output: partialResearchOutput(request, initial, 'before axis searches'), error: RESEARCH_TURN_DEADLINE_STOP_ERROR }
         : { ok: false, ladder: initial, outputContract, output: '', error: 'research aborted' };
     }
     debug.log('research.turn', 'bloom-generated', { questionCount: 6 });
   } catch (error) {
+    finishQuestionPlan(signal.aborted ? 'aborted' : 'fail');
     if (signal.aborted) {
       return {
         ok: false, ladder: initial, outputContract,
@@ -589,6 +648,7 @@ export async function runResearchQuestionLadder(
   try {
     generated = JSON.parse(extractJson(raw));
   } catch (error) {
+    finishQuestionPlan('fail');
     debug.log('research.turn', 'bloom-validation-failed', { reason: errorText(error) }, { level: 'warn' });
     return { ok: false, ladder: initial, outputContract, output: '', error: `question generation returned invalid JSON: ${errorText(error)}` };
   }
@@ -596,11 +656,13 @@ export async function runResearchQuestionLadder(
     withRequest(generated, request), outputContract.sections.map((section) => section.id),
   );
   if (!parsed.ok) {
+    finishQuestionPlan('fail');
     debug.log('research.turn', 'bloom-validation-failed', { reason: parsed.reason }, { level: 'warn' });
     return { ok: false, ladder: initial, outputContract, output: '', error: parsed.reason };
   }
 
   const ladder = parsed.value;
+  finishQuestionPlan('ok');
   debug.log('research.turn', 'bloom-ladder-validated', { questionCount: ladder.questions.length });
   debug.log('research.turn', 'deep-bloom-applied', {
     levels: [4, 5], trigger: 'research-intent',
@@ -609,14 +671,37 @@ export async function runResearchQuestionLadder(
   });
   const observedAt = new Date().toISOString();
   let fanout: AxisFanoutResult;
+  for (const [index, question] of ladder.questions.entries()) {
+    const node = researchNodeId('axis', question.id);
+    emitGraphEvent(options, { type: 'node-added', node, kind: 'research', reason: 'Bloom question ladder generated this evidence axis' });
+    emitGraphEvent(options, {
+      type: 'edge-rerouted', from: 'axes', outcome: index === 0 ? '$default' : question.id,
+      to: node, was: index === 0 ? 'evidence-check' : '$absent',
+      reason: 'Question axes are collected concurrently as independent evidence paths',
+    });
+    emitGraphEvent(options, { type: 'edge-rerouted', from: node, outcome: '$default', to: 'evidence-check', was: '$absent', reason: 'Each evidence axis returns to the shared output contract check' });
+    emitGraphEvent(options, { type: 'enter', node });
+  }
+  let axesFinished = false;
+  const finishAxes = (outcome: string): void => {
+    if (axesFinished) return;
+    axesFinished = true;
+    emitGraphEvent(options, { type: 'exit', node: 'axes', outcome });
+  };
   try {
+    emitGraphEvent(options, { type: 'enter', node: 'axes' });
     fanout = await (options.invokeAxes ?? invokeProductionResearchAxes)(ladder.questions, signal, options.admitToolCall);
-    if (signal.aborted && !shouldReturnPartial()) return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
+    if (signal.aborted && !shouldReturnPartial()) {
+      finishAxes('aborted');
+      for (const question of ladder.questions) emitGraphEvent(options, { type: 'exit', node: researchNodeId('axis', question.id), outcome: 'aborted' });
+      return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
+    }
     debug.log('research.turn', 'axis-evidence-collected', {
       axisCount: fanout.axes.length,
       evidenceCount: fanout.axes.reduce((count, axis) => count + axis.evidence.length, 0),
     });
   } catch (error) {
+    finishAxes('fail');
     debug.log('research.turn', 'axis-evidence-failed', { reason: errorText(error) }, { level: 'warn' });
     fanout = {
       plan: [],
@@ -626,6 +711,12 @@ export async function runResearchQuestionLadder(
         observedAt, content: errorText(error), outcome: 'failed', truncated: false,
       }] })),
     };
+  }
+
+  const collectedAxes = new Map(fanout.axes.map((axis) => [axis.questionId, axis]));
+  for (const question of ladder.questions) {
+    const axis = collectedAxes.get(question.id);
+    emitGraphEvent(options, { type: 'exit', node: researchNodeId('axis', question.id), outcome: axis?.evidence.some((item) => item.outcome !== 'failed') ? 'ok' : 'fail' });
   }
 
   let evidenceRejected = false;
@@ -678,6 +769,9 @@ export async function runResearchQuestionLadder(
 
   let finalBoundary = planWorkingBackwardsCompletion(outputContract, ladder.questions, ladder.evidence);
   logCompletionBoundary('axis-fanout', finalBoundary, options.runId);
+  finishAxes('ok');
+  emitGraphEvent(options, { type: 'enter', node: 'evidence-check' });
+  emitGraphEvent(options, { type: 'exit', node: 'evidence-check', outcome: finalBoundary.complete ? 'complete' : 'gap' });
   if (finalBoundary.complete) {
     debug.log('research.turn', 'completion-boundary-stop', {
       stage: 'axis-fanout', reason: 'every output-contract section slot is filled',
@@ -700,6 +794,27 @@ export async function runResearchQuestionLadder(
     if (options.planGapFollowup || !options.gapFollowup) {
       try {
         followupPlan = (options.planGapFollowup ?? planGapFollowup)(followupInput);
+        const prioritized = prioritizeGapFollowups(followupPlan, followupInput);
+        followupPlan = prioritized.plan;
+        if (followupPlan.followups.length > 0) {
+          const followupNodes = followupPlan.followups.map((call) => researchNodeId('followup', call.questionId));
+          for (const node of followupNodes) emitGraphEvent(options, { type: 'node-added', node, kind: 'research', reason: 'Output contract gap scheduled a bounded evidence follow-up' });
+          emitGraphEvent(options, {
+            type: 'edge-rerouted', from: 'evidence-check', outcome: 'gap', to: 'followup', was: 'synthesis',
+            reason: 'Missing contract evidence routes the run through follow-up fanout',
+          });
+          for (const node of followupNodes) {
+            emitGraphEvent(options, {
+              type: 'edge-rerouted', from: 'followup', outcome: node.slice('followup-'.length),
+              to: node, was: '$absent',
+              reason: 'Follow-up fanout dispatches prioritized evidence questions concurrently',
+            });
+            emitGraphEvent(options, { type: 'edge-rerouted', from: node, outcome: '$default', to: 'synthesis', was: '$absent', reason: 'Follow-up evidence returns to answer synthesis' });
+          }
+        }
+        for (const change of prioritized.changes) {
+          emitGraphEvent(options, { type: 'priority-changed', ...change, reason: 'Follow-up order now follows the unfilled output-contract sections' });
+        }
         debug.log('research.turn', 'gap-followup-planned', {
           rounds: followupPlan.rounds,
           classifications: followupPlan.classifications.length,

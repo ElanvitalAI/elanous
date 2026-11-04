@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listSources } from './intake-sources.js';
-import { appendTopicBriefingTelegramDryRun, deliverTopicBriefing, deliverTopicBriefingWithReceipts, isDecisionImpactingTopicEvidence, scheduleIntakeSession, subscribeTopicSearch } from './actions.js';
+import { appendTopicBriefingTelegramDryRun, deliverTopicBriefing, deliverTopicBriefingWithReceipts, isDecisionImpactingTopicEvidence, projectTopicBriefing, scheduleIntakeSession, subscribeTopicSearch } from './actions.js';
+import type { BriefItem } from '../briefing/brief-items.js';
 import type { IntakeStore } from './store.js';
 
 const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
@@ -246,6 +247,7 @@ test('issue briefing sends only related findings to Telegram and Linear, then re
   });
   expect(result).toEqual({ related: 1, reopened: true });
   expect(calls).toHaveLength(5);
+  expect(calls[0]).toContain('관련 이슈: HBM project');
   expect(calls[0]).toContain('관련 이슈');
   expect(calls[0]).toContain('https://example.test/hbm');
   expect(calls[0]).not.toContain('Unrelated item');
@@ -253,6 +255,23 @@ test('issue briefing sends only related findings to Telegram and Linear, then re
   expect(calls[2]).toBe('impact:1');
   expect(calls.slice(3)).toEqual(['reopen', expect.stringContaining('메모 갱신?')]);
   expect(calls[4]).toContain('HBM project');
+});
+
+test('Telegram dry-run projects the issue group without contacting Linear or Telegram', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'markdown-brief-dryrun-'));
+  const output = join(stateDir, 'telegram.jsonl');
+  const item = { id: 1, text: '새 토픽 자료: 미국 호르무즈 보도', domain: '흡수', priority: 'P1', deadline: null,
+    evidence: 'https://example.com/ap', source: 'intake.markdown:scenario-v2', linearIssueId, created_at: '2026-11-04T00:00:00.000Z', sent_at: null } as BriefItem;
+  try {
+    await projectTopicBriefing({ id: 'scenario-v2', seat: 'user', kind: 'markdown', spec: '/tmp/news.md', every: '1d',
+      linearIssueId, briefingTopic: '2027 사업계획 리스크' }, [item], stateDir, { telegramDryRunFile: output });
+    const recorded = readFileSync(output, 'utf8');
+    const rows = recorded.trim().split('\n').map(line => JSON.parse(line));
+    expect(rows).toHaveLength(1);
+    expect(recorded).toContain(linearIssueId);
+    expect(recorded).toContain('관련 이슈: 2027 사업계획 리스크');
+    expect(recorded).toContain('https://example.com/ap');
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });
 
 test('Done issue reopening requires specific decision-scale evidence rather than incidental keywords', () => {

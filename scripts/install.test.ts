@@ -230,6 +230,39 @@ describe('scripts/install.sh', () => {
     expect(readFileSync(join(home, '.profile'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
   }, 120_000);
 
+  test('a non-interactive SSH bash command finds the installed binary after repeat install without changing other startup files', () => {
+    const env = setup();
+    const bashProfile = join(env.home, '.bash_profile');
+    writeFileSync(bashProfile, 'export KEEP_BASH_PROFILE=1\n');
+    writeFileSync(join(env.home, '.bashrc'), 'export KEEP=1\nexport KEEP_BASH=2\n');
+    writeFileSync(join(env.home, '.profile'), 'export KEEP_PROFILE=1\nexport PROFILE_MARKER=2\n');
+    const shell = { ELANOUS_SHELL_STARTUP: '', SHELL: '/bin/bash' };
+    const first = run([], env, hostPathWithoutEln(), repoRoot, shell);
+    expect(first.result.status, first.result.stderr).toBe(0);
+    const second = run([], env, hostPathWithoutEln(), repoRoot, shell);
+    expect(second.result.status, second.result.stderr).toBe(0);
+
+    const remote = spawnSync('/bin/bash', ['-c', 'command -v elanous && command -v bun'], {
+      encoding: 'utf8',
+      env: { HOME: env.home, PATH: '/usr/bin:/bin', SSH_CLIENT: '127.0.0.1 22 12345' },
+    });
+    expect(remote.status, remote.stderr).toBe(0);
+    expect(remote.stdout.trim().split('\n')).toEqual([
+      realpathSync(join(env.prefix, 'bin', 'elanous')),
+      join(realpathSync(join(env.prefix, 'bin')), 'bun'),
+    ]);
+
+    const bashrc = readFileSync(join(env.home, '.bashrc'), 'utf8');
+    const profile = readFileSync(join(env.home, '.profile'), 'utf8');
+    expect(bashrc).toStartWith('export KEEP=1\nexport KEEP_BASH=2\n');
+    expect(profile).toStartWith('export KEEP_PROFILE=1\nexport PROFILE_MARKER=2\n');
+    expect(readFileSync(bashProfile, 'utf8')).toBe('export KEEP_BASH_PROFILE=1\n');
+    expect(bashrc.match(/^# >>> elanous installer PATH >>>$/gm)).toHaveLength(1);
+    expect(bashrc.match(/^# <<< elanous installer PATH <<<$/gm)).toHaveLength(1);
+    expect(profile.match(/^# >>> elanous installer PATH >>>$/gm)).toHaveLength(1);
+    expect(profile.match(/^# <<< elanous installer PATH <<<$/gm)).toHaveLength(1);
+  }, 120_000);
+
   // 🩸 2026-09-28 node-b: zsh 도 ~/.zshrc 는 대화형만 읽는다 ⇒ `ssh host elanous`(비대화형)가 못 찾았다.
   test('a zsh user without an override gets the PATH block in ~/.zshenv too (non-interactive ssh)', () => {
     const { home, result } = run([], setup(), process.env.PATH ?? '', repoRoot, { ELANOUS_SHELL_STARTUP: '', SHELL: '/bin/zsh' });

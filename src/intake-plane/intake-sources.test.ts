@@ -3,13 +3,29 @@ import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addSource, dueSources, listSources, removeSource, runDue, sourcesFile, syncBriefingTopicSource, syncStarterTopicRssSources } from './intake-sources.js';
+import { addSource, dueSources, listSources, parseMarkdownNews, removeSource, runDue, sourcesFile, syncBriefingTopicSource, syncStarterTopicRssSources } from './intake-sources.js';
 import { readStarSnapshots } from './collect-github.js';
 import { ingestIntakeItems, listIntakeItems, markIntakeItem } from './items.js';
 import { loadIntakeLedger } from './items.js';
 import { BriefItemsLedger, type AddBriefItem } from '../briefing/brief-items.js';
 
 const now = new Date('2026-10-01T12:00:00.000Z');
+
+test('markdown scenario source parses curated rows and projects them into its parent issue briefing', fixture(async (root) => {
+  const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  const source = addSource({ id: 'scenario-v2', seat: 'user', kind: 'markdown', spec: '/tmp/scenario-v2/news.md', every: '1d',
+    linearIssueId, briefingTopic: '2027 사업계획 리스크' }, root);
+  const markdown = '# news\n\n1. **미국 호르무즈 보도** — 미군 작전 뒤 협상 긴장이 이어졌다. [AP 원문](https://example.com/ap)\n2. **수에즈 복귀 일정** — HMM 포함 얼라이언스가 12월 재개 예정이다. [기사](https://example.com/shipping)';
+  expect(parseMarkdownNews(markdown)).toHaveLength(2);
+  let projected: import('../briefing/brief-items.js').BriefItem[] = [];
+  const result = await runDue({ now, sourceId: source.id, deps: { stateDir: root, readMarkdown: () => markdown,
+    projectTopicBriefing: async (_source, items) => { projected = items; },
+  } });
+  expect(result.ran).toEqual([{ id: source.id, items: 2 }]);
+  expect(projected).toHaveLength(2);
+  expect(projected[0]).toMatchObject({ linearIssueId, evidence: 'https://example.com/ap', source: 'intake.markdown:scenario-v2' });
+  expect(projected[0]!.text).toContain('미군 작전 뒤 협상 긴장이 이어졌다.');
+}));
 
 test('configured briefing topic creates and updates one recurring RSS source without replacing other sources', fixture((root) => {
   const other = addSource({ id: 'existing', seat: 'OP', kind: 'rss', spec: 'https://example.com/op.xml', every: '1d' }, root);

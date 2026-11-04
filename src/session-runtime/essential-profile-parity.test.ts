@@ -50,6 +50,8 @@ const EXPECTED_ESSENTIAL_MEMBERS = [
   'MsgList', 'MsgPost', 'MsgAsk', 'MsgAck',
   'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
   'PersistentGrounding',
+  'ToolSearch',
+  'elanous_linear_issue',
 ];
 const PARITY_GUARD = 'The essential fixed catalog changed; if intentional, update this test with the reason. This guard makes the change visible rather than forbidding it.';
 

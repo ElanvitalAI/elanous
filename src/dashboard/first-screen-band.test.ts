@@ -93,10 +93,10 @@ describe('resolveTuiDaemonLink', () => {
     for (const root of ['/tmp/a\nb', '/tmp/\u001b[2Jx', '/tmp/\u009bx']) {
       const link = await resolveTuiDaemonLink({ universe: () => 'test', testRoot: () => root, endpoint: () => null, observe: () => {} });
       expect(link).toEqual({ status: 'absent', startCommand: '' });
-      expect(buildFirstScreenBand({ width: 120, daemon: false, link })[0]).toBe('elanous | 데몬: 없음');
+      expect(buildFirstScreenBand({ width: 120, daemon: false, link })[0]).toBe('웹 화면을 여는 중…');
     }
     expect(buildFirstScreenBand({ width: 120, daemon: false, link: { status: 'unhealthy', startCommand: 'elanous \u001b[31mx' } })[0])
-      .toBe('elanous | 데몬: 응답 없음');
+      .toBe('웹 화면을 여는 중…');
     expect(await resolveTuiDaemonLink({ universe: () => 'test', testRoot: () => { throw new Error('x'); }, endpoint: () => null, observe: () => {} }))
       .toEqual({ status: 'error', stage: 'identity' });
   });
@@ -124,8 +124,8 @@ describe('buildFirstScreenBand', () => {
     const cases = [
       [{ status: 'checking' }, 'elanous | 데몬: 확인 중'],
       [{ status: 'connected', address: 'http://127.0.0.1:31415' }, 'elanous | 데몬: 연결됨 (http://127.0.0.1:31415)'],
-      [{ status: 'absent', startCommand: 'elanous nexus run' }, 'elanous | 데몬: 없음 · 시작: elanous nexus run'],
-      [{ status: 'unhealthy', startCommand: 'elanous --test nexus run' }, 'elanous | 데몬: 응답 없음 · 시작: elanous --test nexus run'],
+      [{ status: 'absent', startCommand: 'elanous nexus run' }, '웹 화면을 여는 중…'],
+      [{ status: 'unhealthy', startCommand: 'elanous --test nexus run' }, '웹 화면을 여는 중…'],
       [{ status: 'error', stage: 'health' }, 'elanous | 데몬: health 조회 오류'],
     ] as const satisfies ReadonlyArray<readonly [TuiDaemonLink, string]>;
     for (const [link, expected] of cases) {
@@ -148,9 +148,9 @@ describe('buildFirstScreenBand', () => {
     expect(buildFirstScreenBand({ width: 46, daemon: false, link: connected })[0])
       .toBe('elanous | 데몬: 연결됨');
     expect(buildFirstScreenBand({ width: 56, daemon: false, link: absent })[0])
-      .toBe('elanous | 데몬: 없음 · 시작: elanous nexus run');
+      .toBe('웹 화면을 여는 중…');
     expect(buildFirstScreenBand({ width: 40, daemon: false, link: absent })[0])
-      .toBe('elanous | 데몬: 없음');
+      .toBe('웹 화면을 여는 중…');
     expect(buildFirstScreenBand({ width: 15, daemon: false, link: connected })[0])
       .toBe('elanous | 데몬:');
   });
@@ -261,13 +261,13 @@ describe('buildFirstScreenBand', () => {
     expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'connected', address: 'http://127.0.0.1:31415' } })[0])
       .toBe('elanous | daemon: connected (http://127.0.0.1:31415)');
     expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'absent', startCommand: 'elanous nexus run' } })[0])
-      .toBe('elanous | daemon: absent · start: elanous nexus run');
+      .toBe('Opening web setup…');
     expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'unhealthy', startCommand: 'elanous nexus run' } })[0])
-      .toBe('elanous | daemon: unhealthy · start: elanous nexus run');
+      .toBe('Opening web setup…');
     expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'error', stage: 'health' } })[0])
       .toBe('elanous | daemon: health lookup error');
     expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'ko', link: { status: 'absent', startCommand: 'elanous nexus run' } })[0])
-      .toBe('elanous | 데몬: 없음 · 시작: elanous nexus run');
+      .toBe('웹 화면을 여는 중…');
   });
 
   test('keeps the same guidance readable on error and empty screens in both locales', () => {

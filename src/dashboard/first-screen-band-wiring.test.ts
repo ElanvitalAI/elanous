@@ -52,11 +52,11 @@ test('daemon link settles independently of PWA and never overwrites a replaced f
   await Promise.resolve();
   finishLink({ status: 'absent', startCommand: 'elanous --test nexus run' });
   await Bun.sleep(0);
-  expect(lines[0]).toBe('elanous | 데몬: 없음 · 시작: elanous --test nexus run');
+  expect(lines[0]).toBe('웹 화면을 여는 중…');
   expect(lines[1]).toBe('PWA: not checked');
   finishPwa({ status: 'absent' });
   await pending;
-  expect(lines[0]).toContain('데몬: 없음');
+  expect(lines[0]).toBe('웹 화면을 여는 중…');
 
   let finishStale!: (value: { status: 'connected'; address: string }) => void;
   const staleLines: string[] = [];
@@ -199,10 +199,10 @@ test.skipIf(process.platform === 'darwin')('showDashboard renders the startup ba
       return header >= 0 && footer > header ? frame.slice(header + 1, footer) : [];
     };
     const before = await waitFor((frame) => historyArea(frame).some((line) => line.includes('무엇을 할 수 있어?'))
-      && historyArea(frame).some((line) => line.includes('데몬: 없음')), 'resolved daemon link in real TUI');
-    // `--test=<root>` is an explicit root, so the start command names it (or is dropped when it does not fit).
-    expect(historyArea(before).join('\n')).toContain('데몬: 없음');
-    expect(historyArea(before).join('\n')).not.toContain('시작: elanous --test nexus run');
+      && historyArea(frame).some((line) => line.includes('웹 화면을 여는 중…')), 'resolved daemon link in real TUI');
+    // The test universe is not surfaced as an operator command on the first screen.
+    expect(historyArea(before).join('\n')).toContain('웹 화면을 여는 중…');
+    expect(historyArea(before).join('\n')).not.toContain('--test');
     expect(historyArea(before).join('\n')).toContain('PWA:');
     expect(historyArea(before).join('\n')).not.toContain('band-retention-probe');
     child.stdin!.write('band-retention-probe\r');

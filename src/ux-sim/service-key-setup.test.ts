@@ -118,7 +118,7 @@ test('first-run key import persists only verified keys and never exposes the sec
         expect(printed.some(line => line.includes(`검증 ${reason}`))).toBe(true);
       }
       // Fresh isolated cache must agree with the import verdict.
-      const status = serviceKeyStatus({ env: {}, cacheDir }).find(row => row.id === 'openai-api');
+      const status = (await serviceKeyStatus({ env: {}, cacheDir })).find(row => row.id === 'openai-api');
       expect(status?.configured).toBe(outcome === 'stored');
       if (outcome === 'stored') {
         const persisted = readFileSync(join(cacheDir, 'openai_api_key'), 'utf8').trim();
@@ -248,7 +248,7 @@ test('synthetic canary inputs never reach the key verifier or emitted output', a
   globalThis.fetch = (async () => {
     outboundRequests += 1;
     throw new Error('network access forbidden in synthetic canary test');
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
   try {
     console.log({ canary });
     expect(consoleOutput.join('\n')).toContain(canary);

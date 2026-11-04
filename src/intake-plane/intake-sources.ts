@@ -8,7 +8,7 @@ import { findTrack } from '../autopilot/mission-phase-track.js';
 import { appendGithubStarSnapshots, collectGithubStars, ghApiSearchRepos, type SearchGithubRepos } from './collect-github.js';
 import { ingestIntakeItems, parseRawIntakeJsonl, type IntakeSource, type RegisteredIntakeSourceKind, type RawIntakeItem } from './items.js';
 
-export type SourceKind = 'github-query' | 'rss' | 'command' | 'topic-search';
+export type SourceKind = 'github-query' | 'rss' | 'command' | 'topic-search' | 'markdown';
 export interface RegisteredIntakeSource {
   id: string;
   seat: string;
@@ -112,18 +112,19 @@ function commandArgv(spec: string): string[] {
 
 export function addSource(input: RegisteredIntakeSource, stateDir = effectiveInstanceRoot()): RegisteredIntakeSource {
   const seat = canonicalSeat(input.seat);
-  if (!['github-query', 'rss', 'command', 'topic-search'].includes(input.kind)) throw new Error(`알 수 없는 원천 종류: ${input.kind}`);
+  if (!['github-query', 'rss', 'command', 'topic-search', 'markdown'].includes(input.kind)) throw new Error(`알 수 없는 원천 종류: ${input.kind}`);
   cadenceMs(input.every);
   if (input.until !== undefined) untilMs(input.until);
   if (!input.id?.trim() || !/^[\w.-]+$/.test(input.id)) throw new Error('원천 id 는 영문·숫자·_·-·. 만 허용한다');
   if (!input.spec?.trim()) throw new Error('원천 spec 이 비었다');
-  if (input.linearIssueId !== undefined && (input.kind !== 'topic-search'
+  if (input.linearIssueId !== undefined && (!['topic-search', 'markdown'].includes(input.kind)
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.linearIssueId))) {
-    throw new Error('topic-search linearIssueId 는 부모 Linear issue UUID여야 한다');
+    throw new Error('관련 issue linearIssueId 는 부모 Linear issue UUID여야 한다');
   }
   if (input.kind === 'topic-search' && (!input.linearIssueId || !input.scheduleCron || !cron.validate(input.scheduleCron))) {
     throw new Error('topic-search 는 부모 Linear UUID와 유효한 개별 schedule cron 이 필요하다');
   }
+  if (input.kind === 'markdown' && !input.linearIssueId) throw new Error('markdown 원천은 관련 Linear issue UUID가 필요하다');
   if (input.kind !== 'topic-search' && input.scheduleCron !== undefined) throw new Error('scheduleCron 은 topic-search 원천만 가질 수 있다');
   if (input.kind === 'rss') {
     let protocol = '';
@@ -131,6 +132,7 @@ export function addSource(input: RegisteredIntakeSource, stateDir = effectiveIns
     if (protocol !== 'http:' && protocol !== 'https:') throw new Error('RSS spec 은 HTTP(S) URL 이어야 한다');
   }
   if (input.kind === 'command') commandArgv(input.spec);
+  if (input.kind === 'markdown' && !input.spec.startsWith('/')) throw new Error('markdown spec 은 절대 경로여야 한다');
   const sources = readSources(stateDir);
   if (sources.some((source) => source.id === input.id)) throw new Error(`이미 등록된 원천 id: ${input.id}`);
   const source = { ...input, seat };
@@ -224,6 +226,7 @@ export interface RunDueDeps {
   stateDir?: string;
   searchGithub?: SearchGithubRepos;
   fetchFeed?: (url: string) => Promise<string>;
+  readMarkdown?: (path: string) => string;
   runCommand?: (command: string) => Promise<string>;
   searchTopic?: (topic: string) => Promise<RawIntakeItem[]>;
   addBriefItem?: (input: import('../briefing/brief-items.js').AddBriefItem) => unknown;
@@ -248,9 +251,12 @@ async function addTopicBriefItems(stateDir: string, source: RegisteredIntakeSour
   const ledger = addBriefItem ? null : new (await import('../briefing/brief-items.js')).BriefItemsLedger({ stateDir });
   for (const item of items) {
     if (!item.url) continue;
-    const text = `새 토픽 자료: ${(item.title ?? item.text ?? item.url).replace(/[\r\n]+/g, ' ').trim()}`;
+    const title = (item.title ?? item.text ?? item.url).replace(/[\r\n]+/g, ' ').trim();
+    const detail = source.kind === 'markdown' && item.title && item.text && item.text !== item.title
+      ? ` — ${item.text.replace(/[\r\n]+/g, ' ').trim()}` : '';
+    const text = `새 토픽 자료: ${title}${detail}`;
     const input = {
-      text, domain: '흡수' as const, priority: 'P1' as const, source: `intake.topic-search:${source.id}`,
+      text, domain: '흡수' as const, priority: 'P1' as const, source: `intake.${source.kind}:${source.id}`,
       evidence: item.url, createdAt,
       ...(source.linearIssueId ? { linearIssueId: source.linearIssueId } : {}),
       dedupeKey: `${source.linearIssueId ?? source.id}:${item.url}`, dedupeWithinMs: Math.max(86_400_000, cadenceMs(source.every)),
@@ -258,6 +264,16 @@ async function addTopicBriefItems(stateDir: string, source: RegisteredIntakeSour
     if (addBriefItem) addBriefItem(input);
     else ledger!.add(input);
   }
+}
+
+/** Parse curated scenario news rows without interpreting the factual summaries. */
+export function parseMarkdownNews(markdown: string): RawIntakeItem[] {
+  return markdown.split(/\r?\n/).flatMap((line) => {
+    const match = /^\s*\d+\.\s+\*\*(.+?)\*\*\s+—\s+(.+?)(?:\s+\[[^\]]+\]\((https?:\/\/[^)]+)\))?\s*$/.exec(line);
+    if (!match) return [];
+    return [{ title: match[1]!.trim(), text: match[2]!.trim(), kind: 'article' as const,
+      ...(match[3] ? { url: match[3] } : {}) }];
+  });
 }
 
 function xmlText(value: string): string {
@@ -289,7 +305,7 @@ export async function runDue({ now = new Date(), seat, sourceId, deps = {} }: { 
   const ran: Array<{ id: string; items: number; error?: string }> = [];
   for (const source of dueSources(now, stateDir, sourceId).filter((source) =>
     (selectedSeat === undefined || source.seat === selectedSeat)
-      && (source.kind !== 'topic-search' || !!deps.projectTopicBriefing))) {
+      && (!['topic-search', 'markdown'].includes(source.kind) || !source.linearIssueId || !!deps.projectTopicBriefing))) {
     try {
       let raws: RawIntakeItem[];
       let githubSnapshots: { day: string; repo: string; stars: number }[] | undefined;
@@ -314,6 +330,11 @@ export async function runDue({ now = new Date(), seat, sourceId, deps = {} }: { 
       } else if (source.kind === 'topic-search') {
         raws = await (deps.searchTopic ?? searchTopicWithResearchBridge)(source.spec);
         intakeSource = 'topic-search';
+      } else if (source.kind === 'markdown') {
+        const contents = (deps.readMarkdown ?? ((path: string) => readFileSync(path, 'utf8')))(source.spec);
+        raws = parseMarkdownNews(contents);
+        if (!raws.length) throw new Error('markdown 원천에서 뉴스 항목을 찾지 못했다');
+        intakeSource = 'markdown';
       } else {
         const argv = commandArgv(source.spec);
         const stdout = await (deps.runCommand ?? (async () => execFileSync(argv[0]!, argv.slice(1), { encoding: 'utf8', timeout: 600_000, maxBuffer: 16 * 1024 * 1024 })))(source.spec);
@@ -328,19 +349,19 @@ export async function runDue({ now = new Date(), seat, sourceId, deps = {} }: { 
       }
       raws = raws.map((raw) => ({ ...raw, seat: source.seat,
         ...(source.briefingTopic ? { briefingTopic: source.briefingTopic } : {}),
-        ...(source.kind === 'topic-search' && source.linearIssueId ? { linearIssueId: source.linearIssueId } : {}) }));
+        ...((source.kind === 'topic-search' || source.kind === 'markdown') && source.linearIssueId ? { linearIssueId: source.linearIssueId } : {}) }));
       const publishers = new Set(raws.map((raw) => {
         if (raw.publisher?.trim()) return raw.publisher.trim().toLowerCase();
         try { return new URL(raw.url!).hostname.toLowerCase().replace(/^www\./, ''); } catch { return undefined; }
       }).filter((host): host is string => !!host));
       const items = (deps.ingest ?? ingestIntakeItems)(stateDir, intakeSource, raws, now.toISOString()).shaped;
-      if (source.kind === 'topic-search') await addTopicBriefItems(stateDir, source, raws, now.toISOString(), deps.addBriefItem);
+      if (source.kind === 'topic-search' || (source.kind === 'markdown' && source.linearIssueId)) await addTopicBriefItems(stateDir, source, raws, now.toISOString(), deps.addBriefItem);
       await deps.onCollected?.(source, raws, now);
       if (githubSnapshots) appendGithubStarSnapshots(stateDir, githubSnapshots);
-      if (source.kind === 'topic-search' && source.linearIssueId && deps.projectTopicBriefing) {
+      if ((source.kind === 'topic-search' || source.kind === 'markdown') && source.linearIssueId && deps.projectTopicBriefing) {
         const { BriefItemsLedger } = await import('../briefing/brief-items.js');
         const ledger = new BriefItemsLedger({ stateDir });
-        const pending = ledger.list().filter(item => item.source === `intake.topic-search:${source.id}`
+        const pending = ledger.list().filter(item => item.source === `intake.${source.kind}:${source.id}`
           && item.linearIssueId?.toLowerCase() === source.linearIssueId!.toLowerCase() && item.sent_at === null);
         if (pending.length) {
           await deps.projectTopicBriefing(source, pending, stateDir);

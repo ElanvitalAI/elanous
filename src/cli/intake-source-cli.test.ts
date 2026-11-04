@@ -100,6 +100,23 @@ test('topic-search CLI uses the subscription action and keeps the parent Linear 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('markdown source CLI registers a fixed news file with its related issue label', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'markdown-source-cli-'));
+  const linearIssueId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+  try {
+    const added = await cli(root, ['add', '--seat', 'user', '--kind', 'markdown', '--spec', '/tmp/news.md', '--every', '1d',
+      '--id', 'scenario-v2', '--linear-issue-id', linearIssueId, '--briefing-topic', '2027 사업계획 리스크']);
+    expect(added.exitCode).toBe(0);
+    expect(listSources({}, root)).toMatchObject([{ id: 'scenario-v2', kind: 'markdown', spec: '/tmp/news.md', linearIssueId,
+      briefingTopic: '2027 사업계획 리스크' }]);
+    const wrongDryRunStage = await cli(root, ['add', '--seat', 'user', '--kind', 'markdown', '--spec', '/tmp/news.md', '--every', '1d',
+      '--id', 'scenario-v2-extra', '--linear-issue-id', linearIssueId, '--telegram-dry-run-file', '/tmp/briefing.jsonl']);
+    expect(wrongDryRunStage.exitCode).toBe(2);
+    expect(wrongDryRunStage.errors.join('\n')).toContain('markdown 은 run-due 때 지정한다');
+    expect(listSources({}, root)).toHaveLength(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('topic-search CLI resolves a Telegram dry-run file once and passes it into subscription and projection', async () => {
   const root = mkdtempSync(join(tmpdir(), 'intake-source-cli-dryrun-'));
   try {

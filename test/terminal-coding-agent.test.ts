@@ -80,7 +80,7 @@ describe('spawnCodingAgent', () => {
       { brand: 'codex', cwd: '/tmp/p', extraArgs: ['--resume', 'abc123'] },
       { registry, termCols: 100, termRows: 30, whichBinary: () => '/usr/bin/codex' },
     );
-    expect(session.command).toBe('codex --resume abc123');
+    expect(session.command).toBe('codex -c \'projects."/tmp/p".trust_level="trusted"\' --resume abc123');
   });
 
   test('onSpawned hook fires post-spawn', () => {
@@ -131,7 +131,7 @@ describe('spawnCodingAgent', () => {
         wrapCommand: (c) => `SH:${c}`,
       },
     );
-    expect(session.command).toBe('codex');
+    expect(session.command).toBe('codex -c \'projects."/x".trust_level="trusted"\'');
   });
 
   test('brand=gemini spawns gemini binary + skips wrapCommand', () => {

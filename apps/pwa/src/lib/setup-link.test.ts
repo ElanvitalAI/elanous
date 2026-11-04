@@ -25,7 +25,7 @@ describe('readSetupLinkToken', () => {
 
 describe('claimSetupLink', () => {
   test('posts a one-time link and returns only the setup bearer and expiry', async () => {
-    const mock = mockResponse(200, { scope: 'setup', bearer, expiresAt: 12345, token: linkToken });
+    const mock = mockResponse(200, { scope: 'setup', bearer, expiresAt: new Date(12345).toISOString(), token: linkToken });
     expect(await claimSetupLink('https://nexus.example/', linkToken, mock.fetchImpl)).toEqual({
       status: 'claimed', bearer, expiresAt: 12345,
     });

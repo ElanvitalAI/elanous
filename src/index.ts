@@ -11564,6 +11564,23 @@ const nexusPwaCmd = nexusCmd
   .command('pwa')
   .description('PWA operational helpers — stop / show / global / share / restart / dev. (start/test/build are deprecated → use `nexus run` / `nexus run --test` / `nexus build`.)');
 
+nexusPwaCmd
+  .command('connect-link')
+  .description('Issue a one-use 10-minute link to connect a remote PWA device.')
+  .action(async () => {
+    const { runNexusShow } = await import('./cli/nexus-show.js');
+    const shown = await runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } });
+    const pwaUrl = shown.urls?.pwa.tailnet;
+    if (!pwaUrl) {
+      console.error('elanous nexus pwa connect-link: 원격 접속 URL이 없습니다. nexus pwa share enable 후 다시 시도하세요.');
+      process.exit(1);
+    }
+    const { issueSetupLinkToken } = await import('./auth/setup-link-tokens.js');
+    const { token } = issueSetupLinkToken();
+    const base = pwaUrl.replace(/\/app\/?$/, '').replace(/\/$/, '');
+    console.log(`${base}/app/live-run#t=${encodeURIComponent(token)}`);
+  });
+
 // Deprecation forward: `nexus pwa build` → `nexus build`.
 nexusPwaCmd
   .command('build')
@@ -13308,6 +13325,15 @@ async function defaultTuiSelfRestartSpawn(command: string, argv: readonly string
  * 회귀 방어 = `src/cli-entry.test.ts`(실물 `bin/elanous.mjs` 를 spawn 한다).
  */
 export function runCli(): void {
+  if (process.env.NODE_ENV === 'test' && process.env.ELANOUS_TEST_FIRSTRUN_DOCTOR_PROBE === '1') {
+    void import('./onboarding/first-run-doctor-test-control.js').then(({ runFirstRunDoctorTestControl }) => {
+      runFirstRunDoctorTestControl();
+    }).catch((error) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    });
+    return;
+  }
   main().catch(async (err) => {
     closeTui();
     if (isCliUserError(err)) {

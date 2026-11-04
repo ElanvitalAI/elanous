@@ -27,6 +27,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { openMsgStore } from '../msg/msg-store.js';
+import { resolveInstance } from '../instance/resolve.js';
 import { SEAT_MEMORY_RECALL_MAX_CHARS, SEAT_MEMORY_RECALL_PREFIX } from '../dashboard/seat-boot-preamble.js';
 import { AUTOHEAL_MAX_ATTEMPTS } from '../self-health/autoheal.js';
 import { mockSeatPtySequence, type SeatPtySequenceEvidence, type SeatPtyStep } from './mock-seat-pty-sequence.js';
@@ -37,7 +38,7 @@ import {
 import { pasteFoldToken } from '../chat/paste-fold.js';
 import { bracketedPaste, CLIP_TEXT, GOAL_CONTINUE_PLEDGE_REPLY, GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL, goalInterimScreenCounts, INTERNAL_TURN_USER_HEADER, clipboardShimPath, PASTE_LONG, PASTE_LONG_TOKEN, PASTE_SHORT, parseData, readLogs } from './next-tui-seat-scenarios.js';
 
-export const CLASSIC_TUI_SCENARIOS = ['classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
+export const CLASSIC_TUI_SCENARIOS = ['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
 export type ClassicTuiScenario = (typeof CLASSIC_TUI_SCENARIOS)[number];
 
 export interface ClassicTuiScenarioSpec {
@@ -115,7 +116,7 @@ const AUTOHEAL_CAP = AUTOHEAL_MAX_ATTEMPTS;
 
 type Row = { category?: string; event?: string; data?: unknown };
 
-const classicReady = (s: string) => s.includes('elanous | daemon') && s.includes('실행 ') && s.includes('❯');
+const classicReady = (s: string) => (s.includes('elanous | daemon') || s.includes('Opening web setup…') || s.includes('웹 화면을 여는 중…')) && s.includes('실행 ') && s.includes('❯');
 const turnDone = (s: string) => /✔ 완료|✘ 실패/.test(s);
 
 type CapturedRequest = { messages: Array<{ role: string; content: string | null }> };
@@ -141,7 +142,9 @@ function onlyFake(rows: Row[]): boolean {
 export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promise<ClassicTuiScenarioResult> {
   const root = resolve(spec.root);
   mkdirSync(root, { recursive: true });
-  writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+  if (spec.scenario !== 'classic-first-screen-noise') {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+  }
   const env: Record<string, string> = {
     ELANOUS_SESSION_ROOT: join(root, 'sessions'),
     [TEST_FAKE_LLM_ENV]: '1',
@@ -155,7 +158,9 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     rows: 30,
     cols: 100,
     ...(spec.expectedBinarySha256 ? { expectedBinarySha256: spec.expectedBinarySha256 } : {}),
-    ready: { label: 'boot', until: classicReady, timeoutMs: 90_000 },
+    ready: spec.scenario === 'classic-first-screen-noise'
+      ? { label: 'first-run provider chooser', until: (screen: string) => screen.includes('처음 실행 LLM 설정') && screen.includes('선택:'), timeoutMs: 90_000 }
+      : { label: 'boot', until: classicReady, timeoutMs: 90_000 },
     // Ctrl+C tears down slower than the device's default window; `/exit` is the clean path.
     quitKeys: '/exit\r',
     exitTimeoutMs: 20_000,
@@ -165,6 +170,51 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     const logs = readLogs({ root, executable: spec.executable, entry: spec.entry }, logCategories);
     return { scenario: spec.scenario, universe: root, run, store, logs, checks: checks(rowsOf(logs)) };
   };
+
+  if (spec.scenario === 'classic-first-screen-noise') {
+    const run = await mockSeatPtySequence({
+      ...base,
+      env,
+      steps: [{ label: 'enter skips first-run provider setup', keys: '\r', until: (screen) => screen.includes('Try typing:') && screen.includes('❯') }],
+    });
+    const initial = run.frames[0]?.screen ?? '';
+    const afterSkip = run.frames.at(-1)?.screen ?? '';
+    const debugPath = join(root, '.elanous', 'debug');
+    const readDebugRows = (): Row[] => {
+      const lines = existsSync(debugPath)
+        ? readdirSync(debugPath).filter((name) => name.endsWith('.log'))
+          .flatMap((name) => readFileSync(join(debugPath, name), 'utf8').split('\n').filter(Boolean))
+        : [];
+      return lines.flatMap((line) => { try { return [JSON.parse(line) as Row]; } catch { return []; } });
+    };
+    const tuiDebugRows = readDebugRows();
+    const tuiDoctorStarts = tuiDebugRows.filter((row) => row.category === 'doctor.first-run' && row.event === 'started').length;
+    // Positive control invokes the exact CLI entry and executable under test. Its test-only route calls
+    // this package's production Doctor implementation with inert filesystem/install edges.
+    const doctorInstance = resolveInstance({ explicitFlagRoot: root, prodRoot: join(root, '.elanous') });
+    const doctorEnv: NodeJS.ProcessEnv = {
+      HOME: root, ELANOUS_STATE_DIR: root, ELANOUS_SESSION_ROOT: join(root, 'sessions'),
+      ELANOUS_STATE_DIR_SOURCE: doctorInstance.layer === 'default' ? 'derived' : 'explicit',
+      PATH: join(root, 'bin'), NODE_ENV: 'test', ELANOUS_TEST_FIRSTRUN_DOCTOR_PROBE: '1',
+    };
+    const doctorControl = spawnSync(spec.executable, [
+      spec.entry, '--config-dir', root, '--test-state-dir', root, '__test-first-run-doctor-control',
+    ], { cwd: root, env: doctorEnv, encoding: 'utf8', timeout: 15_000 });
+    const afterControlRows = readDebugRows();
+    const afterDoctorStarts = afterControlRows.filter((row) => row.category === 'doctor.first-run' && row.event === 'started').length;
+    return finish(run, { initial, afterSkip, testedEntry: resolve(spec.entry), doctorControlStatus: doctorControl.status, tuiDebugRows: tuiDebugRows.length }, () => ({
+      initialScreenCaptured: initial.length > 0,
+      promptBankInternalLineHidden: !initial.includes('[prompt-bank]') && !afterSkip.includes('[prompt-bank]'),
+      daemonSetupCommandHidden: !initial.includes('--test') && !afterSkip.includes('--test')
+        && !initial.includes('--hmr') && !afterSkip.includes('--hmr') && !afterSkip.includes('nexus run'),
+      humanWebSetupMessage: initial.includes('웹 화면을 여는 중…') || afterSkip.includes('웹 화면을 여는 중…')
+        || initial.includes('Opening web setup…') || afterSkip.includes('Opening web setup…'),
+      enterSkipReachedChat: afterSkip.includes('Try typing:') && afterSkip.includes('❯'),
+      firstRunDoctorNotInvoked: tuiDebugRows.length > 0 && tuiDoctorStarts === 0,
+      doctorStartPositiveControl: doctorControl.status === 0 && afterDoctorStarts === tuiDoctorStarts + 1,
+      exitedClean: run.exitCode === 0,
+    }));
+  }
 
   if (spec.scenario === 'classic-400-heal' || spec.scenario === 'classic-400-exhausted') {
     const heal = spec.scenario === 'classic-400-heal';

@@ -186,6 +186,7 @@ describe('LiveRunGraph — 390px', () => {
         { seq: 4, ts: '2026-10-29T00:00:00.000Z', type: 'node-added' as const, node: 'source-audit', kind: 'judge', decider: 'runtime-overlay', reason: 'need source' },
         { seq: 5, ts: '2026-10-29T00:00:01.000Z', type: 'edge-rerouted' as const, from: 'audit', outcome: '$default', was: 'ship', to: 'source-audit', decider: 'runtime-overlay', reason: 'need source' },
         { seq: 6, ts: '2026-10-29T00:00:02.000Z', type: 'edge-rerouted' as const, from: 'source-audit', outcome: '$default', was: '$absent', to: 'ship', decider: 'runtime-overlay', reason: 'need source' },
+        { seq: 7, ts: '2026-10-29T00:00:03.000Z', type: 'priority-changed' as const, node: 'audit', from: 2, to: 1, decider: 'research-runtime', reason: 'section priority' },
       ],
     };
     root = await mount(1024, [], withRuntimeGraph);
@@ -194,6 +195,7 @@ describe('LiveRunGraph — 390px', () => {
     const addedNode = root.root.findByProps({ 'data-testid': 'live-node-source-audit' });
     expect(addedNode.props['data-adaptive-event']).toBe('경로 수리');
     expect(root.root.findByProps({ 'data-testid': 'adaptive-event-source-audit' }).children).toEqual(['경로 수리']);
+    expect(root.root.findByProps({ 'data-testid': 'adaptive-event-audit' }).children).toEqual(['우선순위 2→1']);
     expect(addedNode.props.className).toContain('animate-pulse');
     expect(flow.props.edges).toEqual(expect.arrayContaining([
       expect.objectContaining({ source: 'audit', target: 'source-audit' }),

@@ -261,7 +261,9 @@ function setupRouteAllowed(req: Request): boolean {
   if (path.startsWith('/v1/setup/')) return true;
   return (req.method === 'POST' && path === '/v1/prompt/stream')
     || (req.method === 'GET' && (
-      /^\/v1\/sessions\/store\/[^/]+$/.test(path) || path === '/v1/chat/events'
+      /^\/v1\/sessions\/store\/[^/]+$/.test(path)
+      || path === '/v1/chat/events'
+      || path === '/v1/harness/runs'
     ));
 }
 

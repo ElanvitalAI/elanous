@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { NativeToolCatalogEntry } from '../native-tool-catalog.js';
 import type { SignalSnapshot } from './signals.js';
 import { evaluateGate, resetGateCache } from './gate.js';
-import { collectSignals, isResearchAgentIntent } from './signals.js';
+import { collectSignals, isOrderedNonResearchWorkflow, isResearchAgentIntent } from './signals.js';
 import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 
 const TARGET_TOOL_ID = 'run_dev_harness';
@@ -148,4 +148,29 @@ test('surface and gate share one research-agent verdict for old, new and coding 
     expect(collectSignals({ recentUserText: text }).researchAgent).toBe(surfaceResearch);
     expect(isResearchAgentIntent(text)).toBe(surfaceResearch);
   }
+});
+
+test('ordered operational workflows mentioning research do not select the research agent route', () => {
+  const request = '먼저 리니어 이슈를 만들고, 그다음 리서치하고, aside 캡처한 뒤 마지막에 정리해 주세요.';
+  expect(isOrderedNonResearchWorkflow(request)).toBe(true);
+  expect(isResearchAgentIntent(request)).toBe(true);
+  expect(resolveSessionSurfaceProfile({ userText: request }).id).toBe('coding/turn');
+  const emailWorkflow = 'First send an email, then research the topic and summarize the findings.';
+  expect(isOrderedNonResearchWorkflow(emailWorkflow)).toBe(true);
+  expect(resolveSessionSurfaceProfile({ userText: emailWorkflow }).id).toBe('coding/turn');
+  expect(isOrderedNonResearchWorkflow('First send an email and research the topic, then summarize.')).toBe(true);
+  expect(isOrderedNonResearchWorkflow('First send a ticket, then research the topic.')).toBe(true);
+  const deploymentWorkflow = 'First deploy the service, then research any errors and summarize them.';
+  expect(isOrderedNonResearchWorkflow(deploymentWorkflow)).toBe(true);
+  expect(resolveSessionSurfaceProfile({ userText: deploymentWorkflow }).id).toBe('coding/turn');
+  const restartWorkflow = 'First restart the server, then research the errors.';
+  expect(isOrderedNonResearchWorkflow(restartWorkflow)).toBe(true);
+  expect(resolveSessionSurfaceProfile({ userText: restartWorkflow }).id).toBe('coding/turn');
+  expect(isOrderedNonResearchWorkflow('First delete the old deployment, then research the errors.')).toBe(true);
+  const researchTopic = 'First do deep research on email security, then summarize the findings.';
+  expect(isOrderedNonResearchWorkflow(researchTopic)).toBe(false);
+  expect(resolveSessionSurfaceProfile({ userText: researchTopic }).id).toBe('research/agent');
+  const researchHowTo = 'First research how to send an email, then summarize the steps.';
+  expect(isOrderedNonResearchWorkflow(researchHowTo)).toBe(false);
+  expect(resolveSessionSurfaceProfile({ userText: researchHowTo }).id).toBe('research/agent');
 });

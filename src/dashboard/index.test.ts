@@ -529,7 +529,7 @@ test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direc
     };
     await wait(async () => {
       const rows = (await handle.renderScreen()).split('\n');
-      return rows.some(line => line.trim() === '❯') && rows[2]?.includes('elanous | daemon:');
+      return rows.some(line => line.trim() === '❯') && (rows[2]?.includes('elanous | daemon:') || rows[2]?.includes('Opening web setup…') || rows[2]?.includes('웹 화면을 여는 중…'));
     });
     const before = await handle.renderScreen();
     const rawBefore = handle.snapshot();

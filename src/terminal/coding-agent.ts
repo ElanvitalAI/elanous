@@ -14,6 +14,7 @@
 //     not found"
 
 import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import type { CodingAgentBrand, TerminalSession, TerminalSessionRegistry } from './session-registry.js';
 import { wrapCommandForKeychainUnlock } from './keychain-unlock.js';
 import { buildPtyEnv } from '../agent/identity-env.js';
@@ -76,7 +77,12 @@ export function spawnCodingAgent(
 
   const cwdName = basenameSafe(opts.cwd);
   const title = opts.title ?? `${opts.brand} [${cwdName}]`;
-  const extraArgs = opts.extraArgs ?? (opts.brand === 'grok' ? ['--always-approve'] : undefined);
+  const extraArgs = [...(opts.extraArgs ?? (opts.brand === 'grok' ? ['--always-approve'] : []))];
+  // Codex asks for workspace trust in a fresh worktree before it reads the mission.
+  // Scope trust to this absolute path via a CLI override; never mutate ~/.codex/config.toml.
+  if (opts.brand === 'codex') {
+    extraArgs.unshift('-c', shellQuote(`projects.${JSON.stringify(resolve(opts.cwd))}.trust_level="trusted"`));
+  }
   const rawCommand = extraArgs && extraArgs.length > 0
     ? `${binary} ${extraArgs.join(' ')}`
     : binary;
@@ -163,4 +169,9 @@ function defaultWhich(name: string): string | null {
 function basenameSafe(p: string): string {
   const parts = p.split('/').filter(Boolean);
   return parts[parts.length - 1] ?? p;
+}
+
+/** Quote one generated argument for the interactive shell command. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

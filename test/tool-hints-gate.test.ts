@@ -165,6 +165,12 @@ describe('signals — intent matching', () => {
     expect(collectSignals({ recentUserText: '최신 기사 찾아줘' }).intentResearch).toBe(true);
   });
 
+  test('recognizes an explicitly requested Linear issue action as ops-fleet intent', () => {
+    const signals = collectSignals({ recentUserText: '먼저 Linear 이슈를 생성하고, 그다음 시장을 여러 소스로 리서치해줘' });
+    expect(signals.intentOpsFleet).toBe(true);
+    expect(signals.intentLinearIssue).toBe(true);
+  });
+
   test('recognizes diagram intent (en + ko)', () => {
     expect(collectSignals({ recentUserText: 'draw a sequence diagram' }).intentDiagram).toBe(true);
     expect(collectSignals({ recentUserText: '다이어그램 만들어줘' }).intentDiagram).toBe(true);
@@ -371,6 +377,17 @@ describe('gate — model-family cap', () => {
     const signals = { ...bareSignals(), modelFamily: 'codex' as const };
     const decision = evaluateGate(catalog, [], signals);
     expect(decision.filtered.length).toBe(8);
+  });
+
+  test('explicit Linear issue action reserves the native tool inside the codex cap', () => {
+    const catalog = [
+      ...Array.from({ length: 12 }, (_, i) => mini({ id: `t${i}` })),
+      mini({ id: 'elanous_linear_issue' }),
+    ];
+    const signals = { ...bareSignals(), modelFamily: 'codex' as const, intentLinearIssue: true };
+    const decision = evaluateGate(catalog, [], signals);
+    expect(decision.filtered).toHaveLength(8);
+    expect(decision.filtered).toContain('elanous_linear_issue');
   });
 
   test('claude model does not cap', () => {

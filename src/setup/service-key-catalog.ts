@@ -4,6 +4,8 @@ export interface ServiceKeyCatalogEntry {
   label: string;
   kind: 'api-key' | 'subscription' | 'oauth' | 'cli' | 'local';
   envNames: readonly string[];
+  /** Secret-store IDs read by the runtime consumer for this service. */
+  storeIds?: readonly string[];
   setupUrl: string;
   usedBy: string;
   cost: 'account-plan' | 'usage-based' | 'plan-dependent' | 'local';
@@ -19,7 +21,7 @@ export const SERVICE_KEY_CATALOG: readonly ServiceKeyCatalogEntry[] = [
   { id: 'xai', label: 'xAI / Grok API', kind: 'api-key', envNames: ['XAI_API_KEY', 'GROK_API_KEY'], setupUrl: 'https://console.x.ai/', usedBy: '씬 2 흡수 · Grok API', cost: 'usage-based', verification: 'GET /v1/models · 상태 코드만', demoRequired: true },
   { id: 'tavily', label: 'Tavily', kind: 'api-key', envNames: ['TAVILY_API_KEY', 'TAVILY_KEY'], setupUrl: 'https://app.tavily.com/home', usedBy: '웹 검색 대체 경로', cost: 'usage-based', verification: 'POST /search · 상태 코드만', demoRequired: false },
   { id: 'openrouter', label: 'OpenRouter · GLM', kind: 'api-key', envNames: ['OPENROUTER_API_KEY'], setupUrl: 'https://openrouter.ai/keys', usedBy: 'GLM · OpenRouter 모델', cost: 'usage-based', verification: 'GET /api/v1/key · 상태 코드만', demoRequired: true },
-  { id: 'linear', label: 'Linear API', kind: 'api-key', envNames: ['LINEAR_API_KEY'], setupUrl: 'https://linear.app/settings/api', usedBy: '씬 2 능동 비서', cost: 'plan-dependent', verification: 'GraphQL viewer · 상태 코드만', demoRequired: true },
+  { id: 'linear', label: 'Linear API', kind: 'api-key', envNames: ['LINEAR_API_KEY'], storeIds: ['connector.linear.apiKey'], setupUrl: 'https://linear.app/settings/api', usedBy: '씬 2 능동 비서', cost: 'plan-dependent', verification: 'GraphQL viewer · 상태 코드만', demoRequired: true },
   { id: 'telegram', label: 'Telegram bot', kind: 'api-key', envNames: ['ELANOUS_TELEGRAM_BOT_TOKEN'], setupUrl: 'https://t.me/BotFather', usedBy: '씬 2 · 씬 3 채널', cost: 'local', verification: 'getMe · 상태 코드만', demoRequired: true },
   { id: 'telegram-chat', label: 'Telegram chat ID', kind: 'api-key', envNames: ['ELANOUS_TELEGRAM_CHAT_ID'], setupUrl: 'https://core.telegram.org/bots/features#botfather', usedBy: '데모 알림 대상', cost: 'local', verification: 'getChat · 상태 코드만 · 미발송', demoRequired: true },
   { id: 'google-workspace', label: 'Google Workspace', kind: 'oauth', envNames: [], setupUrl: 'https://developers.google.com/workspace/guides/get-started', usedBy: 'Gmail · Drive 커넥터', cost: 'account-plan', verification: '로그인 상태 확인 · 토큰 미표시', demoRequired: false },
@@ -41,6 +43,6 @@ export const SERVICE_KEY_CATALOG: readonly ServiceKeyCatalogEntry[] = [
 ] as const;
 
 export function renderServiceKeyCatalogMarkdown(): string {
-  const rows = SERVICE_KEY_CATALOG.map(item => `| ${item.id} | ${item.label} | ${item.kind} | ${item.envNames.join(', ') || '로그인/설치'} | ${item.setupUrl} | ${item.cost} | ${item.usedBy} | ${item.verification} | ${item.demoRequired ? '씬 사용' : '선택'} |`);
+  const rows = SERVICE_KEY_CATALOG.map(item => `| ${item.id} | ${item.label} | ${item.kind} | ${[...item.envNames, ...(item.storeIds ?? [])].join(', ') || '로그인/설치'} | ${item.setupUrl} | ${item.cost} | ${item.usedBy} | ${item.verification} | ${item.demoRequired ? '씬 사용' : '선택'} |`);
   return ['| id | 서비스 | 인증 | 환경 이름 | 설정 위치 | 비용 유형 | 사용처 | 최소 확인 | 판정 |', '|---|---|---|---|---|---|---|---|---|', ...rows].join('\n');
 }

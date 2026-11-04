@@ -1,7 +1,7 @@
 import { buildGitSnapshot } from '../git-fs/index.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { debug } from '../debug/log.js';
-import { isResearchAgentIntent } from '../tool-hints/signals.js';
+import { isOrderedNonResearchWorkflow, isResearchAgentIntent } from '../tool-hints/signals.js';
 import { resolve } from 'node:path';
 import type { ModelFamily } from '../models/prompts.js';
 import type { InputSourceKind, InputSourceRef } from '../input/input-source-kind.js';
@@ -1541,8 +1541,11 @@ export function resolveSessionSurfaceProfile(opts: {
   const text = String(opts.userText ?? '').toLowerCase();
   if (hasOpsFleetIntent(text)) return decision('ops-fleet/agent', 'ops-fleet-intent');
   if (hasOpsUiIntent(text)) return decision('ops-ui/agent', 'ops-ui-intent');
-  if (hasResearchSearchIntent(text)) return decision('research/agent', 'research-search-intent');
-  if (hasWebSearchIntent(text) || hasWebFetchIntent(text)) return decision('research/turn', 'web-search-or-fetch-intent');
+  const orderedNonResearchWorkflow = isOrderedNonResearchWorkflow(text);
+  if (!orderedNonResearchWorkflow && hasResearchSearchIntent(text)) return decision('research/agent', 'research-search-intent');
+  if (!orderedNonResearchWorkflow && (hasWebSearchIntent(text) || hasWebFetchIntent(text))) {
+    return decision('research/turn', 'web-search-or-fetch-intent');
+  }
   if (hasDevHarnessIntent(text)) return decision('coding/agent', 'dev-harness-intent');
   return decision('coding/turn', 'fallback-default');
 }
@@ -1761,6 +1764,7 @@ const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops', 'release-read'] as const;
 // ScheduleWakeup (H5) is a dashboard-only host tool — present only when the TUI registered it.
 const ESSENTIAL_HOST_EXTRA_NAMES = ['logs_query', 'ScheduleWakeup'] as const;
 const ESSENTIAL_RUNTIME_FAMILY_IDS = ['bash', 'run-shell', 'ops-ledger', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'] as const;
+const ESSENTIAL_RUNTIME_EXTRA_NAMES = ['tool_search'] as const;
 const ESSENTIAL_OPTIONAL_TOOL_NAMES = [
   'GetDashboardState',
   'TerminalModalList', 'TerminalModalObserve', 'TerminalModalFocus', 'TerminalModalDetach', 'TerminalModalKill',
@@ -1809,6 +1813,23 @@ function buildEssentialSessionRuntimeToolSpecs(opts: {
         .map(tool => tool.spec)
       : [];
   });
+  const runtimeExtras = ESSENTIAL_RUNTIME_EXTRA_NAMES
+    .map(name => runtimeById.get(name))
+    .filter((tool): tool is ToolRuntime<Record<string, unknown>, ToolRunResult> => !!tool)
+    .filter(tool => isToolAvailable(tool.spec.name, opts.toolAvailability))
+    .map(tool => tool.spec);
+  // Keep explicit external-service actions callable in the TUI. The catalog metadata, not a service-name list, defines this lane.
+  const explicitIntegrationSpecs = opts.runtimeTools
+    .filter(tool => {
+      const entry = findNativeTool(tool.id);
+      return entry?.host.includes('tui')
+        && entry.safety.includes('mutating')
+        && entry.safety.includes('network')
+        && entry.intentScope === 'ops-fleet'
+        && entry.alwaysLoad !== false;
+    })
+    .filter(tool => isToolAvailable(tool.spec.name, opts.toolAvailability))
+    .map(tool => tool.spec);
   // External MCP proxy runtimes are registered asynchronously by the TUI boot
   // path and carry both `mcp` and `tui` surfaces. They are intentionally not
   // part of the fixed built-in family allowlist above; include these explicit
@@ -1822,7 +1843,7 @@ function buildEssentialSessionRuntimeToolSpecs(opts: {
     .map(name => optionalByName.get(name))
     .filter((tool): tool is LLMToolSpec => !!tool)
     .filter(tool => isToolAvailable(tool.name, opts.toolAvailability));
-  return [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...mcpProxySpecs, ...optionalSpecs];
+  return [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...runtimeExtras, ...explicitIntegrationSpecs, ...mcpProxySpecs, ...optionalSpecs];
 }
 
 /** Build the full TUI-visible catalog for Agent children. The parent model's
@@ -1897,13 +1918,26 @@ export function buildSessionRuntimeToolSpecs(opts: {
     .map(name => hostByName.get(name))
     .filter((tool): tool is LLMToolDef => !!tool)
     .map(toSpec);
+  // classic dashboard turns use rich=false, whose essential catalog skips
+  // intent-based native selection. Preserve the explicitly registered
+  // Linear runtime there; put it first for ordered issue-then-research asks.
+  const linearIssueSpec = hasAny(normalizedIntentText, ['linear', '리니어'])
+    ? (opts.runtimeTools ?? []).find(tool => tool.id === 'elanous_linear_issue')?.spec
+    : undefined;
+  const orderedLinear = !!linearIssueSpec && isOrderedNonResearchWorkflow(opts.userText)
+    && hasAny(normalizedIntentText, ['linear', '리니어']);
   const droppedNames = new Set(['Edit', 'Write']);
   const dropWriteTools = hasDevHarnessIntent(opts.userText);
   const droppedWriteSpecs = dropWriteTools
     ? essentialSpecs.filter(spec => droppedNames.has(spec.name))
     : [];
   const finalSpecs: LLMToolSpec[] = [...new Map(
-    [...essentialSpecs, ...intentHostSpecs]
+    [
+      ...(orderedLinear && linearIssueSpec ? [linearIssueSpec] : []),
+      ...essentialSpecs,
+      ...intentHostSpecs,
+      ...(!orderedLinear && linearIssueSpec ? [linearIssueSpec] : []),
+    ]
       .filter(spec => !dropWriteTools || !droppedNames.has(spec.name))
       .map(spec => [spec.name, spec] as const),
   ).values()];
@@ -2753,6 +2787,14 @@ function isToolAvailable(
   const family = TOOL_NAME_TO_FAMILY.get(name);
   if (family?.isAvailable) return family.isAvailable(name);
   return true;
+}
+
+/** Filter a surface's candidate tool specs through the same availability gate used by the session catalog. */
+export function filterAvailableToolSpecs(
+  specs: readonly LLMToolSpec[],
+  overrides?: Readonly<Record<string, boolean>>,
+): LLMToolSpec[] {
+  return specs.filter(spec => isToolAvailable(spec.name, overrides));
 }
 
 function isNativeToolAvailable(

@@ -64,6 +64,31 @@ describe('named installed skill research routing', () => {
     expect(requestsNamedSkill(prompt, ['omni-crawl'])).toBe(expected);
   });
 
+  test('ordered Linear plus research uses the native issue tool and runs the research ladder', async () => {
+    const prompt = '먼저 Linear 이슈를 생성하고, 그다음 시장을 여러 소스로 리서치해줘';
+    let researchCalls = 0;
+    let firstTurnTools: string[] = [];
+    let toolChoice: unknown;
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, opts) => {
+      firstTurnTools = opts?.firstTurnTools?.map((candidate) => candidate.name) ?? [];
+      toolChoice = opts?.toolChoice;
+      await handlers.dispatchTool('elanous_linear_issue', { action: 'create' }, { callId: 'linear-call' });
+      return 'done';
+    });
+    const result = await runCoreTurn({
+      sessionId: 'ordered-linear-research',
+      messages: [{ role: 'user', content: prompt }],
+      tools: [{ ...tool, name: 'skill_exec' }, { ...tool, name: 'elanous_linear_issue' }, { ...tool, name: 'WebSearch' }],
+      dispatchTool: async (name) => name === 'elanous_linear_issue' ? { ok: true } : null,
+      signal,
+      userText: prompt,
+    }, { runResearch: async () => { researchCalls += 1; return { ok: true, output: 'mock evidence' }; } });
+    expect(firstTurnTools).toEqual(['elanous_linear_issue']);
+    expect(toolChoice).toEqual({ name: 'elanous_linear_issue' });
+    expect(researchCalls).toBe(1);
+    expect(result.stopReason).toBe('end_turn');
+  });
+
   test('the CEO original prompt bypasses the text-only research pre-answer when skill_exec is available', async () => {
     const prompt = 'omni crawl 로 grokbot 사용사례를 찾아주고 elanous 와 어떤 연계를 하면 될까요?';
     const statuses: string[] = [];

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { splitKeys, KeyStreamParser } from './tui.js';
+import { splitKeys, KeyStreamParser, sliceAnsiByColumns } from './tui.js';
 
 describe('raw terminal control keys', () => {
   test('LF is Ctrl+J, not Enter', () => {
@@ -22,6 +22,44 @@ describe('raw terminal control keys', () => {
       raw: '\x1b[200~a\nb\x1b[201~', paste: 'a\nb',
     }]);
   });
+});
+
+describe('modal-preserving terminal row updates', () => {
+  test('slices ANSI rows by visible columns and protects wide glyph edges', () => {
+    expect(sliceAnsiByColumns('\x1b[31mAB界CD\x1b[0m', 1, 4)).toBe('\x1b[31mB界\x1b[0m');
+    expect(sliceAnsiByColumns('A界B', 0, 2)).toBe('A ');
+  });
+
+  test('updates only the visible margins beneath an overlay in one render write', async () => {
+    const { code, stdout } = await runChild(`
+      const { render, resetRenderCache } = await import(${JSON.stringify(TUI_PATH)});
+      const chunks = [];
+      const write = process.stdout.write.bind(process.stdout);
+      process.stdout.rows = 3;
+      process.stdout.columns = 12;
+      process.stdout.write = (chunk) => { chunks.push(String(chunk)); return true; };
+      resetRenderCache();
+      render(['abcdefghijkl'], { force: true });
+      render(['ABCDEFGHIJKL'], {
+        force: true,
+        preserveBounds: { row: 1, col: 4, width: 4, height: 1 },
+        overlay: 'POPUP',
+      });
+      render(['ABCDEFGHIJKL'], { force: true });
+      process.stdout.write = write;
+      console.log(JSON.stringify(chunks.slice(1)));
+    `);
+
+    expect(code).toBe(0);
+    const [modalFrame, closedFrame] = JSON.parse(stdout.trim()) as string[];
+    expect(modalFrame).toContain('\x1b[1;1HABC');
+    expect(modalFrame).toContain('\x1b[1;8HHIJKL');
+    expect(modalFrame).toEndWith('POPUP');
+    expect(modalFrame).not.toContain('\x1b[1;1H\x1b[2K');
+    expect(modalFrame).not.toContain('\x1b[J');
+    expect(closedFrame).toContain('\x1b[J');
+    expect(closedFrame).toContain('\x1b[1;1H\x1b[2KABCDEFGHIJKL');
+  }, 10_000);
 });
 
 const REPO_ROOT = join(import.meta.dir, '..');

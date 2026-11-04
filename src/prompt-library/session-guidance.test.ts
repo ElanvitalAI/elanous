@@ -59,6 +59,26 @@ describe('aside browser guidance', () => {
   });
 });
 
+describe('ordered workflow planning guidance', () => {
+  test('names the active update_plan tool and preserves the user order', () => {
+    const content = buildSessionGuidanceAddendum(['Read', 'update_plan']).map(m => String(m.content)).join('\n');
+    expect(content).toContain('use `update_plan` with those steps in the same order before starting');
+    expect(content).toContain('begin with step one');
+    expect(content).not.toContain('`TaskCreate`');
+    const preamble = buildUniversalPreamble({ cwd, enabledTools: ['update_plan'] }).map(m => String(m.content)).join('\n');
+    expect(preamble).toContain('use `update_plan` with those steps in the same order before starting');
+  });
+
+  test('names TaskCreate when it is the active planning tool', () => {
+    const content = buildSessionGuidanceAddendum(['Read', 'TaskCreate']).map(m => String(m.content)).join('\n');
+    expect(content).toContain('use `TaskCreate` with those steps in the same order before starting');
+    const updatePlanAlias = buildSessionGuidanceAddendum(['UpdatePlan']).map(m => String(m.content)).join('\n');
+    expect(updatePlanAlias).toContain('use `UpdatePlan` with those steps in the same order before starting');
+    const taskCreateAlias = buildSessionGuidanceAddendum(['task_create']).map(m => String(m.content)).join('\n');
+    expect(taskCreateAlias).toContain('use `task_create` with those steps in the same order before starting');
+  });
+});
+
 // 재현 — ASIDE-TAB-REUSE 사고(10-22 22:5x · n8n 특강 세션 elanous-session-bif5y7).
 // 관측 원문: 매 단계 `Bash(aside repl "var p=await openTab('https://n8n.elanvitaloffice.com/workflow/4jRnAEWOSK9XvU68');…")`.
 // 일회성 `aside repl` 은 호출마다 새 세션이라 같은 탭이 쌓여 n8n «Editing in another tab» 잠금이 났다.

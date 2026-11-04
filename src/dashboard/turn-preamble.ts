@@ -47,6 +47,9 @@ import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js'
 import { buildSelfHealthLine, type InstalledRecord, type SelfHealthErrors } from '../pty-shell/tui-run-state.js';
 import type { PtyBuildIdentity } from '../pty-shell/pty-manifest.js';
 
+const TUI_INTEGRATION_TOOL_SELECTION_GUIDANCE =
+  'For one explicit action in an external service, choose the narrow direct-action integration tool over any secretary or multi-step workflow tool. Use a secretary or workflow tool only when the user asks for its multi-step workflow. If no matching integration tool is active, use `ToolSearch` before inspecting local plugin, config, or CLI files. When ToolSearch finds a matching tool, call it directly. Start `StartPluginWizard` only after ToolSearch finds no matching tool for the requested capability.';
+
 type UserConfig = ReturnType<typeof getUserConfig>;
 
 export interface DashboardTurnPreambleContext {
@@ -326,6 +329,7 @@ function buildDashboardTurnPreambleUnmeasured(
   const preamble: LLMMessage[] = [
     ...skillCatalogSystemMsgs,
     ...universalPreamble,
+    { role: 'system', content: TUI_INTEGRATION_TOOL_SELECTION_GUIDANCE },
     ...markCacheVolatile([
       ...seatBootSystemMsgs,
       ...planModeSystemMsgs,
@@ -340,6 +344,10 @@ function buildDashboardTurnPreambleUnmeasured(
       ...controllerSystemMsgs,
       ...implDisciplineSystemMsgs,
       ...concisenessSystemMsgs,
+      {
+        role: 'system' as const,
+        content: '## Response language\nAnswer entirely in the primary natural language of the user’s latest message. Determine it from the user’s grammar and request, not from quoted text, proper nouns, or isolated foreign words. For a Korean request containing Japanese or other foreign text, answer in Korean. Preserve foreign names, quotes, and tool names as written without switching the response language.',
+      },
     ]),
   ];
   // Capture exactly what the ACP path's getPreamble emits so we can

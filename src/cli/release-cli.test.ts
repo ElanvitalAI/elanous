@@ -20,7 +20,7 @@ import { releaseLedgerRoot } from '../instance/resolve.js';
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
-import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
+import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
 import { simInProcessCli } from '../ux-sim/in-process-cli.js';
@@ -2169,6 +2169,25 @@ function stateOk(a: readonly string[]): { status: number; stdout: string; stderr
 const notesCurl = (a: readonly string[], code = '200') => (a.includes('-w') ? { status: 0, stdout: code, stderr: '' } : null);
 
 describe('release verify — 공개 주소로 끝까지', () => {
+  test('prepare와 verify의 로컬 설치기는 명시적 동의 --yes를 전달한다', async () => {
+    const calls: Array<{ command: string; args: readonly string[]; input?: string }> = [];
+    const runner: Runner = (command, args, _cwd, options) => {
+      calls.push({ command, args, input: options?.input });
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    runReleaseInstaller('local installer', '/tmp/prepare-home', {}, runner);
+    expect(calls[0]).toEqual({ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path'], input: 'local installer' });
+
+    const verifyCalls: Array<{ command: string; args: readonly string[] }> = [];
+    const verifyRunner: Runner = (command, args) => {
+      verifyCalls.push({ command, args });
+      if (command === 'curl') return notesCurl(args) ?? { status: 0, stdout: 'installer', stderr: '' };
+      return args[0] === '--version' ? { status: 0, stdout: '0.1.1 abc', stderr: '' } : stateOk(args);
+    };
+    await verifyRelease({ version: '0.1.1', log: () => {} }, verifyRunner);
+    expect(verifyCalls.find((call) => call.command === 'bash')).toEqual({ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path'] });
+  });
+
   test('고정 버전이면 download/v<버전> 설치기를 받고, --version 이 그 버전으로 시작해야 ok', async () => {
     const urls: string[] = [];
     const run: Runner = (c, a) => {

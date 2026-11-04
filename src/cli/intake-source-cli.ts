@@ -14,17 +14,21 @@ export function registerIntakeSourceCommands(intake: Command, root: () => string
   const fail = (error: unknown) => { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 2; };
   source.command('add')
     .requiredOption('--seat <id>', '자리 id 또는 별칭')
-    .requiredOption('--kind <kind>', 'github-query | rss | command | topic-search')
+    .requiredOption('--kind <kind>', 'github-query | rss | command | topic-search | markdown')
     .requiredOption('--spec <spec>', 'GitHub 질의 · 피드 URL · 명령')
     .requiredOption('--every <cadence>', 'Nh | Nd | Nw')
     .option('--until <date>', '만료 시작 날짜 YYYY-MM-DD (UTC)')
     .option('--why <reason>', '등록 이유')
     .option('--id <id>', '원천 id')
-    .option('--linear-issue-id <uuid>', 'topic-search parent Linear issue UUID')
+    .option('--linear-issue-id <uuid>', 'topic-search/markdown parent Linear issue UUID')
+    .option('--briefing-topic <label>', 'issue briefing display label')
     .option('--schedule-cron <expression>', 'topic-search schedule registry cron (e.g. 0 8 * * 1)')
-    .option('--telegram-dry-run-file <path>', 'Telegram 브리핑 본문을 이 파일에 기록하고 실제 발송은 하지 않음 (topic-search)')
-    .action(async (opts: { seat: string; kind: string; spec: string; every: string; until?: string; why?: string; id?: string; linearIssueId?: string; scheduleCron?: string; telegramDryRunFile?: string }) => {
+    .option('--telegram-dry-run-file <path>', 'topic-search 즉시 투영 본문을 이 파일에 기록하고 실제 발송은 하지 않음')
+    .action(async (opts: { seat: string; kind: string; spec: string; every: string; until?: string; why?: string; id?: string; linearIssueId?: string; briefingTopic?: string; scheduleCron?: string; telegramDryRunFile?: string }) => {
       try {
+        if (opts.telegramDryRunFile && opts.kind !== 'topic-search') {
+          throw new Error('--telegram-dry-run-file 은 topic-search add 에서만 사용한다; markdown 은 run-due 때 지정한다');
+        }
         if (opts.kind === 'topic-search') {
           if (!opts.linearIssueId || !opts.scheduleCron) throw new Error('topic-search 는 --linear-issue-id 와 --schedule-cron 이 필요하다');
           const telegramDryRunFile = opts.telegramDryRunFile ? resolve(opts.telegramDryRunFile) : undefined;
@@ -40,6 +44,7 @@ export function registerIntakeSourceCommands(intake: Command, root: () => string
         const added = addSource({ id: opts.id ?? `src-${randomUUID().slice(0, 8)}`, seat: opts.seat, kind: opts.kind as SourceKind,
           spec: opts.spec, every: opts.every, ...(opts.until ? { until: opts.until } : {}), ...(opts.why ? { why: opts.why } : {}),
           ...(opts.linearIssueId ? { linearIssueId: opts.linearIssueId } : {}),
+          ...(opts.briefingTopic ? { briefingTopic: opts.briefingTopic } : {}),
           ...(opts.scheduleCron ? { scheduleCron: opts.scheduleCron } : {}) }, root());
         console.log(`${added.id}  ${added.seat}  ${added.kind}  ${added.every}`);
       } catch (error) { fail(error); }

@@ -56,6 +56,10 @@ test('anonymous setup claim validates JSON and t before consuming the one-use li
   expect(claimed.bearer).toMatch(/^elsb_[A-Za-z0-9_-]{43}$/);
   expect(claimed.expiresAt).toBe(new Date(Date.parse(claimed.expiresAt)).toISOString());
   expect(matchSetupBearer(claimed.bearer)).toEqual({ expiresAt: claimed.expiresAt });
+  const runs = await fetch(url + '/v1/harness/runs', {
+    headers: { authorization: 'Bearer ' + claimed.bearer, 'sec-fetch-site': 'cross-site' },
+  });
+  expect(runs.status).toBe(200);
   const reused = await post(url, JSON.stringify({ t: token }));
   expect(reused.status).toBe(401);
   expect(await reused.json()).toEqual({ error: 'used' });

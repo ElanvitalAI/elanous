@@ -43,9 +43,10 @@ describe('projectRunLedgerSteps', () => {
   });
 
   test('requires both decider and reason for each structural change without dropping valid siblings', () => {
-    for (const event of ['node-added', 'edge-rerouted', 'unit-expanded', 'unit-collapsed']) {
+    for (const event of ['node-added', 'edge-rerouted', 'priority-changed', 'unit-expanded', 'unit-collapsed']) {
       const fields: Record<string, unknown> = event === 'node-added' ? { node: 'n', kind: 'agent' }
         : event === 'edge-rerouted' ? { from: 'a', outcome: 'fail', to: 'b', was: 'c' }
+          : event === 'priority-changed' ? { node: 'n', from: 2, to: 1 }
           : event === 'unit-expanded' ? { node: 'n', unit: 'u@1', childRunId: 'child', resolution: 1 }
             : { node: 'n', resolution: 0 };
       for (const missing of ['decider', 'reason']) {

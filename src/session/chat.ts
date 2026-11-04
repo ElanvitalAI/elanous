@@ -12,6 +12,7 @@
 // path is untouched — wiring that in is follow-up work the user can
 // approve separately (lots of UI surface; one bug = broken dashboard).
 
+import { randomUUID } from 'node:crypto';
 import {
   createSession, appendMessage, loadSession,
   type SessionMeta, type SerializedMessage, type CreateSessionOpts,
@@ -551,6 +552,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       }
       const coreCtx: CoreTurnContext = {
         sessionId: opts.sessionId,
+        ...(armResearchTurn ? { runId: randomUUID() } : {}),
         // ⭐ 이 턴의 «사람 문장» 운반자. 없으면 표면 판정이 늘 기본값으로 떨어진다
         //   (골 루프가 라운드 사이에 기계 문장을 밀어 넣기 때문 — run-goal-loop.ts 진입 주석).
         userText: opts.userText,

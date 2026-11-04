@@ -43,6 +43,42 @@ test('replays traversal graphEvents by adding a runtime node and replacing its a
   ]));
 });
 
+test('research follow-up reroutes the declared gap edge through the live follow-up node', () => {
+  const research: RunGraphDetail = {
+    id: 'natural-language-research', source: 'core', editable: false,
+    entry_node: 'question-plan', terminal_nodes: ['synthesis'],
+    nodes: [
+      { node_id: 'question-plan', kind: 'agent', recipe: 'planner', max_visits: 1 },
+      { node_id: 'axes', kind: 'agent', recipe: 'axes', max_visits: 1 },
+      { node_id: 'evidence-check', kind: 'gate', recipe: 'check', max_visits: 1 },
+      { node_id: 'followup', kind: 'agent', recipe: 'followup', max_visits: 1 },
+      { node_id: 'synthesis', kind: 'agent', recipe: 'synthesis', max_visits: 1 },
+    ],
+    edges: [
+      { from: 'question-plan', to: 'axes' }, { from: 'axes', to: 'evidence-check' },
+      { from: 'evidence-check', on: 'outcome', map: { complete: 'synthesis', gap: 'synthesis' } },
+    ],
+  };
+  const replayed = applyRunGraphEvents(research, [
+    { seq: 1, ts: '2026-11-04T00:00:00.000Z', type: 'node-added', node: 'followup-q5', kind: 'research', decider: 'research-runtime', reason: 'missing output section' },
+    { seq: 2, ts: '2026-11-04T00:00:00.500Z', type: 'node-added', node: 'followup-q6', kind: 'research', decider: 'research-runtime', reason: 'missing output section' },
+    { seq: 3, ts: '2026-11-04T00:00:01.000Z', type: 'edge-rerouted', from: 'evidence-check', outcome: 'gap', was: 'synthesis', to: 'followup', decider: 'research-runtime', reason: 'missing output section' },
+    { seq: 4, ts: '2026-11-04T00:00:01.500Z', type: 'edge-rerouted', from: 'followup', outcome: 'q5', was: '$absent', to: 'followup-q5', decider: 'research-runtime', reason: 'parallel follow-up fanout' },
+    { seq: 5, ts: '2026-11-04T00:00:02.000Z', type: 'edge-rerouted', from: 'followup', outcome: 'q6', was: '$absent', to: 'followup-q6', decider: 'research-runtime', reason: 'parallel follow-up fanout' },
+    { seq: 6, ts: '2026-11-04T00:00:02.250Z', type: 'edge-rerouted', from: 'followup-q5', outcome: '$default', was: '$absent', to: 'synthesis', decider: 'research-runtime', reason: 'return to synthesis' },
+    { seq: 7, ts: '2026-11-04T00:00:02.500Z', type: 'edge-rerouted', from: 'followup-q6', outcome: '$default', was: '$absent', to: 'synthesis', decider: 'research-runtime', reason: 'return to synthesis' },
+  ]);
+  expect(replayed.edges.find((edge) => edge.from === 'evidence-check')?.map).toEqual({ complete: 'synthesis', gap: 'followup' });
+  expect(replayed.nodes.some((node) => node.node_id === 'followup-q5')).toBe(true);
+  expect(runGraphToFlow(replayed).edges).toEqual(expect.arrayContaining([
+    expect.objectContaining({ source: 'evidence-check', target: 'followup' }),
+    expect.objectContaining({ source: 'followup', target: 'followup-q5' }),
+    expect.objectContaining({ source: 'followup', target: 'followup-q6' }),
+    expect.objectContaining({ source: 'followup-q5', target: 'synthesis' }),
+    expect.objectContaining({ source: 'followup-q6', target: 'synthesis' }),
+  ]));
+});
+
 test('scenario injection provenance is retained for both declared B/C nodes', () => {
   const withScenes: RunGraphDetail = {
     ...graph,

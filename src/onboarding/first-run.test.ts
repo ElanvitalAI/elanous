@@ -630,7 +630,7 @@ describe('first run', () => {
       // 대시보드 진입을 보는 시험이므로 PTY 크기를 먼저 고정한다.
       const processChild = spawn('sh', ['-c', 'script -q -e -c "$1" /dev/null', 'sh',
         `stty rows 40 cols 120; exec ${process.execPath} ${resolve(import.meta.dir, '../../bin/elanous.mjs')} --test --config-dir ${configDir}`],
-        { cwd: resolve(import.meta.dir, '../..'), env, stdio: ['pipe', 'pipe', 'pipe'] });
+        { cwd: resolve(import.meta.dir, '../..'), env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
       let stdout = '';
       let stderr = '';
       let sentQuit = false;
@@ -643,7 +643,13 @@ describe('first run', () => {
       });
       processChild.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
       let timedOut = false;
-      const timeout = setTimeout(() => { timedOut = true; processChild.kill('SIGTERM'); }, 45000);
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        // Killing only the shell leaves `script`/Bun holding the pipes open,
+        // so the test runner times out before it can report the startup miss.
+        try { if (processChild.pid) process.kill(-processChild.pid, 'SIGTERM'); }
+        catch { processChild.kill('SIGTERM'); }
+      }, 45000);
       const status = await new Promise<number | null>((resolve, reject) => {
         processChild.once('error', reject);
         processChild.once('close', (code) => resolve(code));

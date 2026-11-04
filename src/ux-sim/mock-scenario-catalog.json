@@ -985,7 +985,7 @@
         "src/ux-sim/classic-tui-seat-scenarios.test.ts",
         "src/ux-sim/next-tui-seat-scenarios.test.ts"
       ],
-      "target": "first-run, authoring, scripted TUI flows, and persisted same-build seminar freeze state",
+      "target": "first-run, authoring, scripted TUI flows, persisted same-build seminar freeze state, and first-screen noise regression through a real isolated PTY",
       "inputs": [
         "mock author response",
         "scenario steps",
@@ -993,7 +993,8 @@
         "build identifier",
         "three consecutive rehearsal verdicts",
         "owner approval receipt",
-        "private simulation world"
+        "private simulation world",
+        "first-run Enter skip"
       ],
       "observations": [
         "step result",
@@ -1002,7 +1003,11 @@
         "persisted same-build pass count",
         "frozen state after the third pass",
         "changed build rejected before rehearsal without owner approval",
-        "approved build transition and owner receipt"
+        "approved build transition and owner receipt",
+        "internal prompt-bank event absent from the screen",
+        "daemon setup command absent from the screen",
+        "human web setup guidance visible",
+        "Doctor start event absent after Enter skip"
       ],
       "entryCommands": [
         "bun test src/ux-sim/mock-authoring-first-run.test.ts src/ux-sim/seminar-rehearsal.test.ts src/ux-sim/classic-tui-seat-scenarios.test.ts src/ux-sim/next-tui-seat-scenarios.test.ts"

@@ -53,6 +53,20 @@ async function runBin(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ st
   return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', status: r.status };
 }
 
+test('disabled first-run Doctor probe leaves CLI entry bytes unchanged', async () => {
+  const key = 'ELANOUS_TEST_FIRSTRUN_DOCTOR_PROBE';
+  const inherited = process.env[key];
+  delete process.env[key];
+  try {
+    const withoutFlag = await runBin(['--help'], { NODE_ENV: 'test' });
+    const explicitlyOff = await runBin(['--help'], { NODE_ENV: 'test', [key]: '0' });
+    expect(explicitlyOff).toEqual(withoutFlag);
+  } finally {
+    if (inherited === undefined) delete process.env[key];
+    else process.env[key] = inherited;
+  }
+}, 180_000);
+
 // ⚠️ 실물 spawn 은 모듈 그래프가 커서 1회 ~7초다(실측). bun test 기본 5초로는
 //    **타임아웃이 곧 0바이트**라 죽은 엔트리와 구분이 안 된다 — 명시 상향한다.
 const SPAWN_TIMEOUT_MS = 120_000;

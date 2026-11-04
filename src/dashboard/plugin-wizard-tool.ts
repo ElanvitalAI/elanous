@@ -17,11 +17,21 @@ export interface TuiPluginWizardTool {
   dispatchTool(name: string, args: unknown, context?: ClassicSidetabMissionDispatchContext): Promise<unknown> | undefined;
 }
 
+export interface TuiPluginWizardToolOptions {
+  createId?: () => string;
+  findAvailableTools?: (capability: string) => readonly string[];
+}
+
 /** Add a non-blocking TUI entry point; the injected host runs the shared task/plugin-wizard path. */
-export function createTuiPluginWizardTool(start: (request: TuiPluginWizardRequest) => Promise<void>, createId: () => string = randomUUID): TuiPluginWizardTool {
+export function createTuiPluginWizardTool(
+  start: (request: TuiPluginWizardRequest) => Promise<void>,
+  createIdOrOptions: (() => string) | TuiPluginWizardToolOptions = randomUUID,
+): TuiPluginWizardTool {
+  const createId = typeof createIdOrOptions === 'function' ? createIdOrOptions : createIdOrOptions.createId ?? randomUUID;
+  const findAvailableTools = typeof createIdOrOptions === 'function' ? undefined : createIdOrOptions.findAvailableTools;
   const spec: LLMToolSpec = {
     name: TUI_PLUGIN_WIZARD_TOOL_NAME,
-    description: 'When a needed capability is missing, start the plugin wizard in this TUI session. It asks a short question, searches trusted plugins, and if needed launches the visible Codex and Claude side-tab pair. Returns a run ID immediately; check the task notification for completion.',
+    description: 'Only when ToolSearch confirms no available tool can perform the requested capability, start the plugin wizard in this TUI session. If a matching tool is found, call that tool instead. The wizard asks a short question, searches trusted plugins, and if needed launches the visible Codex and Claude side-tab pair. Returns a run ID immediately; check the task notification for completion.',
     parameters: {
       type: 'object',
       properties: {
@@ -44,6 +54,10 @@ export function createTuiPluginWizardTool(start: (request: TuiPluginWizardReques
       const mission = typeof input.mission === 'string' ? input.mission.trim() : '';
       const missing = typeof input.missing === 'string' ? input.missing.trim() : '';
       if (!mission || !missing) return Promise.resolve(output('error', 'mission and missing capability are required'));
+      const matches = findAvailableTools?.(missing) ?? [];
+      if (matches.length > 0) {
+        return Promise.resolve(output('error', `Plugin wizard was not started: ToolSearch found matching available tool(s): ${matches.join(', ')}. Call a matching tool directly to complete the request.`));
+      }
       const runId = createId();
       void Promise.resolve().then(() => start({ runId, mission, missing, ...(context ? { context } : {}) })).catch((error) => {
         try { debug.log('plugin-wizard.tool', 'start-failed', { runId, reason: error instanceof Error ? error.message : String(error) }, { level: 'error' }); }

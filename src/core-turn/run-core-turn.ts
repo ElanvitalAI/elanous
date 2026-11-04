@@ -25,7 +25,7 @@ import { drainPendingUserInput } from '../session/pending-input.js';
 import type { StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
 import { applyDeferredTools } from '../session-runtime/tier-flip.js';
-import { isResearchAgentIntent } from '../tool-hints/signals.js';
+import { isOrderedLinearIssueStep, isOrderedLinearResearchWorkflow, isOrderedNonResearchWorkflow, isResearchAgentIntent } from '../tool-hints/signals.js';
 import { buildResearchDateSystemMessage, resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import { ensureResearchAnswerHasSourceUrl } from '../research/evidence-attribution.js';
 import {
@@ -167,6 +167,14 @@ export interface RunCoreTurnOptions {
   timers?: { setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>; clearTimeout(handle: ReturnType<typeof setTimeout>): void };
   firstReplyBudgetMs?: number;
   researchWallClockBudgetMs?: number;
+  /** Injectable lower-level runner for core/live-run integration tests; production uses the lazy-loaded research ladder. */
+  researchQuestionLadderRunner?: (
+    request: string,
+    options: import('../auto-research/research-turn.js').ResearchQuestionLadderRunOptions,
+  ) => Promise<import('../auto-research/research-turn.js').ResearchGroundingResult>;
+  researchRunObserverFactory?: (
+    runId: string,
+  ) => import('../nexus/api/research-run-observer.js').ResearchRunObserver;
   runResearch?: (
     request: string,
     signal: AbortSignal,
@@ -320,6 +328,15 @@ export async function runCoreTurn(
       debug.log('session.link', 'core-turn', { parentSessionId: ctx.originSessionId, childSessionId: ctx.sessionId });
     });
   }
+  let researchRunObserver: import('../nexus/api/research-run-observer.js').ResearchRunObserver | undefined;
+  let researchSynthesisStarted = false;
+  let researchSynthesisOutcome = 'failed';
+  let researchRunOutcome: 'completed' | 'failed' = 'failed';
+  const beginResearchSynthesis = (): void => {
+    if (!researchRunObserver || researchSynthesisStarted) return;
+    researchSynthesisStarted = true;
+    researchRunObserver.event({ type: 'enter', node: 'synthesis' });
+  };
   return withAmbientSessionScope(ctx.sessionId, async () => {
     if (ctx.signal.aborted) {
       return { stopReason: 'aborted', finalText: '' };
@@ -336,6 +353,9 @@ export async function runCoreTurn(
     let researchToolCallCount = 0;
     let researchAxisCount = 0;
     let researchStopReason: string | undefined;
+    let orderedLinearIssueStep = false;
+    let orderedLinearResearchWorkflow = false;
+    let releaseOrderedLinearResearch: (() => void) | undefined;
     const loggedResearchStops = new Set<string>();
     const logResearchStop = (reason: string, extra: Record<string, unknown> = {}): void => {
       if (loggedResearchStops.has(reason)) return;
@@ -463,6 +483,7 @@ export async function runCoreTurn(
         success = true;
         return result;
       } finally {
+        if (orderedLinearResearchWorkflow && name === 'elanous_linear_issue') releaseOrderedLinearResearch?.();
         if (name === 'Agent' && enforceResearchToolAllowlist) {
           debug.log('research.turn', 'subagent-completed', {
             sessionId: ctx.sessionId,
@@ -542,7 +563,11 @@ export async function runCoreTurn(
   const surface = ctx.surfaceProfile ?? resolveSessionSurfaceProfile({ userText: surfaceUserText });
   // Use the shared #31663 research-intent verdict. Surface labels are a
   // presentation/routing result and may remain `chat` for a research turn.
-  const researchTurn = isResearchAgentIntent(surfaceUserText);
+  orderedLinearIssueStep = isOrderedLinearIssueStep(surfaceUserText)
+    && ctx.tools.some((tool) => tool.name === 'elanous_linear_issue');
+  orderedLinearResearchWorkflow = orderedLinearIssueStep && isOrderedLinearResearchWorkflow(surfaceUserText);
+  const researchTurn = isResearchAgentIntent(surfaceUserText)
+    && (!isOrderedNonResearchWorkflow(surfaceUserText) || orderedLinearResearchWorkflow);
   const { selectDeepBloom } = await import('./deep-turn-bloom.js');
   const deepBloomDecision = selectDeepBloom(surfaceUserText, {
     researchIntent: researchTurn,
@@ -565,7 +590,8 @@ export async function runCoreTurn(
   const namedSkillRequest = requestsNamedSkill(surfaceUserText, installedSkillNames);
   // A named skill only skips the research prepass when its executor is active.
   const explicitSkillToolRequest = namedSkillRequest
-    && tieredTools.some((tool) => tool.name === 'skill_exec');
+    && tieredTools.some((tool) => tool.name === 'skill_exec')
+    && !orderedLinearResearchWorkflow;
   const constrainDeepNonResearchTools = deepBloomDecision.apply && !researchTurn;
   // ToolSearch routes against the surface's full live pool, so hiding a tool
   // from the model alone is insufficient. Remove the summoner from the
@@ -586,12 +612,17 @@ export async function runCoreTurn(
     });
   }
   enforceResearchToolBudget = researchTurn;
-  enforceResearchToolAllowlist = researchTurn && !namedSkillRequest;
+  enforceResearchToolAllowlist = researchTurn && !namedSkillRequest && !orderedLinearIssueStep;
   enforceResearchDocumentWrite = enforceResearchToolAllowlist && requestsResearchDocumentWrite(surfaceUserText);
   // Codex Responses only supports tool_choice="required" (not a named
   // function choice). Make the first request deterministic by exposing only
   // skill_exec there; streamLLMWithTools restores the full pool on later turns.
-  const routedSkillTools = explicitSkillToolRequest
+  const routedLinearTool = orderedLinearIssueStep
+    ? bloomFilteredTools.find((tool) => tool.name === 'elanous_linear_issue')
+    : undefined;
+  const routedSkillTools = routedLinearTool
+    ? [routedLinearTool]
+    : explicitSkillToolRequest
     ? bloomFilteredTools.filter((tool) => tool.name === 'skill_exec')
     : [];
   const tools = enforceResearchToolAllowlist
@@ -599,6 +630,11 @@ export async function runCoreTurn(
     : bloomFilteredTools;
   // Preserve the ordinary pool if a later filter removes the executor.
   const firstTurnTools = routedSkillTools.length > 0 ? routedSkillTools : undefined;
+  // Keep the forced first-turn target in the model-visible pool too. The
+  // research allowlist and toolChoice must never describe different sets.
+  const turnTools = firstTurnTools
+    ? [...firstTurnTools, ...tools.filter((tool) => !firstTurnTools.some((first) => first.name === tool.name))]
+    : tools;
   const maxToolTurns = researchTurn
     ? Math.min(ctx.maxToolTurns ?? RESEARCH_TURN_MAX_TOOL_TURNS, RESEARCH_TURN_MAX_TOOL_TURNS)
     : ctx.maxToolTurns;
@@ -678,6 +714,9 @@ export async function runCoreTurn(
       try { ctx.callbacks?.onStatus?.(plan); } catch { /* UI feedback is fail-soft. */ }
     }
     if (researchTurn && surfaceUserText?.trim() && !explicitSkillToolRequest) {
+      const orderedResearchGate = orderedLinearResearchWorkflow
+        ? new Promise<void>((resolve) => { releaseOrderedLinearResearch = resolve; })
+        : undefined;
       turnStartedAt = now();
       researchStartedAt = turnStartedAt;
       debug.log('research.turn', 'tui-research-started', {
@@ -714,16 +753,38 @@ export async function runCoreTurn(
       }
       researchResultPromise = (async () => {
         try {
+          if (orderedResearchGate) {
+            await Promise.race([orderedResearchGate, new Promise<void>((resolve) => {
+              researchController.signal.addEventListener('abort', () => resolve(), { once: true });
+            })]);
+            if (researchController.signal.aborted) return null;
+          }
+          if (!options.runResearch && ctx.runId) {
+            try {
+              researchRunObserver = options.researchRunObserverFactory
+                ? options.researchRunObserverFactory(ctx.runId)
+                : (await import('../nexus/api/research-run-observer.js')).registerResearchRun(ctx.runId);
+            }
+            catch (error) {
+              debug.log('research.turn', 'nexus-run-registration-failed', {
+                runId: ctx.runId, reason: error instanceof Error ? error.message : String(error),
+              }, { level: 'warn' });
+            }
+          }
           const work = (options.runResearch ?? (async (request, signal, admitToolCall, providerRouting) => {
             // Keep the Bloom/skill pipeline out of ordinary and packaged TUI startup graphs.
             const { researchTurnForGrounding, runResearchQuestionLadder } = await import('../auto-research/research-turn.js');
-            return researchTurnForGrounding(await runResearchQuestionLadder(request, {
+            const researchOptions = {
               ...providerRouting,
+              ...(ctx.runId ? { runId: ctx.runId } : {}),
+              onGraphEvent: researchRunObserver?.event,
               signal, admitToolCall, allowPartialOnAbort: true, allowOutputSkill: false,
               deadlineMs: deepBloomDecision.apply
                 ? RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS
                 : Math.min(RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS, Math.max(1, researchWallClockBudgetMs - 1)),
-            }));
+            } satisfies import('../auto-research/research-turn.js').ResearchQuestionLadderRunOptions;
+            if (options.researchQuestionLadderRunner) return options.researchQuestionLadderRunner(request, researchOptions);
+            return researchTurnForGrounding(await runResearchQuestionLadder(request, researchOptions));
           }))(surfaceUserText, researchController.signal, admitResearchToolCall, {
             ...(ctx.initialProvider ? { initialProvider: ctx.initialProvider } : {}),
             ...(ctx.skipProviders ? { skipProviders: ctx.skipProviders } : {}),
@@ -761,11 +822,11 @@ export async function runCoreTurn(
         }
       })();
     }
-    const streamOptions = (turnTools: typeof tools, signal: AbortSignal = ctx.signal) => ({
-      tools: turnTools,
+    const streamOptions = (availableTools: typeof tools, signal: AbortSignal = ctx.signal) => ({
+      tools: availableTools,
       ...(firstTurnTools ? { firstTurnTools } : {}),
       researchTurn,
-      ...(firstTurnTools ? { toolChoice: { name: 'skill_exec' } } : {}),
+      ...(firstTurnTools?.[0] ? { toolChoice: { name: firstTurnTools[0].name } } : {}),
       signal,
       ...(ctx.requestSizeGuard ? { requestSizeGuard: ctx.requestSizeGuard } : {}),
       ...(ctx.reasoningEffort !== undefined ? { reasoningEffort: ctx.reasoningEffort } : {}),
@@ -865,7 +926,7 @@ export async function runCoreTurn(
           firstReplyTimer = timers.setTimeout(() => resolve({ timedOut: true }), firstReplyBudgetMs);
         });
         try {
-          const firstPass = streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(tools, firstPassController.signal))
+          const firstPass = streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(turnTools, firstPassController.signal))
             .then(text => ({ timedOut: false as const, text }));
           const outcome = await Promise.race([firstPass, deadline]);
           if (outcome.timedOut) {
@@ -884,7 +945,7 @@ export async function runCoreTurn(
           ctx.signal.removeEventListener('abort', abortFirstPassFromParent);
         }
       } else {
-        finalText = await streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(tools));
+        finalText = await streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(turnTools));
       }
       if (researchResultPromise && firstPassStartedAt !== undefined) {
         debug.log('research.turn', 'first-pass-answer-ready', {
@@ -911,6 +972,7 @@ export async function runCoreTurn(
           commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
           return { stopReason: 'aborted', finalText };
         }
+        beginResearchSynthesis();
         const forcedSynthesis = researchStopReason === 'wall-clock-budget' || researchStopReason === 'tool-budget';
         const hasUsableResearch = Boolean(result?.output.trim())
           && (result?.ok === true || result?.error === RESEARCH_TURN_DEADLINE_STOP_ERROR);
@@ -947,6 +1009,8 @@ export async function runCoreTurn(
             }
             finalText = ensureResearchAnswerHasSourceUrl(synthesizedText || staged.text() || provisionalText, result.sourceUrls ?? []);
             accumulatedText = finalText;
+            researchSynthesisOutcome = 'ok';
+            if (result.ok) researchRunOutcome = 'completed';
             debug.log('research.turn', 'synthesis-completed', {
               sessionId: ctx.sessionId,
               elapsedMs: now() - synthesisStartedAt,
@@ -959,14 +1023,16 @@ export async function runCoreTurn(
           } catch (error) {
             commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
             const stopReason = classifyStopReason(error, ctx.signal);
-            if (stopReason === 'aborted') return { stopReason, finalText: provisionalText };
+            if (stopReason === 'aborted') { researchSynthesisOutcome = 'aborted'; researchRunOutcome = 'failed'; return { stopReason, finalText: provisionalText }; }
             if (stopReason === 'auth_rejected') {
+              researchSynthesisOutcome = 'failed'; researchRunOutcome = 'failed';
               return {
                 stopReason,
                 finalText: provisionalText,
                 errorMessage: redactSecretText(error instanceof Error ? error.message : String(error)),
               };
             }
+            researchSynthesisOutcome = 'fallback';
             try { ctx.callbacks?.onStatus?.('근거 반영에 실패해 첫 답변을 유지합니다.'); } catch { /* UI feedback is fail-soft. */ }
             return { stopReason: 'end_turn', finalText: provisionalText, ...(handlers.onTurnComplete ? { finalPhaseAnswer } : {}) };
           }
@@ -993,19 +1059,23 @@ export async function runCoreTurn(
             }
             finalText = ensureResearchAnswerHasSourceUrl(fallbackText || staged.text() || provisionalText, result?.sourceUrls ?? []);
             accumulatedText = finalText;
+            researchSynthesisOutcome = 'ok';
+            if (result?.ok) researchRunOutcome = 'completed';
             commitSynthesizedTurn(staged, provisionalTurnMessages, handlers, finalText, provisionalText,
               value => { finalPhaseAnswer = value; }, ctx.callbacks?.onReplaceText);
           } catch (error) {
             commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
             const stopReason = classifyStopReason(error, ctx.signal);
-            if (stopReason === 'aborted') return { stopReason, finalText: provisionalText };
+            if (stopReason === 'aborted') { researchSynthesisOutcome = 'aborted'; researchRunOutcome = 'failed'; return { stopReason, finalText: provisionalText }; }
             if (stopReason === 'auth_rejected') {
+              researchSynthesisOutcome = 'failed'; researchRunOutcome = 'failed';
               return {
                 stopReason,
                 finalText: provisionalText,
                 errorMessage: redactSecretText(error instanceof Error ? error.message : String(error)),
               };
             }
+            researchSynthesisOutcome = 'fallback';
             try { ctx.callbacks?.onStatus?.('도구 fallback이 실패해 첫 답변을 유지합니다.'); } catch { /* UI feedback is fail-soft. */ }
             return { stopReason: 'end_turn', finalText: provisionalText, ...(handlers.onTurnComplete ? { finalPhaseAnswer } : {}) };
           }
@@ -1013,6 +1083,8 @@ export async function runCoreTurn(
           const lastAssistant = [...provisionalTurnMessages].reverse().find(message => message.role === 'assistant');
           finalPhaseAnswer = lastAssistant?.phase === 'final_answer';
           ctx.callbacks.onTurnComplete(provisionalTurnMessages);
+          researchSynthesisOutcome = 'ok';
+          if (result?.ok) researchRunOutcome = 'completed';
         }
       }
       try {
@@ -1030,6 +1102,7 @@ export async function runCoreTurn(
       };
     } catch (err) {
       const stopReason = classifyStopReason(err, ctx.signal);
+      researchRunOutcome = stopReason === 'end_turn' ? researchRunOutcome : 'failed';
       if (stopReason === 'aborted') {
         return { stopReason, finalText: accumulatedText };
       }
@@ -1041,6 +1114,12 @@ export async function runCoreTurn(
         };
       }
       throw err;
+    } finally {
+      if (ctx.signal.aborted) researchRunOutcome = 'failed';
+      if (researchRunObserver) {
+        if (researchSynthesisStarted) researchRunObserver.event({ type: 'exit', node: 'synthesis', outcome: researchSynthesisOutcome });
+        researchRunObserver.finish(researchRunOutcome);
+      }
     }
   });
 }

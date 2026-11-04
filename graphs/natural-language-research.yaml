@@ -1,0 +1,38 @@
+# Nexus live graph for the default natural-language research path.
+graph_id: natural-language-research
+version: 1
+entry_node: question-plan
+terminal_nodes: [synthesis]
+
+nodes:
+  - node_id: question-plan
+    kind: agent
+    recipe: research-question-planner
+    max_visits: 1
+  - node_id: axes
+    kind: agent
+    recipe: research-axis-fanout
+    max_visits: 1
+  - node_id: evidence-check
+    kind: gate
+    recipe: research-output-contract-check
+    max_visits: 1
+  - node_id: followup
+    kind: agent
+    recipe: research-gap-followup-fanout
+    max_visits: 1
+  - node_id: synthesis
+    kind: agent
+    recipe: research-answer-synthesis
+    max_visits: 1
+
+edges:
+  - from: question-plan
+    to: axes
+  - from: axes
+    to: evidence-check
+  - from: evidence-check
+    on: outcome
+    map: { complete: synthesis, gap: synthesis }
+  - from: followup
+    to: synthesis

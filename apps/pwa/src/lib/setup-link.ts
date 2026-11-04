@@ -31,9 +31,12 @@ export async function claimSetupLink(
   const body: unknown = await response.json().catch(() => null);
   if (!body || typeof body !== 'object') return { status: 'invalid' };
   const claim = body as Record<string, unknown>;
+  const expiresAt = typeof claim.expiresAt === 'number'
+    ? claim.expiresAt
+    : typeof claim.expiresAt === 'string' ? Date.parse(claim.expiresAt) : NaN;
   if (claim.scope !== 'setup' || typeof claim.bearer !== 'string' || !claim.bearer ||
-      typeof claim.expiresAt !== 'number' || !Number.isFinite(claim.expiresAt)) {
+      !Number.isFinite(expiresAt)) {
     return { status: 'invalid' };
   }
-  return { status: 'claimed', bearer: claim.bearer, expiresAt: claim.expiresAt };
+  return { status: 'claimed', bearer: claim.bearer, expiresAt };
 }
