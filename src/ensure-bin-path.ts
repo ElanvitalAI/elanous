@@ -57,4 +57,8 @@ export function ensureBinPath(
 }
 
 // import 시점 즉시 보강 — 어떤 CLI 커맨드/subprocess 호출보다 먼저.
-ensureBinPath();
+// Isolated CLI integration tests can supply the candidate list without inheriting host tools.
+const testCandidateOverride = process.env.NODE_ENV === 'test'
+  ? process.env.ELANOUS_TEST_BIN_PATH_CANDIDATES
+  : undefined;
+ensureBinPath(process.env, testCandidateOverride === undefined ? CANDIDATE_BIN_DIRS : testCandidateOverride.split(':'));

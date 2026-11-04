@@ -510,13 +510,24 @@ test('explicit template expansion refuses a target beyond the measured quota bef
   expect(kubectlCalls).toBe(0);
 });
 
-test('an unmeasured template quota fails closed before Pod work', () => {
+test('declared template slots cannot bypass quota or double-count one host across tiers', () => {
+  const template = { host: 'test-host', tier: 'standard' as const, slotCount: 5,
+    spec: { ...spec, name: 'standard-template', workerId: 'standard-generation', nodeName: 'test-host-server-0' } };
+  expect(() => newTestWarmPodProvider({ candidates: [], poolTemplates: [template],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), quotaResolverForTest: () => 2 })).toThrow('warm candidate quota exceeded');
+  expect(() => newTestWarmPodProvider({ candidates: [], poolTemplates: [
+    { ...template, slotCount: 2 }, { ...template, tier: 'lite' as const, slotCount: 1, spec: { ...spec, name: 'lite-template', workerId: 'lite-generation', nodeName: 'test-host-server-0' } },
+  ], controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), quotaResolverForTest: (_profile, _host, tier) => tier === 'standard' ? 2 : 1 })).toThrow('warm candidate quota exceeded');
+});
+
+test('an unmeasured template quota fails closed before Pod work even with declared slots', () => {
   let kubectlCalls = 0;
-  const template = { host: 'unmeasured-host', tier: 'standard' as const,
+  const template = { host: 'unmeasured-host', tier: 'standard' as const, slotCount: 1,
     spec: { ...spec, name: 'unmeasured-template', workerId: 'generation-20261022', nodeName: 'pool-test-host-server-0' } };
   expect(() => newTestWarmPodProvider({ candidates: [], poolTemplates: [template], expandPoolTemplatesToQuota: true,
     profileConfig: { pod: { warmPoolProfile: 'gate' } }, controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), kubectl: () => { kubectlCalls++; return { status: 0, stdout: '{}', stderr: '' }; },
+    memberToken: '1'.repeat(64), quotaResolverForTest: () => undefined as unknown as number,
+    kubectl: () => { kubectlCalls++; return { status: 0, stdout: '{}', stderr: '' }; },
   })).toThrow('unmeasured warm pool template');
   expect(kubectlCalls).toBe(0);
 });
@@ -2391,6 +2402,12 @@ test('WARM-POOL-PROVIDER-DEPLOY: production CLIs redact tokens, reconcile with f
     return { holder: productionHost, generation: 1, iAmHolder: true, known: true };
   } } });
   const device = createFakeKubectl({ context: 'k3d-elanous-pool', node: `pool-${productionHost}-server-0`, podReadinessOnCreate: true });
+  const ledgerServer = spawn("node", ["-e", "const http=require(\"http\");const pools=[{purpose:\"gate\",fanoutGroupId:\"g\",members:[{host:\"node-b\",count:16,digest:\"sha256:\"+\"d\".repeat(64),role:\"both\"}],fanoutGroup:{shard:{kind:\"gate\",input:\"i\",result:\"r\",fingerprint:\"f\"}},fingerprint:{runtime:\"bun\",environment:\"linux\",skillPacks:[]},cleanup:{procedure:\"clean\",verify:\"verify\"}}];http.createServer((q,s)=>{s.setHeader(\"Content-Type\",\"application/json\");s.end(JSON.stringify({pools}));}).listen(0,\"127.0.0.1\",function(){console.log(this.address().port)});"], { stdio: ["ignore", "pipe", "pipe"] });
+  const ledgerPort = await new Promise<string>((resolve, reject) => {
+    ledgerServer.stdout.once("data", chunk => resolve(String(chunk).trim()));
+    ledgerServer.once("error", reject);
+    ledgerServer.once("close", code => reject(new Error("ledger fixture exited before listening: " + code)));
+  });
   const rawPodRequests: string[] = [];
   const receivedKubectlCalls: string[][] = [];
   const fakeKubectlServer = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
@@ -2437,9 +2454,10 @@ test('WARM-POOL-PROVIDER-DEPLOY: production CLIs redact tokens, reconcile with f
     const script = join(import.meta.dir, '../../../scripts/warm-pool-provider-config.ts');
     const controlUrl = `${controlServer.url}/`;
     const assemblerArgs = [script, '--config', config, '--control-url', controlUrl,
+      '--resource-ledger-url', 'http://127.0.0.1:' + ledgerPort + '/v1/ops/resources/ledger',
       '--member-token-file', member, '--machine-token', `${productionHost}=${machine}`, '--output'];
     const dry = spawnSync(process.execPath, [...assemblerArgs, dryOutput, '--dry-run'], { encoding: 'utf8' });
-    expect(dry.status).toBe(0); expect(dry.stdout).toContain('"memberToken":"[redacted]"');
+    if (dry.status !== 0) throw new Error(dry.stderr); expect(dry.stdout).toContain('"memberToken":"[redacted]"');
     expect(dry.stdout).not.toContain(memberValue); expect(dry.stdout).not.toContain(machineValue);
     expect(existsSync(dryOutput)).toBe(false);
     const singleDry = spawnSync(process.execPath,
@@ -2519,6 +2537,7 @@ test('WARM-POOL-PROVIDER-DEPLOY: production CLIs redact tokens, reconcile with f
     expect(device.calls.length).toBe(callsAfterClose);
   } finally {
     fakeKubectlServer.stop(true);
+    ledgerServer.kill("SIGTERM");
     controlServer.stop();
     rmSync(root, { recursive: true, force: true });
   }

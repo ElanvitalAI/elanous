@@ -40,6 +40,7 @@ function RunPanel({ index, title, runId, picks, selectionVersion, onSelect }: {
     || (event.type === 'edge-rerouted' && (event.from === selectedNode || event.to === selectedNode)),
   ) ?? [];
   const run = traversal.data;
+  const journeyEdges = run?.journeyEdges ?? [];
   const elapsed = run?.startedAt && run.endedAt
     ? Math.max(0, Date.parse(run.endedAt) - Date.parse(run.startedAt))
     : null;
@@ -88,6 +89,17 @@ function RunPanel({ index, title, runId, picks, selectionVersion, onSelect }: {
                 return <li key={`${event.seq}:${event.type}`} data-event-seq={event.seq} className="rounded-full border border-primary/40 bg-primary/10 px-2 py-1 font-medium text-text-primary">{label}</li>;
               })}
             </ol>
+          )}
+          {journeyEdges.length > 0 && (
+            <section aria-label={`${title} 선택 경로 근거`} data-testid={`arg-route-outcome-${index}`} className="mx-2 mb-2 rounded border border-primary/40 bg-primary/5 p-2 text-[10px]">
+              <h4 className="font-semibold">run ledger 선택 경로 · selector={journeyEdges.every((edge) => edge.source === 'graph') ? 'graph' : 'mixed'}</h4>
+              <ol className="mt-1 space-y-0.5">
+                {journeyEdges.map((edge, edgeIndex) => <li key={`${edge.seq ?? edgeIndex}:${edge.from}:${edge.taken}`}>
+                  {edge.from} · {edge.label} → {edge.taken}
+                  {edge.injected ? ` · injected: mock-outcome(${edge.mockOutcome ?? 'unknown'})` : ''}
+                </li>)}
+              </ol>
+            </section>
           )}
           <section aria-label={`${title} 손 노드 카드`} data-testid={`arg-hand-card-${index}`} className="mx-2 mb-2 rounded border border-border p-2 text-[10px]">
             <h4 className="font-semibold">손 노드 · 누가 무엇을</h4>

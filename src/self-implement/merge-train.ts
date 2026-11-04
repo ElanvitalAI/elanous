@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 
 export type TrainCandidate = { number: number; head: string; files?: string[]; filesUnmeasured?: boolean };
@@ -68,6 +69,16 @@ const defaultGit: TrainGit = (args, repo) => {
 };
 const SHA = /^[0-9a-f]{40,64}$/i;
 
+/** Pass driver config only to this merge-tree process. Worktree .git/config can be shared,
+ * so persistent --local settings race across simultaneous train worktrees. */
+function uxSimMergeDriverArgs(repo: string): string[] {
+  const driver = resolve(repo, 'scripts/ux-sim-merge-driver.mjs');
+  return [
+    '-c', `merge.uxsim-catalog.driver=node \"${driver}\" catalog \"%O\" \"%A\" \"%B\"`,
+    '-c', `merge.uxsim-manual.driver=node \"${driver}\" manual \"%O\" \"%A\" \"%B\"`,
+  ];
+}
+
 /** Create unreachable synthetic merge commits only; never update refs or check out a tree. */
 export function integrateTrain(repo: string, baseSha: string, batch: readonly TrainCandidate[], git: TrainGit = defaultGit): TrainIntegration {
   if (!SHA.test(baseSha) || batch.some((item) => !SHA.test(item.head))) throw new Error('invalid pinned commit SHA');
@@ -75,7 +86,7 @@ export function integrateTrain(repo: string, baseSha: string, batch: readonly Tr
   const conflicts: TrainConflict[] = [];
   const run = (args: string[]) => git(args, repo);
   for (const item of batch) {
-    const merge = run(['merge-tree', '--write-tree', '--name-only', '-z', current, item.head]);
+    const merge = run([...uxSimMergeDriverArgs(repo), 'merge-tree', '--write-tree', '--name-only', '-z', current, item.head]);
     if (merge.status !== 0) {
       if (/unknown option|unrecognized option|unrecognized argument|invalid option|unknown switch|usage: git merge-tree/i.test(merge.stderr)) {
         return { conflicts, unmeasured: true };

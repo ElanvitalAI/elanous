@@ -6,6 +6,7 @@ import {
   MAX_REPAIR_FRAGMENTS_PER_FINGERPRINT,
   MAX_REPAIR_FRAGMENTS_TOTAL,
   formatOrchestrateStartAnnouncement,
+  formatOrchestrateTaskStartedAnnouncement,
   resolveOrchestrateStart,
   runSelfOrchestrateCliCommand,
   type OrchestrateCliDeps,
@@ -1157,6 +1158,14 @@ describe('decompose-and-retry — 단일이 «연합으로 승격»된다', () =
     );
     expect(specs.length).toBe(2);
     expect(JSON.stringify(specs[0])).toBe(JSON.stringify(specs[1]));   // 락 경합은 «그대로» 다시 건다
+  });
+});
+
+describe('formatOrchestrateTaskStartedAnnouncement — task identity output contract', () => {
+  it('prints the exact run and task identity consumed by the Pod-exit classifier', () => {
+    expect(formatOrchestrateTaskStartedAnnouncement('run-12345678', 'task:abcd1234')).toBe(
+      '[self-dev] run run-12345678 ▶ 시작 task:abcd1234',
+    );
   });
 });
 

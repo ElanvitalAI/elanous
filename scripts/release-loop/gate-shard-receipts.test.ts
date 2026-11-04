@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gateShardReceiptPath, markGateShardUnmeasured, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
+import { gateShardReceiptPath, inspectGateShardReceipts, markGateShardUnmeasured, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
 import type { GateShardReceipt } from './gate-shard-dispatch.js';
 
 const roots: string[] = [];
@@ -44,6 +44,24 @@ test('receipt payload rejects incomplete passed IDs and inconsistent execution c
   saveGateShardResult(root, { receipt: inconsistent,
     runs: [{ output: '1 pass\n0 fail\nRan 2 tests across 1 file.\n', rc: 0, pass: 1, fail: 0, errors: 0, ran: 2, files: 1, passedIds: ['src/b.test.ts > pass'] }] });
   expect(readGateShardResult(root, { shard: inconsistent, head40: inconsistent.head40, base40: inconsistent.base40, envKey: inconsistent.envKey })).toBeNull();
+});
+
+test("formal receipt inspection rejects version and graph pin mismatches", () => {
+  const root = mkdtempSync(join(tmpdir(), "gate-receipt-inspection-")); roots.push(root);
+  const original = receipt();
+  saveGateShardResult(root, { receipt: original,
+    runs: [{ output: "1 pass\n0 fail\nRan 1 test across 1 file.\n", rc: 0, pass: 1, fail: 0, errors: 0, ran: 1, files: 1, passedIds: ["src/a.test.ts > pass"] }] });
+  const expected = { version: original.version, commit: original.head40, base40: original.base40, envFingerprint: original.envFingerprint!,
+    graphPins: { graphSha: original.graphSha!, recipeSha: original.recipeSha! }, graphEntry: original.graphEntry!,
+    recipeCommand: original.recipeCommand!, recipeTimeoutMs: original.recipeTimeoutMs!,
+    shards: [{ id: original.id, files: original.files }], tests: original.files };
+  expect(inspectGateShardReceipts(root, expected).kind).toBe("valid");
+  const mismatches = [
+    inspectGateShardReceipts(root, { ...expected, version: "9.9.9" }),
+    inspectGateShardReceipts(root, { ...expected, graphPins: { ...expected.graphPins, graphSha: "0".repeat(64) } }),
+    inspectGateShardReceipts(root, { ...expected, graphPins: { ...expected.graphPins, recipeSha: "0".repeat(64) } }),
+  ];
+  expect(mismatches.map((result) => result.kind)).toEqual(["invalid", "invalid", "invalid"]);
 });
 
 test('a replacement attempt blocks reuse of its predecessor before execution', () => {

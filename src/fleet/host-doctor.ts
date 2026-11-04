@@ -103,7 +103,67 @@ export function normalizeArch(arch: string): string {
   return lower;
 }
 
-/** 묶음 셋(접근 · 엔진 · 판)의 선언 표 — 첫 조각. */
+/** Parse the ASCII-only PowerShell task observation emitted by the read-only WSL probe. */
+export function parseWslKeepaliveObservation(stdout: string): HostDoctorExpectResult {
+  const observed = line(stdout);
+  const expected = 'enabled current-user logon task runs this distro keepalive indefinitely without idle or battery stop conditions';
+  if (observed === 'no-windows-interop') {
+    return { status: 'unmeasured', observed: 'powershell.exe is unavailable through WSL interop', expected };
+  }
+  if (observed === 'unsupported-distro') {
+    return { status: 'unmeasured', observed: 'WSL_DISTRO_NAME is missing or is not a supported managed distro', expected };
+  }
+  if (observed === 'no-script-encoder') {
+    return { status: 'unmeasured', observed: 'iconv or base64 is unavailable for safe PowerShell command encoding', expected };
+  }
+  const fields = observed.split('|');
+  if (fields.length === 18 && fields[0] === 'task' && (fields[1] === 'ElangramWslKeepalive' || fields[1] === 'ElanainucWslKeepalive')) {
+    const [, name = '', state = '', triggerType = '', triggerEnabled = '', triggerUser = '', principalUser = '', currentUser = '', logonType = '', stopOnIdleEnd = '', idleDuration = '', disallowStartOnBattery = '', stopOnBattery = '', executionTimeLimit = '', triggerExecutionTimeLimit = '', actionCount = '', execute = '', args = ''] = fields;
+    const distro = name === 'ElangramWslKeepalive' ? 'elangram-wsl' : 'host-e-wsl';
+    const argsNormalized = args.trim().replace(/\s+/g, ' ').toLowerCase();
+    const actionMatches = /(?:^|\\|\/)wsl\.exe$/i.test(execute) && argsNormalized === `-d ${distro} --exec /usr/bin/sleep infinity`;
+    const known = (value: string) => value !== '' && value !== '<unknown>';
+    if (triggerUser === '<unknown>') {
+      return { status: 'unmeasured', observed: `${name} trigger user SID could not be resolved`, expected };
+    }
+    const principalMatches = known(principalUser) && known(currentUser)
+      && principalUser.toLowerCase() === currentUser.toLowerCase();
+    const triggerUserMatches = triggerUser === '<not-set>'
+      || (known(triggerUser) && known(currentUser) && triggerUser.toLowerCase() === currentUser.toLowerCase());
+    const userMatches = principalMatches && triggerUserMatches;
+    const seconds = (value: string): number => {
+      const match = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i.exec(value);
+      if (!match || !match.slice(1).some((part) => part !== undefined)) return Number.NaN;
+      return Number(match[1] ?? 0) * 86400 + Number(match[2] ?? 0) * 3600 + Number(match[3] ?? 0) * 60 + Number(match[4] ?? 0);
+    };
+    const taskLimitSeconds = seconds(executionTimeLimit);
+    const triggerLimitSeconds = triggerExecutionTimeLimit === '<not-set>' ? 0 : seconds(triggerExecutionTimeLimit);
+    const bool = (value: string) => value.toLowerCase();
+    const finiteTaskLimit = known(executionTimeLimit) && Number.isFinite(taskLimitSeconds) && taskLimitSeconds > 0;
+    const finiteTriggerLimit = known(triggerExecutionTimeLimit) && Number.isFinite(triggerLimitSeconds) && triggerLimitSeconds > 0;
+    const failed = state === 'Disabled' || triggerType !== 'MSFT_TaskLogonTrigger' || bool(triggerEnabled) === 'false'
+      || logonType !== 'InteractiveToken' || actionCount !== '1' || !actionMatches
+      || (known(principalUser) && known(currentUser) && !userMatches)
+      || bool(stopOnIdleEnd) === 'true' || bool(disallowStartOnBattery) === 'true' || bool(stopOnBattery) === 'true'
+      || finiteTaskLimit || finiteTriggerLimit;
+    const fullyMeasured = [state, triggerType, triggerEnabled, triggerUser, principalUser, currentUser, logonType,
+      stopOnIdleEnd, disallowStartOnBattery, stopOnBattery, executionTimeLimit, triggerExecutionTimeLimit, actionCount, execute, args].every(known);
+    const booleansKnown = [triggerEnabled, stopOnIdleEnd, disallowStartOnBattery, stopOnBattery].every((value) => ['true', 'false'].includes(bool(value)));
+    const limitsKnown = known(executionTimeLimit) && Number.isFinite(taskLimitSeconds)
+      && known(triggerExecutionTimeLimit) && Number.isFinite(triggerLimitSeconds);
+    const passes = !failed && fullyMeasured && booleansKnown && limitsKnown && userMatches
+      && bool(triggerEnabled) === 'true' && bool(stopOnIdleEnd) === 'false'
+      && bool(disallowStartOnBattery) === 'false' && bool(stopOnBattery) === 'false'
+      && taskLimitSeconds === 0 && triggerLimitSeconds === 0;
+    const status = passes ? 'pass' : failed ? 'fail' : 'unmeasured';
+    const detail = `${name} state=${state || 'unknown'} trigger=${triggerType || 'unknown'} triggerEnabled=${triggerEnabled || 'unknown'} triggerUser=${triggerUser || 'unknown'} principal=${principalUser || 'unknown'} currentUser=${currentUser || 'unknown'} logonType=${logonType || 'unknown'} actions=${actionCount || 'unknown'} action=${execute || 'none'} ${args || '(no arguments)'} idleStop=${stopOnIdleEnd || 'unknown'} idleDuration=${idleDuration || 'none'} disallowStartOnBattery=${disallowStartOnBattery || 'unknown'} stopOnBattery=${stopOnBattery || 'unknown'} executionTimeLimit=${executionTimeLimit || 'unknown'} triggerExecutionTimeLimit=${triggerExecutionTimeLimit || 'unknown'}`;
+    return { status, observed: detail, expected };
+  }
+  if (observed === 'missing') return { status: 'fail', observed: 'no matching per-user logon task registered', expected };
+  return { status: 'unmeasured', observed: observed || 'task query returned no readable result', expected };
+}
+
+
 export const HOST_DOCTOR_CHECKS: readonly HostDoctorCheckSpec[] = [
   // ── 접근 ──
   {
@@ -257,6 +317,16 @@ export const HOST_DOCTOR_CHECKS: readonly HostDoctorCheckSpec[] = [
     fix: 'pull the image pinned to this host architecture',
   },
   {
+    id: 'wsl.keepalive-logon-task',
+    bundle: 'platform',
+    platforms: ['wsl'],
+    roles: ALL_ROLES,
+    probe: `command -v powershell.exe >/dev/null 2>&1 || { echo no-windows-interop; exit 0; }; case "\${WSL_DISTRO_NAME:-}" in elangram-wsl) taskName=ElangramWslKeepalive ;; host-e-wsl) taskName=ElanainucWslKeepalive ;; *) echo unsupported-distro; exit 0 ;; esac; command -v iconv >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 || { echo no-script-encoder; exit 0; }; psScript='$ErrorActionPreference="Stop";$name="TASKNAME";$task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;if($null -eq $task){Write-Output "missing";exit 0};$trigger=@($task.Triggers|Where-Object{$_.CimClass.CimClassName -eq "MSFT_TaskLogonTrigger"}|Select-Object -First 1);$triggerType=if($trigger.Count -gt 0){"MSFT_TaskLogonTrigger"}else{"none"};$triggerUserRaw=if($trigger.Count -gt 0){$trigger[0].UserId}else{$null};$triggerUser=if([string]::IsNullOrWhiteSpace([string]$triggerUserRaw)){"<not-set>"}else{$triggerUserRaw};if($triggerUser -ne "<not-set>" -and $triggerUser -notmatch "^S-1-"){try{$triggerUser=[Security.Principal.NTAccount]::new($triggerUser).Translate([Security.Principal.SecurityIdentifier]).Value}catch{$triggerUser="<unknown>"}};$triggerEnabled=if($trigger.Count -gt 0){$trigger[0].Enabled}else{$null};$triggerExecutionTimeLimit=if($trigger.Count -gt 0){if($null -eq $trigger[0].ExecutionTimeLimit){"<not-set>"}else{$trigger[0].ExecutionTimeLimit}}else{$null};$action=$task.Actions|Select-Object -First 1;$principalUser=$task.Principal.UserId;if($principalUser -and $principalUser -notmatch "^S-1-"){try{$principalUser=[Security.Principal.NTAccount]::new($principalUser).Translate([Security.Principal.SecurityIdentifier]).Value}catch{$principalUser="<unknown>"}};$current=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$values=@("task",$name,$task.State,$triggerType,$triggerEnabled,$triggerUser,$principalUser,$current,$task.Principal.LogonType,$task.Settings.IdleSettings.StopOnIdleEnd,$task.Settings.IdleSettings.IdleDuration,$task.Settings.DisallowStartIfOnBatteries,$task.Settings.StopIfGoingOnBatteries,$task.Settings.ExecutionTimeLimit,$triggerExecutionTimeLimit,@($task.Actions).Count,$action.Execute,$action.Arguments);Write-Output (($values|ForEach-Object{if($null -eq $_){"<unknown>"}elseif($_ -is [bool]){$_.ToString()}elseif([string]$_ -eq ""){"<unknown>"}else{$_}}) -join "|")'; psScript="\${psScript/TASKNAME/$taskName}"; encoded=$(printf '%s' "$psScript" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n') || { echo no-script-encoder; exit 0; }; powershell.exe -NoProfile -NonInteractive -EncodedCommand "$encoded"`,
+    expect: (run) => parseWslKeepaliveObservation(run.stdout),
+    fixKind: 'human',
+    fix: 'Windows 작업 스케줄러에서 per-user 로그온 작업을 등록/활성화한다: ElangramWslKeepalive는 InteractiveToken 로그온 트리거와 `wsl.exe -d elangram-wsl --exec /usr/bin/sleep infinity`, ElanainucWslKeepalive는 InteractiveToken 로그온 트리거와 `wsl.exe -d host-e-wsl --exec /usr/bin/sleep infinity`를 쓴다. 작업과 로그온 트리거의 실행 시간 제한을 무제한(PT0S)으로 두고, Idle 종료를 끄며 배터리 사용 중 시작·유지를 허용한 뒤 doctor를 다시 실행한다.',
+  },
+  {
     id: 'node.present',
     bundle: 'platform',
     platforms: ALL_PLATFORMS,
@@ -405,7 +475,7 @@ export async function runHostDoctor(options: HostDoctorOptions): Promise<HostDoc
   const reached = await remote(host, 'uname -s') !== null;
   const platform = reached ? await detectHostDoctorPlatform(remote, host) : null;
   const arch = reached ? await detectHostDoctorArch(remote, host) : null;
-  const specs = HOST_DOCTOR_CHECKS.filter((spec) => spec.roles.includes(role));
+  const specs = HOST_DOCTOR_CHECKS.filter((spec) => spec.roles.includes(role) && (spec.id !== 'wsl.keepalive-logon-task' || platform === 'wsl'));
   const remoteChecks = reached
     ? await Promise.all(specs.map((spec) => runCheck(spec, { host, remote, role, platform, arch, expected })))
     : specs.map((spec) => unmeasuredBecauseUnreached(spec, { platform, arch, expected }));
@@ -441,6 +511,7 @@ export function formatHostDoctorLines(report: HostDoctorReport): string[] {
     }
     const mark = check.status === 'pass' ? '✓' : check.status === 'fail' ? '✗' : '→';
     const detail = check.status === 'fail' ? `${check.observed} (expected: ${check.expected})` : check.observed;
-    return `${mark} ${check.id} ${detail}`;
+    const remedy = check.id === 'wsl.keepalive-logon-task' && check.status !== 'pass' && check.fix ? ` · 수동 조치: ${check.fix}` : '';
+    return `${mark} ${check.id} ${detail}${remedy}`;
   });
 }

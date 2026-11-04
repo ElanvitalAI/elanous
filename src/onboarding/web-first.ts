@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { hostname, networkInterfaces, userInfo } from 'node:os';
 import { findNexusLifecycleState } from '../nexus/supervisor/lock.js';
@@ -13,10 +14,10 @@ import type { UserConfig } from '../user-config.js';
 
 export interface WebFirstSetupDeps {
   config: Pick<UserConfig, 'onboarding'>;
-  /** Whether a person is at a terminal (stdin TTY). Without one the web path only uses a daemon that is already up. */
+  /** Whether a person is at a terminal (stdin TTY). */
   isTty?: boolean;
   terminal?: boolean;
-  /** Bare first run never starts or waits for a missing daemon; explicit setup retains web launch. */
+  /** Set true when this entry owns first-run launch and may start a missing daemon without a TTY. */
   startIfMissing?: boolean;
   startedAt?: number;
   /** Locale for user-facing wording; defaults to the shared ambient decision (detectLocale). */
@@ -39,6 +40,18 @@ export interface WebFirstSetupDeps {
 }
 
 const STARTUP_TIMEOUT_MS = 12_000;
+const require = createRequire(import.meta.url);
+
+export function renderTerminalQr(link: string): string | undefined {
+  try {
+    const qr = require('qrcode-terminal') as {
+      generate: (value: string, options: { small: boolean }, callback: (value: string) => void) => void;
+    };
+    let rendered: string | undefined;
+    qr.generate(link, { small: true }, value => { rendered = value; });
+    return rendered;
+  } catch { return undefined; }
+}
 
 /** User-facing web-first fallback wording, routed by the shared locale decision (detectLocale). */
 const WEB_FIRST_TEXT = {
@@ -53,9 +66,12 @@ const WEB_FIRST_TEXT = {
     phoneOnSameWifi: (link: string) => `같은 와이파이의 폰이면: ${link}`,
     linkSingleUse: '이 링크는 10분 안에 한 번만 열 수 있습니다',
     sameWifiRestart: '같은 와이파이에서 열려면 `elanous nexus run` 을 루프백 없이 다시 띄우세요',
-    scanTailnet: '같은 와이파이·tailnet 의 폰 카메라로 스캔하세요',
+    scanTailnet: 'tailnet에 연결된 기기의 카메라로 스캔하세요',
     scanSameWifi: '같은 와이파이의 폰 카메라로 스캔하세요',
-    terminalInstead: '터미널에서 하려면: `elanous setup --terminal`',
+    scanAfterTunnel: 'SSH -L 을 실행한 뒤 이 기기의 브라우저에서 여세요',
+    tailnetLink: (link: string) => `어디서든(Tailscale): ${link}`,
+    reachability: (browser: 'available' | 'unavailable' | 'unknown', lan: 'available' | 'unavailable' | 'unknown', tailnet: boolean) => `접속 경로: 이 기기 브라우저 ${browser === 'available' ? '사용 가능' : browser === 'unknown' ? '조회 미확인' : '현재 세션에서 사용 불가'} · 같은 네트워크 ${lan === 'available' ? '주소 있음' : lan === 'unknown' ? '조회 미확인' : '주소 없음'} · Tailscale ${tailnet ? '주소 있음' : '주소 없음'} · 외부 공개 여부 미확인`,
+    terminalInstead: '링크가 열리지 않으면 터미널 설정에서 계속하세요: `elanous setup --terminal`',
   },
   en: {
     unavailable: (reason: string) => `web setup is unavailable (${reason}); switching to terminal setup.`,
@@ -68,9 +84,12 @@ const WEB_FIRST_TEXT = {
     phoneOnSameWifi: (link: string) => `on a phone on the same wifi: ${link}`,
     linkSingleUse: 'this link can be opened only once within 10 minutes',
     sameWifiRestart: 'to open it from the same wifi, restart `elanous nexus run` without a loopback-only bind',
-    scanTailnet: 'scan with a phone camera on the same wifi/tailnet',
+    scanTailnet: 'scan with a phone connected to your Tailscale tailnet',
     scanSameWifi: 'scan with a phone camera on the same wifi',
-    terminalInstead: 'to use the terminal instead: `elanous setup --terminal`',
+    scanAfterTunnel: 'open it in this device’s browser after starting SSH -L',
+    tailnetLink: (link: string) => `from anywhere (Tailscale): ${link}`,
+    reachability: (browser: 'available' | 'unavailable' | 'unknown', lan: 'available' | 'unavailable' | 'unknown', tailnet: boolean) => `Reachability: browser on this device ${browser === 'available' ? 'available' : browser === 'unknown' ? 'not checked' : 'unavailable in this session'} · same network ${lan === 'available' ? 'address available' : lan === 'unknown' ? 'not checked' : 'no address'} · Tailscale ${tailnet ? 'address available' : 'no address'} · public access unverified`,
+    terminalInstead: 'If the link does not open, continue setup in the terminal: `elanous setup --terminal`',
   },
 } as const;
 
@@ -84,14 +103,14 @@ async function probeHealth(url: string, timeoutMs: number): Promise<boolean> {
 }
 
 function setupUrl(pwa: string, token: string): string {
-  return `${pwa.replace(/\/app\/?$/, '').replace(/\/$/, '')}/setup#t=${encodeURIComponent(token)}`;
+  return `${pwa.replace(/\/$/, '')}/setup/#t=${encodeURIComponent(token)}`;
 }
 
 export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-shown' | 'fallback'> {
   const startedAt = deps.startedAt ?? Date.now();
   const print = deps.print ?? console.log;
   const text = WEB_FIRST_TEXT[(deps.locale ?? detectLocale()) === 'en' ? 'en' : 'ko'];
-  const observe = (event: 'link-shown' | 'fallback', reason?: string, qr = false, browserOpened = false, remote: 'loopback' | 'tailnet' = 'loopback', ms?: number, lan?: 'shown' | 'loopback-bind' | 'no-address', ssh?: boolean) => {
+  const observe = (event: 'link-shown' | 'fallback', reason?: string, qr = false, browserOpened = false, remote: 'loopback' | 'tailnet' = 'loopback', ms?: number, lan?: 'shown' | 'loopback-bind' | 'no-address' | 'unknown', ssh?: boolean) => {
     try { debug.log('onboarding.web-first', event, { ...(reason ? { reason } : {}), qr, browserOpened, remote, ...(ms !== undefined ? { ms } : {}), ...(lan ? { lan, ssh } : {}) }); }
     catch { /* Observability must not block onboarding. */ }
   };
@@ -115,9 +134,9 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     observe('fallback', reason);
     return 'fallback';
   }
-  // A script, pipe or CI run never starts a daemon on its own: without a terminal the web path
-  // only uses a daemon that already answers health once.
-  if ((deps.isTty ?? (process.stdin.isTTY === true)) !== true) {
+  // Non-interactive automation remains read-only by default. First-run callers may opt in so an
+  // installer can start the daemon and hand a headless user the link and SSH-forward command.
+  if ((deps.isTty ?? (process.stdin.isTTY === true)) !== true && deps.startIfMissing !== true) {
     const rest = running ? shown?.urls?.rest.loopback : undefined;
     const up = rest && shown?.urls?.pwa.loopback
       ? await (deps.probeHealth ?? probeHealth)(joinRestHealthUrl(rest), 500) : false;
@@ -202,6 +221,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   const confirmedBind = typeof httpHost === 'string';
   const reachable = confirmedBind && isLanReachableBind(httpHost);
   let lanAddress: string | null = null;
+  let lanInspectionUnknown = !confirmedBind;
   if (reachable && httpHost !== undefined) {
     if (isPrivateIpv4(httpHost.trim())) {
       lanAddress = httpHost.trim();
@@ -211,12 +231,39 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
           interfaces: (deps.interfaces ?? networkInterfaces)(),
           defaultRouteInterface: deps.defaultRouteInterface,
         });
-      } catch { /* Optional LAN discovery must not block the local setup link. */ }
+      } catch { lanInspectionUnknown = true; /* Optional LAN discovery must not block the local setup link. */ }
     }
   }
-  const lan: 'shown' | 'loopback-bind' | 'no-address' = !confirmedBind ? 'no-address' : !reachable ? 'loopback-bind' : lanAddress ? 'shown' : 'no-address';
+  const lan: 'shown' | 'loopback-bind' | 'no-address' | 'unknown' = lanInspectionUnknown ? 'unknown' : !reachable ? 'loopback-bind' : lanAddress ? 'shown' : 'no-address';
   const lanLink = lanAddress ? setupUrl(`http://${lanAddress}:${port}/app/`, token) : undefined;
-  const phoneLink = shown.urls.pwa.tailnet ? setupUrl(shown.urls.pwa.tailnet, token) : lanLink;
+  const tailnetLink = shown.urls.pwa.tailnet ? setupUrl(shown.urls.pwa.tailnet, token) : undefined;
+  const phoneLink = tailnetLink ?? lanLink;
+  const env = deps.browserEnv ?? process.env;
+  const ssh = !!(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
+  const noDisplay = !!browserUnavailableReason(env, deps.browserPlatform ?? process.platform);
+  const isHeadless = (deps.isHeadless ?? (() => isHeadlessEnv(env)))();
+  const why = browserUnavailableReason(env, deps.browserPlatform ?? process.platform);
+  const tunnelHint = ssh || noDisplay || isHeadless || (deps.isTty ?? (process.stdin.isTTY === true)) !== true;
+  const qrLink = phoneLink ?? (tunnelHint ? link : undefined);
+  let browserOpened = false;
+  let browserReachability: 'available' | 'unavailable' | 'unknown' = 'unknown';
+  if (why) {
+    browserReachability = 'unavailable';
+    debug.log('browser.open', 'skipped', { reason: why.includes('ssh') ? 'ssh' : 'no-display' });
+  } else if (isHeadless) {
+    browserReachability = 'unavailable';
+  } else {
+    try {
+      const opened = deps.openBrowser ? deps.openBrowser(link) : (() => {
+        const command = process.platform === 'darwin' ? 'open' : process.platform === 'linux' || process.platform === 'freebsd' || process.platform === 'openbsd' ? 'xdg-open' : undefined;
+        return command ? spawnSync(command, [link], { stdio: 'ignore' }).status === 0 : undefined;
+      })();
+      if (opened === true) { browserOpened = true; browserReachability = 'available'; }
+      else if (opened === false) browserReachability = 'unavailable';
+    } catch { /* Keep browser reachability unknown when the opener gives no result. */ }
+  }
+  const lanReachability = lan === 'shown' ? 'available' : lan === 'unknown' ? 'unknown' : 'unavailable';
+  print(text.reachability(browserReachability, lanReachability, !!tailnetLink));
   print(text.continueInBrowser);
   print(link);
   if (lanLink) {
@@ -225,38 +272,24 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   } else if (lan === 'loopback-bind') {
     print(text.sameWifiRestart);
   }
+  if (tailnetLink) print(text.tailnetLink(tailnetLink));
   const linkShownMs = Date.now() - startedAt;
   let qr = false;
-  if (phoneLink) {
+  if (qrLink) {
     try {
-      const rendered = (deps.renderQr ?? ((url: string) => {
-        const result = spawnSync('qrencode', ['-t', 'ANSIUTF8', url], { encoding: 'utf8' });
-        return result.status === 0 ? result.stdout : undefined;
-      }))(phoneLink);
+      const rendered = (deps.renderQr ?? renderTerminalQr)(qrLink);
       if (rendered) {
         print(rendered);
-        print(shown.urls.pwa.tailnet ? text.scanTailnet : text.scanSameWifi);
+        print(phoneLink ? tailnetLink ? text.scanTailnet : text.scanSameWifi : text.scanAfterTunnel);
         qr = true;
       }
     } catch { /* QR is optional. */ }
   }
   print(text.terminalInstead);
-  let browserOpened = false;
-  const env = deps.browserEnv ?? process.env;
-  const ssh = !!(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
-  const why = browserUnavailableReason(env, deps.browserPlatform ?? process.platform);
   if (why) {
     print(why);
-    debug.log('browser.open', 'skipped', { reason: why.includes('ssh') ? 'ssh' : 'no-display' });
-  } else if (!(deps.isHeadless ?? (() => isHeadlessEnv(deps.browserEnv ?? process.env)))()) {
-    try {
-      browserOpened = (deps.openBrowser ?? ((url: string) => {
-        const command = process.platform === 'darwin' ? 'open' : process.platform === 'linux' || process.platform === 'freebsd' || process.platform === 'openbsd' ? 'xdg-open' : undefined;
-        return command ? spawnSync(command, [url], { stdio: 'ignore' }).status === 0 : false;
-      }))(link);
-    } catch { /* The displayed link remains usable. */ }
   }
-  if (ssh) {
+  if (tunnelHint) {
     try {
       print(`ssh -L ${port}:localhost:${port} ${(deps.username ?? (() => userInfo().username))()}@${(deps.hostname ?? hostname)()}`);
     } catch { /* Optional SSH guidance must not block the setup link. */ }

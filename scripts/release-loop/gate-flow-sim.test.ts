@@ -239,7 +239,7 @@ edges:
         outcome: 'fail', verdict: 'fail', commit: CUT,
         introduced: [FAILURE], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [],
         autoheal: { action: 'hitl', cause: 'true-regression', signature: expect.any(String), shardKey: 'gate', reason: 'measured regression requires a human decision', shardElapsedMs: POD_SECONDS * 1000 * 3, overallElapsedMs: POD_SECONDS * 1000 * 3 },
-        stalledEnv: [], rcNonzeroNoFailures: [],
+        stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], abortedShards: 0, rcNonzeroNoFailures: [],
         // ① exactly three Pods, each ninety seconds on the injected clock: no real (or global) clock produces this.
         durationMs: POD_SECONDS * 1000 * 3,
         baselineSource: 'instance', baselineCache: { hits: 0, misses: 1 }, selectionMs: 0,

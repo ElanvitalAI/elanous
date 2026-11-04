@@ -7,7 +7,11 @@ loop:
   title: 정기 흡수
   description: 외부 지식을 매일 수집·흡수한다
   trigger:
-    cron: '0 7 * * *'
+    cron: '0 8 * * *'
+triggers:
+  schedule:
+    type: cron
+    cron: '0 8 * * *'
 version: 1
 entry_node: trend
 terminal_nodes: [done, failed]

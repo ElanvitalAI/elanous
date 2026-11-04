@@ -529,8 +529,8 @@ describe('TUI ACP durable persistence', () => {
       expect(stored?.meta).toMatchObject({ id: session.id, source: 'tui' });
       expect(stored?.messages.map((message) => [message.role, message.content])).toEqual([
         ['user', 'TUI integration prompt'],
-        // A plain read prompt routes to 읽기·분석, and its route line is part of the turn as on every non-goal route.
-        ['assistant', '라우팅: 읽기·분석\nserver answer'],
+        // The route decision stays in debug logs; persisted conversation contains only the answer.
+        ['assistant', 'server answer'],
       ]);
     } finally {
       await session.close();

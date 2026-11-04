@@ -7,6 +7,7 @@ import { loadMockScenarioCatalog, renderMockScenarioDevices } from '../ux-sim/mo
 import { createWorld, destroyWorldById, loadWorld, runWorldScenario } from '../ux-sim/world.js';
 import { createSimWorld, destroySimWorld, listSimWorlds } from '../ux-sim/world-store.js';
 import { parseSimWorld } from '../ux-sim/world-schema.js';
+import { listMockDeviceRequests, renderMockDeviceRequests, requestMockDevice } from '../ux-sim/mock-device-requests.js';
 
 export function registerSimCommands(program: Command): void {
   const sim = program.command('sim').description('격리 시나리오를 실행하고 화면·로그 기대값을 대조한다');
@@ -48,12 +49,38 @@ export function registerSimCommands(program: Command): void {
       const { renderEventMonkeyKinds } = await import('../ux-sim/event-monkey.js');
       console.log(renderEventMonkeyKinds(opts.json === true).join('\n'));
     });
-  sim.command('devices')
+  const devices = sim.command('devices')
     .description('정본 목장치 카탈로그를 읽기 전용으로 조회한다')
+    .option('--missing', 'test 우주에 기록된 미해결 mock 장치 요청 조회')
     .option('--json', '카탈로그 JSON 출력')
-    .action((opts: { json?: boolean }) => {
+    .action((opts: { json?: boolean; missing?: boolean }) => {
+      if (opts.missing) {
+        try {
+          const rows = listMockDeviceRequests();
+          console.log(opts.json ? JSON.stringify({ missing: rows.filter((row) => row.state === 'missing'), resolved: rows.filter((row) => row.state === 'resolved') }, null, 2) : renderMockDeviceRequests(rows));
+        } catch (error) {
+          console.error(`sim devices --missing: ${error instanceof Error ? error.message : String(error)}`);
+          process.exitCode = 2;
+        }
+        return;
+      }
       const catalog = loadMockScenarioCatalog();
       console.log(opts.json ? JSON.stringify(catalog, null, 2) : renderMockScenarioDevices(catalog).join('\n'));
+    });
+  devices.command('request <cellId>')
+    .description('test 우주에 필요한 mock 장치와 미충족 경계를 기록한다')
+    .requiredOption('--boundary <boundary>', '미충족 경계')
+    .requiredOption('--nearest <deviceId>', '가장 가까운 기존 mock 장치 ID')
+    .option('--json', '구조화 출력')
+    .action((cellId: string, opts: { boundary: string; nearest: string; json?: boolean }, command) => {
+      const json = opts.json === true || command.optsWithGlobals().json === true;
+      try {
+        const row = requestMockDevice({ cellId, boundary: opts.boundary, nearestDeviceId: opts.nearest });
+        console.log(json ? JSON.stringify(row, null, 2) : `mock device request ${row.id}: ${row.cellId} ${row.state}`);
+      } catch (error) {
+        console.error(`sim devices request: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 2;
+      }
     });
   const world = sim.command('world').description('test 우주 안에서 독립 시뮬레이션 작업공간과 선언형 세계를 다룬다');
   world.command('validate <world-yaml>')
@@ -68,7 +95,7 @@ export function registerSimCommands(program: Command): void {
       }
     });
   world.command('create <id>')
-    .description('빈 격리 시뮬레이션 작업공간을 만든다')
+    .description('test 우주에 mock catalog의 MD 소스 모듈을 조립한 작업공간을 만든다')
     .action((id: string) => {
       try {
         console.log(JSON.stringify(createSimWorld(id)));

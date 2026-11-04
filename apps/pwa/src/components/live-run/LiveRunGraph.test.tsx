@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { act, create, type ReactTestInstance } from 'react-test-renderer';
 import { ReactFlow } from '@xyflow/react';
@@ -45,7 +46,7 @@ const nodeMock = (width: number) => () => ({
   clientWidth: width, clientHeight: 700, offsetWidth: width, offsetHeight: 700, style: {}, ownerDocument: globalThis.document,
 });
 
-async function mount(width: number, requests: string[] = [], traversal = TRAVERSAL, graph = GRAPH, throughPage = false) {
+async function mount(width: number, requests: string[] = [], traversal = TRAVERSAL, graph = GRAPH, throughPage = false, stageMode = false, runId = 'run-390') {
   const fetchImpl = (async (url: string) => {
     requests.push(String(url));
     if (String(url).includes('/v1/harness/run-traversal')) return new Response(JSON.stringify(traversal), { status: 200 });
@@ -61,11 +62,11 @@ async function mount(width: number, requests: string[] = [], traversal = TRAVERS
         <NexusProvider client={client}>
           {throughPage ? (
             <AppRouterContext.Provider value={{ replace: () => {} } as never}>
-              <SearchParamsContext.Provider value={new URLSearchParams({ run: 'run-390' })}>
+              <SearchParamsContext.Provider value={new URLSearchParams({ run: runId })}>
                 <LiveRunPage />
               </SearchParamsContext.Provider>
             </AppRouterContext.Provider>
-          ) : <LiveRunGraph runId="run-390" />}
+          ) : <LiveRunGraph runId={runId} stageMode={stageMode} />}
         </NexusProvider>
       </QueryClientProvider>,
       { createNodeMock: nodeMock(width) },
@@ -200,6 +201,39 @@ describe('LiveRunGraph — 390px', () => {
     ]));
   });
 
+  test('DEMO1104 fixed traversal response renders B/C scenario injections through /live-run', async () => {
+    const traversal = JSON.parse(readFileSync(new URL('../../../../../test/fixtures/run-ledgers/demo1104-arg-9770d6f8.traversal.json', import.meta.url), 'utf8')) as HarnessRunTraversal;
+    const runId = '9770d6f8-39e6-412a-9e83-9447b7a2cd36';
+    const requests: string[] = [];
+    const declaredGraph: RunGraphDetail = {
+      ...GRAPH,
+      nodes: [...GRAPH.nodes,
+        { node_id: 'subscription-repair', kind: 'judge', recipe: 'subscription-repair', max_visits: 1 },
+        { node_id: 'headline-refresh', kind: 'researcher', recipe: 'headline-refresh', max_visits: 1 },
+      ],
+    };
+    root = await mount(1024, requests, traversal, declaredGraph, true, false, runId);
+    expect(requests).toContain('http://daemon/v1/harness/run-traversal?runId=' + runId);
+    const flow = root.root.findByType(ReactFlow);
+    const nodes = flow.props.nodes as Array<{ id: string; data: { provenance?: { type: string; scene?: string; reason: string; mock?: boolean } } }>;
+    expect(nodes.filter((node) => ['subscription-repair', 'headline-refresh'].includes(node.id))).toMatchObject([
+      { id: 'subscription-repair', data: { provenance: { type: 'scenario-injection', scene: 'B', reason: 'paid-wall recovery mock', mock: true } } },
+      { id: 'headline-refresh', data: { provenance: { type: 'scenario-injection', scene: 'C', reason: 'new headline reordering mock', mock: true } } },
+    ]);
+    expect(text(root.root.findByProps({ 'data-testid': 'scenario-injection-subscription-repair' })).trim()).toBe('시나리오 주입 · B · mock');
+    expect(text(root.root.findByProps({ 'data-testid': 'scenario-injection-headline-refresh' })).trim()).toBe('시나리오 주입 · C · mock');
+    expect(root.root.findByProps({ 'data-testid': 'scenario-injection-subscription-repair' }).props.title).toContain('paid-wall recovery mock');
+  });
+
+  test('non-mock scenario injection does not claim a mock label', async () => {
+    const traversal = JSON.parse(readFileSync(new URL('../../../../../test/fixtures/run-ledgers/demo1104-arg-9770d6f8.traversal.json', import.meta.url), 'utf8')) as HarnessRunTraversal;
+    const graphEvents = traversal.graphEvents?.map((event) => event.type === 'node-added' && event.node === 'subscription-repair'
+      ? { ...event, reason: 'plugin grounded repair, not mock' }
+      : event);
+    root = await mount(1024, [], { ...traversal, graphEvents }, GRAPH);
+    expect(text(root.root.findByProps({ 'data-testid': 'scenario-injection-subscription-repair' })).trim()).toBe('시나리오 주입 · B');
+  });
+
   test('선언 그래프 밖에서 실제로 밟은 노드에만 새로 추가 표식을 붙인다', async () => {
     const addedNode = 'runtime-source-check';
     const traversal: HarnessRunTraversal = {
@@ -212,6 +246,30 @@ describe('LiveRunGraph — 390px', () => {
     expect(nodes.find((node) => node.id === addedNode)?.data.adaptiveLabel).toBe('새로 추가');
     expect(nodes.find((node) => node.id === 'ship')?.data.adaptiveLabel).toBeUndefined();
     expect(root.root.findByProps({ 'data-testid': 'adaptive-event-runtime-source-check' }).children).toEqual(['새로 추가']);
+  });
+
+  test('무대 방문 패널은 관측된 복수 자원과 시각을 보이고 비어 있는 항목은 미계측으로 표시한다', async () => {
+    const traversal: HarnessRunTraversal = {
+      ...TRAVERSAL,
+      steps: [
+        { ...STEPS[0]!, resources: undefined },
+        { ...STEPS[1]!, resources: { host: 'gcp2', pod: 'worker-7', models: ['gpt-6-sol', 'claude-sonnet-5'], plugins: ['browser', 'search'] } },
+      ],
+    };
+    root = await mount(1024, [], traversal, GRAPH, false, true);
+    const flow = root.root.findByType(ReactFlow);
+    await act(async () => { flow.props.onNodeClick({}, { id: 'intake', type: 'live' }); });
+    const panel = root.root.findByProps({ 'data-testid': 'node-detail' });
+    const unmeasured = root.root.findByProps({ 'data-testid': 'visit-resources-intake-1' });
+    expect(text(panel)).toContain('시각 18:00:00');
+    expect(text(panel)).toContain('소요 1초');
+    expect(text(unmeasured)).toContain('호스트 미계측');
+    expect(text(unmeasured)).toContain('플러그인 미계측');
+
+    await act(async () => { flow.props.onNodeClick({}, { id: 'compose', type: 'live' }); });
+    const observed = root.root.findByProps({ 'data-testid': 'node-detail' });
+    expect(text(observed)).toContain('모델 gpt-6-sol, claude-sonnet-5');
+    expect(text(observed)).toContain('플러그인 browser, search');
   });
 
   test('넓은 화면(≥700px) 배치는 그대로 — 좁은 화면 수리가 넓은 골을 침범하지 않는다', async () => {

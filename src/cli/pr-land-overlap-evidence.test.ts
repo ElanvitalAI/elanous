@@ -627,7 +627,7 @@ describe('official OP review waiver fixtures', () => {
     'opwaiver-32646-1694ccc7a170.json',
     'opwaiver-33113-3ab51f05968f.json',
   ];
-  const runFixture = (name: string, mutate?: (value: Record<string, unknown>) => void) => {
+  const runFixture = (name: string, mutate?: (value: Record<string, unknown>) => void, includeSupersedes = false) => {
     const selectedText = readFileSync(join(fixtureDir, name), 'utf8');
     const selectedRecord = JSON.parse(selectedText) as Record<string, unknown>;
     if (mutate) mutate(selectedRecord);
@@ -639,7 +639,8 @@ describe('official OP review waiver fixtures', () => {
     const names = [selectedName, ...(priorName ? [priorName] : [])];
     const selectedPath = `${STD_DIR}/${selectedName}`;
     const evidencePath = '/evidence.json';
-    const evidence = JSON.stringify({ pr, head, reviewResult: selectedPath });
+    const evidence = JSON.stringify({ pr, head, reviewResult: selectedPath,
+      ...(includeSupersedes && priorName ? { supersedes: [{ reviewResult: `${STD_DIR}/${priorName}`, reason: 'review-verdict-fail' }] } : {}) });
     const run: CmdRunner = () => ({ ok: true, out: '', err: '' });
     return verifyOverlapEvidence({
       evidencePath, pr, expectedHead: head, remote: 'origin', branch: 'main', cwd: '/repo', run,
@@ -661,20 +662,25 @@ describe('official OP review waiver fixtures', () => {
     }
   });
 
+  test('a complete newer OP adjudication supersedes the same-head FAIL without an OPEN follow-up PR', () => {
+    expect(runFixture('opwaiver-33097-1cc85900413c.json', undefined, true))
+      .toMatchObject({ ok: true, mode: 'already-ancestor' });
+  });
+
   test('refuses an OP-waiver PASS without exact-head zero-fail test evidence or complete approved dispositions', () => {
     const fixture = 'opwaiver-33097-1cc85900413c.json';
     expect(runFixture(fixture, (value) => {
       const waiver = value.waiver as Record<string, unknown>;
       (waiver.headTestRun as Record<string, unknown>).sha = 'f'.repeat(40);
-    })).toMatchObject({ ok: false, reason: 'review-op-waiver-head-test-missing' });
+    }, true)).toMatchObject({ ok: false, reason: 'review-op-waiver-head-test-missing' });
     expect(runFixture(fixture, (value) => {
       const waiver = value.waiver as Record<string, unknown>;
       (waiver.dispositions as Array<Record<string, unknown>>)[0]!.evidence = '';
-    })).toMatchObject({ ok: false, reason: 'review-op-waiver-disposition-invalid' });
+    }, true)).toMatchObject({ ok: false, reason: 'review-op-waiver-disposition-invalid' });
     expect(runFixture(fixture, (value) => {
       const waiver = value.waiver as Record<string, unknown>;
       waiver.approvedBy = '';
-    })).toMatchObject({ ok: false, reason: 'review-op-waiver-approval-missing' });
+    }, true)).toMatchObject({ ok: false, reason: 'review-op-waiver-approval-missing' });
   });
 
   test('same-head OP waiver must name the failed review and disposition every finding', () => {
@@ -783,6 +789,44 @@ describe('advanced base window (OVERLAP-EVIDENCE-BASE-WINDOW)', () => {
   test('refuses a window commit that touches the PR files and asks for a re-judge', () => {
     expect(verifyWindow({ prFiles: ['src/cli/pr-cli.ts'], window: [{ sha: WINDOW_COMMIT, files: ['src/cli/pr-cli.ts'] }] }))
       .toMatchObject({ ok: false, reason: expect.stringContaining('base-stale-overlap:'), baseTip: BASE_TIP });
+  });
+});
+
+describe('same-head error review candidates', () => {
+  const errorBody = JSON.stringify({ pr: PR, headCommit: HEAD, error: 'review process cap refusal' });
+  const passBody = JSON.stringify({ pr: PR, headCommit: HEAD, reviewed: true, verdict: 'pass', mustFix: [] });
+
+  test('ignores a same-head error candidate whenever a PASS/WARN mustFix-zero exists', () => {
+    const error = `card-error-${PR}-${HEAD.slice(0, 10)}.json`;
+    const pass = `card-pass-${PR}-${HEAD.slice(0, 12)}.json`;
+    expect(verifyAllSameHeadReviews({
+      pr: PR, expectedHead: HEAD, reviewResultsDir: STD_DIR, listDir: () => [error, pass],
+      readFile: (path) => basename(path) === error ? errorBody : passBody,
+    })).toEqual({ ok: true, reviewResult: `${STD_DIR}/${pass}` });
+  });
+
+  test('keeps refusing when same-head error candidates have no valid review', () => {
+    const error = `card-error-${PR}-${HEAD.slice(0, 10)}.json`;
+    expect(verifyAllSameHeadReviews({
+      pr: PR, expectedHead: HEAD, reviewResultsDir: STD_DIR, listDir: () => [error],
+      readFile: () => errorBody,
+    })).toEqual({ ok: false, reason: 'review-error' });
+  });
+
+  test('explicit evidence selects a valid same-head review over an error candidate regardless of mtime', () => {
+    const error = `card-error-${PR}-${HEAD.slice(0, 10)}.json`;
+    const pass = `card-pass-${PR}-${HEAD.slice(0, 12)}.json`;
+    const selected = `${STD_DIR}/${pass}`;
+    const run: CmdRunner = () => ({ ok: true, out: '', err: '' });
+    expect(verifyOverlapEvidence({
+      evidencePath: '/evidence.json', pr: PR, expectedHead: HEAD, remote: 'origin', branch: 'main', cwd: '/repo', run,
+      reviewResultsDir: STD_DIR, listDir: () => [error, pass], reviewMtime: (path) => path.endsWith(error) ? 999 : 1,
+      reviewRealPath: (path) => path,
+      readFile: (path) => path === '/evidence.json'
+        ? JSON.stringify({ pr: PR, head: HEAD, reviewResult: `${STD_DIR}/${error}` })
+        : path.endsWith(error) ? errorBody : passBody,
+      overlappingLandings: ['abcdef1234567'],
+    })).toMatchObject({ ok: true, mode: 'already-ancestor', reviewResult: selected });
   });
 });
 

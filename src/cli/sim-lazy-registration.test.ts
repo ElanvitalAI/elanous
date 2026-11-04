@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { resolve } from 'node:path';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { delimiter, resolve, join } from 'node:path';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 const entry = resolve(import.meta.dir, '../../bin/elanous.mjs');
@@ -33,6 +33,41 @@ describe('lazy sim command registration', () => {
       expect(run(flags).stdout).toBe(canonicalHelp.stdout);
     }
   }, 180_000);
+  test('root help succeeds from blank HOME and outside-Git cwd when rev-parse fails', () => {
+    const directory = mkdtempSync(resolve(tmpdir(), 'elanous-help-no-git-'));
+    try {
+      const stubBin = join(directory, 'bin');
+      const gitLog = join(directory, 'git.log');
+      mkdirSync(stubBin);
+      const gitStub = join(stubBin, 'git');
+      writeFileSync(gitStub, [
+        '#!/bin/sh',
+        'printf "%s\\n" "$*" >> "$GIT_STUB_LOG"',
+        '[ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ] && exit 1',
+        'exit 0',
+        '',
+      ].join('\n'));
+      chmodSync(gitStub, 0o755);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: directory,
+        PATH: [stubBin, process.env.PATH ?? ''].filter(Boolean).join(delimiter),
+        GIT_STUB_LOG: gitLog,
+      };
+      delete env.GIT_DIR;
+      delete env.GIT_WORK_TREE;
+      delete env.GIT_COMMON_DIR;
+      const result = spawnSync(process.execPath, [entry, '--help'], {
+        cwd: directory, env, encoding: 'utf8', timeout: 45_000,
+      });
+      expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+      expect(result.stdout).toContain('sim');
+      expect(existsSync(gitLog)).toBe(true);
+      expect(readFileSync(gitLog, 'utf8')).toContain('rev-parse HEAD');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
   test('exported Commander program supports sim run without runCli', () => {
     const directory = mkdtempSync(resolve(tmpdir(), 'elanous-sim-direct-'));
     const missing = resolve(directory, 'missing-scenario.yaml');

@@ -112,7 +112,30 @@ export function parseLinearSecretaryManifest(description: string, currentIssueId
   const end = description.indexOf(MANIFEST_END);
   if (start < 0 || end <= start) return undefined;
   try {
-    const manifest = JSON.parse(description.slice(start + MANIFEST_START.length, end).trim()) as Partial<LinearSecretaryManifest>;
+    const raw = description.slice(start + MANIFEST_START.length, end).trim();
+    // Linear markdown edits may preserve escaped JSON array delimiters as `\\[` / `\\]`.
+    // Normalize only the tasks array boundaries; do not unescape arbitrary manifest text.
+    const tasksArray = /"tasks"\s*:\s*\\\[/.exec(raw);
+    let json = raw;
+    if (tasksArray?.index !== undefined) {
+      const open = tasksArray.index + tasksArray[0].lastIndexOf('\\[');
+      let inString = false;
+      let escaped = false;
+      let close = -1;
+      for (let index = open + 2; index < raw.length; index++) {
+        const char = raw[index]!;
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (char === '\\') escaped = true;
+          else if (char === '"') inString = false;
+          continue;
+        }
+        if (char === '"') { inString = true; continue; }
+        if (char === '\\' && raw[index + 1] === ']') { close = index; break; }
+      }
+      if (close >= 0) json = `${raw.slice(0, open)}[${raw.slice(open + 2, close)}]${raw.slice(close + 2)}`;
+    }
+    const manifest = JSON.parse(json) as Partial<LinearSecretaryManifest>;
     if (typeof manifest.parentIssueId !== 'string' || !manifest.parentIssueId.trim() || !Array.isArray(manifest.tasks) ||
         !manifest.tasks.length || !manifest.tasks.every(task => task && typeof task.issueId === 'string' && task.issueId.trim() && typeof task.title === 'string' && task.title.trim()) ||
         !manifest.tasks.some(task => task.issueId === currentIssueId)) return undefined;

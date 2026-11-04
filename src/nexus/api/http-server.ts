@@ -35,6 +35,8 @@ import { ensureAuthToken } from '../../auth/acp-token.js';
 import { pushEvent, type NexusState } from '../state/state.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { machineForToken } from '../../control-plane/member-tokens.js';
+import { handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
 import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
 
 export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
@@ -59,6 +61,7 @@ import { dispatchIntentPredictionRoute } from './intent-prediction.js';
 import { handleNotificationAction } from './notification-action.js';
 import { handleUserIntentEmit, handleUserIntentBatch } from './user-intents.js';
 import { handleDebugLogsBatch } from './debug-logs.js';
+import { handleLogFederationBatch, handleLogFederationRevoke } from '../../mss/logging/log-federation.js';
 import { handleOutboundTokens, type OutboundTokenRouteOpts } from './outbound-tokens.js';
 // Cascade-zyu W9 / W9b / W9c endpoint dispatch — added by W9d-FU (2026-05-12).
 // Each handler does its own method check internally; the dispatch block
@@ -1101,6 +1104,23 @@ export async function routeRequest(
     }
     const routed = handleGraphRunRoute(method, pathname);
     if (routed) return routed;
+    return jsonResponse({ error: 'method-not-allowed' }, 405);
+  }
+
+  // Warm-pool pool declarations are authoritative in the Nexus resource ledger.
+  // Machine credentials can read only declarations that include their host; owner bearer can publish declarations.
+  if (pathname === '/v1/resource-ledger/pools') {
+    if (method === 'GET') {
+      const offered = req.headers.get('authorization');
+      const presented = offered?.startsWith('Bearer ') ? offered.slice(7).trim() : '';
+      const machine = presented ? machineForToken(presented, effectiveInstanceRoot()) : undefined;
+      if (!machine) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleResourceLedgerPoolsApi(machine);
+    }
+    if (method === 'POST') {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleResourceLedgerPoolDeclarationPost(req);
+    }
     return jsonResponse({ error: 'method-not-allowed' }, 405);
   }
 
@@ -2203,6 +2223,8 @@ export async function routeRequest(
     if (pathname === '/v1/debug-logs/batch' && (method === 'POST' || method === 'OPTIONS')) {
       return handleDebugLogsBatch(req);
     }
+    if (pathname === '/v1/log-federation/batch') return handleLogFederationBatch(req);
+    if (pathname === '/v1/log-federation/revoke') return handleLogFederationRevoke(req);
     // W7 Z11.a-1 — outbound device token registry. GET allowed for the
     // counts debug surface; POST/DELETE for mutation. Wired only when
     // opts.outboundTokens carries a tokenStore (runNexus boot).

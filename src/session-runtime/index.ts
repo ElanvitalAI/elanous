@@ -542,7 +542,7 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
     description: 'Retrieve the result of a background sub-agent task.',
     build: () => buildAgentOutputTool(),
     match: () => false,
-    dispatch: async (args) => await dispatchAgentOutput(args),
+    dispatch: async (args, signal) => await dispatchAgentOutput(args, { signal }),
     preferRuntime: true,
   },
   {

@@ -273,9 +273,10 @@ test('interactive setup registers starter topics once and skips existing sources
     await program.parseAsync(['node', 'elanous', 'setup', '--non-interactive']);
     expect(listSources({ seat: 'user' }, root)).toHaveLength(1);
     await program.parseAsync(['node', 'elanous', 'setup']);
-    expect(listSources({ seat: 'user' }, root).map(s => s.spec)).toEqual(['agents', 'bun']);
+    expect(listSources({ seat: 'user' }, root).filter(s => s.kind === 'rss').map(s => [s.kind, new URL(s.spec).searchParams.get('q')]))
+      .toEqual([['rss', 'agents'], ['rss', 'bun']]);
     await program.parseAsync(['node', 'elanous', 'setup']);
-    expect(listSources({ seat: 'user' }, root)).toHaveLength(2);
+    expect(listSources({ seat: 'user' }, root)).toHaveLength(3);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

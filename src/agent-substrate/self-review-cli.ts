@@ -16,7 +16,7 @@
 
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './review-observation.js';
@@ -111,7 +111,7 @@ export interface SelfReviewCliDeps {
   /** `gh` 호출. 실패도 예외 없이 `{status, stdout, stderr}` 로 돌려준다(spawnSync 동형). */
   gh(args: string[], timeoutMs: number): { status: number | null; stdout: string; stderr: string };
   /** ⭐ `git` 호출(선택). 주입되면 리뷰 증거를 **이 PR 이 저작한 변경**으로 좁힌다(아래 참조).
-   *  미주입이면 종전대로 `gh pr diff`(three-dot) 전체를 쓴다 — 기존 호출부·테스트 무변경. */
+   *  저장 리뷰 delta 에서는 main-merge 구간을 가를 수 없어 미주입이면 fail-closed 한다. */
   git?(args: string[], timeoutMs: number): { status: number | null; stdout: string; stderr: string };
   /** Repository-bounded file reader used only to complete truncated diff context. */
   readReferencedFile?: ReferencedFileReader;
@@ -181,7 +181,7 @@ export interface SelfReviewCliOutcome {
 
 interface SavedReviewEvidence {
   heads: string[];
-  records: Array<{ head: string; reviewedAt: number; model?: string }>;
+  records: Array<{ head: string; reviewedAt: number; model?: string; capExempt?: boolean }>;
   loopRounds: Array<{ head: string; reviewedAt: number; state: 'clear' | 'stale-reopen' }>;
   fixedFindings: string[];
   priorFindings: string[];
@@ -348,10 +348,11 @@ function readDeltaDiffAtHead(pr: string, base: string, deps: SelfReviewCliDeps):
   const comparePath = `repos/${repo}/compare/${base}...${before.value}`;
   const comparison = deps.gh(['api', comparePath], 25_000);
   if (comparison.status !== 0) return { error: 'saved-review-head-not-ancestor', headCommit: before.value };
+  let comparisonMeta: { status?: unknown; merge_base_commit?: { sha?: unknown }; ahead_by?: unknown; commits?: unknown };
   try {
-    const parsed = JSON.parse(comparison.stdout) as { status?: unknown; merge_base_commit?: { sha?: unknown } };
-    if (parsed.status !== 'ahead' || typeof parsed.merge_base_commit?.sha !== 'string'
-      || parsed.merge_base_commit.sha.toLowerCase() !== base.toLowerCase()) {
+    comparisonMeta = JSON.parse(comparison.stdout) as typeof comparisonMeta;
+    if (comparisonMeta.status !== 'ahead' || typeof comparisonMeta.merge_base_commit?.sha !== 'string'
+      || comparisonMeta.merge_base_commit.sha.toLowerCase() !== base.toLowerCase()) {
       return { error: 'saved-review-head-not-ancestor', headCommit: before.value };
     }
   } catch { return { error: 'compare-response-invalid', headCommit: before.value }; }
@@ -359,8 +360,107 @@ function readDeltaDiffAtHead(pr: string, base: string, deps: SelfReviewCliDeps):
   if (diff.status !== 0 || !diff.stdout.trim()) return { error: 'delta-diff-unavailable', headCommit: before.value };
   const after = prHeadCommit(pr, deps);
   if (after.state !== 'known' || after.value !== before.value) return { error: 'current-pr-head-moved', headCommit: before.value };
+  // A complete linear compare graph proves there is no merge to exclude, even when these SHAs are absent locally.
+  const authoredDelta = comparisonHasCompleteLinearHistory(base, before.value, comparisonMeta)
+    ? { excludedFiles: 0 }
+    : deltaDiffWithoutMainMerges(pr, base, before.value, deps);
+  if ('error' in authoredDelta) return { error: authoredDelta.error, headCommit: before.value };
   return { read: { diff, headCommit: before.value, headCommitState: 'known', currentHeadCommit: after.value,
-    currentHeadCommitState: 'known', stale: false, refetched: false, source: 'sha-pinned', baseCommit: base.toLowerCase() } };
+    currentHeadCommitState: 'known', stale: false, refetched: false, source: 'sha-pinned', baseCommit: base.toLowerCase(),
+    ...(authoredDelta.diff === undefined ? {} : { diff: { ...diff, stdout: authoredDelta.diff } }),
+    excludedMainMergeFiles: authoredDelta.excludedFiles } };
+}
+
+/** Keep PR first-parent segments while excluding only merges whose second parent is on the PR base branch. */
+function deltaDiffWithoutMainMerges(
+  pr: string,
+  reviewedHead: string,
+  currentHead: string,
+  deps: SelfReviewCliDeps,
+):
+  | { diff?: string; excludedFiles?: number }
+  | { error: string } {
+  // A pinned compare cannot distinguish PR commits from base merges; without Git ancestry, do not review it as a delta.
+  if (!deps.git) return { error: 'main-merge-history-unavailable' };
+  const repository = deps.reviewRepositoryPath ? resolve(deps.reviewRepositoryPath) : undefined;
+  const git = (args: string[], timeoutMs = 15_000) => deps.git!(repository ? ['-C', repository, ...args] : args, timeoutMs);
+  for (const commit of [reviewedHead, currentHead]) {
+    if (git(['rev-parse', '--verify', `${commit}^{commit}`]).status === 0) continue;
+    if (git(['fetch', 'origin', commit], 30_000).status !== 0
+      || git(['rev-parse', '--verify', `${commit}^{commit}`]).status !== 0) return { error: 'main-merge-delta-head-unavailable' };
+  }
+  const firstParentHistory = git(['rev-list', '--first-parent', currentHead]);
+  if (firstParentHistory.status !== 0) return { error: 'main-merge-history-unavailable' };
+  if (!firstParentHistory.stdout.split(/\s+/).includes(reviewedHead)) return { error: 'main-merge-review-head-not-first-parent' };
+  const merges = git(['rev-list', '--first-parent', '--reverse', '--merges', `${reviewedHead}..${currentHead}`]);
+  if (merges.status !== 0) return { error: 'main-merge-history-unavailable' };
+  const mergeCommits = merges.stdout.trim().split(/\s+/).filter(Boolean);
+  if (mergeCommits.length === 0) return { excludedFiles: 0 };
+  const view = deps.gh(['pr', 'view', pr, '--json', 'baseRefName'], 15_000);
+  if (view.status !== 0) return { error: 'main-merge-base-branch-unavailable' };
+  let baseRefName = '';
+  try {
+    const value = JSON.parse(view.stdout) as { baseRefName?: unknown };
+    if (typeof value.baseRefName === 'string' && /^[\w./-]{1,255}$/.test(value.baseRefName)) baseRefName = value.baseRefName;
+  } catch { /* keep unknown */ }
+  if (!baseRefName) return { error: 'main-merge-base-branch-unavailable' };
+  if (git(['fetch', 'origin', `refs/heads/${baseRefName}`], 30_000).status !== 0) return { error: 'main-merge-base-fetch-failed' };
+  const baseTip = git(['rev-parse', '--verify', 'FETCH_HEAD^{commit}']);
+  if (baseTip.status !== 0 || !COMMIT_OID.test(baseTip.stdout.trim())) return { error: 'main-merge-base-tip-unavailable' };
+  let cursor = reviewedHead;
+  let foundMainMerge = false;
+  const segments: string[] = [];
+  const excludedFiles = new Set<string>();
+  for (const merge of mergeCommits) {
+    const parents = git(['rev-list', '--parents', '-n', '1', merge]);
+    const fields = parents.stdout.trim().split(/\s+/);
+    if (parents.status !== 0 || fields.length !== 3 || fields[0] !== merge) return { error: 'main-merge-parents-unavailable' };
+    const [firstParent, secondParent] = fields.slice(1);
+    if (!COMMIT_OID.test(firstParent ?? '') || !COMMIT_OID.test(secondParent ?? '')) return { error: 'main-merge-parents-unavailable' };
+    const fromBase = git(['merge-base', '--is-ancestor', secondParent!, baseTip.stdout.trim()]);
+    if (fromBase.status === 1) continue;
+    if (fromBase.status !== 0) return { error: 'main-merge-ancestry-unavailable' };
+    const resolution = git(['show', '--remerge-diff', '--format=', '--no-ext-diff', '--no-color', merge], 30_000);
+    if (resolution.status !== 0) return { error: 'main-merge-resolution-unknown' };
+    if (resolution.stdout.trim()) return { error: 'main-merge-has-resolution-changes' };
+    const beforeMerge = git(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--binary', `${cursor}..${firstParent}`], 30_000);
+    if (beforeMerge.status !== 0) return { error: 'main-merge-pr-segment-unavailable' };
+    if (beforeMerge.stdout) segments.push(beforeMerge.stdout);
+    const mergedFiles = git(['diff', '--name-only', '-z', `${firstParent}..${merge}`], 30_000);
+    if (mergedFiles.status !== 0) return { error: 'main-merge-file-list-unavailable' };
+    for (const path of mergedFiles.stdout.split('\0')) if (path) excludedFiles.add(path);
+    // The merge tree is the next PR-authored baseline. Starting at the second
+    // parent would replay every pre-merge PR change in the final segment.
+    cursor = merge;
+    foundMainMerge = true;
+  }
+  if (!foundMainMerge) return { excludedFiles: 0 };
+  const afterMerge = git(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--binary', `${cursor}..${currentHead}`], 30_000);
+  if (afterMerge.status !== 0) return { error: 'main-merge-pr-segment-unavailable' };
+  if (afterMerge.stdout) segments.push(afterMerge.stdout);
+  return { diff: segments.join(''), excludedFiles: excludedFiles.size };
+}
+
+/** GitHub's compare response proves the no-merge case without requiring local objects or a network fetch. */
+function comparisonHasCompleteLinearHistory(
+  reviewedHead: string,
+  currentHead: string,
+  comparisonMeta?: { ahead_by?: unknown; commits?: unknown },
+): boolean {
+  if (!comparisonMeta || !Number.isSafeInteger(comparisonMeta.ahead_by) || !Array.isArray(comparisonMeta.commits)
+    || comparisonMeta.commits.length !== comparisonMeta.ahead_by || comparisonMeta.commits.length === 0) return false;
+  let parent = reviewedHead.toLowerCase();
+  for (const item of comparisonMeta.commits) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const commit = item as { sha?: unknown; parents?: unknown };
+    if (typeof commit.sha !== 'string' || !COMMIT_OID.test(commit.sha) || !Array.isArray(commit.parents) || commit.parents.length !== 1) return false;
+    const firstParent = commit.parents[0];
+    if (!firstParent || typeof firstParent !== 'object' || Array.isArray(firstParent)
+      || typeof (firstParent as { sha?: unknown }).sha !== 'string'
+      || ((firstParent as { sha: string }).sha).toLowerCase() !== parent) return false;
+    parent = commit.sha.toLowerCase();
+  }
+  return parent === currentHead.toLowerCase();
 }
 
 function deltaReviewIntent(base: SavedReviewForDelta, preserveUnmarkedNewFindings = false): string {
@@ -403,6 +503,55 @@ function assessDeltaReview(review: ReviewResult, previous: SavedReviewForDelta, 
   return { valid: true, mustFix: [...openFindings, ...newFindings], deltaFindings, excludedNewFindings };
 }
 
+export function classifyMainMergeOnlyCapExemptHead(
+  records: ReadonlyArray<{ head?: string; reviewedAt?: number }>,
+  head: string | undefined,
+  baseRefName: string | undefined,
+  baseRefOid: string | undefined,
+  git: ((args: string[], timeoutMs: number) => { status: number | null; stdout: string; stderr: string }) | undefined,
+): string | undefined {
+  if (!git || !head || !COMMIT_OID.test(head) || baseRefName !== 'main'
+    || !baseRefOid || !COMMIT_OID.test(baseRefOid)) return undefined;
+  const latest = records.reduce<{ head?: string; reviewedAt?: number } | undefined>(
+    (acc, record) => !acc || (record.reviewedAt ?? 0) > (acc.reviewedAt ?? 0) ? record : acc, undefined,
+  );
+  const base = latest?.head;
+  if (!base || !COMMIT_OID.test(base) || base.toLowerCase() === head.toLowerCase()) return undefined;
+  const parents = git(['rev-list', '--parents', '-n', '1', head], 10_000);
+  const fields = parents.stdout.trim().split(/\s+/);
+  if (parents.status !== 0 || fields[0]?.toLowerCase() !== head.toLowerCase() || fields.length !== 3
+    || !COMMIT_OID.test(fields[1] ?? '') || !COMMIT_OID.test(fields[2] ?? '')) return undefined;
+  const firstParent = fields[1]!.toLowerCase();
+  const mainParent = fields[2]!.toLowerCase();
+  if (git(['merge-base', '--is-ancestor', base.toLowerCase(), firstParent], 10_000).status !== 0) return undefined;
+  if (git(['merge-base', '--is-ancestor', mainParent, baseRefOid.toLowerCase()], 10_000).status !== 0) return undefined;
+  const firstParentHistory = git(['rev-list', '--first-parent', firstParent], 10_000);
+  if (firstParentHistory.status !== 0) return undefined;
+  const firstParentCommits = firstParentHistory.stdout.trim().split(/\s+/).filter(Boolean);
+  const reviewedIndex = firstParentCommits.findIndex((commit) => commit.toLowerCase() === base.toLowerCase());
+  if (reviewedIndex < 0) return undefined; // The reviewed head must be on the first-parent lineage.
+  for (const commit of firstParentCommits.slice(0, reviewedIndex)) {
+    const commitParents = git(['rev-list', '--parents', '-n', '1', commit], 10_000);
+    const commitFields = commitParents.stdout.trim().split(/\s+/);
+    if (commitParents.status !== 0 || commitFields[0]?.toLowerCase() !== commit.toLowerCase()
+      || commitFields.length !== 3 || !COMMIT_OID.test(commitFields[1] ?? '') || !COMMIT_OID.test(commitFields[2] ?? '')) return undefined;
+    const intermediateFirst = commitFields[1]!.toLowerCase();
+    const intermediateMain = commitFields[2]!.toLowerCase();
+    if (git(['merge-base', '--is-ancestor', intermediateMain, baseRefOid.toLowerCase()], 10_000).status !== 0) return undefined;
+    const intermediateTree = git(['merge-tree', '--write-tree', intermediateFirst, intermediateMain], 10_000);
+    const actualIntermediateTree = git(['rev-parse', `${commit.toLowerCase()}^{tree}`], 10_000);
+    const expectedIntermediateTree = intermediateTree.stdout.trim().split(/\s+/)[0];
+    if (intermediateTree.status !== 0 || !expectedIntermediateTree || actualIntermediateTree.status !== 0
+      || actualIntermediateTree.stdout.trim().toLowerCase() !== expectedIntermediateTree.toLowerCase()) return undefined;
+  }
+  const mergedTree = git(['merge-tree', '--write-tree', firstParent, mainParent], 10_000);
+  if (mergedTree.status !== 0) return undefined; // Conflicts require a human resolution and are not cap-exempt.
+  const expectedTree = mergedTree.stdout.trim().split(/\s+/)[0];
+  const actualTree = git(['rev-parse', `${head.toLowerCase()}^{tree}`], 10_000);
+  if (!expectedTree || actualTree.status !== 0 || actualTree.stdout.trim().toLowerCase() !== expectedTree.toLowerCase()) return undefined;
+  return head.toLowerCase();
+}
+
 function savedReviewEvidence(
   pr: string,
   root = effectiveInstanceRoot(),
@@ -413,7 +562,7 @@ function savedReviewEvidence(
   try { names = readdirSync(dir); } catch { return { heads: [], records: [], loopRounds: [], fixedFindings: [], priorFindings: [], unreadableFiles: [] }; }
   const escapedPr = pr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const matchingPrInName = new RegExp(`(?:^|-)${escapedPr}(?:-|\\.json$)`, 'i');
-  const records = new Map<string, { head: string; reviewedAt: number; model?: string }>();
+  const records = new Map<string, { head: string; reviewedAt: number; model?: string; capExempt?: boolean }>();
   const loopRounds = new Map<string, { head: string; reviewedAt: number; state: 'clear' | 'stale-reopen' }>();
   const fixedFindings = new Map<string, string>();
   let latestFindings: { reviewedAt: number; findings: string[] } | undefined;
@@ -453,7 +602,10 @@ function savedReviewEvidence(
       const model = [result.model, result.respondedModel, result.requestedModel]
         .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
       const existing = records.get(normalized);
-      if (!existing || reviewedAt > existing.reviewedAt) records.set(normalized, { head: normalized, reviewedAt, ...(model ? { model } : {}) });
+      const capExempt = result.mainMergeOnlyCapExempt === true;
+      if (!existing || reviewedAt > existing.reviewedAt) records.set(normalized, {
+        head: normalized, reviewedAt, ...(model ? { model } : {}), ...(capExempt ? { capExempt: true } : {}),
+      });
       const loopBreaker = result.loopBreaker;
       if (loopBreaker && typeof loopBreaker === 'object' && !Array.isArray(loopBreaker)) {
         const loopRecord = loopBreaker as Record<string, unknown>;
@@ -479,7 +631,7 @@ function savedReviewEvidence(
     }
   }
   const saved = [...records.values()];
-  return { heads: saved.map(({ head }) => head), records: saved, loopRounds: [...loopRounds.values()],
+  return { heads: saved.filter((record) => !record.capExempt).map(({ head }) => head), records: saved, loopRounds: [...loopRounds.values()],
     fixedFindings: [...fixedFindings.values()], priorFindings: latestFindings?.findings ?? [], unreadableFiles };
 }
 
@@ -596,6 +748,7 @@ interface DiffRead {
   /** `sha-pinned` 를 못 쓴 이유. 폴백했을 때만 채운다. ⛔ 부재와 미지를 같은 값으로 두지 않는다. */
   pinFallbackReason?: 'head-unknown' | 'base-oid-unknown' | 'repo-unknown' | 'compare-failed';
   baseCommit?: string;
+  excludedMainMergeFiles?: number;
 }
 
 type LocalHeadComparison =
@@ -850,13 +1003,13 @@ function comparisonObservation(comparison: LocalHeadComparison): Record<string, 
 }
 
 /** PR 의 base OID 와 `owner/repo` 를 한 번에 읽는다(SHA 고정 diff 에 둘 다 필요하다). */
-function prCompareAnchors(pr: string, deps: SelfReviewCliDeps): { baseOid?: string; repo?: string } {
-  const view = deps.gh(['pr', 'view', pr, '--json', 'baseRefOid,headRepository,headRepositoryOwner'], 15_000);
+function prCompareAnchors(pr: string, deps: SelfReviewCliDeps): { baseOid?: string; baseRefName?: string; repo?: string } {
+  const view = deps.gh(['pr', 'view', pr, '--json', 'baseRefName,baseRefOid,headRepository,headRepositoryOwner'], 15_000);
   if (view.status !== 0) return {};
   try {
     const parsed: unknown = JSON.parse(view.stdout);
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const row = parsed as { baseRefOid?: unknown; headRepository?: unknown; headRepositoryOwner?: unknown };
+    const row = parsed as { baseRefName?: unknown; baseRefOid?: unknown; headRepository?: unknown; headRepositoryOwner?: unknown };
     const baseOid = typeof row.baseRefOid === 'string' && COMMIT_OID.test(row.baseRefOid) ? row.baseRefOid : undefined;
     const owner = row.headRepositoryOwner !== null && typeof row.headRepositoryOwner === 'object'
       ? (row.headRepositoryOwner as { login?: unknown }).login : undefined;
@@ -864,7 +1017,8 @@ function prCompareAnchors(pr: string, deps: SelfReviewCliDeps): { baseOid?: stri
       ? (row.headRepository as { name?: unknown }).name : undefined;
     const repo = typeof owner === 'string' && typeof name === 'string' && /^[\w.-]{1,100}$/.test(owner) && /^[\w.-]{1,100}$/.test(name)
       ? `${owner}/${name}` : undefined;
-    return { ...(baseOid ? { baseOid } : {}), ...(repo ? { repo } : {}) };
+    const baseRefName = typeof row.baseRefName === 'string' && /^[\w./-]{1,255}$/.test(row.baseRefName) ? row.baseRefName : undefined;
+    return { ...(baseOid ? { baseOid } : {}), ...(baseRefName ? { baseRefName } : {}), ...(repo ? { repo } : {}) };
   } catch { return {}; }
 }
 
@@ -1045,6 +1199,7 @@ interface AuthoredEvidence {
   authoredBaseKind?: 'merge-base' | 'pr-first-parent';
   /** 안 좁힌 이유(좁혔으면 undefined). 부재와 미지를 가른다. */
   skipped?: 'no-git-seam' | 'base-unknown' | 'fetch-failed' | 'head-missing' | 'merge-base-unknown' | 'merged-range-unknown' | 'diff-failed' | 'nothing-to-narrow';
+  excludedMainMergeFiles?: number;
 }
 
 /**
@@ -1149,6 +1304,9 @@ export function narrowEvidenceToAuthored(pr: string, headSha: string, prDiff: st
 
 /** 리뷰 입력 머리에 붙는 증거 출처 한 줄 — 리뷰어가 **무엇을 보고 있는지** 알아야 한다. */
 export function renderEvidenceProvenance(e: AuthoredEvidence): string {
+  if (e.evidence === 'saved-review-delta') {
+    return `Review evidence: saved-review delta — ${e.prDiffFiles} file(s); main-merge content excluded: ${e.excludedMainMergeFiles ?? 'unknown'} file(s).`;
+  }
   const basis = e.authoredBase
     ? ` (authored base: ${e.authoredBase}; kind: ${e.authoredBaseKind ?? 'unknown'})`
     : '';
@@ -2102,6 +2260,10 @@ async function runSelfReviewCliCommandPinned(
   let failed = 0;
   const providedReviewerContext = loadReviewerContext(opts, deps.readReferencedFile);
   const hasProvidedReviewerContext = (opts.contextOrder?.length ?? 0) > 0 || (opts.context?.length ?? 0) > 0 || (opts.contextText?.length ?? 0) > 0;
+  // REVIEW-CAP-MAINMERGE-EXEMPT: a head that only merges main into the PR branch (no PR
+  // commits since the latest reviewed head) carries no new review payload, so the r5 cap
+  // preflight and the OP manual-allowance loop must not count it.
+  const mainMergeOnlyCapExemptHead = classifyMainMergeOnlyCapExemptHead;
   for (const pr of normalizedPrArgs as string[]) {
     const savedEvidence = savedReviewEvidence(pr, undefined, (file) => {
       deps.observeDoctorReview?.('saved-result-unreadable', { pr, file }, { level: 'warn' });
@@ -2111,13 +2273,17 @@ async function runSelfReviewCliCommandPinned(
     const shouldPersistCapResult = previousRoundCount >= 5 && !opts.reviewerMixPrimaryLane;
     const reason = opts.overCapReason?.trim();
     const authorization = previousRoundCount >= 5 ? readCapOverride(pr) : undefined;
-    const capPreflightHead = previousRoundCount >= 5 ? prHeadCommit(pr, deps).value.toLowerCase() : undefined;
+    const capPreflightHead = savedEvidence.records.length > 0 ? prHeadCommit(pr, deps).value.toLowerCase() : undefined;
+    const capPreflightAnchors = savedEvidence.records.length > 0 ? prCompareAnchors(pr, deps) : {};
+    const capExemptHead = savedEvidence.records.length > 0 && !opts.reviewerMixPrimaryLane && !opts.reviewerMixCapClaimed
+      ? mainMergeOnlyCapExemptHead(savedEvidence.records, capPreflightHead, capPreflightAnchors.baseRefName, capPreflightAnchors.baseOid, deps.git)
+      : undefined;
     deps.observeDoctorReview?.('round-counted', { pr, previousRoundCount, round: previousRoundCount + 1 });
     const opAllowed = previousRoundCount >= 5 && opAllowsReviewOverCap(pr);
     if (previousRoundCount >= 5) {
-      deps.observeDoctorReview?.('cap-attempt', { pr, previousRoundCount, round: previousRoundCount + 1, reasonProvided: Boolean(reason), opAllowed }, { level: 'warn' });
+      deps.observeDoctorReview?.('cap-attempt', { pr, previousRoundCount, round: previousRoundCount + 1, reasonProvided: Boolean(reason), opAllowed, mainMergeExempt: capExemptHead !== undefined }, { level: 'warn' });
     }
-    if (previousRoundCount >= 5 && (!opAllowed || (!authorization && !reason && !opts.reviewerMixCapClaimed))) {
+    if (previousRoundCount >= 5 && !capExemptHead && (!opAllowed || (!authorization && !reason && !opts.reviewerMixCapClaimed))) {
       const refusalHead = capPreflightHead ?? prHeadCommit(pr, deps).value;
       if (COMMIT_OID.test(refusalHead)) writeReviewLoopBreakerLock(pr, refusalHead, 'review-cap-exceeded');
       const message = !opAllowed
@@ -2201,18 +2367,49 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     const diffRead = diffResult.read;
+    let mainMergeCapExempt = false;
+    if (capExemptHead !== undefined && !opts.reviewerMixPrimaryLane && !opts.reviewerMixCapClaimed) {
+      const actualAnchors = prCompareAnchors(pr, deps);
+      const rechecked = mainMergeOnlyCapExemptHead(
+        savedEvidence.records, diffRead.headCommit.toLowerCase(), actualAnchors.baseRefName, actualAnchors.baseOid, deps.git,
+      );
+      mainMergeCapExempt = !diffRead.stale
+        && diffRead.currentHeadCommitState === 'known'
+        && diffRead.currentHeadCommit.toLowerCase() === diffRead.headCommit.toLowerCase()
+        && rechecked === diffRead.headCommit.toLowerCase();
+      if (!mainMergeCapExempt && previousRoundCount >= 5 && (!opAllowed || (!authorization && !reason && !opts.reviewerMixCapClaimed))) {
+        const message = `PR ${pr}: pinned diff head가 main-merge-only 예외를 충족하지 않아 r5 상한 예외가 필요합니다.`;
+        if (COMMIT_OID.test(diffRead.headCommit)) writeReviewLoopBreakerLock(pr, diffRead.headCommit, 'review-cap-exceeded');
+        deps.observeDoctorReview?.('cap-refused', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: 'merge-only-head-recheck-failed' }, { level: 'warn' });
+        deps.error(message);
+        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'waiver-needed', previousRoundCount, headCommit: diffRead.headCommit });
+        failed += 1;
+        continue;
+      }
+    }
     const loopLock = readReviewLoopBreakerLock(pr);
     // A cap refusal writes a loop-breaker lock before an OP can authorize the
     // retry. Let the normal cap preflight/one-use claim govern that specific
     // lock; other loop-breaker reasons remain an unconditional stop.
     const opAuthorizedCapRetry = loopLock?.reason === 'review-cap-exceeded'
       && previousRoundCount >= 5 && opAllowsReviewOverCap(pr) && Boolean(reason);
+    // REVIEW-CAP-MAINMERGE-EXEMPT: a cap refusal lock on a merge-only successor head is
+    // bypassed without the OP allowance loop — the head itself is exempt from the cap.
+    const capExemptLockHead = loopLock?.reason === 'review-cap-exceeded' && previousRoundCount >= 5
+      && !opts.reviewerMixPrimaryLane && !opts.reviewerMixCapClaimed
+      ? (() => {
+        const anchors = prCompareAnchors(pr, deps);
+        return mainMergeOnlyCapExemptHead(savedEvidence.records, diffRead.headCommit.toLowerCase(), anchors.baseRefName, anchors.baseOid, deps.git);
+      })()
+      : undefined;
+    const mainMergeCapExemptRetry = capExemptLockHead !== undefined && capExemptLockHead === diffRead.headCommit.toLowerCase();
+    mainMergeCapExempt ||= mainMergeCapExemptRetry;
     // Stale-reopen locks belong to the exact head that produced them. Other
     // waiver-needed reasons retain their existing global stop/OP-cap semantics.
     const sameHeadLoopLock = loopLock?.reason === 'two-consecutive-stale-reopen-rounds'
       && (!COMMIT_OID.test(diffRead.headCommit) || loopLock.head === diffRead.headCommit);
     if (loopLock && (loopLock.reason !== 'two-consecutive-stale-reopen-rounds' || sameHeadLoopLock)
-      && !opAuthorizedCapRetry) {
+      && !opAuthorizedCapRetry && !mainMergeCapExemptRetry) {
       const message = loopLock.reason === 'review-loop-lock-corrupt'
         ? `PR ${pr}: 반복 리뷰 lock 파일이 손상됐거나 신원이 맞지 않아 fail-closed 했습니다. lock 파일 점검이 필요합니다.`
         : `PR ${pr}: 반복 리뷰 중단 (${String(loopLock.reason ?? 'waiver-needed')}); OP 웨이버가 필요합니다.`;
@@ -2291,8 +2488,19 @@ async function runSelfReviewCliCommandPinned(
         (latest, record) => !latest || record.reviewedAt > latest.reviewedAt ? record : latest, undefined,
       );
       const classificationBase = latestReviewed?.head ?? authorization.head;
-      const ancestry = git(['merge-base', '--is-ancestor', classificationBase, diffRead.headCommit], 10_000);
-      const parents = git(['rev-list', '--parents', '-n', '1', diffRead.headCommit], 10_000);
+      const reviewRepository = deps.reviewRepositoryPath ? resolve(deps.reviewRepositoryPath) : undefined;
+      const reviewGit = reviewRepository
+        ? (args: string[], timeoutMs: number) => git(['-C', reviewRepository, ...args], timeoutMs)
+        : git;
+      const ancestryArgs = ['merge-base', '--is-ancestor', classificationBase, diffRead.headCommit];
+      const parentArgs = ['rev-list', '--parents', '-n', '1', diffRead.headCommit];
+      const ancestry = reviewGit(ancestryArgs, 10_000);
+      const parents = reviewGit(parentArgs, 10_000);
+      deps.log('review.cap-ancestry-measured', {
+        pr, repositoryPath: reviewRepository ?? null,
+        ancestryCommand: ['git', ...(reviewRepository ? ['-C', reviewRepository] : []), ...ancestryArgs], ancestryStatus: ancestry.status, ancestryStderr: ancestry.stderr.slice(-300),
+        parentCommand: ['git', ...(reviewRepository ? ['-C', reviewRepository] : []), ...parentArgs], parentStatus: parents.status, parentStderr: parents.stderr.slice(-300),
+      });
       const parentFields = parents.stdout.trim().split(/\s+/);
       const headIsMerge = parentFields.length > 2;
       const deltaHead = headIsMerge ? parentFields[1] : diffRead.headCommit;
@@ -2311,7 +2519,13 @@ async function runSelfReviewCliCommandPinned(
         // Non-merge commits brought in from main are reachable but are not on
         // this first-parent line. A merge-only head ends at its first parent;
         // a later PR commit remains in the candidate range.
-        const commits = git(['rev-list', '--first-parent', '--no-merges', `${classificationBase}..${deltaHead}`], 10_000);
+        const firstParentArgs = ['rev-list', '--first-parent', '--no-merges', `${classificationBase}..${deltaHead}`];
+        const commits = reviewGit(firstParentArgs, 10_000);
+        deps.log('review.cap-ancestry-measured', {
+          pr, repositoryPath: reviewRepository ?? null,
+          firstParentCommand: ['git', ...(reviewRepository ? ['-C', reviewRepository] : []), ...firstParentArgs],
+          firstParentStatus: commits.status, firstParentStderr: commits.stderr.slice(-300),
+        });
         if (commits.status !== 0) {
           const message = `PR ${pr}: 후속 head의 PR 변경 여부를 확인할 수 없어 상한 예외 리뷰를 거부합니다.`;
           deps.error(message);
@@ -2340,7 +2554,14 @@ async function runSelfReviewCliCommandPinned(
       deps.observeDoctorReview?.('cap-override', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason }, { level: 'warn' });
     }
     if (mergeOnlyDeltaRange) {
-      const delta = deps.git?.(['diff', '--no-ext-diff', `${mergeOnlyDeltaRange.base}...${mergeOnlyDeltaRange.head}`], 25_000);
+      const deltaArgs = ['diff', '--no-ext-diff', `${mergeOnlyDeltaRange.base}...${mergeOnlyDeltaRange.head}`];
+      const repository = deps.reviewRepositoryPath ? resolve(deps.reviewRepositoryPath) : undefined;
+      const delta = deps.git ? (repository ? deps.git(['-C', repository, ...deltaArgs], 25_000) : deps.git(deltaArgs, 25_000)) : undefined;
+      deps.log('review.cap-ancestry-measured', {
+        pr, repositoryPath: repository ?? null,
+        deltaCommand: ['git', ...(repository ? ['-C', repository] : []), ...deltaArgs],
+        deltaStatus: delta?.status ?? null, deltaStderr: delta?.stderr.slice(-300) ?? 'git seam unavailable',
+      });
       if (!delta || delta.status !== 0) {
         const message = `PR ${pr}: merge-only 후속 head의 delta diff를 고정할 수 없습니다.`;
         deps.error(message);
@@ -2513,7 +2734,8 @@ async function runSelfReviewCliCommandPinned(
     //   좁히고(49→6) 나머지는 그대로다. ⚠️ 새 이벤트를 만들지 않는다 — 증거는 **입력의 성질**이므로
     //   `start` payload 에 싣는다(발화 순서 계약 보존).
     const evidence = deltaBase
-      ? { diff: diff.stdout, evidence: 'saved-review-delta' as const, prDiffFiles: diffFilePaths(diff.stdout).length }
+      ? { diff: diff.stdout, evidence: 'saved-review-delta' as const, prDiffFiles: diffFilePaths(diff.stdout).length,
+        excludedMainMergeFiles: diffRead.excludedMainMergeFiles }
       : narrowEvidenceToAuthored(pr, diffRead.headCommit, diff.stdout, deps);
     const evidenceLine = renderEvidenceProvenance(evidence);
     // ⭐ 골 판정 신호는 reviewInput 조립 전에 PR당 한 번만 조회한다. ACP 폴백이 같은 객체를
@@ -2968,6 +3190,7 @@ async function runSelfReviewCliCommandPinned(
       ...(deltaBase ? deltaReceipt : {}), ...deltaHealOutput, ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
       ...(deltaFallbackReason ? { deltaFallbackReason } : {}),
       ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields,
+      ...(mainMergeCapExempt ? { mainMergeOnlyCapExempt: true } : {}),
       findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles,
       ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) };
     if (opts.json || opts.save !== undefined || shouldPersistCapResult) results.push(resultOutput);

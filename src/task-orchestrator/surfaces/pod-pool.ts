@@ -16,10 +16,11 @@
  * 풀을 안 주면 종전처럼 «현재 컨텍스트» 하나다(동작 불변).
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { debug } from '../../debug/log.js';
+import { debug, redactSecretText } from '../../debug/log.js';
 import { PodLeaseAdmission, type PodLeasePredecessor, type PodLeaseRelease } from '../../pod-lease/admission.js';
 import { predecessorState, type PredecessorState } from '../../pod-lease/dependency-state.js';
 import { HostPoolLease, hostLeaseBaseDir, leaseHasPendingPod } from '../../pod-lease/host-lease.js';
@@ -943,13 +944,63 @@ type RemoteBuild = (host: string, cluster: string, registry?: string, packedTgz?
 /** 같은 트리의 패키지 묶음(tgz)을 «한 번» 만든다 — 멤버들이 같이 쓴다. cleanup 은 동기화가 끝나면 부른다. */
 type PoolPack = () => Promise<{ ok: boolean; tgz?: string; detail: string; cleanup?: () => void }>;
 
-function runBuildScript(script: string, env: NodeJS.ProcessEnv): Promise<{ ok: boolean; detail: string }> {
+const BUILD_STDERR_TAIL_LINES = 80;
+const BUILD_STDERR_LINE_LIMIT = 2_048;
+const BUILD_STDERR_LOG_LIMIT = 12_000;
+
+function buildErrorLine(line: string): boolean {
+  return /(?:\berr(?:or)?\b|\bfatal\b|\bfail(?:ed|ure)?\b|\bcannot\b|\bunable\b|\bno space left\b)/i.test(line);
+}
+
+export function runBuildScript(script: string, env: NodeJS.ProcessEnv): Promise<{ ok: boolean; detail: string }> {
   return new Promise((done) => {
     const child = spawn('bash', [script], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
-    child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
+    let stderrPartial = '';
+    const stderrDecoder = new StringDecoder('utf8');
+    let stderrFirstError: string | null = null;
+    const stderrTail: string[] = [];
+    let stderrLineCount = 0;
+    let stderrLongLine = false;
+    const acceptStderrLine = (line: string): void => {
+      const bounded = line.slice(0, BUILD_STDERR_LINE_LIMIT);
+      if (line.length > BUILD_STDERR_LINE_LIMIT) stderrLongLine = true;
+      stderrLineCount += 1;
+      if (stderrFirstError === null && buildErrorLine(line)) stderrFirstError = bounded;
+      stderrTail.push(bounded);
+      if (stderrTail.length > BUILD_STDERR_TAIL_LINES) stderrTail.shift();
+    };
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => {
+      out += d;
+      const lines = (stderrPartial + stderrDecoder.write(d)).split(/\r?\n/);
+      stderrPartial = lines.pop() ?? '';
+      for (const line of lines) acceptStderrLine(line);
+    });
     const timer = setTimeout(() => child.kill('SIGKILL'), 1_800_000);
-    child.on('close', (code) => { clearTimeout(timer); done({ ok: code === 0, detail: out.trim().split('\n').slice(-2).join(' · ').slice(0, 300) }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      stderrPartial += stderrDecoder.end();
+      if (stderrPartial) acceptStderrLine(stderrPartial);
+      if (code !== 0 && stderrLineCount > 0) {
+        const safeFirstError = stderrFirstError === null ? null : redactSecretText(stderrFirstError).slice(0, BUILD_STDERR_LINE_LIMIT);
+        const safeTailLines = stderrTail.map((line) => redactSecretText(line).slice(0, BUILD_STDERR_LINE_LIMIT));
+        const fullTail = safeTailLines.join("\n");
+        const first = safeFirstError ? "first error: " + safeFirstError : "";
+        const remaining = Math.max(0, BUILD_STDERR_LOG_LIMIT - first.length - (first ? 1 : 0));
+        const tail = fullTail.slice(-remaining);
+        debug.log('self-implement.pod', 'pool-image-sync-build-failed', {
+          host: env.ELANOUS_BUILD_REMOTE ?? null,
+          exitCode: code,
+          stderrFirstError: safeFirstError,
+          stderrTail: tail,
+          stderrLineCount,
+          stderrTailLineCount: tail ? tail.split("\n").length : 0,
+          stderrTruncated: stderrLongLine || stderrLineCount > stderrTail.length || fullTail.length > remaining,
+        }, { compact: { stringMax: BUILD_STDERR_LOG_LIMIT, maxDepth: 4 } });
+      }
+      done({ ok: code === 0, detail: out.trim().split('\n').slice(-2).join(' \u00b7 ').slice(0, 300) });
+    });
   });
 }
 

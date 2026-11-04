@@ -576,26 +576,26 @@ describe('harness say/ask --substrate pod', () => {
     } finally { rmSync(root, { recursive: true, force: true }); if (origin) rmSync(origin, { recursive: true, force: true }); }
   }, 20_000);
 
-  test('isolated TUI pod-child git stderr reaches the notice owner without inheriting terminal stdio', async () => {
+  test('isolated TUI pod-child stderr reaches the notice owner without inheriting terminal stdio', async () => {
     const output: string[] = [];
     const notices: string[] = [];
     const restoreStderrOwner = installTuiStderrOwner((line) => notices.push(line));
     const stdout = spyOn(process.stdout, 'write').mockImplementation(() => true);
-    const outsideRepo = mkdtempSync(join(tmpdir(), 'tui-child-stderr-not-repo-'));
     let childStdio: unknown;
     try {
       const status = await dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'x' }, {
         spawnChild: ((_cmd: string, _args: readonly string[] | undefined, opts?: { stdio?: unknown }) => {
           childStdio = opts?.stdio;
-          return spawn('git', ['-C', outsideRepo, 'status'], { stdio: ['ignore', 'pipe', 'pipe'] });
+          return spawn(process.execPath, ['-e', "process.stderr.write('synthetic child stderr\\n'); process.exitCode = 128"], { stdio: ['ignore', 'pipe', 'pipe'] });
         }) as unknown as typeof spawn,
         onOutput: (chunk) => output.push(chunk),
       });
       expect(status).toBe(128);
-      expect(notices.some((line) => line.startsWith('fatal: not a git repository'))).toBe(true);
+      expect(notices).toEqual(['synthetic child stderr']);
+      expect(notices.some((line) => line.includes('fatal: not a git repository'))).toBe(false);
       expect(childStdio).toEqual(['ignore', 'pipe', 'pipe']);
       expect(output).toEqual([]);
-    } finally { restoreStderrOwner(); stdout.mockRestore(); rmSync(outsideRepo, { recursive: true, force: true }); }
+    } finally { restoreStderrOwner(); stdout.mockRestore(); }
   });
 
   test('host dispatch marker travels to the orchestrator without changing Pod arguments', () => {

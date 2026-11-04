@@ -8,7 +8,7 @@ import { registerIntakeCommands } from './intake-cli.js';
 import { addSource, listSources, runDue } from '../intake-plane/intake-sources.js';
 import { ingestIntakeItems, listIntakeItems } from '../intake-plane/items.js';
 
-async function cli(root: string, args: string[], subscribeTopicSearch?: NonNullable<Parameters<typeof registerIntakeSourceCommands>[2]>['subscribeTopicSearch']) {
+async function cli(root: string, args: string[], deps: Parameters<typeof registerIntakeSourceCommands>[2] = {}) {
   const lines: string[] = [];
   const errors: string[] = [];
   const oldLog = console.log, oldError = console.error, oldExit = process.exitCode;
@@ -17,7 +17,7 @@ async function cli(root: string, args: string[], subscribeTopicSearch?: NonNulla
   process.exitCode = 0;
   try {
     const cmd = new Command().name('elanous').exitOverride();
-    registerIntakeSourceCommands(cmd.command('intake'), () => root, subscribeTopicSearch ? { subscribeTopicSearch } : {});
+    registerIntakeSourceCommands(cmd.command('intake'), () => root, { ...deps, starterTopics: deps.starterTopics ?? (() => undefined) });
     await cmd.parseAsync(['intake', 'source', ...args], { from: 'user' });
     return { lines, errors, exitCode: process.exitCode };
   } finally { console.log = oldLog; console.error = oldError; process.exitCode = oldExit ?? 0; }
@@ -51,6 +51,32 @@ test('add -> list --json canonicalizes T to MK; dry-run lists only due sources w
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('run-due dry-run previews configured starter topics without writing RSS sources', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'intake-source-cli-starter-'));
+  try {
+    const out = await cli(root, ['run-due', '--dry-run', '--json'], { starterTopics: () => ['agent autonomy'] });
+    expect(out.exitCode).toBe(0);
+    const preview = JSON.parse(out.lines.join('')) as Array<{ kind: string; seat: string; every: string; why: string; spec: string }>;
+    expect(preview).toMatchObject([{ kind: 'rss', seat: 'user', every: '1d', why: 'starter.topics', managedBy: 'starter.topics' }]);
+    expect(new URL(preview[0]!.spec).searchParams.get('q')).toBe('agent autonomy');
+    expect(listSources({}, root)).toEqual([]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('run-due dry-run keeps ordinary sources due and leaves their registry unchanged beside starter topics', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'intake-source-cli-starter-boundary-'));
+  try {
+    addSource({ id: 'manual', seat: 'MK', kind: 'rss', spec: 'https://example.com/feed', every: '1h' }, root);
+    const before = listSources({}, root);
+    const out = await cli(root, ['run-due', '--dry-run', '--json'], { starterTopics: () => ['agent autonomy'] });
+    const preview = JSON.parse(out.lines.join('')) as Array<{ id: string; managedBy?: string }>;
+    expect(out.exitCode).toBe(0);
+    expect(preview.map(({ id }) => id)).toEqual(['manual', expect.stringMatching(/^starter-rss-/)]);
+    expect(preview[0]).toMatchObject({ id: 'manual' });
+    expect(listSources({}, root)).toEqual(before);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('topic-search CLI uses the subscription action and keeps the parent Linear UUID', async () => {
   const root = mkdtempSync(join(tmpdir(), 'intake-source-cli-'));
   try {
@@ -63,12 +89,12 @@ test('topic-search CLI uses the subscription action and keeps the parent Linear 
       return { source, scheduleId: 'schedule-topic-linear', immediate: { ran: [{ id: source.id, items: 0 }] } };
     };
     const added = await cli(root, ['add', '--seat', 'MK', '--kind', 'topic-search', '--spec', 'HBM supply chain',
-      '--every', '1w', '--linear-issue-id', linearIssueId, '--schedule-cron', '0 8 * * 1'], subscribeTopicSearch);
+      '--every', '1w', '--linear-issue-id', linearIssueId, '--schedule-cron', '0 8 * * 1'], { subscribeTopicSearch });
     expect(added.exitCode).toBe(0);
     expect(typeof scheduledProjector).toBe('function');
     expect(listSources({}, root)).toMatchObject([{ kind: 'topic-search', spec: 'HBM supply chain', linearIssueId, scheduleCron: '0 8 * * 1' }]);
     const invalid = await cli(root, ['add', '--seat', 'MK', '--kind', 'topic-search', '--spec', 'bad', '--every', '1w',
-      '--linear-issue-id', 'ENG-123', '--schedule-cron', '0 8 * * 1'], subscribeTopicSearch);
+      '--linear-issue-id', 'ENG-123', '--schedule-cron', '0 8 * * 1'], { subscribeTopicSearch });
     expect(invalid.exitCode).toBe(2);
     expect(listSources({}, root)).toHaveLength(1);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -89,7 +115,7 @@ test('topic-search CLI resolves a Telegram dry-run file once and passes it into 
     const path = join(root, 'telegram.jsonl');
     const result = await cli(root, ['add', '--seat', 'MK', '--kind', 'topic-search', '--spec', 'HBM supply chain',
       '--every', '1w', '--linear-issue-id', 'f47ac10b-58cc-4372-a567-0e02b2c3d479', '--schedule-cron', '0 8 * * 1',
-      '--telegram-dry-run-file', path], subscribeTopicSearch);
+      '--telegram-dry-run-file', path], { subscribeTopicSearch });
     expect(result.exitCode).toBe(0);
     expect(receivedPath).toBe(path);
     expect(projector).toBeTypeOf('function');

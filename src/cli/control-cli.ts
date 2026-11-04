@@ -17,6 +17,7 @@ import { collectControlStatus, readControlHqLease } from '../control/control-sta
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import { registerResourceLedgerCommands } from './resource-ledger-cli.js';
+import { registerTrainThroughputCommands } from './train-throughput.js';
 
 function controlPort(flag?: string): number {
   const raw = flag ?? (process.env.ELANOUS_CONTROL_PORT?.trim() || undefined);
@@ -271,6 +272,8 @@ export function registerControlCommands(program: Command): void {
 
   const resources = program.command('resources').description('관제부 자원 조회');
   registerResourceLedgerCommands(resources);
+  const train = program.command('train').description('열차 관측');
+  registerTrainThroughputCommands(train);
   resources.command('where <nameOrKind>').description('이름 또는 kind 로 찾기')
     .option('--primary-url <url>', 'Primary 주소')
     .option('--query-token <token>', 'query 토큰')

@@ -29,7 +29,7 @@ import {
 } from './doctor-readiness.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
-import { applyDoctorFixes, applyGitInstall, applyServiceRestart, applySudoFixes, planDoctorFixes, type DoctorFixDeps, type DoctorFixItem } from './doctor-fix.js';
+import { applyDoctorFixes, applyGitInstall, applyServiceRestart, applySetupBrewTools, applySudoFixes, planDoctorFixes, type DoctorFixDeps, type DoctorFixItem } from './doctor-fix.js';
 import { ADVISABLE_DOCTOR_FIX_IDS, adviseDoctorFixes, type DoctorAdvice } from './doctor-llm-assist.js';
 import { gitInstallPlan } from './git-install-plan.js';
 import { detectDistroFamily, parseOsRelease } from './doctor-distro.js';
@@ -1556,11 +1556,12 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
     .option('--upload', 'send the bundle to diagnostics.uploadUrl after consent (requires --bundle)')
     .option('--out <dir>', 'output directory for --bundle')
     .option('--fix', 'show repairs; git installation asks on a TTY (other repairs require --yes)')
+    .option('--setup-tools', 'also repair missing installer prerequisites (requires --fix --yes)')
     .option('--advise', 'ask the configured LLM to rank catalog repairs (read-only advice)')
     .option('--yes', 'apply planned doctor repairs (--fix), or confirm bundle upload (--bundle --upload)')
     .option('--sudo', 'also run the planned sudo install lines — only where `sudo -n true` works (requires --fix --yes)')
     .option('--restart', 'restart the nexus service when it runs a different version than this installed copy, then verify it (requires --fix --yes · interrupts bots, terminals and running turns)')
-    .action(async (opts: { json?: boolean; credentials?: boolean; bundle?: boolean; upload?: boolean; out?: string; fix?: boolean; advise?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
+    .action(async (opts: { json?: boolean; credentials?: boolean; bundle?: boolean; upload?: boolean; out?: string; fix?: boolean; setupTools?: boolean; advise?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
       if (opts.upload && !opts.bundle) {
         err.error('--upload requires --bundle');
         setExitCode(1);
@@ -1623,6 +1624,11 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         setExitCode(1);
         return;
       }
+      if (opts.setupTools && !(opts.fix && opts.yes) || opts.setupTools && opts.advise) {
+        err.error('--setup-tools requires --fix --yes and cannot be combined with --advise');
+        setExitCode(1);
+        return;
+      }
       if (opts.sudo && !(opts.fix && opts.yes)) {
         err.error('--sudo requires --fix --yes');
         setExitCode(1);
@@ -1646,6 +1652,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         return;
       }
       const makeFixes = (source: DoctorReport): DoctorFixDeps => ({
+        setupTools: opts.setupTools,
         env: deps.env,
         home: deps.home,
         cacheDir: deps.cacheDir,
@@ -1763,8 +1770,10 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       const restartResult = opts.restart && afterSudo.readiness
         ? await (deps.applyServiceRestart ?? applyServiceRestart)({ readiness: afterSudo.readiness })
         : undefined;
+      const setupBrew = opts.setupTools && afterSudo.readiness?.platform === 'darwin'
+        ? applySetupBrewTools(afterSudo.readiness) : undefined;
       // PATH cannot change in this process; re-probe readiness rather than treating a saved block as PATH=ok.
-      const currentReport = results || gitInstall?.ran ? runDoctor(deps) : report;
+      const currentReport = results || gitInstall?.ran || setupBrew ? runDoctor(deps) : report;
       if (currentReport.ok) currentReport.localLlm = report.localLlm;
       if (gitInstall?.ran && gitInstall.ok && currentReport.requiredMissing?.includes('git')) {
         gitInstall.detail = 'git init 성공 · 현재 doctor PATH 에서 git 을 찾지 못했습니다. 새 셸에서 다시 확인하세요.';
@@ -1784,7 +1793,8 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         ...(results ? ['Applied:', ...results.items.map((item) => `  ${item.id}: ${item.result} — ${item.path}${item.reason ? ` — ${item.reason}` : ''}`)] : ['적용하려면 --fix --yes']),
         ...(restartResult ? [`Service restart: ${restartResult.result} — ${restartResult.reason}`] : []),
       ].join('\n'));
-      const exitCode = Math.max(results?.exitCode ?? 0, sudoResult?.exitCode ?? 0, restartResult?.result === 'failed' ? 1 : 0, currentReport.requiredMissing?.length ? 1 : 0, gitInstall?.ran && !gitInstall.ok ? 1 : 0);
+      const setupMissing = opts.setupTools ? ['gh', 'rg', 'codex'].filter((name) => currentReport.externalCommands.some((command) => command.name === name && command.status !== 'found')) : [];
+      const exitCode = Math.max(setupMissing.length ? 1 : 0, setupBrew?.failed.length ? 1 : 0, results?.exitCode ?? 0, sudoResult?.exitCode ?? 0, restartResult?.result === 'failed' ? 1 : 0, currentReport.requiredMissing?.length ? 1 : 0, gitInstall?.ran && !gitInstall.ok ? 1 : 0);
       if (results || exitCode) setExitCode(exitCode);
     });
 }

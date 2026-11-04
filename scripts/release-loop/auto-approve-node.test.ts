@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runAutoApprove } from './auto-approve-node.js';
+import { BLOCKING_METRIC_NAMES, runAutoApprove } from './auto-approve-node.js';
 import type { GraphContext } from './node-verdict.js';
 
 const fixture = () => {
@@ -58,6 +58,26 @@ test('absent gate is unmeasured, never approved', () => {
     expect(absent.outcome).toBe('fail');
     expect(absent.metrics[0]?.verdict).toBe('unmeasured');
     expect(readFileSync(absent.report, 'utf8')).toContain('unmeasured');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('explicit owner-waived gate is a measured approval only with its approver and reason', () => {
+  const f = fixture();
+  try {
+    f.context.outputs.gate = { outcome: 'pass(owner-waived)', verdict: 'owner-waived', approvedBy: 'OP', reason: 'Known gate regression accepted.' };
+    const approved = f.run();
+    expect(approved).toMatchObject({ outcome: 'ok', decidedBy: 'release-loop metrics' });
+    expect(approved.metrics[0]).toMatchObject({ name: BLOCKING_METRIC_NAMES[0], verdict: 'pass' });
+
+    for (const gate of [
+      { outcome: 'pass(owner-waived)', verdict: 'owner-waived', approvedBy: ' ', reason: 'reason' },
+      { outcome: 'pass(owner-waived)', verdict: 'owner-waived', approvedBy: 'OP', reason: ' ' },
+    ]) {
+      f.context.outputs.gate = gate;
+      const rejected = f.run();
+      expect(rejected).toMatchObject({ outcome: 'fail' });
+      expect(rejected.metrics[0]?.verdict).not.toBe('pass');
+    }
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

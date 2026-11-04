@@ -8,7 +8,7 @@ import { readSavedCursorAt } from './collect-telegram-saved.js';
 import { intakeOutboxDir, kstDay } from './route.js';
 
 export type DigestLensVerdict = '대체 후보' | '보강' | '경쟁 대조';
-export interface DigestEntry { id: string; sources: string[]; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { verdict: DigestLensVerdict; why: string; target: string } }
+export interface DigestEntry { id: string; sources: string[]; briefingTopic?: string; briefingTopics?: string[]; publisher?: string; url?: string; note?: string; noteName?: string; oneLiner?: string; axis: string; impact?: { verdict: DigestLensVerdict; why: string; target: string } }
 export interface DigestLedgerEntry { id: string; title: string; url: string; verdict: DigestLensVerdict | '참고' | '판정 대기' }
 export interface IntakeDigest { day: string; seat?: string; absorbed: DigestEntry[]; goals: { fact: string; url?: string }[]; news?: { title: string; url: string; summary: string[]; implication: string[] }[]; xTrends?: DigestLedgerEntry[]; githubNew?: DigestLedgerEntry[]; shadowSuggestions?: { fact: string; url?: string; verdict: string }[]; review?: { fact: string; note?: string }[]; grounding: number; release: number; manual: number; savedSilence?: { days: number; lastNewAt: string } }
 
@@ -96,7 +96,8 @@ export function buildIntakeDigest(root: string, day: string, readFile: (p: strin
     const impact = decision && decision.verdict !== '참고'
       ? { verdict: decision.verdict, why: decision.why, target: decision.target } : undefined;
     return {
-      id: i.id, sources: i.sources, ...(i.url ? { url: i.url } : {}),
+      id: i.id, sources: i.sources, ...(i.briefingTopic ? { briefingTopic: i.briefingTopic } : {}),
+      ...(i.briefingTopics ? { briefingTopics: i.briefingTopics } : {}), ...(i.publisher ? { publisher: i.publisher } : {}), ...(i.url ? { url: i.url } : {}),
       ...(note ? { note, noteName: basename(note, '.md') } : {}),
       ...(md ? { oneLiner: noteOneLiner(md) } : selectedSeat && i.title ? { oneLiner: i.title } : {}),
       axis: AXIS_LABEL[i.judgement?.axis ?? i.axis ?? ''] ?? (i.sources.includes('telegram-saved') ? '내가 저장한 것' : '그 밖'),
@@ -149,6 +150,21 @@ function digestReferenceLine(entries: DigestEntry[]): string {
   return `참고 ${entries.length}편 — 노트: ${named}${rest > 0 ? ` 외 ${rest}편 · 원장 \`elanous intake items\`` : ''}`;
 }
 
+function telegramVisibleSections(d: IntakeDigest): { touching: DigestEntry[]; shownItems: DigestEntry[]; reference: DigestEntry[] } {
+  const touching = d.absorbed.filter((entry) => entry.impact);
+  return {
+    touching,
+    shownItems: touching.filter((entry) => entry.oneLiner?.trim()).slice(0, 3),
+    reference: d.absorbed.filter((entry) => !entry.impact),
+  };
+}
+
+/** Entries named individually in the Telegram card; the omitted tail is only represented by aggregate counts. */
+export function digestTelegramVisibleEntries(d: IntakeDigest): DigestEntry[] {
+  const { shownItems, reference } = telegramVisibleSections(d);
+  return [...shownItems, ...reference.slice(0, DIGEST_REFERENCE_NAMED)];
+}
+
 /** 노트 절 — 축별 묶음 · 노트 링크 · 한 줄 요약 · 골 후보. */
 export function renderDigestMarkdown(d: IntakeDigest): string {
   const L: string[] = [`## 📰 오늘의 흡수 요약 (${d.absorbed.length})`, ''];
@@ -196,10 +212,19 @@ export function renderDigestMarkdown(d: IntakeDigest): string {
 }
 
 /** 텔레그램 — 흡수 렌즈가 대조한 항목만 SCQA 짧은 판으로 낸다. */
-export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: string; notePath?: string } = {}): string {
+function formatKstClock(value: string | undefined): string {
+  if (!value || !Number.isFinite(Date.parse(value))) return '시각 미상';
+  return `${new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(value))} KST`;
+}
+
+export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: string; notePath?: string; topic?: string; sourceCount?: number; collectedAt?: string } = {}): string {
   // «Touching» is decided by the lens verdict alone; a missing note summary only changes how S reads (ACP must-fix).
-  const touching = d.absorbed.filter((e) => e.impact);
-  const L = [`흡수 ${d.absorbed.length}편 → 우리에게 닿는 것 ${touching.length}`];
+  const { touching, shownItems, reference } = telegramVisibleSections(d);
+  const sourceLabel = _opts.sourceCount === undefined ? '출처 수 미상' : `출처 ${_opts.sourceCount}개`;
+  const L = _opts.topic?.trim()
+    ? [`📰 ${_opts.topic.trim()}`, `흡수 ${d.absorbed.length}편 · ${sourceLabel} · 수집 ${formatKstClock(_opts.collectedAt)}`,
+      `우리에게 닿는 것 ${touching.length}`]
+    : [`흡수 ${d.absorbed.length}편 → 우리에게 닿는 것 ${touching.length}`];
   // 관심 뉴스는 최대 셋 — 기사마다 S(요약 첫 줄) · A(엘라누스 함의 첫 줄) · 링크를 한 덩어리로(NEWS-INTAKE).
   for (const article of (d.news ?? []).slice(0, 3)) {
     L.push(`📰 ${article.title}`);
@@ -216,7 +241,6 @@ export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: strin
   }
   // At most three items are shown, each as its own S·C·A·note block so context and source stay paired.
   // S must be the note's own summary: items without one still count as touching but are not shown (ACP must-fix).
-  const shownItems = touching.filter((e) => e.oneLiner?.trim()).slice(0, 3);
   const actionSeen = new Set<string>();
   const actionsUsed = new Set<string>();
   for (const e of shownItems) {
@@ -240,7 +264,6 @@ export function renderDigestTelegram(d: IntakeDigest, _opts: { vaultRoot?: strin
     );
   }
   if (touching.length > shownItems.length) L.push('', `닿는 것 ${touching.length - shownItems.length}건 더(요약 없는 것 포함) · 원장 \`elanous intake items\``);
-  const reference = d.absorbed.filter((e) => !e.impact);
   if (reference.length) L.push('', digestReferenceLine(reference));
   return L.join('\n');
 }

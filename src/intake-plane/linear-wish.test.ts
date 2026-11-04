@@ -7,6 +7,8 @@ import { debug } from '../debug/log.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { createLinearSecretaryBreakdown, parseLinearSecretaryManifest, readApprovedLinearCapture, scanLinearWishes, suggestLinearWishes, type LinearSecretaryPlan, updateLinearSecretaryProgress } from './linear-wish.js';
 import { createArtifactStore } from '../artifact/store.js';
+import { createFakeLinearDevice } from '../ux-sim/fake-linear-device.js';
+import { moveLinearIssueToStateType } from '../connectors/linear.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -161,6 +163,27 @@ test('child issue manifest maps exact Linear UUIDs and rejects unrelated issue I
   expect(parseLinearSecretaryManifest(description, 'other-child')).toBeUndefined();
 });
 
+test('child issue manifest accepts bracket escapes preserved by Linear markdown edits', () => {
+  const description = '<!-- elanous-linear-secretary-manifest:start -->\n'
+    + '{"parentIssueId":"parent-uuid","tasks":\\[{"issueId":"child-uuid","title":"첫 단계"}\\]}\n'
+    + '<!-- elanous-linear-secretary-manifest:end -->';
+  expect(parseLinearSecretaryManifest(description, 'child-uuid')).toEqual({ parentIssueId: 'parent-uuid', tasks: [{ issueId: 'child-uuid', title: '첫 단계' }] });
+});
+
+test('child issue manifest accepts escaped tasks array before a trailing parentIssueId property', () => {
+  const description = '<!-- elanous-linear-secretary-manifest:start -->\n'
+    + '{"tasks":\\[{"issueId":"child-uuid","title":"첫 단계"}\\],"parentIssueId":"parent-uuid"}\n'
+    + '<!-- elanous-linear-secretary-manifest:end -->';
+  expect(parseLinearSecretaryManifest(description, 'child-uuid')).toEqual({ parentIssueId: 'parent-uuid', tasks: [{ issueId: 'child-uuid', title: '첫 단계' }] });
+});
+
+test('child issue manifest does not treat escaped bracket text inside a task title as the array boundary', () => {
+  const description = '<!-- elanous-linear-secretary-manifest:start -->\n'
+    + '{"parentIssueId":"parent-uuid","tasks":\\[{"issueId":"child-uuid","title":"a \\\\], b"}\\]}\n'
+    + '<!-- elanous-linear-secretary-manifest:end -->';
+  expect(parseLinearSecretaryManifest(description, 'child-uuid')).toEqual({ parentIssueId: 'parent-uuid', tasks: [{ issueId: 'child-uuid', title: 'a \\], b' }] });
+});
+
 test('secretary records each progress step in order, attaches the capture, and preserves the parent description', async () => {
   const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
   const parentDescription = [
@@ -213,6 +236,90 @@ test('secretary starts a team-only child whose Linear workflow type is backlog',
     'LinearIssueStatus', 'DecisionIssueStates', 'DecisionIssueClose', 'DecisionComment', 'LinearIssueDescription', 'LinearIssueDescriptionUpdate',
   ]);
   expect(calls[2]!.variables.input).toEqual({ stateId: 'doing' });
+});
+
+test('DEMO1104-LINEAR-6ACT runs the production secretary and connector path through the existing fake Linear device', async () => {
+  const device = createFakeLinearDevice();
+  const issues = new Map<string, { title: string; parentId?: string; description: string; state: string }>();
+  const calls: string[] = [];
+  let nextIssue = 0;
+  const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+    const { query, variables } = request;
+    calls.push(query);
+    const id = String(variables.id ?? '');
+    if (query.includes('LinearTeamByKey')) return Response.json({ data: { teams: { nodes: [{ id: 'team-demo', states: { nodes: [
+      { id: 'todo', type: 'unstarted' }, { id: 'doing', type: 'started' }, { id: 'done', type: 'completed' },
+    ] } }] } } });
+    if (query.includes('LinearTeamIssueCreate')) {
+      const input = variables.input as { title: string; parentId?: string; description?: string; stateId?: string };
+      const issueId = `demo-issue-${++nextIssue}`;
+      issues.set(issueId, { title: input.title, ...(input.parentId ? { parentId: input.parentId } : {}),
+        description: input.description ?? '', state: input.stateId === 'doing' ? 'started' : 'unstarted' });
+      return Response.json({ data: { issueCreate: { success: true, issue: { id: issueId } } } });
+    }
+    if (query.includes('LinearIssueStatus')) return Response.json({ data: { issue: { state: { type: issues.get(id)?.state ?? 'unstarted' } } } });
+    if (query.includes('DecisionIssueStates')) return Response.json({ data: { issue: { team: { states: { nodes: [
+      { id: 'todo', type: 'unstarted' }, { id: 'doing', type: 'started' }, { id: 'done', type: 'completed' },
+    ] } } } } });
+    if (query.includes('DecisionIssueClose') || query.includes('LinearIssueTransition')) {
+      const input = variables.input as { stateId: string };
+      const issue = issues.get(id);
+      if (!issue) throw new Error(`unknown issue ${id}`);
+      issue.state = input.stateId === 'done' ? 'completed' : input.stateId === 'doing' ? 'started' : 'unstarted';
+      return Response.json({ data: { issueUpdate: { success: true } } });
+    }
+    if (query.includes('DecisionComment')) {
+      const input = variables.input as { issueId: string; body: string };
+      const reflectSelection = device.deps.reflectSelection;
+      if (!reflectSelection) throw new Error('fake Linear device has no comment recorder');
+      await reflectSelection(input);
+      return Response.json({ data: { commentCreate: { success: true, comment: { id: `comment-${device.comments.length}` } } } });
+    }
+    if (query.includes('LinearIssueDescription($id')) return Response.json({ data: { issue: { description: issues.get(id)?.description } } });
+    if (query.includes('LinearIssueDescriptionUpdate')) {
+      const input = variables.input as { description: string };
+      const issue = issues.get(id);
+      if (!issue) throw new Error(`unknown issue ${id}`);
+      issue.description = input.description;
+      return Response.json({ data: { issueUpdate: { success: true } } });
+    }
+    throw new Error(`unexpected Linear operation: ${query}`);
+  }) as typeof fetch;
+  const plan: LinearSecretaryPlan = {
+    title: 'DEMO1104 6막 리니어 회귀', rationale: '생산 secretary와 connector 호출을 fake API 경계에서 검증한다.',
+    assigneeId: 'demo-owner', dueDate: '2026-11-04',
+    tasks: ['유가', '환율', '관세', 'SCM', '관찰 종목'].map((name, index) => ({
+      title: `${index + 1}. ${name}`, intent: `${name} 단계 수행`, refs: [`https://example.test/demo/${index + 1}`],
+      assigneeId: 'demo-owner', dueDate: '2026-11-04',
+    })),
+  };
+
+  const result = await createLinearSecretaryBreakdown({ apiKey: 'fake-key', teamKey: 'DEMO', request: 'DEMO1104 6막 진행', plan, fetch: fakeFetch });
+  const tasks = plan.tasks.map((task, index) => ({ issueId: result.childIssueIds[index]!, title: task.title }));
+  expect(result.childIssueIds).toHaveLength(5);
+  expect(issues.get(result.parentIssueId)?.state).toBe('started');
+  expect(result.childIssueIds.every(id => issues.get(id)?.parentId === result.parentIssueId)).toBe(true);
+  for (const [index, task] of tasks.entries()) {
+    await updateLinearSecretaryProgress({ apiKey: 'fake-key', parentIssueId: result.parentIssueId, taskIssueId: task.issueId,
+      taskTitle: task.title, tasks, completedIssueIds: result.childIssueIds.slice(0, index), state: 'started',
+      summary: `${task.title} 진행`, fetch: fakeFetch });
+    expect(issues.get(task.issueId)?.state).toBe('started');
+    await updateLinearSecretaryProgress({ apiKey: 'fake-key', parentIssueId: result.parentIssueId, taskIssueId: task.issueId,
+      taskTitle: task.title, tasks, completedIssueIds: result.childIssueIds.slice(0, index), state: 'completed',
+      summary: `${task.title} 완료`, fetch: fakeFetch });
+  }
+  expect(result.childIssueIds.every(id => issues.get(id)?.state === 'completed')).toBe(true);
+  expect(device.comments).toHaveLength(10);
+  expect(device.comments.map(comment => comment.issueId)).toEqual(tasks.flatMap(task => [task.issueId, task.issueId]));
+  expect(device.comments.map(comment => comment.body.split('\n')[0])).toEqual(tasks.flatMap(task => [`요약: ${task.title} 진행`, `요약: ${task.title} 완료`]));
+  expect(issues.get(result.parentIssueId)?.state).toBe('completed');
+  const checkedItems = issues.get(result.parentIssueId)!.description.split('\n').filter(line => line.startsWith('- [x] '));
+  expect(checkedItems).toEqual(plan.tasks.map(task => `- [x] ${task.title}`));
+  await moveLinearIssueToStateType({ apiKey: 'fake-key', issueId: result.parentIssueId, type: 'started', fetch: fakeFetch });
+  expect(issues.get(result.parentIssueId)?.state).toBe('started');
+  expect(calls.filter(query => query.includes('LinearTeamIssueCreate'))).toHaveLength(6);
+  expect(calls.some(query => query.includes('DecisionComment'))).toBe(true);
 });
 
 test('capture upload requires a fresh browser capture approved for this exact run and public sharing', () => {

@@ -13,6 +13,7 @@ setDefaultTimeout(20000);
 const NOW = new Date('2026-10-06T07:00:00.000Z');
 const FEED = readFileSync(join(import.meta.dir, '__fixtures__/intake-news.xml'), 'utf8');
 const sources = [{ name: 'AI타임스', rss: 'https://www.aitimes.com/rss/allArticle.xml' }];
+
 const articleUrl = 'https://www.aitimes.com/news/articleView.html?idxno=215802';
 const check = async () => ({ items: [{ fact: 'elanous는 `RRSI` 하니스 기능을 지원한다', verdict: '없음', current: '근거 없음', line: 'RRSI → 근거 없음 → 없음' }] });
 
@@ -107,7 +108,7 @@ test('network failure emits 못 모음 and does not block next source', async ()
 test('daily graph wires trend → news → social → registered sources → ingest, including fail continuation and registered command', () => {
   const graph = parseYaml(readFileSync(join(import.meta.dir, '../graphs/intake/intake-daily.yaml'), 'utf8'));
   const recipes = parseYaml(readFileSync(join(import.meta.dir, '../graphs/intake/recipes.yaml'), 'utf8'));
-  expect(graph.loop.trigger.cron).toBe('0 7 * * *');
+  expect(graph.loop.trigger.cron).toBe('0 8 * * *');
   expect(graph.nodes.find((node: { node_id: string }) => node.node_id === 'news').recipe).toBe('cmd:intake-news');
   expect(graph.edges.find((edge: { from: string }) => edge.from === 'trend').map).toEqual({ ok: 'news', fail: 'news' });
   expect(graph.edges.find((edge: { from: string }) => edge.from === 'news').map).toEqual({ ok: 'social', fail: 'social' });

@@ -13,6 +13,7 @@ export interface RunGraphNodeData extends Record<string, unknown> {
   inputHandles: string[];
   outputHandles: string[];
   height: number;
+  provenance?: { type: 'scenario-injection'; scene?: string; reason: string; mock?: boolean };
 }
 
 export const RUN_NODE_WIDTH = 190;
@@ -44,9 +45,18 @@ export function runGraphAdaptiveEvidence(events: readonly HarnessGraphEventWire[
 export function applyRunGraphEvents(graph: RunGraphDetail, events: readonly HarnessGraphEventWire[]): RunGraphDetail {
   return [...events].sort((left, right) => left.seq - right.seq).reduce((current, event) => {
     if (event.type === 'node-added') {
-      if (current.nodes.some((node) => node.node_id === event.node)) return current;
+      const scene = event.scene ?? event.demo1104Scene;
+      const provenance = event.decider === 'scenario-injection'
+        ? { type: 'scenario-injection' as const, ...(scene ? { scene } : {}), reason: event.reason, ...( /\bmock$/i.test(event.reason.trim()) && !/\bnot\s+mock$/i.test(event.reason.trim()) ? { mock: true } : {}) }
+        : undefined;
+      const existing = current.nodes.findIndex((node) => node.node_id === event.node);
+      if (existing >= 0) {
+        if (!provenance) return current;
+        return { ...current, nodes: current.nodes.map((node, index) => index === existing ? { ...node, provenance } : node) };
+      }
       return { ...current, nodes: [...current.nodes, {
         node_id: event.node, kind: event.kind, recipe: `runtime:${event.decider}`, max_visits: 1,
+        ...(provenance ? { provenance } : {}),
       }] };
     }
     if (event.type !== 'edge-rerouted') return current;
@@ -123,6 +133,7 @@ export function runGraphToFlow(graph: RunGraphDetail): { nodes: Node<RunGraphNod
         inputHandles: ['in'],
         outputHandles: ['out'],
         height: placed[index]!.height,
+        ...(node.provenance ? { provenance: node.provenance } : {}),
       },
     })),
     edges,

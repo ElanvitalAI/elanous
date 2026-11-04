@@ -1,8 +1,18 @@
 // 턴 UX 시뮬레이터 계약 — ⛔ 이 장치가 «진짜 렌더 경로»를 탄다는 것이 존재 이유다.
-import { describe, test, expect } from 'bun:test';
+import { afterEach, describe, test, expect, mock, spyOn } from 'bun:test';
 import { simFooterLine, simLines, simTypeaheadState, type TurnSimSpec } from './turn-states.js';
 import { simRenderLogFrame } from './render-frame.js';
 import { renderTurnTypeaheadQueueRow } from '../chat/turn-typeahead.js';
+import { simEscGate } from './interaction.js';
+import { TURN_ABORT_TURN_ONLY } from '../turn-abort-scope.js';
+import { runGoalLoop } from '../core-turn/run-goal-loop.js';
+import type { CoreTurnContext } from '../core-turn/types.js';
+import * as core from '../core-turn/index.js';
+import { debug } from '../debug/log.js';
+import { bridgeCoreTurnToAcp } from '../acp/core-turn-bridge.js';
+import type { AcpTurnContext } from '../acp/server.js';
+
+afterEach(() => mock.restore());
 
 describe('turn-states — 국면별 상태 팩토리', () => {
   test('idle 은 스트리밍 표시줄이 «없다»', () => {
@@ -27,6 +37,7 @@ describe('turn-states — 국면별 상태 팩토리', () => {
     expect(state.queuedSubmissions).toEqual(['첫째', '둘째']);
     expect(state.buffer).toBe('xy');
   });
+
 });
 
 describe('simRenderLogFrame — 실제 위젯 render 를 탄다', () => {
@@ -72,5 +83,61 @@ describe('simRenderLogFrame — 실제 위젯 render 를 탄다', () => {
     const fIdx = frame.lines.findIndex((l) => l.includes('Streaming'));
     expect(qIdx).toBeGreaterThanOrEqual(0);
     expect(fIdx).toBeGreaterThan(qIdx);      // 큐 행이 «위»에 있다
+  });
+
+  test('자리 상한 뒤 idle 창에서 다음 입력 초안과 Esc가 다시 동작한다', async () => {
+    const ctx = {
+      sessionId: 'ux-sim-seat-cap-boundary',
+      messages: [{ role: 'user', content: '자리 작업을 계속해줘' }],
+      tools: [],
+      dispatchTool: async () => ({ ok: true }),
+      signal: new AbortController().signal,
+    } as unknown as CoreTurnContext;
+    const result = await runGoalLoop(ctx, {
+      seatTurnCap: { seat: 'UX', maxTools: 1, maxWallMs: 5_000, idleEmptyMsgListLimit: 2 },
+      maxIterations: 3,
+      changedFiles: () => [],
+      controlSpaceId: null,
+      intentStallProvider: null,
+      attachLifecycleBridge: () => () => {},
+      startLivenessHeartbeat: () => () => {},
+      runTurn: async (turn) => {
+        await turn.dispatchTool('RunShell', { command: 'true' }, {} as never);
+        return { stopReason: 'end_turn', finalText: '상한 직전 진행' };
+      },
+    });
+    expect(result).toMatchObject({ stopReason: 'max_turns', goalComplete: false, iterations: 1 });
+
+    const idleFrame = simRenderLogFrame({ phase: 'idle' });
+    const input = simTypeaheadState({ phase: 'idle', draft: '다음 요청' });
+    const escape = simEscGate({ runningChildren: 0 });
+    escape.esc();
+    expect(idleFrame.text).not.toContain('Streaming');
+    expect(input.buffer).toBe('다음 요청');
+    expect(escape.abortReason()).toBe(TURN_ABORT_TURN_ONLY);
+  });
+
+  test('TUI-HIDE-ROUTING-NOTICE — production route decision is logged but absent from the rendered turn', async () => {
+    let coreContext: core.CoreTurnContext | undefined;
+    spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+      coreContext = ctx;
+      return { stopReason: 'end_turn', finalText: '' };
+    });
+    const routeLog = spyOn(debug, 'log');
+    const pushes: string[] = [];
+    const turn = bridgeCoreTurnToAcp({ tuiRouting: true, getMessages: () => [], getTools: () => [], dispatchTool: async () => ({}) });
+    await turn({
+      sessionId: 'ux-sim-route', cwd: '/tmp', userText: '나한테 온 결정 카드 있어?',
+      promptBlocks: [{ type: 'text', text: '나한테 온 결정 카드 있어?' }], isAborted: () => false,
+      push: async (delta: string) => { pushes.push(delta); }, pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+      pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+    } as unknown as AcpTurnContext);
+    coreContext?.callbacks?.onText?.('결정 카드가 없습니다.', '결정 카드가 없습니다.');
+    const frame = simRenderLogFrame({ phase: 'streaming', lines: pushes });
+
+    expect(routeLog).toHaveBeenCalledWith('core-turn.route', 'decided', expect.objectContaining({ route: '조회', goalLoop: false }));
+    expect(pushes).toEqual(['결정 카드가 없습니다.']);
+    expect(frame.text).toContain('결정 카드가 없습니다.');
+    expect(frame.text).not.toContain('라우팅:');
   });
 });

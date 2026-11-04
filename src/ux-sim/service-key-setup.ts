@@ -7,18 +7,32 @@ import {
 
 export type FakeOpenAiApiMode = 'ok' | 'unauthorized' | 'rate-limited' | 'disconnect' | 'slow';
 
-export type FakeCodexDeviceOAuthMode = 'complete' | 'denied' | 'expired-code';
+export type FakeCodexDeviceOAuthMode = 'complete' | 'denied' | 'expired-code' | 'pending' | 'poll-in-flight' | 'exchange-in-flight';
 
 export interface FakeCodexDeviceOAuth {
   /** Route only the production loginWithCodex fetch seam; unknown URLs fail closed. */
   fetchImpl: typeof fetch;
   /** Safe request facts only. Codes, verifiers and tokens are never retained. */
   requests: () => Array<{ endpoint: 'device-code' | 'device-poll' | 'token'; grantType?: string }>;
+  /** Delayed fake token exchange for cancellation race tests; it carries no live credentials. */
+  exchangeStarted: Promise<void>;
+  releaseExchange(): void;
+  /** Delayed fake device approval for cancellation race tests. */
+  pollStarted: Promise<void>;
+  releasePoll(): void;
 }
 
 /** Fake OpenAI device-code endpoints for the real loginWithCodex production path. */
 export function createFakeCodexDeviceOAuth(mode: FakeCodexDeviceOAuthMode = 'complete'): FakeCodexDeviceOAuth {
   let polls = 0;
+  let signalPollStarted!: () => void;
+  let releasePollResponse!: (response: Response) => void;
+  let signalExchangeStarted!: () => void;
+  let releaseExchangeResponse!: (response: Response) => void;
+  const pollStarted = new Promise<void>(resolve => { signalPollStarted = resolve; });
+  const pollResponse = new Promise<Response>(resolve => { releasePollResponse = resolve; });
+  const exchangeStarted = new Promise<void>(resolve => { signalExchangeStarted = resolve; });
+  const exchangeResponse = new Promise<Response>(resolve => { releaseExchangeResponse = resolve; });
   const calls: Array<{ endpoint: 'device-code' | 'device-poll' | 'token'; grantType?: string }> = [];
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -38,6 +52,13 @@ export function createFakeCodexDeviceOAuth(mode: FakeCodexDeviceOAuthMode = 'com
       if (mode === 'expired-code') {
         return new Response(JSON.stringify({ error: 'expired_token' }), { status: 400 });
       }
+      if (mode === 'pending') return new Response(JSON.stringify({ error: 'authorization_pending' }), { status: 403 });
+      if (mode === 'poll-in-flight') {
+        signalPollStarted();
+        // Deliberately ignore AbortSignal so the production post-poll abort check is exercised.
+        return pollResponse;
+      }
+      if (mode === 'exchange-in-flight') return new Response(JSON.stringify({ authorization_code: 'fake-authorization-code', code_verifier: 'fake-code-verifier' }), { status: 200 });
       if (polls === 1) return new Response(JSON.stringify({ error: 'authorization_pending' }), { status: 403 });
       return new Response(JSON.stringify({ authorization_code: 'fake-authorization-code', code_verifier: 'fake-code-verifier' }), { status: 200 });
     }
@@ -46,6 +67,11 @@ export function createFakeCodexDeviceOAuth(mode: FakeCodexDeviceOAuthMode = 'com
       const grantType = body.get('grant_type') ?? undefined;
       calls.push({ endpoint: 'token', ...(grantType ? { grantType } : {}) });
       if (grantType === 'authorization_code') {
+        if (mode === 'exchange-in-flight') {
+          signalExchangeStarted();
+          // Deliberately ignore AbortSignal so the production post-response abort check is exercised.
+          return exchangeResponse;
+        }
         if (body.get('code') !== 'fake-authorization-code' || body.get('code_verifier') !== 'fake-code-verifier') {
           return new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 });
         }
@@ -62,7 +88,16 @@ export function createFakeCodexDeviceOAuth(mode: FakeCodexDeviceOAuthMode = 'com
     }
     throw new Error('fake Codex OAuth blocked an unexpected endpoint');
   }) as typeof fetch;
-  return { fetchImpl, requests: () => calls.map(call => ({ ...call })) };
+  return {
+    fetchImpl,
+    requests: () => calls.map(call => ({ ...call })),
+    exchangeStarted,
+    pollStarted,
+    releasePoll: () => releasePollResponse(new Response(JSON.stringify({ authorization_code: 'late-fake-authorization-code', code_verifier: 'late-fake-code-verifier' }), { status: 200, headers: { 'content-type': 'application/json' } })),
+    releaseExchange: () => releaseExchangeResponse(new Response(JSON.stringify({
+      access_token: 'fake-delayed-access-token', refresh_token: 'fake-delayed-refresh-token', expires_in: 3600,
+    }), { status: 200, headers: { 'content-type': 'application/json' } })),
+  };
 }
 
 /** Local OpenAI-compatible /v1/models endpoint for testing the production key verifier. */

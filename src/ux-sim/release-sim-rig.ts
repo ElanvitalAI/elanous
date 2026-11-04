@@ -2,17 +2,34 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { getTestStateRoot } from '../nexus/paths.js';
+import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { execFileSync } from 'node:child_process';
 import { listGraphRuns, runGraph, type GraphRunState } from '../graph-runner/runner.js';
+import { releaseResumeWaiver } from '../../scripts/release-loop/resume.js';
+import { runKnownIssues } from '../../scripts/release-loop/known-issues-node.js';
+import { graphGateResult, type GateResult } from '../../scripts/release-loop/gate-node.js';
+import { runNpmPublish } from '../../scripts/release-loop/npm-publish-node.js';
+import { runPublish } from '../../scripts/release-loop/publish-node.js';
+import { resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
+import { runAutoApprove } from '../../scripts/release-loop/auto-approve-node.js';
+import { runVerify } from '../../scripts/release-loop/verify-node.js';
 import { resolveScenarioFilePath } from './scenario.js';
 
 const REPOSITORY_ROOT = join(import.meta.dir, '../..');
 const RELEASE_GRAPH = join(REPOSITORY_ROOT, 'graphs/release/release-loop.yaml');
-const CUT_TIP = 'a'.repeat(40);
+let cachedCutTip: string | undefined;
+function cutTip(): string {
+  // The sim command is registered for root help. Resolve Git only when a
+  // release simulation runs so importing its registrar works from any cwd.
+  cachedCutTip ??= execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPOSITORY_ROOT, encoding: 'utf8' }).trim();
+  return cachedCutTip;
+}
 
 
 export interface ReleaseSimRigCase {
   id: string;
-  mode?: 'baseline' | 'cut-tip-moved-after-resume';
+  mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'gate-waive-introduced-regression' | 'owner-waive-missing-schema' | 'owner-waive-0246-fixture';
   fault?: { node: string; outcome: 'fail' | 'error' | 'timeout'; evidence?: Record<string, unknown> };
   nodeOutcomes?: Record<string, { outcome: 'ok' | 'fail' | 'error'; delayMs?: number }>;
   expect: { status: 'done' | 'failed' | 'resume-refused'; mustVisit: string[]; mustNotVisit: string[]; overlap?: [string, string]; refusalIncludes?: string };
@@ -58,8 +75,9 @@ function unexpectedEdges(path: string[], state: GraphRunState, edges: Map<string
     } else if (output && typeof output === 'object' && !Array.isArray(output)) parsed = output as Record<string, unknown>;
     const named = typeof parsed.outcome === 'string' ? parsed.outcome : nodes.get(from)?.ok ? 'ok' : 'fail';
     const map = edge?.map && typeof edge.map === 'object' ? edge.map as Record<string, unknown> : {};
-    const expectedTo = typeof map[named] === 'string' ? map[named] as string : typeof map[named === 'ok' ? 'ok' : 'fail'] === 'string'
-      ? map[named === 'ok' ? 'ok' : 'fail'] as string : undefined;
+    const mappedOutcome = named === 'pass(owner-waived)' ? 'ok' : named;
+    const expectedTo = typeof map[mappedOutcome] === 'string' ? map[mappedOutcome] as string : typeof map[mappedOutcome === 'ok' ? 'ok' : 'fail'] === 'string'
+      ? map[mappedOutcome === 'ok' ? 'ok' : 'fail'] as string : undefined;
     if (expectedTo !== to) issues.push({ from, to, outcome: named, ...(expectedTo ? { expectedTo } : {}) });
   }
   return issues;
@@ -140,7 +158,7 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
     ids.add(row.id);
     let mode: ReleaseSimRigCase['mode'];
     if (row.mode !== undefined) {
-      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume') throw new Error(`scenario.cases[${index}].mode is unregistered`);
+      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume' && row.mode !== 'gate-waive-introduced-regression' && row.mode !== 'owner-waive-missing-schema' && row.mode !== 'owner-waive-0246-fixture') throw new Error(`scenario.cases[${index}].mode is unregistered`);
       mode = row.mode;
     }
     let fault: ReleaseSimRigCase['fault'];
@@ -198,11 +216,282 @@ function resultForNode(nodeId: string, fault: ReleaseSimRigCase['fault'], versio
   const triggeredFault = fault?.node === nodeId ? fault : undefined;
   const outcome = triggeredFault ? triggeredFault.outcome === 'timeout' ? 'error' : triggeredFault.outcome : 'ok';
   const evidence = triggeredFault?.evidence ?? {};
-  const commit = nodeId === 'version-release' ? { commit: CUT_TIP, tag: `v${version}` } : {};
+  const commit = nodeId === 'version-release' ? { commit: cutTip(), tag: `v${version}` } : {};
   const payload = { outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: triggeredFault ? `simulated ${triggeredFault.outcome}` : `simulated ${nodeId} success`, ...commit,
     simulation: { injected: triggeredFault !== undefined, node: nodeId, evidence } };
   return { exitCode: !triggeredFault ? 0 : triggeredFault.outcome === 'fail' ? 1 : triggeredFault.outcome === 'timeout' ? 124 : 2,
     stdout: `${JSON.stringify(payload)}\n`, stderr: triggeredFault ? `SIMULATED_${triggeredFault.outcome.toUpperCase()}` : '', evidence };
+}
+
+async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string,
+  edges: Map<string, Record<string, unknown>>): Promise<ReleaseSimRigCaseResult> {
+  const runId = `release-sim-${scenario.id}-${item.id}`;
+  if (item.mode === 'owner-waive-0246-fixture') {
+    root = join(root, runId);
+    mkdirSync(root, { recursive: true });
+  }
+  const ownerWaived = item.mode === 'owner-waive-missing-schema' || item.mode === 'owner-waive-0246-fixture';
+  const fixtureOwnerWaiver = item.mode === 'owner-waive-0246-fixture';
+  const input = fixtureOwnerWaiver ? { ...scenario.input, version: '0.2.46', previousVersion: '0.2.45', branchCut: true }
+    : ownerWaived ? { ...scenario.input, version: '0.2.45', previousVersion: '0.2.44' } : scenario.input;
+  const gateFixture = fixtureOwnerWaiver
+    ? JSON.parse(readFileSync(join(REPOSITORY_ROOT, 'scripts/release-loop/fixtures/gate-verdict-0.2.46.json'), 'utf8')) as Record<string, unknown>
+    : undefined;
+  const fixtureIntroducedIds = Array.isArray(gateFixture?.introduced) ? gateFixture.introduced as string[] : [];
+  const introducedId = 'src/example.test.ts > reports the known regression';
+  const acceptedRegressions = [{ id: introducedId, note: 'The example capability may fail during use.' }];
+  const reason = 'Known gate failures remain in this release. Users may encounter these issues during normal use.';
+  const dispatchedNodes: string[] = [];
+  const firstAttemptDispatchedNodes: string[] = [];
+  let resumedPhase = false;
+  let npmPublishEvidence: Record<string, unknown> | undefined;
+  let verifyEvidence: Record<string, unknown> | undefined;
+  const ledgerEvents: Array<Record<string, unknown>> = [];
+  const nodeTimings: NonNullable<ReleaseSimRigCaseResult['nodeTimings']> = {};
+  let knownIssuesAccepted: unknown;
+  const runBash = async (command: string, options: { env?: NodeJS.ProcessEnv }) => {
+    const { nodeId } = parseContext(options.env ?? process.env);
+    if (!command.trim()) throw new Error(`empty command at simulated node ${nodeId}`);
+    dispatchedNodes.push(nodeId);
+    if (!resumedPhase) firstAttemptDispatchedNodes.push(nodeId);
+    const startedAtMs = performance.now();
+    if (nodeId === 'gate') {
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      if (gateFixture) {
+        const persisted = gateFixture as unknown as { outcome: 'regression'; introduced: string[]; preexisting: string[]; knownEnv: string[] };
+        const normalized = graphGateResult({ ...persisted, preexisting: persisted.preexisting.length, knownEnv: persisted.knownEnv.length,
+          fixed: null, knownEnvCleared: [], durationMs: 0, stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [],
+          unmeasuredErrors: [], abortedShards: 0, rcNonzeroNoFailures: [] } as unknown as GateResult, true);
+        return { exitCode: 1, stdout: `${JSON.stringify(normalized)}\n`, stderr: '' };
+      }
+      return { exitCode: 1, stdout: `${JSON.stringify(item.mode === 'owner-waive-missing-schema' ? { outcome: 'fail', introduced: 1, introducedIds: [] } : { outcome: 'fail', verdict: 'fail', introduced: [introducedId],
+        preexisting: 0, knownEnv: 0, durationMs: 1, stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 0 })}
+`, stderr: '' };
+    }
+    if (nodeId === 'version-release' && fixtureOwnerWaiver) {
+      const value = { outcome: 'ok', version: input.version, commit: cutTip(), branch: `release/${input.version}` };
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: '' };
+    }
+    if (nodeId === 'prepare' && fixtureOwnerWaiver) {
+      const out = join(root, 'release', input.version, 'prepared');
+      mkdirSync(join(out, 'dist'), { recursive: true });
+      for (let index = 0; index < 5; index += 1) writeFileSync(join(out, 'dist', `fixture-${index}.tgz`), 'fixture');
+      const value = { outcome: 'ok', commit: cutTip(), out };
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: '' };
+    }
+    if (nodeId === 'docs' && fixtureOwnerWaiver) {
+      const worktree = join(root, 'owner-waive-docs');
+      const notes = join(worktree, 'release/public/docs/releases', `${input.version}.md`);
+      mkdirSync(join(worktree, 'release/public/docs/releases'), { recursive: true });
+      writeFileSync(notes, `# ${input.version}\n\n`);
+      const value = { outcome: 'ok', branch: `release-docs/${input.version}`, worktree, notes: 'fixture release notes', artifactOwner: { runId, attempt: 1 } };
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: '' };
+    }
+    const location = options.env?.ELANOUS_GRAPH_CONTEXT;
+    const context = location ? record(JSON.parse(readFileSync(location, 'utf8')), 'release graph context') : {};
+    if (nodeId === 'known-issues') knownIssuesAccepted = record(context.input, 'known-issues input').acceptedRegressions;
+    if (nodeId === 'docs' && ownerWaived) {
+      const worktree = join(root, 'owner-waive-docs');
+      const notes = join(worktree, 'release/public/docs/releases', `${input.version}.md`);
+      mkdirSync(join(worktree, 'release/public/docs/releases'), { recursive: true });
+      writeFileSync(notes, '# Release\n');
+      const result = { outcome: 'ok', branch: `release-docs/${input.version}`, worktree };
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: 0, stdout: JSON.stringify(result) + '\n', stderr: '' };
+    }
+    if (nodeId === 'known-issues' && ownerWaived) {
+      const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextPath) throw new Error('known-issues context missing in owner waiver rig');
+      const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+      const previousStateDir = process.env.ELANOUS_STATE_DIR;
+      const previousConfigDir = getElanousConfigDirOverride();
+      process.env.ELANOUS_GRAPH_CONTEXT = contextPath;
+      process.env.ELANOUS_STATE_DIR = root;
+      setElanousConfigDir(root);
+      resetEffectiveInstanceRoot();
+      try {
+        const graphContext = record(JSON.parse(readFileSync(contextPath, 'utf8')), 'known-issues context');
+        const output = runKnownIssues(graphContext as never, (program, args, cwd) => program === 'git' ? { status: 0, stdout: '', stderr: '' } : { status: 1, stdout: '', stderr: `unexpected ${program} ${args.join(' ')}` });
+        knownIssuesAccepted = record(graphContext.input, 'known-issues input').acceptedRegressions;
+        nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+        return { exitCode: 0, stdout: JSON.stringify(output) + '\n', stderr: '' };
+      } finally { if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous; if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousStateDir; if (previousConfigDir === undefined) resetElanousConfigDir(); else setElanousConfigDir(previousConfigDir); resetEffectiveInstanceRoot(); }
+    }
+    if (nodeId === 'auto-approve' && fixtureOwnerWaiver) {
+      const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextPath) throw new Error('auto-approve context missing in owner waiver rig');
+      const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+      const previousStateDir = process.env.ELANOUS_STATE_DIR;
+      const previousConfigDir = getElanousConfigDirOverride();
+      process.env.ELANOUS_GRAPH_CONTEXT = contextPath;
+      process.env.ELANOUS_STATE_DIR = root;
+      setElanousConfigDir(root);
+      resetEffectiveInstanceRoot();
+      try {
+        const value = runAutoApprove(record(JSON.parse(readFileSync(contextPath, 'utf8')), 'auto-approve context') as never,
+          { instanceRoot: root, repo: REPOSITORY_ROOT, bunVersion: readFileSync(join(REPOSITORY_ROOT, '.bun-version'), 'utf8').trim() });
+        nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+        return { exitCode: value.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(value)}\n`, stderr: '' };
+      } finally {
+        if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+        if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousStateDir;
+        if (previousConfigDir === undefined) resetElanousConfigDir(); else setElanousConfigDir(previousConfigDir);
+        resetEffectiveInstanceRoot();
+      }
+    }
+    if (nodeId === 'tui' && fixtureOwnerWaiver) {
+      const value = { outcome: 'ok', verdict: 'pass', regress: { pass: 7, fail: 0,
+        results: Array.from({ length: 7 }, (_, index) => ({ id: `R${index + 1}`, title: `fixture R${index + 1}`, ok: true, reason: 'fixture pass' })) } };
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: '' };
+    }
+    if (nodeId === 'npm-publish' && fixtureOwnerWaiver) {
+      const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextPath) throw new Error('npm-publish context missing in owner waiver rig');
+      const graphContext = record(JSON.parse(readFileSync(contextPath, 'utf8')), 'npm-publish context');
+      const tokenFile = join(root, 'npm-token');
+      writeFileSync(tokenFile, 'fixture-token\n', { mode: 0o600 });
+      const registryReads = new Map<string, number>();
+      const published: string[] = [];
+      const result = await runNpmPublish({ ...graphContext, input: { ...record(graphContext.input, 'npm-publish input'), npmWaitMinutes: 0, npmTokenFile: tokenFile } } as never, {
+        stateDir: root, productionRoot: root, sleep: async () => {},
+        exec: (command, args) => {
+          if (command === 'tar') return { status: 0, stdout: JSON.stringify({ name: 'elanous', version: '0.2.46' }), stderr: '' };
+          if (command === 'npm' && args[0] === 'publish') { published.push(args.join(' ')); return { status: 0, stdout: 'published', stderr: '' }; }
+          return { status: 2, stdout: '', stderr: `unexpected ${command} ${args.join(' ')}` };
+        },
+        registry: async (url) => {
+          const count = (registryReads.get(url) ?? 0) + 1;
+          registryReads.set(url, count);
+          if (url.endsWith('/0.2.46')) return count === 1 ? { status: 404, body: null } : { status: 200, body: { name: 'elanous', version: '0.2.46' } };
+          return { status: 200, body: { 'dist-tags': { latest: count === 1 ? '0.2.45' : '0.2.46' } } };
+        },
+      });
+      npmPublishEvidence = { ...(npmPublishEvidence ?? {}), result, publishedCommands: published, registryReads: Object.fromEntries(registryReads) };
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: result.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(result)}\n`, stderr: '' };
+    }
+    if (nodeId === 'publish' && fixtureOwnerWaiver) {
+      const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextPath) throw new Error('publish context missing in owner waiver rig');
+      const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+      const previousStateDir = process.env.ELANOUS_STATE_DIR;
+      const previousConfigDir = getElanousConfigDirOverride();
+      process.env.ELANOUS_GRAPH_CONTEXT = contextPath;
+      process.env.ELANOUS_STATE_DIR = root;
+      setElanousConfigDir(root);
+      resetEffectiveInstanceRoot();
+      const externalCalls: string[] = [];
+      try {
+        const result = runPublish((program, args) => {
+          externalCalls.push(`${program} ${args.join(' ')}`);
+          if (program === 'git' && args[0] === 'show' && args[1]?.endsWith(`release/public/docs/releases/${input.version}.md`))
+            return { status: 0, stdout: `# ${input.version}\n\nKnown Issues\n`, stderr: '' };
+          if (program === 'git' && args[0] === 'show' && args[1]?.endsWith('website/pages.json'))
+            return { status: 0, stdout: JSON.stringify({ pages: [] }), stderr: '' };
+          if (program === 'bun' && args[0] === 'bin/elanous.mjs' && args[1] === 'release' && args[2] === 'publish')
+            return { status: 0, stdout: JSON.stringify({ ok: true, published: true, tag: `v${input.version}`, publicRepo: 'elanous/elanous', assets: [] }), stderr: '' };
+          return { status: 2, stdout: '', stderr: `unexpected publish boundary ${program} ${args.join(' ')}` };
+        }, undefined, { now: () => Date.now(), sleep: () => {} }, root);
+        npmPublishEvidence = { ...(npmPublishEvidence ?? {}), publishNodeResult: result, publishNodeExternalCalls: externalCalls };
+        nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+        return { exitCode: result.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(result)}\n`, stderr: '' };
+      } finally {
+        if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+        if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousStateDir;
+        if (previousConfigDir === undefined) resetElanousConfigDir(); else setElanousConfigDir(previousConfigDir);
+        resetEffectiveInstanceRoot();
+      }
+    }
+    if (nodeId === 'verify' && fixtureOwnerWaiver) {
+      const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextPath) throw new Error('verify context missing in owner waiver rig');
+      const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+      process.env.ELANOUS_GRAPH_CONTEXT = contextPath;
+      try {
+        const result = runVerify(() => ({ status: 0, stdout: JSON.stringify({ ok: true, notesPage: 'ok', npmLatest: '0.2.46' }), stderr: '' }));
+        verifyEvidence = { result, command: 'release verify --version 0.2.46', npmLatest: '0.2.46' };
+        nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+        return { exitCode: result.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(result)}\n`, stderr: '' };
+      } finally { if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous; }
+    }
+    const result = resultForNode(nodeId, undefined, input.version);
+    nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+    return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+  };
+  const capture = (event: string, data: Record<string, unknown>) => ledgerEvents.push({ event, ...data });
+  const first = await runGraph(RELEASE_GRAPH, { runId, input, pinChildUniverse: true, quiet: true,
+    deps: { root, runBash, log: capture } });
+  const waiver = releaseResumeWaiver(first, { from: 'gate', ...(ownerWaived ? { ownerWaive: 'gate' } : { waive: 'gate' }), reason, acceptedRegressions: ownerWaived ? [] : acceptedRegressions, approvedBy: 'OP' });
+  if (!waiver) throw new Error('measured gate waiver was not produced');
+  resumedPhase = true;
+  dispatchedNodes.length = 0;
+  const git = (args: string[]) => {
+    if (args[0] === 'ls-remote' && args.at(-1) === `refs/heads/release/${input.version}`) return `${cutTip()}\trefs/heads/release/${input.version}`;
+    if (args[0] === 'ls-remote' || args[0] === 'show-ref' || args[0] === 'worktree') return '';
+    if (args[0] === 'fetch') return '';
+    if (args[0] === 'rev-parse') return cutTip();
+    if (args[0] === 'ls-files') return '';
+    if (args[0] === '-c' && args.includes('status.showUntrackedFiles=all')) return '';
+    if (args[0] === 'merge-base') return '';
+    throw new Error(`unexpected simulated release git ${args.join(' ')}`);
+  };
+  const trafficFile = join(root, 'traffic.json');
+  writeFileSync(trafficFile, '{}\n');
+  const resumed = fixtureOwnerWaiver
+    ? (await resumeReleaseRun({ runId, from: 'gate', ownerWaive: 'gate', reason, acceptedRegressions: [], approvedBy: 'OP',
+      partial: false, commandRoot: REPOSITORY_ROOT }, {
+      root, repo: REPOSITORY_ROOT, graphPath: RELEASE_GRAPH, runBash, trafficFile, ledgerRoot: root,
+      git, isAncestor: () => true,
+    })).state
+    : await runGraph(RELEASE_GRAPH, { resumeRunId: runId, fromNodeId: 'gate', input,
+      releaseWaiver: { ...waiver, requestedRegressions: ownerWaived ? [] : acceptedRegressions }, pinChildUniverse: true, quiet: true,
+      deps: { root, runBash, log: capture } });
+  const path = resumed.path;
+  const visited = new Set([...path, ...Object.values(resumed.fanOuts ?? {}).flatMap((fanout) => Object.keys(fanout.branches))]);
+  recordObservedEdges(path, ledgerEvents);
+  const edgeIssues = unexpectedEdges(path, resumed, edges);
+  const gate = resumed.nodes.find((node) => node.nodeId === 'gate');
+  const issueRows = Array.isArray(knownIssuesAccepted) ? knownIssuesAccepted as Array<{ id?: unknown; note?: unknown }> : [];
+  const knownIssueOk = (ownerWaived ? !issueRows.some((issue) => issue.id === introducedId) : issueRows.some((issue) => issue.id === introducedId))
+    && issueRows.some((issue) => issue.id === 'waive:gate' && issue.note === reason);
+  const ownerNotes = ownerWaived ? readFileSync(join(root, 'owner-waive-docs', 'release/public/docs/releases', `${input.version}.md`), 'utf8') : '';
+  const ownerRunLedger = ownerWaived ? JSON.parse(readFileSync(resumed.statePath, 'utf8')) as GraphRunState : undefined;
+  const ownerLedger = ownerRunLedger?.nodes.find((node) => node.nodeId === 'gate')?.waiver;
+  const ownerLedgerHasApproval = ownerRunLedger?.path.includes('gate') === true && ownerRunLedger.runId === resumed.runId;
+  const knownIssuesOutput = resumed.nodes.find((node) => node.nodeId === 'known-issues')?.output;
+  const knownIssuesResult = typeof knownIssuesOutput === 'string' ? JSON.parse(knownIssuesOutput) as Record<string, unknown> : {};
+  const auditLine = ownerNotes.match(/<!-- (\{[^\n]*\}) -->/)?.[1];
+  const audit = auditLine ? JSON.parse(auditLine) as Record<string, unknown> : undefined;
+  const expectedOwnerIds = fixtureOwnerWaiver ? fixtureIntroducedIds : [];
+  const ownerRecordOk = !ownerWaived || (ownerLedgerHasApproval && ownerLedger?.ownerWaived === true && ownerLedger.approvedBy === 'OP'
+    && ownerLedger.reason === reason && JSON.stringify(ownerLedger.introducedIds ?? []) === JSON.stringify(expectedOwnerIds)
+    && audit?.type === 'release-owner-waiver' && audit.approvedBy === 'OP' && audit.reason === reason
+    && JSON.stringify(audit.introducedIds ?? []) === JSON.stringify(expectedOwnerIds)
+    && Array.isArray(knownIssuesResult.bullets) && knownIssuesResult.bullets.includes(reason));
+  const statusOk = resumed.status === item.expect.status && resumed.path.includes('publish');
+  const visitOk = item.expect.mustVisit.every((id) => visited.has(id));
+  const notVisitOk = item.expect.mustNotVisit.every((id) => !visited.has(id));
+  const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
+    && ledgerEvents.filter((row) => row.event === 'edge-observed').length === Math.max(0, path.length - 1);
+  const waiverOk = gate?.ok === true && gate.executed === false && gate.waiver?.reason === reason
+    && gate.waiver.approvedBy === 'OP' && (ownerWaived ? gate.waiver.ownerWaived === true && JSON.stringify(JSON.parse(String(gate.output)).outcome) === JSON.stringify('pass(owner-waived)') : JSON.stringify(gate.waiver.introducedIds) === JSON.stringify([introducedId]));
+  const releaseTailOk = !fixtureOwnerWaiver || (dispatchedNodes.includes('publish') && dispatchedNodes.includes('npm-publish') && dispatchedNodes.includes('verify')
+    && (npmPublishEvidence?.publishNodeResult as { outcome?: string } | undefined)?.outcome === 'ok'
+    && Array.isArray(npmPublishEvidence?.publishNodeExternalCalls)
+    && npmPublishEvidence?.result !== undefined && (npmPublishEvidence.result as { outcome?: string; npm?: string }).outcome === 'ok'
+    && (npmPublishEvidence.result as { npm?: string }).npm === 'published'
+    && Array.isArray(npmPublishEvidence.publishedCommands) && npmPublishEvidence.publishedCommands.length === 1
+    && verifyEvidence?.result !== undefined && (verifyEvidence.result as { outcome?: string }).outcome === 'ok');
+  const pass = statusOk && visitOk && notVisitOk && knownIssueOk && waiverOk && ownerRecordOk && releaseTailOk && ledgerOk && edgeIssues.length === 0;
+  const result: ReleaseSimRigCaseResult = { id: item.id, pass, status: resumed.status, path, dispatchedNodes, unexpectedEdges: edgeIssues,
+    checks: { status: statusOk, mustVisit: visitOk && knownIssueOk && waiverOk && ownerRecordOk, mustNotVisit: notVisitOk, overlap: true, ledgerEvents: ledgerOk },
+    injectedEvidence: { introducedId, introducedIds: fixtureIntroducedIds, acceptedRegressions, reason, waived: waiverOk, knownIssuesAccepted, initialStatus: first.status, initialPath: first.path, initialDispatchedNodes: firstAttemptDispatchedNodes, publishReached: path.includes('publish'), npmPublishEvidence, verifyEvidence, ownerNotes, ownerRecordOk, releaseTailOk, ownerLedgerPath: ownerWaived ? resumed.statePath : undefined },
+    fanOuts: resumed.fanOuts, nodeTimings, ledgerEvents, statePath: resumed.statePath };
+  return result;
 }
 
 async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string,
@@ -212,7 +501,7 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
   const dispatchedNodes: string[] = [];
   const nodeTimings: NonNullable<ReleaseSimRigCaseResult['nodeTimings']> = {};
   const runBash = async (command: string, options: { env?: NodeJS.ProcessEnv }) => {
-    const { nodeId } = parseContext(options.env ?? {});
+    const { nodeId } = parseContext(options.env ?? process.env);
     if (!command.trim()) throw new Error(`empty command at simulated node ${nodeId}`);
     dispatchedNodes.push(nodeId);
     const startedAtMs = performance.now();
@@ -225,6 +514,8 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
     return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
   };
   const capture = (event: string, data: Record<string, unknown>) => ledgerEvents.push({ event, ...data });
+
+  if (item.mode === 'gate-waive-introduced-regression' || item.mode === 'owner-waive-missing-schema' || item.mode === 'owner-waive-0246-fixture') return runGateWaiveCase(scenario, item, root, edges);
 
   if (item.mode === 'cut-tip-moved-after-resume') {
     let beforeNode = 0;

@@ -15,7 +15,7 @@ import {
   TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 
-export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4'] as const;
+export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4', 'next-seat-turn-cap'] as const;
 export type NextTuiScenario = (typeof NEXT_TUI_SCENARIOS)[number];
 
 export interface NextTuiScenarioSpec {
@@ -86,8 +86,14 @@ export function parseData<T>(data: unknown): Partial<T> {
 export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<NextTuiScenarioResult> {
   const root = resolve(spec.root);
   mkdirSync(root, { recursive: true });
+  const seatTurnCapScenario = spec.scenario === 'next-seat-turn-cap';
+  if (seatTurnCapScenario) mkdirSync(join(root, 'elanous-hq', 'seat-state', 'UX'), { recursive: true });
   // First-run onboarding would otherwise ask for a provider before the TUI opens.
-  writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+  writeFileSync(join(root, 'config.json'), JSON.stringify({
+    onboarding: { completed: true }, errorReports: { enabled: false },
+    ...(seatTurnCapScenario ? { llm: { goalLoop: { enabled: true, maxIterations: 4 } } } : {}),
+    ...(seatTurnCapScenario ? { chat: { seatTurnCap: { maxTools: 1, maxWallMs: 10_000, idleEmptyMsgListLimit: 2 } } } : {}),
+  }));
   const reply = spec.reply ?? DEFAULT_REPLY;
   const base = {
     executable: spec.executable,
@@ -96,10 +102,52 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     rows: 24,
     cols: 80,
     ...(spec.expectedBinarySha256 ? { expectedBinarySha256: spec.expectedBinarySha256 } : {}),
-    env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), [TEST_FAKE_LLM_ENV]: '1', [TEST_FAKE_LLM_RESPONSE_ENV]: reply },
+    env: {
+      ELANOUS_SESSION_ROOT: join(root, 'sessions'), [TEST_FAKE_LLM_ENV]: '1', [TEST_FAKE_LLM_RESPONSE_ENV]: reply,
+      ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root,
+      ...(seatTurnCapScenario ? { COORD_ID: 'UX' } : {}),
+    },
     ready: { label: 'boot', until: (s: string) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료') },
   };
   const done = (n: number, also?: string) => (s: string) => count(s, reply) === n && s.includes('응답 완료') && (!also || s.includes(also));
+
+  if (seatTurnCapScenario) {
+    const run = await mockSeatPtySequence({
+      ...base,
+      env: {
+        ...base.env,
+        [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: 'CAP-BOUNDARY', name: 'Bash', args: { command: 'true' } }),
+      },
+      steps: [
+        { label: 'seat tool cap ends the real turn', text: '목표: CAP-BOUNDARY 한 번만 실행하고 자리 턴을 닫아줘', until: (screen) => screen.includes(reply) && screen.includes('Turn cap reached') },
+        { label: 'next human turn is submitted and finishes', text: '다음 실제 요청', until: (screen) => count(screen, reply) >= 2 && screen.includes('응답 완료') },
+        { label: 'next idle turn accepts a draft', text: '다음 대기 초안', enter: false, until: (screen) => screen.includes('다음 대기 초안') },
+        { label: 'idle Escape cancels only the draft', keys: '\x1b', until: (screen) => screen.includes('입력 취소됨') && screen.includes(reply) },
+      ],
+    });
+    const logs = readLogs(spec, 'goal.loop,llm.route-decision');
+    const events = parseEvents(logs);
+    const cap = events.filter((event) => event.category === 'goal.loop' && event.event === 'seat-turn-cap');
+    const exhausted = events.filter((event) => event.category === 'goal.loop' && event.event === 'seat-turn-cap-exhausted');
+    const routes = events.filter((event) => event.category === 'llm.route-decision' && event.event === 'local-chat-executed')
+      .map((event) => parseData<{ provider: string }>(event.data));
+    const checks = {
+      capRecordedInRealSeatTurn: cap.length === 1 && parseData<{ reason: string; tools: number }>(cap[0]?.data).reason === 'tools'
+        && parseData<{ reason: string; tools: number }>(cap[0]?.data).tools === 1,
+      capExhaustionObservedBeforeIdleInput: exhausted.length === 1
+        && Number.isFinite(Date.parse(exhausted[0]?.ts ?? ''))
+        && Date.parse(exhausted[0]!.ts!) <= Date.parse(run.frames.find((frame) => frame.label === 'next idle turn accepts a draft')?.at ?? ''),
+      nextDraftReachedIdleComposer: run.frames.find((frame) => frame.label === 'next idle turn accepts a draft')?.screen.includes('다음 대기 초안') === true,
+      nextSubmittedHumanTurnFinished: (() => {
+        const screen = run.frames.find((frame) => frame.label === 'next human turn is submitted and finishes')?.screen ?? '';
+        return count(screen, reply) >= 2 && screen.includes('응답 완료');
+      })(),
+      escapeCanceledIdleDraft: run.frames.find((frame) => frame.label === 'idle Escape cancels only the draft')?.screen.includes('입력 취소됨') === true,
+      onlyFakeProvider: routes.length > 0 && routes.every((route) => route.provider === 'test-fake-llm'),
+      exitedClean: run.exitCode === 0,
+    };
+    return { scenario: spec.scenario, universe: root, run, store: { seat: 'UX', maxTools: 1 }, logs, checks };
+  }
 
   if (spec.scenario === 'next-subagent-e4') {
     const capture = join(root, 'fake-llm.jsonl');
@@ -352,7 +400,7 @@ async function runNextResumeScenario(spec: NextTuiScenarioSpec, root: string, ba
 
 type ScenarioBase = Omit<Parameters<typeof mockSeatPtySequence>[0], 'steps'> & { env: Record<string, string> };
 type Done = (n: number, also?: string) => (s: string) => boolean;
-type LogEvent = { category?: string; event?: string; data?: string };
+type LogEvent = { category?: string; event?: string; data?: string; ts?: string };
 
 function parseEvents(logs: NextTuiScenarioResult['logs']): LogEvent[] {
   return logs.lines.map((l) => { try { return JSON.parse(l) as LogEvent; } catch { return {}; } });

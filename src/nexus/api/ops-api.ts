@@ -1,5 +1,6 @@
-import { lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { debug, redactSecretText } from '../../debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
 import { gateShardsPath, readGateShards, summarizeShards, type GateShardsFile, type GateShardsSummary } from '../../release-loop/gate-shards.js';
@@ -15,11 +16,21 @@ import { loopsMapFromCache } from '../../ops/loops-map.js';
 import { parseSince } from '../../ops/overview-collect.js';
 import { handleResourceLedgerApi } from './resource-ledger.js';
 import { handleResourceGuardianApi } from './resource-guardian.js';
+import { buildTrainThroughput, collectTrainSummaryEvents, isValidTrainDate, parseTrainThroughputLogs, trainIdentityFromBatchDirectory, trainKeysFromManifest, trainRejectionsFromSummary } from './train-throughput.js';
 import type { MetaApiOpts } from './meta-api.js';
 
 const VERSION = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
 const IDENTIFIER = /^[A-Za-z0-9-]+$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+export function defaultTrainArtifactDirectory(home = process.env.HOME || homedir()): string {
+  return join(home, 'elanous-hq', 'seat-state', 'OP', 'train-artifacts');
+}
+
+export function resolveTrainArtifactDirectory(env: NodeJS.ProcessEnv = process.env, home = process.env.HOME || homedir()): string {
+  return env.ELANOUS_TRAIN_ARTIFACT_DIR?.trim() || defaultTrainArtifactDirectory(home);
+}
+
 let seatsCache: ReturnType<typeof createSeatsCache> | null = null;
 /** Tests swap the sources; production builds them lazily on first use. */
 export function setSeatsCacheForTest(cache: ReturnType<typeof createSeatsCache> | null): void { seatsCache = cache; }
@@ -239,6 +250,57 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
   }
   if (pathname === '/v1/ops/resources/ledger') return served(handleResourceLedgerApi());
   if (pathname === '/v1/ops/resources/guardian') return served(handleResourceGuardianApi());
+  if (pathname === '/v1/ops/train-throughput') {
+    const date = url.searchParams.get('date') ?? todayKst();
+    if (!isValidTrainDate(date)) return jsonResponse({ error: 'invalid-date' }, 400);
+    const logDir = resolveTrainArtifactDirectory();
+    if (!existsSync(logDir)) return served(jsonResponse({ error: 'train-throughput-source-unconfigured' }, 503));
+    try {
+      const logFiles = readdirSync(logDir, { withFileTypes: true })
+        .filter(entry => entry.isFile() && /^train-auto-loop-[A-Za-z0-9._-]+\.log$/.test(entry.name))
+        .map(entry => join(logDir, entry.name));
+      let sourceIncomplete = false;
+      const lines = logFiles.flatMap(path => {
+        try { return readFileSync(path, 'utf8').split(/\r?\n/); } catch { sourceIncomplete = true; return []; }
+      });
+      const attempts = logFiles.flatMap(path => {
+        try {
+          const anchorDate = statSync(path).mtime.toISOString().slice(0, 10);
+          return parseTrainThroughputLogs(readFileSync(path, 'utf8').split(/\r?\n/), { date, anchorDate });
+        } catch { sourceIncomplete = true; return []; }
+      });
+      const summaryDir = process.env.ELANOUS_TRAIN_SUMMARY_DIR ?? logDir;
+      const summaries = summaryDir ? readdirSync(summaryDir, { withFileTypes: true }).flatMap(entry => {
+        try {
+          if (entry.isFile() && /^summary-[A-Za-z0-9._-]+\.json$/.test(entry.name)) {
+            return collectTrainSummaryEvents(JSON.parse(readFileSync(join(summaryDir, entry.name), 'utf8')));
+          }
+          if (!entry.isDirectory() || !/^batch-[A-Za-z0-9._-]+$/.test(entry.name)) return [];
+          const file = join(summaryDir, entry.name, 'summary.json');
+          if (!existsSync(file) || !lstatSync(file).isFile()) { sourceIncomplete = true; return []; }
+          const value: unknown = JSON.parse(readFileSync(file, 'utf8'));
+          const manifestFile = join(summaryDir, entry.name, 'manifest.json');
+          let manifest: unknown;
+          try { manifest = existsSync(manifestFile) ? JSON.parse(readFileSync(manifestFile, 'utf8')) as unknown : undefined; } catch { sourceIncomplete = true; manifest = undefined; }
+          const identity = trainIdentityFromBatchDirectory(entry.name, manifest);
+          return [...collectTrainSummaryEvents(value), ...(identity ? [
+            ...trainKeysFromManifest(manifest, identity.host, identity.runId),
+            ...trainRejectionsFromSummary(value, identity.host, identity.runId, manifest),
+          ] : [])];
+        } catch { sourceIncomplete = true; return []; }
+      }) : undefined;
+      const embedded = lines.flatMap(line => {
+        const marker = line.indexOf(' · {');
+        if (marker < 0) return [];
+        try { return collectTrainSummaryEvents(JSON.parse(line.slice(marker + 3))); } catch { sourceIncomplete = true; return []; }
+      });
+      const result = buildTrainThroughput(attempts, summaries ? [...summaries, ...embedded] : embedded.length ? embedded : undefined, date);
+      return served(jsonResponse({ ...result, sourceIncomplete }));
+    } catch (error) {
+      debug.log('ops.api', 'train-throughput-unavailable', { detail: String(error) });
+      return jsonResponse({ error: 'train-throughput-unavailable' }, 503);
+    }
+  }
   if (pathname === '/v1/ops/loops-map') {
     // LOOP-MAP-API — projects only the shared overview cache's loops snapshot
     // (name·era·beat cell observedAt; null/unmeasured value and reason preserved);

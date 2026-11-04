@@ -1,7 +1,7 @@
 // U4b — mission CLI 글루 seam 실행 검증(주입·무실행). 성공경로·모든 옵션 전달·runDevPipeline 호출·
 //   exit-code·에러경로를 process.exit/console 없이 커버(source-grep Goodhart 대체).
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, spyOn } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { runAgentMissionCliCommand, type MissionCliOpts, type MissionCliDeps } f
 import { detectAgentCli, prepareAgentCli } from './tool-install.js';
 import type { AgentBackend, AgentMissionResult } from './driver.js';
 import { planDevPipeline, toAgentMissionSpec, type DevPipelineSpec, type DevPipelineDeps, type ResolvedDevPlan } from '../self-dev/dev-pipeline.js';
+import { debug } from '../debug/log.js';
 
 const BACKEND: AgentBackend = { name: 'codex', cmd: 'codex', args: ['--yolo'] };
 const RESULT: AgentMissionResult = { ok: true, worktree: '/wt', branch: 'b', rounds: 2, evidencePath: '/e', committed: true, usedOmniCrawl: false, detail: 'ok' };
@@ -330,6 +331,48 @@ describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => 
     });
     expect(out.ok).toBe(true);
     expect(cap.last().spec!.mission!.maxRounds).toBe(8);
+  });
+});
+
+describe('MISSION-NO-ENHANCE-MEMORY — --no-enhance 는 기억 주입도 함께 끈다', () => {
+  it('① --no-enhance 면 조립된 spec.memory 가 false 이고 enhance 도 false 이다', async () => {
+    const cap = captureRun();
+    const log = spyOn(debug, 'log');
+    try {
+      const out = await runAgentMissionCliCommand(['M'], baseOpts({ enhance: false }), {
+        resolveBackend: () => BACKEND, runDevPipeline: cap.fn,
+      });
+      expect(out.ok).toBe(true);
+      const { spec } = cap.last();
+      expect(spec!.enhance).toBe(false);
+      expect(spec!.mission!.memory).toBe(false);
+      const driverSpec = toAgentMissionSpec('M', planDevPipeline(spec!), () => BACKEND);
+      expect(driverSpec.enhance).toBe(false);
+      expect(driverSpec.memory).toBe(false);
+      expect(log).toHaveBeenCalledWith('agent-mission', 'no-enhance', { memory: false });
+    } finally { log.mockRestore(); }
+  });
+
+  it('② --no-enhance 가 없으면 spec.memory 는 지금과 같이 키가 없다(undefined)', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts(), {
+      resolveBackend: () => BACKEND, runDevPipeline: cap.fn,
+    });
+    expect(out.ok).toBe(true);
+    const { spec } = cap.last();
+    expect(Object.hasOwn(spec!.mission!, 'memory')).toBe(false);
+    expect(spec!.mission!.memory).toBeUndefined();
+    expect(Object.hasOwn(spec!, 'enhance')).toBe(false);
+    expect(Object.hasOwn(toAgentMissionSpec('M', planDevPipeline(spec!), () => BACKEND), 'memory')).toBe(false);
+  });
+
+  it('③ --no-enhance 면 spec.mission.memory 키가 실려 false 를 문다(no-enhance 경로 한정)', async () => {
+    const cap = captureRun();
+    await runAgentMissionCliCommand(['M'], baseOpts({ enhance: false }), {
+      resolveBackend: () => BACKEND, runDevPipeline: cap.fn,
+    });
+    expect(Object.hasOwn(cap.last().spec!.mission!, 'memory')).toBe(true);
+    expect(cap.last().spec!.mission!.memory).toBe(false);
   });
 });
 

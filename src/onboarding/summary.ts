@@ -84,6 +84,8 @@ export async function showSummaryRecap(
     { defaultIndex: 0 },
   );
   if (save) {
+    io.print('HQ connect (optional): `eln logs federate connect <instance> <HQ URL> <mode-0600 token file> --consent`');
+    io.print('No logs are sent until this explicit consent command is run.');
     return { action: 'accept' };
   }
 

@@ -1,0 +1,195 @@
+{
+  "runId": "9770d6f8-39e6-412a-9e83-9447b7a2cd36",
+  "graphId": "self-implement",
+  "title": "DEMO1104 ARG C scenario replay",
+  "status": "completed",
+  "stage": "gate",
+  "startedAt": "2026-11-03T19:38:23.400Z",
+  "endedAt": "2026-11-03T19:38:23.520Z",
+  "prNumber": null,
+  "substrate": "local",
+  "steps": [
+    {
+      "node": "implement",
+      "round": 1,
+      "outcome": "pass",
+      "at": "2026-11-03T19:38:23.518Z",
+      "durationMs": 1,
+      "visit": 1,
+      "maxVisits": null,
+      "detail": null,
+      "sourceSeq": 22
+    },
+    {
+      "node": "gate",
+      "round": 1,
+      "outcome": "pass",
+      "at": "2026-11-03T19:38:23.519Z",
+      "durationMs": 1,
+      "visit": 1,
+      "maxVisits": null,
+      "detail": null,
+      "sourceSeq": 23
+    }
+  ],
+  "graphEvents": [
+    {
+      "seq": 1,
+      "ts": "2026-11-03T19:38:23.432Z",
+      "type": "node-added",
+      "node": "fx-scenario-quantification",
+      "kind": "judge",
+      "decider": "runtime-overlay",
+      "reason": "runtime overlay demo1104-research-arg-runtime applied at round 0",
+      "trigger": {
+        "overlayIds": [
+          "demo1104-research-arg-runtime"
+        ],
+        "round": 0
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-11-03T19:38:23.432Z",
+      "type": "edge-rerouted",
+      "from": "fx-scenario-quantification",
+      "outcome": "0",
+      "to": "merge",
+      "was": "$absent",
+      "decider": "runtime-overlay",
+      "reason": "runtime overlay demo1104-research-arg-runtime applied at round 0"
+    },
+    {
+      "seq": 3,
+      "ts": "2026-11-03T19:38:23.432Z",
+      "type": "edge-rerouted",
+      "from": "review",
+      "outcome": "3",
+      "to": "fx-scenario-quantification",
+      "was": "$absent",
+      "decider": "runtime-overlay",
+      "reason": "runtime overlay demo1104-research-arg-runtime applied at round 0"
+    },
+    {
+      "seq": 12,
+      "ts": "2026-11-03T19:38:23.515Z",
+      "type": "node-added",
+      "node": "subscription-repair",
+      "kind": "judge",
+      "decider": "scenario-injection",
+      "reason": "paid-wall recovery mock",
+      "scene": "B",
+      "demo1104Scene": "B"
+    },
+    {
+      "seq": 13,
+      "ts": "2026-11-03T19:38:23.515Z",
+      "type": "edge-rerouted",
+      "from": "checkout",
+      "outcome": "paywall",
+      "to": "subscription-repair",
+      "was": "terminal",
+      "decider": "scenario-injection",
+      "reason": "paid-wall recovery mock",
+      "scene": "B",
+      "demo1104Scene": "B"
+    },
+    {
+      "seq": 14,
+      "ts": "2026-11-03T19:38:23.516Z",
+      "type": "edge-rerouted",
+      "from": "subscription-repair",
+      "outcome": "recovered",
+      "to": "summarize",
+      "was": "$absent",
+      "decider": "scenario-injection",
+      "reason": "repair bypass mock",
+      "scene": "B",
+      "demo1104Scene": "B"
+    },
+    {
+      "seq": 17,
+      "ts": "2026-11-03T19:38:23.516Z",
+      "type": "node-added",
+      "node": "headline-refresh",
+      "kind": "researcher",
+      "decider": "scenario-injection",
+      "reason": "new headline reordering mock",
+      "scene": "C",
+      "demo1104Scene": "C"
+    },
+    {
+      "seq": 18,
+      "ts": "2026-11-03T19:38:23.516Z",
+      "type": "edge-rerouted",
+      "from": "research",
+      "outcome": "new_headline",
+      "to": "headline-refresh",
+      "was": "prioritize",
+      "decider": "scenario-injection",
+      "reason": "new headline reordering mock",
+      "scene": "C",
+      "demo1104Scene": "C"
+    },
+    {
+      "seq": 19,
+      "ts": "2026-11-03T19:38:23.516Z",
+      "type": "edge-rerouted",
+      "from": "headline-refresh",
+      "outcome": "complete",
+      "to": "prioritize",
+      "was": "$absent",
+      "decider": "scenario-injection",
+      "reason": "new headline reordering mock",
+      "scene": "C",
+      "demo1104Scene": "C"
+    }
+  ],
+  "journeyEdges": [
+    {
+      "seq": 15,
+      "from": "checkout",
+      "label": "paywall",
+      "taken": "subscription-repair",
+      "source": "graph",
+      "injected": true,
+      "mockOutcome": "paywall",
+      "scene": "B",
+      "demo1104Scene": "B"
+    },
+    {
+      "seq": 16,
+      "from": "subscription-repair",
+      "label": "recovered",
+      "taken": "summarize",
+      "source": "graph",
+      "injected": true,
+      "mockOutcome": "paywall",
+      "scene": "B",
+      "demo1104Scene": "B"
+    },
+    {
+      "seq": 20,
+      "from": "research",
+      "label": "new_headline",
+      "taken": "headline-refresh",
+      "source": "graph",
+      "injected": true,
+      "mockOutcome": "new_headline",
+      "scene": "C",
+      "demo1104Scene": "C"
+    },
+    {
+      "seq": 21,
+      "from": "headline-refresh",
+      "label": "complete",
+      "taken": "prioritize",
+      "source": "graph",
+      "injected": true,
+      "mockOutcome": "new_headline",
+      "scene": "C",
+      "demo1104Scene": "C"
+    }
+  ],
+  "ledgerEvents": 18
+}

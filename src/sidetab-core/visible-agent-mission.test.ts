@@ -1,4 +1,8 @@
 import { expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { TaskNotificationQueue } from '../agent/task-notification.js';
 import { startClassicSidetabMissionPair } from '../dashboard/classic-sidetab-mission-pair.js';
 import { createClassicSidetabMissionPairSessionRegistry } from '../dashboard/classic-sidetab-mission.js';
@@ -700,11 +704,18 @@ test('SIDETAB-MARKER-BACKGROUND-DETECT: Codex-first/Claude-second detached PTYs 
   const registry = createClassicSidetabMissionPairSessionRegistry();
   const sessions = new Map<string, { id: string; cwd: string }>();
   const completedMarkers: string[] = [];
+  const workspaceDir = mkdtempSync(join(tmpdir(), 'visible-agent-pair-workspace-'));
+  execFileSync('git', ['init', '--quiet', workspaceDir]);
+  execFileSync('git', ['-C', workspaceDir, 'config', 'user.name', 'Fixture']);
+  execFileSync('git', ['-C', workspaceDir, 'config', 'user.email', 'fixture@example.invalid']);
+  writeFileSync(join(workspaceDir, 'base.txt'), 'base\n');
+  execFileSync('git', ['-C', workspaceDir, 'add', 'base.txt']);
+  execFileSync('git', ['-C', workspaceDir, 'commit', '--quiet', '-m', 'candidate base']);
   const started = startClassicSidetabMissionPair({
     agent: 'codex', mission: 'Codex task.', parallelMission: 'Claude task.',
     context: { callId: 'parent-call', parentSessionId: 'parent-session' },
     spawnVisible: agent => {
-      const session = { id: `${agent}-pty`, cwd: '/tmp' };
+      const session = { id: `${agent}-pty`, cwd: workspaceDir };
       sessions.set(session.id, session);
       return session;
     },
@@ -715,7 +726,7 @@ test('SIDETAB-MARKER-BACKGROUND-DETECT: Codex-first/Claude-second detached PTYs 
       let markerPath: string | undefined;
       let markerValue: string | undefined;
       let markerSubmitted = false;
-      const outputPath = `/tmp/${agent}-pair-result.md`;
+      const outputPath = join(workspaceDir, `${agent}-pair-result.md`);
       const result = await runVisibleAgentMission({
         pty: {
           snapshot: () => screen,
@@ -752,10 +763,14 @@ test('SIDETAB-MARKER-BACKGROUND-DETECT: Codex-first/Claude-second detached PTYs 
     createId: (() => { let id = 0; return () => `pair-mission-${++id}`; })(),
   });
 
-  await started.completion;
-  expect(completedMarkers).toEqual(['codex', 'claude']);
-  expect(notifications.drainForParentSession('parent-session')).toHaveLength(1);
-  expect(notifications.drainForParentSession('other-parent')).toEqual([]);
+  try {
+    await started.completion;
+    expect(completedMarkers).toEqual(['codex', 'claude']);
+    expect(notifications.drainForParentSession('parent-session')).toHaveLength(1);
+    expect(notifications.drainForParentSession('other-parent')).toEqual([]);
+  } finally {
+    rmSync(workspaceDir, { recursive: true, force: true });
+  }
 });
 
 test('SIDETAB-MARKER-BACKGROUND-DETECT: three-act single-hand restart order preserves detached marker completion', async () => {

@@ -79,6 +79,11 @@ export function formatOrchestrateStartAnnouncement(input: {
   return `[self-dev] ${input.goalCount} goal 병렬 실행 (동시 ${concurrency})${input.promoteMode}${input.teardown ? ' · teardown' : ''} · run ${input.runId}${resume}`;
 }
 
+/** Stable output contract consumed by the Pod-exit classifier to join child failures to launched tasks. */
+export function formatOrchestrateTaskStartedAnnouncement(runId: string, taskId: string): string {
+  return `[self-dev] run ${runId} ▶ 시작 ${taskId}`;
+}
+
 export interface OrchestrateStartResolution {
   /** 실행부에 넘길 값. `undefined` 는 「모른다」이며 안내 문면도 같은 사실을 말한다. */
   readonly concurrency: number | undefined;
@@ -600,6 +605,8 @@ export async function runSelfOrchestrateCliCommand(
             ...baseRuntime, resumeFrom: [...previous], ...(resumeHold.length > 0 ? { resumeHold } : {}),
             onTaskLaunched: (goal, taskId, priorTaskId) => {
               baseRuntime.onTaskLaunched?.(goal, taskId, priorTaskId);
+              const parentRunId = process.env.ELANOUS_RUN_ID;
+              if (parentRunId) console.log(formatOrchestrateTaskStartedAnnouncement(parentRunId, taskId));
               const strategy = strategyByGoal.get(goal);
               if (!strategy) return;
               if (strategy === 'add-repair-task' && !addedRepairIds.includes(goal.id ?? '')) return;

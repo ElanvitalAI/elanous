@@ -1308,13 +1308,14 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
     return root;
   }
   // The fake installer behaves like scripts/install.sh: lays down versions/<ver>-<sha12> (with or without content), moves current, writes install.json.
-  const devDeps = (root: string, opts: { empty?: boolean; failAfterRelink?: boolean } = {}): SelfUpdateDeps => ({
+  const devDeps = (root: string, opts: { empty?: boolean; failAfterRelink?: boolean; installerArgs?: string[][] } = {}): SelfUpdateDeps => ({
     ...fixture().deps,
     installRoot: root,
     packageVersion: () => '0.2.16-dev.0',
     allowLiveRestart: false,
-    run: (cmd) => {
+    run: (cmd, args) => {
       if (cmd !== 'bash') return { status: 0, stderr: '' };
+      opts.installerArgs?.push(args);
       const name = `0.2.16-dev.0-${sha12}`;
       mkdirSync(join(root, 'versions', name, 'node_modules', 'elanous', 'bin'), { recursive: true });
       if (!opts.empty) writeFileSync(join(root, 'versions', name, 'node_modules', 'elanous', 'bin', 'elanous.mjs'), '// entry\n');
@@ -1329,8 +1330,10 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
 
   test('--dev installs versions/<ver>-dev.<sha12>, moves current, and keeps channel=dev plus previous', async () => {
     const root = devRoot();
+    const installerArgs: string[][] = [];
     try {
-      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root));
+      const result = await runSelfUpdate({ dev: true, from: checkout }, devDeps(root, { installerArgs }));
+      expect(installerArgs).toEqual([[join(checkout, 'scripts/install.sh'), '--no-modify-path', '--yes', '--prefix', root]]);
       expect(result).toMatchObject({ exitCode: 0, channel: 'dev', current: `versions/0.2.16-dev.0-${sha12}`, previous: 'versions/0.2.15-aaaaaaaaaaaa', restarted: false });
       expect(readlinkSync(join(root, 'current'))).toBe(`versions/0.2.16-dev.0-${sha12}`);
       expect(lstatSync(join(root, 'versions', `0.2.16-dev.0-${sha12}`, 'node_modules', 'elanous', 'bin', 'elanous.mjs')).isFile()).toBe(true);

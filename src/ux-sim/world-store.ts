@@ -2,6 +2,7 @@ import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSy
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getTestStateRoot } from '../nexus/paths.js';
+import { loadMockScenarioCatalog, type MockScenarioSourceModule } from './mock-scenario-catalog.js';
 
 /**
  * Threat model: worlds live under an explicit private test root; other OS users
@@ -12,6 +13,7 @@ import { getTestStateRoot } from '../nexus/paths.js';
  */
 const WORLD_FORMAT = 1;
 const WORLD_ID = /^[a-z0-9](?:[a-z0-9-]{0,62})$/;
+const DEVICE_CATALOGS_BY_VERSION = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
 
 export interface SimWorld {
   readonly id: string;
@@ -20,6 +22,8 @@ export interface SimWorld {
   readonly configDir: string;
   readonly fixturesDir: string;
   readonly tmpDir: string;
+  readonly devicesDir: string;
+  readonly deviceModuleIds: readonly string[];
   readonly createdAt: string;
 }
 
@@ -27,6 +31,8 @@ export interface SimWorldOptions {
   /** Parent of all worlds. The default is `<effective state root>/sim/worlds`. */
   readonly worldsDir?: string;
   readonly now?: () => Date;
+  /** Catalog update simulation for versioned-world compatibility tests; not exposed by the CLI. */
+  readonly catalogForTesting?: { readonly deviceCatalogVersion: number; readonly sourceModules: readonly MockScenarioSourceModule[] };
   /** Deterministic path-boundary race injection; not exposed by the CLI. */
   readonly beforeWorldsDirectoryCreateForTesting?: (parentDir: string, targetDir: string) => void;
   /** Deterministic reservation replacement injection for lifecycle tests; not exposed by the CLI. */
@@ -136,8 +142,83 @@ function manifestPath(rootDir: string): string {
   return join(rootDir, 'world.json');
 }
 
+function deviceModulePath(devicesDir: string, id: string): string {
+  if (!/^MD-[A-Z0-9-]+$/.test(id)) throw new Error(`invalid sim device module id: ${id}`);
+  return join(devicesDir, `${id}.json`);
+}
+
+function writeDeviceModules(rootDir: string, modules: readonly MockScenarioSourceModule[]): string[] {
+  const devicesDir = join(rootDir, 'devices');
+  mkdirSync(devicesDir, { mode: 0o700 });
+  for (const module of modules) {
+    writeFileSync(deviceModulePath(devicesDir, module.id), `${JSON.stringify(module, null, 2)}\n`, {
+      encoding: 'utf8', mode: 0o600, flag: 'wx',
+    });
+  }
+  return modules.map(({ id }) => id);
+}
+
+function validateDeviceModules(
+  rootDir: string,
+  manifest: Record<string, unknown>,
+  currentCatalog: { readonly deviceCatalogVersion: number; readonly sourceModules: readonly MockScenarioSourceModule[] } = loadMockScenarioCatalog(),
+): string[] {
+  const ids = manifest.deviceModuleIds;
+  if (ids === undefined && manifest.deviceCatalogVersion === undefined) {
+    try {
+      lstatSync(join(rootDir, 'devices'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    throw new Error(`sim world device module index is missing: ${rootDir}`);
+  }
+  if (!Number.isSafeInteger(manifest.deviceCatalogVersion)) {
+    throw new Error(`sim world device catalog version is invalid: ${rootDir}`);
+  }
+  const catalogVersion = String(manifest.deviceCatalogVersion);
+  const catalogIdsForVersion = DEVICE_CATALOGS_BY_VERSION[catalogVersion];
+  if (!catalogIdsForVersion) throw new Error(`sim world device catalog version is unsupported: ${rootDir}`);
+  if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== 'string' || !/^MD-[A-Z0-9-]+$/.test(id))
+    || new Set(ids).size !== ids.length) {
+    throw new Error(`sim world device module index is invalid: ${rootDir}`);
+  }
+  const recordedCatalogIds = [...catalogIdsForVersion].sort();
+  if (catalogVersion === String(currentCatalog.deviceCatalogVersion)
+    && JSON.stringify(currentCatalog.sourceModules.map(({ id }) => id).sort()) !== JSON.stringify(recordedCatalogIds)) {
+    throw new Error(`sim world catalog snapshot does not match the current catalog: ${rootDir}`);
+  }
+  if (JSON.stringify([...ids].sort()) !== JSON.stringify(recordedCatalogIds)) {
+    throw new Error(`sim world device module index does not match the catalog: ${rootDir}`);
+  }
+  const devicesDir = join(rootDir, 'devices');
+  const dirInfo = lstatSync(devicesDir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory() || (dirInfo.mode & 0o777) !== 0o700) {
+    throw new Error(`sim world device directory is invalid: ${devicesDir}`);
+  }
+  const expectedNames = ids.map((id) => `${id}.json`).sort();
+  if (JSON.stringify(readdirSync(devicesDir).sort()) !== JSON.stringify(expectedNames)) {
+    throw new Error(`sim world device module files do not match the index: ${devicesDir}`);
+  }
+  for (const id of ids as string[]) {
+    const path = deviceModulePath(devicesDir, id);
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || !info.isFile() || (info.mode & 0o777) !== 0o600) {
+      throw new Error(`sim world device module must be an owned 0600 file: ${path}`);
+    }
+    const module = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    if (module.id !== id || typeof module.path !== 'string' || !module.path.startsWith('src/ux-sim/')) {
+      throw new Error(`sim world device module metadata is invalid: ${path}`);
+    }
+  }
+  return ids as string[];
+}
+
 /** Reject caller supplied roots unless their private directory and manifest identify this world. */
-export function assertSimWorldOwnership(world: SimWorldOwnershipDescriptor): void {
+export function assertSimWorldOwnership(
+  world: SimWorldOwnershipDescriptor,
+  currentCatalog: { readonly deviceCatalogVersion: number; readonly sourceModules: readonly MockScenarioSourceModule[] } = loadMockScenarioCatalog(),
+): void {
   const resolvedRoot = resolve(world.rootDir);
   const testRoot = getTestStateRoot();
   if (!testRoot) throw new Error('sim worlds require an explicit --test universe');
@@ -167,10 +248,15 @@ export function assertSimWorldOwnership(world: SimWorldOwnershipDescriptor): voi
   if (manifest.format === WORLD_FORMAT && typeof manifest.createdAt !== 'string') {
     throw new Error(`sim world metadata is invalid: ${resolvedRoot}`);
   }
+  validateDeviceModules(resolvedRoot, manifest, currentCatalog);
 }
 
-function readWorld(rootDir: string, id: string): SimWorld {
-  assertSimWorldOwnership({ id, rootDir });
+function readWorld(
+  rootDir: string,
+  id: string,
+  currentCatalog: { readonly deviceCatalogVersion: number; readonly sourceModules: readonly MockScenarioSourceModule[] } = loadMockScenarioCatalog(),
+): SimWorld {
+  assertSimWorldOwnership({ id, rootDir }, currentCatalog);
   const path = manifestPath(rootDir);
   const manifestInfo = lstatSync(path);
   if (manifestInfo.isSymbolicLink() || !manifestInfo.isFile()) {
@@ -180,6 +266,7 @@ function readWorld(rootDir: string, id: string): SimWorld {
   if (manifest.format !== WORLD_FORMAT || manifest.id !== id || typeof manifest.createdAt !== 'string') {
     throw new Error(`sim world metadata is invalid: ${rootDir}`);
   }
+  const deviceModuleIds = validateDeviceModules(rootDir, manifest, currentCatalog);
   for (const name of ['state', 'config', 'fixtures', 'tmp']) {
     let childInfo: ReturnType<typeof lstatSync>;
     try { childInfo = lstatSync(join(rootDir, name)); }
@@ -200,6 +287,8 @@ function readWorld(rootDir: string, id: string): SimWorld {
     configDir: join(rootDir, 'config'),
     fixturesDir: join(rootDir, 'fixtures'),
     tmpDir: join(rootDir, 'tmp'),
+    devicesDir: join(rootDir, 'devices'),
+    deviceModuleIds,
     createdAt: manifest.createdAt,
   };
 }
@@ -264,9 +353,13 @@ export function createSimWorld(id: string, options: SimWorldOptions = {}): SimWo
       options.afterWorldDirectoryForTesting?.(rootDir, name);
       assertReservation();
     }
+    assertReservation();
+    const catalog = loadMockScenarioCatalog();
+    const deviceModuleIds = writeDeviceModules(rootDir, catalog.sourceModules);
+    assertReservation();
     const createdAt = (options.now ?? (() => new Date()))().toISOString();
     assertReservation();
-    writeFileSync(manifestPath(rootDir), `${JSON.stringify({ format: WORLD_FORMAT, id, createdAt }, null, 2)}\n`, {
+    writeFileSync(manifestPath(rootDir), `${JSON.stringify({ format: WORLD_FORMAT, id, createdAt, deviceCatalogVersion: catalog.deviceCatalogVersion, deviceModuleIds }, null, 2)}\n`, {
       encoding: 'utf8', mode: 0o600, flag: 'wx',
     });
     assertReservation();
@@ -293,7 +386,7 @@ export function listSimWorlds(options: SimWorldOptions = {}): SimWorld[] {
     try {
       const rootInfo = lstatSync(rootDir);
       if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) continue;
-      worlds.push(readWorld(rootDir, name));
+      worlds.push(readWorld(rootDir, name, options.catalogForTesting));
     } catch { /* an unrelated or incomplete entry is not a world */ }
   }
   return worlds;
@@ -320,7 +413,7 @@ export function destroySimWorld(id: string, options: SimWorldOptions = {}): bool
   if (!child || child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child)) {
     throw new Error(`refusing to destroy sim world outside its root: ${rootDir}`);
   }
-  readWorld(canonicalRootDir, id); // Require our manifest and complete layout before removal.
+  readWorld(canonicalRootDir, id, options.catalogForTesting); // Require our manifest and complete layout before removal.
   if (!sameDirectory(lstatSync(rootDir), rootInfo)) throw new Error(`sim world path changed before removal: ${rootDir}`);
   options.beforeDestroyRenameForTesting?.();
   removeOwnedDirectory(rootDir, rootInfo, options.beforeQuarantineRemovalForTesting);

@@ -34,10 +34,10 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
   expect(catalog.candidateAudit.sourceRows).toBe(36);
   expect(catalog.candidateAudit.existingPaths).toBe(35);
   expect(catalog.candidateAudit.excludedPaths).toBe(catalog.candidateAudit.candidates.filter((candidate) => candidate.disposition === 'excluded').length);
-  expect(catalog.candidateAudit.candidates).toHaveLength(37);
+  expect(catalog.candidateAudit.candidates).toHaveLength(38);
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/safe-public-copy-publish.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/seminar-rehearsal.test.ts' }));
-  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(37);
+  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(38);
   expect(catalog.candidateAudit.sourceExclusions).toHaveLength(1);
   expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
   expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
@@ -62,6 +62,34 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
     expect(existsSync(join(REPO, path))).toBe(true);
   }
   expect(catalog.devices.every((device) => device.entryCommands.length > 0 && ['yes', 'no', 'conditional', 'runner-dependent'].includes(device.logsRecorded))).toBe(true);
+  const sourceModules = new Map(catalog.sourceModules.map((module) => [module.path, module]));
+  expect([...sourceModules.keys()].sort()).toEqual(listSourceModuleFiles(join(REPO, 'src/ux-sim')).sort());
+  for (const module of catalog.sourceModules) {
+    expect(module.id).toMatch(/^MD-UX-SIM-/);
+    expect(module.boundary.length).toBeGreaterThan(0);
+    expect(module.boundary).not.toContain('module-local implementation');
+    expect(module.boundary).not.toContain('; exports ');
+    expect(module.boundary).not.toContain('...');
+    expect(module.deviceIds.length).toBeGreaterThan(0);
+    expect(module.deviceIds.map((id) => catalog.devices.find((device) => device.id === id)?.target)).not.toContain(module.boundary);
+    expect(module.integrityCertificatePresent).toBe(false);
+    expect(module.integrityCertificatePath).toBeNull();
+  }
+  const boundaryFor = (path: string) => sourceModules.get(path)?.boundary;
+  expect(boundaryFor('src/ux-sim/fault-cred-expiry.ts')).toContain('Grok subscription expiry');
+  expect(boundaryFor('src/ux-sim/fault-sqlite-busy.ts')).toContain('SQLite write lock');
+  expect(boundaryFor('src/ux-sim/fault-pool-cap.ts')).toContain('omitted :N default capacity');
+  expect(boundaryFor('src/ux-sim/fake-browser-page.ts')).toContain('CDP page navigation');
+  expect(boundaryFor('src/ux-sim/fake-cloud-vm.ts')).toContain('never calls a cloud provider');
+  expect(boundaryFor('src/ux-sim/fake-fleet.ts')).toContain('per-context Kubernetes fixtures');
+  expect(boundaryFor('src/ux-sim/fault-glm-no-credential.ts')).toContain('credential absent');
+  expect(boundaryFor('src/ux-sim/in-process-cli.ts')).toContain('registered Commander action');
+  expect(boundaryFor('src/ux-sim/world.ts')).toContain('assembles their fakes');
+  expect(boundaryFor('src/ux-sim/mock-authoring-first-run.ts')).toContain('first-run child probe');
+  expect(boundaryFor('src/ux-sim/skills-tools-shell-device.ts')).toContain('before spawn');
+  expect(boundaryFor('src/ux-sim/research-decision-chain.ts')).toContain('production Think Lens decision chain');
+  expect(boundaryFor('src/ux-sim/scenario.ts')).toContain('executes its registered trigger');
+  expect(boundaryFor('src/ux-sim/slash-menu-frames.ts')).toContain('counting full-screen clears');
   expect(catalog.devices.find((device) => device.id === 'research-decision-chain')?.eventNames).toEqual([
     'research.lens/second-order-applied', 'research.lens/second-order-skipped',
   ]);
@@ -100,6 +128,42 @@ test('version 2 catalogs without the optional world event registry remain readab
   expect(parseMockScenarioCatalog(legacy).worldEvents).toEqual([]);
 });
 
+test('file-level source module inventory is required for catalog consumers', () => {
+  const missingInventory = structuredClone(catalog) as unknown as Record<string, unknown>;
+  delete missingInventory.sourceModules;
+  expect(() => parseMockScenarioCatalog(missingInventory)).toThrow('sourceModules must be an array');
+});
+
+test('catalog devices may declare checklist coverage for request resolution', () => {
+  const covered = structuredClone(catalog);
+  covered.devices[0]!.checklistCells = ['SIM-DEVICE-REQUEST-NEXUS'];
+  expect(parseMockScenarioCatalog(covered).devices[0]?.checklistCells).toEqual(['SIM-DEVICE-REQUEST-NEXUS']);
+  covered.devices[0]!.checklistCells = ['SIM-DEVICE-REQUEST-NEXUS', 'SIM-DEVICE-REQUEST-NEXUS'];
+  expect(() => parseMockScenarioCatalog(covered)).toThrow('checklistCells must not contain duplicates');
+});
+
+test('file-level MD registry rejects duplicate paths, stale names, and unsupported certificate claims', () => {
+  const duplicatePath = structuredClone(catalog);
+  duplicatePath.sourceModules[1]!.path = duplicatePath.sourceModules[0]!.path;
+  expect(() => parseMockScenarioCatalog(duplicatePath)).toThrow('sourceModules contains duplicate path');
+
+  const staleName = structuredClone(catalog);
+  staleName.sourceModules[0]!.id = 'MD-UX-SIM-STALE-NAME';
+  expect(() => parseMockScenarioCatalog(staleName)).toThrow('stable MD- path name');
+
+  const escapedPath = structuredClone(catalog);
+  escapedPath.sourceModules[0]!.path = 'src/ux-sim/..';
+  expect(() => parseMockScenarioCatalog(escapedPath)).toThrow('must stay inside src/ux-sim');
+
+  const windowsEscapedPath = structuredClone(catalog);
+  windowsEscapedPath.sourceModules[0]!.path = 'src/ux-sim/..\\..\\outside.ts';
+  expect(() => parseMockScenarioCatalog(windowsEscapedPath)).toThrow('must stay inside src/ux-sim');
+
+  const unsupportedCertificate = structuredClone(catalog);
+  unsupportedCertificate.sourceModules[0]!.integrityCertificatePresent = true;
+  expect(() => parseMockScenarioCatalog(unsupportedCertificate)).toThrow('must agree with integrityCertificatePresent');
+});
+
 test('read-only device registry prints entry, logs, event, recent-use, and omission metadata', () => {
   const output = renderMockScenarioDevices(catalog).join('\n');
   expect(output).toContain('Mock device registry · read-only');
@@ -108,7 +172,23 @@ test('read-only device registry prints entry, logs, event, recent-use, and omiss
   expect(output).toContain('events=(none recorded)');
   expect(output).toContain('recent=(not recorded)');
   expect(output).toContain('omission check: required=3 missing=0');
+  expect(output).toContain('MD-UX-SIM-FAKE-CLOCK-TS\tsrc/ux-sim/fake-clock.ts');
+  expect(output).toContain('devices=fake-clock');
+  expect(output).toContain('certificate=no');
+  expect(renderMockScenarioDeviceMarkdownTable(catalog).join('\n')).toContain('| Owning device IDs |');
+  expect(renderMockScenarioDeviceMarkdownTable(catalog).join('\n')).toContain('| fake-clock |');
 });
+
+function listSourceModuleFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return listSourceModuleFiles(path);
+    if (entry.name.endsWith('.test.ts')) return [];
+    return entry.name.endsWith('.ts') || entry.name.endsWith('.json')
+      ? [`src/ux-sim/${path.slice(join(REPO, 'src/ux-sim').length + 1)}`]
+      : [];
+  });
+}
 
 test('generated manual catalog block matches the canonical JSON in memory', () => {
   const manual = readFileSync(join(REPO, 'docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md'), 'utf8');
@@ -254,7 +334,7 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
 
 test('list and show render registered scenarios and unknown ids fail closed', () => {
   expect(renderMockScenarioList(catalog).join('\n')).toContain('UX-MS-01\treport-deficit');
-  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 37/38');
+  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 38/39');
   expect(renderMockScenarioDetails(catalog, 'UX-MS-11').join('\n')).toContain('request-shape 400');
   expect(() => renderMockScenarioDetails(catalog, 'UX-MS-99')).toThrow('unknown mock scenario id');
 });
@@ -266,7 +346,7 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(list.stdout).toContain('UX-MS-07');
   expect(list.stdout).toContain('UX-MS-11');
   expect(list.stdout).toContain('UX-MS-12');
-  expect(list.stdout).toContain('후보 감사 37/38');
+  expect(list.stdout).toContain('후보 감사 38/39');
 
   const show = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-11'], { cwd: REPO, encoding: 'utf8' });
   expect(show.status).toBe(0);

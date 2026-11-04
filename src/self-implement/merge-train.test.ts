@@ -201,6 +201,22 @@ test('real merge-tree builds both disjoint changes, excludes a conflicting branc
   expect(calls.filter((args) => args.includes('commit-tree'))).toHaveLength(2);
 }, 30_000);
 
+test('train integration passes UX merge drivers only to the merge-tree process', () => {
+  const { repo, base, first } = fixture();
+  const calls: string[][] = [];
+  const injected: TrainGit = (args, cwd) => {
+    calls.push([...args]);
+    const result = spawnSync('git', [...args], { cwd, encoding: 'utf8' });
+    return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+  };
+  const result = integrateTrain(repo, base, [{ number: 1, head: first }], injected);
+  expect(result.commitSha).toMatch(/^[0-9a-f]{40}$/);
+  const mergeArgs = calls.find((args) => args.includes('merge-tree'))!;
+  expect(mergeArgs).toContainEqual(expect.stringContaining('merge.uxsim-catalog.driver=node'));
+  expect(mergeArgs).toContainEqual(expect.stringContaining('merge.uxsim-manual.driver=node'));
+  expect(git(repo, 'config', '--local', '--list')).not.toContain('merge.uxsim-catalog.driver');
+});
+
 test('unsupported merge-tree option fails closed without attempting checkout or gate', async () => {
   const calls: string[][] = [];
   const integrated = integrateTrain('/not-used', 'a'.repeat(40), candidates.slice(0, 2), (args) => {

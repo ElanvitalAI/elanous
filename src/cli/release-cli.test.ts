@@ -23,6 +23,7 @@ import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
 import { runGateNode } from '../../scripts/release-loop/gate-node.js';
 
 const frozenGateRunner = {
@@ -619,20 +620,26 @@ describe('release checklist CLI', () => {
       rmSync(repo, { recursive: true, force: true });
     }
   });
-  test('actual isolated skip-note exits nonzero for a stale title so dispatcher does not mark it sent', () => {
+  test('actual isolated skip-note exits nonzero for a stale title so dispatcher does not mark it sent', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-skip-note-cli-'));
-    const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${dir}`, 'release', 'checklist', '--version', '9.9.9', ...args],
+    setElanousConfigDir(dir);
+    const run = (...args: string[]) => simInProcessCli(['release', 'checklist', '--version', '9.9.9', ...args], {
+      allowPaths: [['release', 'checklist']], stateRoot: dir,
+    });
+    const actualCli = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${dir}`, 'release', 'checklist', '--version', '9.9.9', ...args],
       { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
     try {
-      expect(run('add', 'SKIP', 'Original').status).toBe(0);
-      const stale = run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Old title', '--by', 'OP');
+      expect((await run('add', 'SKIP', 'Original')).exitCode).toBe(0);
+      const stale = actualCli('skip-note', 'SKIP', 'missing path', '--expected-title', 'Old title', '--by', 'OP');
       expect(stale.status).toBe(1);
       expect(stale.stderr).toContain('칸 제목이 바뀌어');
-      expect(JSON.parse(run('list', '--json').stdout).items[0]?.evidence).toBeUndefined();
-      expect(run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Original', '--by', 'OP').status).toBe(0);
-      expect(run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Original', '--by', 'OP').status).toBe(0);
-      expect(JSON.parse(run('list', '--json').stdout).items[0]?.evidence).toMatch(/^디스패처 건너뜀 \[[a-f0-9]{16}\]: missing path$/);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+      expect(JSON.parse((await run('list', '--json')).stdout).items[0]?.evidence).toBeUndefined();
+      expect((await run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Original', '--by', 'OP')).exitCode).toBe(0);
+      const afterFirstSuccess = checklistHistory('SKIP').length;
+      expect((await run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Original', '--by', 'OP')).exitCode).toBe(0);
+      expect(checklistHistory('SKIP')).toHaveLength(afterFirstSuccess);
+      expect(JSON.parse((await run('list', '--json')).stdout).items[0]?.evidence).toMatch(/^디스패처 건너뜀 \[[a-f0-9]{16}\]: missing path$/);
+    } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   }, 180_000);
   test('refs <doc> lists citing cells across versions as a table or JSON and writes nothing', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-checklist-refs-cli-'));

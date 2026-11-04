@@ -212,7 +212,7 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const storedEnv = prior?.runtimeIdentity && prior.imageDigest && prior.envFingerprint
       ? { ...prior.runtimeIdentity, envFingerprint: prior.envFingerprint } : undefined;
     const environmentMismatch = storedEnv && input.environmentIdentity
-      ? envFields.find((field) => storedEnv[field] !== input.environmentIdentity![field])
+      ? (prior?.imageDigest !== input.environmentIdentity.imageDigest ? 'imageDigest' : envFields.find((field) => storedEnv[field] !== input.environmentIdentity![field]))
       : (!input.environmentIdentity ? 'environment-unmeasured' as const : undefined);
     const recipeMismatch = prior && input.graphEntry && input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
       ? (prior.graphEntry !== input.graphEntry ? 'graph-entry-mismatch' : prior.recipeCommand !== input.recipeCommand ? 'recipe-command-mismatch'
@@ -221,7 +221,8 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40, radiusUnchanged.has(shard.id))
       && !!input.graphEntry && !!input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
       && r.graphEntry === input.graphEntry && r.recipeCommand === input.recipeCommand && r.recipeTimeoutMs === input.recipeTimeoutMs
-      && !!input.environmentIdentity && envFields.every((field) => ({ ...r.runtimeIdentity })[field] === input.environmentIdentity![field]));
+      && !!input.environmentIdentity?.imageDigest && r.imageDigest === input.environmentIdentity.imageDigest
+      && envFields.every((field) => ({ ...r.runtimeIdentity })[field] === input.environmentIdentity![field]));
     const invalidated = new Set(input.invalidatedShardIds ?? []).has(shard.id);
     const forced = input.rerouteShard === shard.id || invalidated;
     const auto = input.rerouteShard === 'auto' && (prior?.status === 'unmeasured'

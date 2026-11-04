@@ -3233,6 +3233,8 @@ export interface IntakeSurfaceConfig {
 export interface IntakeConfig {
   /** Maximum immediately scheduled Telegram absorption links per KST day. */
   eventMax?: number;
+  /** Topic title used by the scheduled user absorption briefing and its topic-scoped feeds. */
+  briefingTopic?: string;
   telegram: IntakeSurfaceConfig;
   discord: IntakeSurfaceConfig;
   approvals?: { repo?: string };
@@ -5878,6 +5880,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     },
     intake: {
       eventMax: typeof intake.eventMax === 'number' && Number.isSafeInteger(intake.eventMax) && intake.eventMax >= 0 ? intake.eventMax : 10,
+      ...(typeof intake.briefingTopic === 'string' && intake.briefingTopic.trim()
+        ? { briefingTopic: intake.briefingTopic.trim() } : {}),
       telegram: {
         ...(normalizeIntakeAmbientCaptureMode(intakeTelegram.ambientCapture) !== undefined
           ? { ambientCapture: normalizeIntakeAmbientCaptureMode(intakeTelegram.ambientCapture)! }

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import sharp from 'sharp';
 import { runInNewContext } from 'node:vm';
-import { EMPTY_STATE_PHRASES, isBlankFrame, parseArgs, sceneSnapshotScript } from './demo-rehearsal.js';
+import { EMPTY_STATE_PHRASES, isBlankFrame, parseArgs, run, runCli, sceneSnapshotScript, scenesForCapture } from './demo-rehearsal.js';
 import { judgeScene, type SceneObservation } from './lib/rehearsal-verdict.js';
 
 const required = ['--url', 'http://127.0.0.1:31415', '--out', '/tmp/rehearsal'];
@@ -12,6 +12,45 @@ test('import is inert and defaults to 20 seconds, 1920x1080 and demo mode', () =
 
 test('no-demo includes scene 5, size and seconds parse explicitly', () => {
   expect(parseArgs([...required, '--no-demo', '--size', '1280x720', '--secs', '2.5', '--token-stdin'])).toMatchObject({ secs: 2.5, width: 1280, height: 720, demo: false, tokenStdin: true });
+});
+
+test('scene selector accepts one configured id while omission preserves the all-scenes default', () => {
+  expect(parseArgs(required)).not.toHaveProperty('scene');
+  for (const scene of [1, 2, 3, 4, 5, 6]) {
+    expect(parseArgs([...required, '--scene', String(scene)])).toMatchObject({ scene });
+  }
+  expect(scenesForCapture().map(({ id }) => id)).toEqual([1, 2, 3, 4, 5, 6]);
+  expect(scenesForCapture(3).map(({ id }) => id)).toEqual([3]);
+  expect(() => parseArgs([...required, '--scene', '01'])).toThrow();
+  expect(() => parseArgs([...required, '--scene', '7'])).toThrow();
+  expect(() => parseArgs([...required, '--scene', '3', '--scene', '4'])).toThrow();
+});
+
+test('missing, unknown, and repeated scene ids are rejected before the browser adapter is called', async () => {
+  let launchCalls = 0;
+  const launchBrowser = async () => {
+    launchCalls++;
+    throw new Error('browser launch must not be reached');
+  };
+  for (const argv of [
+    [...required, '--scene'],
+    [...required, '--scene', 'unknown'],
+    [...required, '--scene', '3', '--scene', '4'],
+  ]) {
+    await expect(runCli(argv, launchBrowser)).rejects.toThrow();
+  }
+  expect(launchCalls).toBe(0);
+});
+
+test('run rejects an invalid direct scene selection before creating or launching a browser', async () => {
+  let launchCalls = 0;
+  const launchBrowser = async () => {
+    launchCalls++;
+    throw new Error('browser launch must not be reached');
+  };
+  const args = { ...parseArgs(required), scene: 7 } as Parameters<typeof run>[0];
+  await expect(run(args, launchBrowser)).rejects.toThrow();
+  expect(launchCalls).toBe(0);
 });
 
 test('visible scene snapshot carries observed empty text to the scene verdict, excluding hidden and chrome text', () => {

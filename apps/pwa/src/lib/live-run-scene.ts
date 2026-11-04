@@ -21,6 +21,8 @@ export interface TraversalStep {
   durationMs: number | null;
   /** 1-based visit count of this node at this step (2 = first revisit). */
   visit: number;
+  /** Shared traversal/graph-event ledger sequence; absent for older run records. */
+  sourceSeq?: number;
   /** One short line (no secrets, no goal body). */
   detail?: string | null;
 }

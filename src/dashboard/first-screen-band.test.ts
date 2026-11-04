@@ -32,7 +32,7 @@ describe('resolveTuiDaemonLink', () => {
     setResolveDaemonEndpointForTest((opts) => { purposes.push(opts.purpose); return null; });
     try {
       expect(await resolveTuiDaemonLink({ universe: () => 'test', observe: () => {} })).toEqual({
-        status: 'absent', startCommand: 'elanous --test nexus run --hmr',
+        status: 'absent', startCommand: 'elanous --test nexus run',
       });
       expect(purposes).toEqual(['write']);
     } finally {
@@ -42,13 +42,13 @@ describe('resolveTuiDaemonLink', () => {
 
   test('absence and unhealthy responses give universe-specific startup commands', async () => {
     expect(await resolveTuiDaemonLink({ universe: () => 'test', endpoint: () => null })).toEqual({
-      status: 'absent', startCommand: 'elanous --test nexus run --hmr',
+      status: 'absent', startCommand: 'elanous --test nexus run',
     });
     expect(await resolveTuiDaemonLink({ universe: () => 'prod', endpoint, probe: async () => Response.json({ ok: false }) })).toEqual({
-      status: 'unhealthy', startCommand: 'elanous nexus run --hmr',
+      status: 'unhealthy', startCommand: 'elanous nexus run',
     });
     expect(await resolveTuiDaemonLink({ universe: () => 'test', endpoint, probe: async () => new Response('bad', { status: 503 }) })).toEqual({
-      status: 'unhealthy', startCommand: 'elanous --test nexus run --hmr',
+      status: 'unhealthy', startCommand: 'elanous --test nexus run',
     });
   });
 
@@ -87,9 +87,9 @@ describe('resolveTuiDaemonLink', () => {
 
   test('a custom test root is named in the start command as one literal shell argument', async () => {
     expect(await resolveTuiDaemonLink({ universe: () => 'test', testRoot: () => '/tmp/my root/it\'s', endpoint: () => null, observe: () => {} }))
-      .toEqual({ status: 'absent', startCommand: "elanous --test='/tmp/my root/it'\\''s' nexus run --hmr" });
+      .toEqual({ status: 'absent', startCommand: "elanous --test='/tmp/my root/it'\\''s' nexus run" });
     expect(await resolveTuiDaemonLink({ universe: () => 'test', testRoot: () => '/tmp/plain-root', endpoint: () => null, observe: () => {} }))
-      .toEqual({ status: 'absent', startCommand: 'elanous --test=/tmp/plain-root nexus run --hmr' });
+      .toEqual({ status: 'absent', startCommand: 'elanous --test=/tmp/plain-root nexus run' });
     for (const root of ['/tmp/a\nb', '/tmp/\u001b[2Jx', '/tmp/\u009bx']) {
       const link = await resolveTuiDaemonLink({ universe: () => 'test', testRoot: () => root, endpoint: () => null, observe: () => {} });
       expect(link).toEqual({ status: 'absent', startCommand: '' });
@@ -124,8 +124,8 @@ describe('buildFirstScreenBand', () => {
     const cases = [
       [{ status: 'checking' }, 'elanous | 데몬: 확인 중'],
       [{ status: 'connected', address: 'http://127.0.0.1:31415' }, 'elanous | 데몬: 연결됨 (http://127.0.0.1:31415)'],
-      [{ status: 'absent', startCommand: 'elanous nexus run --hmr' }, 'elanous | 데몬: 없음 · 시작: elanous nexus run --hmr'],
-      [{ status: 'unhealthy', startCommand: 'elanous --test nexus run --hmr' }, 'elanous | 데몬: 응답 없음 · 시작: elanous --test nexus run --hmr'],
+      [{ status: 'absent', startCommand: 'elanous nexus run' }, 'elanous | 데몬: 없음 · 시작: elanous nexus run'],
+      [{ status: 'unhealthy', startCommand: 'elanous --test nexus run' }, 'elanous | 데몬: 응답 없음 · 시작: elanous --test nexus run'],
       [{ status: 'error', stage: 'health' }, 'elanous | 데몬: health 조회 오류'],
     ] as const satisfies ReadonlyArray<readonly [TuiDaemonLink, string]>;
     for (const [link, expected] of cases) {
@@ -142,13 +142,13 @@ describe('buildFirstScreenBand', () => {
 
   test('uses terminal cells for Hangul and never renders a partial daemon address or command', () => {
     const connected: TuiDaemonLink = { status: 'connected', address: 'http://127.0.0.1:31415' };
-    const absent: TuiDaemonLink = { status: 'absent', startCommand: 'elanous nexus run --hmr' };
+    const absent: TuiDaemonLink = { status: 'absent', startCommand: 'elanous nexus run' };
     expect(buildFirstScreenBand({ width: 47, daemon: false, link: connected })[0])
       .toBe('elanous | 데몬: 연결됨 (http://127.0.0.1:31415)');
     expect(buildFirstScreenBand({ width: 46, daemon: false, link: connected })[0])
       .toBe('elanous | 데몬: 연결됨');
     expect(buildFirstScreenBand({ width: 56, daemon: false, link: absent })[0])
-      .toBe('elanous | 데몬: 없음 · 시작: elanous nexus run --hmr');
+      .toBe('elanous | 데몬: 없음 · 시작: elanous nexus run');
     expect(buildFirstScreenBand({ width: 40, daemon: false, link: absent })[0])
       .toBe('elanous | 데몬: 없음');
     expect(buildFirstScreenBand({ width: 15, daemon: false, link: connected })[0])
@@ -260,14 +260,14 @@ describe('buildFirstScreenBand', () => {
       .toBe('elanous | daemon: checking');
     expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'connected', address: 'http://127.0.0.1:31415' } })[0])
       .toBe('elanous | daemon: connected (http://127.0.0.1:31415)');
-    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'absent', startCommand: 'elanous nexus run --hmr' } })[0])
-      .toBe('elanous | daemon: absent · start: elanous nexus run --hmr');
-    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'unhealthy', startCommand: 'elanous nexus run --hmr' } })[0])
-      .toBe('elanous | daemon: unhealthy · start: elanous nexus run --hmr');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'absent', startCommand: 'elanous nexus run' } })[0])
+      .toBe('elanous | daemon: absent · start: elanous nexus run');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'unhealthy', startCommand: 'elanous nexus run' } })[0])
+      .toBe('elanous | daemon: unhealthy · start: elanous nexus run');
     expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'en', link: { status: 'error', stage: 'health' } })[0])
       .toBe('elanous | daemon: health lookup error');
-    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'ko', link: { status: 'absent', startCommand: 'elanous nexus run --hmr' } })[0])
-      .toBe('elanous | 데몬: 없음 · 시작: elanous nexus run --hmr');
+    expect(buildFirstScreenBand({ width: 120, daemon: false, locale: 'ko', link: { status: 'absent', startCommand: 'elanous nexus run' } })[0])
+      .toBe('elanous | 데몬: 없음 · 시작: elanous nexus run');
   });
 
   test('keeps the same guidance readable on error and empty screens in both locales', () => {
@@ -281,7 +281,7 @@ describe('buildFirstScreenBand', () => {
         width: 120, daemon: false, locale, link: { status: 'checking' },
       });
       const unhealthy = buildFirstScreenBand({
-        width: 120, daemon: false, locale, link: { status: 'unhealthy', startCommand: 'elanous nexus run --hmr' },
+        width: 120, daemon: false, locale, link: { status: 'unhealthy', startCommand: 'elanous nexus run' },
       });
       for (const band of [empty, errored, checking, unhealthy]) {
         expect(band).toHaveLength(6);

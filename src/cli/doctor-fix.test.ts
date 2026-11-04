@@ -85,6 +85,39 @@ describe('doctor git installation consent', () => {
   }, 30_000);
 
   const plan = gitInstallPlan({ platform: 'linux', distro: 'ubuntu', has: () => true });
+  test('git install reports only sudo authorization failures as permissionDenied', async () => {
+    const denied = await applyGitInstall(plan, {
+      yes: true,
+      run: () => ({ status: 1, stderr: 'sudo: a password is required' }),
+    });
+    expect(denied).toMatchObject({ ran: true, ok: false, permissionDenied: true });
+
+    const unrelated = await applyGitInstall(plan, {
+      yes: true,
+      run: () => ({ status: 1, stderr: 'E: Could not resolve archive.ubuntu.com: Permission denied' }),
+    });
+    expect(unrelated).toMatchObject({ ran: true, ok: false });
+    expect(unrelated).not.toHaveProperty('permissionDenied');
+  });
+
+  test('streams large sudo diagnostics and still recognizes a trailing authorization denial', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-doctor-sudo-stream-'));
+    const sudo = join(dir, 'sudo');
+    writeFileSync(sudo, '#!/bin/sh\nhead -c 1100000 /dev/zero >&2\nprintf "sudo: a password is required\\n" >&2\nexit 1\n', { mode: 0o755 });
+    let streamedBytes = 0;
+    try {
+      const result = await applyGitInstall(plan, {
+        yes: true,
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` },
+        writeStderr: (chunk) => { streamedBytes += Buffer.byteLength(chunk); },
+      });
+      expect(result).toMatchObject({ ran: true, ok: false, permissionDenied: true });
+      expect(streamedBytes).toBeGreaterThan(1_100_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('non-TTY --fix does not execute; --yes executes exactly once and verifies git init', async () => {
     const calls: string[][] = [];
     const run = (command: string, args: readonly string[]) => { calls.push([command, ...args]); return { status: 0 }; };
@@ -228,6 +261,36 @@ describe('doctor --fix', () => {
     expect(f.reads).not.toContain('/cache/other_key');
     expect(JSON.stringify(plan)).not.toContain('SECRET-VALUE');
     expect(JSON.stringify(plan)).not.toContain('/cache/');
+  });
+
+  test('SSH zsh PATH repair targets .zshenv, preserves existing PATH order and is idempotent', () => {
+    const interactive = 'interactive startup stays untouched\n';
+    const nonInteractive = 'export PATH="/custom/bin:/usr/bin:$PATH"\n';
+    const zshConfig = '/home/test/zsh config';
+    const nonInteractivePath = `${zshConfig}/.zshenv`;
+    const f = fixture(interactive);
+    f.deps.env = { SHELL: '/bin/zsh', ZDOTDIR: zshConfig, SSH_CONNECTION: '192.0.2.1 1234 192.0.2.2 22' };
+    f.deps.mkdir = (path) => { expect(path).toBe(zshConfig); };
+    f.files.set(nonInteractivePath, { text: nonInteractive, mode: 0o644 });
+
+    const plan = planDoctorFixes(f.deps);
+    expect(plan.items[0]).toMatchObject({ id: 'install-path', path: nonInteractivePath, status: 'fixable' });
+    expect(applyDoctorFixes(f.deps, true).items[0]).toMatchObject({ result: 'fixed', path: nonInteractivePath });
+    expect(f.files.get(nonInteractivePath)?.text).toBe(`${nonInteractive}\n${block}\n`);
+    expect(f.files.get('/home/test/.zshrc')?.text).toBe(interactive);
+    expect(f.files.has('/home/test/.zshenv')).toBe(false);
+    expect(f.files.has('/home/test/.bashrc')).toBe(false);
+
+    const writes = f.writes.length;
+    expect(applyDoctorFixes(f.deps, true).items[0]).toMatchObject({ result: 'skipped', path: nonInteractivePath });
+    expect(f.writes).toHaveLength(writes);
+    expect(f.files.get(nonInteractivePath)?.text).toBe(`${nonInteractive}\n${block}\n`);
+
+    f.deps.env.ELANOUS_SHELL_STARTUP = '/home/test/custom-zsh-startup';
+    expect(planDoctorFixes(f.deps).items[0]?.path).toBe('/home/test/custom-zsh-startup');
+    delete f.deps.env.ELANOUS_SHELL_STARTUP;
+    delete f.deps.env.ZDOTDIR;
+    expect(planDoctorFixes(f.deps).items[0]?.path).toBe('/home/test/.zshenv');
   });
 
   test('Windows writes the installer PowerShell block to the profile, then skips an existing marker', () => {

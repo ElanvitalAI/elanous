@@ -286,7 +286,7 @@ export interface NexusClient {
   /** Live 탭 — 런 원장. */
   getHarnessRuns(): Promise<HarnessRunsResponse>;
   /** HARNESS-RUN-LIVE-GRAPH — 도는 런 ⊕ `sinceMs` 이후 끝난 런(고르개). */
-  getHarnessRunsSince(sinceMs: number): Promise<HarnessRunsSinceResponse>;
+  getHarnessRunsSince(sinceMs: number, options?: { includeLanded?: boolean }): Promise<HarnessRunsSinceResponse>;
   /** HARNESS-RUN-LIVE-GRAPH — 런 하나의 노드 순서·결과·시각 ⊕ 여정 띠. */
   getHarnessRunTraversal(runId: string): Promise<HarnessRunTraversal>;
   /** Live 탭 — 로그 조회(최신순). `store` 는 다른 인스턴스 읽기 전용. */
@@ -441,7 +441,7 @@ export interface RunGraphDetail {
   graph_hash?: string;
   entry_node: string;
   terminal_nodes: string[];
-  nodes: Array<{ node_id: string; kind: string; recipe: string; max_visits: number }>;
+  nodes: Array<{ node_id: string; kind: string; recipe: string; max_visits: number; provenance?: { type: 'scenario-injection'; scene?: string; reason: string; mock?: boolean } }>;
   edges: Array<{
     from: string;
     to?: string;
@@ -1000,10 +1000,12 @@ export interface HarnessTraversalStepWire {
   visit: number; maxVisits: number | null; detail: string | null;
   /** Shared per-run ledger order; absent for legacy runs. */
   sourceSeq?: number;
+  /** Resource identifiers projected from this node's run-ledger interval. */
+  resources?: { host?: string; pod?: string; models?: string[]; plugins?: string[] };
 }
 export type HarnessGraphEventWire =
-  | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; who?: string; what?: string; missionId?: string; trigger?: unknown; undo?: unknown }
-  | { seq: number; ts: string; type: 'edge-rerouted'; from: string; outcome: string; to: string; was: string; decider: string; reason: string }
+  | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; source?: string; injected?: boolean; scene?: string; demo1104Scene?: string; mockOutcome?: string; who?: string; what?: string; missionId?: string; trigger?: unknown; undo?: unknown }
+  | { seq: number; ts: string; type: 'edge-rerouted'; from: string; outcome: string; to: string; was: string; decider: string; reason: string; source?: string; injected?: boolean; scene?: string; demo1104Scene?: string; mockOutcome?: string }
   | { seq: number; ts: string; type: 'unit-expanded'; node: string; unit: string; childRunId: string; resolution: number; decider: string; reason: string }
   | { seq: number; ts: string; type: 'unit-collapsed'; node: string; resolution: number; decider: string; reason: string };
 export interface HarnessRunTraversal {
@@ -1012,6 +1014,8 @@ export interface HarnessRunTraversal {
   steps: HarnessTraversalStepWire[]; ledgerEvents: number;
   /** Structural graph events ordered on the same per-run sequence as step sourceSeq. */
   graphEvents?: HarnessGraphEventWire[];
+  /** Outcome edges read from graph.path ledger rows, preserving injected fixture provenance. */
+  journeyEdges?: Array<{ seq?: number; from: string; label: string; taken: string; source: 'graph' | 'code-default'; injected?: boolean; mockOutcome?: string; scene?: string; demo1104Scene?: string }>;
 }
 export interface LogRow {
   id?: number;
@@ -1481,7 +1485,7 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getWorktrees: () => request('GET', '/v1/worktrees'),
     getDesignCheck: () => request('GET', '/v1/design-check'),
     getHarnessRuns: () => request('GET', '/v1/harness/runs'),
-    getHarnessRunsSince: (sinceMs) => request('GET', `/v1/harness/runs?finishedSince=${Math.max(0, Math.floor(sinceMs))}`),
+    getHarnessRunsSince: (sinceMs, options) => request('GET', `/v1/harness/runs?finishedSince=${Math.max(0, Math.floor(sinceMs))}${options?.includeLanded === false ? '&includeLanded=0' : ''}`),
     getHarnessRunTraversal: (runId) => request('GET', `/v1/harness/run-traversal?runId=${encodeURIComponent(runId)}`),
     getLogs: (query) => {
       const q = new URLSearchParams();

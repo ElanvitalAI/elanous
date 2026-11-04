@@ -55,7 +55,7 @@ import { acpToolDenialResult } from './tool-approval.js';
 import { readOriginSessionMeta } from './origin-session-meta.js';
 import { isFactQuestion } from './fact-question.js';
 import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
-import { classifyTuiChatIntent, formatTuiRouteLine, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
+import { classifyTuiChatIntent, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 import { RESEARCH_TOOL_ALLOWLIST, RESEARCH_TURN_MAX_TOOL_TURNS } from '../core-turn/research-policy.js';
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
@@ -279,7 +279,7 @@ export function bridgeCoreTurnToAcp(
       let seatKnown = false;
       if (deps.tuiRouting && !harness && deps.resolveSeat) {
         try { seat = deps.resolveSeat(); seatKnown = true; }
-        catch (error) { debug.log('chat.route', 'seat-unresolved', { error: String(error) }, { level: 'warn' }); }
+        catch (error) { debug.log('core-turn.route', 'seat-unresolved', { error: String(error) }, { level: 'warn' }); }
       }
       const route = deps.tuiRouting && !harness
         ? classifyTuiChatIntent(turnCtx.userText, {
@@ -291,13 +291,7 @@ export function bridgeCoreTurnToAcp(
         ? toolsForTuiRoute(availableTools, route.route) // bridgeCoreTurnToAcp applies route allowlists here.
         : availableTools;
       if (deps.tuiRouting) {
-        debug.log('chat.route', 'decided', { route: route.route, reason: route.reason, goalLoop: route.goalLoop, seat, seatKnown });
-        // Only a quick route is announced: a coding turn's transcript stays exactly as before (preservation).
-        // Awaited so the route line precedes the answer; a failed write is observed, not fatal to the turn.
-        if (!route.goalLoop) {
-          try { await turnCtx.push(formatTuiRouteLine(route.route)); }
-          catch (error) { debug.log('chat.route', 'push-failed', { route: route.route, error: String(error) }); }
-        }
+        debug.log('core-turn.route', 'decided', { route: route.route, reason: route.reason, goalLoop: route.goalLoop, seat, seatKnown });
       }
       const modelOverride = deps.resolveModel?.({ sessionId: turnCtx.sessionId, userText: turnCtx.userText });
       // TUI-400-AUTOHEAL-FALLBACK ② — TUI 가 «이 턴은 다음 공급자로» 를 실어 보냈다(같은 턴이 400 을 두 번 받은 뒤).
@@ -331,7 +325,7 @@ export function bridgeCoreTurnToAcp(
       if (deps.tuiRouting && seat !== null && !armGoalLoop && !route.reason.startsWith('short-')
         && isSeatOpsDirective(turnCtx.userText)) {
         try {
-          debug.log('chat.route', 'seat-ops-single-turn', {
+          debug.log('core-turn.route', 'seat-ops-single-turn', {
             seat, route: route.route, reason: route.reason, goalLoop: route.goalLoop,
             goalLoopEnabled: goalLoopCfg?.enabled === true,
           }, { level: 'warn' });

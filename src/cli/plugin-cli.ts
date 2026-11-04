@@ -1,4 +1,5 @@
 import type { Command } from 'commander';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout, stderr } from 'node:process';
 import { join } from 'node:path';
@@ -15,6 +16,10 @@ import { credentialStatus, setPluginCredentials } from '../plugins/install/plugi
 import { makePlugin } from '../plugins/maker/plugin-maker.js';
 import { registerStandaloneLogSink } from '../domains/standalone-log-sink.js';
 import { addAndInstallNode } from '../plugins/maker/node-install.js';
+import { readClaudePackageLedger } from '../plugins/adapters/claude-package.js';
+import { loadPluginManifestFromDir } from '../plugins/core/manifest.js';
+import { listNodeKinds } from '../graph-kinds/registry.js';
+import { completePluginGroundingInstall, preparePluginGroundingInstall, type GroundablePlugin } from '../plugins/install/plugin-grounding.js';
 
 function keys(): ReadonlyArray<{ keyId: string; publicKey: string }> {
   const configPath = userConfigPath();
@@ -36,6 +41,48 @@ async function askConsent(capabilities: string[], json: boolean): Promise<boolea
   } finally {
     prompt.close();
   }
+}
+
+function groundablePlugin(agent: 'claude' | 'codex', name: string, marketplace: string, source: string, packagePath: string): GroundablePlugin | undefined {
+  try {
+    const manifest = loadPluginManifestFromDir(packagePath, { id: name }).manifest;
+    const nodes = manifest.contributes.nodes ?? [];
+    if (!nodes.length) return undefined;
+    const skills = (manifest.contributes.skills ?? []).map(skill => skill.name ?? skill.id ?? '').filter(Boolean);
+    const capabilities = [...new Set([manifest.description ?? '', ...skills, ...nodes].filter(Boolean))];
+    const stableId = `${agent}-${createHash('sha256').update(`${marketplace}@${name}`).digest('hex').slice(0, 12)}`;
+    return { id: stableId, agent, name: manifest.id, marketplace, source, packagePath, capabilities, argNodePaths: nodes };
+  } catch { return undefined; }
+}
+
+async function installedGroundingInventory(): Promise<GroundablePlugin[]> {
+  const candidates: GroundablePlugin[] = [];
+  try {
+    const response = await readCodexPluginList() as { marketplaces?: Array<{ name?: unknown; plugins?: Array<Record<string, unknown>> }> };
+    if (!Array.isArray(response.marketplaces)) throw new Error('Codex marketplace inventory is malformed');
+    for (const market of response.marketplaces ?? []) {
+      if (typeof market.name !== 'string') continue;
+      for (const item of market.plugins ?? []) {
+        if (item.installed !== true || typeof item.name !== 'string') continue;
+        if (typeof item.availability === 'string' && item.availability.toUpperCase() !== 'AVAILABLE') continue;
+        try {
+          const packagePath = codexPluginPackagePath(response, item.name, market.name);
+          const candidate = groundablePlugin('codex', item.name, market.name, 'Codex host-installed marketplace package', packagePath);
+          if (candidate) candidates.push(candidate);
+        } catch { /* damaged or unavailable host package stays out of the approval list */ }
+      }
+    }
+  } catch (error) { throw new Error('Codex host plugin inventory is unavailable', { cause: error }); }
+  try {
+    const ledger = readClaudePackageLedger();
+    if (ledger.status !== 'ok') throw new Error('Claude host plugin inventory is unavailable');
+    for (const item of ledger.packages) {
+      if (!existsSync(item.installPath) || item.installPath === '없다') continue;
+      const candidate = groundablePlugin('claude', item.plugin, item.marketplace, `Claude host-installed marketplace ${item.marketplace}`, item.installPath);
+      if (candidate) candidates.push(candidate);
+    }
+  } catch (error) { throw new Error('Claude host plugin inventory is unavailable', { cause: error }); }
+  return candidates;
 }
 
 function outputEvent(event: InstallEvent, json: boolean, nodeCount: { value: number }): void {
@@ -85,6 +132,41 @@ export async function runPluginMake(request: string, opts: { name?: string; dir?
 
 export function registerPluginCommands(program: Command): void {
   const plugin = program.command('plugin').description('Install and manage Elanous plugins');
+  plugin.command('ground <capability>').description('Ground a missing ARG capability in installed Claude/Codex marketplaces and raise an approval card')
+    .option('--json', 'Print the decision reference as JSON')
+    .action(async (capability: string, opts: { json?: boolean }) => {
+      try {
+        const root = elanousStateRoot();
+        const result = await preparePluginGroundingInstall({
+          requiredCapabilities: [capability],
+          availableCapabilities: listNodeKinds().map(kind => kind.kind),
+          inventory: await installedGroundingInventory(),
+        }, { stateDir: root });
+        if (opts.json) stdout.write(JSON.stringify(result) + '\n');
+        else if (result.status === 'approval-required') console.log(`결정 카드 ${result.decisionId} · 후보 ${result.candidateIds.join(', ')} · 선택 뒤 elanous plugin install-approved ${result.decisionId}`);
+        else if (result.status === 'already-covered') console.log(`이미 있는 ARG capability: ${capability}`);
+        else console.log(`${result.status}: ${result.reason}`);
+      } catch {
+        if (opts.json) stdout.write(JSON.stringify({ status: 'failed', reason: 'plugin grounding failed' }) + '\n');
+        else console.error('plugin grounding failed');
+        process.exitCode = 1;
+      }
+    });
+  plugin.command('install-approved <decisionId>').description('Install one plugin selected on an approved grounding card and sync its ARG nodes')
+    .option('--json', 'Print the install result as JSON')
+    .action(async (decisionId: string, opts: { json?: boolean }) => {
+      try {
+        const root = elanousStateRoot();
+        const result = await completePluginGroundingInstall(decisionId, { root, stateDir: root, inventory: await installedGroundingInventory(), consent: capabilities => askConsent(capabilities, !!opts.json) });
+        if (opts.json) stdout.write(JSON.stringify(result) + '\n');
+        else if (result.status === 'installed') console.log(`설치 ${result.plugin.name}@${result.plugin.version} · ARG nodes +${result.graph.registered} · errors ${result.graph.errors.length}`);
+        else console.log(result.status === 'pending' ? `결정 대기 ${decisionId}` : `취소 ${decisionId}`);
+      } catch {
+        if (opts.json) stdout.write(JSON.stringify({ status: 'failed', reason: 'approved plugin install failed' }) + '\n');
+        else console.error('approved plugin install failed');
+        process.exitCode = 1;
+      }
+    });
   plugin.command('make <request>').description('Write, validate and install a local graph plugin, or generate an uninstalled research draft')
     .option('--name <slug>', 'Local plugin name')
     .option('--dir <parent>', 'Parent directory (default: instance plugins-local)')

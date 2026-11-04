@@ -531,7 +531,10 @@ export async function listLandedPrs(sinceMs: number, deps: LandedPrsDeps = {}): 
  *  `finished`(이 우주 원장의 끝난 런 · 최신순 ≤20) · `landed`(그 시각 뒤 main 에 병합된 PR · ≤30 · 실패면 `[]` ⊕ `landedError`) ·
  *  도는 항목마다 `objective`(그 런 원장의 `start.feature`). 없으면 응답은 종전 그대로다(동기 응답). */
 export function handleHarnessRunsGet(req: Request, _metaApi: HarnessMetaApi, deps: HarnessApiDeps = {}): Response | Promise<Response> {
+  const totalStarted = performance.now();
+  const runningStarted = performance.now();
   const runs: RunningRunsResult = (deps.queryRunningRuns ?? queryRunningRuns)({ includeTest: false });
+  const runningMs = Math.max(0, Math.round(performance.now() - runningStarted));
   const raw = new URL(req.url).searchParams.get('finishedSince');
   if (raw === null) return json(runs);
   const sinceMs = Number(raw);
@@ -539,26 +542,33 @@ export function handleHarnessRunsGet(req: Request, _metaApi: HarnessMetaApi, dep
     return json({ error: 'usage: GET /v1/harness/runs?finishedSince=<epoch ms>' }, 400);
   }
   return (async () => {
-    const landedWork = listLandedPrs(sinceMs, deps.landed ?? {});
+    const params = new URL(req.url).searchParams;
+    const includeLanded = params.get('includeLanded') !== '0';
+    const landedStarted = performance.now();
+    const landedWork = includeLanded ? listLandedPrs(sinceMs, deps.landed ?? {}) : undefined;
+    const finishedStarted = performance.now();
     const dir = deps.ledgerDir ?? runLedgerDir();
     const finished = collectFinishedRuns(dir, sinceMs);
+    const finishedMs = Math.max(0, Math.round(performance.now() - finishedStarted));
+    const objectiveStarted = performance.now();
     const entries = runs.entries.map((entry) => {
       const objective = runObjectiveFromLedgers(entry.runId, entry.ledgerDirectories?.length ? entry.ledgerDirectories : [dir]);
       return objective ? { ...entry, objective } : entry;
     });
-    const landed = await landedWork;
+    const objectiveMs = Math.max(0, Math.round(performance.now() - objectiveStarted));
+    const landed = landedWork ? await landedWork : undefined;
+    const landedMs = Math.max(0, Math.round(performance.now() - landedStarted));
     debug.log('harness-http', 'runs-finished', {
       sinceMs, count: finished.runs.length, scannedFiles: finished.scannedFiles, skippedFiles: finished.skippedFiles,
-      landed: landed.prs.length, landedCached: landed.cached === true, ...(landed.error ? { landedError: landed.error } : {}),
+      runningMs, finishedMs, objectiveMs, landedMs, totalMs: Math.max(0, Math.round(performance.now() - totalStarted)),
+      includeLanded, ...(landed ? { landed: landed.prs.length, landedCached: landed.cached === true, ...(landed.error ? { landedError: landed.error } : {}) } : {}),
     });
     return json({
       ...runs,
       entries,
       finished: finished.runs,
       finishedObservation: { sinceMs, scannedFiles: finished.scannedFiles, skippedFiles: finished.skippedFiles, limit: FINISHED_RUNS_LIMIT },
-      landed: landed.prs,
-      ...(landed.truncated ? { landedTruncated: true } : {}),
-      ...(landed.error ? { landedError: landed.error } : {}),
+      ...(landed ? { landed: landed.prs, ...(landed.truncated ? { landedTruncated: true } : {}), ...(landed.error ? { landedError: landed.error } : {}) } : {}),
     });
   })();
 }

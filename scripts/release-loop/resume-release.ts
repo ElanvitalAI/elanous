@@ -18,7 +18,7 @@ import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, p
 import { gateAssignableTestsAtCommit, gateEnvFingerprint, gateShardRecipeIdentityAtCommit, gateSourcePins } from './gate-baseline-receipt.js';
 import { inspectGateShardReceipts, readGateShardManifest, readGateShardResult } from './gate-shard-receipts.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
-import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
+import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateWaiverCoverage, gateUnmeasuredDetail, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
 import { releaseLoopConfig } from './unattended-release.js';
@@ -62,8 +62,8 @@ export interface ResumeReleaseDeps {
 }
 
 export interface ResumeReleaseOptions {
-  runId: string; from: string; partial?: boolean; waive?: string; reason?: string;
-  acceptedRegressions?: AcceptedRegression[]; gateExecutor?: string; gateHost?: string; gatePodPool?: string;
+  runId: string; from: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string;
+  acceptedRegressions?: AcceptedRegression[]; approvedBy?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string;
   rerouteShard?: string; shardHost?: string; shardOs?: 'darwin' | 'linux';
   commandRoot?: string;
 }
@@ -75,6 +75,31 @@ export interface ResumeReleasePlan {
   autoheal?: GateAutohealDecision;
   autohealReroute?: string;
   nextAttempt: number; priorCountKnown: boolean; preflight: 'passed';
+}
+
+function resolveResumeWaiver(state: GraphRunState, opts: ResumeReleaseOptions) {
+  try {
+    const waiver = releaseResumeWaiver(state, opts);
+    if (opts.waive === 'gate') {
+      const gateIndex = state.path.indexOf('gate');
+      const unmeasured = gateIndex >= 0 ? gateUnmeasuredDetail(state, gateIndex) : undefined;
+      const coverage = unmeasured === undefined ? releaseResumeGateWaiverCoverage(state, opts.acceptedRegressions ?? []) : undefined;
+      debug.log('release-loop.gate-waive', 'decision', { decision: waiver ? 'allowed' : 'refused',
+        missingIds: coverage?.missingIds ?? [], coveredIds: coverage?.coveredIds ?? [],
+        ...(unmeasured !== undefined ? { reason: 'legacy unmeasured gate waiver' } : coverage?.reason ? { reason: coverage.reason } : {}) });
+    }
+    return waiver;
+  } catch (error) {
+    if (opts.waive === 'gate') {
+      const gateIndex = state.path.indexOf('gate');
+      const unmeasured = gateIndex >= 0 ? gateUnmeasuredDetail(state, gateIndex) : undefined;
+      const coverage = unmeasured === undefined ? releaseResumeGateWaiverCoverage(state, opts.acceptedRegressions ?? []) : undefined;
+      debug.log('release-loop.gate-waive', 'decision', { decision: 'refused',
+        missingIds: coverage?.missingIds ?? [], coveredIds: coverage?.coveredIds ?? [],
+        reason: error instanceof Error ? error.message : String(error) });
+    }
+    throw error;
+  }
 }
 
 function priorGateAutoheal(run: GraphRunState): GateAutohealDecision | undefined {
@@ -680,7 +705,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   if (original && opts.gateExecutor !== undefined) releaseResumeGateExecutor(original, { from: opts.from, executor: opts.gateExecutor, host: opts.gateHost });
   if (original && opts.gatePodPool !== undefined) releaseResumeGatePodPool(original, { from: opts.from, pool: opts.gatePodPool });
   if (original && opts.rerouteShard !== undefined) releaseResumeGateShardReroute(original, { from: opts.from, shard: opts.rerouteShard, host: opts.shardHost, os: opts.shardOs });
-  const waiver = original && (opts.waive !== undefined || opts.reason !== undefined) ? releaseResumeWaiver(original, opts) : undefined;
+  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || opts.reason !== undefined) ? resolveResumeWaiver(original, opts) : undefined;
   if (original && opts.acceptedRegressions !== undefined && !waiver)
     releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from);
   const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
@@ -742,8 +767,8 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   if (gatePodPool) debug.log('release-loop.resume', 'gate-pod-pool', {
     runId: opts.runId, from: opts.from, pool: gatePodPool.set.gatePodPool, previous: gatePodPool.previous,
   });
-  const waiver = original && (opts.waive !== undefined || opts.reason !== undefined)
-    ? releaseResumeWaiver(original, opts) : undefined;
+  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || opts.reason !== undefined)
+    ? resolveResumeWaiver(original, opts) : undefined;
   if (waiver) debug.log('release-loop.resume', 'waiver', { runId: opts.runId, node: waiver.nodeId, reason: waiver.reason, unmeasured: waiver.unmeasured ?? null });
   const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
     ? releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from) : undefined;
@@ -920,6 +945,7 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
   if (!Array.isArray(opts.pick) || !opts.pick.length) throw new Error('release recover requires at least one --pick commit');
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = readRecoverJson(statePath, 'release run 상태') as GraphRunState;
+  if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // The saved version-release record names what to repair: the release branch and the commit the run cut.
   const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
   const recorded = lastJsonObject(versionRecord?.output);

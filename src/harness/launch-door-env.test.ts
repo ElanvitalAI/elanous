@@ -51,32 +51,56 @@ function say(extraEnv: Record<string, string> = {}, flags: string[] = [], active
     expect(result.error).toBeUndefined();
     const ledgerDir = join(state, 'run-ledger');
     const runLedgers = existsSync(ledgerDir) ? readdirSync(ledgerDir).filter((name) => name.endsWith('.jsonl')) : [];
+    const requestId = launchRequestId(sentence);
+    const launchDoorDecisions = (() => {
+      const logDir = join(repo, 'log');
+      if (!existsSync(logDir)) return [];
+      return readdirSync(logDir).filter((name) => name.startsWith('debug-') && name.endsWith('.log'))
+        .flatMap((name) => readFileSync(join(logDir, name), 'utf8').split('\n').flatMap((line) => {
+          try {
+            const row = JSON.parse(line) as { category?: string; event?: string; data?: Record<string, unknown> };
+            return row.category === 'execution-loop.launch-door' && row.event === 'decision' && row.data?.goalId === requestId ? [row.data] : [];
+          } catch { return []; }
+        }));
+    })();
     const launchStamps = runLedgers.flatMap((name) => readFileSync(join(ledgerDir, name), 'utf8').split('\n').flatMap((line) => {
       try {
         const entry = JSON.parse(line) as { event?: string; data?: { launch?: unknown } };
         return entry.event === 'run-origin' && entry.data?.launch ? [entry.data.launch] : [];
       } catch { return []; }
     }));
-    return { ...result, runLedgers, launchStamps, duplicateRunId, activeDuplicateRuns };
+    return { ...result, runLedgers, launchStamps, launchDoorDecisions, duplicateRunId, activeDuplicateRuns };
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-test('default enforce refuses without permission before dispatch or ledger writes', () => {
+test('default shadow records the launch door without refusing before dispatch', () => {
   const result = say();
-  expect(result.stderr).toContain('launch door: blocked');
-  expect(result.status).toBe(3);
-  expect(result.runLedgers).toEqual([]);
-  expect(result.launchStamps).toEqual([]);
-});
+  expect(result.stderr).not.toContain('launch door: blocked');
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('No LLM provider available');
+  expect(result.runLedgers.length).toBeGreaterThan(0);
+  expect(result.launchStamps).toHaveLength(0);
+  expect(result.launchDoorDecisions).toEqual(expect.arrayContaining([
+    expect.objectContaining({ mode: 'shadow', modeSource: 'default', allowed: false, wouldReject: true }),
+  ]));
+}, 300_000);
 
-test('default and empty modes honor explicit permission and signal', () => {
+test('default and empty modes use shadow while explicit permission and signal remain allowed', () => {
   const permission = { ELANOUS_LAUNCH_DOOR_PERMISSION: 'allow', ELANOUS_LAUNCH_DOOR_SIGNAL: 'green' };
   for (const env of [permission, { ...permission, ELANOUS_LAUNCH_DOOR_MODE: '' }]) {
     const resolved = resolveLaunchDoorEnv(env);
-    expect(resolved.mode).toBe('enforce');
+    expect(resolved.mode).toBe('shadow');
     expect(decideLaunchDoor({ entrance: 'harness-say', actor: 'DOOR', viaQueue: false }, resolved).allowed).toBe(true);
   }
-});
+  const emptyMode = say({ ...permission, ELANOUS_LAUNCH_DOOR_MODE: '' });
+  expect(emptyMode.stderr).not.toContain('launch door: blocked');
+  expect(emptyMode.status).toBe(1);
+  expect(emptyMode.runLedgers.length).toBeGreaterThan(0);
+  expect(emptyMode.launchStamps).toHaveLength(0);
+  expect(emptyMode.launchDoorDecisions).toEqual(expect.arrayContaining([
+    expect.objectContaining({ mode: 'shadow', modeSource: 'default', allowed: true, wouldReject: false }),
+  ]));
+}, 300_000);
 
 test('enforce refuses before dispatch with an explicit status and reason, even when --force-gate would bypass a duplicate', () => {
   for (const flags of [[], ['--force-gate']]) {
@@ -120,8 +144,8 @@ test('ordinary CLI and queue-tick admit a green signal and allow permission unde
 }, 300_000);
 
 test('env adapter defaults safely and malformed values never grant permission', () => {
-  expect(resolveLaunchDoorEnv({})).toEqual({ mode: 'enforce', modeSource: 'default', permission: 'deny', signal: 'unknown' });
-  expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: '' })).toEqual({ mode: 'enforce', modeSource: 'default', permission: 'deny', signal: 'unknown' });
+  expect(resolveLaunchDoorEnv({})).toEqual({ mode: 'shadow', modeSource: 'default', permission: 'deny', signal: 'unknown' });
+  expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: '' })).toEqual({ mode: 'shadow', modeSource: 'default', permission: 'deny', signal: 'unknown' });
   expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: 'enforce', ELANOUS_LAUNCH_DOOR_PERMISSION: 'allow', ELANOUS_LAUNCH_DOOR_SIGNAL: 'green' }))
     .toEqual({ mode: 'enforce', modeSource: 'env', permission: 'allow', signal: 'green' });
   expect(resolveLaunchDoorEnv({ ELANOUS_LAUNCH_DOOR_MODE: 'typo', ELANOUS_LAUNCH_DOOR_PERMISSION: 'yes', ELANOUS_LAUNCH_DOOR_SIGNAL: 'maybe' }))

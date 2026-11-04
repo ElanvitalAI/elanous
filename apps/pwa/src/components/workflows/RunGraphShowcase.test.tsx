@@ -6,6 +6,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createNexusClient, type HarnessRunTraversal, type RunGraphDetail } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import { RunGraphShowcase } from './RunGraphShowcase';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTestStateRoot } from '../../../../../src/nexus/paths.js';
+import { runGraphRuntimeOverlayEventPathDevice } from '../../../../../src/ux-sim/graph-runtime-overlay-event-path.js';
 
 // Snapshot copied from `eln logs --instance prod --grep 49669d4d-75d9-44bd-9679-2e080c78fb0e
 // --category graph.run --limit 30 --json`: four node-entry events, three matching node exits.
@@ -75,7 +80,7 @@ const nodeMock = (width: number) => () => ({
   clientWidth: width, clientHeight: 700, offsetWidth: width, offsetHeight: 700, style: {}, ownerDocument: globalThis.document,
 });
 
-async function mount(width: number, traversal: HarnessRunTraversal = TRAVERSAL) {
+async function mount(width: number, traversal: HarnessRunTraversal = TRAVERSAL, graph: RunGraphDetail = GRAPH) {
   const fetchImpl = (async (url: string) => {
     if (String(url).includes('/v1/harness/runs')) return new Response(JSON.stringify(RUNS), { status: 200 });
     if (String(url).includes('/v1/harness/run-traversal')) {
@@ -87,7 +92,7 @@ async function mount(width: number, traversal: HarnessRunTraversal = TRAVERSAL) 
         ...(otherRun ? { title: '다른 런', status: 'completed', endedAt: '2026-10-29T09:27:00.000Z', steps: traversal.steps.slice(0, 2) } : {}),
       }), { status: 200 });
     }
-    if (String(url).includes('/v1/graphs/')) return new Response(JSON.stringify(GRAPH), { status: 200 });
+    if (String(url).includes('/v1/graphs/')) return new Response(JSON.stringify(graph), { status: 200 });
     return new Response('{}', { status: 200 });
   }) as unknown as typeof fetch;
   const client = createNexusClient({ baseUrl: 'http://daemon', fetchImpl });
@@ -223,6 +228,59 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
     const nodes = root.root.findByType(ReactFlow).props.nodes as Array<{ id: string }>;
     expect(nodes.some((node) => node.id === 'source-check')).toBe(true);
     expect(nodes.some((node) => node.id === 'codex-hand')).toBe(true);
+  });
+
+  test('ARG-UI-DIFF: production runtime ledger diff/sequence and an unvisited route reach the PWA view', { timeout: 30_000 }, async () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), 'ux-sim-arg-ui-pwa-'));
+    setTestStateRoot(stateRoot);
+    try {
+      const runtime = await runGraphRuntimeOverlayEventPathDevice(stateRoot, crypto.randomUUID(), 'demo1104-research-arg-graph', 'fx_forecast_missing');
+      expect(runtime.ledgerRoute).toEqual([
+        expect.objectContaining({ from: 'review', outcome: 'source_missing', to: 'fx-scenario-quantification', source: 'graph', injected: true, mockOutcome: 'source_missing' }),
+        expect.objectContaining({ from: 'fx-scenario-quantification', to: 'merge', source: 'graph', injected: true, mockOutcome: 'source_missing' }),
+      ]);
+      expect(runtime.graphEvents.map(({ type }) => type)).toEqual(['node-added', 'edge-rerouted', 'edge-rerouted']);
+      const traversal: HarnessRunTraversal = {
+        ...TRAVERSAL,
+        status: 'completed',
+        endedAt: '2026-11-03T00:00:01.000Z',
+        steps: [{ node: 'review', round: null, outcome: 'pass', at: '2026-11-03T00:00:00.000Z', durationMs: 1, visit: 1, maxVisits: 1, detail: null }],
+        graphEvents: runtime.graphEvents,
+        journeyEdges: runtime.ledgerRoute.map((edge) => ({ from: edge.from, label: edge.outcome, taken: edge.to, source: edge.source, injected: edge.injected, mockOutcome: edge.mockOutcome })),
+      };
+      const graph: RunGraphDetail = {
+        id: 'self-implement', source: 'core', editable: false, entry_node: 'review', terminal_nodes: ['merge'],
+        nodes: [
+          { node_id: 'review', kind: 'judge', recipe: 'review', max_visits: 2 },
+          { node_id: 'merge', kind: 'git', recipe: 'merge', max_visits: 1 },
+          { node_id: 'skipped-route', kind: 'agent', recipe: 'legacy-route', max_visits: 1 },
+        ],
+        edges: [{ from: 'review', map: { pass: 'merge' } }],
+      };
+      root = await mount(1280, traversal, graph);
+      await pickRun(root);
+
+      const stream = root.root.findByProps({ 'data-testid': 'arg-event-stream-0' });
+      const sequence = stream.findAll((node) => node.props['data-event-seq'] !== undefined)
+        .map((node) => node.props['data-event-seq']);
+      expect(sequence).toEqual([...sequence].sort((left, right) => left - right));
+      const flow = root.root.findByType(ReactFlow);
+      expect(flow.props.nodes.some((node: { id: string }) => node.id === 'fx-scenario-quantification')).toBe(true);
+      expect(flow.props.edges).toEqual(expect.arrayContaining([
+        expect.objectContaining({ source: 'review', target: 'fx-scenario-quantification' }),
+        expect.objectContaining({ source: 'fx-scenario-quantification', target: 'merge' }),
+      ]));
+      const routeOutcome = root.root.findByProps({ 'data-testid': 'arg-route-outcome-0' });
+      expect(text(routeOutcome)).toContain('review · source_missing → fx-scenario-quantification');
+      expect(text(routeOutcome)).toContain('fx-scenario-quantification · complete → merge');
+      expect(text(routeOutcome)).toContain('injected: mock-outcome(source_missing)');
+      const unvisited = root.root.findByProps({ 'data-testid': 'live-node-skipped-route' });
+      expect(unvisited.props['data-state']).toBe('pending');
+      expect(text(unvisited)).toContain('기록 없음');
+    } finally {
+      setTestStateRoot(null);
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
   });
 
   test('태블릿 폭(820px) — 실제 진행 노드와 현재 간선을 넓은 배치로 유지한다', async () => {

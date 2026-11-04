@@ -33,6 +33,14 @@ function writeConfig(value: unknown): void {
   writeFileSync(configPath, JSON.stringify(value));
 }
 
+test('intake.briefingTopic is a trimmed config value and survives save', () => {
+  writeConfig({ intake: { briefingTopic: '  2027 사업계획: 호르무즈·중간선거 이후 원가·환율·물류  ' } });
+  const config = buildUserConfig(configPath);
+  expect(config.intake.briefingTopic).toBe('2027 사업계획: 호르무즈·중간선거 이후 원가·환율·물류');
+  saveUserConfig(config, configPath);
+  expect(buildUserConfig(configPath).intake.briefingTopic).toBe(config.intake.briefingTopic);
+});
+
 test('outbound quietHours accepts off and KST ranges and survives config save', () => {
   writeConfig({ outbound: { quietHours: 'off', deferredMaxAttempts: 7 } });
   const off = buildUserConfig(configPath);

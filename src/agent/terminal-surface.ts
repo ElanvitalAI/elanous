@@ -302,6 +302,250 @@ function asksForInformation(tokens: readonly string[]): boolean {
   return false;
 }
 
+/** Split shell command text without treating quoted operators as syntax. This is
+ *  an accident guard, not a shell interpreter: unsupported expansions fail
+ *  closed and dynamic evaluation is rejected. Redirection operands are skipped so `> eln`
+ *  cannot look like a command. */
+const SHELL_PARSE_UNCERTAIN = '__ELANOUS_SHELL_PARSE_UNCERTAIN__';
+
+function shellCommandSegments(line: string, depth = 0): string[][] {
+  if (depth > 4) return [[SHELL_PARSE_UNCERTAIN]];
+  // Command substitution and heredoc expansion are intentionally unsupported.
+  // Treat them as uncertain instead of pretending their contents were checked.
+  const segments: string[][] = [];
+  const appendBacktickScript = (start: number): number | null => {
+    let end = start + 1;
+    let script = '';
+    for (; end < line.length; end += 1) {
+      const c = line[end]!;
+      if (c === '`') {
+        segments.push(...shellCommandSegments(script, depth + 1));
+        return end;
+      }
+      if (c === '\\' && end + 1 < line.length) script += line[++end]!;
+      else script += c;
+    }
+    return null;
+  };
+  let segment: string[] = [];
+  let word = '';
+  let hasWord = false;
+  let quote: "'" | '"' | null = null;
+  const heredocs: Array<{ delimiter: string; stripTabs: boolean; quoted: boolean }> = [];
+  const flushWord = () => {
+    if (hasWord) segment.push(word);
+    word = '';
+    hasWord = false;
+  };
+  const flushSegment = () => {
+    flushWord();
+    if (segment.length) segments.push(segment);
+    segment = [];
+  };
+  const skipWord = (start: number): { end: number; value: string; quoted: boolean; hasCommandSubstitution: boolean } => {
+    let value = '';
+    let quoted = false;
+    let hasCommandSubstitution = false;
+    let q: "'" | '"' | null = null;
+    let i = start;
+    for (; i < line.length; i += 1) {
+      const c = line[i]!;
+      if (q === "'") { if (c === "'") q = null; else value += c; continue; }
+      if (q === '"') {
+        if (c === '"') { q = null; continue; }
+        if (c === '\\' && i + 1 < line.length) { value += line[++i]!; continue; }
+        if (c === '`') hasCommandSubstitution = true;
+        if (c === '$' && line[i + 1] === '(') hasCommandSubstitution = true;
+        value += c; continue;
+      }
+      if (c === "'" || c === '"') { q = c; quoted = true; continue; }
+      if (c === '\\' && i + 1 < line.length) { quoted = true; value += line[++i]!; continue; }
+      if (c === '`') hasCommandSubstitution = true;
+      if (c === '$' && line[i + 1] === '(') hasCommandSubstitution = true;
+      if (/\s/.test(c) || ';|&()<>'.includes(c)) break;
+      value += c;
+    }
+    return { end: i, value, quoted, hasCommandSubstitution };
+  };
+
+  for (let i = 0; i < line.length; i += 1) {
+    const c = line[i]!;
+    if (quote === "'") {
+      if (c === "'") quote = null;
+      else word += c;
+      hasWord = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (c === '"') { quote = null; hasWord = true; continue; }
+      if (c === '`') {
+        const end = appendBacktickScript(i);
+        if (end !== null) { i = end; hasWord = true; continue; }
+        return [[SHELL_PARSE_UNCERTAIN]];
+      }
+      if (c === '$' && line[i + 1] === '(') return [[SHELL_PARSE_UNCERTAIN]];
+      if (c === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1]!)) { word += line[++i]!; hasWord = true; continue; }
+      word += c; hasWord = true; continue;
+    }
+    if (c === '`') {
+      const end = appendBacktickScript(i);
+      if (end !== null) { i = end; continue; }
+      return [[SHELL_PARSE_UNCERTAIN]];
+    }
+    if (c === '$' && line[i + 1] === '(') return [[SHELL_PARSE_UNCERTAIN]];
+    if (c === '\\' && i + 1 < line.length) {
+      if (line[i + 1] === '\n') { i += 1; continue; }
+      word += line[++i]!; hasWord = true; continue;
+    }
+    if (c === "'" || c === '"') { quote = c; hasWord = true; continue; }
+    if (c === '#' && !hasWord) {
+      while (i + 1 < line.length && line[i + 1] !== '\n') i += 1;
+      continue;
+    }
+    if (c === '<' || c === '>' || (c === '&' && line[i + 1] === '>')) {
+      if (/^\d+$/.test(word)) { word = ''; hasWord = false; }
+      else flushWord();
+      const start = i;
+      while (i + 1 < line.length && '<>&'.includes(line[i + 1]!)) i += 1;
+      const operator = line.slice(start, i + 1);
+      const stripTabs = operator === '<<' && line[i + 1] === '-';
+      if (stripTabs) i += 1;
+      while (i + 1 < line.length && /[ \t]/.test(line[i + 1]!)) i += 1;
+      const target = skipWord(i + 1);
+      // Redirection operands are not commands, but backtick substitution in
+      // one executes a command while resolving the destination. `skipWord`
+      // intentionally does not parse shell expansions, so fail closed here.
+      if (target.hasCommandSubstitution) segments.push([SHELL_PARSE_UNCERTAIN]);
+      if (operator === '<<' && target.value) heredocs.push({ delimiter: target.value, stripTabs, quoted: target.quoted });
+      i = target.end - 1;
+      continue;
+    }
+    if (/\s/.test(c)) {
+      if (c === '\n' && heredocs.length) {
+        flushSegment();
+        let cursor = i + 1;
+        for (const doc of heredocs.splice(0)) {
+          while (cursor < line.length) {
+            const end = line.indexOf('\n', cursor);
+            const bodyLine = line.slice(cursor, end < 0 ? line.length : end);
+            if (!doc.quoted && /`|\$\(/.test(bodyLine)) segments.push([SHELL_PARSE_UNCERTAIN]);
+            const compare = doc.stripTabs ? bodyLine.replace(/^\t+/, '') : bodyLine;
+            cursor = end < 0 ? line.length : end + 1;
+            if (compare === doc.delimiter) break;
+          }
+        }
+        i = cursor - 1;
+      } else if (c === '\n') flushSegment();
+      else flushWord();
+      continue;
+    }
+    if (';|&()'.includes(c)) {
+      flushSegment();
+      if ((c === '&' || c === '|') && line[i + 1] === c) i += 1;
+      continue;
+    }
+    word += c;
+    hasWord = true;
+  }
+  flushSegment();
+  return segments;
+}
+
+const SELF_NEST_WRAPPERS = new Set(['exec', 'command', 'nohup', 'time', 'nice', 'builtin', 'sudo']);
+const SELF_NEST_SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
+// These wrappers can execute a nested command, but their command boundary is
+// not modeled here. Refuse them rather than guessing whether they launch TUI.
+const UNSUPPORTED_EXEC_WRAPPERS = new Set(['watch', 'xargs', 'tmux', 'screen']);
+const SAFE_LITERAL_COMMANDS = new Set(['echo', 'printf', 'cat', 'pwd', 'ls', 'test', 'true', 'false', 'grep', 'rg', 'head', 'tail', 'sed', 'awk', 'cut', 'wc', 'stat']);
+const TUI_COMMAND_MARKER = /(?:^|[\s/=@])(?:eln|elanous)(?=$|[\s/.-])/i;
+const SHELL_CONTROL_WORDS = new Set(['!', 'if', 'then', 'elif', 'while', 'until', 'do', 'for', 'select', 'case', 'in', 'function', '{', '}']);
+// This allowlist is intentionally limited to wrappers whose command boundary
+// is parsed below. It does not model watch/xargs/tmux/screen or custom launchers.
+const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+function segmentStartsTui(tokens: readonly string[], depth = 0): boolean {
+  if (tokens.includes(SHELL_PARSE_UNCERTAIN)) return true;
+  if (depth > 4) return true;
+  if (tokens.length === 0) return false;
+  let start = 0;
+  // Shell control words/operators may prefix a command segment (e.g. `! eln`
+  // or `then eln`). They are not executable names; continue to the command.
+  while (start < tokens.length && SHELL_CONTROL_WORDS.has(tokens[start]!)) start += 1;
+  while (start < tokens.length && ENV_ASSIGNMENT.test(tokens[start]!)) start += 1;
+  const command = tokens[start];
+  if (!command) return false;
+  const name = basenameOf(command);
+  const rest = tokens.slice(start + 1);
+
+  if (UNSUPPORTED_EXEC_WRAPPERS.has(name)) return true;
+  if (name === 'eval' || name === 'ssh' || name === 'setsid') return true;
+  if (name === 'find' && rest.some((token) => token === '-exec' || token === '-execdir')) return true;
+
+  if (name === 'env') {
+    let i = 0;
+    while (i < rest.length) {
+      const token = rest[i]!;
+      if (token === '--') { i += 1; break; }
+      if (token === '-S' || token === '--split-string') return rest[i + 1] !== undefined && shellCommandSegments(rest[i + 1]!, depth + 1).some((s) => segmentStartsTui(s, depth + 1));
+      if (token.startsWith('--split-string=')) return shellCommandSegments(token.slice('--split-string='.length), depth + 1).some((s) => segmentStartsTui(s, depth + 1));
+      if (token === '-u' || token === '--unset' || token === '-C' || token === '--chdir') { i += 2; continue; }
+      if (token.startsWith('-') || ENV_ASSIGNMENT.test(token)) { i += 1; continue; }
+      break;
+    }
+    return segmentStartsTui(rest.slice(i), depth + 1);
+  }
+
+  if (SELF_NEST_SHELLS.has(name)) {
+    for (let i = 0; i < rest.length; i += 1) {
+      const token = rest[i]!;
+      if (token === '--command' || token === '-c' || /^-[A-Za-z]*c[A-Za-z]*$/.test(token)) {
+        const script = rest[i + 1];
+        return script !== undefined && shellCommandSegments(script, depth + 1).some((s) => segmentStartsTui(s, depth + 1));
+      }
+      if (token === '--') break;
+    }
+    return false;
+  }
+
+  if (SELF_NEST_WRAPPERS.has(name)) {
+    if (name === 'command' && ['-v', '-V', '--help'].includes(rest[0] ?? '')) return false;
+    let i = 0;
+    while (i < rest.length && rest[i]!.startsWith('-')) {
+      const option = rest[i]!;
+      if (option === '--') { i += 1; break; }
+      const takesValue = (name === 'sudo' && ['-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt', '-C', '--close-from', '-T', '--command-timeout', '-D', '--chdir'].includes(option))
+        || (name === 'nice' && ['-n', '--adjustment'].includes(option))
+        || (name === 'time' && ['-o', '--output', '-f', '--format'].includes(option));
+      i += takesValue ? 2 : 1;
+    }
+    return segmentStartsTui(rest.slice(i), depth + 1);
+  }
+
+  if (name === 'npx' || name === 'bunx') {
+    for (let i = 0; i < rest.length; i += 1) {
+      const token = rest[i] ?? '';
+      if (token.startsWith('--call=') || token.startsWith('-c=')) {
+        const inline = token.slice(token.indexOf('=') + 1);
+        return shellCommandSegments(inline, depth + 1).some((s) => segmentStartsTui(s, depth + 1));
+      }
+      if (['-c', '--call'].includes(token)) {
+        return rest[i + 1] !== undefined && shellCommandSegments(rest[i + 1]!, depth + 1).some((s) => segmentStartsTui(s, depth + 1));
+      }
+    }
+  }
+  if (classifyTuiLaunch(tokens.slice(start)).kind === 'elanous-tui-launch') return true;
+  // Unknown commands carrying a TUI marker may be custom launch wrappers.
+  // Known literal/inspection commands keep their ordinary arguments harmless.
+  return !asksForInformation(rest) && !SAFE_LITERAL_COMMANDS.has(name) && rest.some((token) => TUI_COMMAND_MARKER.test(token));
+}
+
+function commandHasTuiLaunch(argv: readonly string[]): boolean {
+  if (classifyTuiLaunch(argv).kind === 'elanous-tui-launch') return true;
+  const command = argv[0] ?? '';
+  if (/[\s;&|()<>`]/.test(command) && shellCommandSegments(command).some((segment) => segmentStartsTui(segment))) return true;
+  return segmentStartsTui(argv);
+}
+
 /** First non-flag token, skipping the value of a value-taking flag. */
 function firstPositional(tokens: readonly string[]): string {
   for (let i = 0; i < tokens.length; i += 1) {
@@ -378,13 +622,14 @@ export function decideTuiSelfNest(
   env: NodeJS.ProcessEnv = process.env,
 ): TuiSelfNestDecision {
   const look = classifyTuiLaunch(argv);
+  const tuiLaunch = commandHasTuiLaunch(argv);
   const nest = readTuiNestEnv(env);
   const insideTui = Boolean(nest.parentPtyId) || nest.nestDepth >= 1;
-  if (look.kind !== 'elanous-tui-launch' || !insideTui) {
+  if (!tuiLaunch || !insideTui) {
     return {
       reject: false,
       reason: null,
-      command: look.kind,
+      command: tuiLaunch ? 'elanous-tui-launch' : 'other',
       subcommand: look.subcommand,
       parentPtyId: nest.parentPtyId,
       nestDepth: nest.nestDepth,
@@ -394,7 +639,7 @@ export function decideTuiSelfNest(
   return {
     reject: true,
     reason: 'already-inside-tui',
-    command: look.kind,
+    command: 'elanous-tui-launch',
     subcommand: look.subcommand,
     parentPtyId: nest.parentPtyId,
     nestDepth: nest.nestDepth,

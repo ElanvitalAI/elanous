@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
-import { activeResourceLeases, beginResourceLease, endResourceLease, heartbeatResourceLease, readResourceLedger,
+import { activeResourceLeases, activeResourcePools, beginResourceLease, declareResourcePool, endResourceLease, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordWarmPoolPodReceipt,
   reconcileResourceLeases, reapResourceLeaseIfCurrent, resourceMatrix, type ResourceLease, type ResourceMeasurement } from './resource-ledger.js';
 import { buildResourceLedgerSnapshot, collectResourceMeasurement, registerResourceLedgerCommands, type ResourceCommandRunner } from '../cli/resource-ledger-cli.js';
 import { Command } from 'commander';
@@ -12,6 +12,29 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 const lease = (overrides: Partial<ResourceLease> = {}): ResourceLease => ({ id: 'fp_run001', fp: 'fp_run001', host: 'node-b', lane: 'ta',
   resources: { cpu: 2, memoryBytes: 1024 }, mission: { cell: 'TA-1' }, ttlMs: 1000,
   heartbeatAt: '2026-11-01T00:00:00.000Z', startedAt: '2026-11-01T00:00:00.000Z', ...overrides });
+
+test('Nexus resource ledger records per-Pod digest, runtime, skill, last job, and cleanup receipt', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-pod-receipt-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const receipt = { purpose: 'ta' as const, host: 'aws1', podUid: 'pod-uid-1', digest: 'sha256:' + 'c'.repeat(64),
+    runtime: 'bun-v1', environment: 'linux-amd64', skillPacks: [{ name: 'research', version: '2' }],
+    lastJob: 'crawl-shard-1', cleanupResult: { state: 'unclean' as const, procedure: 'clean-v1',
+      reason: 'host-disappeared', verifiedAt: '2026-11-02T00:00:00.000Z' } };
+  recordWarmPoolPodReceipt(receipt, new Date('2026-11-02T00:00:01.000Z'), path);
+  expect(latestWarmPoolPodReceipts(readResourceLedger(path))).toEqual([receipt]);
+});
+
+test('Nexus resource ledger retains validated pool declarations independently of host-local files', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-pools-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const pool = { purpose: 'ta' as const, fanoutGroupId: 'ta-mesh-v1',
+    members: [{ host: 'gcp1', count: 2, digest: 'sha256:' + 'a'.repeat(64), role: 'both' as const }],
+    fanoutGroup: { shard: { kind: 'skill' as const, input: 'research-shard', result: 'citation-rows', fingerprint: 'runtime-env-skills' } },
+    fingerprint: { runtime: 'bun-v1', environment: 'linux', skillPacks: [{ name: 'research', version: '2' }] }, cleanup: { procedure: 'clean-v1', verify: 'verify-v1' } };
+  declareResourcePool(pool, new Date('2026-11-02T00:00:00Z'), path);
+  expect(activeResourcePools(readResourceLedger(path))).toEqual([pool]);
+  expect(activeResourceLeases(readResourceLedger(path))).toEqual([]);
+});
 
 test('lease C/U/D appends an auditable history and active view reflects terminal endRun', () => {
   const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-')); dirs.push(dir);
@@ -23,6 +46,20 @@ test('lease C/U/D appends an auditable history and active view reflects terminal
   expect(activeResourceLeases(readResourceLedger(path))).toEqual([]);
   expect(readResourceLedger(path).map(row => row.event)).toEqual(['lease-created', 'lease-heartbeat', 'lease-ended']);
   expect(readResourceLedger(path)[2]).toMatchObject({ event: 'lease-ended', reason: 'completed', stoppedBy: 'self' });
+});
+
+test('machine disappearance is recorded as a distinct lease-reap reason', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-disappeared-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const started = beginResourceLease({ fp: 'fp_disappeared', host: 'gcp1', lane: 'warm',
+    resources: { pods: 1 }, mission: { cell: 'warm-pool' }, ttlMs: 60_000,
+    now: new Date('2026-11-02T00:00:00.000Z') }, path);
+  const expiresAt = Date.parse(started.heartbeatAt) + started.ttlMs;
+  expect(reapResourceLeaseIfCurrent({ id: started.id, expectedHeartbeatAt: started.heartbeatAt,
+    expectedExpiresAtMs: expiresAt, observedAtMs: Date.parse(started.heartbeatAt) - 1, reason: 'machine-disappeared' }, path)).toBe(false);
+  expect(reapResourceLeaseIfCurrent({ id: started.id, expectedHeartbeatAt: started.heartbeatAt,
+    expectedExpiresAtMs: expiresAt, observedAtMs: Date.parse(started.heartbeatAt) + 1, reason: 'machine-disappeared' }, path)).toBe(true);
+  expect(readResourceLedger(path).at(-1)).toMatchObject({ event: 'lease-reaped', reason: 'machine-disappeared' });
 });
 
 test('reconcile reaps only the exact expired heartbeat version under the ledger lock', () => {

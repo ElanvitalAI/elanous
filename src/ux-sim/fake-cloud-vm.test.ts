@@ -43,6 +43,19 @@ describe('fake-cloud-vm control-plane simulation', () => {
     });
   });
 
+
+  test('unexpected VM disappearance invalidates resident leases for reconciliation', async () => {
+    await withSimClock(EPOCH, () => {
+      const fleet = createFakeCloudVm();
+      fleet.createFromImage({ id: 'gcp1', imageDigest: 'sha256:image-a', hourlyCost: 1 });
+      fleet.openLease('gcp1');
+      expect(fleet.disappear('gcp1')).toMatchObject({ state: 'disappeared', activeLeases: 0 });
+      expect(fleet.events().at(-1)).toMatchObject({ type: 'vm-disappeared', id: 'gcp1', lostLeases: 1 });
+      expect(() => fleet.openLease('gcp1')).toThrow('new lease refused');
+      expect(() => fleet.closeLease('gcp1')).toThrow('no active lease');
+    });
+  });
+
   test('a late first status poll accounts cost and stop at the scheduled deadline', async () => {
     await withSimClock(EPOCH, (clock) => {
       const fleet = createFakeCloudVm();

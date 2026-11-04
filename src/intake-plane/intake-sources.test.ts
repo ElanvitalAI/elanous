@@ -1,14 +1,56 @@
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { addSource, dueSources, listSources, removeSource, runDue, sourcesFile } from './intake-sources.js';
+import { addSource, dueSources, listSources, removeSource, runDue, sourcesFile, syncBriefingTopicSource, syncStarterTopicRssSources } from './intake-sources.js';
 import { readStarSnapshots } from './collect-github.js';
 import { ingestIntakeItems, listIntakeItems, markIntakeItem } from './items.js';
 import { loadIntakeLedger } from './items.js';
 import { BriefItemsLedger, type AddBriefItem } from '../briefing/brief-items.js';
 
 const now = new Date('2026-10-01T12:00:00.000Z');
+
+test('configured briefing topic creates and updates one recurring RSS source without replacing other sources', fixture((root) => {
+  const other = addSource({ id: 'existing', seat: 'OP', kind: 'rss', spec: 'https://example.com/op.xml', every: '1d' }, root);
+  const topic = '2027 사업계획: 호르무즈·중간선거 이후 원가·환율·물류';
+  const source = syncBriefingTopicSource(topic, root)!;
+  expect(source).toMatchObject({ id: 'intake-briefing-topic-config', seat: 'user', kind: 'rss', every: '1d', why: 'intake.briefingTopic' });
+  expect(decodeURIComponent(source.spec)).toContain('호르무즈 원가 OR 호르무즈 환율 OR 호르무즈 물류 OR 중간선거 원가 OR 중간선거 환율 OR 중간선거 물류');
+  expect(decodeURIComponent(source.spec)).not.toContain('중간선거 중간선거');
+  expect(syncBriefingTopicSource(topic, root)).toEqual(source);
+  expect(syncBriefingTopicSource('다음 주제', root)?.spec).not.toBe(source.spec);
+  expect(syncBriefingTopicSource(undefined, root)).toBeUndefined();
+  expect(listSources({}, root).map(({ id }) => id)).toEqual(['existing']);
+  expect(other.id).toBe('existing');
+}));
+
+test('RSS collection records distinct publishers from the fetched result for the briefing card', fixture(async (root) => {
+  const source = syncBriefingTopicSource('토픽 하나', root)!;
+  const feed = '<rss><channel><item><title>A</title><link>https://one.example/a</link><source>One News</source></item><item><title>B</title><link>https://two.example/b</link><source>Two News</source></item></channel></rss>';
+  const result = await runDue({ now, seat: 'user', sourceId: source.id, deps: { stateDir: root, fetchFeed: async () => feed } });
+  expect(result.ran).toEqual([{ id: source.id, items: 2 }]);
+  expect(listSources({ seat: 'user' }, root).find((entry) => entry.id === source.id)).toMatchObject({ lastSourceCount: 2, briefingTopic: '토픽 하나' });
+  expect(loadIntakeLedger(root).items.size).toBe(2);
+}));
+
+test('overlapping topic fetches preserve both topic memberships and never stamp old results onto new source', fixture(async (root) => {
+  const source = syncBriefingTopicSource('이전 토픽', root)!;
+  let releaseOld!: (xml: string) => void;
+  const oldFeed = new Promise<string>((resolve) => { releaseOld = resolve; });
+  const oldRun = runDue({ now, seat: 'user', sourceId: source.id, deps: { stateDir: root, fetchFeed: () => oldFeed } });
+  syncBriefingTopicSource('새 토픽', root);
+  const newRun = await runDue({ now: new Date(now.getTime() + 1_000), seat: 'user', sourceId: source.id, deps: { stateDir: root,
+    fetchFeed: async () => '<rss><channel><item><title>공통 자료</title><link>https://shared.example/a</link><source>Shared News</source></item></channel></rss>' } });
+  releaseOld('<rss><channel><item><title>공통 자료</title><link>https://shared.example/a</link><source>Shared News</source></item></channel></rss>');
+  await oldRun;
+  expect(newRun.ran[0]).toMatchObject({ id: source.id, items: 1 });
+  const current = listSources({ seat: 'user' }, root).find((entry) => entry.id === source.id)!;
+  expect(current).toMatchObject({ briefingTopic: '새 토픽', lastRunAt: new Date(now.getTime() + 1_000).toISOString() });
+  const item = [...loadIntakeLedger(root).items.values()].find((entry) => entry.url === 'https://shared.example/a');
+  expect(item?.briefingTopics).toEqual(['새 토픽', '이전 토픽']);
+}));
+
 function fixture(fn: (root: string) => Promise<void> | void) {
   return async () => {
     const root = mkdtempSync(join(tmpdir(), 'seat-intake-'));
@@ -30,6 +72,62 @@ test('registry persists canonical seat, 0600 file, removal and due/expiration bo
   expect(dueSources(new Date('2026-10-02T00:00:00Z'), root).map((s) => s.id)).toEqual(['mk']);
   expect(removeSource('mk', root)).toBe(true);
   expect(removeSource('mk', root)).toBe(false);
+}));
+
+test('starter topics reconcile to stable RSS sources idempotently and remove only managed entries', fixture((root) => {
+  addSource({ id: 'manual', seat: 'MK', kind: 'rss', spec: 'https://example.com/feed', every: '1h' }, root);
+  const first = syncStarterTopicRssSources(['agents', 'bun', 'agents', '  '], root);
+  expect(first).toHaveLength(2);
+  expect(first[0]).toMatchObject({ id: expect.stringMatching(/^starter-rss-/), seat: 'user', kind: 'rss', every: '1d', why: 'starter.topics', managedBy: 'starter.topics' });
+  expect(new URL(first[0]!.spec).searchParams.get('q')).toBe('agents');
+  const afterFirst = readFileSync(sourcesFile(root), 'utf8');
+  syncStarterTopicRssSources(['agents', 'bun'], root);
+  expect(readFileSync(sourcesFile(root), 'utf8')).toBe(afterFirst);
+  expect(listSources({}, root)).toHaveLength(3);
+  syncStarterTopicRssSources(['bun'], root);
+  expect(listSources({}, root).map(source => source.id)).toEqual(['manual', first[1]!.id]);
+}));
+
+test('starter RSS reconciliation preserves a manual ID collision and dry-run leaves the registry unchanged', fixture((root) => {
+  const managed = syncStarterTopicRssSources(['agents'], root)[0]!;
+  removeSource(managed.id, root);
+  const manual = addSource({ id: managed.id, seat: 'MK', kind: 'rss', spec: 'https://example.com/manual', every: '1h', why: 'starter.topics' }, root);
+  const before = readFileSync(sourcesFile(root), 'utf8');
+  const planned = syncStarterTopicRssSources(['agents'], root, { dryRun: true });
+  expect(planned[0]!.id).not.toBe(manual.id);
+  expect(listSources({}, root)).toEqual([manual]);
+  expect(readFileSync(sourcesFile(root), 'utf8')).toBe(before);
+  syncStarterTopicRssSources([], root);
+  expect(listSources({}, root)).toEqual([manual]);
+}));
+
+test('starter RSS sync never claims an unmarked source, even when its legacy shape matches', fixture((root) => {
+  const topic = 'legacy topic';
+  const id = `starter-rss-${createHash('sha256').update(topic).digest('hex').slice(0, 12)}`;
+  const feed = new URL('https://news.google.com/rss/search');
+  feed.searchParams.set('q', topic);
+  feed.searchParams.set('hl', 'en-US');
+  feed.searchParams.set('gl', 'US');
+  feed.searchParams.set('ceid', 'US:en');
+  addSource({ id, seat: 'user', kind: 'rss', spec: feed.toString(), every: '1d', why: 'starter.topics' }, root);
+  addSource({ id: 'manual', seat: 'user', kind: 'rss', spec: 'https://example.com/feed', every: '1d', why: 'starter.topics' }, root);
+  const planned = syncStarterTopicRssSources([topic], root);
+  expect(planned[0]).toMatchObject({ managedBy: 'starter.topics' });
+  expect(planned[0]!.id).not.toBe(id);
+  expect(listSources({}, root).map(source => source.id)).toEqual([id, 'manual', planned[0]!.id]);
+  syncStarterTopicRssSources([], root);
+  expect(listSources({}, root).map(source => source.id)).toEqual([id, 'manual']);
+}));
+
+test('starter RSS sync replaces only the legacy watch GitHub rows that main actually generated', fixture((root) => {
+  const topic = 'agents';
+  const watchId = `watch-${createHash('sha256').update(topic).digest('hex').slice(0, 12)}`;
+  addSource({ id: watchId, seat: 'user', kind: 'github-query', spec: topic, every: '1d', why: 'starter.topics' }, root);
+  const manual = addSource({ id: 'manual-rss', seat: 'user', kind: 'rss', spec: 'https://example.com/feed', every: '1d', why: 'starter.topics' }, root);
+  const rss = syncStarterTopicRssSources([topic], root)[0]!;
+  expect(listSources({}, root)).toEqual([manual, rss]);
+  syncStarterTopicRssSources([], root);
+  expect(listSources({}, root)).toEqual([manual]);
 }));
 
 test('topic-search runs the research bridge seam, keeps parent Linear UUID in subscription/intake/brief, and stamps success', fixture(async (root) => {

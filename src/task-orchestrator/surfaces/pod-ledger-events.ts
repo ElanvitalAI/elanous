@@ -1,7 +1,35 @@
-import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { podTerminalRow } from './pod-failure-reason.js';
+
+function eventFreshness(item: Record<string, unknown>): { readonly at?: number; readonly count?: number; readonly resourceVersion?: bigint } {
+  const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata as Record<string, unknown> : {};
+  const series = item.series && typeof item.series === 'object' ? item.series as Record<string, unknown> : {};
+  const at = [series.lastObservedTime, item.lastTimestamp, item.eventTime, metadata.creationTimestamp, item.firstTimestamp]
+    .filter((value): value is string => typeof value === 'string')
+    .map(value => Date.parse(value)).filter(Number.isFinite).sort((a, b) => b - a)[0];
+  const counts = [series.count, item.count].filter((value): value is number => Number.isSafeInteger(value) && (value as number) >= 0);
+  const resourceVersion = typeof metadata.resourceVersion === 'string' && /^\d+$/.test(metadata.resourceVersion)
+    ? BigInt(metadata.resourceVersion) : undefined;
+  return { ...(at !== undefined ? { at } : {}), ...(counts.length ? { count: Math.max(...counts) } : {}), ...(resourceVersion !== undefined ? { resourceVersion } : {}) };
+}
+
+function eventIsFresher(candidate: Record<string, unknown>, previous: Record<string, unknown>): boolean {
+  const next = eventFreshness(candidate);
+  const prior = eventFreshness(previous);
+  if (next.at !== prior.at) return next.at !== undefined && (prior.at === undefined || next.at > prior.at);
+  if (next.count !== prior.count) return next.count !== undefined && (prior.count === undefined || next.count > prior.count);
+  if (next.resourceVersion !== prior.resourceVersion) return next.resourceVersion !== undefined
+    && (prior.resourceVersion === undefined || next.resourceVersion > prior.resourceVersion);
+  return false;
+}
+
+function eventIdentity(item: Record<string, unknown>): string {
+  const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata as Record<string, unknown> : {};
+  return typeof metadata.uid === 'string' ? `uid:${metadata.uid}`
+    : typeof metadata.name === 'string' ? `name:${metadata.name}` : `body:${JSON.stringify(item)}`;
+}
 
 /** Capture a failed Job against its recorded placement, never the caller's current kubectl context. */
 export function captureFailedPodJobs(input: {
@@ -13,9 +41,10 @@ export function captureFailedPodJobs(input: {
   kubectl: (host: string, args: readonly string[]) => { status: number | null; stdout: string; stderr: string };
   record: (event: string, data: Record<string, unknown>) => void;
   now?: () => number;
-}): void {
+}): { readonly outcome: 'collected'; readonly reason: 'existing-evidence-complete' } | void {
   const { runId, job, ledgerPath, artifactDir, kubectl, record } = input;
-  const capturedAt = new Date((input.now ?? Date.now)()).toISOString();
+  const capturedAtMs = (input.now ?? Date.now)();
+  const capturedAt = new Date(capturedAtMs).toISOString();
   const base = { runId, job, capturedAt };
   const finish = (outcome: 'collected' | 'failed' | 'vanished', reason: string, extra: Record<string, unknown> = {}) =>
     record('pod-failure-capture', { ...base, ...extra, outcome, reason });
@@ -47,7 +76,11 @@ export function captureFailedPodJobs(input: {
   const evidenceDir = join(artifactDir, 'pod-failure-capture', runId, job, first.childRunId as string);
   // A failed kubectl/SSH read is itself the missing diagnostic. Keep its stderr in
   // the private artifact directory and put only the path and exit status in the ledger.
-  const captureStderr = (reason: string, result: { status: number | null; stderr: string }): Record<string, unknown> => {
+  const captureStderr = (reason: string, result: { status: number | null; stderr: string }): {
+    kubectlStatus: number | null;
+    stderrEvidence: string | null;
+    stderrCaptureStatus: 'saved' | 'redacted' | 'empty' | 'write-failed';
+  } => {
     let stderrEvidence: string | null = null;
     let stderrCaptureStatus: 'saved' | 'redacted' | 'empty' | 'write-failed' = result.stderr ? 'saved' : 'empty';
     if (result.stderr) {
@@ -84,6 +117,22 @@ export function captureFailedPodJobs(input: {
   const previousReadComplete = priorCurrentReadStatus === 'captured'
     ? ['captured', 'empty', 'not-needed', 'unknown'].includes(String(priorPreviousReadStatus))
     : priorCurrentReadStatus === 'empty' && priorPreviousReadStatus === 'captured';
+  const eventCaptureComplete = (data: Record<string, unknown> | undefined, kind: 'job' | 'pod'): boolean => {
+    const status = data?.[`${kind}EventStatus`];
+    if (!['captured', 'empty', 'uid-missing'].includes(String(status))) return false;
+    if (status === 'captured' || status === 'empty') {
+      const expected = data?.[`${kind}EventEvidence`];
+      const filename = typeof expected === 'string' ? expected.slice(evidenceDir.length + 1) : '';
+      if (typeof expected !== 'string' || dirname(expected) !== evidenceDir
+        || !new RegExp(`^${kind}\\.events(?:\\..+)?\\.json$`).test(filename)) return false;
+      try { if (!statSync(expected).isFile()) return false; } catch { return false; }
+    }
+    const stderrEvidence = data?.[`${kind}EventStderrEvidence`];
+    if (typeof stderrEvidence === 'string') {
+      try { if (!statSync(stderrEvidence).isFile()) return false; } catch { return false; }
+    }
+    return true;
+  };
   const currentLogEvidencePresent = priorCurrentReadStatus === 'captured'
     && priorLogEvidence === join(evidenceDir, 'child.log')
     && (() => { try { return statSync(priorLogEvidence).isFile(); } catch { return false; } })();
@@ -93,18 +142,84 @@ export function captureFailedPodJobs(input: {
   const logEvidenceComplete = currentLogEvidencePresent
     ? priorPreviousReadStatus !== 'captured' || previousLogEvidencePresent
     : priorCurrentReadStatus === 'empty' && previousLogEvidencePresent;
-  if (previous && previousReadComplete && ([['jobEvidence', 'job.json'], ['podEvidence', 'pods.json']] as const)
+  if (previous && previousReadComplete && eventCaptureComplete(previous.data, 'job') && eventCaptureComplete(previous.data, 'pod')
+    && ([['jobEvidence', 'job.json'], ['podEvidence', 'pods.json']] as const)
     .every(([field, filename]) => {
       const path = join(evidenceDir, filename);
       if (previous.data?.[field] !== path) return false;
       try { return statSync(path).isFile(); } catch { return false; }
     })
-    && logEvidenceComplete) return;
+    && logEvidenceComplete) return { outcome: 'collected', reason: 'existing-evidence-complete' };
   const args = ['--context', first.context as string, '-n', first.namespace as string] as const;
+  const captureEventsForVanishedJob = (): Record<string, unknown> => {
+    const eventArgs = [...args, 'get', 'events', '--field-selector', `involvedObject.uid=${first.jobUid}`, '-o', 'json'];
+    let result: { status: number | null; stdout: string; stderr: string };
+    try { result = kubectl(first.host as string, eventArgs); }
+    catch { return { jobEventStatus: 'read-failed', jobEventCount: 0, jobEventKubectlStatus: null, jobEventStderrCaptureStatus: 'unavailable' }; }
+    if (result.status !== 0) {
+      const failure = captureStderr('job-events-read-failed', result);
+      return { jobEventStatus: 'read-failed', jobEventCount: 0, jobEventKubectlStatus: failure.kubectlStatus,
+        jobEventStderrCaptureStatus: failure.stderrCaptureStatus,
+        ...(failure.stderrEvidence ? { jobEventStderrEvidence: failure.stderrEvidence } : {}) };
+    }
+    let items: Array<Record<string, unknown>>;
+    try {
+      const body = JSON.parse(result.stdout) as { items?: unknown };
+      if (!Array.isArray(body.items) || body.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+        return { jobEventStatus: 'invalid', jobEventCount: 0 };
+      }
+      items = body.items as Array<Record<string, unknown>>;
+    } catch { return { jobEventStatus: 'invalid', jobEventCount: 0 }; }
+    const path = join(evidenceDir, `job.events.${capturedAtMs}.${process.pid}.${randomUUID()}.json`);
+    let mergedItems = items;
+    try {
+      mkdirSync(evidenceDir, { recursive: true });
+      const byIdentity = new Map<string, Record<string, unknown>>();
+      const snapshots = readdirSync(evidenceDir).filter(filename => /^job\.events(?:\..+)?\.json$/.test(filename)).sort();
+      for (const filename of snapshots) {
+        const previous = JSON.parse(readFileSync(join(evidenceDir, filename), 'utf8')) as { items?: unknown };
+        if (!Array.isArray(previous.items) || previous.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('existing events artifact invalid');
+        for (const item of previous.items as Array<Record<string, unknown>>) {
+          const identity = eventIdentity(item);
+          const prior = byIdentity.get(identity);
+          if (!prior || eventIsFresher(item, prior)) byIdentity.set(identity, item);
+        }
+      }
+      for (const item of items) {
+        const identity = eventIdentity(item);
+        const prior = byIdentity.get(identity);
+        if (!prior || eventIsFresher(item, prior)) byIdentity.set(identity, item);
+      }
+      mergedItems = [...byIdentity.values()];
+      const body = JSON.parse(result.stdout) as Record<string, unknown>;
+      const serialized = `${JSON.stringify({ ...body, items: mergedItems })}\n`;
+      const temp = `${path}.tmp`;
+      try {
+        writeFileSync(temp, serialized, { flag: 'wx', mode: 0o600 });
+        renameSync(temp, path);
+      }
+      catch (error) {
+        try { unlinkSync(temp); } catch { /* best-effort temporary artifact cleanup */ }
+        throw error;
+      }
+    } catch { return { jobEventStatus: 'write-failed', jobEventCount: items.length }; }
+    const latest = mergedItems.map(item => {
+      const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata as Record<string, unknown> : {};
+      const at = [item.eventTime, item.lastTimestamp, metadata.creationTimestamp, item.firstTimestamp]
+        .find(value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value));
+      return { item, at: typeof at === 'string' ? at : undefined };
+    }).filter(row => row.at).sort((a, b) => Date.parse(a.at!) - Date.parse(b.at!)).at(-1);
+    const reason = latest && typeof latest.item.reason === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(latest.item.reason) ? latest.item.reason : undefined;
+    const type = latest && typeof latest.item.type === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(latest.item.type) ? latest.item.type : undefined;
+    return { jobEventStatus: mergedItems.length ? 'captured' : 'empty', jobEventCount: mergedItems.length, jobEventEvidence: path,
+      ...(reason ? { latestEventReason: reason } : {}), ...(type ? { latestEventType: type } : {}),
+      ...(latest?.at ? { latestEventAt: latest.at } : {}) };
+  };
   try {
     const jobResult = kubectl(first.host as string, [...args, 'get', 'job', job, '-o', 'json']);
     if (jobResult.status !== 0) {
-      if (/\bNotFound\b|not found/i.test(jobResult.stderr)) finish('vanished', 'job-not-found', { ...location, kubectlStatus: jobResult.status });
+      if (/\bNotFound\b|not found/i.test(jobResult.stderr)) finish('vanished', 'job-not-found', {
+        ...location, kubectlStatus: jobResult.status, ...captureEventsForVanishedJob() });
       else readFailure('job-read-failed', jobResult);
       return;
     }
@@ -159,6 +274,71 @@ export function captureFailedPodJobs(input: {
       ...(typeof terminated?.finishedAt === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(terminated.finishedAt) ? { containerFinishedAt: terminated.finishedAt } : {}),
       ...(restartCount !== undefined ? { containerRestartCount: restartCount } : {}),
     };
+    const readEvents = (kind: 'job' | 'pod', uid: string | undefined): {
+      status: 'captured' | 'empty' | 'read-failed' | 'invalid' | 'write-failed' | 'uid-missing';
+      count: number;
+      kubectlStatus?: number | null;
+      evidence?: string;
+      stderrEvidence?: string | null;
+      stderrCaptureStatus?: string;
+      latest?: { reason?: string; type?: string; at?: string };
+    } => {
+      if (!uid || !/^[A-Za-z0-9-]{8,128}$/.test(uid)) return { status: 'uid-missing', count: 0 };
+      let result: { status: number | null; stdout: string; stderr: string };
+      try {
+        result = kubectl(first.host as string, [...args, 'get', 'events', '--field-selector', `involvedObject.uid=${uid}`, '-o', 'json']);
+      } catch { return { status: 'read-failed', count: 0, kubectlStatus: null, stderrCaptureStatus: 'unavailable' }; }
+      if (result.status !== 0) {
+        const failure = captureStderr(`${kind}-events-read-failed`, result);
+        const kubectlStatus = typeof failure.kubectlStatus === 'number' || failure.kubectlStatus === null ? failure.kubectlStatus : null;
+        return { status: 'read-failed', count: 0, kubectlStatus,
+          stderrEvidence: failure.stderrEvidence, stderrCaptureStatus: failure.stderrCaptureStatus };
+      }
+      let items: Array<Record<string, unknown>>;
+      try {
+        const body = JSON.parse(result.stdout) as { items?: unknown };
+        if (!Array.isArray(body.items) || body.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+          return { status: 'invalid', count: 0 };
+        }
+        items = body.items as Array<Record<string, unknown>>;
+      } catch { return { status: 'invalid', count: 0 }; }
+      let evidence: string;
+      try { evidence = save(`${kind}.events.json`, result.stdout); }
+      catch { return { status: 'write-failed', count: items.length }; }
+      const eventTime = (item: Record<string, unknown>): string | undefined => {
+        const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata as Record<string, unknown> : {};
+        for (const value of [item.eventTime, item.lastTimestamp, metadata.creationTimestamp, item.firstTimestamp]) {
+          if (typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value)) return value;
+        }
+        return undefined;
+      };
+      const latest = items.map(item => ({ item, at: eventTime(item) })).filter(row => row.at)
+        .sort((a, b) => Date.parse(a.at!) - Date.parse(b.at!)).at(-1);
+      const latestReason = latest && typeof latest.item.reason === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(latest.item.reason)
+        ? latest.item.reason : undefined;
+      const latestType = latest && typeof latest.item.type === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(latest.item.type)
+        ? latest.item.type : undefined;
+      return { status: items.length ? 'captured' : 'empty', count: items.length, evidence,
+        ...(latest ? { latest: { ...(latestReason ? { reason: latestReason } : {}), ...(latestType ? { type: latestType } : {}), at: latest.at } } : {}) };
+    };
+    const jobEvents = readEvents('job', first.jobUid as string);
+    const podEvents = readEvents('pod', typeof pod.metadata?.uid === 'string' ? pod.metadata.uid : undefined);
+    const latestEvent = [jobEvents.latest, podEvents.latest].filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .sort((a, b) => Date.parse(a.at ?? '') - Date.parse(b.at ?? '')).at(-1);
+    const eventSummary = {
+      jobEventStatus: jobEvents.status, jobEventCount: jobEvents.count,
+      podEventStatus: podEvents.status, podEventCount: podEvents.count,
+      ...(jobEvents.kubectlStatus !== undefined ? { jobEventKubectlStatus: jobEvents.kubectlStatus } : {}),
+      ...(podEvents.kubectlStatus !== undefined ? { podEventKubectlStatus: podEvents.kubectlStatus } : {}),
+      ...(jobEvents.stderrCaptureStatus ? { jobEventStderrCaptureStatus: jobEvents.stderrCaptureStatus } : {}),
+      ...(podEvents.stderrCaptureStatus ? { podEventStderrCaptureStatus: podEvents.stderrCaptureStatus } : {}),
+      ...(jobEvents.evidence ? { jobEventEvidence: jobEvents.evidence } : {}),
+      ...(podEvents.evidence ? { podEventEvidence: podEvents.evidence } : {}),
+      ...(jobEvents.stderrEvidence ? { jobEventStderrEvidence: jobEvents.stderrEvidence } : {}),
+      ...(podEvents.stderrEvidence ? { podEventStderrEvidence: podEvents.stderrEvidence } : {}),
+      ...(latestEvent ? { latestEventReason: latestEvent.reason ?? null, latestEventType: latestEvent.type ?? null,
+        latestEventAt: latestEvent.at ?? null } : {}),
+    };
     const logs = kubectl(first.host as string, [...args, 'logs', `pod/${podName}`, '-c', 'child']);
     const currentLogReadStatus = logs.status === 0 ? (logs.stdout.trim() ? 'captured' : 'empty') : 'failed';
     const currentLogBytes = logs.status === 0 ? Buffer.byteLength(logs.stdout) : 0;
@@ -189,7 +369,7 @@ export function captureFailedPodJobs(input: {
         resultMarkerPresent ||= hasTerminalMarker(previousLogs.stdout);
       }
     }
-    const summary = { ...podSummary, jobEvidence, podEvidence, currentLogReadStatus, currentLogBytes,
+    const summary = { ...podSummary, ...eventSummary, jobEvidence, podEvidence, currentLogReadStatus, currentLogBytes,
       previousLogReadStatus, ...(previousLogBytes !== undefined ? { previousLogBytes } : {}), ...previousLogFailure, resultMarkerPresent,
       ...(logEvidence ? { logEvidence } : {}), ...(previousLogEvidence ? { previousLogEvidence } : {}) };
     if (currentLogReadStatus !== 'captured' && previousLogReadStatus !== 'captured') {
@@ -219,7 +399,9 @@ const MAX_FIELDS = 32;
 // lifecycle prefix; string fields survive only when they are short code-like values in a fixed set of keys.
 const EVENT_ALLOWED = /^(?:gate|gated|review|reviewed|repair|repaired|rework|merge|merged|pr|land|landed|stage|round|supervisor|child|plan|planned|decompose|decomposed|shard|stall|harvest|decision|run|pipeline|progress|human|start|started|finish|finished|done|implement|implemented|commit|test|typecheck)(?:-(?:started|finished|round|opened|closed|failed|passed|blocked|done|entry|node|outcome|delivery|decision|stop|merged|ready|requested|resolved|result|fix|must-fix|verdict|skipped|origin|cleared))*$/;
 const CODE_FIELDS = new Set(['stage', 'outcome', 'verdict', 'status', 'kind', 'phase', 'role', 'result', 'containerReason',
-  'podPhase', 'currentLogReadStatus', 'previousLogReadStatus', 'previousLogStderrCaptureStatus', 'stderrCaptureStatus']);
+  'podPhase', 'currentLogReadStatus', 'previousLogReadStatus', 'previousLogStderrCaptureStatus', 'stderrCaptureStatus',
+  'jobEventStatus', 'podEventStatus', 'jobEventStderrCaptureStatus', 'podEventStderrCaptureStatus',
+  'latestEventReason', 'latestEventType']);
 const CODE_VALUE = /^[a-z0-9_.:-]{1,40}$/i;
 const IDENTITY_FIELDS = new Set(['job', 'jobUid', 'childRunId', 'host', 'context', 'namespace', 'podName', 'podUid']);
 const SAFE_ID_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -274,7 +456,7 @@ export function ledgerLineToLogEvent(line: string, runId: string): {
         // Free text (reasons, messages, patches) never leaves the pod ledger; only short code values in known keys.
         const acceptedCode = CODE_FIELDS.has(name) && CODE_VALUE.test(value);
         const acceptedIdentity = IDENTITY_FIELDS.has(name) && SAFE_ID_VALUE.test(value);
-        const acceptedTimestamp = name === 'containerFinishedAt' && SAFE_ISO_TIMESTAMP.test(value);
+        const acceptedTimestamp = (name === 'containerFinishedAt' || name === 'latestEventAt') && SAFE_ISO_TIMESTAMP.test(value);
         if ((!acceptedCode && !acceptedIdentity && !acceptedTimestamp) || containsCredential(value)) continue;
         data[name] = value;
       } else if (typeof value === 'number' && Number.isFinite(value) || typeof value === 'boolean' || value === null) {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { act, create, type ReactTestInstance } from 'react-test-renderer';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ReactFlow } from '@xyflow/react';
 import { createNexusClient, type HarnessRunTraversal, type HarnessTraversalStepWire, type RunGraphDetail } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import { LiveRunGraph } from './LiveRunGraph';
@@ -41,7 +42,7 @@ const nodeMock = () => ({
   clientWidth: 1024, clientHeight: 700, offsetWidth: 1024, offsetHeight: 700, style: {}, ownerDocument: globalThis.document,
 });
 
-async function mount(traversal: HarnessRunTraversal, graph: RunGraphDetail | null = GRAPH) {
+async function mount(traversal: HarnessRunTraversal, graph: RunGraphDetail | null = GRAPH, stageMode = false) {
   const fetchImpl = (async (url: string) => {
     if (String(url).includes('/v1/harness/run-traversal')) return new Response(JSON.stringify(traversal), { status: 200 });
     if (String(url).includes('/v1/graphs/')) {
@@ -57,7 +58,7 @@ async function mount(traversal: HarnessRunTraversal, graph: RunGraphDetail | nul
     root = create(
       <QueryClientProvider client={queryClient}>
         <NexusProvider client={client}>
-          <LiveRunGraph runId="run-metrics" />
+          <LiveRunGraph runId="run-metrics" stageMode={stageMode} />
         </NexusProvider>
       </QueryClientProvider>,
       { createNodeMock: nodeMock },
@@ -120,5 +121,38 @@ describe('LiveRunGraph — 상단 지표 띠', () => {
     expect(text(strip.findByProps({ 'data-testid': 'metric-elapsed' }))).toContain('미계측');
     expect(text(strip.findByProps({ 'data-testid': 'metric-cost' }))).toContain('미계측');
     expect(text(strip)).not.toMatch(/비용\s*0/);
+  });
+
+  test('무대 리플레이는 커서 앞 사건만 세고 4× 속도로 시작한다', async () => {
+    const stageTraversal: HarnessRunTraversal = {
+      ...TRAVERSAL,
+      steps: [
+        { ...STEPS[0]!, at: '2026-10-17T09:00:01Z' },
+        { ...STEPS[1]!, outcome: 'fail', at: '2026-10-17T09:00:05Z' },
+        { ...STEPS[2]!, at: '2026-10-17T09:00:09Z' },
+      ],
+      graphEvents: [
+        { seq: 4, ts: '2026-10-17T09:00:07Z', type: 'node-added', node: 'repair', kind: 'agent', decider: 'runtime', reason: 'repair' },
+        { seq: 5, ts: '2026-10-17T09:00:08Z', type: 'edge-rerouted', from: 'compose', outcome: 'fail', to: 'repair', was: 'audit', decider: 'runtime', reason: 'repair' },
+        { seq: 6, ts: '2026-10-17T09:00:10Z', type: 'node-added', node: 'tail', kind: 'agent', decider: 'runtime', reason: 'post-visit growth' },
+        { seq: 7, ts: 'invalid-date', type: 'edge-rerouted', from: 'compose', outcome: 'fail', to: 'unknown', was: 'audit', decider: 'runtime', reason: 'unorderable legacy event' },
+      ],
+    };
+    root = await mount(stageTraversal, GRAPH, true);
+    const metrics = root.root.findByProps({ 'data-testid': 'stage-metrics' });
+    expect(metrics.findAllByType('dd').map(text)).toEqual(['4', '3', '1', '0', '0', '0']);
+    expect(root.root.findByProps({ 'data-testid': 'stage-recovery' }).children.map(text).join('')).toContain('이 런에 실패→수리 사건 없음');
+    expect(text(root.root.findByProps({ 'data-testid': 'stage-order-uncertainty' }))).toContain('사건 순서 미확인 1');
+    const speedGroup = root.root.findByProps({ role: 'group', 'aria-label': '속도' });
+    expect(speedGroup.findAllByType('button').map(text)).toEqual(['4×', '16×']);
+    expect(speedGroup.findAllByProps({ 'aria-pressed': true }).map(text)).toEqual(['4×']);
+    const timeline = root.root.findByProps({ 'aria-label': '재생 위치' });
+    await act(async () => { timeline.props.onChange({ target: { value: '2' } }); await Bun.sleep(30); });
+    expect(metrics.findAllByType('dd').map(text)).toEqual(['6', '4', '3', '1', '2', '0']);
+    expect(text(root.root.findByProps({ 'data-testid': 'stage-metrics' }).parent!)).toContain('노드 탄생 2');
+    const flow = root.root.findByType(ReactFlow);
+    expect(flow.props.nodes.some((node: { id: string }) => node.id === 'tail')).toBe(true);
+    expect(flow.props.nodes.find((node: { id: string; data: { birthActive?: boolean } }) => node.id === 'tail')?.data.birthActive).toBe(true);
+    expect(root.root.findByProps({ 'data-testid': 'stage-recovery' }).children.map(text).join('')).toContain('실패 → 수리 · audit ↝ repair');
   });
 });

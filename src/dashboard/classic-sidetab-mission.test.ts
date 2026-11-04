@@ -85,6 +85,106 @@ test('classic chat exposes and dispatches a sidetab mission without leaking its 
   expect(JSON.stringify(toolResults)).not.toContain('/private/state');
 });
 
+test('splits a parent request into scoped Codex and Claude briefs under one parent call ID', async () => {
+  const starts: Array<{ agent: string; codexBrief: string; claudeBrief: string; callId?: string; parentSessionId?: string }> = [];
+  const tool = createClassicSidetabMissionTool(
+    async () => { throw new Error('single mission must not start'); },
+    async (agent, codexBrief, claudeBrief, context) => {
+      starts.push({ agent, codexBrief, claudeBrief, callId: context?.callId, parentSessionId: context?.parentSessionId });
+      return {
+        pairId: 'pair-1',
+        codex: { ok: true, status: 'running', interactionId: 'codex-child' },
+        claude: { ok: true, status: 'running', interactionId: 'claude-child' },
+      };
+    },
+  );
+  const result = await tool.dispatch({
+    agent: 'claude',
+    mission: 'Add authenticated export support.',
+    decomposition: {
+      status: 'ready',
+      codex: { scope: 'Implement the export authorization guard.', deliverables: 'Guard and focused unit tests.', dependsOn: 'Existing export API contract.' },
+      claude: { scope: 'Document the authenticated export behavior.', deliverables: 'User-facing docs and examples.', dependsOn: 'Existing export API contract.' },
+    },
+  }, { callId: 'parent-call-42', parentSessionId: 'parent-session-9' });
+  expect(result.status).toBe('running');
+  expect(starts).toHaveLength(1);
+  expect(starts[0]).toMatchObject({ agent: 'codex', callId: 'parent-call-42', parentSessionId: 'parent-session-9' });
+  expect(starts[0]?.codexBrief).toContain('Implement the export authorization guard.');
+  expect(starts[0]?.codexBrief).toContain('Guard and focused unit tests.');
+  expect(starts[0]?.codexBrief).toContain('Existing export API contract.');
+  expect(starts[0]?.claudeBrief).toContain('Document the authenticated export behavior.');
+  expect(starts[0]?.claudeBrief).toContain('User-facing docs and examples.');
+  expect(starts[0]?.claudeBrief).toContain('Existing export API contract.');
+  expect(starts[0]?.codexBrief).not.toEqual(starts[0]?.claudeBrief);
+});
+
+test('keeps distinct legacy pair prompts dispatchable while routing Codex and Claude roles', async () => {
+  let received: { agent: string; codexBrief: string; claudeBrief: string } | undefined;
+  const tool = createClassicSidetabMissionTool(
+    async () => { throw new Error('single mission must not start'); },
+    async (agent, codexBrief, claudeBrief) => {
+      received = { agent, codexBrief, claudeBrief };
+      return {
+        pairId: 'legacy-pair',
+        codex: { ok: true, status: 'running', interactionId: 'codex-child' },
+        claude: { ok: true, status: 'running', interactionId: 'claude-child' },
+      };
+    },
+  );
+  await tool.dispatch({ agent: 'claude', mission: 'Claude-scoped task', parallelMission: 'Codex-scoped task' });
+  expect(received).toEqual({
+    agent: 'codex',
+    codexBrief: 'Codex-scoped task',
+    claudeBrief: 'Claude-scoped task',
+  });
+});
+
+test('holds an unsplittable parent request with its reason and launches no child', async () => {
+  let childDispatches = 0;
+  const tool = createClassicSidetabMissionTool(
+    async () => { throw new Error('single mission must not start'); },
+    async () => {
+      childDispatches += 1;
+      throw new Error('pair must not start');
+    },
+  );
+  const result = await tool.dispatch({
+    agent: 'codex',
+    mission: 'Make one atomic migration that must be authored and validated by the same hand.',
+    decomposition: { status: 'cannot-split', reason: 'The migration authoring and validation must remain one atomic owner.' },
+  });
+  expect(result).toMatchObject({
+    status: 'error',
+    body: 'Pair dispatch held: The migration authoring and validation must remain one atomic owner.',
+  });
+  expect(childDispatches).toBe(0);
+});
+
+test('rejects duplicate pair briefs before dispatching either mock child', async () => {
+  let childDispatches = 0;
+  const tool = createClassicSidetabMissionTool(
+    async () => { throw new Error('single mission must not start'); },
+    async () => {
+      childDispatches += 1;
+      return {
+        pairId: 'duplicate-pair',
+        codex: { ok: true, status: 'running', interactionId: 'codex-child' },
+        claude: { ok: true, status: 'running', interactionId: 'claude-child' },
+      };
+    },
+  );
+  const result = await tool.dispatch(
+    { agent: 'codex', mission: 'Implement the auth guard.', parallelMission: '  Implement the auth guard.  ' },
+    { callId: 'parent-call-1', parentSessionId: 'parent-session-1' },
+  );
+  expect(result).toMatchObject({
+    status: 'error',
+    body: 'Pair missions must be distinct child briefs; split the parent task before dispatch',
+  });
+  expect(childDispatches).toBe(0);
+});
+
 test('linear mission binding stays single-only while pairs skip sync with a warning and continue', async () => {
   const seen: Array<string | undefined> = [];
   const pairContexts: Array<unknown> = [];
@@ -107,7 +207,14 @@ test('linear mission binding stays single-only while pairs skip sync with a warn
     expect((await tool.dispatch({ agent: 'codex', mission: 'work', linearIssueId: 'DEMO-42' })).status).toBe('running');
     expect(seen).toEqual(['DEMO-42']);
     expect((await tool.dispatch(
-      { agent: 'codex', mission: 'work', linearIssueId: 'DEMO-42', parallelMission: 'other' },
+      {
+        agent: 'codex', mission: 'Parent request: work', linearIssueId: 'DEMO-42',
+        decomposition: {
+          status: 'ready',
+          codex: { scope: 'Implement work API.', deliverables: 'API code.', dependsOn: 'Existing API.' },
+          claude: { scope: 'Review work API.', deliverables: 'Review notes.', dependsOn: 'Existing API.' },
+        },
+      },
       { callId: 'pair-call', parentSessionId: 'parent-session', linearIssueId: 'DEMO-42' },
     )).status).toBe('running');
     expect(seen).toEqual(['DEMO-42']);
@@ -149,6 +256,7 @@ test('strict-schema empty optional sentinels normalize before trio exclusivity c
   );
   const properties = (tool.spec.parameters as { properties: Record<string, unknown> }).properties;
   const parallelSchema = properties.parallelMission as { anyOf: Array<Record<string, unknown>> };
+  expect(properties.decomposition).toMatchObject({ type: 'object' });
   const linearSchema = properties.linearIssueId as { anyOf: Array<Record<string, unknown>> };
   expect(parallelSchema.anyOf).toContainEqual({ type: 'null' });
   expect(parallelSchema.anyOf.some((schema) => schema.type === 'array' && schema.maxItems === 0)).toBe(true);

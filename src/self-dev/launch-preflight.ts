@@ -19,7 +19,7 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, resolve, sep } from 'node:path';
-import { classifyTracedPathToken, linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { classifyTracedPathToken, linesOutsideFencedCode, parseGoalType } from '../self-implement/goal-author.js';
 import { declaredNewFilePaths } from '../self-implement/goal-new-paths.js';
 import { resolveLogTargets } from '../cli/logs-cli.js';
 import { debug } from '../debug/log.js';
@@ -1394,9 +1394,15 @@ export function decideAskPreflight(
     ...(interruptedRunsUnknownReason ? { interruptedRunsUnknownReason } : {}),
     ...(recentChangesUnknownReason ? { recentChangesUnknownReason } : {}),
   });
+  // Research goals produce evidence documents and may have no implementation paths.
+  // Scope the exemption to an authored research goal; pre-authoring and other goal
+  // kinds still require a readable or explicitly new traced path.
+  const researchGoalMayOmitTracedPaths = hasAuthoredGoal
+    && goalDocument !== null
+    && parseGoalType(goalDocument) === 'research';
   const missingTracedPathBlockers: LaunchPreflightBlocker[] = [
     // ⛔ 해석 실패를 「traced path 0」으로 한 번 더 뭉개지 않는다 — 그건 다른 갈래다.
-    ...(hasAuthoredGoal && authoredTracedPaths.length === 0 && goalParseFailure === undefined ? [{
+    ...(hasAuthoredGoal && authoredTracedPaths.length === 0 && goalParseFailure === undefined && !researchGoalMayOmitTracedPaths ? [{
       kind: 'missing-traced-path' as const,
       name: '최종 골의 TRACED PATHS 경로 0',
       detail: '정리 후 보존된 traced 경로가 없다 — 실제 파일 또는 유효한 신설: 파일 경로를 골에 선언해야 발사할 수 있다',
@@ -1440,7 +1446,7 @@ export function decideAskPreflight(
     ...result,
     // ⛔ 해석 실패를 「대상 경로 0」 문면으로 덮지 않는다 — 사유 코드가 이미 그 자리를 말한다.
     blockers: [
-      ...result.blockers.filter((blocker) => goalParseFailure === undefined || blocker.kind !== 'no-target-paths'),
+      ...result.blockers.filter((blocker) => (goalParseFailure === undefined && !researchGoalMayOmitTracedPaths) || blocker.kind !== 'no-target-paths'),
       ...missingTracedPathBlockers, ...goalParseBlockers, ...goalReadBlockers,
     ],
     warnings: [...result.warnings, ...askMarkerWarnings],
@@ -1450,7 +1456,7 @@ export function decideAskPreflight(
   return {
     result: decisionResult,
     shouldLaunch: missingTracedPathBlockers.length === 0 && goalParseBlockers.length === 0 && goalReadBlockers.length === 0
-      && (result.blockers.length === 0 || force),
+      && (decisionResult.blockers.length === 0 || force),
     plannedBranchResolution,
   };
 }

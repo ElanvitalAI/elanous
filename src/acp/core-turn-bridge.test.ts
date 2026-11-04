@@ -338,14 +338,14 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
     expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Write');
     expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).not.toContain('Bash');
     expect(coreCalls.at(-1)?.tools.map((tool) => tool.name).includes('Agent')).toBe(expected === '조사');
-    expect(pushes[0]).toBe(`라우팅: ${expected}\n`);
-    expect(routeLog).toHaveBeenCalledWith('chat.route', 'decided', {
+    expect(pushes).toEqual([]);
+    expect(routeLog).toHaveBeenCalledWith('core-turn.route', 'decided', {
       route: expected, reason: expect.any(String), goalLoop: false, seat: null, seatKnown: false,
     });
   }
   expect(coreCalls).toHaveLength(4);
   expect(toolsForTuiRoute(specs, '조회').map((tool) => tool.name)[0]).toBe('decisions_pending');
-  // review r4: the same lookup sentence on a bridge without tuiRouting (daemon ACP) keeps every tool and no route line.
+  // The daemon ACP path keeps every tool and also emits no route notice.
   const daemonPushes: string[] = [];
   const daemonTurn = bridgeCoreTurnToAcp({
     getMessages: () => [{ role: 'user', content: '나한테 온 결정 카드 있어?' }], getTools: () => specs,
@@ -359,8 +359,11 @@ test('TUI route selects one core turn, matching tools and visible/logged decisio
     pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
   } as unknown as AcpTurnContext);
   expect(coreCalls.length).toBeGreaterThan(4);
-  // Every host tool stays, and the goal loop arms as before (it adds update_goal).
-  expect(coreCalls.at(-1)?.tools.map((tool) => tool.name)).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
+  // The daemon does not use the TUI route allowlist (which excludes Edit for this read route);
+  // ordinary core-turn filtering may still defer research tools, and the goal loop adds update_goal.
+  const daemonTools = coreCalls.at(-1)?.tools.map((tool) => tool.name) ?? [];
+  expect(daemonTools).toContain('Edit');
+  expect(daemonTools).toContain('update_goal');
   expect(daemonPushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
 });
 
@@ -395,11 +398,11 @@ test('TUI read question runs one full-tool turn outside the goal loop; a write r
   };
   const read = await run('OP 앞 글 읽고 제안 표로');
   expect(read.tools).toEqual(specs.map((spec) => spec.name));
-  expect(read.pushes[0]).toBe('라우팅: 읽기·분석\n');
+  expect(read.pushes).toEqual([]);
   expect(read.calls).toBe(1);
   const transcription = await run('도구 쓰지 말고 답해: 문서의 첫 줄을 그대로 옮기고');
-  expect(transcription.pushes[0]).toBe('라우팅: 읽기·분석\n');
-  expect(routeLog).toHaveBeenCalledWith('chat.route', 'decided', {
+  expect(transcription.pushes).toEqual([]);
+  expect(routeLog).toHaveBeenCalledWith('core-turn.route', 'decided', {
     route: '읽기·분석', reason: expect.any(String), goalLoop: false, seat: null, seatKnown: false,
   });
   const write = await run('지시 문서에 절 추가');
@@ -445,20 +448,20 @@ test('TUI-H1-SEAT-GOALLOOP: a seat TUI sends an operational directive to the goa
     push: async () => {}, pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
     pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
   } as unknown as AcpTurnContext);
-  expect(log).toHaveBeenCalledWith('chat.route', 'decided', expect.objectContaining({ reason: 'short-question', goalLoop: false, seat: 'OPT' }));
-  expect(log.mock.calls.some(([c, e]) => c === 'chat.route' && e === 'seat-ops-single-turn')).toBe(false);
+  expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', expect.objectContaining({ reason: 'short-question', goalLoop: false, seat: 'OPT' }));
+  expect(log.mock.calls.some(([c, e]) => c === 'core-turn.route' && e === 'seat-ops-single-turn')).toBe(false);
   const seatTurn = await run('OPT', true);
   expect(seatTurn.tools).toEqual([...specs.map((spec) => spec.name), 'update_goal']);
   expect(seatTurn.pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
-  expect(log).toHaveBeenCalledWith('chat.route', 'decided', { route: '읽기·분석', reason: 'seat-read', goalLoop: true, seat: 'OPT', seatKnown: true });
+  expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', { route: '읽기·분석', reason: 'seat-read', goalLoop: true, seat: 'OPT', seatKnown: true });
   const human = await run(null, true);
   expect(human.tools).toEqual(specs.map((spec) => spec.name));
-  expect(human.pushes[0]).toBe('라우팅: 읽기·분석\n');
-  expect(log).toHaveBeenCalledWith('chat.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: null, seatKnown: true });
-  expect(log.mock.calls.some(([c, e]) => c === 'chat.route' && e === 'seat-ops-single-turn')).toBe(false);
+  expect(human.pushes).toEqual([]);
+  expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: null, seatKnown: true });
+  expect(log.mock.calls.some(([c, e]) => c === 'core-turn.route' && e === 'seat-ops-single-turn')).toBe(false);
   // 인지: a seat operational directive that still runs as a single turn (goal loop off) is warned, not silent.
   await run('OPT', false);
-  expect(log).toHaveBeenCalledWith('chat.route', 'seat-ops-single-turn', expect.objectContaining({ seat: 'OPT', goalLoopEnabled: false }), { level: 'warn' });
+  expect(log).toHaveBeenCalledWith('core-turn.route', 'seat-ops-single-turn', expect.objectContaining({ seat: 'OPT', goalLoopEnabled: false }), { level: 'warn' });
   // A failed seat lookup is «unknown», not «not a seat» (review r2): routed as a human TUI, logged seatKnown:false.
   const failing = bridgeCoreTurnToAcp({
     tuiRouting: true, resolveSeat: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); },
@@ -470,8 +473,8 @@ test('TUI-H1-SEAT-GOALLOOP: a seat TUI sends an operational directive to the goa
     push: async () => {}, pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
     pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
   } as unknown as AcpTurnContext);
-  expect(log).toHaveBeenCalledWith('chat.route', 'seat-unresolved', expect.objectContaining({ error: expect.stringContaining('EACCES') }), { level: 'warn' });
-  expect(log).toHaveBeenCalledWith('chat.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: null, seatKnown: false });
+  expect(log).toHaveBeenCalledWith('core-turn.route', 'seat-unresolved', expect.objectContaining({ error: expect.stringContaining('EACCES') }), { level: 'warn' });
+  expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', { route: '읽기·분석', reason: 'read', goalLoop: false, seat: null, seatKnown: false });
 });
 
 test('TUI routing skips only an explicit executor harness child; a human TUI in a harness space is routed', async () => {
@@ -502,7 +505,7 @@ test('TUI routing skips only an explicit executor harness child; a human TUI in 
     delete process.env.ELANOUS_HARNESS_ROLE;
     const human = await run();
     expect(human.tools).toEqual(['decisions_pending']);
-    expect(human.pushes[0]).toBe('라우팅: 조회\n');
+    expect(human.pushes).toEqual([]);
     process.env.ELANOUS_HARNESS_ROLE = 'executor';
     const executor = await run();
     expect(executor.tools).toContain('Edit');

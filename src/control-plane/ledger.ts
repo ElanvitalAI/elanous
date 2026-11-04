@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { acquireLockAsync, withFileLockSync } from '../storage/file-lock.js';
 
-export const RESOURCE_KINDS = ['machine', 'instance', 'port-lease', 'exposure', 'universe', 'setup-status', 'image', 'slot-lease', 'pod-worker-lease'] as const;
+export const RESOURCE_KINDS = ['machine', 'instance', 'port-lease', 'exposure', 'universe', 'setup-status', 'image', 'slot-lease', 'pod-worker-lease', 'fleet-resource'] as const;
 export type ResourceKind = (typeof RESOURCE_KINDS)[number];
 export interface ResourceRecord {
   id: string;

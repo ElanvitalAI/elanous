@@ -39,6 +39,12 @@ cases:
       status: failed
       mustVisit: [gate, gate-triage, failed]
       mustNotVisit: [publish]
+  - id: gate-measured-regression-waive
+    mode: gate-waive-introduced-regression
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [gate-triage, failed]
   - id: release-version-skip
     fault:
       node: cutoff
@@ -110,3 +116,16 @@ cases:
       status: failed
       mustVisit: [mac-smoke, pwa, pre-prepare-join, traffic-failed-restore, failed]
       mustNotVisit: [prepare, publish]
+
+  - id: owner-waive-malformed-gate-schema
+    mode: owner-waive-missing-schema
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [gate-triage, failed]
+  - id: owner-waive-0246-verdict-fixture
+    mode: owner-waive-0246-fixture
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, verify, done]
+      mustNotVisit: [gate-triage, failed]

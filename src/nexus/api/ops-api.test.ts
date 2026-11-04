@@ -10,7 +10,7 @@ import { TabRegistry } from '../state/tab-registry.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { NexusEventBus } from './event-bus.js';
 import { routeRequest } from './http-server.js';
-import { readReleaseRuns, setOverviewCacheForTest } from './ops-api.js';
+import { defaultTrainArtifactDirectory, readReleaseRuns, resolveTrainArtifactDirectory, setOverviewCacheForTest } from './ops-api.js';
 import { setResourceLedgerSnapshotForTest } from './resource-ledger.js';
 import * as guardianReconcile from '../../resource-ledger/guardian-reconcile.js';
 import { setLatestResourceSnapshotForTest, type ResourceReconcileSnapshot } from '../../resource-ledger/guardian-reconcile.js';
@@ -25,6 +25,9 @@ const SECRET = 'op-proxy-secret-0123456789abcdef';
 const API_KEY = 'sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
 const OWNER = 'owner-token';
 const dirs: string[] = [];
+const originalTrainArtifactDir = process.env.ELANOUS_TRAIN_ARTIFACT_DIR;
+const originalTrainSummaryDir = process.env.ELANOUS_TRAIN_SUMMARY_DIR;
+const originalHome = process.env.HOME;
 
 // The legacy XDG config is pointed at a per-test temp dir and restored — never the person's own.
 const originalXdgConfig = process.env.XDG_CONFIG_HOME;
@@ -36,6 +39,9 @@ afterEach(() => {
   else process.env.XDG_CONFIG_HOME = originalXdgConfig;
   resetUserConfig();
   resetElanousConfigDir();
+  if (originalTrainArtifactDir === undefined) delete process.env.ELANOUS_TRAIN_ARTIFACT_DIR; else process.env.ELANOUS_TRAIN_ARTIFACT_DIR = originalTrainArtifactDir;
+  if (originalTrainSummaryDir === undefined) delete process.env.ELANOUS_TRAIN_SUMMARY_DIR; else process.env.ELANOUS_TRAIN_SUMMARY_DIR = originalTrainSummaryDir;
+  if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -68,6 +74,61 @@ function fixture(enabled: boolean | undefined) {
   };
   return { dir, send, run };
 }
+
+test('train throughput source defaults to the canonical OP artifact directory and allows an explicit override', () => {
+  expect(defaultTrainArtifactDirectory('/home/operator')).toBe('/home/operator/elanous-hq/seat-state/OP/train-artifacts');
+  expect(resolveTrainArtifactDirectory({}, '/home/operator')).toBe('/home/operator/elanous-hq/seat-state/OP/train-artifacts');
+  expect(resolveTrainArtifactDirectory({ ELANOUS_TRAIN_ARTIFACT_DIR: '/data/train-artifacts' }, '/ignored'))
+    .toBe('/data/train-artifacts');
+});
+
+test('train throughput API discovers the train loop output under the operator home without extra setup', async () => {
+  const { dir, send } = fixture(true);
+  const home = join(dir, 'operator-home');
+  const artifacts = defaultTrainArtifactDirectory(home);
+  mkdirSync(artifacts, { recursive: true });
+  writeFileSync(join(artifacts, 'train-auto-loop-aws-prod.log'), [
+    '11-02 14:40:00 [aws-prod] manager assigned stage=group prs=9 base=abc run=run-a slot=1',
+    '11-02 14:48:00 [aws-prod] manager done stage=group run=run-a rc=0 · completed',
+  ].join('\n'));
+  delete process.env.ELANOUS_TRAIN_ARTIFACT_DIR;
+  delete process.env.ELANOUS_TRAIN_SUMMARY_DIR;
+  process.env.HOME = home;
+  const response = await send('/v1/ops/train-throughput?date=2026-11-02', { authorization: `Bearer ${OWNER}` });
+  if (!response) throw new Error('train throughput route returned no response');
+  expect(response.status).toBe(200);
+  const body = await response.json() as { hosts: Record<string, { assigned: number; succeeded: number }> };
+  expect(body.hosts['aws-prod']).toMatchObject({ assigned: 1, succeeded: 1 });
+});
+
+test('train throughput API aggregates host logs and batch summary rejection categories behind operator auth', async () => {
+  const { dir, send } = fixture(true);
+  const artifacts = join(dir, 'train-artifacts');
+  mkdirSync(join(artifacts, 'batch-aws-prod-run-a'), { recursive: true });
+  mkdirSync(join(artifacts, 'batch-aws-prod-corrupt'), { recursive: true });
+  writeFileSync(join(artifacts, 'batch-aws-prod-corrupt', 'summary.json'), '{ incomplete');
+  process.env.ELANOUS_TRAIN_ARTIFACT_DIR = artifacts;
+  writeFileSync(join(artifacts, 'train-auto-loop-aws-prod.log'), [
+    '11-02 14:40:00 [aws-prod] manager assigned stage=group prs=1,2 base=abc run=run-a slot=2',
+    '11-02 14:48:00 [aws-prod] manager done stage=group run=run-a rc=2 · BATCH REFUSED: gate verdict not pass',
+  ].join('\n'));
+  writeFileSync(join(artifacts, 'batch-aws-prod-run-a', 'manifest.json'), JSON.stringify({ host: 'aws-prod', base: 'base40', members: [{ pr: '1', head: 'head40' }, { pr: '2', head: 'head41' }] }));
+  writeFileSync(join(artifacts, 'batch-aws-prod-run-a', 'summary.json'), JSON.stringify({
+    verdict: 'failed', exitCode: 1, typecheck: { status: 'failed' }, trainAlwaysRatchets: { status: 'passed' },
+    introduced: 1, preconditionUnmet: 0,
+  }));
+  const headers = { authorization: `Bearer ${OWNER}` };
+  expect((await send('/v1/ops/train-throughput?date=2026-02-30', headers))?.status).toBe(400);
+  expect((await send('/v1/ops/train-throughput?date=2026-11-02'))?.status).toBe(403);
+  const response = await send('/v1/ops/train-throughput?date=2026-11-02', headers);
+  if (!response) throw new Error('train throughput route returned no response');
+  expect(response.status).toBe(200);
+  const body = await response.json() as { sourceIncomplete: boolean; hosts: Record<string, { assigned: number; rejectedByReason: Record<string, number> }>; attempts: Array<{ ledgerKeys?: Array<{ pr: string; head: string; base: string }> }> };
+  expect(body.sourceIncomplete).toBe(true);
+  expect(body.hosts['aws-prod']?.assigned).toBe(1);
+  expect(body.hosts['aws-prod']?.rejectedByReason).toMatchObject({ typecheck: 1, introduced: 1 });
+  expect(body.attempts[0]?.ledgerKeys).toEqual([{ pr: '1', head: 'head40', base: 'base40' }, { pr: '2', head: 'head41', base: 'base40' }]);
+});
 
 test('resource ledger: operator-gated handler returns the mocked host/lane snapshot without local paths', async () => {
   const { send } = fixture(true);

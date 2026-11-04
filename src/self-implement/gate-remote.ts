@@ -7,6 +7,7 @@ import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { loadavg } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { gateHostReservationRoot, inspectReleaseGateHost, readGateHostResourcesForHost, type GateHostResourceReading } from '../release-loop/gate-host-reservation.js';
 import type { GateRemoteConfig } from '../user-config.js';
 
@@ -109,6 +110,38 @@ export function remoteSelfGateArgv(input: {
     ...(input.includeImporters ? ['--include-importers'] : []),
     ...(input.noInherit ? ['--no-inherit'] : []),
     ...(input.artifactDir ? ['--artifact-dir', input.artifactDir] : [])];
+}
+
+/** A PR can be measured remotely when its checked-out head and GitHub base are pinned to exact commits. */
+export function resolveGatePrBase(pr: string, repo: string, deps: {
+  gh?: (args: readonly string[]) => { status: number | null; stdout: string };
+  git?: (args: readonly string[]) => { status: number | null; stdout: string };
+} = {}): string | null {
+  if (!/^[1-9]\d*$/.test(pr)) return null;
+  const gh = deps.gh ?? ((args: readonly string[]) => {
+    const result = spawnSync('gh', [...args], { cwd: repo, encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+    return { status: result.status, stdout: result.stdout ?? '' };
+  });
+  const git = deps.git ?? ((args: readonly string[]) => {
+    const result = spawnSync('git', [...args], { cwd: repo, encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+    return { status: result.status, stdout: result.stdout ?? '' };
+  });
+  const view = gh(['pr', 'view', pr, '--json', 'files,baseRefOid,headRefOid']);
+  if (view.status !== 0) return null;
+  let row: { baseRefOid?: unknown; headRefOid?: unknown; files?: unknown };
+  try { row = JSON.parse(view.stdout) as typeof row; } catch { return null; }
+  if (typeof row.baseRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(row.baseRefOid) ||
+    typeof row.headRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(row.headRefOid) || !Array.isArray(row.files) ||
+    row.files.some((file) => !file || typeof file !== 'object' || typeof (file as { path?: unknown }).path !== 'string')) return null;
+  const head = git(['rev-parse', 'HEAD']);
+  if (head.status !== 0 || head.stdout.trim().toLowerCase() !== row.headRefOid.toLowerCase()) return null;
+  const base = git(['cat-file', '-e', `${row.baseRefOid}^{commit}`]);
+  if (base.status !== 0) return null;
+  const changed = git(['diff', '--name-only', '-z', `${row.baseRefOid}...HEAD`]);
+  if (changed.status !== 0) return null;
+  const localFiles = changed.stdout.split('\0').filter(Boolean).sort();
+  const prFiles = (row.files as Array<{ path: string }>).map(({ path }) => path).sort();
+  return localFiles.length === prFiles.length && localFiles.every((file, index) => file === prFiles[index]) ? row.baseRefOid : null;
 }
 
 export interface GateDispatchDecision { mode: 'local' | 'remote'; host?: string; reason: string; load1: number }
@@ -597,21 +630,28 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   const reservationRoot = opts.tool === 'self-gate' || opts.tool === 'ci-typecheck-changed'
     ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
   if (reservationRoot) {
+    type ReservationObservation = { status: 'free'; probeFailed: boolean; probeFailure?: string }
+      | Exclude<ReturnType<typeof inspectReleaseGateHost>, { status: 'free' }>;
     const resourceStatus = (target: string) => {
       if (!deps.readHostResources && deps.runner) return null; // fake runners keep tests hermetic unless the producer is explicitly exercised
       return (deps.readHostResources ?? ((selected) => readGateHostResourcesForHost(selected, env)))(target.split('@').at(-1)!);
     };
-    const inspect = (target: string) => {
+    const inspect = (target: string): ReservationObservation => {
       const claim = inspectReleaseGateHost(reservationRoot, target);
       const resources = resourceStatus(target);
-      if (!resources) return claim;
+      if (!resources) return claim.status === 'free' ? { status: 'free', probeFailed: false } : claim;
       if (resources.status === 'unmeasurable') {
-        // Keep a concrete release owner visible even if the independent Pod ledgers cannot be read.
-        if (claim.status === 'reserved') return claim;
-        return { status: 'unknown' as const, reason: `resource probe unmeasurable: ${resources.reason}` };
+        // An unreadable claim ledger stays fail-closed; only a measured absence of a claim lets
+        // the remote check proceed when the independent Pod resource probe fails.
+        if (claim.status !== 'free') return claim;
+        return { status: 'free', probeFailed: true, probeFailure: resources.reason.trim() || 'unspecified' };
       }
       if (!resources.empty) return { status: 'reserved' as const, reason: `Pod resource pool occupied (${resources.reservations} reservations)` };
-      return claim;
+      return claim.status === 'free' ? { status: 'free', probeFailed: false } : claim;
+    };
+    const warnProbeFailure = (target: string, reason: string) => {
+      debug.log('gate.remote', 'host-reservation-probe-unavailable', { tool: opts.tool, host: target, reason, releaseClaim: 'none' });
+      write.err(`[gate.remote] host reservation probe unavailable on ${target}: ${reason}; no active release claim — proceeding remotely\n`);
     };
     const reservationHost = host.split('@').at(-1)!;
     const first = inspect(reservationHost);
@@ -627,7 +667,16 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
         : `observed-at=${observedAt}`;
       const alternates = opts.tool === 'self-gate'
         ? gateReservationAlternateHosts(reservationHost, opts.reservationAltHosts) : [];
-      const alternate = alternates.find((candidate) => inspect(candidate).status === 'free');
+      const alternate = alternates.find((candidate) => {
+        const observation = inspect(candidate);
+        if (observation.status !== 'free') return false;
+        if (observation.probeFailed) {
+          debug.log('gate.remote', 'host-reservation-probe-unavailable', { tool: opts.tool, host: candidate, reason: observation.probeFailure, releaseClaim: 'none', disposition: 'alternate-not-selected' });
+          write.err(`[gate.remote] host reservation probe unavailable on ${candidate}: ${observation.probeFailure}; alternate not selected\n`);
+          return false;
+        }
+        return true;
+      });
       if (alternate) {
         const rerouted = host.includes('@') ? `${host.slice(0, host.lastIndexOf('@'))}@${alternate}` : alternate;
         debug.log('gate.remote', 'host-reserved-reroute', { tool: opts.tool, from: host, to: rerouted, owner, reason: first.reason, reservedAt: first.reservedAt, observedAt });
@@ -649,8 +698,12 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
         }
         const waitedMs = Math.max(0, now() - waitStart);
         if (latest.status === 'free') {
-          debug.log('gate.remote', 'host-reserved-released', { tool: opts.tool, host, owner, waitedMs });
-          write.err(`[gate.remote] host-reserved released on ${host} after ${Math.floor(waitedMs / 1000)}s — proceeding remotely\n`);
+          if (latest.probeFailed) {
+            warnProbeFailure(reservationHost, latest.probeFailure ?? 'unspecified');
+          } else {
+            debug.log('gate.remote', 'host-reserved-released', { tool: opts.tool, host, owner, waitedMs });
+            write.err(`[gate.remote] host-reserved released on ${host} after ${Math.floor(waitedMs / 1000)}s — proceeding remotely\n`);
+          }
         } else {
           const reason = `host-reserved: ${host} (${latest.reason})`;
           const manualAlternative = reservationHost === 'node-b'
@@ -662,7 +715,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
           return 1;
         }
       }
-    }
+    } else if (first.probeFailed) warnProbeFailure(reservationHost, first.probeFailure ?? 'unspecified');
   }
   const fallback = (reason: string, failure?: { stage?: string; rc?: number | null; stderr?: string }) => {
     const selfGateInfrastructureFailure = opts.tool === 'self-gate' && failure?.stage !== 'reproducibility';

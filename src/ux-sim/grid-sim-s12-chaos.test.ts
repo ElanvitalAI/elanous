@@ -50,6 +50,7 @@ function makeTopology(): { topology: GridChaosTopology; leases: LeaseRow[] } {
           leases.push({ grid: gridId, host, sessionId, leaseId });
           return {
             id: sessionId,
+            processId: kind === 'nexus' ? `${host}-nexus-process` : `${host}-work-process`,
             leaseId,
             podDeathScenario: podDeathAfterPartialScenario({ job: `${sessionId}-job`, runId: `${sessionId}-run` }),
           };
@@ -164,6 +165,7 @@ function expectGridAdmissionLimits(ledger: ReturnType<typeof createGridLedger>, 
 
 test('GRID-SIM-S12: gorilla loss ends every target-grid work, GOP, and Nexus lease only', async () => {
   let sawPriorNonTargetLeaseLoss = false;
+  let sawSharedProcessMonkey = false;
   for (let seed = 1; seed <= 10; seed++) {
     const first = await runGridLoss(seed);
     const replay = await runGridLoss(seed);
@@ -174,7 +176,21 @@ test('GRID-SIM-S12: gorilla loss ends every target-grid work, GOP, and Nexus lea
     const topology = makeTopology();
     expect(first.result.events.filter(({ attack }) => attack === 'gorilla')).toHaveLength(1);
     const gorillaEvent = first.result.events.find(({ attack }) => attack === 'gorilla')!;
+    const monkeyEvent = first.result.events.find(({ attack }) => attack === 'monkey')!;
     const gorillaCheckpoint = first.checkpoints.find(({ attack }) => attack === 'gorilla')!;
+    expect(monkeyEvent.scope).toBe('process');
+    expect(monkeyEvent.targetProcessIds).toHaveLength(1);
+    const targetSessions = topology.topology.grids.flatMap(({ hosts }) => hosts)
+      .flatMap(({ sessions }) => sessions)
+      .filter(({ processId }) => monkeyEvent.targetProcessIds.includes(processId));
+    expect(monkeyEvent.targetProcessIds).toHaveLength(1);
+    expect([...monkeyEvent.affectedSessionIds].sort()).toEqual(targetSessions.map(({ id }) => id).sort());
+    const targetHost = topology.topology.grids.flatMap(({ hosts }) => hosts)
+      .find(({ id }) => id === monkeyEvent.targetHostIds[0])!;
+    const otherProcessSessions = targetHost.sessions.filter(({ processId }) => !monkeyEvent.targetProcessIds.includes(processId));
+    expect(otherProcessSessions.length).toBeGreaterThan(0);
+    expect(otherProcessSessions.every(({ leaseId }) => first.ledger.getLease(leaseId)?.endedAt === undefined)).toBe(true);
+    sawSharedProcessMonkey ||= targetSessions.length === 2;
     const isTargetHost = (snapshot: GridWhoSnapshot): boolean =>
       'host' in snapshot.selector && gorillaEvent.targetHostIds.includes(snapshot.selector.host);
     sawPriorNonTargetLeaseLoss ||= gorillaCheckpoint.ledgerBefore.hosts.some((host) =>
@@ -239,6 +255,7 @@ test('GRID-SIM-S12: gorilla loss ends every target-grid work, GOP, and Nexus lea
     expectGridAdmissionLimits(first.ledger, gorillaEvent.targetGridId, targetHosts, seed);
   }
   expect(sawPriorNonTargetLeaseLoss).toBe(true);
+  expect(sawSharedProcessMonkey).toBe(true);
 });
 
 test('GRID-SIM-S12 detects unknown grid-level summary metadata drift injected at the ledger adapter boundary', async () => {

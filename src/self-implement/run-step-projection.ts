@@ -5,8 +5,8 @@ export type RunStep =
   | { seq: number; ts: string; type: 'node-exit'; node: string; outcome: string }
   | { seq: number; ts: string; type: 'edge-taken'; from: string; to: string; via: string; condition?: string }
   | { seq: number; ts: string; type: 'node-skipped'; node: string; reason: string; condition?: string }
-  | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; trigger?: unknown; undo?: unknown }
-  | { seq: number; ts: string; type: 'edge-rerouted'; from: string; outcome: string; to: string; was: string; decider: string; reason: string }
+  | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; trigger?: unknown; undo?: unknown; source?: string; injected?: boolean; scene?: string; demo1104Scene?: string; mockOutcome?: string }
+  | { seq: number; ts: string; type: 'edge-rerouted'; from: string; outcome: string; to: string; was: string; decider: string; reason: string; source?: string; injected?: boolean; scene?: string; demo1104Scene?: string; mockOutcome?: string }
   | { seq: number; ts: string; type: 'unit-expanded'; node: string; unit: string; childRunId: string; resolution: number; decider: string; reason: string }
   | { seq: number; ts: string; type: 'unit-collapsed'; node: string; resolution: number; decider: string; reason: string };
 
@@ -31,6 +31,20 @@ const STRUCTURAL_EVENTS = new Set(['node-added', 'edge-rerouted', 'unit-expanded
 function text(data: Record<string, unknown>, key: string): string | null {
   const value = data[key];
   return typeof value === 'string' && value.trim().length > 0 ? value : null;
+}
+
+function structuralProvenance(data: Record<string, unknown>) {
+  const source = text(data, 'source');
+  const scene = text(data, 'scene');
+  const demo1104Scene = text(data, 'demo1104Scene');
+  const mockOutcome = text(data, 'mockOutcome');
+  return {
+    ...(source ? { source } : {}),
+    ...(data.injected === true ? { injected: true } : {}),
+    ...(scene ? { scene } : {}),
+    ...(demo1104Scene ? { demo1104Scene } : {}),
+    ...(mockOutcome ? { mockOutcome } : {}),
+  };
 }
 
 function validSeq(value: unknown): value is number {
@@ -81,14 +95,14 @@ function projectStep(entry: RunLedgerEntry, type: string, seq: number): RunStep 
     }
     case 'node-added': {
       const kind = text(data, 'kind');
-      return node && kind ? { seq, ts, type, node, kind, decider: text(data, 'decider')!, reason: text(data, 'reason')!, ...(data.trigger === undefined ? {} : { trigger: data.trigger }), ...(data.undo === undefined ? {} : { undo: data.undo }) } : 'node-added requires node and kind';
+      return node && kind ? { seq, ts, type, node, kind, decider: text(data, 'decider')!, reason: text(data, 'reason')!, ...structuralProvenance(data), ...(data.trigger === undefined ? {} : { trigger: data.trigger }), ...(data.undo === undefined ? {} : { undo: data.undo }) } : 'node-added requires node and kind';
     }
     case 'edge-rerouted': {
       const from = text(data, 'from');
       const outcome = text(data, 'outcome');
       const to = text(data, 'to');
       const was = text(data, 'was');
-      return from && outcome && to && was ? { seq, ts, type, from, outcome, to, was, decider: text(data, 'decider')!, reason: text(data, 'reason')! } : 'edge-rerouted requires from, outcome, to and was';
+      return from && outcome && to && was ? { seq, ts, type, from, outcome, to, was, decider: text(data, 'decider')!, reason: text(data, 'reason')!, ...structuralProvenance(data) } : 'edge-rerouted requires from, outcome, to and was';
     }
     case 'unit-expanded': {
       const unit = text(data, 'unit') ?? text(data, 'into');

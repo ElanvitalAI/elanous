@@ -12,6 +12,29 @@ export interface ShortQuestionVerdict {
   reason: string;
 }
 
+export interface KnownAnswerRoute {
+  answerFromModel: boolean;
+  reason: 'stable-fact' | 'contextual-follow-up' | 'freshness' | 'citations' | 'not-known-answer';
+}
+
+/** Research stays available only when the request asks for fresh facts/sources, or a later answer is uncertain. */
+export function classifyKnownAnswerRoute(text: string, hasAssistantContext = false): KnownAnswerRoute {
+  const q = text.trim();
+  if (LIVE.test(q)) return { answerFromModel: false, reason: 'freshness' };
+  if (/(?:출처|인용|링크|근거|참고문헌|sources?|citations?|links?)/i.test(q)) {
+    return { answerFromModel: false, reason: 'citations' };
+  }
+  if (!q || [...q].length > 80 || OPERATIONAL.test(q) || PATH_OR_CODE.test(q) || TASK.test(q)
+    || REQUEST_KO.test(q) || REQUEST_EN.test(q) || /(?:조사|검색|찾아\s*봐|research|search)/i.test(q)) {
+    return { answerFromModel: false, reason: 'not-known-answer' };
+  }
+  const short = classifyShortQuestion(q);
+  const stableFactShape = /(?:리스트|목록|뜻|의미|정의|무엇|뭐|누구|언제|어디|몇|얼마나|왜|인가\??|야\??|까\??|\?)$/i.test(q);
+  if (short.fast || stableFactShape) return { answerFromModel: true, reason: 'stable-fact' };
+  if (hasAssistantContext) return { answerFromModel: true, reason: 'contextual-follow-up' };
+  return { answerFromModel: false, reason: 'not-known-answer' };
+}
+
 const GREETING = /^(?:안녕(?:하세요|하십니까)?|반가워(?:요)?|고마워(?:요)?|감사합니다|하이|hi|hello|hey|thanks|thank you)[!?.~\s]*$/i;
 // «한 줄로» 같은 짧은 꼬리를 떼고 본다.
 const TAIL = /\s*(?:한\s*줄로|짧게|간단히|briefly|in one line)[.!]?\s*$/i;
@@ -21,16 +44,16 @@ const REQUEST_KO = /(?:해\s*줘|해\s*주세요|줘(?:요)?(?=[?.!\s]|$)|주세
 const REQUEST_EN = /\b(?:please|can you|could you|would you|run|test|tests|fix|build|open|search|check|send|create|write|deploy|install|summarize)\b/i;
 const TASK = /(?:작업|파일|폴더|디렉터리|레포|저장소|커밋|브랜치|\bPR\b|코드|스크립트|테스트|빌드|배포|설치|설정|명령어|로그|버그|이슈)/i;
 const PATH_OR_CODE = /(?:https?:\/\/|www\.|[\w.-]+\/[\w./-]+|\.(?:ts|tsx|js|py|md|json|yaml|swift|kt)\b|[`{};=<>])/i;
-const LIVE = /(?:오늘\s*(?:날짜|며칠|무슨\s*요일)|지금\s*몇\s*시|최신|뉴스|속보|주가|시세|환율|날씨|today'?s|latest|news|stock|weather|right now)/i;
+const LIVE = /(?:현재|현행|요즘|지금|오늘|최신|뉴스|속보|주가|시세|환율|날씨|today'?s|latest|news|stock|weather|right now|\bcurrent(?:ly)?\b|\brecent(?:ly)?\b|\bas of\b)/i;
+// Operational facts depend on the current workspace/runtime, even when phrased as a short question.
+const OPERATIONAL = /(?:상태|현황|로그|릴리스|배포|우편|일감|작업|세션|브랜치|커밋|\b[A-Z][A-Z0-9_-]{1,}(?:의)?\s*(?:값|수치|카운트|개수|value|count|status)|goal|status|release|deployment|mailbox|session|branch|commit)/i;
 
 export type TuiChatRoute = '조회' | '설정 변경' | '조사' | '상시 일' | '읽기·분석' | '코딩·구현';
 const TUI_CHAT_ROUTES: readonly TuiChatRoute[] = ['조회', '설정 변경', '조사', '상시 일', '읽기·분석', '코딩·구현'];
-
-// goal loop 밖 턴이 답 앞에 먼저 보내는 «라우팅 줄»(core-turn-bridge) — 형식의 정본은 여기 하나다.
+// 이전 bridge 가 생성한 transcript chunk 를 TUI 가 표시하지 않도록 식별한다.
 export function formatTuiRouteLine(route: TuiChatRoute): string {
   return `라우팅: ${route}\n`;
 }
-// 그 줄 «그대로»인 청크만 참이다 — 모델 출력의 시작으로 세지 않을 때 쓴다(compact-400 재시도 판정 · 0.2.29).
 export function isTuiRouteLine(chunk: string): boolean {
   return TUI_CHAT_ROUTES.some((route) => chunk === formatTuiRouteLine(route));
 }

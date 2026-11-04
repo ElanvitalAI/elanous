@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { LogStore } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
+import { tracedPathReferences } from '../self-implement/goal-author.js';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -312,6 +313,69 @@ test('an authored goal with no preserved traced path cannot force launch', () =>
     expect(decision.result.blockers).toContainEqual(expect.objectContaining({
       kind: 'missing-traced-path', name: '최종 골의 TRACED PATHS 경로 0',
     }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an authored research goal may omit traced paths while every other authored goal kind remains blocked', () => {
+  const root = mkdtempSync(join(tmpdir(), 'traced-empty-research-goal-'));
+  try {
+    const goalFile = join(root, 'goal.md');
+    const deps = {
+      readGoalDocument: (path: string) => readFileSync(path, 'utf8'),
+      tracedPaths: (document: string) => tracedPathReferences(document).map(({ path }) => path),
+      listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    };
+    const options = { goalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7 };
+
+    writeFileSync(goalFile, [
+      '# Research goal',
+      '- GoalType: research',
+      '',
+      '## PROBLEM', 'Research only.',
+      '',
+      '## WHAT TO BUILD', 'Write an evidence report.',
+      '',
+      '## ACCEPTANCE CRITERIA', '- The report has sources.',
+      '',
+      '## REQUIRED EVIDENCE', '- [report] The report path.',
+      '',
+      '## SCOPE BOUNDARY', 'Research only.',
+      '',
+      '## 답하지 못하는 것', 'Unknown values remain unknown.',
+      '',
+      '## 불변식', 'No operational writes.',
+      '',
+      '## 판정 신호', '판정 신호: 조건 = report exists; 관측 = report; 기대 = report exists.',
+      '',
+    ].join('\n'));
+    const research = decideAskPreflight(options, deps, false);
+    expect(research.result.blockers.filter((blocker) => blocker.kind === 'missing-traced-path')).toEqual([]);
+    expect(research.result.blockers.some((blocker) => blocker.kind === 'no-target-paths')).toBe(false);
+    expect(research.shouldLaunch).toBe(true);
+
+    writeFileSync(goalFile, [
+      '# Research goal with an invalid traced path',
+      '- GoalType: research',
+      '',
+      '## PROBLEM', 'Research only.',
+      '',
+      '## TRACED PATHS', '- src/missing-research-evidence.ts',
+      '',
+    ].join('\n'));
+    const invalidResearchPath = decideAskPreflight(options, deps, false);
+    expect(invalidResearchPath.result.blockers).toContainEqual(expect.objectContaining({
+      kind: 'missing-traced-path', name: '실재하지 않는 traced path: src/missing-research-evidence.ts',
+    }));
+    expect(invalidResearchPath.shouldLaunch).toBe(false);
+
+    for (const goalType of ['implement', 'document', 'operate']) {
+      writeFileSync(goalFile, `# ${goalType} goal\n- GoalType: ${goalType}\n\n## PROBLEM\nNo traced paths.\n`);
+      const other = decideAskPreflight(options, deps, true);
+      expect(other.shouldLaunch).toBe(false);
+      expect(other.result.blockers).toContainEqual(expect.objectContaining({
+        kind: 'missing-traced-path', name: '최종 골의 TRACED PATHS 경로 0',
+      }));
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

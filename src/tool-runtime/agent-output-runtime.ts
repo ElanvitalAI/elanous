@@ -13,5 +13,5 @@ import type { ToolRuntime } from './types.js';
 export const agentOutputRuntime: ToolRuntime<Partial<AgentOutputParams>, AgentOutputResult> = {
   id: 'agent_output',
   spec: buildAgentOutputTool(),
-  async run(req) { return dispatchAgentOutput(req); },
+  async run(req, ctx) { return dispatchAgentOutput(req, { signal: ctx.signal }); },
 };

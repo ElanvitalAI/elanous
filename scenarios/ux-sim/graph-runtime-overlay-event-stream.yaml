@@ -5,6 +5,7 @@ seed: 110109
 triggers:
   - id: runtime-overlay-dispatch
     type: ux.graph-runtime-overlay.evaluate
+    goal_id: event_stream_probe
 expect:
   screen:
     mode: widget

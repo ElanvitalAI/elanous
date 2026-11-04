@@ -113,7 +113,13 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
       && hasMeasuredApprovalMetrics(auto.metrics))) {
     return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: neither auto-approve nor approve-publish approved' };
   }
-  for (const node of ['gate', 'pwa', 'upgrade', 'tui', 'prepare', 'docs']) {
+  const gate = context.outputs.gate;
+  const ownerWaivedGate = gate?.outcome === 'pass(owner-waived)' && gate.verdict === 'owner-waived'
+    && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
+    && typeof gate.reason === 'string' && gate.reason.trim().length > 0;
+  if (gate?.outcome !== 'ok' && !ownerWaivedGate)
+    return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: gate outcome is not ok or explicitly owner-waived' };
+  for (const node of ['pwa', 'upgrade', 'tui', 'prepare', 'docs']) {
     if (context.outputs[node]?.outcome !== 'ok') return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `publish blocked: ${node} outcome is not ok` };
   }
   if (nodeOutput(context, 'prepare', 'commit') !== nodeOutput(context, 'version-release', 'commit')) throw new Error('prepare commit differs from release commit');

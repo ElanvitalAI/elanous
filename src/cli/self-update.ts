@@ -1203,7 +1203,7 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
 
     if (options.dev) {
       try {
-        const installed = installDevBuild(checkout, head.stdout.trim(), { ...deps, runInstaller: () => run('bash', [join(checkout, 'scripts/install.sh'), '--no-modify-path', ...(deps.installRoot ? ['--prefix', deps.installRoot] : [])], checkout) });
+        const installed = installDevBuild(checkout, head.stdout.trim(), { ...deps, runInstaller: () => run('bash', [join(checkout, 'scripts/install.sh'), '--no-modify-path', '--yes', ...(deps.installRoot ? ['--prefix', deps.installRoot] : [])], checkout) });
         return emit({
           exitCode: 0,
           installedVersion: installed.versionName,

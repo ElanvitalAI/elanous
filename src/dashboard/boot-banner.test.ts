@@ -70,8 +70,8 @@ describe('minimal boot banner', () => {
 
   test('a failed daemon link writes exactly one row', async () => {
     for (const link of [
-      { status: 'absent', startCommand: 'elanous nexus run --hmr' },
-      { status: 'unhealthy', startCommand: 'elanous nexus run --hmr' },
+      { status: 'absent', startCommand: 'elanous nexus run' },
+      { status: 'unhealthy', startCommand: 'elanous nexus run' },
       { status: 'error', stage: 'health' },
     ] as TuiDaemonLink[]) {
       const lines: string[] = [];

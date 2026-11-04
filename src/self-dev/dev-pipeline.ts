@@ -29,6 +29,7 @@ import { requiredEvidenceFromGoal } from '../self-implement/off-diff-evidence.js
 import { debug } from '../debug/log.js';
 import { REVIEW_DEFERRED_TO_HOST_ENV, reviewDeferredToHostFromEnv } from '../self-implement/review-deferred-to-host.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from './release-path-guard.js';
+import { findGitDir } from '../git-fs/locate.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import type { GitRunResult } from '../git-fs/retry.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE, observeGitResidue, type GitResidueObservation } from '../git-fs/worktree.js';
@@ -689,6 +690,7 @@ export function buildAgentMissionDevSpec(o: {
   deliverableHint?: string;
   screensDir?: string;
 }): DevPipelineSpec {
+  if (o.enhanceOff) debug.log('agent-mission', 'no-enhance', { memory: false });
   return {
     input: { text: o.mission },
     executor: { kind: 'external', backend: o.backend },
@@ -697,6 +699,7 @@ export function buildAgentMissionDevSpec(o: {
     ...(o.enhanceOff ? { enhance: false } : {}),
     mission: {
       evidence: o.evidence,
+      ...(o.enhanceOff ? { memory: false } : {}),
       ...(o.headless === true ? { headless: true } : {}),
       ...(o.followUp !== undefined ? { followUp: o.followUp } : {}),
       ...(o.chain ? { chain: o.chain } : {}),
@@ -1643,8 +1646,8 @@ function preflightGoalFileLint(
   let branch = '';
   try {
     branch = (deps.branch ?? ((directory: string) => {
-      const result = runGitCommand(directory, ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' });
-      if (result.status !== 0) throw new Error(result.stderr);
+      const result = runDevGitProbe(directory, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      if (!result || result.status !== 0) throw new Error(result?.stderr || 'git branch probe unavailable');
       return result.stdout.trim();
     }))(cwd);
   } catch { /* fail-open — 브랜치 미상은 린트 한 축의 입력 결손이지 관문 실패가 아니다 */ }
@@ -1781,6 +1784,30 @@ export function observeTargetRemote(
   return result.stdout.trim()
     ? { state: 'remote-present', repoRoot }
     : { state: 'remote-absent', repoRoot };
+}
+
+/** Probe a Git-derived value without leaking expected negative-probe stderr to the TUI. */
+function runDevGitProbe(cwd: string, args: string[], run: (cwd: string, args: string[]) => GitRunResult =
+  (directory, command) => runGitCommand(directory, command, { encoding: 'utf8', timeout: 30_000 }),
+): GitRunResult | null {
+  if (!findGitDir(cwd)) {
+    debug.log('dev-pipeline', 'git-probe', { cwd, args, outcome: 'skipped', reason: 'cwd-not-a-git-repository' });
+    return null;
+  }
+  try {
+    const result = run(cwd, args);
+    debug.log('dev-pipeline', 'git-probe', {
+      cwd,
+      args,
+      outcome: result.status === 0 ? 'ok' : 'failed',
+      status: result.status,
+      ...(result.status === 0 ? {} : { stderr: result.stderr }),
+    });
+    return result;
+  } catch (error) {
+    debug.log('dev-pipeline', 'git-probe', { cwd, args, outcome: 'failed', reason: String(error) });
+    return null;
+  }
 }
 
 /**
@@ -2190,8 +2217,8 @@ async function runDevPipelineDispatch(
   };
   const provisionForeignWorkingRepository = (cwd: string): void => {
     const topLevel = (dir: string): string | null => {
-      const r = runGitCommand(dir, ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 30_000 });
-      return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+      const result = runDevGitProbe(dir, ['rev-parse', '--show-toplevel']);
+      return result?.status === 0 && result.stdout.trim() ? result.stdout.trim() : null;
     };
     const cwdTop = topLevel(cwd);
     if (!cwdTop) return;

@@ -1100,6 +1100,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         logsCfg.retention,
       );
       if (off) console.log(`logs: store ${storeMod.logsDbPath()} (surface=nexus · instance=${storeMod.resolveLogInstanceName()})`);
+      const federationOff = (await import('../mss/logging/log-federation.js')).registerLogFederationWorker();
+      process.on('exit', federationOff);
       // Phase D2-핵심 — 부팅 시 config-dir↔state-dir 정합 가드(warn-first). 부분 격리
       // (한 축만 설정)로 스토어가 갈라지면 시끄럽게(관측+stderr). 부팅은 안 막는다.
       try {

@@ -12,13 +12,15 @@ import { simRenderLogFrame } from './render-frame.js';
 import { assessDraftInventory, buildDraftInventory } from './draft-inventory-builder.js';
 import { reviewerPrecheckFixtureDocument, runAuthorReviewerPrecheckDevice, type AuthorReviewerPrecheckDeviceResult, type AuthorReviewerPrecheckVariant } from './author-reviewer-precheck-device.js';
 import { runGraphRuntimeOverlayEventPathDevice, type GraphRuntimeOverlayEventPathResult } from './graph-runtime-overlay-event-path.js';
+import { runBurstReadyLadderSimulation, type BurstReadyLadderSimulationResult } from './burst-ready-ladder-sim.js';
 
 export type ScenarioTrigger = {
   id: string;
-  type: 'codex.responses.fetch' | 'codex.responses.fetch-network-error' | 'ux.draft-inventory.evaluate' | 'ux.author-reviewer-precheck.evaluate' | 'ux.graph-runtime-overlay.evaluate';
+  type: 'codex.responses.fetch' | 'codex.responses.fetch-network-error' | 'ux.draft-inventory.evaluate' | 'ux.author-reviewer-precheck.evaluate' | 'ux.graph-runtime-overlay.evaluate' | 'ux.burst-ready-ladder.evaluate';
   status?: number;
   count?: number;
   variant?: AuthorReviewerPrecheckVariant;
+  goal_id?: string;
 };
 
 export interface ScenarioV0 {
@@ -46,6 +48,7 @@ export interface ScenarioResult {
   failureReasons: string[];
   authorReviewerPrecheck?: AuthorReviewerPrecheckDeviceResult;
   graphRuntimeOverlay?: GraphRuntimeOverlayEventPathResult;
+  burstReadyLadder?: BurstReadyLadderSimulationResult;
 }
 
 /** Test-only fault injection for proving ScenarioV0 rejects corrupted device output and events. */
@@ -109,9 +112,9 @@ export function parseScenarioV0(source: string): ScenarioV0 {
 
   if (!Array.isArray(value.triggers) || value.triggers.length !== 1) throw new Error('scenario.triggers must contain exactly one registered trigger');
   const trigger = record(value.triggers[0], 'scenario.triggers[0]');
-  exactKeys(trigger, ['id', 'type', 'status', 'count', 'variant'], 'scenario.triggers[0]');
+  exactKeys(trigger, ['id', 'type', 'status', 'count', 'variant', 'goal_id'], 'scenario.triggers[0]');
   const triggerId = requiredString(trigger.id, 'scenario.triggers[0].id');
-  if (trigger.type !== 'codex.responses.fetch' && trigger.type !== 'codex.responses.fetch-network-error' && trigger.type !== 'ux.draft-inventory.evaluate' && trigger.type !== 'ux.author-reviewer-precheck.evaluate' && trigger.type !== 'ux.graph-runtime-overlay.evaluate') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
+  if (trigger.type !== 'codex.responses.fetch' && trigger.type !== 'codex.responses.fetch-network-error' && trigger.type !== 'ux.draft-inventory.evaluate' && trigger.type !== 'ux.author-reviewer-precheck.evaluate' && trigger.type !== 'ux.graph-runtime-overlay.evaluate' && trigger.type !== 'ux.burst-ready-ladder.evaluate') throw new Error(`unregistered scenario trigger: ${String(trigger.type)}`);
   if (trigger.type === 'codex.responses.fetch' && (!Number.isInteger(trigger.status) || (trigger.status as number) < 400 || (trigger.status as number) > 499)) throw new Error('codex.responses.fetch.status must be an HTTP 4xx status');
   if ((trigger.type === 'codex.responses.fetch-network-error' || trigger.type === 'ux.draft-inventory.evaluate') && trigger.status !== undefined) throw new Error(`${trigger.type} does not accept status`);
   if (trigger.count !== undefined && (!Number.isInteger(trigger.count) || (trigger.count as number) < 1)) throw new Error('codex.responses.fetch.count must be a positive integer');
@@ -120,6 +123,8 @@ export function parseScenarioV0(source: string): ScenarioV0 {
   if (trigger.type !== 'ux.author-reviewer-precheck.evaluate' && trigger.variant !== undefined) throw new Error(`${String(trigger.type)} does not accept variant`);
   if (trigger.type === 'ux.author-reviewer-precheck.evaluate' && (trigger.status !== undefined || trigger.count !== undefined)) throw new Error('ux.author-reviewer-precheck.evaluate does not accept status or count');
   if (trigger.type === 'ux.graph-runtime-overlay.evaluate' && (trigger.status !== undefined || trigger.count !== undefined || trigger.variant !== undefined)) throw new Error('ux.graph-runtime-overlay.evaluate does not accept status, count, or variant');
+  if (trigger.goal_id !== undefined && (trigger.type !== 'ux.graph-runtime-overlay.evaluate' || typeof trigger.goal_id !== 'string' || !/^[a-z0-9_-]{1,80}$/.test(trigger.goal_id))) throw new Error('scenario.triggers[0].goal_id is valid only for graph runtime overlay scenarios');
+  if (trigger.type === 'ux.burst-ready-ladder.evaluate' && (trigger.status !== undefined || trigger.count !== undefined || trigger.variant !== undefined)) throw new Error('ux.burst-ready-ladder.evaluate does not accept status, count, or variant');
 
   const expect = record(value.expect, 'scenario.expect');
   exactKeys(expect, ['screen', 'logs'], 'scenario.expect');
@@ -159,7 +164,7 @@ export function parseScenarioV0(source: string): ScenarioV0 {
     id,
     isolation: 'test',
     seed: value.seed as number,
-    triggers: [{ id: triggerId, type: trigger.type as ScenarioTrigger['type'], ...(trigger.status !== undefined ? { status: trigger.status as number } : {}), ...(trigger.count !== undefined ? { count: trigger.count as number } : {}), ...(trigger.variant !== undefined ? { variant: trigger.variant as AuthorReviewerPrecheckVariant } : {}) }],
+    triggers: [{ id: triggerId, type: trigger.type as ScenarioTrigger['type'], ...(trigger.status !== undefined ? { status: trigger.status as number } : {}), ...(trigger.count !== undefined ? { count: trigger.count as number } : {}), ...(trigger.variant !== undefined ? { variant: trigger.variant as AuthorReviewerPrecheckVariant } : {}), ...(trigger.goal_id !== undefined ? { goal_id: trigger.goal_id as string } : {}) }],
     expect: {
       screen: {
         mode: 'widget',
@@ -354,6 +359,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0, testOverrides: Scena
   let screenLines: string[] = [];
   let authorReviewerPrecheck: AuthorReviewerPrecheckDeviceResult | undefined;
   let graphRuntimeOverlay: GraphRuntimeOverlayEventPathResult | undefined;
+  let burstReadyLadder: BurstReadyLadderSimulationResult | undefined;
   if (trigger.type.startsWith('codex.')) {
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       fetchCount++;
@@ -401,14 +407,33 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0, testOverrides: Scena
       ];
       triggerObserved = result.status === expectedStatus && authorReviewerPrecheckMatches(result, trigger.variant!);
     } else if (trigger.type === 'ux.graph-runtime-overlay.evaluate') {
-      graphRuntimeOverlay = await runGraphRuntimeOverlayEventPathDevice(stateRoot, runId, scenario.id);
+      graphRuntimeOverlay = await runGraphRuntimeOverlayEventPathDevice(stateRoot, runId, scenario.id, trigger.goal_id);
       screenLines = [
-        'Graph runtime overlay event stream simulation',
+        scenario.id === 'demo1104-research-arg-graph' ? '2027 사업계획 ARG simulation' : 'Graph runtime overlay event stream simulation',
         `status=${graphRuntimeOverlay.status}`,
         `decisionObserved=${graphRuntimeOverlay.decisionObserved}`,
         `overlayApplied=${graphRuntimeOverlay.overlayApplied}`,
+        ...(scenario.id === 'demo1104-research-arg-graph' && graphRuntimeOverlay.ledgerRoute.length ? [`selectedPath=${[graphRuntimeOverlay.ledgerRoute[0]!.from, ...graphRuntimeOverlay.ledgerRoute.map((edge) => edge.to)].join('>')}`] : []),
+        ...(scenario.id === 'demo1104-research-arg-graph' && graphRuntimeOverlay.ledgerRoute.length ? [`routeOutcome=injected:mock-outcome(${graphRuntimeOverlay.ledgerRoute[0]!.mockOutcome ?? 'unknown'})`] : []),
+        ...(scenario.id === 'demo1104-research-arg-graph' ? graphRuntimeOverlay.graphEvents.map((event, index) => `graphEvent${index}=${event.type === 'node-added' ? `node-added:${event.node}` : event.type === 'edge-rerouted' ? `edge-rerouted:${event.from}>${event.to}` : event.type}`) : []),
       ];
       triggerObserved = graphRuntimeOverlay.status === 'done' && graphRuntimeOverlay.decisionObserved && graphRuntimeOverlay.overlayApplied;
+    } else if (trigger.type === 'ux.burst-ready-ladder.evaluate') {
+      burstReadyLadder = await runBurstReadyLadderSimulation(runId, scenario.id);
+      screenLines = [
+        'Purpose-specific burst ready ladder simulation',
+        `runs=${burstReadyLadder.runs.length}`,
+        `allPreparedOneHourAhead=${burstReadyLadder.allPreparedOneHourAhead}`,
+        `allPrematureAdmissionsRejected=${burstReadyLadder.allPrematureAdmissionsRejected}`,
+        `allReadyBeforeAdmissionRejected=${burstReadyLadder.allReadyBeforeAdmissionRejected}`,
+        `allDeadlineDraining=${burstReadyLadder.allDeadlineDraining}`,
+        `allPostExpiryAdmissionsRejected=${burstReadyLadder.allPostExpiryAdmissionsRejected}`,
+        `allLeasesDrainedAfterExpiry=${burstReadyLadder.allLeasesDrainedAfterExpiry}`,
+        `allStoppedAfterDrain=${burstReadyLadder.allStoppedAfterDrain}`,
+        `mockVmCount=${burstReadyLadder.mockVmCount}`,
+        `forbiddenTerminateCount=${burstReadyLadder.forbiddenTerminateCount}`,
+      ];
+      triggerObserved = burstReadyLadder.pass;
     } else {
       try {
         for await (const _event of streamCodexResponsesEvents('https://chatgpt.com/backend-api/codex/responses', 'scenario-fake-token', {
@@ -440,7 +465,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0, testOverrides: Scena
     const expectedTriggerCount = trigger.type.startsWith('codex.') ? trigger.count ?? 1 : 1;
     const observedTriggerCount = trigger.type.startsWith('codex.') ? fetchCount : triggerObserved ? 1 : 0;
     if (trigger.type.startsWith('codex.') && fetchCount !== expectedTriggerCount) failureReasons.push(`trigger-count-mismatch:expected-${expectedTriggerCount}-observed-${fetchCount}`);
-    if (!triggerObserved) failureReasons.push(trigger.type.startsWith('codex.') ? 'provider-error-not-observed' : trigger.type === 'ux.draft-inventory.evaluate' ? 'draft-inventory-evaluation-failed' : trigger.type === 'ux.graph-runtime-overlay.evaluate' ? 'graph-runtime-overlay-result-mismatch' : 'author-reviewer-precheck-result-mismatch');
+    if (!triggerObserved) failureReasons.push(trigger.type.startsWith('codex.') ? 'provider-error-not-observed' : trigger.type === 'ux.draft-inventory.evaluate' ? 'draft-inventory-evaluation-failed' : trigger.type === 'ux.graph-runtime-overlay.evaluate' ? 'graph-runtime-overlay-result-mismatch' : trigger.type === 'ux.burst-ready-ladder.evaluate' ? 'burst-ready-ladder-result-mismatch' : 'author-reviewer-precheck-result-mismatch');
     if (!screenPass) failureReasons.push('screen-snapshot-mismatch');
     if (rows.length === 0 && expectedCount > 0) failureReasons.push('expected-log-event-absent');
     else if (rows.length !== expectedCount) failureReasons.push(`log-event-count-mismatch:expected-${expectedCount}-observed-${rows.length}`);
@@ -485,6 +510,7 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0, testOverrides: Scena
       failureReasons,
       ...(authorReviewerPrecheck ? { authorReviewerPrecheck } : {}),
       ...(graphRuntimeOverlay ? { graphRuntimeOverlay } : {}),
+      ...(burstReadyLadder ? { burstReadyLadder } : {}),
     };
     const uxSimDir = join(stateRoot, 'ux-sim');
     const evidenceDir = join(uxSimDir, 'evidence');

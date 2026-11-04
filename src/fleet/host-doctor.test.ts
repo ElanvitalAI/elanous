@@ -1,8 +1,9 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { registerDoctorCommand } from '../cli/doctor-cli.js';
 import {
   HOST_DOCTOR_CHECKS,
@@ -10,6 +11,7 @@ import {
   hostDoctorRunFromSpawn,
   detectHostDoctorPlatform,
   normalizeArch,
+  parseWslKeepaliveObservation,
   formatHostDoctorLines,
   runHostDoctor,
   checkHostMembership,
@@ -42,6 +44,7 @@ function probeOf(id: string): string {
   if (!spec) throw new Error(`unknown check ${id}`);
   return spec.probe;
 }
+
 
 /** 세 묶음 전부 통과하는 원격 응답 — HQ 실측값과 함께 쓴다. */
 const HEALTHY: Record<string, string> = {
@@ -197,6 +200,68 @@ describe('host doctor bundles', async () => {
     expect(byId.get('install.version')?.status).toBe('unmeasured');
     expect(byId.get('image.pin')?.status).toBe('unmeasured');
     expect(report.ok).toBe(false);
+  });
+});
+
+describe('WSL keepalive logon registration probe', async () => {
+  test('detects a registered enabled per-user logon task by exact known task name', () => {
+    expect(parseWslKeepaliveObservation('task|ElangramWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d elangram-wsl --exec /usr/bin/sleep infinity').status).toBe('pass');
+    expect(parseWslKeepaliveObservation('task|ElanainucWslKeepalive|Running|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|PT0S|PT0S|1|C:\\Windows\\System32\\wsl.exe|-d host-e-wsl --exec /usr/bin/sleep infinity').status).toBe('pass');
+    expect(parseWslKeepaliveObservation('task|ElangramWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|P1D|PT0S|1|wsl.exe|-d elangram-wsl --exec /usr/bin/sleep infinity').status).toBe('fail');
+    expect(parseWslKeepaliveObservation('task|ElangramWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|<unknown>|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d elangram-wsl --exec /usr/bin/sleep infinity').status).toBe('unmeasured');
+  });
+
+  test('unknown trigger identity is unmeasured and both execution limits are checked', () => {
+    const base = 'task|ElangramWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|';
+    const tail = '|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d elangram-wsl --exec /usr/bin/sleep infinity';
+    expect(parseWslKeepaliveObservation(base + '<unknown>' + tail).status).toBe('unmeasured');
+    expect(parseWslKeepaliveObservation(base + '<not-set>' + tail).status).toBe('pass');
+    expect(parseWslKeepaliveObservation(base + 'S-1-5-21-1000' + tail.replace('|PT0S|PT0S|1|', '|PT0S|P1D|1|')).status).toBe('fail');
+    expect(parseWslKeepaliveObservation(base + 'S-1-5-21-1000' + tail.replace('|PT0S|PT0S|1|', '|PT0S|<not-set>|1|')).status).toBe('pass');
+    expect(parseWslKeepaliveObservation(base + 'S-1-5-21-1000' + tail.replace('|PT0S|PT0S|1|', '|PT0S|<unknown>|1|')).status).toBe('unmeasured');
+  });
+
+  test('missing, disabled, or non-logon task fails and keeps the manual action visible', async () => {
+    expect(parseWslKeepaliveObservation('missing').status).toBe('fail');
+    expect(parseWslKeepaliveObservation('task|ElangramWslKeepalive|Disabled|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d elangram-wsl --exec /usr/bin/sleep infinity').status).toBe('fail');
+    expect(parseWslKeepaliveObservation('task|ElanainucWslKeepalive|Ready|MSFT_TaskBootTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d host-e-wsl --exec /usr/bin/sleep infinity').status).toBe('fail');
+    expect(parseWslKeepaliveObservation('task|ElangramWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|True|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d elangram-wsl --exec /usr/bin/sleep infinity').status).toBe('fail');
+    expect(parseWslKeepaliveObservation('task|ElanainucWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|True|False|PT0S|PT0S|1|wsl.exe|-d host-e-wsl --exec /usr/bin/sleep infinity').status).toBe('fail');
+    expect(parseWslKeepaliveObservation('task|ElanainucWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d elangram-wsl --exec /usr/bin/sleep infinity').status).toBe('fail');
+    expect(parseWslKeepaliveObservation('task|ElanainucWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|False|00:10:00|False|False|PT0S|PT0S|2|wsl.exe|-d host-e-wsl --exec /usr/bin/sleep infinity').status).toBe('fail');
+    const map: Record<string, string> = { ...HEALTHY, 'uname -s': 'Linux', 'cat /proc/version 2>/dev/null || true': 'Linux version 6.1.0-microsoft-standard-WSL2' };
+    map[probeOf('wsl.keepalive-logon-task')] = 'missing';
+    const report = await runHostDoctor({ host: 'host-e-wsl', remote: remoteFrom(map), expected: HQ });
+    const check = report.checks.find((entry) => entry.id === 'wsl.keepalive-logon-task');
+    expect(report.platform).toBe('wsl');
+    expect(check?.status).toBe('fail');
+    expect(formatHostDoctorLines(report).find((entry) => entry.includes('wsl.keepalive-logon-task'))).toContain('수동 조치:');
+    map[probeOf('wsl.keepalive-logon-task')] = 'task|ElanainucWslKeepalive|Ready|MSFT_TaskLogonTrigger|True|S-1-5-21-1000|S-1-5-21-1000|S-1-5-21-1000|InteractiveToken|True|00:10:00|False|False|PT0S|PT0S|1|wsl.exe|-d host-e-wsl --exec /usr/bin/sleep infinity';
+    const idleLimited = await runHostDoctor({ host: 'host-e-wsl', remote: remoteFrom(map), expected: HQ });
+    const idleCheck = idleLimited.checks.find((entry) => entry.id === 'wsl.keepalive-logon-task');
+    expect(idleCheck?.status).toBe('fail');
+    expect(idleCheck?.observed).toContain('idleDuration=00:10:00');
+    expect(formatHostDoctorLines(idleLimited).find((entry) => entry.includes('wsl.keepalive-logon-task'))).toContain('작업과 로그온 트리거');
+    const warning = formatHostDoctorLines(idleLimited).find((entry) => entry.includes('wsl.keepalive-logon-task')) ?? '';
+    expect(warning).toContain('ElanainucWslKeepalive');
+    expect(warning).toContain('wsl.exe -d host-e-wsl --exec /usr/bin/sleep infinity');
+    expect(warning).toContain('InteractiveToken 로그온 트리거');
+    expect(probeOf('wsl.keepalive-logon-task')).not.toContain('wsl.exe --shutdown');
+    expect(probeOf('wsl.keepalive-logon-task')).not.toContain('DockerDesktop.exe');
+  });
+
+  test('missing WSL Windows interop is unmeasured, and non-WSL hosts do not run this probe', async () => {
+    expect(parseWslKeepaliveObservation('no-windows-interop').status).toBe('unmeasured');
+    let wslProbeCalls = 0;
+    const remote: HostDoctorRemote = (host, probe) => {
+      if (probe === probeOf('wsl.keepalive-logon-task')) wslProbeCalls += 1;
+      return remoteFrom(HEALTHY)(host, probe);
+    };
+    const report = await runHostDoctor({ host: 'node-c', remote });
+    expect(report.platform).toBe('linux');
+    expect(report.checks.some((entry) => entry.id === 'wsl.keepalive-logon-task')).toBe(false);
+    expect(report.checks.map((entry) => entry.id)).toEqual(HOST_DOCTOR_CHECKS.filter((spec) => spec.roles.includes('worker') && spec.id !== 'wsl.keepalive-logon-task').map((spec) => spec.id));
+    expect(wslProbeCalls).toBe(0);
   });
 });
 

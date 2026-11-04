@@ -87,6 +87,44 @@ describe('doctor CLI', () => {
     ]);
   });
 
+  test('doctor --setup-tools applies production repairs and re-probes missing commands', async () => {
+    const outputs: string[] = [];
+    const exitCodes: number[] = [];
+    const installed = new Set<string>();
+    const probes = new Map<string, number>();
+    const installs: string[] = [];
+    const commands = ['gh', 'rg', 'codex'];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({
+        repositoryRoot: '/repo',
+        readFile: (path) => path === '/repo/.env.example' ? example
+          : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: gh\n    tier: required\n  - name: rg\n    tier: required\n  - name: codex\n    tier: required\n' : '',
+        env: { PATH: '/mock/bin' },
+        readiness: { ...options().readiness, platform: 'linux', distro: 'debian', ghOnPath: false, rgOnPath: false, codexOnPath: false, nodeOnPath: true, ghVersion: null, pythonEnv: { status: 'ok', evidence: 'injected healthy Python' }, tmpdirSameFsAsBunCache: true },
+        platform: 'linux',
+        commandExists: (name) => {
+          if (commands.includes(name)) probes.set(name, (probes.get(name) ?? 0) + 1);
+          return installed.has(name);
+        },
+        codeRevision: () => 'abc123def456',
+        fetchHealth: () => null,
+        readInstallPrefix: () => null,
+      }),
+      platform: 'linux', home: '/tmp/doctor-setup-test', cacheDir: '/tmp/doctor-setup-test/cache',
+      installStaticTool: (name) => { installs.push(name); installed.add(name); return { ok: true, detail: 'mock install' }; },
+      smokeCheck: (name) => installed.has(name),
+      out: { log: (line) => outputs.push(line) }, setExitCode: (code) => exitCodes.push(code),
+    });
+    await program.parseAsync(['doctor', '--fix', '--yes', '--setup-tools', '--json'], { from: 'user' });
+    const result = JSON.parse(outputs.at(-1)!);
+    expect(installs).toEqual(['rg', 'codex', 'codex-code-mode-host', 'gh']);
+    expect(commands.every((name) => result.report.externalCommands.find((command: { name: string; status: string }) => command.name === name)?.status === 'found')).toBe(true);
+    expect(commands.every((name) => (probes.get(name) ?? 0) >= 2)).toBe(true);
+    expect(result.results.items.find((item: { id: string }) => item.id === 'static-tools')).toMatchObject({ result: 'fixed' });
+    expect(exitCodes.at(-1)).toBe(0);
+  });
+
   test('doctor --json reports three modes and human output adds only the mode section', async () => {
     const outputs: string[] = [];
     const program = new Command();

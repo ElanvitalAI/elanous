@@ -34,6 +34,9 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   const root = deps.instanceRoot ?? effectiveInstanceRoot();
   const repo = deps.repo ?? resolve(import.meta.dir, '../..');
   const gate = context.outputs.gate;
+  const ownerWaivedGate = gate?.outcome === 'pass(owner-waived)' && gate.verdict === 'owner-waived'
+    && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
+    && typeof gate.reason === 'string' && gate.reason.trim().length > 0;
   const prepare = context.outputs.prepare;
   let pinned: string | undefined;
   try { pinned = readFileSync(join(repo, '.bun-version'), 'utf8').trim(); } catch { pinned = undefined; }
@@ -53,9 +56,10 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   const regressNeedsApproval = regressStatus.level !== 'ok';
   const macSmoke = context.outputs['mac-smoke'];
   const metrics: ApprovalMetric[] = [
-    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null }),
-      verdict: !gate || gate.outcome === undefined || !Array.isArray(gate.introduced) ? 'unmeasured'
-        : gate.outcome === 'ok' && gate.introduced.length === 0 && gateErrorAbsent ? 'pass' : 'fail' },
+    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate }),
+      verdict: !gate || gate.outcome === undefined ? 'unmeasured'
+        : ownerWaivedGate ? 'pass' : !Array.isArray(gate.introduced) ? 'unmeasured'
+          : gate.outcome === 'ok' && gate.introduced.length === 0 && gateErrorAbsent ? 'pass' : 'fail' },
     { name: BLOCKING_METRIC_NAMES[1], value: `running=${bunVersion}; pinned=${pinned ?? 'missing'}`,
       verdict: !pinned ? 'unmeasured' : bunVersion === pinned ? 'pass' : 'fail' },
     outcomeMetric(BLOCKING_METRIC_NAMES[2], context.outputs.upgrade),

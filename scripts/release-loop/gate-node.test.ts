@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, releaseGatePoolStartBlock, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, resolveWarmProviderConfig, warmProviderTarget, type WarmGateControlDependencies, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, gateReceiptReuseKey, planGateRiskLaneShards, reconcileStaleGateShardBoard, type GateAdmission, type GateRunner } from './gate-node';
+import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, releaseGatePoolStartBlock, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, resolveWarmProviderConfig, warmProviderTarget, type WarmGateControlDependencies, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, gateReceiptReuseKey, planGateRiskLaneShards, reconcileStaleGateShardBoard, parseGateInstallSlotWaitMs, gatePreparationTimings, type GateAdmission, type GateRunner } from './gate-node';
 import { cleanRetryVerdict, failedJunitFiles } from './gate-shard-load-flaky';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { buildUserConfig, resetUserConfig } from '../../src/user-config.js';
@@ -241,6 +241,7 @@ test('B2 formal-receipt fallback is judgeGate-scoped to complete same-run eviden
   });
   const saveReceiptSet = (caseId: string) => {
     rmSync(receiptRoot, { recursive: true, force: true });
+    if (caseId === 'absent') return;
     for (let index = 0; index < files.length; index++) {
       if (caseId === 'incomplete' && index === 1) continue;
       const fingerprint = caseId === 'environment' ? 'f'.repeat(64) : currentFingerprint;
@@ -276,6 +277,9 @@ test('B2 formal-receipt fallback is judgeGate-scoped to complete same-run eviden
     const valid = await runCase('valid');
     expect(valid.only).toEqual(['src/a.test.ts']);
     expect(valid.event).toMatchObject({ reason: 'formal-receipt-radius-proven', action: 'radius-regate', selectedTests: 1, carriedTests: 1 });
+    const absent = await runCase('absent');
+    expect(absent.only).toBeUndefined();
+    expect(absent.event).toMatchObject({ reason: 'formal-receipt-set-absent', action: 'full-sweep', selectedTests: 0, carriedTests: 0 });
     for (const [caseId, reason] of [
       ['missing-run', 'formal-receipt-run-id-missing-or-mismatch'],
       ['mixed', 'formal-receipt-run-id-missing-or-mismatch'],
@@ -300,6 +304,33 @@ test('B2 formal-receipt fallback is judgeGate-scoped to complete same-run eviden
     expect(runtimeMismatch.event).toMatchObject({ reason: 'formal-receipt-runtime-fingerprint-mismatch', action: 'full-sweep', carriedTests: 0 });
   } finally { log.mockRestore(); }
 }, 30_000);
+
+test('GATE-NONTEST-TIME-CUT: preparation timing is keyed to measured Pod stages and install slot wait', () => {
+  expect(parseGateInstallSlotWaitMs('[gate] install-slot 2 waited 7s\n')).toBe(7000);
+  expect(parseGateInstallSlotWaitMs('[gate] install-slot none (waited 11s)\n')).toBe(11000);
+  expect(parseGateInstallSlotWaitMs('no install was needed\n')).toBeUndefined();
+
+  const result = gatePreparationTimings({
+    phaseTimes: { poolPlaced: '2026-11-03T00:00:00.000Z' },
+    podLifecycle: {
+      podCreated: '2026-11-03T00:00:02.000Z', podScheduled: '2026-11-03T00:00:05.000Z',
+      childStart: '2026-11-03T00:00:09.000Z',
+    },
+    podStages: { 'prep-start': 100, 'clone-end': 106, 'deps-start': 106, 'deps-end': 114 },
+    admissionWaitMs: 1000, installSeconds: 5.5, installSlotWaitMs: 3000,
+  });
+  expect(result).toEqual({
+    stagesMs: { admissionWait: 1000, create: 2000, schedule: 3000, imageAndBoot: 4000, clone: 6000,
+      installSlotWait: 3000, install: 5500, dependencyTotal: 8000 },
+    preTestMs: 24000,
+    measuredPreTestStages: ['admissionWait', 'create', 'schedule', 'imageAndBoot', 'clone', 'dependencyTotal', 'installSlotWait', 'install'],
+    missingPreTestStages: [],
+  });
+  expect(gatePreparationTimings({ phaseTimes: {}, podStages: {} })).toEqual({
+    stagesMs: {}, measuredPreTestStages: [],
+    missingPreTestStages: ['admissionWait', 'create', 'schedule', 'imageAndBoot', 'clone', 'dependencyTotal', 'installSlotWait', 'install'],
+  });
+});
 
 test('GATE-POD-IMAGE-STICKY: graph run pins one image, excludes drifted pools, and refuses an unavailable or missing resume pin', async () => {
   const f = fake([], [], false);
@@ -370,25 +401,102 @@ test('GATE-PULL-BY-PINNED-DIGEST: a new run with no pool image builds once befor
   const f = fake([], [], false);
   const runId = 'gate-image-pin-image-missing';
   const digest = `sha256:${'3'.repeat(64)}`;
+  const repo = join(f.root, 'image-source-repo');
+  mkdirSync(join(repo, 'docker/harness'), { recursive: true });
+  writeFileSync(join(repo, 'docker/harness/build.sh'), '#!/bin/bash\n# build this tree\n');
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    return result.stdout.trim();
+  };
+  expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+  git('config', 'user.name', 'gate image test');
+  git('config', 'user.email', 'gate-image-test@example.invalid');
+  git('add', '.');
+  git('commit', '-qm', 'release cut');
+  const cutCommit = git('rev-parse', 'HEAD');
   let imageReady = false;
   let syncCalls = 0;
-  const input = { ...options(f.instanceRoot), graphRunId: runId, repo: join(f.root, 'repo'),
+  let buildScript = '';
+  const input = { ...options(f.instanceRoot), commit: cutCommit, graphRunId: runId, repo,
     pod: { pool: 'pool-a:1', shards: 1 } };
+  const localCommand = f.runner.localCommand.bind(f.runner);
+  f.runner.localCommand = async (cmd, args, cwd) => {
+    if (cmd === 'git' && ['clone', 'checkout'].includes(args[0] ?? '')) {
+      f.calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+      const result = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
+      return { rc: result.status ?? 2, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+    }
+    return localCommand(cmd, args, cwd);
+  };
 
   const result = await judgeGate(input, f.runner, () => imageReady ? digest : null, undefined,
-    async (members, image, commit) => {
+    async (members, image, commit, deps) => {
       syncCalls++;
       expect(members.map((member) => member.context)).toEqual(['pool-a']);
       expect(image).toBe('elanous-harness:local');
-      expect(commit).toBe(CUT);
+      expect(commit).toBe(cutCommit);
+      buildScript = deps?.buildScript ?? '';
+      const imageSourceTree = buildScript.slice(0, -'/docker/harness/build.sh'.length);
+      const sourceHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: imageSourceTree, encoding: 'utf8' });
+      expect(sourceHead.status).toBe(0);
+      expect(sourceHead.stdout.trim()).toBe(cutCommit);
       imageReady = true;
       return new Map(members.map((member) => [member.context, { ok: true, action: 'built' as const, detail: 'mock build/push', ms: 0 }]));
     });
 
   expect(result.outcome).toBe('ok');
   expect(syncCalls).toBe(1);
+  expect(buildScript).toContain(`release-gate-image-source-`);
+  expect(buildScript.endsWith('/cut/docker/harness/build.sh')).toBe(true);
+  const imageSourceTree = buildScript.slice(0, -'/docker/harness/build.sh'.length);
+  expect(f.calls).toContain(`git clone --quiet --shared --no-checkout ${input.repo} ${imageSourceTree} @${input.repo}`);
+  expect(f.calls).toContain(`git checkout --quiet --detach ${cutCommit} @${imageSourceTree}`);
+  expect(existsSync(dirname(imageSourceTree))).toBe(false);
   expect(JSON.parse(readFileSync(gateImagePinPath(f.instanceRoot, '1.0.1', runId), 'utf8')))
-    .toMatchObject({ runId, digest, commit: CUT });
+    .toMatchObject({ runId, digest, commit: cutCommit });
+});
+
+test('GATE-PULL-BY-PINNED-DIGEST: failed image-source checkout removes a partial clone', async () => {
+  const f = fake([], [], false);
+  const runId = 'gate-image-pin-source-worktree-failed';
+  const input = { ...options(f.instanceRoot), graphRunId: runId, repo: join(f.root, 'repo'),
+    pod: { pool: 'pool-a:1', shards: 1 } };
+  const localCommand = f.runner.localCommand.bind(f.runner);
+  f.runner.localCommand = async (cmd, args, cwd) => {
+    const result = await localCommand(cmd, args, cwd);
+    if (cmd === 'git' && args[0] === 'checkout' && args.includes(CUT)) return { rc: 1, output: 'injected checkout failure' };
+    return result;
+  };
+
+  const result = await judgeGate(input, f.runner, () => null, undefined,
+    async () => { throw new Error('image sync must not run when source checkout fails'); });
+
+  expect(result.outcome).toBe('error');
+  expect(f.calls.some((call) => call.startsWith(`git clone --quiet --shared --no-checkout ${input.repo} `))).toBe(true);
+  const checkoutCall = f.calls.find((call) => call.startsWith(`git checkout --quiet --detach ${CUT} @`));
+  expect(checkoutCall).toBeTruthy();
+  const imageSourceTree = checkoutCall!.split(' @').at(-1)!;
+  expect(existsSync(dirname(imageSourceTree))).toBe(false);
+});
+
+test('GATE-PULL-BY-PINNED-DIGEST: image-sync failure removes the cut source clone', async () => {
+  const f = fake([], [], false);
+  const runId = 'gate-image-pin-sync-failure-cleans-source';
+  const input = { ...options(f.instanceRoot), graphRunId: runId, repo: join(f.root, 'repo'),
+    pod: { pool: 'pool-a:1', shards: 1 } };
+  let buildScript = '';
+
+  const result = await judgeGate(input, f.runner, () => null, undefined,
+    async (_members, _image, _commit, deps) => {
+      buildScript = deps?.buildScript ?? '';
+      throw new Error('injected image sync failure');
+    });
+
+  expect(result.outcome).toBe('error');
+  expect(f.calls.some((call) => call.startsWith(`git clone --quiet --shared --no-checkout ${input.repo} `))).toBe(true);
+  expect(buildScript.endsWith('/cut/docker/harness/build.sh')).toBe(true);
+  expect(existsSync(dirname(buildScript.slice(0, -'/docker/harness/build.sh'.length)))).toBe(false);
 });
 
 test('GATE-PULL-BY-PINNED-DIGEST: an ok:false image sync result fails closed even when a digest appears', async () => {
@@ -1970,7 +2078,7 @@ test('four shard sweep combines file failures and passes explicit CDP ignores', 
   for (const name of ['src-cli', 'src-rest', 'test', 'other']) expect(existsSync(join(logDir, `${name}.log`))).toBe(true);
 });
 
-test('gate receipt reuse requires shard-local recipe and runtime provenance but ignores global pins and source image digest', () => {
+test('gate receipt reuse rejects a receipt image digest that differs from the current execution pin', () => {
   const fingerprint = 'a'.repeat(64), imageDigest = `sha256:${'b'.repeat(64)}`;
   const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'arm64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'c'.repeat(64) };
   const receipt = { version: '1.0.1', graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/a.test.ts'], head40: 'c'.repeat(40), base40: 'd'.repeat(40),
@@ -1978,11 +2086,16 @@ test('gate receipt reuse requires shard-local recipe and runtime provenance but 
     failureIds: [], errorIds: [], evidencePath: 'pod-0.json', evidenceSha256: 'e'.repeat(64), measuredAt: new Date().toISOString(), attempt: 1 };
   const current = { imageDigest: `sha256:${'c'.repeat(64)}`, ...runtimeIdentity };
   const shardPins = { graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 };
-  // Source-bearing image digests differ across appends; stable runtime identity and exact graph/recipe pins permit radius carry.
-  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, shardPins).envKey)
-    .toBe(receipt.envKey);
-  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current,
-    { ...shardPins, graphSha: '9'.repeat(64), recipeSha: '8'.repeat(64) }).envKey).toBe(receipt.envKey);
+  // Matching shard image digest is required; unrelated global graph/recipe SHAs do not replace the shard-local pins.
+  expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, shardPins))
+    .toEqual({ reason: 'receipt-imageDigest-current-pin-mismatch' });
+  const matchingImageReceipt = { ...receipt, imageDigest: current.imageDigest, envKey: fingerprint + ':' + current.imageDigest };
+  expect(gateReceiptReuseKey(matchingImageReceipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current,
+    { ...shardPins, graphSha: '9'.repeat(64), recipeSha: '8'.repeat(64) }).envKey).toBe(matchingImageReceipt.envKey);
+  expect(gateReceiptReuseKey(matchingImageReceipt, '1.0.1', 'c'.repeat(40), fingerprint, undefined, current, shardPins).envKey)
+    .toBe(matchingImageReceipt.envKey);
+  expect(gateReceiptReuseKey(matchingImageReceipt, '1.0.1', 'c'.repeat(40), fingerprint, undefined,
+    ({ ...current, imageDigest: undefined } as unknown as typeof current), shardPins).reason).toBe('environment-imageDigest-current-pin-unmeasured');
   expect(gateReceiptReuseKey({ ...receipt, graphEntry: 'changed-entry' }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, shardPins).reason)
     .toBe('graph-entry-mismatch');
   expect(gateReceiptReuseKey({ ...receipt, recipeCommand: 'changed-command' }, '1.0.1', 'c'.repeat(40), fingerprint, imageDigest, current, shardPins).reason)
@@ -1997,7 +2110,7 @@ test('gate receipt reuse identity accepts another executor host when immutable r
   const receipt = { version: '1.0.1', graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/a.test.ts'], head40: 'c'.repeat(40), base40: 'd'.repeat(40),
     host: 'aws2', envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity, status: 'complete' as const,
     failureIds: [], errorIds: [], evidencePath: 'pod-0.json', evidenceSha256: 'e'.repeat(64), measuredAt: new Date().toISOString(), attempt: 1 };
-  const current = { imageDigest: `sha256:${'c'.repeat(64)}`, ...runtimeIdentity };
+  const current = { imageDigest, ...runtimeIdentity };
   const graphPins = { graphSha: 'f'.repeat(64), recipeSha: '1'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 };
   expect(gateReceiptReuseKey(receipt, '1.0.1', 'c'.repeat(40), fingerprint, current.imageDigest, current, graphPins))
     .toEqual({ envKey: `${fingerprint}:${imageDigest}`, reason: 'environment-match; baseline=1.0.1@cccccccccccc; current=1.0.1@cccccccccccc' });
@@ -2189,6 +2302,8 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     expect(reused.rc).toBe(1);
     expect(reused.output).toContain('Ran 10 tests across 10 files.');
     expect(invoked).toHaveLength(3);
+    // This exercises release sweep -> gateReceiptReuseKey -> planGateShardDispatch with the current identity image digest.
+    // With no explicit expectedImageDigest, the measured execution identity remains the required pin.
     // The same CLI invocation without a graph image pin must reuse measured sibling receipts.
     const direct = await runner.sweep(repo, logs, { pool: 'pool-test', shards: 3, shardsFile: {
       path: join(logs, 'direct-shards.json'), version: '1.0.1', receiptRoot, base40: BASE,
@@ -2254,6 +2369,17 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     expect(JSON.parse(readFileSync(join(receiptRoot, 'pod-2.receipt.json'), 'utf8'))).toMatchObject({
       id: 'pod-2', status: 'unmeasured', attempt: 2,
     });
+    // A changed current image pin must trigger real shard dispatch through the integrated sweep path.
+    const beforeImageMismatch = invoked.length;
+    const changedImageDigest = 'sha256:' + '9'.repeat(64);
+    const imageMismatch = await runner.sweep(repo, logs, { pool: 'pool-test', shards: 3, shardsFile: {
+      path: join(logs, 'image-mismatch-shards.json'), version: '1.0.1', receiptRoot, base40: BASE,
+      envFingerprint: fingerprint, expectedImageDigest: changedImageDigest, graphPins,
+      executionIdentity: { ...reuseExecutionIdentity, imageDigest: changedImageDigest },
+    } });
+    expect(imageMismatch.rc).toBe(1);
+    expect(imageMismatch.output).toContain('Ran 10 tests across 10 files.');
+    expect(invoked.length).toBeGreaterThan(beforeImageMismatch);
   } finally {
     if (previousEntrance === undefined) delete process.env.ELANOUS_RELEASE_ENTRANCE;
     else process.env.ELANOUS_RELEASE_ENTRANCE = previousEntrance;

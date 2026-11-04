@@ -83,7 +83,7 @@ function selectedIndexFastRoot(args: readonly string[]): string | undefined {
   // the small path; all other options take the complete parser.
   const fastOptions = new Set(root === 'where' ? ['--help', '-h', '--json'] : ['--help', '-h']);
   if (args.slice(index + 1).some((arg) => arg.startsWith('-') && !fastOptions.has(arg))) return undefined;
-  return root && INDEX_FAST_ROOTS.has(root) ? root : undefined;
+  return root && (INDEX_FAST_ROOTS.has(root) || root === 'secret') ? root : undefined;
 }
 // An explicit `--tui next` launch does not dispatch a CLI subcommand. Keep command
 // registrars out of the first-frame path while retaining the full tree for
@@ -398,7 +398,7 @@ async function readStdinLine(prompt: string = ''): Promise<string> {
   try { return await rl.question(prompt); }
   finally { rl.close(); }
 }
-import { loginWithCodex, CODEX_DEVICE_LOGIN_URL } from './oauth/codex.js';
+import { loginWithCodex } from './oauth/codex.js';
 import { authStorePath, loadTokens, deleteTokens, saveTokens, listProviders as listAuthProviders, type CodexMirrorResult } from './oauth/store.js';
 import { renderKeyHelp, CONTEXT_LABELS, type KeyContext } from './keybindings.js';
 import { auditKeybindings, renderKeymapAudit } from './keymap-audit.js';
@@ -4797,7 +4797,7 @@ selfCmd
   .option('--fixed-shard-distribution', '--shards N 과 함께만: RSS 사전 측정 없이 정렬된 파일을 N 조각에 라운드로빈 고정 배정한다(opt-in · 메모리 보증 아님 · 조각 타임아웃/OOM = unmeasured)')
   .option('--include-importers', '변경 모듈을 가져오는 importer 시험도 실행한다 (기본 caller 한도 밖까지)')
   .option('--no-inherit', '이전 게이트 시험 영수증의 통과 시험을 상속하지 않고 전체 범위를 실행한다')
-  .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(깨끗한 트리 · --pr 은 로컬)')
+  .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(재현 가능한 커밋 범위)')
   .option('--local', '원격 실행을 끄고 명시적으로 로컬에서 돌린다')
   .option('--artifact-dir <dir>', '조각별 지금/기준 JUnit ⊕ summary.json 을 이 디렉토리에 남긴다(판정 불변 · JUnit 은 --shards 경로만 · 원격 실행이면 그 호스트에서 가져온다)')
   .option('--orchestration-id <id>', 'GATE-REMOTE-SHARD-PLAN — 조각 오케스트레이션 id. --shard-id · --shard-position 와 세벌 세트로만 쓰고 원격 명령줄에 그대로 실린다')
@@ -4850,17 +4850,18 @@ selfCmd
       }
     };
     try {
-      const { dispatchHeavyCheck, remoteSelfGateArgv } = await import('./self-implement/gate-remote.js');
+      const { dispatchHeavyCheck, remoteSelfGateArgv, resolveGatePrBase } = await import('./self-implement/gate-remote.js');
       const { runGitCommand } = await import('./git-fs/runner.js');
       const topLevel = runGitCommand(process.cwd(), ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
       if (topLevel.status !== 0) throw new Error(`git rev-parse --show-toplevel failed: ${topLevel.stderr.trim() || `rc=${topLevel.status}`}`);
       const repo = topLevel.stdout.trim();
-      // Only a committed --base range is reproducible on another host: the default mode measures uncommitted files, --pr
-      // reads files through gh on this host, and the remote checkout runs from the repository root — these cases
-      // fall back locally for automatic placement; an explicitly requested remote run is unmeasured.
+      // Only a committed range is reproducible on another host. Pin --pr to its exact GitHub base/head pair so the
+      // remote checkout can measure the same diff without needing gh credentials there.
       const { realpathSync } = await import('node:fs');
-      const localOnlyReason = opts.pr ? 'self gate --pr reads PR files through gh on this host'
-        : !opts.base ? 'self gate without --base measures uncommitted files on this host'
+      const prBase = opts.pr ? resolveGatePrBase(opts.pr, repo) : null;
+      const gateBase = opts.pr ? prBase ?? undefined : opts.base;
+      const localOnlyReason = opts.pr && !prBase ? 'self gate --pr base/head could not be pinned to this checkout'
+        : !gateBase ? 'self gate without --base measures uncommitted files on this host'
         : realpathSync(repo) !== realpathSync(process.cwd()) ? 'self gate run from a sub-directory' : undefined;
       // SIDE-VERIFY-GATE-SHARDS ② — the host writes its artifacts outside its scratch tree (which its trap removes) and we
       // fetch them back after the run. Only when the measured commit knows --artifact-dir: an unknown option would kill the
@@ -4872,7 +4873,7 @@ selfCmd
       // origin/main is pinned to this machine's origin/main on the host; any other base is passed as its resolved sha.
       const remoteArgv = (sha: (ref: string) => string) => {
         const argv = remoteSelfGateArgv({
-          changed: opts.changed, base: opts.base, shards, shardConcurrency: opts.shardConcurrency === undefined ? undefined : Number(opts.shardConcurrency), fixedShardDistribution: opts.fixedShardDistribution,
+          changed: opts.changed || !!opts.pr, base: gateBase, shards, shardConcurrency: opts.shardConcurrency === undefined ? undefined : Number(opts.shardConcurrency), fixedShardDistribution: opts.fixedShardDistribution,
           includeImporters: opts.includeImporters,
           noInherit: opts.inherit === false,
           // A measured commit without this option rejects it (exit ≠ 0) — read as not passed, never as a silent measured run.
@@ -4890,7 +4891,7 @@ selfCmd
       };
       const { gateHostReservationRoot } = await import('./release-loop/gate-host-reservation.js');
       process.exitCode = await dispatchHeavyCheck({
-        tool: 'self-gate', repo, installPwa: true, remoteArgv, refs: opts.base ? [opts.base] : [], reservationRoot: gateHostReservationRoot(),
+        tool: 'self-gate', repo, installPwa: true, remoteArgv, refs: gateBase ? [gateBase] : [], reservationRoot: gateHostReservationRoot(),
         localOnlyReason,
         explicitRemoteOnly: opts.remote !== undefined, reportRemoteHost: true,
         flags: { remote: typeof opts.remote === 'string' ? opts.remote : opts.remote ? true : undefined, local: !!opts.local },
@@ -6945,6 +6946,10 @@ async function loadJevAccessOrExit(): Promise<import('./decide/jev.js').JevAcces
 registerIntakeCommands(program);
 
 registerLogsCommands(program);
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'secret') {
+  const { registerSecretCommands } = require('./cli/secret-cli.js') as typeof import('./cli/secret-cli.js');
+  registerSecretCommands(program);
+}
 // Keep the sim command in its public slot until either CLI or direct Commander
 // parsing selects it (or asks for help). The domain registrar owns its definition.
 const simCommandOrder = program.commands.length;
@@ -9278,6 +9283,7 @@ loginCmd
   .action(async (opts: { replaceCodexCliLogin?: boolean }) => {
     // OB5d — say why there is no browser (ssh · no display) and what to do instead; otherwise try the browser first.
     const { browserUnavailableReason } = await import('./oauth/browser-availability.js');
+    const { formatCodexDeviceLoginFailure, runCodexDeviceLoginWait } = await import('./cli/codex-device-login-wait.js');
     const noBrowser = browserUnavailableReason();
     let browserState: Awaited<ReturnType<typeof import('./oauth/codex-browser-login.js')['loginWithCodexBrowser']>> | null = null;
     if (!noBrowser) {
@@ -9291,30 +9297,32 @@ loginCmd
       }
     }
     if (!browserState) ui.header('OpenAI Codex — 코드로 로그인');
-    if (noBrowser) console.log(`  ${noBrowser}`);
     try {
-      const state = browserState ?? await loginWithCodex({
-        onProgress: (p) => {
-          if (p.type === 'user_code' && p.userCode) {
-            console.log('');
-            console.log(`  1) 아무 브라우저에서 열기: ${p.loginUrl}`);
-            console.log(`  2) 코드 입력:             ${p.userCode}`);
-            console.log('');
-            console.log('  로그인을 기다리는 중… (취소: Ctrl+C)');
-          }
-          if (p.type === 'polling' && p.pollAttempt === 1) {
-            process.stdout.write('  .');
-          } else if (p.type === 'polling') {
-            process.stdout.write('.');
-          }
-          if (p.type === 'exchanging') {
-            console.log('\n  Code received — exchanging for tokens…');
-          }
-          if (p.type === 'saved') {
-            console.log('  Tokens saved.');
-          }
-        },
-      });
+      let state = browserState;
+      if (!state) {
+        const outcome = await runCodexDeviceLoginWait(loginWithCodex, {
+          print: line => console.log(`  ${line}`),
+          ...(process.stdout.isTTY ? {
+            updateLine: line => process.stdout.write(`\r\x1b[2K  ${line}`),
+            finishLine: () => process.stdout.write('\n'),
+          } : {}),
+          onInterrupt: handler => {
+            const onSigint = () => handler();
+            process.once('SIGINT', onSigint);
+            return () => process.off('SIGINT', onSigint);
+          },
+        }, {
+          headless: noBrowser !== null,
+          ...(noBrowser ? { introMessage: `${noBrowser.split(' — ')[0]} — 아래 주소와 코드로 로그인하세요.` } : {}),
+        });
+        if (outcome.kind === 'cancelled') {
+          ui.info('Codex 로그인을 취소했습니다. 나중에 elanous login openai-codex로 다시 시작할 수 있습니다.');
+          process.exitCode = 130;
+          return;
+        }
+        if (outcome.kind === 'failed') throw outcome.error;
+        state = outcome.state;
+      }
       // AUTH1 — another account's Codex CLI login is left alone unless the user says to replace it.
       let mirrorResult = state.codexMirrorResult;
       if (mirrorResult === 'skipped-different-account') {
@@ -9332,8 +9340,7 @@ loginCmd
       ui.info(codexLoginSuccessMessage(mirrorResult));
       ui.info(`Expires in ~${state.tokens.expiresAt ? Math.round((state.tokens.expiresAt - Date.now()) / 60000) : '?'}min; auto-refresh on next use.`);
     } catch (err: any) {
-      ui.error(`login failed: ${err?.message ?? err}`);
-      console.log(`If the browser didn't open, navigate manually to ${CODEX_DEVICE_LOGIN_URL}.`);
+      ui.error(formatCodexDeviceLoginFailure(err));
       process.exit(1);
     }
   });
@@ -10067,6 +10074,13 @@ program
       if (!await runFirstSetupForCli(cfg, true)) return;
     }
     const refreshed = reloadUserConfig();
+    // The sticky Next TUI REPL is a child process and does not inherit the
+    // parent's StoreSink. Goal-loop/cap events must still reach the same
+    // isolated logs.db that the host TUI reads for seat-turn observations.
+    if (process.env.ELANOUS_NEXT_TUI_BG_STATUS === '1') {
+      try { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('tui'); }
+      catch { /* fail-open — logging setup must not prevent the REPL turn */ }
+    }
     const { runRepl } = await import('./repl/index.js');
     const isTty = process.stdin.isTTY === true;
     const exitDefault = !isTty || opts.scenario !== undefined || opts.replay !== undefined;
@@ -12852,6 +12866,17 @@ async function main(): Promise<void> {
   const rootResume = resolveRootResumeSessionId({
     ...(resumeFromFlag !== undefined ? { flagId: resumeFromFlag } : {}),
     continueLatest,
+    // `session resume <id>` marks the selected transcript active. A named
+    // dashboard is an explicit seat attachment, so it resumes that marker;
+    // an unnamed bare launch still starts clean as required by #73.
+    ...(dashboardName.name ? {
+      namedDashboard: true,
+      activeSessionId: () => {
+        const id = getActiveSessionId();
+        return id;
+      },
+      sessionExists: (id) => loadSession(id) !== null,
+    } : {}),
     // 명시 인자가 있으면 env 를 «읽지도» 않는다(폐기 경고가 명시 이어하기에 섞이지 않게).
     readEnvId: () => readDeprecatedEnvForResume('ELANOUS_RESUME_SESSION').value ?? null,
     latest: () => resolveLatestSessionId({
@@ -12955,13 +12980,14 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Bare entry only requires an LLM; detailed setup stays behind `eln setup`.
+  // First-run owns onboarding, so it starts the Nexus daemon before handing off to web setup,
+  // including in a headless session. Later bare invocations keep the dashboard's read-only probe.
   const firstRunStartedAt = Date.now();
   const cfg = getUserConfig();
   if ((await import('./onboarding.js')).needsFirstRun(cfg)) {
     if (cfg.onboarding.webFirst !== false) {
       const { runWebFirstSetup } = await import('./onboarding/web-first.js');
-      if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: false }) === 'link-shown') return;
+      if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: true }) === 'link-shown') return;
     }
     const { runFirstRun } = await import('./onboarding/first-run.js');
     if (process.stdin.isTTY === true) {

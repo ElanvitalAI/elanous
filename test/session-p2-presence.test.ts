@@ -5,6 +5,7 @@ import { describe, test, expect, afterEach, beforeEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withSimClock } from '../src/ux-sim/fake-clock.js';
 
 let previousRoot: string | undefined;
 let tmp: string;
@@ -21,7 +22,7 @@ afterEach(() => {
 });
 
 describe('session_manage 구독 액션 (전 서피스 노출)', () => {
-  test('subscribe → subscribers → unsubscribe(leave) 왕복', async () => {
+  test('subscribe → subscribers → unsubscribe(leave) 왕복', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
     const S = await import('../src/session/index.js');
     const { dispatchSessionQuery } = await import('../src/domains/session-query-tool.js');
     const m = S.createSession({ source: 'cli' }, tmp);
@@ -38,17 +39,17 @@ describe('session_manage 구독 액션 (전 서피스 노출)', () => {
     const leave = await dispatchSessionQuery({ action: 'unsubscribe', sessionId: m.id, subscriberKey: 'telegram:42' }, { root: tmp }) as { left: boolean; remaining: number };
     expect(leave.left).toBe(true);
     expect(leave.remaining).toBe(0);
-  });
+  }));
 
-  test('subscribe 잘못된 surface → error', async () => {
+  test('subscribe 잘못된 surface → error', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
     const S = await import('../src/session/index.js');
     const { dispatchSessionQuery } = await import('../src/domains/session-query-tool.js');
     const m = S.createSession({ source: 'cli' }, tmp);
     const res = await dispatchSessionQuery({ action: 'subscribe', sessionId: m.id, surface: 'bogus' }, { root: tmp }) as { error?: string };
     expect(res.error).toBeDefined();
-  });
+  }));
 
-  test('context 액션 — grounded 자기인지 문맥(누가 보고 있나)', async () => {
+  test('context 액션 — grounded 자기인지 문맥(누가 보고 있나)', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
     const S = await import('../src/session/index.js');
     const { dispatchSessionQuery } = await import('../src/domains/session-query-tool.js');
     const m = S.createSession({ source: 'cli' }, tmp);
@@ -57,18 +58,18 @@ describe('session_manage 구독 액션 (전 서피스 노출)', () => {
     expect(ctx.found).toBe(true);
     expect(ctx.subscribers.length).toBe(1);
     expect(ctx.formatted).toContain('pwa:p1');
-  });
+  }));
 
-  test('context — 없는 세션은 anti-confabulation', async () => {
+  test('context — 없는 세션은 anti-confabulation', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
     const { dispatchSessionQuery } = await import('../src/domains/session-query-tool.js');
     const res = await dispatchSessionQuery({ action: 'context', sessionId: 'deadbeef-no-such' }, { root: tmp }) as { error?: string };
     // resolveSessionId 가 못 찾으면 error(prefix 불일치).
     expect(res.error).toBeDefined();
-  });
+  }));
 });
 
 describe('presence 셀프힐 — reconcileSessionPresence(TTL)', () => {
-  test('grace 유예가 TTL 초과 → left 전이', async () => {
+  test('grace 유예가 TTL 초과 → left 전이', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
     const S = await import('../src/session/index.js');
     const m = S.createSession({ source: 'cli' }, tmp);
     const key = S.subscriberKey('telegram', '9');
@@ -80,9 +81,9 @@ describe('presence 셀프힐 — reconcileSessionPresence(TTL)', () => {
     const evicted = S.reconcileSessionPresence(m.id, { ttlMs: 60_000, now: future }, tmp);
     expect(evicted).toEqual([key]);
     expect(S.listSubscribers(m.id, { presence: 'left' }, tmp).length).toBe(1);
-  });
+  }));
 
-  test('grace 지만 TTL 이내 → 유지(무이탈)', async () => {
+  test('grace 지만 TTL 이내 → 유지(무이탈)', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
     const S = await import('../src/session/index.js');
     const m = S.createSession({ source: 'cli' }, tmp);
     const key = S.subscriberKey('pwa', 'p');
@@ -92,9 +93,9 @@ describe('presence 셀프힐 — reconcileSessionPresence(TTL)', () => {
     const evicted = S.reconcileSessionPresence(m.id, { ttlMs: 10 * 60_000, now: lastSeenAt + 10 * 60_000 }, tmp);
     expect(evicted).toEqual([]);
     expect(S.listSubscribers(m.id, { presence: 'grace' }, tmp).length).toBe(1);
-  });
+  }));
 
-  test('sweepSessionPresence — 데몬 타이머용 배치(grace 세션만 스캔·일괄 이탈)', async () => {
+  test('sweepSessionPresence — 데몬 타이머용 배치(grace 세션만 스캔·일괄 이탈)', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
     const S = await import('../src/session/index.js');
     // 세션 A: grace 초과 · 세션 B: active(무관) · 세션 C: grace 이내.
     const a = S.createSession({ source: 'cli' }, tmp);
@@ -107,5 +108,5 @@ describe('presence 셀프힐 — reconcileSessionPresence(TTL)', () => {
     expect(evicted).toBe(1);                                          // A 만 이탈
     expect(S.listSubscribers(a.id, { presence: 'left' }, tmp).length).toBe(1);
     expect(S.listSubscribers(b.id, { presence: 'active' }, tmp).length).toBe(1); // B 무관
-  });
+  }));
 });

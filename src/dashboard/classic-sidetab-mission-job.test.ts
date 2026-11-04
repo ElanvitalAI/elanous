@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +12,20 @@ const workspaces: string[] = [];
 function createWorkspace(): string {
   const workspace = mkdtempSync(join(tmpdir(), 'classic-pair-job-'));
   workspaces.push(workspace);
+  execFileSync('git', ['init', '--quiet', workspace]);
+  execFileSync('git', ['-C', workspace, 'config', 'user.name', 'Fixture']);
+  execFileSync('git', ['-C', workspace, 'config', 'user.email', 'fixture@example.invalid']);
+  writeFileSync(join(workspace, 'one.txt'), 'one\n');
+  writeFileSync(join(workspace, 'two.txt'), 'two\n');
+  execFileSync('git', ['-C', workspace, 'add', 'one.txt', 'two.txt']);
+  execFileSync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'base']);
   return workspace;
+}
+
+function candidate(baseSha: string, file: string, before: string, after: string): string {
+  return `<SIDETAB-CANDIDATE-V1 base-sha="${baseSha}">\n` +
+    `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-${before}\n+${after}\n` +
+    '</SIDETAB-CANDIDATE-V1>';
 }
 
 afterEach(() => {
@@ -81,6 +95,7 @@ test('pair output preparation preserves permissions on an existing result direct
 test('pair completion is one parent-scoped notification with both answers and redacted result paths', async () => {
   const notifications: PendingTaskNotification[] = [];
   const workspaceDir = createWorkspace();
+  const baseSha = execFileSync('git', ['-C', workspaceDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   const pair = {
     codex: {
       missionId: 'codex-mission',
@@ -89,7 +104,8 @@ test('pair completion is one parent-scoped notification with both answers and re
       startedAt: 10,
       mission: 'Codex mission',
       workspaceDir,
-      completion: Promise.resolve({ ok: true, path: '/private/codex.md', content: 'Codex answer /private/codex.md' }),
+      baseSha,
+      completion: Promise.resolve({ ok: true, path: '/private/codex.md', content: `Codex answer /private/codex.md\n${candidate(baseSha, 'one.txt', 'one', 'codex-one')}` }),
     },
     claude: {
       missionId: 'claude-mission',
@@ -98,7 +114,8 @@ test('pair completion is one parent-scoped notification with both answers and re
       startedAt: 20,
       mission: 'Claude mission',
       workspaceDir,
-      completion: Promise.resolve({ ok: true, path: '/private/claude.md', content: 'Claude answer /private/claude.md' }),
+      baseSha,
+      completion: Promise.resolve({ ok: true, path: '/private/claude.md', content: `Claude answer /private/claude.md\n${candidate(baseSha, 'two.txt', 'two', 'claude-two')}` }),
     },
   };
 
@@ -119,6 +136,103 @@ test('pair completion is one parent-scoped notification with both answers and re
   expect(synthesis).toContain('Codex answer [internal result]');
   expect(synthesis).toContain('Claude answer [internal result]');
   expect(synthesis).not.toContain('/private/');
+  expect(synthesis).toContain('State: merged');
+});
+
+test('successful child text without a captured base SHA stays unavailable and cannot report done', async () => {
+  const notifications: PendingTaskNotification[] = [];
+  const workspaceDir = createWorkspace();
+  await enqueueClassicSidetabMissionPairCompletion({
+    codex: {
+      taskId: 'missing-base', startedAt: 1, mission: 'Codex', workspaceDir,
+      completion: Promise.resolve({ ok: true, content: 'unverified codex answer' }),
+    },
+    claude: {
+      taskId: 'missing-base', startedAt: 1, mission: 'Claude', workspaceDir,
+      completion: Promise.resolve({ ok: true, content: 'unverified claude answer' }),
+    },
+  }, (notification) => notifications.push(notification), () => 2);
+
+  expect(notifications[0]!.state).toBe('error');
+  const synthesis = readFileSync(notifications[0]!.resultPath!, 'utf8');
+  expect(synthesis).toContain('State: unavailable');
+  expect(synthesis).toContain('pair base SHA was not captured');
+  expect(synthesis).toContain('unverified codex answer');
+  expect(synthesis).toContain('unverified claude answer');
+});
+
+test('pair completion attaches the isolated merged patch from the pinned base SHA', async () => {
+  const notifications: PendingTaskNotification[] = [];
+  const workspaceDir = createWorkspace();
+  execFileSync('git', ['init', '--quiet', workspaceDir]);
+  execFileSync('git', ['-C', workspaceDir, 'config', 'user.name', 'Fixture']);
+  execFileSync('git', ['-C', workspaceDir, 'config', 'user.email', 'fixture@example.invalid']);
+  writeFileSync(join(workspaceDir, 'one.txt'), 'one\n');
+  writeFileSync(join(workspaceDir, 'two.txt'), 'two\n');
+  execFileSync('git', ['-C', workspaceDir, 'add', 'one.txt', 'two.txt']);
+  const baseSha = execFileSync('git', ['-C', workspaceDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const diff = (agent: string, file: string, before: string, after: string) =>
+    `${agent} candidate\n<SIDETAB-CANDIDATE-V1 base-sha="${baseSha}">\n` +
+    `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-${before}\n+${after}\n` +
+    '</SIDETAB-CANDIDATE-V1>';
+  const pair = {
+    codex: {
+      taskId: 'integrate-task', startedAt: 1, mission: 'change one', workspaceDir, baseSha,
+      completion: Promise.resolve({ ok: true, path: '/private/codex.md', content: diff('codex', 'one.txt', 'one', 'codex-one') }),
+    },
+    claude: {
+      taskId: 'integrate-task', startedAt: 1, mission: 'change two', workspaceDir, baseSha,
+      completion: Promise.resolve({ ok: true, path: '/private/claude.md', content: diff('claude', 'two.txt', 'two', 'claude-two') }),
+    },
+  };
+
+  await enqueueClassicSidetabMissionPairCompletion(pair, (notification) => notifications.push(notification), () => 2);
+
+  expect(notifications).toHaveLength(1);
+  expect(notifications[0]!.state).toBe('done');
+  expect(notifications[0]!.output).toContain('Non-overlapping candidate changes are merged');
+  const synthesis = readFileSync(notifications[0]!.resultPath!, 'utf8');
+  expect(synthesis).toContain('State: merged');
+  expect(synthesis).toContain('codex-one');
+  expect(synthesis).toContain('claude-two');
+  expect(synthesis).toContain('codex candidate');
+  expect(synthesis).toContain('claude candidate');
+  expect(readFileSync(join(workspaceDir, 'one.txt'), 'utf8')).toBe('one\n');
+  expect(readFileSync(join(workspaceDir, 'two.txt'), 'utf8')).toBe('two\n');
+  expect(execFileSync('git', ['-C', workspaceDir, 'status', '--porcelain'], { encoding: 'utf8' }).trim()).toBe('?? .elanous/');
+});
+
+test('pair completion leaves overlapping candidate hunks unresolved and preserves both for the parent', async () => {
+  const notifications: PendingTaskNotification[] = [];
+  const workspaceDir = createWorkspace();
+  const baseSha = execFileSync('git', ['-C', workspaceDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const diff = (agent: string, choice: string) =>
+    `${agent} candidate\n<SIDETAB-CANDIDATE-V1 base-sha="${baseSha}">\n` +
+    `diff --git a/one.txt b/one.txt\n--- a/one.txt\n+++ b/one.txt\n@@ -1 +1 @@\n-one\n+${choice}\n` +
+    '</SIDETAB-CANDIDATE-V1>';
+  const pair = {
+    codex: {
+      taskId: 'conflict-task', startedAt: 1, mission: 'Codex change', workspaceDir, baseSha,
+      completion: Promise.resolve({ ok: true, content: diff('Codex', 'codex-choice') }),
+    },
+    claude: {
+      taskId: 'conflict-task', startedAt: 1, mission: 'Claude change', workspaceDir, baseSha,
+      completion: Promise.resolve({ ok: true, content: diff('Claude', 'claude-choice') }),
+    },
+  };
+
+  await enqueueClassicSidetabMissionPairCompletion(pair, (notification) => notifications.push(notification), () => 2);
+
+  expect(notifications).toHaveLength(1);
+  expect(notifications[0]!.state).toBe('done');
+  expect(notifications[0]!.output).toContain('unresolved overlapping hunks');
+  const synthesis = readFileSync(notifications[0]!.resultPath!, 'utf8');
+  expect(synthesis).toContain('State: conflict');
+  expect(synthesis).toContain('Parent action: choose or revise');
+  expect(synthesis).toContain('codex-choice');
+  expect(synthesis).toContain('claude-choice');
+  expect(readFileSync(join(workspaceDir, 'one.txt'), 'utf8')).toBe('one\n');
+  expect(execFileSync('git', ['-C', workspaceDir, 'status', '--porcelain'], { encoding: 'utf8' }).trim()).toBe('?? .elanous/');
 });
 
 test('pair completion marks a missing answer as error and says which agent had no answer', async () => {
@@ -144,4 +258,57 @@ test('pair completion marks a missing answer as error and says which agent had n
   expect(synthesis).toContain('| Codex | Codex task | 없음 | 실패/빈 결과 | 미채택 — 빈 결과 |');
   expect(synthesis).toContain('| Claude Code | Claude task | 없음 | 성공 | 채택');
   expect(synthesis).toContain('Claude answer');
+});
+
+test('a failed child candidate is preserved for review but never reconciled', async () => {
+  const notifications: PendingTaskNotification[] = [];
+  const workspaceDir = createWorkspace();
+  const baseSha = execFileSync('git', ['-C', workspaceDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const makeDiff = (file: string, before: string, after: string) => candidate(baseSha, file, before, after);
+  await enqueueClassicSidetabMissionPairCompletion({
+    codex: {
+      taskId: 'failed-candidate', startedAt: 1, mission: 'Codex failed', workspaceDir, baseSha,
+      completion: Promise.resolve({ ok: false, status: 'failed', error: 'child failed after partial output', content: makeDiff('one.txt', 'one', 'must-not-merge') }),
+    },
+    claude: {
+      taskId: 'failed-candidate', startedAt: 1, mission: 'Claude ok', workspaceDir, baseSha,
+      completion: Promise.resolve({ ok: true, content: makeDiff('two.txt', 'two', 'claude-ok') }),
+    },
+  }, (notification) => notifications.push(notification), () => 2);
+
+  expect(notifications[0]!.state).toBe('error');
+  const synthesis = readFileSync(notifications[0]!.resultPath!, 'utf8');
+  expect(synthesis).toContain('State: unavailable');
+  expect(synthesis).toContain('requires two successful children');
+  expect(synthesis).not.toContain('State: merged');
+  expect(synthesis).toContain('Codex 실패 결과의 후보 패치 (보존만 · 병합 대상 아님)');
+  expect(synthesis).toContain('must-not-merge');
+  expect(synthesis).not.toContain('```diff');
+  expect(synthesis).toContain('claude-ok');
+});
+
+test('failed candidate evidence survives when the pair has no common base SHA', async () => {
+  const notifications: PendingTaskNotification[] = [];
+  const workspaceDir = createWorkspace();
+  const baseSha = execFileSync('git', ['-C', workspaceDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const failedDiff = candidate(baseSha, 'one.txt', 'one', 'preserve-for-review');
+  await enqueueClassicSidetabMissionPairCompletion({
+    codex: {
+      taskId: 'mismatched-base-candidate', startedAt: 1, mission: 'Codex failed', workspaceDir, baseSha,
+      completion: Promise.resolve({ ok: false, status: 'failed', error: 'child failed after partial output', content: failedDiff }),
+    },
+    claude: {
+      taskId: 'mismatched-base-candidate', startedAt: 1, mission: 'Claude ok', workspaceDir, baseSha: 'a'.repeat(40),
+      completion: Promise.resolve({ ok: true, content: candidate('a'.repeat(40), 'two.txt', 'two', 'claude-ok') }),
+    },
+  }, (notification) => notifications.push(notification), () => 2);
+
+  expect(notifications[0]!.state).toBe('error');
+  const synthesis = readFileSync(notifications[0]!.resultPath!, 'utf8');
+  expect(synthesis).toContain('State: unavailable');
+  expect(synthesis).toContain('pair base SHA was not captured');
+  expect(synthesis).toContain('Codex 실패 결과의 후보 패치 (보존만 · 병합 대상 아님)');
+  expect(synthesis).toContain('preserve-for-review');
+  expect(synthesis).not.toContain('State: merged');
+  expect(synthesis).not.toContain('```diff');
 });

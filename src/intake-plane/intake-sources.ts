@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,11 +19,15 @@ export interface RegisteredIntakeSource {
   scheduleCron?: string;
   until?: string;
   why?: string;
+  /** Explicit owner marker for entries reconciled from user-configured starter topics. */
+  managedBy?: 'starter.topics';
   /** Existing Linear secretary issue identifier; absent for ordinary sources. */
   issueRef?: string;
   /** Parent Linear issue UUID; never replace with the display identifier. */
   linearIssueId?: string;
   lastRunAt?: string;
+  lastSourceCount?: number;
+  briefingTopic?: string;
 }
 
 export function canonicalSeat(value: string): string {
@@ -57,6 +61,19 @@ export function sourceIsDue(source: RegisteredIntakeSource, now: Date): boolean 
 }
 
 export function sourcesFile(stateDir: string): string { return join(stateDir, 'intake', 'sources.json'); }
+
+function starterRssId(topic: string): string {
+  return `starter-rss-${createHash('sha256').update(topic.toLowerCase()).digest('hex').slice(0, 12)}`;
+}
+
+/**
+ * Ownership requires an explicit marker; an ID, URL, or free-form reason alone never proves ownership.
+ * Prior main versions registered starter topics only as `watch-*` GitHub sources, never as RSS. A markerless
+ * `starter-rss-*` row is therefore an unrelated/manual RSS source and must not be migrated or removed by inference.
+ */
+export function isManagedStarterTopicRssSource(source: RegisteredIntakeSource): boolean {
+  return source.managedBy === 'starter.topics' && source.id.startsWith('starter-rss-') && source.kind === 'rss';
+}
 
 function readSources(stateDir: string): RegisteredIntakeSource[] {
   const file = sourcesFile(stateDir);
@@ -126,11 +143,74 @@ export function listSources(filter: { seat?: string } = {}, stateDir = effective
   return readSources(stateDir).filter((source) => seat === undefined || source.seat === seat);
 }
 
+/** Keep the recurring user briefing's RSS source derived from the configured topic. */
+export function syncBriefingTopicSource(topic: string | undefined, stateDir = effectiveInstanceRoot()): RegisteredIntakeSource | undefined {
+  const normalized = topic?.trim();
+  const id = 'intake-briefing-topic-config';
+  if (!normalized) {
+    removeSource(id, stateDir);
+    return undefined;
+  }
+  const topicParts = normalized.replace(/^\d{4}\s*사업계획\s*[:：]?\s*/, '').split(/[·,]/).map((part) => part.trim()).filter(Boolean);
+  const anchorTerms = topicParts.slice(0, 2).map((part) => part.split(/\s+/)[0]!).filter((term) => term.length > 1);
+  const impactTerms = topicParts.slice(1).flatMap((part, index) => {
+    const tail = index === 0 && /이후/.test(part) ? part.split(/이후/).slice(1).join(' ') : part;
+    return tail.split(/\s+/).filter((term) => term.length > 1 && term !== '이후');
+  });
+  const scopedQueries = anchorTerms.length >= 2 && impactTerms.length
+    ? [...new Set(anchorTerms.flatMap((anchor) => impactTerms.map((impact) => `${anchor} ${impact}`)))]
+    : [...new Set(topicParts.flatMap((part) => part.split(/\s+/).filter((term) => term.length > 1 && term !== '이후')))];
+  const query = scopedQueries.length ? scopedQueries.join(' OR ') : normalized;
+  const source: RegisteredIntakeSource = {
+    id, seat: 'user', kind: 'rss',
+    spec: `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=ko&gl=KR&ceid=KR%3Ako`,
+    every: '1d', why: 'intake.briefingTopic', briefingTopic: normalized,
+  };
+  const sources = readSources(stateDir);
+  const existing = sources.find((entry) => entry.id === id);
+  if (existing && existing.seat === source.seat && existing.kind === source.kind && existing.spec === source.spec
+    && existing.every === source.every && existing.why === source.why && existing.briefingTopic === source.briefingTopic) return existing;
+  saveSources(stateDir, [...sources.filter((entry) => entry.id !== id), source]);
+  return source;
+}
+
 export function removeSource(id: string, stateDir = effectiveInstanceRoot()): boolean {
   const sources = readSources(stateDir);
   if (!sources.some((source) => source.id === id)) return false;
   saveSources(stateDir, sources.filter((source) => source.id !== id));
   return true;
+}
+
+/** Keep configured starter topics represented as stable RSS sources. Only this function owns `starter-rss-*` entries. */
+export function syncStarterTopicRssSources(topics: readonly string[] | undefined, stateDir = effectiveInstanceRoot(), options: { dryRun?: boolean } = {}): RegisteredIntakeSource[] {
+  const normalized = [...new Map((topics ?? []).map((topic) => topic.trim()).filter(Boolean)
+    .map((topic) => [topic.toLowerCase(), topic])).values()];
+  const managedPrefix = 'starter-rss-';
+  const existing = readSources(stateDir);
+  const byId = new Map(existing.map((source) => [source.id, source]));
+  const usedIds = new Set(existing.filter((source) => !isManagedStarterTopicRssSource(source)).map((source) => source.id));
+  const desired = normalized.map((topic): RegisteredIntakeSource => {
+    const baseId = starterRssId(topic);
+    let id = baseId;
+    for (let suffix = 2; usedIds.has(id); suffix += 1) id = `${baseId}-${suffix}`;
+    usedIds.add(id);
+    const prior = byId.get(id);
+    const feed = new URL('https://news.google.com/rss/search');
+    feed.searchParams.set('q', topic);
+    feed.searchParams.set('hl', 'en-US');
+    feed.searchParams.set('gl', 'US');
+    feed.searchParams.set('ceid', 'US:en');
+    return { id, seat: 'user', kind: 'rss', spec: feed.toString(), every: '1d', why: 'starter.topics', managedBy: 'starter.topics',
+      ...(prior?.lastRunAt ? { lastRunAt: prior.lastRunAt } : {}) };
+  });
+  const next = [
+    ...existing.filter((source) => !isManagedStarterTopicRssSource(source)
+      && !(source.id.startsWith('watch-') && source.kind === 'github-query' && source.why === 'starter.topics')),
+    ...desired,
+  ];
+  const changed = existing.length !== next.length || next.some((source, index) => JSON.stringify(source) !== JSON.stringify(existing[index]));
+  if (changed && !options.dryRun) saveSources(stateDir, next);
+  return desired;
 }
 
 export function dueSources(now: Date = new Date(), stateDir = effectiveInstanceRoot(), sourceId?: string): RegisteredIntakeSource[] {
@@ -196,7 +276,10 @@ export function parseFeed(xml: string): RawIntakeItem[] {
   return entries.map((entry) => {
     const field = (name: string): string => xmlText(entry.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i'))?.[1] ?? '');
     const link = entry.match(/<link\b[^>]*\bhref=["']([^"']+)["'][^>]*\/?\s*>/i)?.[1] ?? field('link');
-    return { url: xmlText(link), title: field('title'), text: field('description') || field('summary') || field('content'), kind: 'rss' as const };
+    const publisher = entry.match(/<source\b[^>]*>([\s\S]*?)<\/source>/i)?.[1];
+    const publisherUrl = entry.match(/<source\b[^>]*\burl=["']([^"']+)["']/i)?.[1];
+    return { url: xmlText(link), title: field('title'), text: field('description') || field('summary') || field('content'), kind: 'rss' as const,
+      ...(publisher ? { publisher: xmlText(publisher) } : publisherUrl ? { publisher: publisherUrl } : {}) };
   }).filter((entry) => !!entry.url);
 }
 
@@ -244,7 +327,12 @@ export async function runDue({ now = new Date(), seat, sourceId, deps = {} }: { 
         intakeSource = 'command';
       }
       raws = raws.map((raw) => ({ ...raw, seat: source.seat,
+        ...(source.briefingTopic ? { briefingTopic: source.briefingTopic } : {}),
         ...(source.kind === 'topic-search' && source.linearIssueId ? { linearIssueId: source.linearIssueId } : {}) }));
+      const publishers = new Set(raws.map((raw) => {
+        if (raw.publisher?.trim()) return raw.publisher.trim().toLowerCase();
+        try { return new URL(raw.url!).hostname.toLowerCase().replace(/^www\./, ''); } catch { return undefined; }
+      }).filter((host): host is string => !!host));
       const items = (deps.ingest ?? ingestIntakeItems)(stateDir, intakeSource, raws, now.toISOString()).shaped;
       if (source.kind === 'topic-search') await addTopicBriefItems(stateDir, source, raws, now.toISOString(), deps.addBriefItem);
       await deps.onCollected?.(source, raws, now);
@@ -263,7 +351,8 @@ export async function runDue({ now = new Date(), seat, sourceId, deps = {} }: { 
       // A projection failure must remain retryable; advance cadence only after delivery succeeds.
       const current = readSources(stateDir);
       const found = current.find((entry) => entry.id === source.id);
-      if (found) saveSources(stateDir, current.map((entry) => entry.id === source.id ? { ...entry, lastRunAt: now.toISOString() } : entry));
+      if (found && found.spec === source.spec && found.briefingTopic === source.briefingTopic) saveSources(stateDir, current.map((entry) => entry.id === source.id
+        ? { ...entry, lastRunAt: now.toISOString(), lastSourceCount: publishers.size } : entry));
       ran.push({ id: source.id, items });
     } catch (error) {
       ran.push({ id: source.id, items: 0, error: error instanceof Error ? error.message : String(error) });

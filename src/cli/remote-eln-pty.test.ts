@@ -98,6 +98,34 @@ describe('remote eln pty inventory command adapter', () => {
     }
   });
 
+  test('sidetab register rejects a ref matching one row id and another nickname', async () => {
+    const rows = [
+      { ...mkRow('shared-ref', true), nickname: 'first' },
+      { ...mkRow('second-id', true), nickname: 'shared-ref' },
+    ];
+    const saved: PtySidetabRegistration[] = [];
+    const deps: RemoteElnPtyCommandDeps = {
+      rows: () => rows, registrations: () => saved, register: (entry) => { saved.push(entry); return true; },
+      unregister: () => true, remoteHosts: () => [], queryHost: async () => [], now: () => 20, localHost: () => 'aws1',
+    };
+    let out = '';
+    let err = '';
+    const originalOut = process.stdout.write;
+    const originalErr = process.stderr.write;
+    process.stdout.write = ((chunk: string) => { out += chunk; return true; }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string) => { err += chunk; return true; }) as typeof process.stderr.write;
+    try {
+      const program = new Command(); registerRemoteElnPtyCommands(program, deps);
+      await program.parseAsync(['node', 'eln', 'sidetab', 'register', 'shared-ref', '--host', 'aws1', '--name', 'work', '--by', 'OPT']);
+      expect(process.exitCode).toBe(2);
+      expect(err).toContain('ambiguous registration ref: shared-ref');
+      expect(out).toBe('');
+      expect(saved).toEqual([]);
+    } finally {
+      process.stdout.write = originalOut; process.stderr.write = originalErr;
+    }
+  });
+
   test('ambiguous unregister-by-name is explicitly rejected; qualified id remains resolvable', () => {
     const registrations = [reg('one', 'same'), reg('two', 'same')];
     expect(resolveSidetabUnregisterRef(registrations, 'same')).toEqual({ ambiguous: true });

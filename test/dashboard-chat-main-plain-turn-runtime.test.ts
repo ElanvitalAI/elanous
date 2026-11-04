@@ -15,6 +15,7 @@ import { getUserConfig } from '../src/user-config.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
 import { createTurnThrowSim } from '../src/ux-sim/turn-throw-sim.js';
 import { createExternalInputQueue } from '../src/input/external-input-queue.js';
+import { formatTuiRouteLine } from '../src/core-turn/short-question.js';
 import { saveTokens } from '../src/oauth/store.js';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -252,6 +253,38 @@ async function implementationDisciplineFromDirectRuntime(
 }
 
 describe('runDashboardChatMainPlainTurn', () => {
+  it('hides legacy route chunks on the initial send and autoheal retry while preserving answers', async () => {
+    const rendered: string[] = [];
+    let sends = 0;
+    const detail = 'Codex API 400: {"detail":"Bad Request"}';
+    const ctx = buildDeps({
+      createTurnStreamRuntime: () => ({
+        onText: (chunk) => { rendered.push(chunk); },
+        onToolCall: () => {}, onToolResult: () => {}, getAssistantStart: () => 0,
+      }),
+      autoheal: {
+        summarizeHistory: async () => '',
+        renewBackendSession: async () => 'renewed-session',
+        peekFallbackProvider: () => null,
+      },
+      acpSession: {
+        send: async ({ onText }) => {
+          sends++;
+          onText(formatTuiRouteLine('조회'));
+          if (sends === 1) throw new Error(detail);
+          onText('answer');
+        },
+      },
+    });
+
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(sends).toBe(2);
+    expect(rendered).toEqual(['answer']);
+    expect(ctx.chatLines.join(' ')).not.toContain('라우팅:');
+    expect(ctx.finalizeCalls).toEqual([{ status: 'completed', error: undefined }]);
+  });
+
   it('direct runtime preserves static implementation-discipline bytes when native structure is off', async () => {
     expect(await implementationDisciplineFromDirectRuntime(false, ['Grep', 'Glob', 'Read']))
       .toBe(promptForPhase('implementation-ready'));

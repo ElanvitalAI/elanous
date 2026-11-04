@@ -2,7 +2,7 @@ import type { Command } from 'commander';
 import { issueIngestToken, listIngestTokens, revokeIngestToken } from '../nexus/api/ingest-token.js';
 
 export function registerIngestTokenCommands(nexus: Command): void {
-  const token = nexus.command('ingest-token').description('Manage POST /v1/tasks-only bearer tokens');
+  const token = nexus.command('ingest-token').description('Manage scoped POST bearer tokens for tasks, reports, and log federation');
   token.command('issue <name>').description('Issue a token; print its secret exactly once')
     .action((name: string) => {
       try { process.stdout.write(`${issueIngestToken(name).token}\n`); }

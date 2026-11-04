@@ -92,6 +92,86 @@ describe('PtyShellStart sshHost', () => {
     }
   });
 
+  test('shell compound TUI launch is rejected before PTY spawn', async () => {
+    const previousParent = process.env.ELANOUS_PARENT_PTY_ID;
+    const previousDepth = process.env.ELANOUS_NEST_DEPTH;
+    process.env.ELANOUS_PARENT_PTY_ID = 'pty-skill-parent';
+    process.env.ELANOUS_NEST_DEPTH = '1';
+    try {
+      const r = await dispatchPtyShellStart({ cmd: 'cd /tmp && eln --name opt', yield_time_ms: 1 });
+      expect(r.output).toContain('[TUI 자기중첩 거부]');
+      expect(captured).toHaveLength(0);
+    } finally {
+      if (previousParent === undefined) delete process.env.ELANOUS_PARENT_PTY_ID;
+      else process.env.ELANOUS_PARENT_PTY_ID = previousParent;
+      if (previousDepth === undefined) delete process.env.ELANOUS_NEST_DEPTH;
+      else process.env.ELANOUS_NEST_DEPTH = previousDepth;
+    }
+  });
+
+  test('shell compound cmd with separate args is rejected before PTY spawn', async () => {
+    const previousParent = process.env.ELANOUS_PARENT_PTY_ID;
+    const previousDepth = process.env.ELANOUS_NEST_DEPTH;
+    process.env.ELANOUS_PARENT_PTY_ID = 'pty-skill-parent';
+    process.env.ELANOUS_NEST_DEPTH = '1';
+    try {
+      const r = await dispatchPtyShellStart({ cmd: 'cd /tmp && eln', args: ['--name', 'opt'], yield_time_ms: 1 });
+      expect(r.output).toContain('[TUI 자기중첩 거부]');
+      expect(captured).toHaveLength(0);
+    } finally {
+      if (previousParent === undefined) delete process.env.ELANOUS_PARENT_PTY_ID;
+      else process.env.ELANOUS_PARENT_PTY_ID = previousParent;
+      if (previousDepth === undefined) delete process.env.ELANOUS_NEST_DEPTH;
+      else process.env.ELANOUS_NEST_DEPTH = previousDepth;
+    }
+  });
+
+  test('npx call=, unknown --exec= wrapper, and redirection backtick are rejected before PTY spawn', async () => {
+    const previousParent = process.env.ELANOUS_PARENT_PTY_ID;
+    const previousDepth = process.env.ELANOUS_NEST_DEPTH;
+    process.env.ELANOUS_PARENT_PTY_ID = 'pty-skill-wrapper-parent';
+    process.env.ELANOUS_NEST_DEPTH = '1';
+    try {
+      for (const cmd of [
+        'npx --yes --call=eln --name opt',
+        'custom-launch --exec=eln --name opt',
+        'echo safe > `eln --name opt`',
+        'echo safe > "$(eln --name opt)"',
+        'echo safe\neln --name opt',
+        'cat <<EOF\n`eln --name opt`\nEOF',
+      ]) {
+        const r = await dispatchPtyShellStart({ cmd, yield_time_ms: 1 });
+        expect(r.output).toContain('[TUI 자기중첩 거부]');
+        expect(captured).toHaveLength(0);
+      }
+      expect(captured).toHaveLength(0);
+    } finally {
+      if (previousParent === undefined) delete process.env.ELANOUS_PARENT_PTY_ID;
+      else process.env.ELANOUS_PARENT_PTY_ID = previousParent;
+      if (previousDepth === undefined) delete process.env.ELANOUS_NEST_DEPTH;
+      else process.env.ELANOUS_NEST_DEPTH = previousDepth;
+    }
+  });
+
+  test('literal argv containing TUI words still spawns safely', async () => {
+    const previousParent = process.env.ELANOUS_PARENT_PTY_ID;
+    const previousDepth = process.env.ELANOUS_NEST_DEPTH;
+    process.env.ELANOUS_PARENT_PTY_ID = 'pty-skill-literal-parent';
+    process.env.ELANOUS_NEST_DEPTH = '1';
+    try {
+      const r = await dispatchPtyShellStart({ cmd: 'echo', args: ['eln --name opt'], yield_time_ms: 1 });
+      expect(r.output).toMatch(/^PtyShellStart process_id=pty_/);
+      expect(captured).toHaveLength(1);
+      expect(captured[0]!.cmd).toBe('echo');
+      expect(captured[0]!.args).toEqual(['eln --name opt']);
+    } finally {
+      if (previousParent === undefined) delete process.env.ELANOUS_PARENT_PTY_ID;
+      else process.env.ELANOUS_PARENT_PTY_ID = previousParent;
+      if (previousDepth === undefined) delete process.env.ELANOUS_NEST_DEPTH;
+      else process.env.ELANOUS_NEST_DEPTH = previousDepth;
+    }
+  });
+
   test('known sshHost starts ssh -t <resolved-target> only', async () => {
     withHosts([{ name: 'node-b', host: 'node-b' }]);
     await dispatchPtyShellStart({ cmd: 'sh', sshHost: 'node-b', yield_time_ms: 1 });

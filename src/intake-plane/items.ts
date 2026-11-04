@@ -21,6 +21,10 @@ export interface IntakeItem {
   /** 같은 항목이 다른 입력원에서도 왔으면 여기 모인다 — «두 입력원에서 동시에 뜬 것»이 신호다. */
   sources: (IntakeSource | RegisteredIntakeSourceKind)[];
   seat?: string;
+  /** Configured topic identity used to keep successive briefing topics isolated. */
+  briefingTopic?: string;
+  briefingTopics?: string[];
+  publisher?: string;
   /** Parent Linear issue UUID, kept separate from its human-readable identifier. */
   linearIssueId?: string;
   url?: string;
@@ -41,6 +45,8 @@ export interface IntakeItem {
 /** 수집기가 내는 한 줄 — 모양 맞추기 전. */
 export interface RawIntakeItem {
   seat?: string;
+  briefingTopic?: string;
+  publisher?: string;
   linearIssueId?: string;
   url?: string;
   title?: string;
@@ -133,6 +139,9 @@ export function shapeIntakeItem(source: IntakeSource | RegisteredIntakeSourceKin
     source,
     sources: [source],
     ...(seat ? { seat } : {}),
+    ...(raw.briefingTopic ? { briefingTopic: raw.briefingTopic } : {}),
+    ...(raw.briefingTopic ? { briefingTopics: [raw.briefingTopic] } : {}),
+    ...(raw.publisher ? { publisher: raw.publisher } : {}),
     ...(raw.linearIssueId ? { linearIssueId: raw.linearIssueId } : {}),
     ...(url ? { url } : {}),
     kind: raw.kind ?? kindFor(source, url),
@@ -201,6 +210,10 @@ export function ingestIntakeItems(instanceRoot: string, source: IntakeSource | R
       title: prev.title ?? shaped.title,
       text: prev.text ?? shaped.text,
       linearIssueId: prev.linearIssueId ?? shaped.linearIssueId,
+      briefingTopic: shaped.briefingTopic ?? prev.briefingTopic,
+      briefingTopics: [...new Set([...(prev.briefingTopics ?? (prev.briefingTopic ? [prev.briefingTopic] : [])),
+        ...(shaped.briefingTopics ?? (shaped.briefingTopic ? [shaped.briefingTopic] : []))])],
+      publisher: shaped.publisher ?? prev.publisher,
       axis: shaped.axis ?? prev.axis,
       judgement: shaped.judgement ?? prev.judgement,
       // 한 번이라도 개인 입력원에서 왔으면 개인으로 남긴다(공개로 풀지 않는다).

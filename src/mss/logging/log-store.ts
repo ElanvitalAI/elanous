@@ -107,7 +107,7 @@ const LOG_STORE_WRITE_BUSY_TIMEOUT_MS = 5_000;
 const LOG_STORE_OPEN_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600] as const;
 const LOG_STORE_BUSY_RETRY_MAX_ATTEMPTS = 3;
 const LOG_STORE_BUSY_RETRY_BUFFER_MAX_ROWS = 2_000;
-type LogStoreInsertRow = { rec: LogRecord; surface: string };
+type LogStoreInsertRow = { rec: LogRecord; surface: string; instance?: string; federatedId?: string; hostId?: string };
 type LogStoreRetryBatch = { rows: LogStoreInsertRow[]; attempts: number; preserveRows: boolean };
 const sqliteOpenWait = new Int32Array(new SharedArrayBuffer(4));
 let pendingBusyOpenLosses: Array<{ path: string; loss: { store: 'logs'; op: 'open'; waitedMs: number } }> = [];
@@ -302,6 +302,11 @@ export class LogStore {
       line INTEGER NOT NULL,
       PRIMARY KEY (job, line)
     )`);
+    this.db.run(`CREATE TABLE IF NOT EXISTS log_federation_receipts (
+      instance TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      PRIMARY KEY (instance, source_id)
+    )`);
   }
 
   /** Insert each returned Pod line at most once per job, atomically with its receipt. */
@@ -316,7 +321,7 @@ export class LogStore {
   }
 
   /** 배치 insert(단일 트랜잭션). SQLITE_BUSY 는 bounded in-memory buffer 후 throw — fail-soft 는 호출측(StoreSink) 책임. */
-  insertBatch(rows: Array<{ rec: LogRecord; surface: string }>, opts: { preserveRows?: boolean } = {}): void {
+  insertBatch(rows: Array<{ rec: LogRecord; surface: string; instance?: string; federatedId?: string; hostId?: string }>, opts: { preserveRows?: boolean } = {}): void {
     if (rows.length === 0) return;
     const retrying = this.busyRetryBuffer;
     const current: LogStoreRetryBatch = { rows, attempts: 0, preserveRows: opts.preserveRows === true };
@@ -328,8 +333,12 @@ export class LogStore {
     const decisionRow = this.db.prepare(`SELECT id FROM logs WHERE instance = ? AND category = 'loop.steward' AND event = 'decision'
       AND json_valid(data) AND json_extract(data, '$.runId') = ? ORDER BY id DESC LIMIT 1`);
     const updateDecision = this.db.prepare(`UPDATE logs SET ts = ?, ts_ms = ?, level = ?, surface = ?, data = ? WHERE id = ?`);
+    const federationReceipt = this.db.prepare('INSERT OR IGNORE INTO log_federation_receipts (instance, source_id) VALUES (?, ?)');
     const insertAll = this.db.transaction((batch: Array<{ row: LogStoreInsertRow; preserveRows: boolean }>) => {
-      for (const { row: { rec, surface }, preserveRows } of batch) {
+      for (const { row, preserveRows } of batch) {
+        const { rec, surface } = row;
+        const instance = row.instance ?? this.instance;
+        if (row.federatedId && federationReceipt.run(instance, row.federatedId).changes === 0) continue;
         const tsMs = Date.parse(rec.ts);
         const timestamp = Number.isFinite(tsMs) ? tsMs : Date.now();
         const level = deriveLogLevel(rec);
@@ -338,7 +347,7 @@ export class LogStore {
           rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)
           ? (rec.data as Record<string, unknown>).runId : undefined;
         const existing = !preserveRows && typeof runId === 'string' && runId
-          ? decisionRow.get(this.instance, runId) as { id: number } | undefined : undefined;
+          ? decisionRow.get(instance, runId) as { id: number } | undefined : undefined;
         if (existing) {
           updateDecision.run(rec.ts, timestamp, level, surface, data, existing.id);
           continue;
@@ -347,11 +356,11 @@ export class LogStore {
           rec.ts,
           timestamp,
           level,
-          this.instance,
-          rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)
+          instance,
+          row.hostId ?? (rec.data && typeof rec.data === 'object' && !Array.isArray(rec.data)
             && typeof (rec.data as Record<string, unknown>).hostId === 'string'
             ? (rec.data as Record<string, string>).hostId
-            : process.env.ELANOUS_HOST_ID ?? '',
+            : process.env.ELANOUS_HOST_ID ?? ''),
           surface,
           rec.category,
           rec.event,

@@ -181,6 +181,18 @@ function scheduleError(result: unknown): string | null {
   return result && typeof result === 'object' && 'error' in result ? String((result as { error: unknown }).error) : null;
 }
 
+function scheduleCommandMatches(row: { command?: string; command_full?: string }, expected: string): boolean {
+  const actual = row.command_full ?? row.command;
+  if (actual === expected) return true;
+  const prefix = `${expected} >> `;
+  const suffix = ' 2>&1';
+  if (!actual?.startsWith(prefix) || !actual.endsWith(suffix)) return false;
+  const logPath = actual.slice(prefix.length, -suffix.length);
+  return /^(?:\/|~\/)[A-Za-z0-9._/-]+$/.test(logPath) && !logPath.split('/').some(part => part === '.' || part === '..');
+}
+
+type TopicScheduleRow = { id?: string; command?: string; command_full?: string; cron?: string };
+
 /**
  * Linear secretary handoff: register one issue-linked topic source, create and
  * migrate exactly one existing schedule-registry job to the workflow daemon,
@@ -232,10 +244,10 @@ export async function subscribeTopicSearch(input: SubscribeTopicSearchInput, dep
       // Crontab inventory derives category from the command, so the created
       // job may appear under maintenance instead of the requested ingest
       // category. Match by exact command + cron across the registry.
-      const listing = await dispatch({ action: 'list' }) as { schedules?: Array<{ id?: string; command?: string; cron?: string }> };
+      const listing = await dispatch({ action: 'list' }) as { schedules?: TopicScheduleRow[] };
       const listError = scheduleError(listing);
       if (listError) throw new Error(`topic-search 일정 목록 확인 실패: ${listError}`);
-      const match = listing.schedules?.find((row) => row.command === command && row.cron === input.scheduleCron);
+       const match = listing.schedules?.find((row) => scheduleCommandMatches(row, command) && row.cron === input.scheduleCron);
       if (!match?.id) throw new Error('topic-search 일정이 schedule registry에 나타나지 않았다');
       scheduleId = match.id;
       const migrated = await dispatch({ action: 'migrate', id: scheduleId, yes: true });
@@ -249,14 +261,14 @@ export async function subscribeTopicSearch(input: SubscribeTopicSearchInput, dep
   try {
     if (!existing) await createSchedule();
     else {
-      const listing = await dispatch({ action: 'list' }) as { schedules?: Array<{ id?: string; command?: string; cron?: string }> };
+      const listing = await dispatch({ action: 'list' }) as { schedules?: TopicScheduleRow[] };
       const listError = scheduleError(listing);
       if (listError) throw new Error(`기존 topic-search 일정 목록 확인 실패: ${listError}`);
       const sourceCommandPrefix = `eln intake source run-due --source-id ${sourceId} --project-issue-briefing`;
       const conflicting = listing.schedules?.find((row) => row.cron === input.scheduleCron
-        && row.command?.startsWith(sourceCommandPrefix) && row.command !== command);
+        && (row.command_full ?? row.command)?.startsWith(sourceCommandPrefix) && !scheduleCommandMatches(row, command));
       if (conflicting) throw new Error(`기존 topic-search 일정의 Telegram 실행 모드가 다르다; 중복 예약을 피하려면 기존 일정부터 제거해야 한다: ${conflicting.id ?? sourceId}`);
-      const match = listing.schedules?.find((row) => row.command === command && row.cron === input.scheduleCron);
+       const match = listing.schedules?.find((row) => scheduleCommandMatches(row, command) && row.cron === input.scheduleCron);
       if (match?.id) scheduleId = match.id;
       else await createSchedule();
     }
@@ -265,8 +277,8 @@ export async function subscribeTopicSearch(input: SubscribeTopicSearchInput, dep
       let orphan = scheduleId;
       if (!orphan) {
         try {
-          const listing = await dispatch({ action: 'list' }) as { schedules?: Array<{ id?: string; command?: string; cron?: string }> };
-          orphan = listing.schedules?.find((row) => row.command === command && row.cron === input.scheduleCron)?.id;
+          const listing = await dispatch({ action: 'list' }) as { schedules?: TopicScheduleRow[] };
+           orphan = listing.schedules?.find((row) => scheduleCommandMatches(row, command) && row.cron === input.scheduleCron)?.id;
         } catch { /* source cleanup below remains primary */ }
       }
       if (orphan) try { await dispatch({ action: 'delete', id: orphan, yes: true }); } catch { /* preserve primary error */ }

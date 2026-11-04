@@ -19,6 +19,8 @@ import { resumeInProcessDashboardSession } from '../src/dashboard/index.js';
 import type { ChatMessage } from '../src/chat/index.js';
 import * as llmModule from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
+import { getActiveSessionId, historyFromSession, loadSession, setActiveSessionId } from '../src/session/index.js';
+import { ptyAvailable, startPty, unregisterPty } from '../src/pty-shell/registry.js';
 
 const root = new URL('../', import.meta.url).pathname;
 
@@ -145,6 +147,189 @@ describe('TUI-H8-FOLLOW ② — id 없는 --resume 뒤 프롬프트 첫 낱말�
 
 describe('대시보드 TUI 루트 이어하기 우선순위(r1 must-fix)', () => {
   const latest = () => 'latest-1';
+  test('이름 있는 TUI는 session resume으로 지정된 활성 세션을 복원한다', () => {
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      activeSessionId: () => 'session-with-history',
+      continueLatest: false,
+      readEnvId: () => null,
+      latest,
+    })).toEqual({ sessionId: 'session-with-history', source: 'named-active' });
+  });
+  test('이름 있는 TUI에서는 session resume의 활성 표지가 옛 env override보다 우선한다', () => {
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      activeSessionId: () => 'session-selected-by-resume',
+      sessionExists: () => true,
+      continueLatest: false,
+      readEnvId: () => 'stale-env-override',
+      latest,
+    })).toEqual({ sessionId: 'session-selected-by-resume', source: 'named-active' });
+  });
+  test('활성 표식이 낡았거나 읽을 수 없으면 이름 있는 TUI도 새 세션으로 간다', () => {
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      activeSessionId: () => '  ',
+      continueLatest: false,
+      readEnvId: () => null,
+      latest,
+    })).toEqual({ source: 'none' });
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      activeSessionId: () => { throw new Error('marker unavailable'); },
+      continueLatest: false,
+      readEnvId: () => null,
+      latest,
+    })).toEqual({ source: 'none' });
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      activeSessionId: () => 'missing-session',
+      sessionExists: () => false,
+      continueLatest: false,
+      readEnvId: () => null,
+      latest,
+    })).toEqual({ source: 'none' });
+  });
+  test('이름 있는 TUI의 활성 표식이 없거나 낡으면 env override 대신 새 세션으로 간다', () => {
+    let envReads = 0;
+    const readEnvId = () => { envReads += 1; return 'unrelated-env-session'; };
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      activeSessionId: () => null,
+      continueLatest: false,
+      readEnvId,
+      latest,
+    })).toEqual({ source: 'none' });
+    expect(resolveRootResumeSessionId({
+      namedDashboard: true,
+      activeSessionId: () => 'deleted-session',
+      sessionExists: () => false,
+      continueLatest: false,
+      readEnvId,
+      latest,
+    })).toEqual({ source: 'none' });
+    expect(envReads).toBe(0);
+  });
+  test('session resume 표식 뒤 이름 있는 TUI 재기동은 마지막 13개 저장 메시지를 복원한다', () => {
+    const priorState = process.env.ELANOUS_STATE_DIR;
+    const state = mkdtempSync(join(tmpdir(), 'named-tui-resume-'));
+    process.env.ELANOUS_STATE_DIR = state;
+    const sessions = join(state, 'sessions');
+    try {
+      const sessionModulePath = join(root, 'src/session/index.ts');
+      const writer = `
+        const { appendMessage, createSession, setActiveSessionId } = await import(${JSON.stringify(sessionModulePath)});
+        const root = process.env.TEST_SESSION_ROOT;
+        const session = createSession({ source: 'tui', title: 'restart transcript' }, root);
+        for (let i = 0; i < 13; i += 1) {
+          appendMessage(session.id, {
+            role: i === 12 ? 'assistant' : i % 2 === 0 ? 'user' : 'assistant',
+            content: i === 12 ? 'latest persisted assistant turn' : 'saved message ' + (i + 1),
+          }, root);
+        }
+        setActiveSessionId(session.id);
+        process.exit(0);
+      `;
+      // The writer exits immediately after the final synchronous append (no TUI
+      // teardown hook can help it); the next process must recover the JSONL tail.
+      const exited = spawnSync(process.execPath, ['-e', writer], {
+        cwd: root,
+        env: { ...process.env, ELANOUS_STATE_DIR: state, TEST_SESSION_ROOT: sessions },
+        encoding: 'utf8',
+        timeout: 15_000,
+      });
+      expect(exited.status).toBe(0);
+      const sessionId = getActiveSessionId()!;
+
+      const restart = resolveRootResumeSessionId({
+        namedDashboard: true,
+        activeSessionId: getActiveSessionId,
+        sessionExists: (id) => loadSession(id, sessions) !== null,
+        continueLatest: false,
+        readEnvId: () => null,
+        latest,
+      });
+      expect(restart).toEqual({ sessionId, source: 'named-active' });
+
+      const chatHistory: ChatMessage[] = [{ role: 'system', content: 'dashboard prompt' }];
+      const resumed = resumeInProcessDashboardSession(restart.sessionId!, {
+        resolveSessionId: (prefix) => prefix === sessionId ? sessionId : null,
+        historyFromSession: (id) => historyFromSession(id, sessions),
+        chatHistory,
+        setAttachedSessionId: () => {},
+        setActiveSessionId,
+      });
+      expect(resumed).toMatchObject({ resumed: true, sessionId, turns: 13 });
+      expect(chatHistory.at(-1)).toEqual({ role: 'assistant', content: 'latest persisted assistant turn' });
+    } finally {
+      if (priorState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorState;
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+  test.skipIf(!ptyAvailable())('실제 CLI: session resume 뒤 --name opt 재기동 화면에 마지막 저장 답변을 표시한다', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'named-tui-cli-resume-'));
+    const state = join(home, 'state');
+    const sessions = join(home, 'sessions');
+    mkdirSync(state);
+    mkdirSync(sessions);
+    writeFileSync(join(state, 'config.json'), JSON.stringify({
+      onboarding: { completed: true },
+      llm: { provider: 'local', model: 'resume-live-test', memoryJudge: { enabled: false } },
+    }));
+    const env: Record<string, string | undefined> = { ...process.env };
+    for (const key of ['XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY', 'ELANOUS_RESUME_SESSION']) delete env[key];
+    env.HOME = home;
+    env.ELANOUS_STATE_DIR = state;
+    env.ELANOUS_SESSION_ROOT = sessions;
+    env.TERM = 'xterm-256color';
+    env.LOCAL_LLM_URL = 'http://127.0.0.1:9/v1';
+
+    try {
+      const writer = `
+        const { appendMessage, createSession } = await import(${JSON.stringify(join(root, 'src/session/index.ts'))});
+        const session = createSession({ source: 'tui', title: 'named restart CLI proof' }, ${JSON.stringify(sessions)});
+        for (let i = 0; i < 13; i += 1) appendMessage(session.id, {
+          role: i === 12 ? 'assistant' : i % 2 === 0 ? 'user' : 'assistant',
+          content: i === 12 ? 'RESUME_SENTINEL_7C8A' : 'persisted message ' + (i + 1),
+        }, ${JSON.stringify(sessions)});
+        process.stdout.write(session.id);
+        process.exit(0);
+      `;
+      const written = spawnSync(process.execPath, ['-e', writer], { cwd: root, env: env as Record<string, string>, encoding: 'utf8', timeout: 15_000 });
+      expect(written.status, written.stderr).toBe(0);
+      const sessionId = written.stdout.trim();
+      expect(sessionId).toBeTruthy();
+
+      // The same public command used by the operator selects the active session.
+      const resumed = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${state}`, 'session', 'resume', sessionId], {
+        cwd: root, env: env as Record<string, string>, encoding: 'utf8', timeout: 30_000,
+      });
+      expect(resumed.status, `${resumed.stdout}\n${resumed.stderr}`).toBe(0);
+
+      const dashboard = startPty({
+        cmd: 'bun', args: ['bin/elanous.mjs', `--test=${state}`, '--name', 'opt'],
+        workdir: root, cols: 140, rows: 36, env: env as Record<string, string>,
+      });
+      try {
+        const deadline = Date.now() + 45_000;
+        let screen = '';
+        while (Date.now() < deadline) {
+          screen = await dashboard.renderScreen();
+          if (screen.includes('RESUME_SENTINEL_7C8A')) break;
+          await Bun.sleep(100);
+        }
+        expect(screen, 'named dashboard did not render the persisted last turn').toContain('RESUME_SENTINEL_7C8A');
+      } finally {
+        dashboard.write('/quit\r');
+        await Bun.sleep(250);
+        dashboard.kill();
+        unregisterPty(dashboard.id);
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
   test('인자 없음 ∧ env 없음 → 새 세션', () => {
     expect(resolveRootResumeSessionId({ continueLatest: false, readEnvId: () => null, latest })).toEqual({ source: 'none' });
   });

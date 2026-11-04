@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { parseMachinePoolDeclarations, type MachinePoolDeclaration } from './machine-pool-inventory.js';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
@@ -22,11 +23,25 @@ export interface ResourceLease {
   stoppedBy?: string;
 }
 
+export interface WarmPoolPodReceipt {
+  purpose: MachinePoolDeclaration['purpose'];
+  host: string;
+  podUid: string;
+  digest: string;
+  runtime: string;
+  environment: string;
+  skillPacks: Array<{ name: string; version: string }>;
+  lastJob: string;
+  cleanupResult: { state: 'clean' | 'unclean' | 'unknown'; procedure: string; reason: string; verifiedAt: string };
+}
+
 export type ResourceLedgerEvent =
   | { event: 'lease-created'; at: string; lease: ResourceLease }
   | { event: 'lease-heartbeat'; at: string; id: string; heartbeatAt: string; resources?: ResourceLease['resources'] }
   | { event: 'lease-ended'; at: string; id: string; reason: string; stoppedBy: string }
-  | { event: 'lease-reaped'; at: string; id: string; expectedHeartbeatAt: string; expectedExpiresAt: string; observedAt: string; reason: 'expired-and-absent' };
+  | { event: 'lease-reaped'; at: string; id: string; expectedHeartbeatAt: string; expectedExpiresAt: string; observedAt: string; reason: 'expired-and-absent' | 'machine-disappeared' }
+  | { event: 'pool-declared'; at: string; pool: MachinePoolDeclaration }
+  | { event: 'pool-pod-receipt'; at: string; receipt: WarmPoolPodReceipt };
 
 export interface ResourceMeasurement {
   host: string;
@@ -85,7 +100,7 @@ export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
   return text.split(/\r?\n/).filter(Boolean).map((line, index) => {
     let value: unknown;
     try { value = JSON.parse(line); } catch { throw new Error(`resource ledger malformed at line ${index + 1}`); }
-    if (!value || typeof value !== 'object' || !['lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped'].includes(String((value as { event?: unknown }).event))) {
+    if (!value || typeof value !== 'object' || !['lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt'].includes(String((value as { event?: unknown }).event))) {
       throw new Error(`resource ledger invalid event at line ${index + 1}`);
     }
     return value as ResourceLedgerEvent;
@@ -100,7 +115,7 @@ export function activeResourceLeases(events: readonly ResourceLedgerEvent[]): Re
       const current = leases.get(event.id);
       if (current && !current.endedAt) leases.set(event.id, { ...current, heartbeatAt: event.heartbeatAt,
         ...(event.resources ? { resources: event.resources } : {}) });
-    } else {
+    } else if (event.event === 'lease-ended' || event.event === 'lease-reaped') {
       const current = leases.get(event.id);
       if (current && !current.endedAt) leases.set(event.id, { ...current, endedAt: event.at,
         endReason: event.event === 'lease-reaped' ? event.reason : event.reason,
@@ -108,6 +123,45 @@ export function activeResourceLeases(events: readonly ResourceLedgerEvent[]): Re
     }
   }
   return [...leases.values()].filter(lease => !lease.endedAt);
+}
+
+
+
+/** Latest authoritative machine-pool declarations from the Nexus resource ledger. */
+export function activeResourcePools(events: readonly ResourceLedgerEvent[]): MachinePoolDeclaration[] {
+  const pools = new Map<string, MachinePoolDeclaration>();
+  for (const event of events) if (event.event === 'pool-declared') {
+    const pool = parseMachinePoolDeclarations({ pools: [event.pool] })[0]!;
+    pools.set(pool.purpose + '/' + pool.fanoutGroupId, pool);
+  }
+  return [...pools.values()];
+}
+
+/** Most recent per-Pod image/runtime/environment/job/cleanup identity from the Nexus resource ledger. */
+export function latestWarmPoolPodReceipts(events: readonly ResourceLedgerEvent[]): WarmPoolPodReceipt[] {
+  const receipts = new Map<string, WarmPoolPodReceipt>();
+  for (const event of events) if (event.event === 'pool-pod-receipt')
+    receipts.set(event.receipt.host + '/' + event.receipt.podUid, event.receipt);
+  return [...receipts.values()];
+}
+
+/** Append a structured per-Pod receipt; cleanup state is explicit and cannot be inferred from a missing field. */
+export function recordWarmPoolPodReceipt(receipt: WarmPoolPodReceipt, now = new Date(), path?: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/.test(receipt.host) || !receipt.podUid.trim()
+    || !/^sha256:[a-f0-9]{64}$/.test(receipt.digest) || !receipt.runtime.trim() || !receipt.environment.trim()
+    || !receipt.lastJob.trim() || !receipt.cleanupResult.procedure.trim() || !receipt.cleanupResult.reason.trim()
+    || !Number.isFinite(Date.parse(receipt.cleanupResult.verifiedAt))
+    || !['clean', 'unclean', 'unknown'].includes(receipt.cleanupResult.state))
+    throw new Error('invalid warm-pool Pod receipt');
+  const target = path ?? resourceLedgerPath();
+  withLedgerLock(target, () => appendEvent({ event: 'pool-pod-receipt', at: now.toISOString(), receipt }, target));
+}
+
+/** Append a validated pool declaration to the shared resource ledger (Nexus owns this file). */
+export function declareResourcePool(pool: MachinePoolDeclaration, now = new Date(), path?: string): void {
+  const validated = parseMachinePoolDeclarations({ pools: [pool] })[0]!;
+  const target = path ?? resourceLedgerPath();
+  withLedgerLock(target, () => appendEvent({ event: 'pool-declared', at: now.toISOString(), pool: validated }, target));
 }
 
 function withLedgerLock(path: string, action: () => void): void {
@@ -160,20 +214,23 @@ export function endResourceLease(id: string, reason: string, stoppedBy: string, 
 }
 
 /** Append the final reaped event only if the observed lease version is still current under the ledger lock. */
-export function reapResourceLeaseIfCurrent(input: { id: string; expectedHeartbeatAt: string; expectedExpiresAtMs: number; observedAtMs: number }, path?: string): boolean {
+export function reapResourceLeaseIfCurrent(input: { id: string; expectedHeartbeatAt: string; expectedExpiresAtMs: number; observedAtMs: number; reason?: 'expired-and-absent' | 'machine-disappeared' }, path?: string): boolean {
   if (!input.id.trim() || !Number.isFinite(Date.parse(input.expectedHeartbeatAt))
     || !Number.isSafeInteger(input.expectedExpiresAtMs) || !Number.isSafeInteger(input.observedAtMs)
-    || input.observedAtMs < input.expectedExpiresAtMs) return false;
+    || (input.reason === 'machine-disappeared' && input.observedAtMs < Date.parse(input.expectedHeartbeatAt))
+    || (input.reason !== 'machine-disappeared' && input.observedAtMs < input.expectedExpiresAtMs)) return false;
   const target = path ?? resourceLedgerPath();
   let reaped = false;
   withLedgerLock(target, () => {
     const current = activeResourceLeases(readResourceLedger(target)).find(lease => lease.id === input.id);
     if (!current || current.heartbeatAt !== input.expectedHeartbeatAt
       || Date.parse(current.heartbeatAt) + current.ttlMs !== input.expectedExpiresAtMs
-      || input.observedAtMs < Date.parse(current.heartbeatAt) + current.ttlMs) return;
+      || (input.reason === 'machine-disappeared' && input.observedAtMs < Date.parse(current.heartbeatAt))
+      || (input.reason !== 'machine-disappeared'
+        && input.observedAtMs < Date.parse(current.heartbeatAt) + current.ttlMs)) return;
     const at = new Date(input.observedAtMs).toISOString();
     appendEvent({ event: 'lease-reaped', at, id: current.id, expectedHeartbeatAt: input.expectedHeartbeatAt,
-      expectedExpiresAt: new Date(input.expectedExpiresAtMs).toISOString(), observedAt: at, reason: 'expired-and-absent' }, target);
+      expectedExpiresAt: new Date(input.expectedExpiresAtMs).toISOString(), observedAt: at, reason: input.reason ?? 'expired-and-absent' }, target);
     reaped = true;
   });
   return reaped;

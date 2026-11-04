@@ -173,6 +173,14 @@ function printInventory(hosts: readonly RemoteElnInventoryHost[], json: boolean)
   }
 }
 
+function resolveSidetabRegisterRef(
+  rows: readonly PtyManifestRow[],
+  ref: string,
+): { readonly row?: PtyManifestRow; readonly ambiguous: boolean } {
+  const matches = rows.filter((candidate) => candidate.id === ref || candidate.nickname === ref);
+  return matches.length > 1 ? { ambiguous: true } : { row: matches[0], ambiguous: false };
+}
+
 export function resolveSidetabUnregisterRef(
   registrations: readonly PtySidetabRegistration[],
   ref: string,
@@ -225,7 +233,13 @@ export function registerRemoteElnPtyCommands(
     .requiredOption('--by <person>', 'person who explicitly registered this session')
     .description('Register a live TUI for side-tab display; ordinary PTYs cannot be registered')
     .action((ref: string, options: { host: string; name: string; by: string }) => {
-      const row = deps.rows().find((candidate) => candidate.id === ref || candidate.nickname === ref);
+      const resolved = resolveSidetabRegisterRef(deps.rows(), ref);
+      if (resolved.ambiguous) {
+        process.stderr.write(`pty sidetab register: ambiguous registration ref: ${ref}\n`);
+        process.exitCode = 2;
+        return;
+      }
+      const row = resolved.row;
       if (!row || !row.alive || !isElanousTuiManifestRow(row)) {
         process.stderr.write(`pty sidetab register: live TUI ref not found: ${ref}\n`);
         process.exitCode = 1;

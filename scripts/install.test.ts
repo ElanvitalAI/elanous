@@ -4,6 +4,7 @@ import { chmodSync, copyFileSync, existsSync, symlinkSync, lstatSync, mkdtempSyn
 import { homedir, tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
+import { isUnprivilegedGitRepairOnlyFailure } from './install-doctor-result';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -69,13 +70,30 @@ function expectCommandsMissing(commands: string[], path: string): void {
   }
 }
 
+function isolatedDoctorBin(env: ReturnType<typeof setup>): string {
+  const bin = join(env.dir, 'doctor-test-bin');
+  mkdirSync(bin, { recursive: true });
+  if (!existsSync(join(bin, 'git'))) symlinkSync('/usr/bin/git', join(bin, 'git'));
+  if (!existsSync(join(bin, 'bun'))) symlinkSync(process.execPath, join(bin, 'bun'));
+  for (const [name, output] of [['gh', 'gh version 2.0.0'], ['rg', 'ripgrep 14.0.0'], ['codex', 'codex 1.0.0']] as const) {
+    const path = join(bin, name);
+    if (existsSync(path)) continue;
+    writeFileSync(path, `#!/bin/sh\nif [ "$1" = auth ] && [ "$2" = status ]; then exit 1; fi\necho '${output}'\n`, { mode: 0o755 });
+  }
+  return bin;
+}
+
 function run(args: string[], env: ReturnType<typeof setup> = setup(), path = hostPathWithoutEln(), cwd = repoRoot, extra: Record<string, string> = {}) {
-  const result = spawnSync('/bin/bash', [installer, ...args], {
+  // Existing installer behavior tests consent to the install explicitly; refusal is covered separately.
+  const refusingConsent = extra.ELANOUS_INSTALL_ANSWER?.toLowerCase() === 'n';
+  const effectiveArgs = args.includes('--help') || refusingConsent ? args : ['--yes', ...args];
+  const doctorBin = isolatedDoctorBin(env);
+  const result = spawnSync('/bin/bash', [installer, ...effectiveArgs], {
     cwd,
     encoding: 'utf8',
     // BUN_INSTALL points at the isolated home: install.sh prepends `${BUN_INSTALL}/bin`, and the host's (~/.bun) may hold an eln.
     // The package cache stays the host's — the offline install path depends on it.
-    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), BUN_INSTALL: join(env.home, '.bun'), BUN_INSTALL_CACHE_DIR: hostBunCache, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ELANOUS_INSTALL_LANG: 'en', ...extra },
+    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), BUN_INSTALL: join(env.home, '.bun'), BUN_INSTALL_CACHE_DIR: hostBunCache, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ELANOUS_INSTALL_LANG: 'en', ...extra, NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin },
   });
   return { ...env, result };
 }
@@ -121,6 +139,25 @@ function pack(destination: string): string {
 }
 
 describe('scripts/install.sh', () => {
+  test('only an otherwise-healthy report with explicit sudo denial for git install is non-blocking', () => {
+    const healthyGitDenied = { report: { ok: true }, gitInstall: { ran: true, ok: false, permissionDenied: true } };
+    expect(isUnprivilegedGitRepairOnlyFailure(healthyGitDenied)).toBe(true);
+    expect(isUnprivilegedGitRepairOnlyFailure({ report: { ok: true }, gitInstall: { ran: true, ok: false, permissionDenied: false } })).toBe(false);
+    expect(isUnprivilegedGitRepairOnlyFailure({ report: { ok: false }, gitInstall: { ran: true, ok: false, permissionDenied: true } })).toBe(false);
+    expect(isUnprivilegedGitRepairOnlyFailure({ report: { ok: true }, gitInstall: { ran: false, ok: false, permissionDenied: true } })).toBe(false);
+    expect(isUnprivilegedGitRepairOnlyFailure({ report: { ok: true }, gitInstall: { ran: true, ok: true, permissionDenied: true } })).toBe(false);
+    // Aggregate doctor stderr must never turn another repair's permission error into a git exception.
+    expect(isUnprivilegedGitRepairOnlyFailure({ report: { ok: true }, gitInstall: { ran: true, ok: false } })).toBe(false);
+  });
+
+  test('release tarball contains the doctor result helper at the installed path used by install.sh', () => {
+    const packed = pack(fixture());
+    const listing = spawnSync('tar', ['-tzf', packed], { encoding: 'utf8' });
+    expect(listing.status, listing.stderr).toBe(0);
+    expect(listing.stdout).toContain('package/scripts/install-doctor-result.ts');
+    expect(readFileSync(installer, 'utf8')).toContain('$PREFIX/current/node_modules/elanous/scripts/install-doctor-result.ts');
+  }, 120_000);
+
   test('package bin exposes elanous and eln through the same entrypoint, without mda', () => {
     expect(packageJson.bin).toEqual({ elanous: './bin/elanous.cjs', eln: './bin/elanous.cjs' });
   });
@@ -145,7 +182,8 @@ describe('scripts/install.sh', () => {
     const shortVersion = spawnSync(eln, ['--version'], { encoding: 'utf8', env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache') } });
     expect(shortVersion.status, shortVersion.stderr).toBe(0);
     expect(shortVersion.stdout).toBe(version.stdout);
-    expect(result.stdout).toContain('eln harness say');
+    expect(result.stdout).toContain('Setup: prerequisite repairs completed.');
+    expect(result.stdout).toContain('Next:');
     const metadata = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8')) as Record<string, string>;
     expect(metadata.version).toBe(packageJson.version);
     expect(metadata.source).toBe(realpathSync(repoRoot));
@@ -162,8 +200,8 @@ describe('scripts/install.sh', () => {
     const installed = run(['--no-modify-path'], env);
     expect(installed.result.status, installed.result.stderr).toBe(0);
     expect(installed.result.stdout.match(/⚠ eln:/g)).toHaveLength(1);
-    expect(installed.result.stdout).toContain('elanous harness say');
-    expect(installed.result.stdout).not.toContain('eln harness say');
+    expect(installed.result.stdout).toContain('Setup: prerequisite repairs completed.');
+    expect(installed.result.stdout).toContain('Next:');
     expect(readFileSync(eln, 'utf8')).toBe('#!/bin/sh\necho other\n');
     expect(spawnSync(eln, [], { encoding: 'utf8' }).stdout).toBe('other\n');
   }, 120_000);
@@ -178,8 +216,8 @@ describe('scripts/install.sh', () => {
     const installed = run(['--no-modify-path'], env, `${pathDir}:${process.env.PATH ?? ''}`);
     expect(installed.result.status, installed.result.stderr).toBe(0);
     expect(installed.result.stdout.match(/⚠ eln:/g)).toHaveLength(1);
-    expect(installed.result.stdout).toContain('elanous harness say');
-    expect(installed.result.stdout).not.toContain('eln harness say');
+    expect(installed.result.stdout).toContain('Setup: prerequisite repairs completed.');
+    expect(installed.result.stdout).toContain('Next:');
     expect(existsSync(join(env.prefix, 'bin', 'eln'))).toBe(false);
     expect(spawnSync(foreign, [], { encoding: 'utf8' }).stdout).toBe('other\n');
   }, 120_000);
@@ -296,7 +334,7 @@ describe('scripts/install.sh', () => {
       encoding: 'utf8', env: { ...process.env, HOME: env.home, PATH: process.env.PATH ?? '' },
     });
     expect(loaded.status).toBe(0);
-    expect(loaded.stdout.trim()).toBe(join(realpathSync(env.prefix), 'bin', 'elanous'));
+    expect(loaded.stdout.trim().split('\n').at(-1)).toBe(join(realpathSync(env.prefix), 'bin', 'elanous'));
   }, 120_000);
 
   test('--no-modify-path preserves the startup file byte-for-byte', () => {
@@ -464,6 +502,87 @@ describe('scripts/install.sh', () => {
     expect(result.stderr).toContain('   sudo apt-get install -y curl unzip');
   });
 
+  test('consented Ubuntu install uses sudo apt to prepare bun bootstrap prerequisites', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(1000, 'ID=ubuntu\nVERSION_ID="24.04"\n');
+    writeFileSync(join(path, 'sudo'), '#!/bin/sh\nif [ "$1" = -n ] && [ "$2" = -l ]; then exit 0; fi\nexec "$@"\n', { mode: 0o755 });
+    const { result } = run(['--no-modify-path'], env, path, repoRoot, extra);
+    expect(readFileSync(calls, 'utf8')).toBe('update -qq\ninstall -y -qq curl unzip\n');
+    expect(result.stderr).toContain('installed: curl unzip');
+    expect(result.stderr).not.toMatch(/required command missing: [^\n]*\b(?:curl|unzip)\b/);
+  });
+
+  test('interactive Ubuntu install verifies sudo privilege before attempting apt', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(1000, 'ID=ubuntu\nVERSION_ID="24.04"\n');
+    const sudoCalls = join(env.dir, 'sudo-calls');
+    writeFileSync(join(path, 'sudo'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${sudoCalls}'\nexit 1\n`, { mode: 0o755 });
+    const script = spawnSync('/bin/bash', ['-c', 'command -v script'], { encoding: 'utf8' }).stdout.trim();
+    if (!script) throw new Error('script(1) is required to exercise the installer TTY path');
+    const command = ['/bin/bash', installer, '--yes', '--no-modify-path'].join(' ');
+    const args = process.platform === 'darwin' ? ['-q', '/dev/null', '/bin/bash', installer, '--yes', '--no-modify-path'] : ['-qec', command, '/dev/null'];
+    const result = spawnSync(script, args, {
+      cwd: repoRoot, encoding: 'utf8',
+      env: { ...process.env, HOME: env.home, PATH: path,
+        ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_INTERACTIVE: '1', CI: '', ...extra },
+    });
+    expect(readFileSync(sudoCalls, 'utf8').trim().split('\n')).toEqual(['-n -l apt-get', '-l apt-get']);
+    expect(existsSync(calls)).toBe(false);
+    expect(result.status).not.toBe(0);
+  });
+
+  test('does not probe sudo when apt is disabled or Bun and unzip are already present', () => {
+    const disabled = aptPrerequisiteFixture(1000, 'ID=ubuntu\nVERSION_ID="24.04"\n');
+    const disabledCalls = join(disabled.env.dir, 'sudo-calls');
+    writeFileSync(join(disabled.path, 'sudo'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${disabledCalls}'\nexit 1\n`, { mode: 0o755 });
+    run(['--no-install-deps'], disabled.env, disabled.path, repoRoot, disabled.extra);
+    expect(existsSync(disabledCalls)).toBe(false);
+
+    const ready = aptPrerequisiteFixture(1000, 'ID=ubuntu\nVERSION_ID="24.04"\n');
+    const readyCalls = join(ready.env.dir, 'sudo-calls');
+    writeFileSync(join(ready.path, 'sudo'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${readyCalls}'\nexit 1\n`, { mode: 0o755 });
+    for (const name of ['bun', 'unzip']) writeFileSync(join(ready.path, name), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    run(['--no-bootstrap-bun'], ready.env, ready.path, repoRoot, ready.extra);
+    expect(existsSync(readyCalls)).toBe(false);
+  });
+
+  test('non-root Ubuntu without sudo privileges uses Python extraction and retains Bun after shim cleanup', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(1000, 'ID=ubuntu\nVERSION_ID="24.04"\n');
+    // The binary exists, but this account cannot run sudo without a password or a terminal.
+    writeFileSync(join(path, 'sudo'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const python3 = spawnSync('/usr/bin/env', ['python3', '-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim();
+    if (!python3) throw new Error('Python 3 is required for the unzip fallback test');
+    symlinkSync(python3, join(path, 'python3'));
+    const marker = join(env.home, 'extracted-bun-called');
+    const archive = join(env.home, 'bun-test.zip');
+    const bunStub = `#!/bin/sh\nprintf '%s\\n' "$*" >> '${marker}'\n`;
+    const zipped = spawnSync(python3, ['-c', 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1], "w"); z.writestr("bin/bun", sys.argv[2]); z.close()', archive, bunStub], { encoding: 'utf8' });
+    if (zipped.status !== 0) throw new Error(`could not create the Bun test archive: ${zipped.stderr}`);
+    writeFileSync(join(path, 'curl'), [
+      '#!/bin/bash',
+      "cat <<'INSTALLER'",
+      '#!/bin/bash',
+      'command -v unzip >/dev/null || exit 61',
+      'unzip -oqd "${BUN_INSTALL:-$HOME/.bun}" "$HOME/bun-test.zip" || exit 62',
+      'chmod +x "${BUN_INSTALL:-$HOME/.bun}/bin/bun" || exit 63',
+      '"${BUN_INSTALL:-$HOME/.bun}/bin/bun" bootstrap || exit 64',
+      'INSTALLER',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    for (const command of ['bash', 'cat', 'mktemp', 'mkdir', 'rm']) {
+      const resolved = spawnSync('/bin/bash', ['-c', 'command -v "$1"', '--', command], { encoding: 'utf8' }).stdout.trim();
+      if (resolved) symlinkSync(resolved, join(path, command));
+    }
+    const invalidTarball = join(env.dir, 'invalid.tgz');
+    writeFileSync(invalidTarball, 'not a tarball');
+    const { result } = run(['--source', invalidTarball, '--no-modify-path'], env, path, repoRoot, { ...extra, TMPDIR: env.dir });
+    expect(existsSync(calls)).toBe(false);
+    expect(result.stderr).toContain('using Python zip extraction for Bun bootstrap');
+    expect(readFileSync(marker, 'utf8')).toContain('bootstrap');
+    expect(readFileSync(marker, 'utf8')).toContain('-e');
+    expect(result.stderr).not.toContain('required command missing: unzip');
+    expect(result.stderr).not.toContain('required command missing: bun');
+    expect(readdirSync(env.dir).some(name => name.startsWith('elanous-unzip-shim.'))).toBe(false);
+  });
+
   test('--no-install-deps disables apt for root without changing the existing hint', () => {
     const { env, path, calls, extra } = aptPrerequisiteFixture(0);
     const { result } = run(['--no-install-deps'], env, path, repoRoot, extra);
@@ -586,7 +705,7 @@ describe('scripts/install.sh', () => {
       cwd: workdir, encoding: 'utf8', env: { ...process.env, HOME: env.home, PATH: process.env.PATH ?? '' },
     });
     expect(loaded.status).toBe(0);
-    expect(loaded.stdout.split(':')[0]).toBe(join(expectedPrefix, 'bin'));
+    expect(loaded.stdout.trim().split('\n').at(-1)?.split(':')[0]).toBe(join(expectedPrefix, 'bin'));
     expect(readFileSync(env.startup, 'utf8')).not.toContain('not-run\n');
   }, 120_000);
 
@@ -606,65 +725,68 @@ describe('scripts/install.sh', () => {
     expect((statSync(helper).mode & 0o111) !== 0).toBe(process.platform === 'darwin');
   }, 120_000);
 
-  // 결정 2026-09-23 — Phase 3 「사람 손」: 설치가 끝나면 «지금 상태로 계산한» 다음 걸음을 말한다.
-  test('ends with next steps in order — new shell → elanous first setup → harness say · no separate login · never a provider-config step (INST1)', () => {
+  test('reports automatic setup and keeps the remaining Next steps', () => {
     const env = setup();
     const fresh = run(['--no-modify-path'], env);
     expect(fresh.result.status, fresh.result.stderr).toBe(0);
-    const next = fresh.result.stdout.slice(fresh.result.stdout.indexOf('Next:'));
-    const shell = next.indexOf('to PATH');
-    const firstSetup = next.indexOf('# first-time setup');
-    const say = next.indexOf('harness say');
-    expect(shell).toBeGreaterThan(-1);
-    expect(firstSetup).toBeGreaterThan(shell);
-    expect(say).toBeGreaterThan(firstSetup);
-    expect(next).not.toContain('elanous login');   // first-time setup signs in
-    expect(next).not.toContain('llm.provider');   // auto 는 로그인만 있으면 런타임이 codex 로 고른다(#19950)
+    expect(fresh.result.stdout.match(/Setup: prerequisite repairs completed\./g)).toHaveLength(1);
+    expect(fresh.result.stdout).toContain('Next:');
+    expect(fresh.result.stdout).toContain('check anytime: elanous setup --non-interactive');
+    expect(fresh.result.stdout).not.toContain('harness command missing');
   }, 180_000);
 
-  test('Next does not require native build tools and still suggests ripgrep only when missing', () => {
-    const packed = pack(fixture());
+  test('automatic setup output preserves the remaining next-step guidance', () => {
     const env = setup();
-    const pathDir = join(env.dir, 'path');
-    mkdirSync(pathDir);
-    const release = join(env.dir, 'os-release');
-    writeFileSync(release, 'ID=debian\nVERSION_ID="12"\n');
-    for (const name of ['git', 'bun', 'make', 'c++', 'rg']) {
-      const real = spawnSync('/bin/bash', ['-c', `command -v ${name}`], { encoding: 'utf8' }).stdout.trim();
-      if (real) writeFileSync(join(pathDir, name), `#!/bin/sh\nexec ${real} "$@"\n`, { mode: 0o755 });
-    }
-    const extra = { ELANOUS_INSTALL_OS_RELEASE_FILE: release };
-    const install = (path: string) => run(['--source', packed, '--no-modify-path'], env, path, repoRoot, extra);
-    // Keep system utilities but hide only the three commands under test.
-    const missingDir = join(env.dir, 'missing');
-    mkdirSync(missingDir);
-    for (const name of ['git', 'bun']) copyFileSync(join(pathDir, name), join(missingDir, name));
-    // The Debian branch is chosen by `uname -s`; report Linux so this also runs on a Mac.
-    writeFileSync(join(missingDir, 'uname'), '#!/bin/sh\nif [ "$1" = "-s" ]; then echo Linux; else exec /usr/bin/uname "$@"; fi\n', { mode: 0o755 });
-    const hidden = join(env.dir, 'hidden');
-    mkdirSync(hidden);
-    const systemPath = process.env.PATH ?? '';
-    for (const dir of systemPath.split(':')) {
-      if (!dir || !existsSync(dir)) continue;
-      for (const name of readdirSync(dir)) {
-        if (['make', 'c++', 'rg'].includes(name)) continue;
-        // The first directory on PATH wins; a dangling link already made for an earlier directory reads as absent to existsSync.
-        try { symlinkSync(join(dir, name), join(hidden, name)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-      }
-    }
-    const missing = install(`${missingDir}:${hidden}`);
-    expect(missing.result.status, missing.result.stderr).toBe(0);
-    const next = missing.result.stdout.slice(missing.result.stdout.indexOf('Next:'));
-    expect(next).not.toContain('build-essential');
-    expect(next).not.toContain('rebuild node-pty');
-    expect(next).toContain('sudo apt-get install -y ripgrep');
-    for (const name of ['make', 'c++', 'rg']) writeFileSync(join(missingDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-    const present = install(`${missingDir}:${hidden}`);
-    expect(present.result.status, present.result.stderr).toBe(0);
-    const already = present.result.stdout.slice(present.result.stdout.indexOf('Next:'));
-    expect(already).not.toContain('build-essential');
-    expect(already).not.toContain('doctor --fix --yes');
-    expect(already).not.toContain('install -y ripgrep');
+    const result = run(['--no-modify-path', '--no-setup'], env).result;
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('Setup: prerequisite repairs completed.');
+    expect(result.stdout).toContain('Next:');
+    expect(result.stdout).toContain('check anytime: elanous setup --non-interactive');
+    expect(result.stdout).not.toContain('harness command missing');
+    expect(result.stdout).not.toContain('build-essential');
+    expect(result.stdout).not.toContain('rebuild node-pty');
+  }, 180_000);
+
+  test('Next guidance recognizes gh installed into the selected prefix', () => {
+    const env = setup();
+    const first = run(['--no-modify-path', '--no-setup'], env);
+    expect(first.result.status, first.result.stderr).toBe(0);
+    const gh = join(env.prefix, 'bin', 'gh');
+    mkdirSync(join(env.prefix, 'bin'), { recursive: true });
+    writeFileSync(gh, '#!/bin/sh\nif [ "$1" = auth ] && [ "$2" = status ]; then exit 1; fi\necho gh version 2.0.0\n', { mode: 0o755 });
+    const retry = run(['--no-modify-path', '--no-setup'], env);
+    expect(retry.result.status, retry.result.stderr).toBe(0);
+    expect(retry.result.stdout).toContain('gh auth login');
+    expect(retry.result.stdout).not.toContain('install gh');
+  }, 180_000);
+
+  test('installed macOS CLI repairs missing prerequisites through isolated brew and re-probes them', () => {
+    if (process.platform !== 'darwin') return; // Linux static-tool install and re-probe are covered by the injected production-path doctor CLI test.
+    const env = setup();
+    const installed = run(['--no-modify-path', '--no-setup'], env);
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    const mockBin = join(env.dir, 'doctor-mock-bin');
+    mkdirSync(mockBin);
+    const record = join(env.dir, 'doctor-brew-calls');
+    writeFileSync(join(mockBin, 'brew'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${record}'\ncase "$*" in\n  *gh*) tool=gh ;;\n  *ripgrep*) tool=rg ;;\n  *codex*) tool=codex ;;\n  *) exit 2 ;;\nesac\ncat > '${mockBin}'/"$tool" <<'TOOL'\n#!/bin/sh\ncase "$0" in *gh) [ "$1" = auth ] && exit 1; echo 'gh version 2.0.0' ;; *rg) echo 'ripgrep 14.0.0' ;; *codex) echo 'codex 1.0.0' ;; esac\nTOOL\nchmod +x '${mockBin}'/"$tool"\n`, { mode: 0o755 });
+    symlinkSync('/usr/bin/git', join(mockBin, 'git'));
+    symlinkSync(process.execPath, join(mockBin, 'bun'));
+    const path = pathWithoutCommands(['gh', 'rg', 'codex'], `${mockBin}:/usr/bin:/bin`);
+    expectCommandsMissing(['gh', 'rg', 'codex'], path);
+    const entry = join(env.prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs');
+    const doctorEnv = { HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_FAST_ROUTER: '0', NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: mockBin, PATH: path, TMPDIR: env.dir, LANG: 'C' };
+    const before = spawnSync('/usr/bin/env', ['-i', ...Object.entries(doctorEnv).map(([name, value]) => `${name}=${value}`), process.execPath, entry, 'doctor', '--json'], { cwd: repoRoot, encoding: 'utf8', timeout: 120_000 });
+    const beforeReport = JSON.parse(before.stdout) as { externalCommands: Array<{ name: string; status: string }> };
+    expect(beforeReport.externalCommands.filter((command) => ['gh', 'rg', 'codex'].includes(command.name)).map(({ name, status }) => ({ name, status }))).toEqual(['gh', 'rg', 'codex'].map((name) => ({ name, status: 'missing' })));
+    const doctor = spawnSync('/usr/bin/env', ['-i', ...Object.entries(doctorEnv).map(([name, value]) => `${name}=${value}`), process.execPath, entry, 'doctor', '--fix', '--yes', '--setup-tools', '--json'], {
+      cwd: repoRoot, encoding: 'utf8', timeout: 120_000,
+    });
+    expect(doctor.status, doctor.stderr).toBe(0);
+    const result = JSON.parse(doctor.stdout) as { report: { externalCommands: Array<{ name: string; status: string }> } };
+    expect(['gh', 'rg', 'codex'].every((name) => result.report.externalCommands.find((command) => command.name === name)?.status === 'found')).toBe(true);
+    expect(existsSync(record), `doctor did not invoke isolated brew: ${JSON.stringify(result.report.externalCommands)}`).toBe(true);
+    expect(readFileSync(record, 'utf8').trim().split('\n')).toEqual(['install gh', 'install ripgrep', 'install --cask codex']);
+    expect(existsSync(join(mockBin, 'gh')) && existsSync(join(mockBin, 'rg')) && existsSync(join(mockBin, 'codex'))).toBe(true);
   }, 240_000);
 
   test('nexus boot banner has no internal phase or PR markers and keeps exit and service help', () => {
@@ -848,9 +970,10 @@ describe('scripts/install.sh', () => {
     const copied = join(lonely, 'install.sh');
     copyFileSync(installer, copied);
     const env = setup();
-    const result = spawnSync('/bin/bash', [copied, '--no-modify-path'], {
+    const doctorBin = isolatedDoctorBin(env);
+    const result = spawnSync('/bin/bash', [copied, '--yes', '--no-modify-path'], {
       cwd: lonely, encoding: 'utf8',
-      env: { ...process.env, HOME: env.home, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: `file://${release}`, ELANOUS_VERSION: '', ...extra },
+      env: { ...process.env, HOME: env.home, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: `file://${release}`, ELANOUS_VERSION: '', ...extra, NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin },
     });
     return { ...env, result };
   }
@@ -914,7 +1037,7 @@ test('reuses bun from ${BUN_INSTALL}/bin when bun is not on PATH', () => {
       const real = spawnSync('/bin/sh', ['-c', `command -v ${c}`], { encoding: 'utf8' }).stdout.trim();
       if (real) spawnSync('/bin/ln', ['-s', real, join(stub, c)]);
     }
-    const r = spawnSync('/bin/bash', [installer, '--no-modify-path', '--no-bootstrap-bun', '--prefix', join(home, 'prefix')], {
+    const r = spawnSync('/bin/bash', [installer, '--yes', '--no-modify-path', '--no-bootstrap-bun', '--prefix', join(home, 'prefix')], {
       cwd: repoRoot, encoding: 'utf8', env: { HOME: home, PATH: stub, BUN_INSTALL: join(home, '.bun') },
     });
     expect(`${r.stdout}${r.stderr}`).toContain('REUSED-BUN');
@@ -945,11 +1068,12 @@ describe('INST2 — finish in the same window', () => {
     const record = join(env.dir, 'setup-tty');
     const exec = join(env.dir, 'fake-setup-tty');
     writeFileSync(exec, `#!/bin/sh\nprintf '%s' "$ELANOUS_INSTALL_SETUP_TTY" > '${record}'\n`, { mode: 0o755 });
-    const command = ['/bin/bash', installer, '--no-modify-path'];
+    const doctorBin = isolatedDoctorBin(env);
+    const command = ['/bin/bash', installer, '--yes', '--no-modify-path'];
     const argv = process.platform === 'darwin' ? ['-q', '/dev/null', ...command] : ['-qec', command.join(' '), '/dev/null'];
     const result = spawnSync('script', argv, {
       cwd: repoRoot, encoding: 'utf8',
-      env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, ELANOUS_INSTALL_LANG: 'en', CI: '' },
+      env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, ELANOUS_INSTALL_LANG: 'en', CI: '', NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin },
     });
     expect(result.status, result.stderr).toBe(0);
     const tty = readFileSync(record, 'utf8');
@@ -967,33 +1091,51 @@ describe('INST2 — finish in the same window', () => {
     expect(readFileSync(record, 'utf8')).toBe('/dev/tty');
   }, 180_000);
 
-  test('INST4: same-window setup drops the «new shell» step (numbering starts at 1) and Korean has no English lines of ours', () => {
+  test('INST4: same-window setup starts in Korean and keeps the remaining Next steps', () => {
     const env = setup();
     const { exec } = fakeSetup(env.dir);
     const { result } = run([], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '', ELANOUS_INSTALL_LANG: 'ko' });
     expect(result.status, result.stderr).toBe(0);
-    const next = result.stdout.slice(result.stdout.indexOf('다음:'), result.stdout.indexOf('첫 설정을 시작합니다'));
-    expect(next).not.toContain('새 셸을 여세요');
-    expect(next).toMatch(/\n {2}1\) /);
-    expect(next).not.toMatch(/install gh|install Node|the harness|rebuild node-pty|install ripgrep/);
+    expect(result.stdout).toContain('설정: 필수 환경 복구를 완료했습니다.');
+    expect(result.stdout).toContain('다음:');
+    expect(result.stdout).not.toMatch(/install gh|install Node|the harness|rebuild node-pty|install ripgrep/);
     expect(result.stderr).not.toContain('harness command missing');
   }, 180_000);
 
-  test('non-interactive: never starts setup and the first Next line is the absolute Run command', () => {
+  test('headless fresh install starts web first-run without requiring /dev/tty', () => {
     const env = setup();
     const { exec, record } = fakeSetup(env.dir);
-    const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec });
+    const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
     expect(result.status, result.stderr).toBe(0);
-    expect(existsSync(record)).toBe(false);
-    const next = result.stdout.slice(result.stdout.indexOf('Next:')).split('\n');
-    expect(next.find((line) => line.includes('Run: '))).toContain(`Run: ${join(realpathSync(prefix), 'bin', 'elanous')}`);
-    expect(result.stdout).not.toContain('Starting first-time setup');
+    expect(readFileSync(record, 'utf8').trim()).toBe(join(realpathSync(prefix), 'bin', 'elanous'));
+    expect(result.stdout).toContain('Setup: prerequisite repairs completed.');
+    expect(result.stdout).toContain('Next:');
+    expect(result.stdout).toContain('Starting first-time setup');
+  }, 180_000);
+
+  test('headless setup handoff marks the installer opt-in and does not fabricate a terminal', () => {
+    const env = setup();
+    const record = join(env.dir, 'setup-env');
+    const exec = join(env.dir, 'fake-setup-env');
+    writeFileSync(exec, `#!/bin/sh\nprintf '%s|%s|%s' "$1" "$ELANOUS_INSTALL_FIRST_RUN" "\${ELANOUS_INSTALL_SETUP_TTY-unset}" > '${record}'\n`, { mode: 0o755 });
+    const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(record, 'utf8')).toBe(`${join(realpathSync(prefix), 'bin', 'elanous')}|1|unset`);
   }, 180_000);
 
   test('--no-setup: an interactive terminal still does not start setup', () => {
     const env = setup();
     const { exec, record } = fakeSetup(env.dir);
     const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(record)).toBe(false);
+    expect(result.stdout).not.toContain('Starting first-time setup');
+  }, 180_000);
+
+  test('--no-setup: a fresh headless install does not start setup', () => {
+    const env = setup();
+    const { exec, record } = fakeSetup(env.dir);
+    const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
     expect(result.status, result.stderr).toBe(0);
     expect(existsSync(record)).toBe(false);
     expect(result.stdout).not.toContain('Starting first-time setup');
@@ -1045,9 +1187,8 @@ describe('INST1 — one language · no silent downgrade · ask before updating',
     const env = setup();
     plantInstalled(env.prefix, '0.0.1');
     const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_ANSWER: 'n', CI: '' });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain('Update to');
-    expect(result.stdout).toContain('Left elanous 0.0.1 as it is.');
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('consent required');
     expect(existsSync(join(env.prefix, 'bin', 'elanous'))).toBe(false);
   }, 180_000);
 
@@ -1056,8 +1197,8 @@ describe('INST1 — one language · no silent downgrade · ask before updating',
     const ko = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_LANG: 'ko' });
     expect(ko.result.status, ko.result.stderr).toBe(0);
     expect(ko.result.stdout).toContain('설치했습니다');
+    expect(ko.result.stdout).toContain('설정: 필수 환경 복구를 완료했습니다.');
     expect(ko.result.stdout).toContain('다음:');
-    expect(ko.result.stdout).toContain('첫 설정');
     expect(ko.result.stdout).not.toContain('Next:');
     expect(ko.result.stdout).not.toMatch(/쓰십시오|않았다 —/);
   }, 180_000);

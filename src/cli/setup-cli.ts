@@ -1,8 +1,7 @@
 import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
-import { createHash } from 'node:crypto';
-import { addSource, listSources } from '../intake-plane/intake-sources.js';
+import { syncStarterTopicRssSources } from '../intake-plane/intake-sources.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { Command } from 'commander';
 import { formatDoctorReport, registerDoctorCommand, runDoctor, type DoctorOptions, type DoctorReport } from './doctor-cli.js';
@@ -417,18 +416,8 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         }
       }
       const starter = configured.starter;
-      if (Array.isArray(starter?.topics) && configured.watch?.enabled !== false) {
-        const root = deps.watchRoot ?? effectiveInstanceRoot();
-        const existing = listSources({ seat: 'user' }, root);
-        for (const rawTopic of starter.topics) {
-          if (typeof rawTopic !== 'string' || !rawTopic.trim()) continue;
-          const topic = rawTopic.trim();
-          if (existing.some((source) => source.kind === 'github-query' && source.spec === topic)) continue;
-          const id = `watch-${createHash('sha256').update(topic).digest('hex').slice(0, 12)}`;
-          if (listSources({}, root).some((source) => source.id === id)) continue;
-          existing.push(addSource({ id, seat: 'user', kind: 'github-query', spec: topic, every: '1d', why: 'starter.topics' }, root));
-        }
-      }
+      const root = deps.watchRoot ?? effectiveInstanceRoot();
+      syncStarterTopicRssSources(configured.watch?.enabled === false ? undefined : starter?.topics, root);
       const accepted = opts.yes || (isStdinTty() && /^(?:y|yes)?$/i.test((await prompt('추천대로 켤까요? [Y/n] '))?.trim() ?? 'n'));
       if (accepted) {
         const runDoctorFix = deps.runDoctorFix ?? (async (args: readonly string[]) => {

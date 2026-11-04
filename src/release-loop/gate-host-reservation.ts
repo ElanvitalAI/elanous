@@ -32,13 +32,13 @@ export interface GateHostResourceSnapshot {
 
 export type GateHostResourceReading =
   | { status: 'measured'; empty: boolean; reservations: number; authoringLeases: number; waitingJobs: number; activeJobs: number }
-  | { status: 'unmeasurable'; empty: null; reason: 'lease-ledger-unavailable' | 'lease-ledger-invalid' | 'pod-list-unavailable' | 'pod-list-invalid' | 'pod-pool-invalid' };
+  | { status: 'unmeasurable'; empty: null; reason: 'lease-ledger-unavailable' | 'lease-ledger-invalid' | 'pod-list-unavailable' | 'pod-list-invalid' | 'pod-pool-invalid' | 'pod-pool-unconfigured' | 'host-not-in-pod-pool' | 'kubectl-unavailable' | 'kubectl-context-missing' | 'kubectl-api-unavailable' };
 
 const unavailable = (reason: Extract<GateHostResourceReading, { status: 'unmeasurable' }>['reason']): GateHostResourceReading => ({ status: 'unmeasurable', empty: null, reason });
 
 /** Read leases and active harness Pods from the configured pool without creating, pruning, or updating any ledger. */
 export function readGateHostResourcesForHost(host: string, env: NodeJS.ProcessEnv = process.env,
-  deps: { members?: readonly PodPoolMember[]; kubectl?: (args: readonly string[]) => { status: number | null; stdout: string };
+  deps: { members?: readonly PodPoolMember[]; kubectl?: (args: readonly string[]) => { status: number | null; stdout: string; stderr?: string; error?: string; errorCode?: string };
     processStart?: (pid: number) => string | null } = {}): GateHostResourceReading {
   let members: readonly PodPoolMember[];
   try {
@@ -51,10 +51,10 @@ export function readGateHostResourcesForHost(host: string, env: NodeJS.ProcessEn
     });
     members = deps.members ?? (spec ? parsePodPool(spec) : []);
   } catch { return unavailable('pod-pool-invalid'); }
-  if (!members.length) return unavailable('pod-list-unavailable');
+  if (!members.length) return unavailable('pod-pool-unconfigured');
   const selectedHost = host.split('@').at(-1)!;
   const selectedMembers = members.filter(member => member.sshHost === selectedHost);
-  if (!selectedMembers.length) return unavailable('pod-list-unavailable');
+  if (!selectedMembers.length) return unavailable('host-not-in-pod-pool');
   const selectedContexts = new Set(selectedMembers.map(member => member.context));
 
   const leasePool = podPoolHostLease(members);
@@ -90,14 +90,20 @@ export function readGateHostResourcesForHost(host: string, env: NodeJS.ProcessEn
 
   const kubectl = deps.kubectl ?? ((args: readonly string[]) => {
     const result = spawnSync('kubectl', [...args], { encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024 * 1024 });
-    return { status: result.status, stdout: result.stdout ?? '' };
+    const spawnError = result.error as NodeJS.ErrnoException | undefined;
+    return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: spawnError?.message, errorCode: spawnError?.code };
   });
   const activeJobs = new Map<string, PendingJobIdentity>();
   for (const member of selectedMembers) {
-    let result: { status: number | null; stdout: string };
+    let result: { status: number | null; stdout: string; stderr?: string; error?: string; errorCode?: string };
     try { result = kubectl(['--context', member.context, '--request-timeout=10s', 'get', 'pods', '--all-namespaces', '-l', 'elanous.substrate=pod', '-o', 'json']); }
-    catch { return unavailable('pod-list-unavailable'); }
-    if (result.status !== 0) return unavailable('pod-list-unavailable');
+    catch { return unavailable('kubectl-api-unavailable'); }
+    if (result.status !== 0) {
+      const diagnostic = `${result.stderr ?? ''} ${result.error ?? ''}`.toLowerCase();
+      if (result.status === null && ['ENOENT', 'EACCES', 'EISDIR'].includes(result.errorCode ?? '')) return unavailable('kubectl-unavailable');
+      if (/context .* (not found|does not exist)|no context exists/.test(diagnostic)) return unavailable('kubectl-context-missing');
+      return unavailable('kubectl-api-unavailable');
+    }
     let items: unknown;
     try { items = (JSON.parse(result.stdout) as { items?: unknown }).items; }
     catch { return unavailable('pod-list-invalid'); }

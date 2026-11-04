@@ -13,6 +13,8 @@ import { parseOptions as gateOptions } from './gate-node.js';
 import { debug } from '../../src/debug/log.js';
 import { TRACEABLE_RELEASE_JSON } from './gate-closure.js';
 import './resume-test-traffic.js';
+import { createTempGitRemote } from '../../src/ux-sim/temp-git-remote.js';
+import { withFakeBins } from '../../src/ux-sim/fake-bin.js';
 
 const releaseSnapshot = {
   graphSha: createHash('sha256').update(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'))).digest('hex'),
@@ -55,13 +57,13 @@ function addResumeRuntimeDirs(root: string): void {
   mkdirSync(join(root, 'apps', 'pwa', 'node_modules'), { recursive: true });
 }
 
-/** A bare origin, a seat clone that lands on main, and the release checkout the node runs in. */
+/** Shared temp-git-remote device supplies an isolated local origin and seat/release clones. */
 function fixture(mainVersion = '0.2.18-dev.3') {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'release-branch-')));
-  const origin = join(root, 'origin.git');
-  git(root, 'init', '--bare', '-b', 'main', origin);
-  const seat = join(root, 'seat');
-  git(root, 'clone', origin, seat);
+  const remote = createTempGitRemote();
+  const { root, remote: origin, seed: seat, checkout: repo } = remote;
+  const git = (cwd: string, ...args: string[]) => remote.git(cwd, args);
+  git(seat, 'config', 'user.name', 'fixture');
+  git(seat, 'config', 'user.email', 'fixture@example.invalid');
   writeVersion(seat, mainVersion);
   mkdirSync(join(seat, 'src'));
   writeFileSync(join(seat, 'src', 'a.ts'), 'export const a = 1;\n');
@@ -71,10 +73,10 @@ function fixture(mainVersion = '0.2.18-dev.3') {
     copyFileSync(join(import.meta.dir, '../../graphs/release', name), join(releaseDir, name));
   }
   git(seat, 'add', '-A');
-  git(seat, 'commit', '-m', 'seed');
-  git(seat, 'push', 'origin', 'HEAD:main');
-  const repo = join(root, 'release');
-  git(root, 'clone', origin, repo);
+  git(seat, 'commit', '-m', 'fixture main');
+  git(seat, 'push', 'origin', 'main');
+  git(repo, 'fetch', 'origin', 'main');
+  git(repo, 'reset', '--hard', 'origin/main');
   const land = (file: string, body: string) => {
     git(seat, 'pull', '--ff-only', 'origin', 'main');
     writeFileSync(join(seat, 'src', file), body);
@@ -84,7 +86,7 @@ function fixture(mainVersion = '0.2.18-dev.3') {
     return git(seat, 'rev-parse', 'HEAD');
   };
   const versionOn = (ref: string) => (JSON.parse(git(origin, 'show', `${ref}:package.json`)) as { version: string }).version;
-  return { root, origin, seat, repo, land, versionOn, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, origin, seat, repo, git, land, versionOn, done: remote.cleanup };
 }
 
 test('release versions: stable or rc/alpha/beta; the next free prerelease number comes from branches and tags', () => {
@@ -409,22 +411,26 @@ test('RELEASE-BRANCH: a real child records the branch-cut command fingerprint an
       '  - { from: gate, on: outcome, map: { ok: done, fail: failed, error: failed } }', ''].join('\n'));
     writeFileSync(join(probe, 'recipes.yaml'), `vr:\n  command: 'cat ${join(probe, 'vr.json')}'\n  timeout_ms: 30000\ngate:\n  command: 'bun ${join(probe, 'gate.js')}'\n  timeout_ms: 30000\n`);
     const { runGraph } = await import('../../src/graph-runner/runner.js');
-    const first = await runGraph(join(probe, 'release-loop.yaml'), { input: { version: '0.2.18', previousVersion: '0.2.17', branchCut: true }, deps: { root: state } });
-    expect(first.status).toBe('failed');
-    expect(JSON.stringify(first.nodes.find((node) => node.nodeId === 'gate')!.output)).toContain(cut.commit!);
-    const expectedArgvSha256 = createHash('sha256').update(JSON.stringify(['/bin/bash', '-c', `cat ${join(probe, 'vr.json')}`])).digest('hex');
-    const realDispatch = debug.events(500).find((entry) => entry.category === 'graph.run' && entry.event === 'command-dispatch' &&
-      (entry.data as { runId?: string; nodeId?: string }).runId === first.runId &&
-      (entry.data as { nodeId?: string }).nodeId === 'version-release');
-    const realSpawn = debug.events(500).find((entry) => entry.category === 'graph.run' && entry.event === 'command-spawn' &&
-      (entry.data as { runId?: string; nodeId?: string }).runId === first.runId &&
-      (entry.data as { nodeId?: string }).nodeId === 'version-release');
-    const spawnedPid = (realSpawn?.data as { pid?: number } | undefined)?.pid;
-    expect(typeof spawnedPid).toBe('number');
-    expect(Number(spawnedPid) > 0).toBe(true);
-    expect(realDispatch?.data).toMatchObject({ nodeId: 'version-release', recipe: 'cmd:vr', argvSha256: expectedArgvSha256, pid: null });
-    expect(realSpawn?.data).toMatchObject({ nodeId: 'version-release', recipe: 'cmd:vr', argvSha256: expectedArgvSha256,
-      pid: expect.any(Number) });
+    // Keep the graph-runner's Bash child real (PID/fingerprint contract); fake only the fixture file read.
+    await withFakeBins({ cat: { stdout: `${JSON.stringify({ outcome: 'ok', kind: 'release', version: '0.2.18', commit: cut.commit, pr: null, branch: 'release/0.2.18' })}\n` } }, async (fakeBins) => {
+      const first = await runGraph(join(probe, 'release-loop.yaml'), { input: { version: '0.2.18', previousVersion: '0.2.17', branchCut: true }, deps: { root: state } });
+      expect(first.status).toBe('failed');
+      expect(JSON.stringify(first.nodes.find((node) => node.nodeId === 'gate')!.output)).toContain(cut.commit!);
+      const expectedArgvSha256 = createHash('sha256').update(JSON.stringify(['/bin/bash', '-c', `cat ${join(probe, 'vr.json')}`])).digest('hex');
+      const realDispatch = debug.events(500).find((entry) => entry.category === 'graph.run' && entry.event === 'command-dispatch' &&
+        (entry.data as { runId?: string; nodeId?: string }).runId === first.runId &&
+        (entry.data as { nodeId?: string }).nodeId === 'version-release');
+      const realSpawn = debug.events(500).find((entry) => entry.category === 'graph.run' && entry.event === 'command-spawn' &&
+        (entry.data as { runId?: string; nodeId?: string }).runId === first.runId &&
+        (entry.data as { nodeId?: string }).nodeId === 'version-release');
+      const spawnedPid = (realSpawn?.data as { pid?: number } | undefined)?.pid;
+      expect(typeof spawnedPid).toBe('number');
+      expect(Number(spawnedPid) > 0).toBe(true);
+      expect(realDispatch?.data).toMatchObject({ nodeId: 'version-release', recipe: 'cmd:vr', argvSha256: expectedArgvSha256, pid: null });
+      expect(realSpawn?.data).toMatchObject({ nodeId: 'version-release', recipe: 'cmd:vr', argvSha256: expectedArgvSha256,
+        pid: expect.any(Number) });
+      expect(fakeBins.calls().filter((call) => call.name === 'cat')).toHaveLength(1);
+    });
   } finally { f.done(); }
 });
 

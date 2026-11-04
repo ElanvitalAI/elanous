@@ -144,6 +144,79 @@ describe('decideTuiSelfNest — TUI 안 eln/elanous 기동 거부 ⊕ 안내', (
     expect(real.reject).toBe(true);
     expect(real.output?.startsWith(TUI_SELF_NEST_REJECT_MARKER)).toBe(true);
   });
+
+  test('셸 복합 입력의 어느 조각에든 TUI 기동이 있으면 거부하고 리터럴·조회는 허용한다 (LEXICON)', () => {
+    const env = { ELANOUS_PARENT_PTY_ID: 'pty-lexicon-1', ELANOUS_NEST_DEPTH: '1' } as NodeJS.ProcessEnv;
+    const rejected = [
+      'cd /tmp && eln --name opt',
+      'printf ready; /usr/local/bin/elanous --name opt',
+      'echo safe > /tmp/out && ELANOUS_CODEX_ACCOUNT=third eln',
+      'bash -lc \'eln --name opt\'',
+      'sudo -u operator eln --name opt',
+      'sudo -E -u operator eln --name opt',
+      'nice -n 5 eln --name opt',
+      'time -o /tmp/eln-time eln --name opt',
+      'npx --yes -c \'eln --name opt\'',
+      'npx --yes --call=eln --name opt',
+      'bunx --call=eln --name opt',
+      'echo `eln --name opt`',
+      'echo $(eln --name opt)',
+      'echo safe > `eln --name opt`',
+      'echo safe > "$(eln --name opt)"',
+      'echo safe\neln --name opt',
+      'cat <<EOF\n`eln --name opt`\nEOF',
+      'node -r./bin/elanous.mjs --name opt',
+      '! eln --name opt',
+      'then eln --name opt',
+      'do eln --name opt',
+      '{ eln --name opt; }',
+      'watch -n 1 eln --name opt',
+      'printf eln | xargs -I{} tmux new-session {}',
+      'screen -dmS nested eln --name opt',
+      'eval "eln --name opt"',
+      'ssh host eln --name opt',
+      'setsid eln --name opt',
+      'find . -exec eln --name opt \\;',
+      'custom-launch eln --name opt',
+      'custom-launch --exec=eln --name opt',
+      'bash -c "$(echo eln)"',
+      "cat <<EOF\n$(eln --name opt)\nEOF",
+      'if eln --name opt; then echo done; fi',
+      'while eln --name opt; do echo done; done',
+      'until eln --name opt; do echo done; done',
+      'if false; then echo no; elif eln --name opt; then echo yes; fi',
+    ];
+    for (const command of rejected) expect(decideTuiSelfNest([command], env).reject).toBe(true);
+    expect(decideTuiSelfNest(['cd /tmp && eln', '--name', 'opt'], env).reject).toBe(true);
+    let deeplyWrapped = 'eln';
+    for (let depth = 0; depth < 6; depth += 1) deeplyWrapped = `bash -c ${JSON.stringify(deeplyWrapped)}`;
+    expect(decideTuiSelfNest([deeplyWrapped], env).reject).toBe(true);
+
+    let overLimitWrapper = 'eln';
+    for (let depth = 0; depth < 5; depth += 1) overLimitWrapper = `bash -c ${JSON.stringify(overLimitWrapper)}`;
+    expect(decideTuiSelfNest([overLimitWrapper], env).reject).toBe(true);
+
+    const allowed = [
+      "echo '&&' eln",
+      "echo 'eln --name opt'",
+      "echo '`eln --name opt`'",
+      'cat <<\'EOF\'\n`eln --name opt`\nEOF',
+      "echo '$(literal)'",
+      "echo 'eln --name opt'",
+      "printf 'left; right'",
+      'echo safe > eln',
+      'echo safe > /tmp/eln-output',
+      "echo safe > '`eln`'",
+      'cat <<EOF\neln\nEOF',
+      'cat <<-EOF\n\teln\n\tEOF\ncd /tmp && echo safe',
+      'cd /tmp && echo safe',
+      'eln msg list',
+      'eln --help',
+      'command -v eln',
+    ];
+    for (const command of allowed) expect(decideTuiSelfNest([command], env).reject).toBe(false);
+    expect(decideTuiSelfNest(['echo', 'eln --name opt'], env).reject).toBe(false);
+  });
 });
 
 describe('생산 진입점 wiring — dispatchPtyShellTool(PtyShellStart)', () => {

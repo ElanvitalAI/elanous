@@ -94,6 +94,8 @@ export interface GoalContinueTurnEnd {
 export interface GoalContinueController {
   /** 모델 턴이 끝났다 — 답 끝 구절을 판정해 둔다(여는 것은 check). */
   noteTurnEnded(end: GoalContinueTurnEnd): void;
+  /** A goal-loop completion is terminal until a person starts a fresh turn. */
+  noteGoalCompleted(): void;
   /** 판정된 턴 끝이 무장돼 있으면 H2 로 연다. 사람 입력이 먼저면 미뤘다가 다시 잰다. */
   check(): { opened: boolean; reason: string };
   /** 사람이 턴을 열었다 — 연속 카운터·지문을 비운다. */
@@ -120,8 +122,10 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   const openedFingerprints = new Set<string>();
   let capNotified = false;
   let retryArmed = false;
+  let completedGoal = false;
 
   const check: GoalContinueController['check'] = () => {
+    if (completedGoal) return { opened: false, reason: 'goal-completed' };
     if (!armed) return { opened: false, reason: 'not-armed' };
     const { tail, phrase, fingerprint, mode } = armed;
     // 초기화는 실제 사람 턴(noteHumanTurn)에서만 — 키만 치고 안 보낸 것으로 상한을 우회하지 못한다(r2 must-fix).
@@ -168,6 +172,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   return {
     noteTurnEnded(end) {
       armed = null;
+      if (completedGoal) return;
       if (!isEnabled()) return;
       if (end.failed) {
         log('tui.goal-continue', 'decided', { rejected: true, reason: 'turn-failed' });
@@ -189,8 +194,13 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       const phrase = remaining ?? (verdict.pledge ? verdict.phrase : '');
       armed = { tail: tail!, phrase, fingerprint: goalContinueFingerprint(remaining ?? tail!), mode: remaining ? 'remaining' : 'pledge' };
     },
+    noteGoalCompleted() {
+      completedGoal = true;
+      armed = null;
+    },
     check,
     noteHumanTurn() {
+      completedGoal = false;
       armed = null;
       consecutive = 0;
       openedFingerprints.clear();

@@ -1,0 +1,28 @@
+overlay_id: demo1104-research-arg-runtime
+target: self-implement
+stage: runtime
+applies_when: goal_id == fx_forecast_missing
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      nodeId: fx-scenario-quantification
+      kind: judge
+      recipe: observe-only
+      maxVisits: 1
+      contract:
+        inputs: [worktree]
+        tools: read-only
+        outputs: [findings]
+  - op: add
+    path: /edges/-
+    value:
+      from: review
+      on: outcome
+      map:
+        source_missing: fx-scenario-quantification
+  - op: add
+    path: /edges/-
+    value:
+      from: fx-scenario-quantification
+      to: merge

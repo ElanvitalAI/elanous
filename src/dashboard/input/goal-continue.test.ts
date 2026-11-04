@@ -88,6 +88,18 @@ describe('createGoalContinue — 턴 끝 → H2 문', () => {
     expect(h.logs.some((l) => l.category === 'tui.proactive' && l.event === 'continue')).toBe(true);
   });
 
+  test('완료된 목표는 새 사람 턴 전까지 자동 재개를 막고 사람 입력 뒤 다시 연다', () => {
+    const h = harness();
+    h.ctl.noteGoalCompleted();
+    h.ctl.noteTurnEnded({ lines: ['남은 작업은 자막 검증입니다. 아직 확정하지 못했습니다.'] });
+    expect(h.ctl.check()).toEqual({ opened: false, reason: 'goal-completed' });
+    expect(h.calls).toHaveLength(0);
+    h.ctl.noteHumanTurn();
+    h.ctl.noteTurnEnded({ lines: ['남은 작업은 자막 검증입니다. 아직 확정하지 못했습니다.'] });
+    expect(h.ctl.check().opened).toBe(true);
+    expect(h.calls).toHaveLength(1);
+  });
+
   test('로그인·승인처럼 사람 몫이면 자동 턴을 열지 않고 stop-human 을 남긴다', () => {
     const h = harness();
     h.ctl.noteTurnEnded({ lines: ['남은 작업은 계정 로그인입니다. 로그인해 주세요.'] });

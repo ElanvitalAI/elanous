@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { describe, it, expect, spyOn } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -24,7 +25,7 @@ import { debug } from '../debug/log.js';
 import { releasePathHoldComment } from './release-path-guard.js';
 import { createRepositoryReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { loadReviewerContext, reviewerContextArgs } from '../agent-substrate/self-review-cli.js';
-import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
+import { DEFAULT_BRANCH_WORKTREE_BASE, resolveMainRepoRoot } from '../git-fs/worktree.js';
 import { loadSelfDevRun, selfDevRunsDir } from './run-store.js';
 import { ensureRunIdentity } from '../harness/harness-space.js';
 import { ROLE_MODEL_DEFAULTS, clearLaunchRoleLlmOverrides, getLaunchRoleLlmOverrides, resolveRoleModel, setLaunchRoleLlmOverrides, setUserConfigOverlay } from '../user-config.js';
@@ -651,7 +652,7 @@ describe('U4b — mission 재라우팅 seam(성공경로·모든 옵션 전달·
       input: { text: 'M' },
       executor: { kind: 'external', backend: 'claude' },
       branch: 'wt/a', base: 'main', enhance: false,
-      mission: { evidence: { kind: 'tsc' }, maxRounds: 12, commit: false, entry: 'elanous-apparatus', deliverableHint: 'PPT', screensDir: '/s' },
+      mission: { evidence: { kind: 'tsc' }, maxRounds: 12, commit: false, memory: false, entry: 'elanous-apparatus', deliverableHint: 'PPT', screensDir: '/s' },
     });
   });
 
@@ -3448,6 +3449,112 @@ describe('dev-pipeline — self-mission target seam forwarding', () => {
     expect(received?.target).toBeUndefined();
     expect(remoteQueries).toBe(1);
     expect(received?.completion).toBe('auto-merge');
+  });
+
+  it('skips expected Git root probes outside a repository and records cwd plus argv without fatal stderr', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'dev-pipeline-no-repo-probe-'));
+    const gitCalls: string[][] = [];
+    const gitProbeLogs: Array<{ cwd?: string; args?: string[]; outcome?: string; reason?: string }> = [];
+    let stderrText = '';
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'dev-pipeline' && event === 'git-probe') gitProbeLogs.push(data as typeof gitProbeLogs[number]);
+    });
+    const stderr = spyOn(process.stderr, 'write').mockImplementation((chunk) => { stderrText += String(chunk); return true; });
+    try {
+      await runDevPipeline(T({ humanReadableOutput: false, completion: 'auto-merge', completionSource: 'default' }), {
+        cwd,
+        runGit: (_directory, args) => {
+          gitCalls.push([...args]);
+          return { status: 0, stdout: 'origin\n', stderr: '' };
+        },
+        buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+        runSelfImplement: async () => selfResult,
+      });
+
+      expect(gitCalls).toEqual([['remote']]);
+      expect(gitProbeLogs).toContainEqual({ cwd, args: ['rev-parse', '--show-toplevel'], outcome: 'skipped', reason: 'cwd-not-a-git-repository' });
+      expect(stderrText).not.toContain('fatal: not a git repository');
+      expect(stderrText).not.toContain('[stderr]');
+    } finally {
+      log.mockRestore();
+      stderr.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves a bare shared Git directory from the real worktree root without probing its parent', async () => {
+    const root = mkdtempSync(join(homedir(), '.dev-pipeline-bare-common-repo-'));
+    const seed = join(root, 'seed');
+    const bare = join(root, '.git');
+    const cwd = join(root, 'worktree');
+    mkdirSync(seed);
+    execFileSync('git', ['init', '-q', '-b', 'main', seed]);
+    execFileSync('git', ['-C', seed, 'config', 'user.name', 'dev-pipeline fixture']);
+    execFileSync('git', ['-C', seed, 'config', 'user.email', 'dev-pipeline@example.invalid']);
+    writeFileSync(join(seed, 'fixture.txt'), 'repo\n');
+    execFileSync('git', ['-C', seed, 'add', 'fixture.txt']);
+    execFileSync('git', ['-C', seed, 'commit', '-qm', 'fixture']);
+    execFileSync('git', ['clone', '-q', '--bare', seed, bare]);
+    execFileSync('git', ['--git-dir', bare, 'worktree', 'add', '--quiet', '--detach', cwd, 'main']);
+    const gitCalls: Array<{ cwd: string; args: string[] }> = [];
+    const resolved = resolveMainRepoRoot(cwd, (probeCwd, args) => {
+      gitCalls.push({ cwd: probeCwd, args: [...args] });
+      const output = execFileSync('git', args, { cwd: probeCwd, encoding: 'utf8' });
+      return { status: 0, stdout: output };
+    });
+    expect(resolved).toBe(cwd);
+    expect(gitCalls).toEqual([{ cwd, args: ['--git-dir', bare, 'rev-parse', '--is-bare-repository'] }]);
+    let stderrText = '';
+    const stderr = spyOn(process.stderr, 'write').mockImplementation((chunk) => { stderrText += String(chunk); return true; });
+    try {
+      const provisioned: string[] = [];
+      await runDevPipeline(T({ humanReadableOutput: false }), {
+        cwd,
+        toolRepositoryRoot: '/elsewhere/elanous-tool-checkout',
+        runGit: () => ({ status: 0, stdout: 'origin\n', stderr: '' }),
+        provisionRepository: (target) => {
+          provisioned.push(target.repoRoot ?? target.canonicalTarget ?? target.target);
+          return { status: 'already-git', target: cwd } as never;
+        },
+        buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+        runSelfImplement: async () => selfResult,
+      });
+
+      expect(provisioned).toEqual([cwd]);
+      expect(stderrText).not.toContain('fatal: not a git repository');
+    } finally {
+      stderr.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the main checkout root for linked worktrees using a separate non-bare Git directory', () => {
+    const root = mkdtempSync(join(homedir(), '.dev-pipeline-separate-git-dir-'));
+    const main = join(root, 'main');
+    const gitDir = join(main, '.git-alt');
+    const linked = join(root, 'linked');
+    mkdirSync(main);
+    execFileSync('git', ['init', '-q', '-b', 'main', `--separate-git-dir=${gitDir}`, main]);
+    execFileSync('git', ['-C', main, 'config', 'user.name', 'dev-pipeline fixture']);
+    execFileSync('git', ['-C', main, 'config', 'user.email', 'dev-pipeline@example.invalid']);
+    writeFileSync(join(main, 'fixture.txt'), 'repo\n');
+    execFileSync('git', ['-C', main, 'add', 'fixture.txt']);
+    execFileSync('git', ['-C', main, 'commit', '-qm', 'fixture']);
+    execFileSync('git', ['-C', main, 'worktree', 'add', '--quiet', '--detach', linked, 'HEAD']);
+    try {
+      const gitCalls: Array<{ cwd: string; args: string[] }> = [];
+      const resolved = resolveMainRepoRoot(linked, (probeCwd, args) => {
+        gitCalls.push({ cwd: probeCwd, args: [...args] });
+        return { status: 0, stdout: execFileSync('git', args, { cwd: probeCwd, encoding: 'utf8' }) };
+      });
+      expect(resolved).toBe(main);
+      expect(gitCalls).toEqual([
+        { cwd: linked, args: ['--git-dir', gitDir, 'rev-parse', '--is-bare-repository'] },
+        { cwd: main, args: ['rev-parse', '--show-toplevel'] },
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   // ⛔ 2026-09-23 (벤더 A/B) — 사용자 경로에도 대상 저장소 준비(.gitignore 에 elanous 산출물)를 건다. 도구 저장소면 안 건다.

@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assessTddBaseHeadTest, judgeTddEvidence, tddPlanFromGoal, parseOffDiffEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest } from './off-diff-evidence.js';
+import { assessTddBaseHeadTest, judgeTddEvidence, tddPlanFromGoal, parseOffDiffEvidence, receiveObservedTddRed, receiveObservedTddGreen, runTddBaseHeadTest, structuralMissingExport } from './off-diff-evidence.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
 import { ensureDeviceFirstSteps } from './device-first.js';
 
@@ -36,6 +36,10 @@ const greenRecord = [
   `EVIDENCE: [tdd-green] 구현 뒤 같은 명령이 통과했다(GREEN) || ${tddTestCommand}`,
   'RESULT: 9 pass · 0 fail',
 ].join('\n');
+
+function readStructuralRedFixture(name: string): string {
+  return readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
+}
 
 test('tddPlanFromGoal — 골 문서의 «검증 계획(TDD)» ③/④ 문면을 읽는다', () => {
   const plan = tddPlanFromGoal(goalWithTddPlan);
@@ -244,6 +248,172 @@ test('실제 base worktree에는 head의 변경 시험만 덮고, base RED·head
     expect(result.transcript).toContain('[harness-head-test-result] 1 pass · 0 fail');
   } finally {
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('base에 없는 named export를 head가 추가한 경우 loader 실패를 구조적 RED로 기록한다', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'tdd-base-new-export-'));
+  try {
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(join(repo, 'node_modules'));
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'tdd-base-new-export', type: 'module' }));
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
+    writeFileSync(join(repo, 'src', 'value.ts'), 'export default function added() { return false; }\n');
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 'TDD fixture'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['add', 'package.json', 'bun.lock', 'src/value.ts'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repo, stdio: 'ignore' });
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    writeFileSync(join(repo, 'src', 'value.ts'), "const commentStart = '/*';\nconst commentEnd = '*/';\nconst pattern = /[/*]/;\nfunction added() { return true; }\nexport { added/* declaration note */ as added };\n");
+    const testFixture = readStructuralRedFixture('structural-red-named-export.fixture.mjs');
+    writeFileSync(join(repo, 'src', 'value.test.mjs'), testFixture);
+
+    const result = runTddBaseHeadTest({ cwd: repo, baseSha, goal: [
+      '## 검증 계획 (TDD)',
+      '- ③ 먼저 쓸 시험(RED): bun test src/value.test.mjs',
+      '- ④ GREEN 뒤 같은 명령: bun test src/value.test.mjs',
+    ].join('\n') });
+    expect(result.accepted).toBe(true);
+    expect(result).toMatchObject({
+      accepted: true,
+      reason: 'base-structural-red-head-green:missing-export-added',
+      baseResult: 'structural RED · base lacks export added',
+      headResult: '1 pass · 0 fail',
+    });
+
+    const baseMirror = mkdtempSync(join(tmpdir(), 'tdd-base-new-export-mirror-'));
+    try {
+      mkdirSync(join(baseMirror, 'src'), { recursive: true });
+      writeFileSync(join(baseMirror, 'src', 'value.ts'), 'export default function added() { return false; }\n');
+      writeFileSync(join(baseMirror, 'src', 'value.test.mjs'), testFixture);
+      expect(structuralMissingExport({ cwd: repo, baseCwd: baseMirror, testFiles: ['src/value.test.mjs'],
+        output: `SyntaxError: The requested module '${join(baseMirror, 'src', 'value.ts')}' does not provide an export named 'added'` })).toBe('added');
+    } finally {
+      rmSync(baseMirror, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('타입 전용 base export와 export-star 모듈의 런타임 named export 추가를 구분한다', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'tdd-base-type-export-'));
+  try {
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(join(repo, 'node_modules'));
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'tdd-base-type-export', type: 'module' }));
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
+    writeFileSync(join(repo, 'src', 'types.ts'), 'export interface added { value: boolean }\n');
+    writeFileSync(join(repo, 'src', 'index.ts'), "export * from './types';\n");
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 'TDD fixture'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['add', 'package.json', 'bun.lock', 'src/types.ts', 'src/index.ts'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repo, stdio: 'ignore' });
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    writeFileSync(join(repo, 'src', 'runtime.ts'), 'export const added = true;\n');
+    writeFileSync(join(repo, 'src', 'index.ts'), "export * from './types';\nexport * from './runtime';\n");
+    const testFixture = readStructuralRedFixture('structural-red-export-star.fixture.mjs');
+    writeFileSync(join(repo, 'src', 'value.test.mjs'), testFixture);
+
+    const result = runTddBaseHeadTest({ cwd: repo, baseSha, goal: [
+      '## 검증 계획 (TDD)',
+      '- ③ 먼저 쓸 시험(RED): bun test src/value.test.mjs',
+      '- ④ GREEN 뒤 같은 명령: bun test src/value.test.mjs',
+    ].join('\n') });
+    expect(result.accepted).toBe(true);
+    expect(result).toMatchObject({
+      accepted: true,
+      reason: 'base-structural-red-head-green:missing-export-added',
+      baseResult: 'structural RED · base lacks export added',
+      headResult: '1 pass · 0 fail',
+    });
+
+    const baseMirror = mkdtempSync(join(tmpdir(), 'tdd-base-type-export-mirror-'));
+    try {
+      mkdirSync(join(baseMirror, 'src'), { recursive: true });
+      writeFileSync(join(baseMirror, 'src', 'types.ts'), 'export interface added { value: boolean }\n');
+      writeFileSync(join(baseMirror, 'src', 'index.ts'), "export * from './types';\n");
+      writeFileSync(join(baseMirror, 'src', 'value.test.mjs'), testFixture);
+      expect(structuralMissingExport({ cwd: repo, baseCwd: baseMirror, testFiles: ['src/value.test.mjs'],
+        output: `SyntaxError: The requested module '${join(baseMirror, 'src', 'index.ts')}' does not provide an export named 'added'` })).toBe('added');
+    } finally {
+      rmSync(baseMirror, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('named export가 default import를 재export해 생긴 경우도 structural RED로 잡는다', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'tdd-base-default-reexport-'));
+  try {
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(join(repo, 'node_modules'));
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'tdd-base-default-reexport', type: 'module' }));
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
+    writeFileSync(join(repo, 'src', 'dep.ts'), 'export default () => true;\n');
+    writeFileSync(join(repo, 'src', 'value.ts'), 'export default function added() { return false; }\n');
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 'TDD fixture'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['add', 'package.json', 'bun.lock', 'src/dep.ts', 'src/value.ts'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repo, stdio: 'ignore' });
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    writeFileSync(join(repo, 'src', 'value.ts'), "import added from './dep';\nexport { added as added };\n");
+    const testFixture = readStructuralRedFixture('structural-red-default-reexport.fixture.mjs');
+    writeFileSync(join(repo, 'src', 'value.test.mjs'), testFixture);
+
+    const result = runTddBaseHeadTest({ cwd: repo, baseSha, goal: [
+      '## 검증 계획 (TDD)',
+      '- ③ 먼저 쓸 시험(RED): bun test src/value.test.mjs',
+      '- ④ GREEN 뒤 같은 명령: bun test src/value.test.mjs',
+    ].join('\n') });
+    expect(result.accepted).toBe(true);
+    expect(result).toMatchObject({
+      accepted: true,
+      reason: 'base-structural-red-head-green:missing-export-added',
+      baseResult: 'structural RED · base lacks export added',
+      headResult: '1 pass · 0 fail',
+    });
+
+    const baseMirror = mkdtempSync(join(tmpdir(), 'tdd-base-default-reexport-mirror-'));
+    try {
+      mkdirSync(join(baseMirror, 'src'), { recursive: true });
+      writeFileSync(join(baseMirror, 'src', 'dep.ts'), 'export default () => true;\n');
+      writeFileSync(join(baseMirror, 'src', 'value.ts'), 'export default function added() { return false; }\n');
+      writeFileSync(join(baseMirror, 'src', 'value.test.mjs'), testFixture);
+      expect(structuralMissingExport({ cwd: repo, baseCwd: baseMirror, testFiles: ['src/value.test.mjs'],
+        output: `SyntaxError: The requested module '${join(baseMirror, 'src', 'value.ts')}' does not provide an export named 'added'` })).toBe('added');
+    } finally {
+      rmSync(baseMirror, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('절대 loader 경로를 base 그래프의 정확한 모듈에 연결한다', () => {
+  const base = mkdtempSync(join(tmpdir(), 'tdd-absolute-base-'));
+  const head = mkdtempSync(join(tmpdir(), 'tdd-absolute-head-'));
+  try {
+    for (const root of [base, head]) mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(base, 'src', 'value.ts'), 'export default function added() { return false; }\n');
+    writeFileSync(join(base, 'src', 'other.ts'), 'export default function added() { return false; }\n');
+    writeFileSync(join(base, 'src', 'value.test.ts'), "import { added } from './value';\nvoid added;\n");
+    writeFileSync(join(head, 'src', 'value.ts'), 'export function added() { return true; }\n');
+    writeFileSync(join(head, 'src', 'other.ts'), 'export function added() { return true; }\n');
+    writeFileSync(join(head, 'src', 'value.test.ts'), "import { added } from './value';\nvoid added;\n");
+
+    const absoluteBaseModule = join(base, 'src', 'value.ts');
+    expect(structuralMissingExport({ cwd: head, baseCwd: base, testFiles: ['src/value.test.ts'],
+      output: `SyntaxError: The requested module '${absoluteBaseModule}' does not provide an export named 'added'` })).toBe('added');
+    expect(structuralMissingExport({ cwd: head, baseCwd: base, testFiles: ['src/value.test.ts'],
+      output: `SyntaxError: The requested module '${join(base, 'src', 'other.ts')}' does not provide an export named 'added'` })).toBeUndefined();
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+    rmSync(head, { recursive: true, force: true });
   }
 });
 

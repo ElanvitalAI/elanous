@@ -31,10 +31,44 @@ export function contextDayHours(since: string): number {
   return hours;
 }
 
-function kindFor(surface: string, kind: string): ContextDayKind | null {
+function duplicateCodexExitIndexes(events: JournalEvent[]): Set<number> {
+  const duplicateExits = new Set<number>();
+  const lifecycles = new Map<string, { kinds: string[]; exitIndexes: number[] }[]>();
+  const current = new Map<string, { kinds: string[]; exitIndexes: number[] }>();
+  for (const [index, event] of events.entries()) {
+    if (event.surface !== 'context:external') continue;
+    const attribution = sourceFor(event);
+    const locator = attribution?.refs.source;
+    if (attribution?.source !== 'codex-agent-mission' || typeof locator !== 'string') continue;
+    if (event.kind === 'started') {
+      const previous = current.get(locator);
+      const groups = lifecycles.get(locator) ?? [];
+      if (previous) groups.push(previous);
+      const next = { kinds: [event.kind], exitIndexes: [] as number[] };
+      current.set(locator, next);
+      if (!lifecycles.has(locator)) lifecycles.set(locator, groups);
+      continue;
+    }
+    const lifecycle = current.get(locator);
+    if (!lifecycle) continue;
+    lifecycle.kinds.push(event.kind);
+    if (event.kind === 'exit') lifecycle.exitIndexes.push(index);
+  }
+  for (const [locator, lifecycle] of current) lifecycles.get(locator)?.push(lifecycle);
+  for (const groups of lifecycles.values()) {
+    for (const lifecycle of groups) {
+      if (lifecycle.kinds.includes('finished') || lifecycle.kinds.includes('done')) {
+        for (const index of lifecycle.exitIndexes) duplicateExits.add(index);
+      }
+    }
+  }
+  return duplicateExits;
+}
+
+function kindFor(surface: string, kind: string, source?: ContextDaySource, codexExitAlreadyFinished = false): ContextDayKind | null {
   if (surface === 'context:external') {
     if (kind === 'started' || kind === 'claimed') return 'task-claimed';
-    if (kind === 'finished' || kind === 'done') return 'done';
+    if (kind === 'finished' || kind === 'done' || (kind === 'exit' && !(source === 'codex-agent-mission' && codexExitAlreadyFinished))) return 'done';
     if (kind === 'guide-changed') return 'guidance-changed';
   }
   if (kind === 'task-claimed' || kind === 'claimed') return 'task-claimed';
@@ -57,35 +91,48 @@ function sourceFor(event: JournalEvent): { source: ContextDaySource; refs: { url
 }
 
 /** Read only the context journal, not recallEvents (which mutates recall counts) or the writable DB opener. */
-function readDay(since: string, deps: DayDeps): { since: string; until: string; events: JournalEvent[] } {
+function readDay(since: string, deps: DayDeps): { since: string; until: string; events: JournalEvent[]; lifecycleEvents: JournalEvent[]; lifecycleOffset: number } {
   const hours = contextDayHours(since);
   const now = (deps.now ?? (() => new Date()))();
   const until = now.toISOString();
   const from = new Date(now.getTime() - hours * 3_600_000).toISOString();
   const path = deps.dbPath ?? surfaceEventsDbPath();
-  if (!existsSync(path)) return { since: from, until, events: [] };
+  if (!existsSync(path)) return { since: from, until, events: [], lifecycleEvents: [], lifecycleOffset: 0 };
   const db = new Database(path, { readonly: true });
   try {
     const events = db.prepare(`SELECT surface, kind, ts, refs, summary FROM events
       WHERE surface IN ('coord:channel', 'context:session', 'context:external')
         AND direction='outbound' AND ts>=? AND ts<=? ORDER BY ts ASC`).all(from, until) as JournalEvent[];
-    return { since: from, until, events };
+    const boundaryLifecycleEvents = db.prepare(`SELECT prior.surface, prior.kind, prior.ts, prior.refs, prior.summary FROM events prior
+      WHERE prior.surface='context:external' AND prior.direction='outbound'
+        AND prior.kind IN ('started', 'finished', 'done', 'exit') AND prior.ts<?
+        AND json_extract(CASE WHEN json_valid(prior.refs) THEN prior.refs ELSE '{}' END, '$.origin')='codex-agent-mission'
+        AND EXISTS (
+          SELECT 1 FROM events current
+          WHERE current.surface='context:external' AND current.direction='outbound'
+            AND current.kind IN ('started', 'finished', 'done', 'exit') AND current.ts>=? AND current.ts<=?
+            AND json_extract(CASE WHEN json_valid(current.refs) THEN current.refs ELSE '{}' END, '$.origin')='codex-agent-mission'
+            AND json_extract(CASE WHEN json_valid(current.refs) THEN current.refs ELSE '{}' END, '$.source')
+              = json_extract(CASE WHEN json_valid(prior.refs) THEN prior.refs ELSE '{}' END, '$.source')
+        ) ORDER BY prior.ts ASC`).all(from, from, until) as JournalEvent[];
+    return { since: from, until, events, lifecycleEvents: [...boundaryLifecycleEvents, ...events], lifecycleOffset: boundaryLifecycleEvents.length };
   } finally { db.close(); }
 }
 
 export function contextDay(since = '24h', deps: { now?: () => Date; dbPath?: string } = {}): ContextDayReport {
-  const { since: from, until, events } = readDay(since, deps);
+  const { since: from, until, events, lifecycleEvents, lifecycleOffset } = readDay(since, deps);
+  const duplicateCodexExits = duplicateCodexExitIndexes(lifecycleEvents);
   const rows: ContextDayRow[] = CONTEXT_DAY_SOURCES.map(source => ({
     source, counts: { 'task-claimed': 0, done: 0, asked: 0, 'guidance-changed': 0 }, lastAt: null, status: '안 들어옴',
   }));
   const bySource = new Map(rows.map(row => [row.source, row]));
-  for (const event of events) {
+  for (const [eventIndex, event] of events.entries()) {
     const attribution = sourceFor(event);
     if (!attribution) continue;
     const row = bySource.get(attribution.source)!;
     row.lastAt = event.ts;
     row.status = '들어옴';
-    const kind = kindFor(event.surface, event.kind);
+    const kind = kindFor(event.surface, event.kind, attribution.source, duplicateCodexExits.has(eventIndex + lifecycleOffset));
     if (kind) row.counts[kind]++;
   }
   return { since: from, until, rows };
@@ -95,14 +142,16 @@ export function contextDayTimeline(since = '24h', deps: DayDeps = {}): ContextDa
   if (deps.seat !== undefined && !CONTEXT_DAY_SOURCES.some(source => source === deps.seat)) {
     throw new Error(`unknown --seat: ${deps.seat}`);
   }
-  const { since: from, until, events } = readDay(since, deps);
+  const { since: from, until, events, lifecycleEvents, lifecycleOffset } = readDay(since, deps);
+  const duplicateCodexExits = duplicateCodexExitIndexes(lifecycleEvents);
   const timeline: ContextDayTimelineEvent[] = [];
-  for (const event of events) {
+  for (const [eventIndex, event] of events.entries()) {
     const attribution = sourceFor(event);
     if (!attribution || (deps.seat && attribution.source !== deps.seat)) continue;
     const { url, source } = attribution.refs;
     const link = [url, source].find(value => typeof value === 'string' && /^(?:https?:\/\/|elanous:\/\/)[^\s]+$/.test(value));
-    timeline.push({ at: event.ts, source: attribution.source, kind: kindFor(event.surface, event.kind) ?? 'other',
+    timeline.push({ at: event.ts, source: attribution.source, kind: kindFor(event.surface, event.kind, attribution.source,
+      duplicateCodexExits.has(eventIndex + lifecycleOffset)) ?? 'other',
       summary: event.summary ?? '', link: typeof link === 'string' ? link : null });
   }
   return { since: from, until, events: timeline };

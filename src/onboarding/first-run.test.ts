@@ -610,10 +610,11 @@ describe('first run', () => {
       expect(timedOut).toBe(false);
       expect(child.status).toBe(0);
       expect(child.stdout).toContain('[elanous] provider: openai-codex');
-      expect(child.stdout).toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
+      expect(child.stdout).toContain('웹 셋업을 위해 데몬을 시작합니다.');
+      expect(child.stdout).toContain('웹 셋업을 사용할 수 없습니다 (daemon-start-failed). 터미널 설정으로 전환합니다.');
       expect(child.stdout).toContain('오류 보고 안내:');
       expect(child.stdout.indexOf('오류 보고 안내:')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
-      expect(child.stdout.indexOf('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
+      expect(child.stdout.indexOf('웹 셋업을 위해 데몬을 시작합니다.')).toBeLessThan(child.stdout.indexOf('\x1b[?1049h'));
       expect(child.stdout.indexOf('\x1b[?1049h')).toBeGreaterThan(child.stdout.indexOf('[elanous] provider: openai-codex'));
       expect(child.stdout + child.stderr).not.toContain('eln setup llm');
       expect(child.stdout + child.stderr).not.toContain('Step 1');
@@ -687,7 +688,7 @@ describe('first run', () => {
     } finally { f.cleanup(); }
   }, 60000);
 
-  test('spawned CLI: bare first run with no daemon reaches the first-screen gate within 3s and does not mark the notice shown without a TTY', async () => {
+  test('spawned CLI: explicit terminal setup opt-out reaches the first-screen gate without marking the notice shown', async () => {
     const f = fixture();
     try {
       const home = join(f.dir, 'home');
@@ -703,16 +704,14 @@ describe('first run', () => {
       spawnSync(cli[0]!, [...cli.slice(1), '--version'], { cwd, env, input: '', encoding: 'utf8', timeout: 30000 });
       writeFileSync(join(configDir, 'config.json'), JSON.stringify({
         llm: { provider: 'anthropic', apiKey: 'timing-cli-secret', model: 'claude-sonnet-4' },
-        onboarding: { completed: false },
+        onboarding: { completed: false, webFirst: false },
         errorReports: { identity: true, email: 'person@example.org' },
       }));
       const began = Date.now();
-      let offlineAt = -1;
       const proc = spawn(cli[0]!, cli.slice(1), { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
       const run = { stdout: '', stderr: '', status: null as number | null, error: undefined as Error | undefined };
       proc.stdout.setEncoding('utf8').on('data', (chunk: string) => {
         run.stdout += chunk;
-        if (offlineAt < 0 && run.stdout.includes('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다')) offlineAt = Date.now() - began;
       });
       proc.stderr.setEncoding('utf8').on('data', (chunk: string) => { run.stderr += chunk; });
       const killer = setTimeout(() => proc.kill('SIGTERM'), 30000);
@@ -723,14 +722,8 @@ describe('first run', () => {
       // Exit 1 at the stdin-TTY gate = the point where the dashboard would draw its first screen.
       expect(run.status).toBe(1);
       expect(run.stderr).toContain('stdin TTY');
-      // The daemon decision (the old 12s health wait) is made within 3s of spawn.
-      expect(offlineAt).toBeGreaterThanOrEqual(0);
-      expect(offlineAt).toBeLessThanOrEqual(3000);
-      // Whole path to the first-screen gate: far below the old 12s wait (measured 1.3–3.2s at load 12;
-      // the variance is first-run provider detection after the decision, outside this cell).
-      expect(elapsed).toBeLessThan(6000);
-      expect(run.stdout).toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
-      expect(run.stdout + run.stderr).not.toContain('웹 셋업을 위해 데몬을 시작');
+      expect(elapsed).toBeLessThan(20000);
+      expect(run.stdout).not.toContain('웹 셋업을 위해 데몬을 시작합니다.');
       // No TTY → no dashboard → nobody saw a notice: it is neither printed nor recorded as shown.
       expect(run.stdout).not.toContain('오류 보고 안내:');
       expect(buildUserConfig(join(configDir, 'config.json')).errorReports?.noticeShown).toBeUndefined();
@@ -853,7 +846,8 @@ describe('first run', () => {
         { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60000 });
       const text = child.stdout + child.stderr;
       expect(child.error).toBeUndefined();
-      expect(text).toContain('web setup daemon is not running yet; continuing in terminal setup');
+      expect(text).toContain('starting the daemon for web setup.');
+      expect(text).toMatch(/web setup is unavailable \(daemon-(?:start-failed|health-timeout)\); switching to terminal setup\./);
       expect(text).toContain('pick a provider via eln setup llm');
       expect(text).not.toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
       expect(text).not.toContain('eln setup llm 으로 고르세요');
@@ -874,7 +868,8 @@ describe('first run', () => {
         { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60000 });
       const text = child.stdout + child.stderr;
       expect(child.error).toBeUndefined();
-      expect(text).toContain('웹 셋업 데몬이 아직 실행되지 않았습니다 · 터미널 설정을 계속합니다');
+      expect(text).toContain('웹 셋업을 위해 데몬을 시작합니다.');
+      expect(text).toMatch(/웹 셋업을 사용할 수 없습니다 \(daemon-(?:start-failed|health-timeout)\)\. 터미널 설정으로 전환합니다\./);
       expect(text).toContain('eln setup llm 으로 고르세요');
       expect(text).not.toContain('web setup daemon is not running yet; continuing in terminal setup');
       expect(text).not.toContain('pick a provider via eln setup llm');

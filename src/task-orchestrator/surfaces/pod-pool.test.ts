@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { checkPodPool, genericConfigPodPool, imageShipLockPath, measureMemberOccupancy, parsePodPool, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, snapshotWarmPoolMembers, syncPoolImage as syncPoolImageRaw, syncPoolImages as syncPoolImagesRaw, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
+import { checkPodPool, genericConfigPodPool, imageShipLockPath, measureMemberOccupancy, parsePodPool, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, snapshotWarmPoolMembers, runBuildScript, syncPoolImage as syncPoolImageRaw, syncPoolImages as syncPoolImagesRaw, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
 import { podPlacementKind, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
 import { loadRunLedger } from '../../self-implement/run-ledger.js';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -20,6 +20,58 @@ const syncPoolImages: typeof syncPoolImagesRaw = (members, image, commit, deps =
   syncPoolImagesRaw(members, image, commit, { ...deps, lock: deps.lock ?? imageTestLock() });
 
 describe('pod pool — priority ⊕ per-node capacity', () => {
+  test('remote build stderr keeps the first error and bounded tail in debug.log', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pool-build-stderr-'));
+    const script = join(dir, 'build.sh');
+    const successScript = join(dir, 'success.sh');
+    writeFileSync(script, [
+      '#!/usr/bin/env bash',
+      "printf 'tar: Write error: injected cause\\n' >&2",
+      'for i in $(seq 1 100); do printf "remote-stderr-%03d " "$i" >&2; printf "%01000d\\n" 0 >&2; done',
+      "printf 'Authorization: Bearer sk-testfixture1234567890abcdef\\n' >&2",
+      "printf 'build stdout one\\nbuild stdout two\\n'",
+      'exit 23',
+    ].join(String.fromCharCode(10)));
+    writeFileSync(successScript, ["printf 'build complete\\n'; printf 'benign warning\\n' >&2"].join(String.fromCharCode(10)));
+    const podPoolUrl = new URL('./pod-pool.js', import.meta.url).href;
+    const debugUrl = new URL('../../debug/log.js', import.meta.url).href;
+    const childCode = `
+      process.chdir(${JSON.stringify(dir)});
+      const { debug } = await import(${JSON.stringify(debugUrl)});
+      const { runBuildScript } = await import(${JSON.stringify(podPoolUrl)});
+      debug.setLevel('trail');
+      const failed = await runBuildScript(${JSON.stringify(script)}, { ...process.env, ELANOUS_BUILD_REMOTE: 'remote-test' });
+      const succeeded = await runBuildScript(${JSON.stringify(successScript)}, { ...process.env, ELANOUS_BUILD_REMOTE: 'remote-test' });
+      await debug.flush();
+      process.stdout.write(JSON.stringify({ failed, succeeded, path: debug.path() }));
+    `;
+    try {
+      const child = Bun.spawn([process.execPath, '-e', childCode], { cwd: dir, stdout: 'pipe', stderr: 'pipe' });
+      const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(exitCode, stderr).toBe(0);
+      const result = JSON.parse(stdout) as { failed: { ok: boolean; detail: string }; succeeded: { ok: boolean }; path: string };
+      expect(result.failed.ok).toBe(false);
+      expect(result.failed.detail).toContain('build stdout two');
+      expect(result.succeeded.ok).toBe(true);
+      const records = readFileSync(result.path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as { category?: string; event?: string; data?: Record<string, unknown> });
+      const failures = records.filter((record) => record.category === 'self-implement.pod' && record.event === 'pool-image-sync-build-failed');
+      expect(failures).toHaveLength(1);
+      const record = failures[0]!.data!;
+      expect(record).toMatchObject({ host: 'remote-test', exitCode: 23, stderrLineCount: 102, stderrTruncated: true });
+      expect(record.stderrFirstError).toContain('tar: Write error: injected cause');
+      const tail = record.stderrTail as string;
+      expect(tail.split('\n').length).toBeLessThanOrEqual(80);
+      expect(tail).toContain('remote-stderr-100');
+      expect(tail).not.toContain('remote-stderr-020');
+      expect(tail).toContain('Authorization: Bearer sk-***');
+      expect(tail).not.toContain('sk-testfixture1234567890abcdef');
+      expect((record.stderrFirstError as string).length + tail.length).toBeLessThanOrEqual(12_000);
+      expect(tail.length).toBeGreaterThan(10_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('cut shadow reads warm worker identities without moving pool members', () => {
     const members = parsePodPool('first:2,second:1');
     const calls: string[] = [];

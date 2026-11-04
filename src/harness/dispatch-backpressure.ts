@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync, readlinkSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { mkdirSync, readFileSync, readlinkSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { logsDbPath, LogStore, type LogStoreRow, type LogQuery } from '../mss/logging/log-store.js';
 import { getUserConfig } from '../user-config.js';
@@ -8,7 +8,9 @@ import { harnessQueuePath } from './harness-queue.js';
 import { leaseKubectl, measurePoolLease, recommendConcurrency, type PodLeaseMember } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, resolvePodPoolSpec, type PodPoolMember, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
-import { defaultSshRunner, resolveParentHosts, type SshRunner } from '../task-agent/parent-host.js';
+import { resolveParentHosts, type SshRunner } from '../task-agent/parent-host.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { withFileLockSync } from '../storage/file-lock.js';
 import { debug } from '../debug/log.js';
 import type { LiveSupplySnapshot } from '../live-supply/snapshot.js';
 
@@ -113,6 +115,20 @@ const LOG_WINDOW_MS = 35 * 60_000;
 const WAIT_FRESH_MS = 5 * 60_000;
 const STARVED_MS = 30 * 60_000;
 const REMOTE_PS_MARKER = '__ELANOUS_BACKPRESSURE_PS__';
+const MEASUREMENT_CACHE_TTL_MS = 60_000;
+
+/** Preserve host SSH config, including ControlMaster and IAP ProxyCommand. */
+export function backpressureSshArgv(host: string, script: string): string[] {
+  return ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', host, script];
+}
+
+export const backpressureSshRunner: SshRunner = (host, script, timeoutMs, stdin) => {
+  const result = spawnSync('ssh', backpressureSshArgv(host, script), {
+    encoding: 'utf8', timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024,
+    ...(stdin !== undefined ? { input: stdin } : {}),
+  });
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? (result.error ? String(result.error) : '') };
+};
 
 type AdmissionRow = Pick<LogStoreRow, 'ts_ms' | 'data'>;
 export interface BackpressureReadDeps {
@@ -125,6 +141,8 @@ export interface BackpressureReadDeps {
   currentVersion?: () => string;
   parentHost?: () => { host: string; elanous?: string } | readonly { host: string; elanous?: string }[] | null;
   ssh?: SshRunner;
+  /** Test seam; null disables disk caching. */
+  cachePath?: string | null;
 }
 
 function readQueue(): unknown {
@@ -148,7 +166,7 @@ function readPodRecommendation(deps: BackpressureReadDeps, remoteReasons: string
   members: readonly PodPoolMember[]): number | null {
   if (!members.length) return null;
   const config = getUserConfig();
-  const ssh = deps.ssh ?? defaultSshRunner;
+  const ssh = deps.ssh ?? backpressureSshRunner;
   const measured: PodLeaseMember[] = [];
   let remoteFailure = false;
   for (const member of members) {
@@ -329,7 +347,7 @@ function readRemote(host: { host: string; elanous?: string }, ssh: SshRunner): {
 }
 
 /** All probes are injectable; a failed individual observation is unknown, not a false zero. */
-export function readBackpressureSignals(deps: BackpressureReadDeps = {}): BackpressureSignals {
+function readBackpressureSignalsUncached(deps: BackpressureReadDeps = {}): BackpressureSignals {
   const now = (deps.now ?? Date.now)();
   if (!Number.isFinite(now)) throw new Error('backpressure clock unavailable');
   const query: LogQuery = { exactCategories: ['pod-lease'], events: ['admit-by-usage'], sinceMs: now - LOG_WINDOW_MS, limit: LOG_LIMIT };
@@ -368,7 +386,7 @@ export function readBackpressureSignals(deps: BackpressureReadDeps = {}): Backpr
   if (configured === 'unknown') remoteReasons.push('remote-parent:configuration-unavailable');
   for (const host of hosts) {
     try {
-      const observed = readRemote(host, deps.ssh ?? defaultSshRunner);
+      const observed = readRemote(host, deps.ssh ?? backpressureSshRunner);
       observedHosts++;
       const counts = admissionCounts(observed.rows, now);
       if (counts.waiting === 'unknown' || counts.starved === 'unknown') {
@@ -399,4 +417,54 @@ export function readBackpressureSignals(deps: BackpressureReadDeps = {}): Backpr
   }
   return { queueDepth, podRecommended, admitWaiting, admitStarvedOver30m,
     dockerBuilds: { local: localBuilds, remote: remoteBuilds }, staleParents, ...(unmeasured.length ? { unmeasured } : {}), ...(remoteReasons.length ? { remoteReasons } : {}) };
+}
+
+function validCachedSignals(value: unknown): value is BackpressureSignals {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as BackpressureSignals;
+  const signal = (v: unknown) => v === 'unknown' || (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0);
+  return signal(row.queueDepth) && signal(row.admitWaiting) && signal(row.admitStarvedOver30m)
+    && signal(row.podRecommended) && signal(row.staleParents) && !!row.dockerBuilds
+    && signal(row.dockerBuilds.local) && signal(row.dockerBuilds.remote)
+    && (row.unmeasured === undefined || Array.isArray(row.unmeasured) && row.unmeasured.every(v => typeof v === 'string'))
+    && (row.remoteReasons === undefined || Array.isArray(row.remoteReasons) && row.remoteReasons.every(v => typeof v === 'string'));
+}
+
+function cacheLog(event: string, data: Record<string, unknown>): void {
+  try { debug.log('harness.backpressure-cache', event, data); } catch { /* diagnostics never block admission */ }
+}
+
+/** Share one measured snapshot across dispatcher processes for at most 60 seconds. */
+export function readBackpressureSignals(deps: BackpressureReadDeps = {}): BackpressureSignals {
+  const cachePath = deps.cachePath === undefined
+    ? (Object.keys(deps).length === 0 ? join(elanousStateRoot(), 'backpressure-measure-cache.json') : null)
+    : deps.cachePath;
+  if (!cachePath) return readBackpressureSignalsUncached(deps);
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true });
+    return withFileLockSync(cachePath + '.lock', () => {
+      const checkedAt = (deps.now ?? Date.now)();
+      if (!Number.isFinite(checkedAt)) throw new Error('backpressure clock unavailable');
+      try {
+        const parsed = JSON.parse(readFileSync(cachePath, 'utf8')) as { measuredAt?: unknown; signals?: unknown };
+        if (typeof parsed.measuredAt === 'number' && checkedAt >= parsed.measuredAt
+          && checkedAt - parsed.measuredAt < MEASUREMENT_CACHE_TTL_MS && validCachedSignals(parsed.signals)) {
+          cacheLog('hit', { ageMs: checkedAt - parsed.measuredAt });
+          return parsed.signals;
+        }
+      } catch { /* absent or damaged cache becomes a miss */ }
+      cacheLog('miss', { path: cachePath });
+      const signals = readBackpressureSignalsUncached(deps);
+      const measuredAt = (deps.now ?? Date.now)();
+      if (!Number.isFinite(measuredAt)) throw new Error('backpressure clock unavailable');
+      const tempPath = cachePath + '.' + process.pid + '.tmp';
+      writeFileSync(tempPath, JSON.stringify({ measuredAt, signals }), { mode: 0o600 });
+      renameSync(tempPath, cachePath);
+      cacheLog('stored', { measuredAt });
+      return signals;
+    }, { breakDeadHolder: true, staleMs: 300_000, maxTries: 4_800 });
+  } catch (error) {
+    cacheLog('lock-unavailable', { error: error instanceof Error ? error.message : String(error) });
+    return readBackpressureSignalsUncached(deps);
+  }
 }

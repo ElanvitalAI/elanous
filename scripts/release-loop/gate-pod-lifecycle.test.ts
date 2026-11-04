@@ -58,18 +58,28 @@ async function sweep(podAge: number, podCommand?: Parameters<typeof createGateRu
   const runner = createGateRunner(repo, undefined, command, podCommand ?? (async (o) => ({ exitCode: 0, artifactsDir: runShell(o.command[2]!, root, repo, podAge), job: 'gate-fake-job' })),
     new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
   const result = await runner.sweep(repo, join(root, 'logs'), { pool: 'pool-test', shards: 1, stallSeconds: 0 }).catch((error: unknown) => ({ rc: -1, error: String(error) }));
-  const json = JSON.parse(readFileSync(join(root, 'logs', 'pod-0.json'), 'utf8')) as { rc: number; host?: string; podStages: Record<string, number>; phaseTimes: Record<string, string> };
-  return { result, json, lines: events.filter((e) => e.category === 'pod.lifecycle' && e.event === 'stages').map((e) => e.data) };
+  const json = JSON.parse(readFileSync(join(root, 'logs', 'pod-0.json'), 'utf8')) as { rc: number; host?: string; runKey: string;
+    podStages: Record<string, number>; phaseTimes: Record<string, string>; preparationTimingsMs: Record<string, unknown> };
+  return { result, json,
+    lines: events.filter((e) => e.category === 'pod.lifecycle' && e.event === 'stages').map((e) => e.data),
+    shardEvents: events.filter((e) => e.category === 'release-loop.gate' && e.event === 'pod-shard').map((e) => e.data) };
 }
 
 test('one line per shard Pod: the pod-0.json stage values, in ms, with the not-measured stages named', async () => {
-  const { result, json, lines } = await sweep(7);
+  const { result, json, lines, shardEvents } = await sweep(7);
   expect(result.rc).toBe(0);
   expect(lines).toHaveLength(1);
   const line = lines[0]!;
   // The fake podCommand never places the Job on a member, so the shard json has no host — the line says null, not a guess.
   expect(json.host).toBeUndefined();
   expect(line).toMatchObject({ kind: 'gate', podJob: 'gate-fake-job', host: null, shard: 'pod-0', outcome: 'pass' });
+  expect(line.runKey).toBe(json.runKey);
+  expect(line.preparationTimingsMs).toEqual(json.preparationTimingsMs);
+  expect(shardEvents).toHaveLength(1);
+  expect(shardEvents[0]!.runKey).toBe(json.runKey);
+  expect(shardEvents[0]!.preparationTimingsMs).toEqual(json.preparationTimingsMs);
+  expect((json.preparationTimingsMs.stagesMs as Record<string, number>).clone)
+    .toBe((json.podStages['clone-end']! - json.podStages['prep-start']!) * 1000);
   const stages = line.stages as Array<{ stage: string; start: number; end: number; clock: string }>;
   const s = json.podStages;
   expect(stages.find((x) => x.stage === 'clone')).toEqual({ stage: 'clone', start: s['prep-start']! * 1000, end: s['clone-end']! * 1000, clock: 'pod' });

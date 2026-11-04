@@ -6,6 +6,7 @@ import { debug } from '../debug/log.js';
 import { redactMissionResultPath, type StartedClassicMissionCliJob } from './mission-cli-consumer.js';
 import type { ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
 import { runVisibleAgentMission, type VisibleMissionDeps } from '../sidetab-core/visible-agent-mission.js';
+import { preservedFailedCandidateBlock, reconcileClassicSidetabCandidatePatches, type ClassicSidetabReconcileResult } from './classic-sidetab-mission-reconcile.js';
 
 export type ClassicMissionNotificationEnqueue = (notification: PendingTaskNotification) => void;
 export const CLASSIC_SIDETAB_MISSION_LABEL = 'sidetab mission';
@@ -30,6 +31,7 @@ export interface ClassicSidetabMissionPairCompletionResult {
   claude: ClassicSidetabMissionResult;
   status: 'done' | 'error';
   finishedAt: number;
+  reconciliation?: ClassicSidetabReconcileResult;
 }
 type ClassicSidetabPairOutcome = ClassicSidetabMissionResult;
 interface ClassicSidetabMissionPairJob {
@@ -39,6 +41,7 @@ interface ClassicSidetabMissionPairJob {
   startedAt: number;
   mission: string;
   workspaceDir: string;
+  baseSha?: string;
   completion: Promise<ClassicSidetabPairOutcome>;
 }
 
@@ -56,6 +59,7 @@ function buildPairSynthesis(
   pair: { codex: ClassicSidetabMissionPairJob; claude: ClassicSidetabMissionPairJob },
   codex: ClassicSidetabPairOutcome,
   claude: ClassicSidetabPairOutcome,
+  reconciliation: ClassicSidetabReconcileResult,
 ): string {
   const rows = [
     { agent: 'Codex', job: pair.codex, result: codex },
@@ -75,6 +79,24 @@ function buildPairSynthesis(
     if (!content) return [];
     return [`## ${agent} 기여`, redactMissionResultPath(content, result.path)];
   });
+  const failedCandidates = rows.flatMap(({ agent, result }) => {
+    if (result.ok) return [];
+    const block = preservedFailedCandidateBlock(result.content);
+    return block ? [`## ${agent} 실패 결과의 후보 패치 (보존만 · 병합 대상 아님)`, block] : [];
+  });
+  const patchSection = [
+    '## Isolated candidate patch reconciliation', '',
+    `- Base SHA: ${reconciliation.baseSha || 'unavailable'}`,
+    `- State: ${reconciliation.status}`,
+    ...(reconciliation.reason ? [`- Reason: ${reconciliation.reason.replace(/[\r\n]+/g, ' ')}`] : []),
+    ...(reconciliation.status === 'conflict'
+      ? ['- Parent action: choose or revise the overlapping hunks; neither candidate was selected. Both original diffs are preserved in the contribution sections below.']
+      : []),
+    ...(reconciliation.status === 'merged' && reconciliation.patch
+      ? ['', '```diff', reconciliation.patch.trimEnd(), '```']
+      : []),
+    '',
+  ];
   return [
     '# Codex + Claude mission pair synthesis', '',
     `- Codex mission: ${pair.codex.missionId ?? 'unavailable'}`,
@@ -83,7 +105,9 @@ function buildPairSynthesis(
     '| 손 | 맡은 작업 | 결과 파일 | 판정 | 채택 근거 |',
     '|---|---|---|---|---|', table, '',
     '채택 기준: 성공하고 비어 있지 않은 결과를 각자 독립 기여로 보존한다. 두 손의 답이 서로 다른 작업 분담에서 나온 경우 품질 순위를 추정하지 않으며, 실패·빈 결과는 채택하지 않고 사유를 남긴다.', '',
+    ...patchSection,
     ...contributions.flatMap((section) => [section, '']),
+    ...failedCandidates.flatMap((section) => [section, '']),
   ].join('\n').trimEnd() + '\n';
 }
 
@@ -92,6 +116,7 @@ function persistPairSynthesis(
   taskId: string,
   codex: ClassicSidetabPairOutcome,
   claude: ClassicSidetabPairOutcome,
+  reconciliation: ClassicSidetabReconcileResult,
 ): string {
   if (typeof pair.codex.workspaceDir !== 'string' || !pair.codex.workspaceDir.trim()
     || pair.codex.workspaceDir !== pair.claude.workspaceDir) {
@@ -100,7 +125,7 @@ function persistPairSynthesis(
   const dir = join(pair.codex.workspaceDir, '.elanous', 'mission-results');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `classic-pair-synthesis-${safeFilePart(taskId)}-${randomUUID()}.md`);
-  writeFileSync(path, buildPairSynthesis(pair, codex, claude), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  writeFileSync(path, buildPairSynthesis(pair, codex, claude, reconciliation), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   return path;
 }
 
@@ -203,21 +228,38 @@ export function enqueueClassicSidetabMissionPairCompletion(
   ]).then(([codex, claude]) => {
     const finishedAt = now();
     const bothSucceeded = codex.ok && claude.ok && Boolean(codex.content?.trim()) && Boolean(claude.content?.trim());
+    const baseSha = pair.codex.baseSha && pair.codex.baseSha === pair.claude.baseSha ? pair.codex.baseSha : undefined;
+    // Partial/failed child output stays evidence only; it is never eligible for candidate reconciliation.
+    const reconciliation = baseSha && bothSucceeded
+      ? reconcileClassicSidetabCandidatePatches({ cwd: pair.codex.workspaceDir, baseSha, codex: codex.content ?? '', claude: claude.content ?? '' })
+      : {
+        status: 'unavailable' as const,
+        baseSha: baseSha ?? '',
+        reason: !baseSha
+          ? 'pair base SHA was not captured; original results are retained without integration'
+          : `candidate reconciliation requires two successful children (codex=${codex.ok ? 'ok' : 'failed'}, claude=${claude.ok ? 'ok' : 'failed'})`,
+      };
     let synthesisPath: string | undefined;
     let synthesisError: string | undefined;
-    try { synthesisPath = persistPairSynthesis(pair, taskId, codex, claude); }
+    try { synthesisPath = persistPairSynthesis(pair, taskId, codex, claude, reconciliation); }
     catch (error) {
       synthesisError = error instanceof Error ? error.message : String(error);
       debug.log('classic-sidetab.mission-pair', 'synthesis-write-failed', { taskId, reason: synthesisError }, { level: 'warn' });
     }
-    const ok = bothSucceeded && Boolean(synthesisPath);
+    const reconciliationReady = Boolean(baseSha) && (reconciliation.status === 'merged' || reconciliation.status === 'conflict');
+    const ok = bothSucceeded && Boolean(synthesisPath) && reconciliationReady;
     const result: ClassicSidetabMissionPairCompletionResult = {
-      codex, claude, status: ok ? 'done' : 'error', finishedAt,
+      codex, claude, status: ok ? 'done' : 'error', finishedAt, reconciliation,
     };
     try { options.onComplete?.(result); }
     catch { debug.log('classic-sidetab.mission-pair', 'completion-callback-failed', { taskId, retry: false }); }
+    const patchSummary = reconciliation.status === 'merged'
+      ? ' Non-overlapping candidate changes are merged into the attached patch.'
+      : reconciliation.status === 'conflict'
+        ? ' Candidate patch has unresolved overlapping hunks; parent choice is required.'
+        : baseSha ? ' Candidate patch could not be reconciled; original results and reason are attached.' : '';
     const summary = synthesisPath
-      ? bothSucceeded ? 'Both missions completed. Full comparison attached.' : 'Pair completed with failures. Full comparison attached.'
+      ? bothSucceeded ? `Both missions completed. Full comparison attached.${patchSummary}` : 'Pair completed with failures. Full comparison attached.'
       : `Synthesis save failed; ${pairFailurePreview('Codex', codex)}; ${pairFailurePreview('Claude', claude)}`;
     const output = compactPairNotification(ok ? 'done' : 'error', summary, pair.codex.missionId ?? pair.claude.missionId ?? taskId);
     try {

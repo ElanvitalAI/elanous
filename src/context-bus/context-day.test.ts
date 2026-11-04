@@ -26,7 +26,15 @@ test('fake bus events count per seat and external origin, boundary, latest time 
     recordExternalEvent({ origin: 'claude-code', kind: 'claimed', summary: 'claim', source: 'elanous://test/claim', at: '2026-10-04T07:00:00.000Z' }, { db });
     recordExternalEvent({ origin: 'claude-code', kind: 'guide-changed', summary: 'guide', source: 'elanous://test/guide', at: '2026-10-04T11:30:00.000Z' }, { db });
     recordExternalEvent({ origin: 'codex-agent-mission', kind: 'started', summary: 'start', source: 'elanous://test/start', at: '2026-10-04T05:00:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'finished', summary: 'result observed', source: 'elanous://test/start', at: '2026-10-04T05:30:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'exit', summary: 'process exited', source: 'elanous://test/start', at: '2026-10-04T05:31:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'started', summary: 'reused locator start', source: 'elanous://test/start', at: '2026-10-04T05:32:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'exit', summary: 'exit-only completion', source: 'elanous://test/start', at: '2026-10-04T05:33:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'started', summary: 'cross-window start', source: 'elanous://test/cross-window', at: '2026-10-03T11:59:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'finished', summary: 'cross-window result', source: 'elanous://test/cross-window', at: '2026-10-04T05:34:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'exit', summary: 'cross-window exit', source: 'elanous://test/cross-window', at: '2026-10-04T05:35:00.000Z' }, { db });
     recordExternalEvent({ origin: 'harness-child', kind: 'finished', summary: 'finish', source: 'elanous://test/finish', at: '2026-10-04T06:00:00.000Z' }, { db });
+    recordExternalEvent({ origin: 'harness-child', kind: 'exit', summary: 'legacy exit completion', source: 'elanous://test/finish', at: '2026-10-04T06:30:00.000Z' }, { db });
     emitSessionEvent({ seat: 'TC', kind: 'task-done', text: 'old', at: '2026-10-03T11:59:59.999Z' }, { db });
     emitSessionEvent({ seat: 'OP', kind: 'asked', text: 'future', at: '2026-10-04T12:00:00.001Z' }, { db });
     recordEvent(db, { surface: 'unrelated', direction: 'outbound', kind: 'asked', text: 'noise', ts: '2026-10-04T10:00:00.000Z' });
@@ -41,10 +49,20 @@ test('fake bus events count per seat and external origin, boundary, latest time 
       ['MK', { 'task-claimed': 0, done: 0, asked: 0, 'guidance-changed': 1 }, '2026-10-04T09:00:00.000Z', '들어옴'],
       ['UX', { 'task-claimed': 0, done: 0, asked: 1, 'guidance-changed': 0 }, '2026-10-04T11:00:00.000Z', '들어옴'],
       ['claude-code', { 'task-claimed': 1, done: 0, asked: 0, 'guidance-changed': 1 }, '2026-10-04T11:30:00.000Z', '들어옴'],
-      ['codex-agent-mission', { 'task-claimed': 1, done: 0, asked: 0, 'guidance-changed': 0 }, '2026-10-04T05:00:00.000Z', '들어옴'],
-      ['harness-child', { 'task-claimed': 0, done: 1, asked: 0, 'guidance-changed': 0 }, '2026-10-04T06:00:00.000Z', '들어옴'],
+      ['codex-agent-mission', { 'task-claimed': 2, done: 3, asked: 0, 'guidance-changed': 0 }, '2026-10-04T05:35:00.000Z', '들어옴'],
+      ['harness-child', { 'task-claimed': 0, done: 2, asked: 0, 'guidance-changed': 0 }, '2026-10-04T06:30:00.000Z', '들어옴'],
     ]);
     expect(JSON.parse(JSON.stringify(report))).toEqual(report);
+    const memberEvents = contextDayTimeline('24h', { now: () => new Date(now), dbPath: path }).events
+      .filter(event => event.source === 'codex-agent-mission');
+    expect(memberEvents.map(({ kind }) => kind)).toEqual(['task-claimed', 'done', 'other', 'task-claimed', 'done', 'done', 'other']);
+    expect(memberEvents[2]?.summary).toBe('process exited');
+    expect(memberEvents[4]?.summary).toBe('exit-only completion');
+    expect(memberEvents[5]?.summary).toBe('cross-window result');
+    expect(memberEvents[6]?.summary).toBe('cross-window exit');
+    const harnessEvents = contextDayTimeline('24h', { now: () => new Date(now), dbPath: path }).events
+      .filter(event => event.source === 'harness-child');
+    expect(harnessEvents.map(({ kind }) => kind)).toEqual(['done', 'done']);
     expect(renderContextDay(report)).toContain('| OP | 1 | 1 | 0 | 0 | 2026-10-04T08:00:00.000Z | 들어옴 |');
     expect((db.prepare('SELECT count(*) AS n, sum(recall_count) AS recalls FROM events').get())).toEqual(before);
     const short = contextDay('1h', { now: () => new Date(now), dbPath: path });

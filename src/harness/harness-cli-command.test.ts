@@ -2828,6 +2828,26 @@ describe('harness CLI command', () => {
           { runId: id, event: 'pr-opened', data: { url: pr } },
         ] : null,
       }).lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(classifyHarnessPodExit({ status: 2 }, '[harness] release gate pool exclusivity: host-identity-unavailable',
+        ledger([]))).toMatchObject({ reason: 'pool-exclusivity-blocked',
+        lines: ['발사 전 거부: release gate pool exclusivity: host-identity-unavailable'] });
+      expect(classifyHarnessPodExit({ status: 1 }, `[self-dev] 1 goal 병렬 실행 · run ${runId} ▶ 시작 task:task-current\nreplayed failure mentioned task:task-stale`, ledger([
+        entry('pod-task-failure', { taskId: 'task:task-current', childError: 'gh auth token 실패 — 호스트에서 gh auth login' }),
+        entry('pod-task-failure', { taskId: 'task:task-stale', childError: 'stale error' }),
+      ]))).toMatchObject({ reason: 'pod-error', lines: ['Pod 작업 실패: gh auth token 실패 — 호스트에서 gh auth login'] });
+      expect(classifyHarnessPodExit({ status: 1 }, `[self-dev] 1 goal 병렬 실행 · run ${runId} ▶ 시작 task:task-current-2`, ledger([
+        entry('pod-task-failure', { taskId: 'task:task-current', childError: 'partial match must not count' }),
+      ]))).toMatchObject({ reason: 'no-launch' });
+      expect(classifyHarnessPodExit({ status: 1 }, `replayed child error mentions task:task-current`, ledger([
+        entry('pod-task-failure', { taskId: 'task:task-current', childError: 'must not be attributed without a start marker' }),
+      ]))).toMatchObject({ reason: 'no-launch' });
+      expect(classifyHarnessPodExit({ status: 2 }, `[self-dev] 1 goal 병렬 실행 · run ${runId} ▶ 시작 task:task-current\nrelease gate pool exclusivity: host-identity-unavailable`, ledger([
+        entry('pod-task-failure', { taskId: 'task:task-current', childError: 'child error' }),
+      ]))).toMatchObject({ reason: 'pool-exclusivity-blocked',
+        lines: ['발사 전 거부: release gate pool exclusivity: host-identity-unavailable · 작업 실패: child error'] });
+      expect(classifyHarnessPodExit({ status: 1 }, `[self-dev] 1 goal 병렬 실행 · run ${runId} ▶ 시작 task:task-current\nOOMKilled`, ledger([
+        entry('pod-task-failure', { taskId: 'task:task-current', childError: 'gh auth token 실패' }),
+      ]))).toMatchObject({ reason: 'OOMKilled', lines: ['Pod 작업 실패: gh auth token 실패 · 추가 분류: OOMKilled'] });
       expect(classifyHarnessPodExit({ status: 1 }, '', {
         ...ledger([]), supervisorDecision: () => ({ stopReason: 'needs-human', why: '승인 대기' }),
       }).lines).toEqual(['감독 판정: needs-human — 승인 대기']);
@@ -5007,6 +5027,17 @@ describe('recordHarnessPodStop — AUT-POD-EXIT-UNCLASSIFIED wiring', () => {
       evidenceRef: `logs:harness.pod/exit-classified:${runId}`,
       nextMove: 'Check Pod launch gate and pool, then relaunch',
     });
+  });
+
+  test('a child failure remains in the durable stop cause alongside a different Pod reason', () => {
+    const runId = uniqueRunId('child-error-with-oom');
+    const { entries, write } = capture();
+    const line = 'Pod 작업 실패: gh auth token 실패 — 호스트에서 gh auth login · 추가 분류: OOMKilled';
+    expect(recordHarnessPodStop(runId, 137, { reason: 'OOMKilled', lines: [line] }, 'OOMKilled',
+      { loadLedger: noLedger, write: write as never })).toBe(true);
+    expect(entries[0]!.data.cause).toContain('Pod 작업 실패: gh auth token 실패');
+    expect(entries[0]!.data.cause).toContain('OOMKilled');
+    expect(String(entries[0]!.data.cause).match(/gh auth token 실패/gu)).toHaveLength(1);
   });
 
   test('② OOMKilled stays byte-identical too', () => {

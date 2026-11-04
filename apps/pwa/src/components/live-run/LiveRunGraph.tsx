@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { BaseEdge, Background, Controls, EdgeLabelRenderer, Handle, Position, ReactFlow, type EdgeProps, type NodeProps, type ReactFlowInstance } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
+import './live-run-stage.css';
 import '@/components/workflows/node-status.css';
 import '@/lib/graph-wiring.css';
 import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
@@ -21,6 +22,7 @@ import type { TidyEdgeData } from '@/components/workflows/TidyEdge';
 import { durationLabel, kstClock, replayDelayMs, sceneAt, type LiveNodeState, type SceneEdge, type TraversalStep } from '@/lib/live-run-scene';
 import { graphFromSteps, mergeWalked, runStatusLabel } from '@/lib/live-run-view';
 import { liveRunMetricCells } from '@/lib/live-run-metrics';
+import { failureRepairEvidence, liveRunStageMetrics, mcpEdgeDirection, nodeBirthsBetweenSteps, stageNodeResourceBadges, unorderableGraphEventCount, visibleRunAtCursor } from '@/lib/live-run-stage';
 import { aggregateGroupState, collapseGroups, GROUP_NODE_PREFIX, groupBoxes, groupNames, groupOf, isGroupNodeId, type GroupedRunGraph } from '@/components/editor/graph-groups';
 import { GROUP_BOX_NODE_TYPES, type GroupBoxData } from '@/components/editor/GraphGroupBox';
 
@@ -58,14 +60,17 @@ interface LiveNodeData extends RunGraphNodeData {
   visits: number;
   focused: boolean;
   adaptiveLabel?: string;
+  stageMode?: boolean;
+  birthActive?: boolean;
+  resourceBadges?: string[];
 }
 
 function LiveNode({ data }: NodeProps) {
   const node = data as LiveNodeData;
   return (
     <div data-testid={`live-node-${node.label}`} data-state={node.state}
-      data-adaptive-event={node.adaptiveLabel}
-      className={`relative rounded-lg border-2 bg-surface px-3 py-2 shadow-sm transition-opacity duration-300 ${STATE_CLASS[node.state]} ${node.state === 'pending' ? node.unrecorded ? 'opacity-35' : 'opacity-60' : ''} ${node.adaptiveLabel ? 'animate-pulse ring-2 ring-primary/60' : ''}`}
+      data-adaptive-event={node.adaptiveLabel} data-birth-active={node.birthActive ? 'true' : 'false'}
+      className={`relative rounded-lg border-2 bg-surface px-3 py-2 shadow-sm transition-opacity duration-300 ${STATE_CLASS[node.state]} ${node.state === 'pending' ? node.unrecorded ? 'opacity-35' : 'opacity-60' : ''} ${node.adaptiveLabel ? 'animate-pulse ring-2 ring-primary/60' : ''} ${node.stageMode && node.birthActive ? 'live-node-birth' : ''}`}
       style={{ width: RUN_NODE_WIDTH, height: node.height, borderColor: STATE_RING[node.state], borderLeft: `5px solid ${KIND_COLORS[node.kind] ?? '#64748b'}`, outline: node.focused ? '2px solid var(--accent, #8b5cf6)' : undefined, outlineOffset: 3 }}>
       <Handle id="in" type="target" position={Position.Left} className="!pointer-events-none !opacity-0" />
       {/* 고정 폭 카드(RUN_NODE_WIDTH) 안에서 상태 말이 밀려나 잘리지 않게 — 종류 말이 대신 줄어든다. */}
@@ -77,7 +82,17 @@ function LiveNode({ data }: NodeProps) {
         <span data-state-word className="ml-auto shrink-0 font-medium" style={{ color: STATE_RING[node.state] }}>{node.unrecorded ? '기록 없음' : STATE_WORD[node.state]}</span>
       </div>
       <div className="overflow-x-auto whitespace-nowrap font-mono text-sm font-semibold text-text-primary" title={node.label}>{isGroupNodeId(node.label) ? `▣ ${node.label.slice(GROUP_NODE_PREFIX.length)}` : node.label}</div>
-      <div className="truncate text-[11px] text-text-tertiary" title={node.recipe}>{node.recipe} · 최대 {node.maxVisits}회</div>
+      {node.stageMode && (
+        <div data-testid={`live-node-resources-${node.label}`} title={node.resourceBadges?.join(' · ')} className="flex h-4 items-center gap-1 overflow-hidden whitespace-nowrap">
+          {(node.resourceBadges ?? ['호스트 미계측', '모델 미계측']).slice(0, 3).map((badge) => <span key={badge} className="shrink-0 rounded-full border border-cyan-400/40 bg-cyan-400/10 px-1 text-[8px] leading-3 text-cyan-700 dark:text-cyan-200">{badge}</span>)}
+        </div>
+      )}
+      {node.provenance?.type === 'scenario-injection' ? (
+        <div data-testid={`scenario-injection-${node.label}`} className="truncate text-[10px] text-amber-700 dark:text-amber-300"
+          title={`${node.provenance.type}${node.provenance.scene ? ` · ${node.provenance.scene}` : ''} · ${node.provenance.reason}`}>
+          시나리오 주입{node.provenance.scene ? ` · ${node.provenance.scene}` : ''}{node.provenance.mock ? ' · mock' : ''}
+        </div>
+      ) : !node.stageMode ? <div className="truncate text-[11px] text-text-tertiary" title={node.recipe}>{node.recipe} · 최대 {node.maxVisits}회</div> : null}
       {node.visits > 1 && (
         <span data-testid={`visit-badge-${node.label}`} className="absolute -right-2 -top-2 rounded-full bg-amber-500 px-1.5 text-xs font-bold text-white shadow">×{node.visits}</span>
       )}
@@ -91,6 +106,8 @@ interface LiveEdgeData extends TidyEdgeData {
   active: boolean;
   tokenKey: string;
   tokenMs: number;
+  mcpDirection: ReturnType<typeof mcpEdgeDirection>;
+  stageMode?: boolean;
 }
 
 /** Same pre-routed path as the editor's tidy edge; taken edges light up, untaken dim, the active one carries a token. */
@@ -98,14 +115,17 @@ function LiveEdge({ id, data, markerEnd, style }: EdgeProps) {
   const edge = data as LiveEdgeData | undefined;
   if (!edge?.route) return null;
   const { route } = edge;
-  const color = EDGE_FAMILY_COLOR[route.family];
+  const color = edge?.stageMode && edge.mcpDirection === 'to-elanous' ? '#22d3ee'
+    : edge?.stageMode && edge.mcpDirection === 'to-aside' ? '#f472b6'
+      : edge?.stageMode && edge.mcpDirection === 'mcp' ? '#a78bfa' : EDGE_FAMILY_COLOR[route.family];
+  const stroke = edge?.stageMode && edge.mcpDirection ? color : style?.stroke ?? color;
   const dashed = route.kind === 'back' || route.family === 'fallback';
   const dasharray = route.family === 'fallback' ? '8 4' : '6 4';
   return (
     <>
       <g data-testid={edge.taken ? `edge-token-${route.from}-${route.to}` : undefined}>
         <BaseEdge id={id} path={route.path} markerEnd={markerEnd}
-          style={{ stroke: color, strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: dasharray } : {}), ...style, ...(style?.stroke ? { opacity: 1 } : {}) }} />
+          style={{ strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: dasharray } : {}), ...style, ...(style?.stroke ? { opacity: 1 } : {}), stroke }} />
       </g>
       {edge.active && (
         <g key={edge.tokenKey} opacity={style?.opacity}>
@@ -136,7 +156,7 @@ function LiveEdge({ id, data, markerEnd, style }: EdgeProps) {
 
 const NODE_TYPES = { live: LiveNode, ...GROUP_BOX_NODE_TYPES };
 const EDGE_TYPES = { live: LiveEdge };
-export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion = 0, onNodeSelect }: {
+export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion = 0, onNodeSelect, stageMode = false }: {
   runId: string;
   /** `?units=folded` — start with every unit folded. */
   initialFolded?: boolean;
@@ -144,6 +164,7 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
   clearFocusVersion?: number;
   /** Let an embedding showcase open a ledger-backed evidence preview for a tapped node. */
   onNodeSelect?: (nodeId: string | null) => void;
+  stageMode?: boolean;
 }) {
   const client = useNexusClient();
   const traversal = useQuery({
@@ -152,6 +173,20 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
     refetchInterval: (query) => (query.state.data as HarnessRunTraversal | undefined)?.status === 'running' ? 4000 : false,
   });
   const run = traversal.data;
+  const live = run?.status === 'running';
+  const [mode, setMode] = useState<'live' | 'replay' | null>(null);
+  const effectiveMode = mode ?? (live ? 'live' : 'replay');
+  const [cursor, setCursor] = useState(-1);
+  const [entering, setEntering] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(() => stageMode ? 4 : DEFAULT_SPEED);
+  const [focus, setFocus] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
+  const steps = useMemo(() => run?.steps ?? [], [run]);
+  const visible = useMemo(() => stageMode
+    ? visibleRunAtCursor({ steps, graphEvents: run?.graphEvents }, cursor, effectiveMode === 'live')
+    : { steps: [...steps], graphEvents: [...(run?.graphEvents ?? [])] },
+  [stageMode, steps, run?.graphEvents, cursor, effectiveMode]);
   const graphQuery = useQuery({
     queryKey: ['run-graph', run?.graphId],
     queryFn: () => client.getRunGraph(run!.graphId!),
@@ -159,19 +194,18 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
     retry: false,
     staleTime: 60_000,
   });
-  const steps: TraversalStep[] = useMemo(() => run?.steps ?? [], [run]);
   const graph: RunGraphDetail | null = useMemo(() => {
     if (!run) return null;
     const real = graphQuery.data;
     // 선언된 그래프를 그리고, 런이 선언 밖 노드를 밟았으면 그것만 더한다(선언 노드는 지우지 않는다).
     // 그래프 정의를 못 읽었을 때만 «밟은 길»로 세운다(지어내지 않는다).
     const declared = real
-      ? mergeWalked(real, steps)
+      ? mergeWalked(real, visible.steps)
       : graphQuery.isLoading && run.graphId
         ? null
-        : graphFromSteps(run.graphId ?? run.runId, steps);
-    return declared ? applyRunGraphEvents(declared, run.graphEvents ?? []) : null;
-  }, [run, graphQuery.data, graphQuery.isLoading, steps]);
+        : graphFromSteps(run.graphId ?? run.runId, visible.steps);
+    return declared ? applyRunGraphEvents(declared, visible.graphEvents) : null;
+  }, [run, graphQuery.data, graphQuery.isLoading, visible]);
   // 묶음: 접은 묶음은 노드 하나로, 펼친 묶음은 이름 붙은 상자로. 기본 = 통합 보기(전부 펼침).
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
   const units = useMemo(() => graph ? groupNames(graph as GroupedRunGraph) : [], [graph]);
@@ -183,22 +217,17 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
     setCollapsed(new Set(units));
   }, [initialFolded, units]);
   const view = useMemo(() => graph ? collapseGroups(graph as GroupedRunGraph, collapsed) : null, [graph, collapsed]);
-  const flow = useMemo(() => view ? runGraphToFlow(view.graph) : null, [view]);
-  // 장면은 «그려진» 노드 위에서 돈다 — 접힌 묶음 안의 노드 방문은 그 묶음 노드의 방문이다.
+  // 장면은 «그려진» 노드 위에서 돈다 — 접힌 묶음 안의 방문은 묶음 노드의 방문이다.
   const viewSteps: TraversalStep[] = useMemo(() => view ? steps.map((step) => ({ ...step, node: view.resolve(step.node) })) : steps, [view, steps]);
+  const visibleViewSteps: TraversalStep[] = useMemo(() => view ? visible.steps.map((step) => ({ ...step, node: view.resolve(step.node) })) : visible.steps, [view, visible.steps]);
+  const resourceBadgesByNode = useMemo(() => stageNodeResourceBadges(
+    visibleViewSteps, (node) => node, run?.substrate, view?.graph.nodes.map((node) => node.node_id),
+  ), [visibleViewSteps, run?.substrate, view]);
+  const flow = useMemo(() => view ? runGraphToFlow(view.graph) : null, [view]);
   const sceneEdges: SceneEdge[] = useMemo(() => flow?.edges.map((edge) => ({
     id: edge.id, from: edge.source, to: edge.target, outcomes: (edge.data as unknown as TidyEdgeData).route.outcomes,
   })) ?? [], [flow]);
 
-  const live = run?.status === 'running';
-  const [mode, setMode] = useState<'live' | 'replay' | null>(null);
-  const effectiveMode = mode ?? (live ? 'live' : 'replay');
-  const [cursor, setCursor] = useState(-1);
-  const [entering, setEntering] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(DEFAULT_SPEED);
-  const [focus, setFocus] = useState<string | null>(null);
-  const [hovered, setHovered] = useState<string | null>(null);
   // 카메라 따라가기 — 그래프가 넓으면 전체 맞춤은 글자가 작아진다. 재생·라이브 중엔 지금 노드로 다가가 따라간다.
   const [follow, setFollow] = useState(true);
   const flowRef = useRef<ReactFlowInstance | null>(null);
@@ -207,6 +236,9 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
   const [flowReady, setFlowReady] = useState(0);
   const started = useRef(false);
   const previousRunId = useRef(runId);
+  useEffect(() => {
+    if (stageMode && speed < 4) setSpeed(4);
+  }, [stageMode, speed]);
   // 화면 폭 — 캔버스 높이·타임라인 높이·물러나기가 같은 문턱(700)을 본다(390px 실물 = 좁은 화면).
   const [viewportWidth, setViewportWidth] = useState(() => (typeof window === 'undefined' || !(window.innerWidth > 0) ? 1024 : window.innerWidth));
   useEffect(() => {
@@ -227,7 +259,7 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
     setCursor(-1);
     setEntering(false);
     setPlaying(false);
-    setSpeed(DEFAULT_SPEED);
+    setSpeed(stageMode ? 4 : DEFAULT_SPEED);
     setFocus(null);
     setHovered(null);
     setFollow(true);
@@ -264,7 +296,7 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
   const visited = useMemo(() => new Set(viewSteps.map((step) => step.node)), [viewSteps]);
   const adaptiveLabels = useMemo(() => {
     const labels = new Map<string, string>();
-    for (const event of (run?.graphEvents ?? []).slice(-8)) {
+    for (const event of visible.graphEvents.slice(-8)) {
       if (event.type === 'node-added') labels.set(event.node, event.kind === 'hand' ? '손 노드' : '새 노드');
       else if (event.type === 'unit-expanded') labels.set(event.node, '깊이 상승');
       else if (event.type === 'edge-rerouted') { labels.set(event.from, '경로 수리'); labels.set(event.to, '경로 수리'); }
@@ -278,7 +310,14 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
       }
     }
     return labels;
-  }, [run?.graphEvents, graphQuery.data, steps]);
+  }, [visible.graphEvents, graphQuery.data, steps]);
+  const birthNodeIds = useMemo(() => {
+    if (!stageMode) return new Set<string>();
+    const previousStep = effectiveMode === 'live' ? viewSteps.at(-2) : cursor > 0 ? viewSteps[cursor - 1] : undefined;
+    const currentStep = effectiveMode === 'live' ? viewSteps.at(-1) : viewSteps[cursor];
+    const finalCursor = effectiveMode === 'live' || cursor >= steps.length - 1;
+    return new Set(nodeBirthsBetweenSteps(visible.graphEvents, previousStep, currentStep, finalCursor));
+  }, [stageMode, effectiveMode, viewSteps, cursor, steps.length, visible.graphEvents]);
   const scene = useMemo(() => sceneAt(flow?.nodes.map((node) => node.id) ?? [], sceneEdges, viewSteps, cursor, entering), [flow, sceneEdges, viewSteps, cursor, entering]);
   const toggleUnit = useCallback((group: string) => setCollapsed((current) => {
     const next = new Set(current);
@@ -297,6 +336,8 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
       ...(hover && !hover.nodes.has(node.id) ? { style: { ...node.style, opacity: WIRING_STYLE.dimNode } } : {}),
       data: {
         ...node.data, state: scene.nodeState[node.id] ?? 'pending', visits: scene.visits[node.id] ?? 0, focused: focus === node.id,
+        stageMode, birthActive: birthNodeIds.has(node.id),
+        ...(stageMode ? { resourceBadges: resourceBadgesByNode.get(node.id) } : {}),
         ...(adaptiveLabels.has(node.id) ? { adaptiveLabel: adaptiveLabels.get(node.id) } : {}),
         unrecorded: !live && !visited.has(node.id),
       } satisfies LiveNodeData,
@@ -311,13 +352,13 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
         } satisfies GroupBoxData,
       }));
     return [...boxes, ...cards];
-  }, [flow, scene, focus, hover, live, visited, unitOf, toggleUnit, adaptiveLabels]);
+  }, [flow, scene, focus, hover, live, visited, unitOf, toggleUnit, adaptiveLabels, stageMode, birthNodeIds]);
   const edges = useMemo(() => flow?.edges.map((edge) => ({
     ...edge, type: 'live',
     ...wiringEdgeStyle(hover, edge.id),
     className: hover?.edges.has(edge.id) ? 'wiring-edge-flow' : undefined,
-    data: { ...(edge.data as unknown as TidyEdgeData), taken: scene.takenEdges.has(edge.id), active: scene.activeEdge === edge.id, tokenKey: `${edge.id}:${scene.cursor}`, tokenMs } satisfies LiveEdgeData,
-  })) ?? [], [flow, scene, tokenMs, hover]);
+    data: { ...(edge.data as unknown as TidyEdgeData), taken: scene.takenEdges.has(edge.id), active: scene.activeEdge === edge.id, tokenKey: `${edge.id}:${scene.cursor}`, tokenMs, mcpDirection: stageMode ? mcpEdgeDirection(edge.source, edge.target) : null, stageMode } satisfies LiveEdgeData,
+  })) ?? [], [flow, scene, tokenMs, hover, stageMode]);
 
   const zoomTo = useCallback((nodeId: string | null) => {
     setFocus(nodeId);
@@ -373,17 +414,48 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
   const focusVisits = focus ? steps.map((step, index) => ({ step, index })).filter(({ step }) => (view?.resolve(step.node) ?? step.node) === focus) : [];
   const current = cursor >= 0 ? steps[cursor] : undefined;
   const metrics = liveRunMetricCells(run, graph);
+  const stageMetrics = liveRunStageMetrics(visible, graph);
+  const recovery = failureRepairEvidence(visible);
+  const unorderableEvents = unorderableGraphEventCount(run, cursor, effectiveMode === 'live');
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3">
+    <div data-stage-mode={stageMode ? 'true' : 'false'} className={`flex min-h-0 flex-1 flex-col ${stageMode ? 'gap-2' : 'gap-3'}`}>
       <div className="flex flex-wrap items-center gap-2">
         <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${live ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400' : run.status === 'completed' ? 'bg-success/15 text-success' : 'bg-error/15 text-error'}`}>
           {runStatusLabel(run.status)}
         </span>
-        <h2 className="order-first min-w-0 basis-full truncate text-sm font-semibold text-text-primary sm:order-none sm:basis-0 sm:flex-1" title={run.title ?? undefined}>{run.title ?? run.runId}</h2>
+        <h2 className={`order-first min-w-0 basis-full truncate font-semibold text-text-primary sm:order-none sm:basis-0 sm:flex-1 ${stageMode ? 'text-xl sm:text-2xl' : 'text-sm'}`} title={run.title ?? undefined}>{run.title ?? run.runId}</h2>
         {run.prNumber !== null && <span className="text-xs text-text-secondary">PR #{run.prNumber}</span>}
         <span className="font-mono text-[11px] text-text-tertiary">{run.runId.slice(0, 12)} · {run.graphId ?? '그래프 모름'}{run.substrate ? ` · ${run.substrate}` : ''}</span>
       </div>
+
+      {stageMode && (
+        <>
+          <dl data-testid="stage-metrics" aria-label="무대 실측 숫자" className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+            {([
+              ['노드', stageMetrics.nodes], ['간선', stageMetrics.edges], ['방문', stageMetrics.visits],
+              ['실패', stageMetrics.failures], ['재배선', stageMetrics.repairs], ['MCP', stageMetrics.mcpEdges],
+            ] as const).map(([label, value]) => (
+              <div key={label} className="stage-counter rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-center shadow-lg">
+                <dt className="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-200/75">{label}</dt>
+                <dd className="font-mono text-2xl font-black leading-tight text-white sm:text-4xl">{value ?? '—'}</dd>
+              </div>
+            ))}
+          </dl>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span data-testid="stage-recovery" className={`rounded-full px-3 py-1 font-bold ${recovery ? 'bg-emerald-400/20 text-emerald-200' : 'bg-amber-400/15 text-amber-200'}`}>
+              {recovery ? `실패 → 수리 · ${recovery.repair.was} ↝ ${recovery.repair.to}` : stageMetrics.failures ? '실패 기록 · 수리 경로는 미기록' : '이 런에 실패→수리 사건 없음'}
+            </span>
+            {unorderableEvents > 0 && <span data-testid="stage-order-uncertainty" role="status" className="rounded-full border border-amber-300/40 px-2 py-1 text-amber-100">사건 순서 미확인 {unorderableEvents}</span>}
+            <span className="rounded-full border border-cyan-300/40 px-2 py-1 text-cyan-100">실행 기반 {run.substrate ?? '미계측'} · 노드별 host/model은 배지 확인</span>
+            {stageMetrics.births > 0 && <span className="rounded-full border border-fuchsia-300/40 px-2 py-1 text-fuchsia-100">노드 탄생 {stageMetrics.births}</span>}
+            <span className="ml-auto flex items-center gap-3 text-[11px] text-white/75">
+              <span><i className="mr-1 inline-block h-2 w-2 rounded-full bg-cyan-300" />aside → 엘라누스 MCP</span>
+              <span><i className="mr-1 inline-block h-2 w-2 rounded-full bg-pink-400" />엘라누스 → aside</span>
+            </span>
+          </div>
+        </>
+      )}
 
       <div className="flex flex-wrap items-center gap-2 text-xs">
         <div role="group" aria-label="보기" className="flex overflow-hidden rounded border border-border">
@@ -400,7 +472,7 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
             }} className="rounded border border-border px-2.5 py-1 font-semibold">{playing ? '⏸ 일시정지' : '▶ 재생'}</button>
             <button type="button" onClick={() => { setCursor(0); setEntering(true); setPlaying(false); }} className="rounded border border-border px-2 py-1">처음</button>
             <div role="group" aria-label="속도" className="flex overflow-hidden rounded border border-border">
-              {SPEEDS.map((value) => (
+              {SPEEDS.filter((value) => !stageMode || value >= 4).map((value) => (
                 <button key={value} type="button" onClick={() => setSpeed(value)} aria-pressed={speed === value}
                   className={`px-2 py-1 ${speed === value ? 'bg-accent/20 font-semibold text-text-primary' : 'text-text-secondary'}`}>{value}×</button>
               ))}
@@ -419,7 +491,7 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
         )}
       </div>
 
-      <dl data-testid="live-run-metrics" aria-label="런 지표" className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+      {!stageMode && <dl data-testid="live-run-metrics" aria-label="런 지표" className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
         <div data-testid="metric-nodes" className="rounded border border-border bg-surface px-2 py-1">
           <dt className="text-text-tertiary">노드 수</dt>
           <dd className="font-mono font-semibold text-text-primary">{metrics.nodeCount}</dd>
@@ -436,12 +508,12 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
           <dt className="text-text-tertiary">비용</dt>
           <dd className="font-mono font-semibold text-text-primary">{metrics.cost}</dd>
         </div>
-      </dl>
+      </dl>}
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
+      <div className={`flex min-h-0 flex-1 flex-col gap-3 ${stageMode ? 'stage-workspace' : 'lg:flex-row'}`}>
         {/* 좁은 화면(세로 쌓임)에서는 그래프가 이 화면의 본체 — 타임라인을 300px 로 낮춘 만큼 캔버스를 더 준다. */}
         <section ref={canvasRef} aria-label="실행 그래프" data-viewport={narrow ? 'narrow' : 'wide'}
-          className={`relative min-w-0 overflow-hidden rounded-lg border border-border bg-surface ${narrow ? 'h-[65dvh] min-h-[380px]' : 'h-[60dvh] min-h-[340px]'} lg:h-[calc(100dvh-230px)] lg:min-h-[520px] lg:flex-1`}>
+          className={`relative min-w-0 overflow-hidden rounded-lg border border-border bg-surface ${stageMode ? 'stage-canvas' : `${narrow ? 'h-[65dvh] min-h-[380px]' : 'h-[60dvh] min-h-[340px]'} lg:h-[calc(100dvh-230px)] lg:min-h-[520px] lg:flex-1`}`}>
           {steps.length === 0 && <p className="absolute left-3 top-3 z-10 text-xs text-text-tertiary">아직 노드에 들어가지 않았습니다(원장에 `pipeline-node-entry` 없음).</p>}
           {flow && (
             <ReactFlow key={`${graph?.id ?? 'graph'}:${[...collapsed].sort().join(',')}`} nodes={nodes} edges={edges} nodeTypes={NODE_TYPES} edgeTypes={EDGE_TYPES}
@@ -482,10 +554,16 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
                 {focusVisits.map(({ step, index }) => (
                   <li key={index}>
                     <button type="button" onClick={() => seek(index)} className="w-full rounded px-1 py-0.5 text-left hover:bg-surface-elevated">
-                      <span className="font-mono text-text-secondary">{kstClock(step.at)}</span>{' '}
+                      <span className="font-mono text-text-secondary">시각 {kstClock(step.at)}</span>{' '}
                       <span className="font-semibold">×{step.visit}</span>{' '}
                       <span className={step.outcome === 'fail' ? 'text-error' : step.outcome === null ? 'text-amber-500' : 'text-success'}>{step.outcome ?? '도는 중'}</span>{' '}
-                      <span className="text-text-tertiary">{durationLabel(step.durationMs)}</span>
+                      <span className="text-text-tertiary">소요 {durationLabel(step.durationMs)}</span>
+                      {stageMode && <span className="mt-0.5 flex flex-wrap gap-x-2 text-[10px] text-cyan-700 dark:text-cyan-200" data-testid={`visit-resources-${step.node}-${step.visit}`}>
+                        <span>호스트 {step.resources?.host ?? '미계측'}</span>
+                        <span>Pod {step.resources?.pod ?? '미계측'}</span>
+                        <span>모델 {step.resources?.models?.join(', ') ?? '미계측'}</span>
+                        <span>플러그인 {step.resources?.plugins?.join(', ') ?? '미계측'}</span>
+                      </span>}
                       {step.detail && <span className="block text-text-secondary">{step.detail}</span>}
                     </button>
                   </li>
@@ -495,7 +573,7 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
           )}
         </section>
 
-        <aside aria-label="실행 타임라인" className={`overflow-y-auto rounded-lg border border-border bg-surface ${narrow ? 'max-h-[300px]' : 'max-h-[420px]'} lg:max-h-[calc(100dvh-230px)] lg:w-[340px] lg:shrink-0`}>
+        <aside aria-label="실행 타임라인" className={`overflow-y-auto rounded-lg border border-border bg-surface ${stageMode ? 'stage-timeline' : `${narrow ? 'max-h-[300px]' : 'max-h-[420px]'} lg:max-h-[calc(100dvh-230px)] lg:w-[340px] lg:shrink-0`}`}>
           <h3 className="sticky top-0 border-b border-border bg-surface px-3 py-2 text-xs font-semibold">타임라인 (KST)</h3>
           <ol>
             {steps.map((step, index) => {

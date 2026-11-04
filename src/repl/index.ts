@@ -23,6 +23,7 @@ import { resolve as resolvePath, isAbsolute, basename } from 'node:path';
 import * as ui from '../ui.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
 import { runTurn } from '../session/chat.js';
+import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import {
   ensureCliSession,
   sessionBudget,
@@ -373,7 +374,7 @@ async function runOneTurn(
   onJsonDelta?: (delta: string) => void,
   onJsonStatus?: (line: string) => void,
   onJsonReplace?: (fullText: string) => void,
-): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null }> {
+): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; goalComplete?: boolean; goalStopReason?: string }> {
   const startedAt = Date.now();
   const replyChunks: string[] = [];
   const userImages = pendingAttachments.length > 0 ? pendingAttachments.map(a => a.block) : [];
@@ -399,11 +400,13 @@ async function runOneTurn(
   // Completion output is untrusted task data. Carry it as a user-role content
   // block for this call, leaving the human prompt and system prompt intact.
   if (nextTuiNotifications) userImages.unshift({ type: 'text', text: nextTuiNotifications });
+  const tuiIntent = classifyTuiChatIntent(userText, { seat: process.env.COORD_ID?.trim() !== undefined });
   const result = await runTurn({
     userConfig: cfg,
     sessionId,
     userText,
     utteranceSurface: 'tui',
+    ...(tuiIntent.goalLoop ? { goalLoop: true } : {}),
     systemPrompt,
     userImages: userImages.length > 0 ? userImages : undefined,
     ...(process.env.ELANOUS_TEST_FAKE_LLM === '1' && Number.isFinite(Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS))
@@ -469,6 +472,8 @@ async function runOneTurn(
     model: result.model ?? null,
     durationMs: Date.now() - startedAt,
     logPath,
+    ...(result.goalComplete ? { goalComplete: true } : {}),
+    ...(result.goalStopReason ? { goalStopReason: result.goalStopReason } : {}),
   };
 }
 
@@ -851,6 +856,8 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         provider: result.provider,
         model: result.model,
         reply: result.reply,
+        ...(result.goalComplete ? { goalComplete: true } : {}),
+        ...(result.goalStopReason ? { goalStopReason: result.goalStopReason } : {}),
         durationMs: result.durationMs,
         logPath: result.logPath,
         assertFailures: failures,

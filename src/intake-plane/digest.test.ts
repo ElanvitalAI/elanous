@@ -3,7 +3,47 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ingestIntakeItems, listIntakeItems, markIntakeItem } from './items.js';
-import { buildIntakeDigest, renderDigestMarkdown, renderDigestTelegram, type IntakeDigest } from './digest.js';
+import { buildIntakeDigest, digestTelegramVisibleEntries, renderDigestMarkdown, renderDigestTelegram, type IntakeDigest } from './digest.js';
+
+test('topic briefing card includes its configured topic, distinct source count and KST collection time', () => {
+  const card = renderDigestTelegram({ day: '2026-11-04', absorbed: [], goals: [], grounding: 0, release: 0, manual: 0 }, {
+    topic: '2027 사업계획: 호르무즈·중간선거 이후 원가·환율·물류', sourceCount: 12, collectedAt: '2026-11-03T23:00:00.000Z',
+  });
+  expect(card.split('\n').slice(0, 3)).toEqual([
+    '📰 2027 사업계획: 호르무즈·중간선거 이후 원가·환율·물류',
+    '흡수 0편 · 출처 12개 · 수집 08:00 KST',
+    '우리에게 닿는 것 0',
+  ]);
+});
+
+test('topic card keeps an unknown collection source count unknown', () => {
+  const card = renderDigestTelegram({ day: '2026-11-04', absorbed: [], goals: [], grounding: 0, release: 0, manual: 0 }, {
+    topic: '사업계획 토픽',
+  });
+  expect(card).toContain('출처 수 미상');
+  expect(card).not.toContain('출처 0개');
+});
+
+test('intake digest preserves configured topic identity for topic-scoped briefing', () => {
+  const root = mkdtempSync(join(tmpdir(), 'topic-brief-digest-'));
+  try {
+    ingestIntakeItems(root, 'rss', [{ seat: 'user', briefingTopic: '새 토픽', publisher: 'Example News', url: 'https://example.com/story', title: '새 기사' }], '2026-11-03T23:00:00Z');
+    const digest = buildIntakeDigest(root, '2026-11-04', undefined, undefined, 'user');
+    expect(digest.absorbed).toHaveLength(1);
+    expect(digest.absorbed[0]).toMatchObject({ briefingTopic: '새 토픽', sources: ['rss'] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Telegram source counts can be derived only from individually visible entries', () => {
+  const digest: IntakeDigest = {
+    day: '2026-11-04', absorbed: Array.from({ length: 12 }, (_, index) => ({ id: `id-${index}`, sources: ['rss'],
+      publisher: `publisher-${index}`, url: `https://publisher-${index}.example/a`, axis: '그 밖' })),
+    goals: [], grounding: 0, release: 0, manual: 0,
+  };
+  const visible = digestTelegramVisibleEntries(digest);
+  expect(visible).toHaveLength(10);
+  expect(new Set(visible.map((entry) => entry.publisher)).size).toBe(10);
+});
 
 test('filtered digest excludes unowned queues and MK notes; empty user briefing has the shared zero headline', () => {
   const root = mkdtempSync(join(tmpdir(), 'watch-digest-'));

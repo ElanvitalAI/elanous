@@ -36,6 +36,8 @@ export interface MachineLedger {
   devices: DeviceRow[];
   rules: string[];
   changes: string[];
+  /** Reserved catalog marker in machines.yaml; non-empty pool data needs its own validated schema. */
+  pools?: never[];
 }
 
 export const machineLedgerPath = (root = process.cwd()): string => resolve(root, 'docs/ops/machines.yaml');
@@ -66,7 +68,10 @@ const list = (value: unknown, label: string): string[] => {
 
 export function validateMachineLedger(value: unknown): MachineLedger {
   const data = record(value, 'ledger');
-  keys(data, ['title', 'policy', 'machines', 'devices', 'rules', 'changes'], 'ledger');
+  keys(data, ['title', 'policy', 'machines', 'devices', 'rules', 'changes', 'pools'], 'ledger');
+  if (data.pools !== undefined && (!Array.isArray(data.pools) || data.pools.length !== 0)) {
+    throw new Error('invalid pools: only the empty reserved catalog is supported');
+  }
   if (!Array.isArray(data.machines) || !Array.isArray(data.devices)) throw new Error('invalid machines or devices');
   const ids = new Set<string>();
   const rows = <T extends { id: string }>(entries: unknown[], fields: string[], label: string, extraFields: string[] = []): T[] => entries.map((entry, index) => {
@@ -102,6 +107,7 @@ export function validateMachineLedger(value: unknown): MachineLedger {
     devices: rows<DeviceRow>(data.devices, ['id', 'name', 'status', 'purpose'], 'devices'),
     rules: list(data.rules, 'rules'),
     changes: list(data.changes, 'changes'),
+    ...(data.pools === undefined ? {} : { pools: [] }),
   };
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { BUILD_SLOW, BUILD_STOP, QUEUE_SLOW, QUEUE_STOP, UNKNOWN_CAP, decideBackpressure, quoteRemoteKubectlArg, readBackpressureSignals, type BackpressureSignals, type BackpressureReadDeps } from './dispatch-backpressure.js';
+import { BUILD_SLOW, BUILD_STOP, QUEUE_SLOW, QUEUE_STOP, UNKNOWN_CAP, backpressureSshArgv, backpressureSshRunner, decideBackpressure, quoteRemoteKubectlArg, readBackpressureSignals, type BackpressureSignals, type BackpressureReadDeps } from './dispatch-backpressure.js';
 import { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { installHarnessCliCommand } from './harness-cli-command.js';
@@ -7,6 +7,9 @@ import { renderLogJsonLine, limitReachedJsonMeta } from '../cli/logs-cli.js';
 import { createFakeKubectl } from '../ux-sim/fake-kubectl.js';
 import { createFakeSsh } from '../ux-sim/fake-ssh.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const NOW = Date.parse('2026-10-10T00:00:00Z');
 const admission = (minutesAgo: number, runId: string, recommended: number) => ({
@@ -22,6 +25,57 @@ const roomy = (): BackpressureSignals => ({ queueDepth: 0, admitWaiting: 2, admi
   dockerBuilds: { local: 0, remote: 1 }, podRecommended: 5, staleParents: 3 });
 
 describe('dispatch backpressure decision', () => {
+  test('SSH measurement keeps configured multiplexing and proxy settings in effect', () => {
+    expect(backpressureSshArgv('gcp1', 'kubectl get pods')).toEqual([
+      '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', 'gcp1', 'kubectl get pods',
+    ]);
+    expect(backpressureSshArgv('gcp1', 'kubectl get pods')).not.toContain('ControlPath=none');
+  });
+  test('SSH runner invokes the configured ssh executable with the host and script', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'backpressure-ssh-'));
+    const executable = join(dir, 'ssh');
+    writeFileSync(executable, '#!/bin/sh\nprintf \'%s\\n\' "$@"\n');
+    chmodSync(executable, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = dir + ':' + (previousPath ?? '');
+    try {
+      const result = backpressureSshRunner('gcp1', 'kubectl get pods', 1_000);
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim().split('\n')).toEqual(backpressureSshArgv('gcp1', 'kubectl get pods'));
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('shares a measured snapshot for 60 seconds and refreshes at expiry', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'backpressure-cache-'));
+    let now = NOW;
+    let reads = 0;
+    const deps = observed({ cachePath: join(dir, 'measure.json'), now: () => now,
+      queue: () => { reads++; return [{ status: 'queued' }]; } });
+    try {
+      expect(readBackpressureSignals(deps).queueDepth).toBe(1);
+      expect(readBackpressureSignals({ ...deps, queue: () => { reads++; return []; } }).queueDepth).toBe(1);
+      expect(reads).toBe(1);
+      const slow = observed({ cachePath: join(dir, 'slow.json'), now: () => now,
+        queue: () => { reads++; now += 75_000; return [{ status: 'queued' }]; } });
+      expect(readBackpressureSignals(slow).queueDepth).toBe(1);
+      expect(readBackpressureSignals(slow).queueDepth).toBe(1);
+      expect(reads).toBe(2);
+      now += 60_000;
+      expect(readBackpressureSignals(deps).queueDepth).toBe(1);
+      expect(reads).toBe(3);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('an unusable cache directory falls back to a live observation', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'backpressure-cache-fallback-'));
+    const file = join(dir, 'not-a-directory');
+    writeFileSync(file, 'occupied');
+    try {
+      expect(readBackpressureSignals(observed({ cachePath: join(file, 'measure.json') })).queueDepth).toBe(2);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   test('fixed thresholds and pod headroom with stale parents only as an observation', () => {
     expect([BUILD_STOP, BUILD_SLOW, QUEUE_STOP, QUEUE_SLOW, UNKNOWN_CAP]).toEqual([4, 2, 8, 4, 1]);
     const result = decideBackpressure(roomy(), { maxPerCycle: 6 });

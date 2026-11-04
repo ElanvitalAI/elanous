@@ -47,6 +47,8 @@ import { LOG_AXIS_CATEGORIES, knownLogAxes, resolveLogAxis } from '../mss/loggin
 import { KNOWN_LOG_EVENT_NAMES } from './log-event-names.js';
 import { bookmarkAttachDefaults } from './remote-resolve.js';
 import { RemotesStore } from './remotes.js';
+import { registerLogFederationCommands } from './log-federation-cli.js';
+import { readFederatedLogInstances } from '../mss/logging/log-federation.js';
 import { detectRepeatedFailures, explainFailure } from '../domains/repeated-failure.js';
 import { redactSecretText } from '../debug/log.js';
 // 타입 전용 — `graph-templates` 는 typescript 를 무는 모듈이라 «런타임 정적 의존»으로 두지 않는다.
@@ -190,7 +192,10 @@ export function resolveLogTargets(
     if (byPathOnly.length === 1) {
       return { targets: [{ name: byPathOnly[0]!.name, dbPath: byPathOnly[0]!.dbPath }] };
     }
-    const known = ['prod', ...instances.map((e) => e.name)].join(', ');
+    if (readFederatedLogInstances().includes(opts.instance)) {
+      return { targets: [{ name: opts.instance, dbPath: logsDbPath() }] };
+    }
+    const known = ['prod', ...instances.map((e) => e.name), ...readFederatedLogInstances()].join(', ');
     return { targets: [], error: `인스턴스 '${opts.instance}' 미등록 (등록: ${known})` };
   }
 
@@ -1889,6 +1894,7 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
   if (recurrenceDisagreementFilter.error) { console.error(`elanous logs: ${recurrenceDisagreementFilter.error}`); return 1; }
   const resolved = deps.resolveTargets?.(opts) ?? resolveLogTargets(opts);
   if (resolved.error) { console.error(`elanous logs: ${resolved.error}`); return 1; }
+  if (opts.instance && readFederatedLogInstances().includes(opts.instance)) query.instances = [opts.instance];
 
   // read-only open — 타겟이 어느 인스턴스든 CLI 조회는 write 0 (연합 불변식).
   const opened: Array<{ name: string; store: LogStore }> = [];
@@ -2274,12 +2280,14 @@ export function runLogsInstances(opts: { json?: boolean }): number {
     } satisfies LogInstanceView]),
     ...views,
   ];
+  const federated = readFederatedLogInstances().map((name) => ({ name, kind: 'federated-log', stateDir: dirname(prodRoot), dbPath: prodDb, dbExists: existsSync(prodDb) }));
   if (opts.json) {
-    console.log(JSON.stringify(rows, null, 2));
+    console.log(JSON.stringify([...rows, ...federated], null, 2));
     return 0;
   }
   for (const v of rows) console.log(formatLogInstance(v));
-  if (rows.length === 0) console.log('(등록된 인스턴스 없음)');
+  for (const v of federated) console.log(`${v.name.padEnd(24)} federated log   ${v.dbExists ? 'store OK' : 'store 없음'}  ${v.stateDir}`);
+  if (rows.length + federated.length === 0) console.log('(등록된 인스턴스 없음)');
   return 0;
 }
 
@@ -2403,6 +2411,7 @@ const logsCmd = program.command('logs')
     const { runLogsCli } = await import('./logs-cli.js');
     process.exitCode = await runLogsCli(o);
   });
+registerLogFederationCommands(logsCmd);
 // ★ 발견성 — 플래그 18개를 나열만 하면 **이미 있는 기능을 못 찾고 손으로 다시 만든다**.
 //   실측(2026-07-28): `--since 30m` 을 모른 채 `$(date -u -v-30M …)` 를 손으로 썼고(macOS 전용),
 //   `-f` 를 모른 채 폴 루프를 짰다. 그래서 예시를 **맨 앞**에 둔다(`before` = Usage 위).

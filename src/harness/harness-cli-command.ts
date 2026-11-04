@@ -424,13 +424,14 @@ function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubs
 }
 type PodExit = { status: number | null; signal?: string | null };
 type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown' | 'preflight-refused'
-  | 'pod-error' | 'launch-gate-blocked' | 'dep-blocked' | 'ENOBUFS' | 'OOMKilled';
+  | 'pod-error' | 'launch-gate-blocked' | 'pool-exclusivity-blocked' | 'dep-blocked' | 'ENOBUFS' | 'OOMKilled';
 
 function unknownPodExitTailReason(output: string): PodExitReason | undefined {
   const tail = output.slice(-16_000);
   if (/\bOOMKilled\b/i.test(tail)) return 'OOMKilled';
   if (/\bENOBUFS\b/i.test(tail)) return 'ENOBUFS';
   if (/launch gate[^\r\n]*blocked|blocked[^\r\n]*launch gate/i.test(tail)) return 'launch-gate-blocked';
+  if (/release gate pool exclusivity:\s*[a-z0-9-]+/i.test(tail)) return 'pool-exclusivity-blocked';
   if (/\bpod-error\b/i.test(tail)) return 'pod-error';
   if (/\b(?:DEP_FAILED|DEPENDENCY_NEEDS_HUMAN|DEP_BLOCKED_REBASE_READY)\b/.test(tail)) return 'dep-blocked';
   return undefined;
@@ -444,6 +445,16 @@ const LAUNCH_EVIDENCE_EVENTS = new Set(['job-applied', 'pod-child-run', 'reviewe
 /** Keep the run identity seen at launch even if the bounded output tail later drops it. */
 export function harnessPodRunId(output: string): string | undefined {
   return output.match(/\[self-dev\][^\r\n]*\brun\s+(run-[a-z0-9_-]{8,64})(?=\s|$)/i)?.[1];
+}
+
+/** Only the self-dev start announcement identifies tasks launched by this output.
+ * Other `task:` strings can be copied from a stale error or quoted as context. */
+function taskIdsStartedInOutput(output: string, runId: string): ReadonlySet<string> {
+  const escapedRunId = runId.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const marker = new RegExp(`^\\[self-dev\\][^\\r\\n]*\\brun ${escapedRunId}\\b[^\\r\\n]*▶ 시작 (task:[\\w-]+)(?=$|[\\s·])`, 'gmu');
+  const ids = new Set<string>();
+  for (const match of output.matchAll(marker)) ids.add(match[1]!);
+  return ids;
 }
 
 /** Classify a missing Pod result from run-scoped evidence, never from a nonzero exit alone. */
@@ -564,13 +575,24 @@ export function classifyHarnessPodExit(
   } else {
     let applied: boolean | undefined;
     try { applied = (deps.hasJobApplied ?? hasHarnessPodJobApplied)(runId, output); } catch { /* unknown */ }
-    const noLaunch = ledgerReadable && !ledger?.some((entry) => LAUNCH_EVIDENCE_EVENTS.has(entry.event))
-      && applied === false && !pr;
-    reason = noLaunch ? 'no-launch' : unknownPodExitTailReason(output) ?? 'unknown';
-    line = noLaunch
-      ? 'Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라'
-      : reason === 'unknown' ? 'Pod 실행 여부 또는 종료 이유를 확인하지 못했다'
-        : `Pod 종료 출력에서 확인한 원인: ${reason}`;
+    const tailReason = unknownPodExitTailReason(output);
+    // A parent run may be resumed; only attribute a ledger child failure to exact task ids in this output.
+    const outputTaskIds = runId ? taskIdsStartedInOutput(output, runId) : new Set<string>();
+    const recordedTaskFailure = [...(ledger ?? [])].reverse().find((entry) => entry.event === 'pod-task-failure'
+      && typeof entry.data.taskId === 'string' && outputTaskIds.has(entry.data.taskId));
+    const childError = recordedTaskFailure && typeof recordedTaskFailure.data.childError === 'string'
+      ? recordedTaskFailure.data.childError.split(/\r?\n/u, 1)[0] : undefined;
+    const noLaunch = tailReason !== 'pool-exclusivity-blocked' && !recordedTaskFailure && ledgerReadable
+      && !ledger?.some((entry) => LAUNCH_EVIDENCE_EVENTS.has(entry.event)) && applied === false && !pr;
+    reason = noLaunch ? 'no-launch' : tailReason ?? (childError ? 'pod-error' : 'unknown');
+    const poolReason = reason === 'pool-exclusivity-blocked'
+      ? output.slice(-16_000).match(/release gate pool exclusivity:\s*[a-z0-9-]+/gi)?.at(-1) : undefined;
+    line = poolReason && childError ? `발사 전 거부: ${poolReason} · 작업 실패: ${childError}`
+      : poolReason ? `발사 전 거부: ${poolReason}`
+        : childError ? `Pod 작업 실패: ${childError}${tailReason && tailReason !== 'pod-error' ? ` · 추가 분류: ${tailReason}` : ''}`
+          : noLaunch ? 'Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라'
+            : reason === 'unknown' ? 'Pod 실행 여부 또는 종료 이유를 확인하지 못했다'
+              : `Pod 종료 출력에서 확인한 원인: ${reason}`;
   }
   try { debug.log('harness.pod', 'exit-classified', { runId, reason, status: exit.status, signal: signal ?? null }); } catch { /* observation is fail-soft */ }
   return { reason, lines: [line, ...(pr ? [`PR 이 남아 있다: ${pr}`] : [])] };
@@ -850,10 +872,13 @@ export function recordHarnessPodStop(
       return true;
     }
     // The classified line is our own one-line verdict («Pod 안 자식이 실패했다 — OOMKilled»), not the raw output tail.
-    const verdict = classified.lines[0]?.split(' — ').slice(1).join(' — ').trim();
+    const explicitCauseLine = classified.lines[0]?.startsWith('발사 전 거부:')
+      || classified.lines[0]?.startsWith('Pod 작업 실패:') ? classified.lines[0] : undefined;
+    const verdict = explicitCauseLine ? undefined : classified.lines[0]?.split(' — ').slice(1).join(' — ').trim();
+    const explicitCause = explicitCauseLine ? ` — ${explicitCauseLine}` : '';
     const stopEntry = (deps.record ?? recordRunStop)({
       runId, site: 'pod-exit', class: scopeEscape ? 'scope-escape' : classifyPodExitStop(classified.reason),
-      cause: `Pod exit ${status}: ${scopeEscape ? 'scope-escape' : classified.reason}${verdict ? ` — ${verdict}` : ''}`,
+      cause: `Pod exit ${status}: ${scopeEscape ? 'scope-escape' : classified.reason}${verdict ? ` — ${verdict}` : ''}${explicitCause}`,
       evidenceRef, nextMove, ...(childEvidence ? { childEvidence } : {}),
       ...(classified.podErrorCode === 'pod-job-failed' ? { terminationReason: classified.podErrorCode } : {}),
     }, ...(deps.write ? [deps.write] : []));

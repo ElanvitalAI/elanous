@@ -1,15 +1,15 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withFakeBins } from '../ux-sim/fake-bin.js';
 import {
   annotateJsonStdout, decideGateDispatch, dispatchHeavyCheck, extractGateRemoteFlags, GATE_REMOTE_DEFAULTS, relativizeArgs,
-  gateRemoteHostCap, gateReservationAlternateHosts, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, remoteSupervisorScript, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type SshResult,
+  gateRemoteHostCap, gateReservationAlternateHosts, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, remoteSupervisorScript, resolveGateRemoteSettings, resolveGatePrBase, runOnRemote, type GateRemoteRunner, type SshResult,
 } from './gate-remote.js';
 import { parseGateRemoteConfig } from '../user-config.js';
-import { readGateHostResources, reserveReleaseGateHosts } from '../release-loop/gate-host-reservation.js';
+import { readGateHostResources, reserveReleaseGateHosts, type GateHostResourceReading } from '../release-loop/gate-host-reservation.js';
 
 // Spawned CLI integration checks can exceed Bun's 5 s unit-test default under concurrent gate load.
 setDefaultTimeout(60_000);
@@ -49,6 +49,23 @@ const settings = { ...GATE_REMOTE_DEFAULTS, slotWaitSeconds: 0 };
 const sink = () => { const out: string[] = []; const err: string[] = []; return { out, err, write: { out: (t: string | Uint8Array) => { out.push(typeof t === 'string' ? t : Buffer.from(t).toString()); }, err: (t: string | Uint8Array) => { err.push(typeof t === 'string' ? t : Buffer.from(t).toString()); } } }; };
 
 describe('dispatch decision', () => {
+  test('a PR range is remote-reproducible only when its exact head is checked out and its base commit exists', () => {
+    const base = 'c'.repeat(40);
+    const head = 'a'.repeat(40);
+    const path = 'src/기능 파일.ts';
+    const gh = () => ({ status: 0, stdout: JSON.stringify({ baseRefOid: base, headRefOid: head, files: [{ path }] }) });
+    const git = (args: readonly string[]) => args[0] === 'rev-parse'
+      ? { status: 0, stdout: `${head}\n` }
+      : args[0] === 'diff' ? { status: 0, stdout: `${path}\0` }
+      : { status: 0, stdout: '' };
+    expect(resolveGatePrBase('34796', '/repo', { gh, git })).toBe(base);
+    expect(remoteSelfGateArgv({ changed: true, base: resolveGatePrBase('34796', '/repo', { gh, git }) ?? undefined }, ref => ref))
+      .toEqual(['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', '--changed', '--base', base]);
+    expect(resolveGatePrBase('34796', '/repo', { gh, git: () => ({ status: 0, stdout: `${'d'.repeat(40)}\n` }) })).toBeNull();
+    expect(resolveGatePrBase('34796', '/repo', { gh, git: (args) => args[0] === 'cat-file' ? { status: 1, stdout: '' } : git(args) })).toBeNull();
+    expect(resolveGatePrBase('34796', '/repo', { gh, git: (args) => args[0] === 'diff' ? { status: 0, stdout: 'src/other.ts\0' } : git(args) })).toBeNull();
+  });
+
   test('remote importer sweep carries a shard plan even when --shards was omitted', () => {
     const argv = remoteSelfGateArgv({ changed: true, base: 'origin/main', includeImporters: true }, () => { throw new Error('origin/main must stay pinned'); });
     expect(argv).toEqual(['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', '--changed', '--base', 'origin/main', '--shards', '2', '--include-importers']);
@@ -490,6 +507,110 @@ describe('self gate explicit remote placement', () => {
     } finally { release(); }
   });
 
+  test('an unavailable Pod probe without a release claim warns and proceeds remotely', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'probe-seed', ['node-b']);
+    release();
+    const runner = fakeRunner();
+    const io = sink();
+    let localCalls = 0;
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+      reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { localCalls++; return 0; } },
+    { runner, settings, env: {}, load1: 1, write: io.write,
+      readHostResources: () => ({ status: 'unmeasurable', empty: null, reason: 'pod-list-unavailable' }) });
+    expect(rc).toBe(0);
+    expect(localCalls).toBe(0);
+    expect(runner.calls).toContainEqual(['ssh', 'node-b']);
+    expect(io.err.join('')).toContain('host reservation probe unavailable on node-b: pod-list-unavailable; no active release claim — proceeding remotely');
+    expect(io.err.join('')).not.toContain('host-reserved');
+  });
+
+  test('each diagnosed Pod probe failure warns through when free and stays blocked behind a live release claim', async () => {
+    const reasons = ['pod-pool-unconfigured', 'host-not-in-pod-pool', 'kubectl-unavailable', 'kubectl-context-missing', 'kubectl-api-unavailable'] as const;
+    for (const reason of reasons) {
+      const reservedRoot = slotDir();
+      const release = reserveReleaseGateHosts(reservedRoot, `claim-${reason}`, ['node-b']);
+      try {
+        const reservedRunner = fakeRunner();
+        const reserved = sink();
+        const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+          explicitRemoteOnly: true, reservationRoot: reservedRoot, remoteArgv: ['x'], runLocal: () => 0 },
+        { runner: reservedRunner, settings, env: {}, load1: 1, write: reserved.write,
+          readHostResources: () => ({ status: 'unmeasurable', empty: null, reason }) });
+        expect(rc).toBe(1);
+        expect(reservedRunner.calls.some(([kind]) => kind === 'ssh')).toBe(false);
+
+        const freeRunner = fakeRunner();
+        const free = sink();
+        const freeRoot = slotDir();
+        mkdirSync(join(freeRoot, 'release', 'gate-host-reservations'), { recursive: true });
+        const freeRc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+          explicitRemoteOnly: true, reservationRoot: freeRoot, remoteArgv: ['x'], runLocal: () => 1 },
+        { runner: freeRunner, settings, env: {}, load1: 1, write: free.write,
+          readHostResources: () => ({ status: 'unmeasurable', empty: null, reason }) });
+        if (freeRc !== 0) throw new Error(`${reason}: ${free.err.join('')}`);
+        expect(freeRc).toBe(0);
+        expect(freeRunner.calls).toContainEqual(['ssh', 'node-b']);
+        expect(free.err.join('')).toContain(`host reservation probe unavailable on node-b: ${reason}; no active release claim — proceeding remotely`);
+      } finally { release(); }
+    }
+  });
+
+  test('an empty Pod probe failure reason still warns and permits a claim-free host', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'probe-seed', ['node-b']);
+    release();
+    const runner = fakeRunner();
+    const io = sink();
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+      reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } },
+    { runner, settings, env: {}, load1: 1, write: io.write,
+      readHostResources: () => ({ status: 'unmeasurable', empty: null, reason: '' } as unknown as GateHostResourceReading) });
+    expect(rc).toBe(0);
+    expect(io.err.join('')).toContain('host reservation probe unavailable on node-b: unspecified; no active release claim — proceeding remotely');
+    expect(runner.calls).toContainEqual(['ssh', 'node-b']);
+  });
+
+  test('a free but unmeasured alternate is rejected and reports its probe reason', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
+    try {
+      const runner = fakeRunner();
+      const io = sink();
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+        explicitRemoteOnly: true, reservationRoot: root, reservationWaitSeconds: 0, remoteArgv: ['x'], runLocal: () => 0 },
+      { runner, settings, env: {}, load1: 1, write: io.write,
+        readHostResources: () => ({ status: 'unmeasurable', empty: null, reason: '' } as unknown as GateHostResourceReading) });
+      expect(rc).toBe(1);
+      expect(runner.calls.some(([kind]) => kind === 'ssh')).toBe(false);
+      expect(io.err.join('')).toContain('host reservation probe unavailable on host-e-wsl: unspecified; alternate not selected');
+      expect(io.err.join('')).toContain('owner=gate-run');
+    } finally { release(); }
+  });
+
+  test('a Pod probe failure after a release claim clears warns and then proceeds', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
+    let clock = Date.parse('2026-10-27T00:00:00.000Z');
+    let probeCount = 0;
+    const runner = fakeRunner();
+    const io = sink();
+    try {
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+        explicitRemoteOnly: true, reservationRoot: root, reservationAltHosts: [], reservationWaitSeconds: 10, remoteArgv: ['x'],
+        runLocal: () => { throw new Error('remote only'); } },
+      { runner, settings, env: {}, load1: 1, write: io.write, now: () => clock,
+        sleep: async (ms) => { clock += ms; release(); },
+        readHostResources: () => ++probeCount === 1
+          ? readGateHostResources({ leases: [], activeJobs: [] })
+          : ({ status: 'unmeasurable', empty: null, reason: 'pod-list-unavailable' }) });
+      expect(rc).toBe(0);
+      expect(runner.calls).toContainEqual(['ssh', 'node-b']);
+      expect(io.err.join('')).toContain('host reservation probe unavailable on node-b: pod-list-unavailable; no active release claim — proceeding remotely');
+      expect(io.err.join('')).not.toContain('host-reserved released');
+    } finally { release(); }
+  });
+
   test('an occupied Pod ledger reroutes the selected gate host to a measured free pool host', async () => {
     const root = slotDir();
     const release = reserveReleaseGateHosts(root, 'resource-probe-seed', ['node-b']);
@@ -676,10 +797,12 @@ describe('self gate explicit remote placement', () => {
     const io = sink();
     const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
       explicitRemoteOnly: true, reservationRoot: root, remoteArgv: ['x'], runLocal: () => { throw new Error('must not run locally'); } },
-    { runner, settings, env: {}, load1: 1, write: io.write });
+    { runner, settings, env: {}, load1: 1, write: io.write,
+      readHostResources: () => ({ status: 'unmeasurable', empty: null, reason: 'pod-list-unavailable' }) });
     expect(rc).toBe(1);
     expect(runner.calls.some(call => call[0] === 'ssh')).toBe(false);
     expect(io.err.join('')).toContain('remote unmeasured on node-b (stage=host-reserved, rc=unknown) — host-reserved: node-b');
+    expect(io.err.join('')).not.toContain('no active release claim');
   });
 
   test('a reserved non-node-b request is refused without changing its explicit host', async () => {
@@ -1163,7 +1286,7 @@ describe('entry-point wiring (spawned, no remote work)', () => {
 
   test('spawned self gate rejects --pr --remote before a mismatched PR head can be reported passed', async () => {
     // PR head and seat checkout intentionally differ. The fake remote would claim a third SHA passed;
-    // the production CLI must reject this unreproducible combination without contacting either gh or SSH.
+    // the production CLI may read PR metadata but must reject the run before contacting SSH.
     const scratch = slotDir();
     expect(spawnSync('git', ['init', '-q'], { cwd: scratch }).status).toBe(0);
     expect(spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'seat tree'], { cwd: scratch }).status).toBe(0);
@@ -1178,7 +1301,7 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     writeFileSync(join(scratch, '.git', 'info', 'exclude'), 'bin/\n.elanous-test/\nlog/\n');
 
     await withFakeBins({
-      gh: { stdout: JSON.stringify({ headRefOid: requestedPrHead, files: [{ path: 'src/example.ts' }] }) },
+      gh: { stdout: JSON.stringify({ baseRefOid: treeHead, headRefOid: requestedPrHead, files: [{ path: 'src/example.ts' }] }) },
       kubectl: { stdout: '{"items":[]}' },
       ssh: { stdout: `gate: passed head=${reportedRemoteHead}\n`, stderr: '__GATE_REMOTE_RC=0\n' },
     }, async (fakeBins) => {
@@ -1194,7 +1317,60 @@ describe('entry-point wiring (spawned, no remote work)', () => {
       expect(gate.stderr).toContain('--pr');
       expect(`${gate.stdout}${gate.stderr}`).not.toContain('gate: passed');
       expect(fakeBins.calls().filter(call => call.name === 'kubectl')).toHaveLength(1);
-      expect(fakeBins.calls().some(call => call.name === 'ssh' || call.name === 'gh')).toBe(false);
+      expect(fakeBins.calls().filter(call => call.name === 'gh')).toHaveLength(1);
+      expect(fakeBins.calls().some(call => call.name === 'ssh')).toBe(false);
+    });
+  });
+
+  test('spawned self gate sends a matching PR as an exact changed base range to the remote host', async () => {
+    const scratch = slotDir();
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    expect(realGit).toMatch(/^\//);
+    expect(spawnSync('git', ['init', '-q'], { cwd: scratch }).status).toBe(0);
+    const git = (args: string[]) => spawnSync('git', args, { cwd: scratch, encoding: 'utf8' });
+    expect(git(['config', 'user.name', 't']).status).toBe(0);
+    expect(git(['config', 'user.email', 't@example.com']).status).toBe(0);
+    expect(git(['commit', '-q', '--allow-empty', '-m', 'PR fork point']).status).toBe(0);
+    const forkPoint = git(['rev-parse', 'HEAD']).stdout.trim();
+    expect(git(['checkout', '-q', '-b', 'pr-head']).status).toBe(0);
+    mkdirSync(join(scratch, 'src'), { recursive: true });
+    const featurePath = 'src/기능 file.ts';
+    writeFileSync(join(scratch, featurePath), 'export const feature = true;\n');
+    expect(git(['add', '--', featurePath]).status).toBe(0);
+    expect(git(['commit', '-q', '-m', 'PR feature']).status).toBe(0);
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: scratch, encoding: 'utf8' }).stdout.trim();
+    expect(git(['checkout', '-q', '-b', 'pr-base', forkPoint]).status).toBe(0);
+    mkdirSync(join(scratch, 'src'), { recursive: true });
+    writeFileSync(join(scratch, 'src', 'base-only.ts'), 'export const baseOnly = true;\n');
+    expect(git(['add', 'src/base-only.ts']).status).toBe(0);
+    expect(git(['commit', '-q', '-m', 'base advanced after PR fork']).status).toBe(0);
+    const base = git(['rev-parse', 'HEAD']).stdout.trim();
+    expect(git(['checkout', '-q', '--detach', head]).status).toBe(0);
+    expect(git(['update-ref', 'refs/remotes/origin/main', base]).status).toBe(0);
+    mkdirSync(join(scratch, '.elanous-test', 'release', 'gate-host-reservations'), { recursive: true });
+    writeFileSync(join(scratch, '.git', 'info', 'exclude'), 'bin/\n.elanous-test/\nlog/\nfake-ssh-bin/\nssh-script.txt\n');
+    const sshDir = join(scratch, 'fake-ssh-bin');
+    mkdirSync(sshDir);
+    const sshCapture = join(scratch, 'ssh-script.txt');
+    const sshShim = join(sshDir, 'ssh');
+    writeFileSync(sshShim, '#!/bin/sh\ncat > "$SSH_CAPTURE_FILE"\nprintf "[self gate] remote passed\\n"\nprintf "\\n__GATE_REMOTE_RC=0\\n" >&2\n');
+    chmodSync(sshShim, 0o755);
+
+    await withFakeBins({
+      gh: { stdout: JSON.stringify({ baseRefOid: base, headRefOid: head, files: [{ path: featurePath }] }) },
+      git: { whenArgsStartWith: ['push'], otherwise: realGit },
+      kubectl: { stdout: '{"items":[]}' },
+    }, async (fakeBins) => {
+      const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = fakeBins.env;
+      const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--pr', '123', '--remote', 'isolated-host'], {
+        cwd: scratch, encoding: 'utf8', env: { ...inherited, PATH: `${sshDir}:${inherited.PATH}`, SSH_CAPTURE_FILE: sshCapture, NODE_ENV: 'development', ELANOUS_POD_LEASE_DIR: slotDir(),
+          ELANOUS_POD_POOL: 'probe-node-b@node-b:1,probe-isolated@isolated-host:1' },
+      });
+      if (gate.status !== 0) throw new Error(`pinned PR gate failed: stdout=${gate.stdout} stderr=${gate.stderr}`);
+      expect(gate.status).toBe(0);
+      expect(gate.stdout).toContain('[self gate] remote passed');
+      expect(readFileSync(sshCapture, 'utf8')).toContain(`'--changed' '--base' '${base}'`);
+      expect(fakeBins.calls().filter(call => call.name === 'gh')).toHaveLength(1);
     });
   });
 

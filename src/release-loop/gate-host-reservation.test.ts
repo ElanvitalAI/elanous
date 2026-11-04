@@ -152,6 +152,20 @@ test('mock E3-E5 host probe emits raw measured-empty evidence while ignoring unr
     data: { host: 'node-b', poolContexts: ['e3-e5-sim-host'], ...measuredEmpty } });
 });
 
+test('an unavailable Pod inventory names whether the pool, host membership, or HQ kubectl access is missing', () => {
+  const member: PodPoolMember = { context: 'pool-gcp1', sshHost: 'gcp1', capacity: 1, k3dCluster: 'gcp1' };
+  expect(readGateHostResourcesForHost('minim5', {}, { members: [] })).toMatchObject({ reason: 'pod-pool-unconfigured' });
+  expect(readGateHostResourcesForHost('minim5', {}, { members: [member] })).toMatchObject({ reason: 'host-not-in-pod-pool' });
+  expect(readGateHostResourcesForHost('gcp1', {}, { members: [member], kubectl: () => ({ status: 1, stdout: '', stderr: 'error: context "pool-gcp1" does not exist' }) }))
+    .toMatchObject({ reason: 'kubectl-context-missing' });
+  expect(readGateHostResourcesForHost('gcp1', {}, { members: [member], kubectl: () => ({ status: 1, stdout: '', stderr: 'connect: connection refused' }) }))
+    .toMatchObject({ reason: 'kubectl-api-unavailable' });
+  expect(readGateHostResourcesForHost('gcp1', {}, { members: [member], kubectl: () => ({ status: null, stdout: '', error: 'spawn kubectl ENOENT', errorCode: 'ENOENT' }) }))
+    .toMatchObject({ reason: 'kubectl-unavailable' });
+  expect(readGateHostResourcesForHost('gcp1', {}, { members: [member], kubectl: () => ({ status: null, stdout: '', error: 'spawnSync kubectl ETIMEDOUT', errorCode: 'ETIMEDOUT' }) }))
+    .toMatchObject({ reason: 'kubectl-api-unavailable' });
+});
+
 test('live pool probe reads matching Pending Job and lease once and never prunes stale lease files', () => {
   const member: PodPoolMember = { context: `probe-${Date.now()}`, sshHost: 'node-b', capacity: 1, k3dCluster: 'probe' };
   const leaseRoot = root();
@@ -161,14 +175,15 @@ test('live pool probe reads matching Pending Job and lease once and never prunes
   roots.push(leasePool.dir);
   try {
     mkdirSync(leasePool.dir, { recursive: true });
-    const liveName = '41-live.json';
-    const deadName = '42-dead.json';
+    // Use PIDs outside the host's low bootstrap range so the integration test behaves the same in containers.
+    const liveName = '98765431-live.json';
+    const deadName = '98765432-dead.json';
     const pending = { context: member.context, namespace: 'elanous-test', job: 'gate-shard-1' };
-    writeFileSync(join(leasePool.dir, liveName), JSON.stringify({ pid: 41, startedAt: 'start-41', at: 'now', stage: 'job', ...pending }));
-    writeFileSync(join(leasePool.dir, deadName), JSON.stringify({ pid: 42, startedAt: 'start-42', at: 'now', stage: 'authoring' }));
+    writeFileSync(join(leasePool.dir, liveName), JSON.stringify({ pid: 98765431, startedAt: 'start-live', at: 'now', stage: 'job', ...pending }));
+    writeFileSync(join(leasePool.dir, deadName), JSON.stringify({ pid: 98765432, startedAt: 'start-dead', at: 'now', stage: 'authoring' }));
     const reading = readGateHostResourcesForHost('node-b', {}, {
       members: [member],
-      processStart: pid => pid === 41 ? 'start-41' : null,
+      processStart: pid => pid === 98765431 ? 'start-live' : null,
       kubectl: args => {
         expect(args).toContain('--context');
         expect(args).toContain('get');

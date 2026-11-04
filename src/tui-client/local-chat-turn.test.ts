@@ -10,6 +10,7 @@ import { ptyAvailable, startPty } from '../pty-shell/registry.js';
 import { CHAT_DEFAULTS } from '../user-config.js';
 import type { CompactProvider } from '../compact/provider.js';
 import { compactNextTuiSession, isCompactCommand, type NextTuiCompactOutcome } from '../tui/slash/compact.js';
+import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 test('a cancellation before lazy turn loading never starts a child', async () => {
   const abort = new AbortController();
@@ -27,18 +28,26 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
       const input = JSON.parse(line);
       if (input.prompt !== 'private prompt text') process.exit(4);
       if (process.argv.includes(input.prompt)) process.exit(2);
-      if (process.argv[2] !== 'repl') process.exit(3);
+    const configFlag = process.argv.indexOf('--config-dir');
+    if (configFlag < 0 || process.argv[configFlag + 1] !== process.env.EXPECTED_CONFIG_DIR) process.exit(3);
+    if (process.argv[configFlag + 2] !== 'repl') process.exit(6);
       if (process.argv.includes('--no-tools')) process.exit(5);
-      console.log(JSON.stringify({ reply: 'ok', provider: 'grok', model: 'grok-4.7' }));
+      console.log(JSON.stringify({ reply: 'ok', provider: 'grok', model: 'grok-4.7', goalComplete: true, goalStopReason: 'max_turns' }));
     }
   `);
   const routeLog = spyOn(debug, 'log');
+  const configDir = join(dir, 'isolated-config');
+  mkdirSync(configDir, { recursive: true });
+  setElanousConfigDir(configDir);
+  process.env.EXPECTED_CONFIG_DIR = getElanousConfigDir();
   const priorSidetabIpc = process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC;
   try {
     process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC = '1';
     setNextSidetabHandler(null);
     setNextSidetabIpcEnabled(false);
-    await expect(runLocalChatTurn('test-session', 'private prompt text', new AbortController().signal, cli)).resolves.toBeUndefined();
+    await expect(runLocalChatTurn('test-session', 'private prompt text', new AbortController().signal, cli)).resolves.toEqual({
+      goalComplete: true, goalStopReason: 'max_turns',
+    });
     expect(routeLog).toHaveBeenCalledWith('llm.route-decision', 'local-chat-executed', {
       surface: 'tui-local', sessionId: 'test-session', provider: 'grok', model: 'grok-4.7',
     });
@@ -48,6 +57,8 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
     if (priorSidetabIpc === undefined) delete process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC;
     else process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC = priorSidetabIpc;
     routeLog.mockRestore();
+    delete process.env.EXPECTED_CONFIG_DIR;
+    resetElanousConfigDir();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -300,7 +311,7 @@ test('a REPL turn error keeps the child alive for the next prompt', async () => 
   `);
   try {
     await expect(runLocalChatTurn('retry', 'first', new AbortController().signal, cli)).rejects.toThrow('temporary turn failure');
-    await expect(runLocalChatTurn('retry', 'second', new AbortController().signal, cli)).resolves.toBeUndefined();
+    await expect(runLocalChatTurn('retry', 'second', new AbortController().signal, cli)).resolves.toEqual({ goalComplete: false });
   } finally {
     await closeLocalChatSession('retry');
     rmSync(dir, { recursive: true, force: true });

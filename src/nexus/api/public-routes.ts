@@ -65,6 +65,20 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
   {
     method: 'POST',
     match: 'exact',
+    path: '/v1/log-federation/batch',
+    selfVerified: true,
+    why: 'remote log federation verifies the scoped instance ingest token and applies server-side redaction before storing',
+  },
+  {
+    method: 'POST',
+    match: 'exact',
+    path: '/v1/log-federation/revoke',
+    selfVerified: true,
+    why: 'a federation token may revoke only itself; the token name binds it to one remote instance',
+  },
+  {
+    method: 'POST',
+    match: 'exact',
     path: '/v1/setup/claim',
     selfVerified: true,
     why: 'one-use setup link is verified by the claim handler without an owner bearer',

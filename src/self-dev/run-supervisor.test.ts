@@ -1,4 +1,5 @@
 import { test, expect, describe, spyOn } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -2099,6 +2100,53 @@ describe('REVIEW-MUSTFIX-CLASSIFY — 슈퍼바이저는 추이 대신 회차 �
     changedFiles: ['src/harness/detach.ts', 'src/harness/fake-llm.ts'],
     ...extra,
   }) as never;
+
+  test('review citation paths use the exact child review head and unreadable checks ask the owner', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'supervisor-review-head-path-'));
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(result.stderr || 'git command failed');
+      return (result.stdout ?? '').trim();
+    };
+    try {
+      git(['init', '-q']);
+      git(['config', 'user.name', 'Review Path Test']);
+      git(['config', 'user.email', 'review-path-test@example.invalid']);
+      mkdirSync(join(repo, 'src'), { recursive: true });
+      writeFileSync(join(repo, 'src/old.ts'), 'export const old = true;\n');
+      git(['add', '.']);
+      git(['commit', '-qm', 'reviewed path exists']);
+      const reviewedHead = git(['rev-parse', 'HEAD']);
+      rmSync(join(repo, 'src/old.ts'));
+      writeFileSync(join(repo, 'src/new.ts'), 'export const current = true;\n');
+      git(['add', '-A']);
+      git(['commit', '-qm', 'path removed after review']);
+      const currentHead = git(['rev-parse', 'HEAD']);
+      const judge = (head: string, worktreePath = repo, finding = 'Fix `src/old.ts`') => {
+        const decision = decideNextRun({
+          results: [scoped('osc', [finding], { worktreePath,
+            selfReview: { verdict: 'fail', head, mustFixCount: 1 },
+            changedFiles: ['src/old.ts'], targetPaths: ['src/old.ts'] })],
+          history: [{ round: 0, landed: 0, actionable: 1 }], repairGoalExecution: true,
+        });
+        return decision.mustFixScope?.byTask.osc?.[0];
+      };
+      // The checked out child tree no longer has this path, but the exact commit actually reviewed does.
+      expect(judge(reviewedHead)).toMatchObject({ scope: 'in-scope' });
+      const missingAtReviewedHead = judge(currentHead, repo, 'Fix `src/old.ts` and `src/new.ts`');
+      expect(missingAtReviewedHead).toMatchObject({ scope: 'ask-owner' });
+      expect(missingAtReviewedHead?.reason).toContain('does not contain cited path(s): src/old.ts');
+      const unreadable = judge('not-a-head', repo, 'Fix `src/old.ts` and `src/new.ts`');
+      expect(unreadable).toMatchObject({ scope: 'ask-owner' });
+      expect(unreadable?.reason).toContain('cannot verify cited path(s)');
+      expect(unreadable?.reason).toContain('src/old.ts, src/new.ts');
+      const noCitation = judge(reviewedHead, repo, 'Handle this safely');
+      expect(noCitation).toMatchObject({ scope: 'ask-owner', signals: ['no-signal'] });
+      expect(noCitation?.reason).not.toContain('cited path');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
 
   test('범위 축 (나) split — 전부 split 이면 같은 런 재수리 0 · 결정에 «중간 착지 ⊕ 연결 골» 제안 · 관측 한 줄', () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});

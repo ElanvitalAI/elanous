@@ -344,9 +344,11 @@ test('runAgentMission re-emits exactly once on its Codex child exit with the spa
   const oldHome = process.env.CODEX_HOME;
   process.env.CODEX_HOME = home;
   const calls: Array<{ codexHome: string; runId: string; workdir: string; sinceMs?: number }> = [];
+  const memberEvents: import('../context-bus/external-events.js').ExternalEventInput[] = [];
   try {
     let spawnedId = '';
     let spawnedRunId = '';
+    let stopMissionPty = () => {};
     const result = await runAgentMission({ mission: 'done', repo: dir, branch: 'fixture', agent: codexBackend,
       evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, resources: 'off', commit: false,
       screensDir: join(dir, 'screens'),
@@ -367,17 +369,26 @@ test('runAgentMission re-emits exactly once on its Codex child exit with the spa
         emitPtyEvent({ type: 'exit', id: 'unrelated-child', exitCode: 0 });
         expect(calls).toHaveLength(0);
         emitPtyEvent({ type: 'output', id: spawnedId, chunk: 'Session ID: 12345678-1234-1234-1234-123456789abc' });
+        stopMissionPty();
         emitPtyEvent({ type: 'exit', id: spawnedId, exitCode: 0 });
         emitPtyEvent({ type: 'exit', id: spawnedId, exitCode: 0 });
         return { termination: { kind: 'success' }, steps: 1 } as never;
       },
       reemitPtyUsage: (opts) => { calls.push(opts); return 0; },
+      emitExternalEvent: (event) => { memberEvents.push(event); },
+      onPtyStarted: (_handle, stop) => { stopMissionPty = stop; },
     });
     expect(result.ok).toBe(false);
     expect(spawnedRunId).toBeTruthy();
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ codexHome: home, runId: spawnedRunId, workdir: dir, sessionId: '12345678-1234-1234-1234-123456789abc' });
     expect(typeof calls[0]?.sinceMs).toBe('number');
+    expect(memberEvents.map(({ kind }) => kind)).toEqual(['started', 'finished', 'exit']);
+    expect(memberEvents.filter(({ kind }) => kind === 'exit')).toHaveLength(1);
+    expect(memberEvents[2]).toMatchObject({
+      origin: 'codex-agent-mission', kind: 'exit', summary: 'Codex mission member exited (code 0)',
+      source: `elanous://agent-mission/${encodeURIComponent(spawnedRunId)}/${encodeURIComponent(spawnedId)}`,
+    });
     emitPtyEvent({ type: 'exit', id: spawnedId, exitCode: 0 });
     expect(calls).toHaveLength(1);
   } finally {

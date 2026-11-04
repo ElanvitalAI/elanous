@@ -1,0 +1,47 @@
+version: 0
+id: burst-ready-ladder
+isolation: test
+seed: 110322
+triggers:
+  - id: purpose-specific-burst-warmup
+    type: ux.burst-ready-ladder.evaluate
+expect:
+  screen:
+    mode: widget
+    snapshot:
+      contains:
+        - "Purpose-specific burst ready ladder simulation"
+        - "runs=6"
+        - "allPreparedOneHourAhead=true"
+        - "allPrematureAdmissionsRejected=true"
+        - "allReadyBeforeAdmissionRejected=true"
+        - "allDeadlineDraining=true"
+        - "allPostExpiryAdmissionsRejected=true"
+        - "allLeasesDrainedAfterExpiry=true"
+        - "allStoppedAfterDrain=true"
+        - "mockVmCount=6"
+        - "forbiddenTerminateCount=0"
+  logs:
+    - category: fleet.burst
+      event: ready-ladder-completed
+      level: debug
+      count: 1
+      data:
+        runId: "$runId"
+        scenarioId: burst-ready-ladder
+        purposeCount: 3
+        purposes: [gate, implementation, execution]
+        ttlHours: [2, 4]
+        runCount: 6
+        warmupLeadMs: 3600000
+        allPreparedOneHourAhead: true
+        allPrematureAdmissionsRejected: true
+        allReadyBeforeAdmissionRejected: true
+        allAdmittedReady: true
+        allDeadlineDraining: true
+        allPostExpiryAdmissionsRejected: true
+        allLeasesDrainedAfterExpiry: true
+        allPoweredOnDurationMatches: true
+        allStoppedAfterDrain: true
+        mockVmCount: 6
+        forbiddenTerminateCount: 0

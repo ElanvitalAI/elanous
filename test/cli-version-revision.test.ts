@@ -4,17 +4,20 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setGitCommandRunnerForTesting } from '../src/git-fs/runner.js';
 import { cliVersion, setInstallMetadataRootForTesting } from '../src/index.js';
-import { installMetadataSource, packageVersion } from '../src/version/code-revision.js';
+import { installMetadataSource, packageVersion, setCodeRevisionRootForTesting } from '../src/version/code-revision.js';
 
 const INSTALL_REVISION = 'a'.repeat(40);
 const CALLER_REVISION = 'b'.repeat(40);
 const METADATA_COMMIT = 'c'.repeat(40);
 const CONSUMER_COMMIT = 'd'.repeat(40);
 const INSTALL_ROOT = resolve(import.meta.dir, '..');
+let codeRevisionRoot = INSTALL_ROOT;
 
 afterEach(() => {
   setGitCommandRunnerForTesting(undefined);
   setInstallMetadataRootForTesting(undefined);
+  setCodeRevisionRootForTesting(undefined);
+  codeRevisionRoot = INSTALL_ROOT;
 });
 
 function withUnrelatedCaller<T>(run: () => T): T {
@@ -31,6 +34,8 @@ function withUnrelatedCaller<T>(run: () => T): T {
 
 function withInstallMetadata<T>(contents: string | undefined, run: () => T): T {
   const root = mkdtempSync(join(tmpdir(), 'elanous-install-meta-'));
+  codeRevisionRoot = root;
+  setCodeRevisionRootForTesting(root);
   setInstallMetadataRootForTesting(root);
   try {
     if (contents !== undefined) {
@@ -39,6 +44,7 @@ function withInstallMetadata<T>(contents: string | undefined, run: () => T): T {
     return run();
   } finally {
     setInstallMetadataRootForTesting(undefined);
+    setCodeRevisionRootForTesting(undefined);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -46,7 +52,7 @@ function withInstallMetadata<T>(contents: string | undefined, run: () => T): T {
 function failGitAtInstallRoot(calls: string[]) {
   setGitCommandRunnerForTesting((cwd) => {
     calls.push(cwd);
-    return cwd === INSTALL_ROOT
+    return cwd === codeRevisionRoot
       ? { status: 1, stdout: '', stderr: 'not a git repository' }
       : { status: 0, stdout: `${CALLER_REVISION}\n`, stderr: '' };
   });
@@ -155,7 +161,7 @@ describe('CLI version revision', () => {
     withInstallMetadata(undefined, () => {
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} unknown`));
     });
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('uses install.json commit when git cannot resolve HEAD', () => {
@@ -170,7 +176,7 @@ describe('CLI version revision', () => {
     }), () => {
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} ${METADATA_COMMIT}`));
     });
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('prefers git revision over install.json commit', () => {
@@ -179,7 +185,7 @@ describe('CLI version revision', () => {
       calls.push(cwd);
       return {
         status: 0,
-        stdout: `${cwd === INSTALL_ROOT ? INSTALL_REVISION : CALLER_REVISION}\n`,
+        stdout: `${cwd === codeRevisionRoot ? INSTALL_REVISION : CALLER_REVISION}\n`,
         stderr: '',
       };
     });
@@ -187,7 +193,7 @@ describe('CLI version revision', () => {
     withInstallMetadata(JSON.stringify({ commit: METADATA_COMMIT }), () => {
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} ${INSTALL_REVISION}`));
     });
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('returns unknown when install.json is malformed JSON', () => {
@@ -197,7 +203,7 @@ describe('CLI version revision', () => {
     withInstallMetadata('{not-json', () => {
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} unknown`));
     });
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('does not use caller install.json when the installed tool cannot resolve HEAD', () => {
@@ -210,7 +216,7 @@ describe('CLI version revision', () => {
         expect(cliVersion()).toBe(`${packageVersion()} unknown`);
       });
     });
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('rejects install.json commit with embedded newline and stays one line', () => {
@@ -223,7 +229,7 @@ describe('CLI version revision', () => {
       expect(version.includes('\n')).toBe(false);
       expect(version.split('\n')).toHaveLength(1);
     });
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('rejects install.json commit with internal whitespace and stays one line', () => {
@@ -236,7 +242,7 @@ describe('CLI version revision', () => {
       expect(version.includes('\n')).toBe(false);
       expect(version.split('\n')).toHaveLength(1);
     });
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('does not use a consumer project install.json above node_modules when git cannot resolve HEAD', () => {
@@ -253,13 +259,15 @@ describe('CLI version revision', () => {
       }));
       const packageRoot = join(consumer, 'node_modules', 'elanous');
       mkdirSync(packageRoot, { recursive: true });
+      codeRevisionRoot = consumer;
+      setCodeRevisionRootForTesting(consumer);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} unknown`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(consumer, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('uses installer prefix install.json when nested under node_modules with the installer shim', () => {
@@ -281,13 +289,15 @@ describe('CLI version revision', () => {
         installedAt: '2026-09-22T00:00:00Z',
         commit: METADATA_COMMIT,
       }));
+      codeRevisionRoot = prefix;
+      setCodeRevisionRootForTesting(prefix);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} ${METADATA_COMMIT}`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(prefix, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   // 🆕 2026-09-24 — 판 폴더 레이아웃(versions/<판> · current · bin/elanous). 종전엔 이 레이아웃에서 늘 `unknown` 이었다.
@@ -308,13 +318,15 @@ describe('CLI version revision', () => {
       symlinkSync(join('..', 'current', 'node_modules', '.bin', 'elanous'), join(root, 'bin', 'elanous'));
       writeFileSync(join(versionDir, 'install.json'), JSON.stringify({ commit: METADATA_COMMIT }));
       writeFileSync(join(root, 'install.json'), JSON.stringify({ commit: CONSUMER_COMMIT }));   // 마지막 설치(다른 판)
+      codeRevisionRoot = root;
+      setCodeRevisionRootForTesting(root);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} ${METADATA_COMMIT}`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(root, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('versioned layout without the installer root shim does not trust the version folder install.json', () => {
@@ -330,13 +342,15 @@ describe('CLI version revision', () => {
       writeFileSync(join(packageRoot, 'bin', 'elanous.mjs'), '');
       symlinkSync(join('..', 'elanous', 'bin', 'elanous.mjs'), join(versionDir, 'node_modules', '.bin', 'elanous'));
       writeFileSync(join(versionDir, 'install.json'), JSON.stringify({ commit: METADATA_COMMIT }));
+      codeRevisionRoot = root;
+      setCodeRevisionRootForTesting(root);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} unknown`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(root, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('uses installer prefix install.json when nested under node_modules with the windows installer shim', () => {
@@ -356,13 +370,15 @@ describe('CLI version revision', () => {
         installedAt: '2026-09-22T00:00:00Z',
         commit: METADATA_COMMIT,
       }));
+      codeRevisionRoot = prefix;
+      setCodeRevisionRootForTesting(prefix);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} ${METADATA_COMMIT}`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(prefix, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('does not use prefix install.json when bin/elanous is an unrelated file rather than the installer shim', () => {
@@ -383,13 +399,15 @@ describe('CLI version revision', () => {
         installedAt: '2026-09-22T00:00:00Z',
         commit: CONSUMER_COMMIT,
       }));
+      codeRevisionRoot = consumer;
+      setCodeRevisionRootForTesting(consumer);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} unknown`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(consumer, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('does not use prefix install.json when bin/elanous is a consumer symlink that happens to resolve to this package', () => {
@@ -409,13 +427,15 @@ describe('CLI version revision', () => {
         installedAt: '2026-09-22T00:00:00Z',
         commit: CONSUMER_COMMIT,
       }));
+      codeRevisionRoot = consumer;
+      setCodeRevisionRootForTesting(consumer);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} unknown`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(consumer, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 
   test('does not use prefix install.json when bin/elanous.cmd names the package without the installer-relative path', () => {
@@ -438,12 +458,14 @@ describe('CLI version revision', () => {
         installedAt: '2026-09-22T00:00:00Z',
         commit: CONSUMER_COMMIT,
       }));
+      codeRevisionRoot = consumer;
+      setCodeRevisionRootForTesting(consumer);
       setInstallMetadataRootForTesting(packageRoot);
       withUnrelatedCaller(() => expect(cliVersion()).toBe(`${packageVersion()} unknown`));
     } finally {
       setInstallMetadataRootForTesting(undefined);
       rmSync(consumer, { recursive: true, force: true });
     }
-    expect(calls).toEqual([INSTALL_ROOT]);
+    expect(calls).toEqual([codeRevisionRoot]);
   });
 });

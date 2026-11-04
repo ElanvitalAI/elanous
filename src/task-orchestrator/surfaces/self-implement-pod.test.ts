@@ -1,4 +1,6 @@
 import { setDefaultTimeout, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+// Apply before registering tests; several tests spawn real Bash/CLI fixtures and exceed Bun's 5 s default under gate load.
+setDefaultTimeout(60_000);
 import { debug } from '../../debug/log.js';
 import { makePrManager, type CmdRunner } from '../../autopilot/pr-manager.js';
 import { guardNewPr } from '../../pr-tool/census.js';
@@ -16,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import * as childProcess from 'node:child_process';
 import type { SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import { parsePodArtifactChunks } from './pod-artifact-return.js';
+import { POD_LAUNCH_FINISHED_EVENT } from './pod-launch-history.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { SUPPLY_AXES } from '../../live-supply/snapshot.js';
 import { enableLandingFreeze } from '../../release-loop/landing-freeze.js';
@@ -4096,6 +4099,110 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     expect(deletion).toBeGreaterThan(logs);
   });
 
+  test('signal stop captures a live Job and writes bounded terminal summary before deletion', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-signal-terminal-summary-'));
+    const parentRunId = 'run-signal-terminal-summary';
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    const ac = new AbortController();
+    ac.abort('SIGTERM');
+    const base = fakeKubectl([''], '');
+    const terminalText = '{"stage":"implement","ok":false}\n';
+    const partialLine = `ELANOUS_USAGE_ROLLUP_PARTIAL ${JSON.stringify({ partial: true, seq: 2, measured: true, rows: [{ model: 'fixture', tokens: 1 }] })}`;
+    const oversizedLogs = `${JSON.stringify({ stage: 'compile', detail: 'x'.repeat(70 * 1024) })}\n${partialLine}\n${terminalText}`;
+    let jobName = '';
+    const calls: string[] = [];
+    const kubectl: Kubectl = (args, input) => {
+      const command = args.join(' ');
+      calls.push(command);
+      if (args.includes('apply') && input) {
+        const manifest = JSON.parse(input) as { kind?: string; metadata?: { name?: string } };
+        if (manifest.kind === 'Job') jobName = manifest.metadata?.name ?? '';
+      }
+      if (args.some(arg => arg.startsWith('jsonpath={.metadata.uid} {.status.active'))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.some(arg => arg.startsWith('jsonpath={.metadata.uid} {.status.conditions'))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.some(arg => arg.startsWith('jsonpath={.metadata.uid}')) && args.includes('job')) return { status: 0, stdout: '11111111-1111-4111-8111-111111111111\n', stderr: '' };
+      if (args.includes('get') && args.includes('job') && args.includes('-o') && args.includes('json')) return { status: 0,
+        stdout: JSON.stringify({ metadata: { name: jobName, uid: '11111111-1111-4111-8111-111111111111' }, status: { active: 1, conditions: [] } }), stderr: '' };
+      if (args.includes('get') && args.includes('pods') && args.includes('-o') && args.includes('json')) return { status: 0,
+        stdout: JSON.stringify({ items: [{ metadata: { name: `${jobName}-pod`, uid: '22222222-2222-4222-8222-222222222222', ownerReferences: [{ uid: '11111111-1111-4111-8111-111111111111' }] },
+          status: { phase: 'Running', containerStatuses: [{ name: 'child', restartCount: 0, state: { running: { startedAt: '2026-11-03T02:59:00Z' } } }] } }] }), stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: oversizedLogs, stderr: '' };
+      return base.k(args, input);
+    };
+    try {
+      const result = await podSelfImplementSpawn({ kubectl, sleep: async () => {}, credentials: CREDS,
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })({ feature: 'signal evidence', spaceId: 'signal-evidence', signal: ac.signal }).done;
+      expect(result.error?.code).toBe('aborted');
+      const entries = loadRunLedger(parentRunId, runLedgerDir(root)) ?? [];
+      const capture = entries.find(entry => entry.event === 'pod-failure-capture');
+      expect(capture?.data).toMatchObject({ outcome: 'collected', reason: 'job-failed', podPhase: 'Running', resultMarkerPresent: true });
+      expect(String(capture?.data.logEvidence)).toStartWith(join(root, 'pod-artifacts'));
+      const finished = entries.find(entry => entry.event === POD_LAUNCH_FINISHED_EVENT);
+      const rawStopCapture = finished?.data.stopCapture;
+      if (!rawStopCapture || typeof rawStopCapture !== 'object' || Array.isArray(rawStopCapture)) {
+        throw new Error('terminal stopCapture summary missing');
+      }
+      const stopCapture = rawStopCapture as Record<string, unknown>;
+      expect(stopCapture).toMatchObject({ trigger: 'abort-signal', outcome: 'collected',
+        lastStage: 'implement' });
+      const logBytes = stopCapture.logBytes;
+      if (typeof logBytes !== 'number') throw new Error('terminal stopCapture.logBytes must be numeric');
+      expect(logBytes).toBeLessThanOrEqual(64 * 1024);
+      expect(readFileSync(String(capture?.data.logEvidence), 'utf8')).toContain(partialLine);
+      const captureRead = calls.findIndex(command => command.includes(`get job ${jobName} -o json`));
+      const deletion = calls.findIndex(command => command.includes(`delete job ${jobName}`));
+      expect(captureRead).toBeGreaterThan(-1);
+      expect(deletion).toBeGreaterThan(captureRead);
+      expect(JSON.stringify(finished?.data)).not.toContain('SIGTERM sender');
+    } finally {
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('three Job NotFound polls record the capture failure reason in the terminal summary', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-vanished-terminal-summary-'));
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    const parentRunId = 'run-vanished-terminal-summary';
+    const base = fakeKubectl([''], '');
+    let jobName = '';
+    let polls = 0;
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input) {
+        const manifest = JSON.parse(input) as { kind?: string; metadata?: { name?: string } };
+        if (manifest.kind === 'Job') jobName = manifest.metadata?.name ?? '';
+      }
+      if (args.some(arg => arg.startsWith('jsonpath={.metadata.uid} {.status.active'))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.some(arg => arg.startsWith('jsonpath={.metadata.uid} {.status.conditions'))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.some(arg => arg.startsWith('jsonpath={.metadata.uid}')) && args.includes('job')) return { status: 0, stdout: '33333333-3333-4333-8333-333333333333\n', stderr: '' };
+      if (args.includes('get') && args.includes('job') && args.some(arg => arg.includes('.status.conditions[*].type'))) {
+        polls += 1; return { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs.batch not found' };
+      }
+      if (args.includes('get') && args.includes('job') && args.includes('-o') && args.includes('json')) return { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs not found' };
+      if (args.includes('get') && args.includes('events')) return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+      return base.k(args, input);
+    };
+    try {
+      const result = await podSelfImplementSpawn({ kubectl, sleep: async () => {}, credentials: CREDS,
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })({ feature: 'vanished evidence', spaceId: 'vanished-evidence' }).done;
+      expect(polls).toBe(3);
+      expect(result.error?.code).toBe('pod-vanished');
+      const entries = loadRunLedger(parentRunId, runLedgerDir(root)) ?? [];
+      const capture = entries.find(entry => entry.event === 'pod-failure-capture');
+      expect(capture?.data).toMatchObject({ outcome: 'vanished', reason: 'job-not-found' });
+      expect(String(capture?.data.jobEventEvidence)).toStartWith(join(root, 'pod-artifacts'));
+      expect(entries.find(entry => entry.event === POD_LAUNCH_FINISHED_EVENT)?.data.stopCapture)
+        .toMatchObject({ trigger: 'job-not-found', outcome: 'vanished', reason: 'job-not-found' });
+    } finally {
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('passEnv puts only present host keys into the secret and pod env (benchmark billing paths)', async () => {
     const { k, calls } = fakeKubectl(['Complete'], '');
     await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, passEnv: ['OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY'], env: { OPENROUTER_API_KEY: 'sk-or-1' }, readKeyCache: () => undefined })({ feature: 'x', spaceId: 's' }).done;
@@ -5746,9 +5853,6 @@ describe('pod run-origin env (RFC run-origin §A3)', () => {
 
 // P2·P3·P4 (2026-09-26 Pod 실물 미션에서 나온 셋).
 import { join as pjoin } from 'node:path';
-
-// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
-setDefaultTimeout(60_000);
 
 describe('pod remote continuity', () => {
   const jwt = (expSec: number) => `h.${Buffer.from(JSON.stringify({ exp: expSec })).toString('base64url')}.s`;

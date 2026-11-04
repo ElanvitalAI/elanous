@@ -410,9 +410,11 @@ export async function runDashboardChatMainPlainTurn(
             } catch { /* observation must never delay a turn */ }
             await deps.acpSession.send({
               ...opts,
-              // 라우팅 줄은 브리지가 모델 호출 «전»에 보낸다 — 모델 출력이 아니므로 재시도를 막지 않는다.
+              // Legacy route chunks are hidden and do not count as model output for retry safety.
               onText: (chunk) => {
-                if (!isTuiRouteLine(chunk)) { emitted = true; if (stage === 'initial') initialAttemptEmitted = true; }
+                if (isTuiRouteLine(chunk)) return;
+                emitted = true;
+                if (stage === 'initial') initialAttemptEmitted = true;
                 opts.onText(chunk);
               },
               onToolCall: (call) => { emitted = true; if (stage === 'initial') initialAttemptEmitted = true; opts.onToolCall(call); },
@@ -531,8 +533,7 @@ export async function runDashboardChatMainPlainTurn(
           ...(meta ? { meta: { ...(opts.meta ?? {}), ...meta } } : {}),
           onText: (chunk) => {
             if (isTuiRouteLine(chunk)) {
-              // 라우팅 줄은 모델 호출 «전»에 다리가 보낸다 — 재시도마다 또 그리지 않는다.
-              if (attemptIndex === 0) opts.onText(chunk);
+              // Never surface a legacy route chunk, including on the first retry attempt.
               return;
             }
             emitted = true;

@@ -59,6 +59,18 @@ describe('N03 key sequence: one screen per step on a real PTY', () => {
 // the universe back through the same CLI's `logs`. The busy-/new probe is a timing race (the fake
 // LLM answers in milliseconds), so it is reported as a check but not asserted here.
 describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
+  test('next-seat-turn-cap: the seat turn returns at its cap, accepts a new turn, then cancels a fresh draft', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'n03-next-seat-cap-'));
+    try {
+      const r = await runNextTuiScenario({ scenario: 'next-seat-turn-cap', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+      expect(r.checks).toEqual({
+        capRecordedInRealSeatTurn: true, capExhaustionObservedBeforeIdleInput: true, nextSubmittedHumanTurnFinished: true, nextDraftReachedIdleComposer: true,
+        escapeCanceledIdleDraft: true, onlyFakeProvider: true, exitedClean: true,
+      });
+      expect(r.logs.rc).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 150_000);
+
   test('next-at-picker: loads on @, lists a local file, and sends its path as an attachment with the prompt', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-next-at-picker-'));
     try {

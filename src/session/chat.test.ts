@@ -417,6 +417,7 @@ describe('session chat dispatchTool ctx forwarding', () => {
     expect(recorded.length).toBeGreaterThan(0);
     expect(recorded[0]?.userText).toBe(human);
   });
+
 });
 
 describe('session chat child context composition', () => {

@@ -10,6 +10,7 @@ import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { readRunChart, recordRunChartDecision } from '../self-implement/run-chart.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { debug } from '../debug/log.js';
+import { checkCitedReviewPathsAtHead, citedReviewPaths } from '../agent-substrate/review-finding-key.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
 import { routeSupervisorVerdict } from './supervisor-verdict-edges.js';
@@ -488,14 +489,30 @@ function judgeTaskMustFixScope(
   const precedingItems = preceding?.mustFix?.items;
   const prevItems = precedingItems === undefined ? undefined
     : precedingItems.filter((item) => item.taskId !== undefined && pairIds.has(item.taskId));
-  return items.map((item) => judgeMustFixScope(item, {
-    ...(result.changedFiles ? { changedFiles: result.changedFiles } : {}),
-    ...(result.targetPaths ? { targetPaths: result.targetPaths } : {}),
-    ...(result.prNumber !== undefined ? { prNumber: result.prNumber } : {}),
-    ...(result.rework?.rounds !== undefined ? { reviewRound: result.rework.rounds } : {}),
-    ...(prevItems !== undefined ? { prevItems } : {}),
-    ...(classification.recurring ? { recurring: classification.recurring } : {}),
-  }));
+  return items.map((item) => {
+    const judgement = judgeMustFixScope(item, {
+      ...(result.changedFiles ? { changedFiles: result.changedFiles } : {}),
+      ...(result.targetPaths ? { targetPaths: result.targetPaths } : {}),
+      ...(result.prNumber !== undefined ? { prNumber: result.prNumber } : {}),
+      ...(result.rework?.rounds !== undefined ? { reviewRound: result.rework.rounds } : {}),
+      ...(prevItems !== undefined ? { prevItems } : {}),
+      ...(classification.recurring ? { recurring: classification.recurring } : {}),
+    });
+    if (citedReviewPaths(item.text).length === 0) return judgement;
+    const reviewedHead = result.selfReview?.head ?? '';
+    const pathCheck = checkCitedReviewPathsAtHead(item.text, result.worktreePath ?? '', reviewedHead);
+    if (pathCheck.status === 'path-missing') {
+      const missing = pathCheck.paths.filter(({ status }) => status === 'missing').map(({ path }) => path);
+      return { ...judgement, scope: 'ask-owner' as const,
+        reason: `reviewed head ${reviewedHead} does not contain cited path(s): ${missing.join(', ')}` };
+    }
+    if (pathCheck.status === 'unreadable') {
+      const unreadable = pathCheck.paths.filter(({ status }) => status === 'unreadable').map(({ path }) => path);
+      return { ...judgement, scope: 'ask-owner' as const,
+        reason: `cannot verify cited path(s) at reviewed head ${reviewedHead || '(unmeasured)'}: ${unreadable.join(', ')}` };
+    }
+    return judgement;
+  });
 }
 
 /**
@@ -517,7 +534,7 @@ function mustFixScopeDecision(
     const cls = taskClasses.get(result.taskId)?.class ?? 'unmeasured';
     for (const j of judged) {
       const action = j.scope === 'split' ? 'split-link-goal' : j.scope === 'ask-owner' ? 'ask-owner-hitl' : 'fix-same-run';
-      try { debug.log('self-dev.supervisor', 'mustfix-scope', { taskId: result.taskId, class: cls, scope: j.scope, signals: j.signals, action }); } catch { /* fail-open */ }
+      try { debug.log('self-dev.supervisor', 'mustfix-scope', { taskId: result.taskId, class: cls, scope: j.scope, signals: j.signals, reason: j.reason, action }); } catch { /* fail-open */ }
     }
     const splits = judged.filter((j) => j.scope === 'split');
     if (splits.length) {

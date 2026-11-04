@@ -50,9 +50,9 @@ test('daemon link settles independently of PWA and never overwrites a replaced f
   });
   expect(lines[0]).toBe('elanous | 데몬: 확인 중');
   await Promise.resolve();
-  finishLink({ status: 'absent', startCommand: 'elanous --test nexus run --hmr' });
+  finishLink({ status: 'absent', startCommand: 'elanous --test nexus run' });
   await Bun.sleep(0);
-  expect(lines[0]).toBe('elanous | 데몬: 없음 · 시작: elanous --test nexus run --hmr');
+  expect(lines[0]).toBe('elanous | 데몬: 없음 · 시작: elanous --test nexus run');
   expect(lines[1]).toBe('PWA: not checked');
   finishPwa({ status: 'absent' });
   await pending;
@@ -79,7 +79,7 @@ test('already populated session leaves its transcript untouched without probing'
   await renderDashboardFirstScreenBand({
     history: [{ role: 'system' }, { role: 'user' }], lines, width: 80,
     show: async () => { called = true; return { status: 'absent' }; },
-    daemonLink: async () => { called = true; return { status: 'absent', startCommand: 'elanous nexus run --hmr' }; },
+    daemonLink: async () => { called = true; return { status: 'absent', startCommand: 'elanous nexus run' }; },
     draw: () => {}, observe: () => {},
   });
   expect(lines).toEqual(['restored transcript']);
@@ -106,12 +106,12 @@ test('a resolved locale threads the localized guidance rows through the producti
   const observations: object[] = [];
   await renderDashboardFirstScreenBand({
     history, lines, width: 120, locale: 'ko',
-    daemonLink: async () => ({ status: 'absent', startCommand: 'elanous nexus run --hmr' }),
+    daemonLink: async () => ({ status: 'absent', startCommand: 'elanous nexus run' }),
     show: async () => ({ status: 'absent' }),
     draw: () => {}, observe: (value) => observations.push(value),
   });
   expect(lines).toEqual(buildFirstScreenBand({
-    width: 120, daemon: false, locale: 'ko', link: { status: 'absent', startCommand: 'elanous nexus run --hmr' },
+    width: 120, daemon: false, locale: 'ko', link: { status: 'absent', startCommand: 'elanous nexus run' },
   }));
   // Rows 2..5 are the three available-action rows plus the immediately-typeable
   // example row; they survive the daemon-link and PWA lookups resolving in place.

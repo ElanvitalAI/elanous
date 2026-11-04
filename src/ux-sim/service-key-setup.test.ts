@@ -7,7 +7,9 @@ import { loadFreshCodexAuthState, loginWithCodex } from '../oauth/codex.js';
 import { loadTokens } from '../oauth/store.js';
 import { serviceKeyStatus, verifyServiceKey, type ServiceKeyVerification } from '../setup/service-keys.js';
 import { importServiceKeys, runFirstRunProviderSetup } from '../cli/setup-keys.js';
+import { formatCodexDeviceLoginFailure, runCodexDeviceLoginWait } from '../cli/codex-device-login-wait.js';
 import type { UserConfig } from '../user-config.js';
+import { withSimClock } from './fake-clock.js';
 import {
   createFakeCodexDeviceOAuth,
   startFakeOpenAiCompatibleApi,
@@ -399,4 +401,114 @@ test('fake device OAuth rejects user denial and expired device codes without sav
     expect(oauth.requests().map(({ endpoint }) => endpoint)).toEqual(['device-code', 'device-poll']);
     expect(JSON.stringify(oauth.requests())).not.toContain('fake-');
   }
+});
+
+test('headless Codex device login cancellation during a delayed token exchange never saves tokens', async () => {
+  useIsolatedAuthStore();
+  const oauth = createFakeCodexDeviceOAuth('exchange-in-flight');
+  const printed: string[] = [];
+  const updates: string[] = [];
+  let interrupt: (() => void) | undefined;
+  let signal: AbortSignal | undefined;
+  const io = {
+    print: (line: string) => printed.push(line),
+    updateLine: (line: string) => updates.push(line),
+    finishLine: () => {},
+    onInterrupt: (handler: () => void) => { interrupt = handler; return () => { interrupt = undefined; }; },
+  };
+
+  await withSimClock(Date.parse('2026-11-04T00:00:00Z'), async clock => {
+    let loginSettled = false;
+    const resultPromise = runCodexDeviceLoginWait(options => {
+      signal = options.signal;
+      return loginWithCodex({
+        ...options,
+        fetchImpl: oauth.fetchImpl,
+        pollIntervalMs: 1_000,
+        maxWaitMs: 10_000,
+        mirrorCodex: false,
+      }).finally(() => { loginSettled = true; });
+    }, io, { headless: true });
+
+    for (let turn = 0; turn < 20 && !printed.some(line => line.startsWith('코드: ')); turn++) await Promise.resolve();
+    expect(printed.some(line => line.startsWith('코드: '))).toBe(true);
+    expect(updates[0]).toContain('0초');
+    expect(updates[0]).toContain('Ctrl-C 취소');
+    clock.tick(1_100);
+    await oauth.exchangeStarted;
+    expect(updates.some(line => line.includes('Codex 로그인 확인 중'))).toBe(true);
+
+    interrupt?.();
+    expect(signal?.aborted).toBe(true);
+    oauth.releaseExchange();
+    expect(await resultPromise).toEqual({ kind: 'cancelled' });
+    for (let turn = 0; turn < 20 && !loginSettled; turn++) await Promise.resolve();
+    expect(loginSettled).toBe(true);
+    expect(oauth.requests().map(request => request.endpoint)).toEqual(['device-code', 'device-poll', 'token']);
+    expect(loadTokens('openai-codex')).toBeNull();
+    expect(updates.every(line => !line.includes('.'))).toBe(true);
+    expect(clock.pendingTimers()).toBe(0);
+  });
+});
+
+test('headless Codex cancellation during a delayed device approval never starts token exchange', async () => {
+  useIsolatedAuthStore();
+  const oauth = createFakeCodexDeviceOAuth('poll-in-flight');
+  const printed: string[] = [];
+  let interrupt: (() => void) | undefined;
+  let signal: AbortSignal | undefined;
+  const resultPromise = runCodexDeviceLoginWait(options => {
+    signal = options.signal;
+    return loginWithCodex({ ...options, fetchImpl: oauth.fetchImpl, sleepImpl: async () => {}, pollIntervalMs: 0, mirrorCodex: false });
+  }, {
+    print: line => printed.push(line),
+    onInterrupt: handler => { interrupt = handler; return () => { interrupt = undefined; }; },
+  }, { headless: true });
+
+  await oauth.pollStarted;
+  interrupt?.();
+  expect(signal?.aborted).toBe(true);
+  oauth.releasePoll();
+  expect(await resultPromise).toEqual({ kind: 'cancelled' });
+  expect(oauth.requests().map(request => request.endpoint)).toEqual(['device-code', 'device-poll']);
+  expect(loadTokens('openai-codex')).toBeNull();
+  expect(printed.filter(line => line.includes('대기 중'))).toHaveLength(1);
+});
+
+test('headless device-flow failures are not formatted as offline or browser-launch failures', async () => {
+  const result = await runCodexDeviceLoginWait(async () => { throw new TypeError('fetch failed'); }, {
+    print: () => {},
+  }, { headless: true });
+  expect(result.kind).toBe('failed');
+  if (result.kind !== 'failed') return;
+  const message = formatCodexDeviceLoginFailure(result.error);
+  expect(message).toContain('fetch failed');
+  expect(message.toLowerCase()).not.toContain('offline');
+  expect(message.toLowerCase()).not.toContain('browser');
+});
+
+test('non-TTY headless login prints elapsed updates every ten seconds without polling dots', async () => {
+  const printed: string[] = [];
+  let interrupt: (() => void) | undefined;
+  await withSimClock(Date.parse('2026-11-04T00:00:00Z'), async clock => {
+    const resultPromise = runCodexDeviceLoginWait(async options => {
+      options.onProgress?.({ type: 'user_code', userCode: 'synthetic-fixture', loginUrl: 'https://example.invalid/device' });
+      return new Promise<never>((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () => reject(new Error('synthetic cancellation')), { once: true });
+      });
+    }, {
+      print: line => printed.push(line),
+      onInterrupt: handler => { interrupt = handler; return () => { interrupt = undefined; }; },
+    }, { headless: true });
+    for (let turn = 0; turn < 20 && !printed.some(line => line.includes('0초')); turn++) await Promise.resolve();
+    clock.tick(10_000);
+    for (let turn = 0; turn < 20 && !printed.some(line => line.includes('10초')); turn++) await Promise.resolve();
+    expect(printed.some(line => line.includes('0초'))).toBe(true);
+    expect(printed.some(line => line.includes('10초'))).toBe(true);
+    expect(printed.filter(line => line.includes('대기 중'))).toHaveLength(2);
+    expect(printed.every(line => !/\.{2,}/.test(line))).toBe(true);
+    interrupt?.();
+    expect(await resultPromise).toEqual({ kind: 'cancelled' });
+    expect(clock.pendingTimers()).toBe(0);
+  });
 });

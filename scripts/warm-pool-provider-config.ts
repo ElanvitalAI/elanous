@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { userConfigPath } from '../src/user-config.js';
 import type { WarmWorkerCandidate } from '../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
+import { machinePoolCapacity, parseMachinePoolDeclarations, readMachinePoolDeclarations, type MachinePoolDeclaration } from '../src/resource-ledger/machine-pool-inventory.js';
 
 const TOKEN = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{40}$/;
@@ -20,6 +21,7 @@ export interface WarmPoolProviderConfig {
   poolTemplates: Array<{
     host: string;
     tier: 'lite' | 'standard';
+    slotCount?: number;
     spec: {
       name: string;
       namespace: string;
@@ -40,6 +42,7 @@ export interface WarmPoolProviderConfig {
   controlUrl: string;
   memberToken: string;
   machineTokens: Record<string, string>;
+  machinePools?: readonly MachinePoolDeclaration[];
 }
 
 export interface AssembleWarmPoolProviderConfigInput {
@@ -47,6 +50,7 @@ export interface AssembleWarmPoolProviderConfigInput {
   controlUrl: string;
   memberToken: string;
   machineTokens: Record<string, string>;
+  machinePools?: readonly MachinePoolDeclaration[];
 }
 
 /** Keep a deployment canary to one explicit worker instead of expanding its profile quota. */
@@ -151,19 +155,47 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   if (!Array.isArray(templates) || templates.length === 0) throw new Error('pod.warmPool.templates is required');
   const seen = new Set<string>();
   const machineTokens: Record<string, string> = {};
+  const purpose: MachinePoolDeclaration['purpose'] = profile === 'gate' ? 'gate' : profile === 'landing' ? 'land' : profile === 'feature' ? 'ta' : profile as MachinePoolDeclaration['purpose'];
+  const declaredMembers = new Map<string, { host: string; count: number; digest: string; role: 'assigner' | 'executor' | 'both' }>();
+  const executionCapacity = machinePoolCapacity(input.machinePools?.filter(row => row.purpose === purpose) ?? []);
+  for (const member of input.machinePools?.filter(pool => pool.purpose === purpose).flatMap(pool => pool.members) ?? []) {
+    const prior = declaredMembers.get(member.host);
+    if (prior && prior.digest !== member.digest) throw new Error('conflicting machine pool digests for ' + member.host);
+    const roles = new Set([prior?.role, member.role].filter(Boolean));
+    const role = roles.has('both') || (roles.has('assigner') && roles.has('executor')) ? 'both'
+      : (roles.has('assigner') ? 'assigner' : 'executor');
+    declaredMembers.set(member.host, { host: member.host, count: executionCapacity[member.host]?.[purpose] ?? 0, digest: member.digest, role });
+  }
+  const templatesByHost = new Map<string, number>();
+  for (const raw of templates) {
+    const row = object(raw, 'pod.warmPool.templates[]');
+    const host = text(row.host, 'pod.warmPool.templates[].host');
+    templatesByHost.set(host, (templatesByHost.get(host) ?? 0) + 1);
+  }
+  const templateOrdinalByHost = new Map<string, number>();
   const poolTemplates = templates.map((raw, index) => {
     const row = object(raw, `pod.warmPool.templates[${index}]`);
     const host = text(row.host, `pod.warmPool.templates[${index}].host`);
     const tier = text(row.tier, `pod.warmPool.templates[${index}].tier`);
     if (!TIERS.has(tier)) throw new Error(`pod.warmPool.templates[${index}].tier must be lite or standard`);
     const nodeName = text(row.nodeName, `pod.warmPool.templates[${index}].nodeName`);
+    const declared = declaredMembers.get(host);
+    if (input.machinePools && !declared) throw new Error('machine pool declaration missing ' + purpose + ' member for ' + host);
+    if (declared && declared.count === 0) throw new Error('machine pool member cannot execute provider jobs: ' + host);
+    if (declared && declared.digest !== imageDigest) throw new Error('machine pool digest mismatch for ' + host);
     const identity = `${host}/${tier}`;
     if (seen.has(identity)) throw new Error(`duplicate pod.warmPool template ${identity}`);
     seen.add(identity);
     machineTokens[host] = token(input.machineTokens[host], `machine token for ${host}`);
+    const ordinal = templateOrdinalByHost.get(host) ?? 0;
+    templateOrdinalByHost.set(host, ordinal + 1);
+    const templateCount = templatesByHost.get(host) ?? 1;
+    if (declared && declared.count < templateCount) throw new Error(`machine pool count for ${host} is smaller than its template count`);
+    const slotCount = declared ? Math.floor(declared.count / templateCount) + (ordinal < declared.count % templateCount ? 1 : 0) : undefined;
     return {
       host,
       tier: tier as 'lite' | 'standard',
+      ...(slotCount !== undefined ? { slotCount } : {}),
       spec: {
         name: `warm-${host}-${tier}-template`, namespace, kubectlContext,
         workerId: `warm-${host}-${cutSha.slice(0, 12)}`, image: `${imageRepository}@${imageDigest}`,
@@ -176,7 +208,7 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   });
   return { candidates: [], expandPoolTemplatesToQuota: expandPoolTemplatesToQuota === true,
     poolTemplates, profileConfig: { pod: { warmPoolProfile: profile } },
-    controlUrl: controlUrl(input.controlUrl), memberToken: token(input.memberToken, 'member token'), machineTokens };
+    controlUrl: controlUrl(input.controlUrl), memberToken: token(input.memberToken, 'member token'), machineTokens, ...(input.machinePools ? { machinePools: input.machinePools } : {}) };
 }
 
 /** Atomically replace the private provider config and repair permissions on an existing file. */
@@ -209,11 +241,13 @@ interface CliOptions {
   dryRun: boolean;
   serve: boolean;
   singleCandidate?: string;
+  machinePoolsFile?: string;
+  resourceLedgerUrl?: string;
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
   let configPath = userConfigPath(), controlUrl = '', memberTokenFile = '', output = '';
-  let dryRun = false, serve = false, singleCandidate: string | undefined;
+  let dryRun = false, serve = false, singleCandidate: string | undefined, machinePoolsFile: string | undefined, resourceLedgerUrl: string | undefined;
   const machineTokenFiles: Record<string, string> = {};
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
@@ -233,13 +267,17 @@ function parseArgs(argv: readonly string[]): CliOptions {
     else if (arg === '--dry-run') dryRun = true;
     else if (arg === '--serve') serve = true;
     else if (arg === '--single-candidate') singleCandidate = next();
+    else if (arg === '--machine-pools') machinePoolsFile = next();
+    else if (arg === '--resource-ledger-url') resourceLedgerUrl = next();
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!isAbsolute(configPath) || !controlUrl || !isAbsolute(memberTokenFile))
-    throw new Error('usage: --config ABSOLUTE --control-url URL --member-token-file ABSOLUTE --machine-token HOST=ABSOLUTE [--output ABSOLUTE] [--single-candidate HOST/TIER] [--dry-run|--serve]');
+    throw new Error('usage: --config ABSOLUTE --control-url URL --member-token-file ABSOLUTE --machine-token HOST=ABSOLUTE [--resource-ledger-url URL] [--output ABSOLUTE] [--single-candidate HOST/TIER] [--dry-run|--serve]');
   if (Object.values(machineTokenFiles).some(file => !isAbsolute(file))) throw new Error('machine token files must be absolute');
+  if (machinePoolsFile && !isAbsolute(machinePoolsFile)) throw new Error('--machine-pools path must be absolute');
+  if (resourceLedgerUrl && !/^https?:\/\//.test(resourceLedgerUrl)) throw new Error('--resource-ledger-url must be http(s)');
   if (dryRun && serve) throw new Error('--dry-run and --serve cannot be combined');
-  return { configPath, controlUrl, memberTokenFile, machineTokenFiles,
+  return { configPath, controlUrl, memberTokenFile, machineTokenFiles, machinePoolsFile, resourceLedgerUrl,
     output: output || join(dirname(configPath), 'warm-pod-provider.json'), dryRun, serve, singleCandidate };
 }
 
@@ -248,13 +286,45 @@ function readPrivateToken(path: string, label: string): string {
   return token(readFileSync(path, 'utf8').trim(), label);
 }
 
+export function requireAuthoritativeMachinePoolSource(resourceLedgerUrl?: string, machinePoolsFile?: string): void {
+  if (!resourceLedgerUrl) throw new Error('--resource-ledger-url is required for authoritative machine-pool declarations');
+}
+
+export async function fetchMachinePoolDeclarationsFromNexus(url: string, memberToken: string, fetcher: typeof fetch = fetch): Promise<MachinePoolDeclaration[]> {
+  const response = await fetcher(url, { headers: { authorization: 'Bearer ' + memberToken } });
+  if (!response.ok) throw new Error('Nexus resource-ledger request failed: HTTP ' + response.status);
+  const body = await response.json() as { pools?: unknown };
+  return parseMachinePoolDeclarations({ pools: body.pools });
+}
+
 export async function runWarmPoolProviderConfig(argv: readonly string[]): Promise<void> {
   const options = parseArgs(argv);
+  if (!options.resourceLedgerUrl?.trim())
+    throw new Error('--resource-ledger-url is required; local templates are not an authoritative pool source');
+  requireAuthoritativeMachinePoolSource(options.resourceLedgerUrl, options.machinePoolsFile);
   const config = JSON.parse(readFileSync(options.configPath, 'utf8')) as unknown;
   const machineTokens = Object.fromEntries(Object.entries(options.machineTokenFiles)
     .map(([host, path]) => [host, readPrivateToken(path, `machine token for ${host}`)]));
-  const assembled = assembleWarmPoolProviderConfig({ config, controlUrl: options.controlUrl,
-    memberToken: readPrivateToken(options.memberTokenFile, 'member token'), machineTokens });
+  const memberToken = readPrivateToken(options.memberTokenFile, 'member token');
+  let fromNexus: MachinePoolDeclaration[] | undefined;
+  if (options.resourceLedgerUrl) {
+    const hostCredentials = Object.values(machineTokens);
+    if (hostCredentials.length === 0) throw new Error('--resource-ledger-url requires at least one host machine token');
+    const declarations = await Promise.all(hostCredentials.map(credential =>
+      fetchMachinePoolDeclarationsFromNexus(options.resourceLedgerUrl!, credential)));
+    const byIdentity = new Map<string, MachinePoolDeclaration>();
+    for (const pool of declarations.flat()) {
+      const identity = `${pool.purpose}/${pool.fanoutGroupId}`;
+      const prior = byIdentity.get(identity);
+      if (prior && JSON.stringify(prior) !== JSON.stringify(pool)) throw new Error('Nexus returned conflicting machine pool declarations for ' + identity);
+      byIdentity.set(identity, pool);
+    }
+    fromNexus = [...byIdentity.values()];
+  }
+  const fromCache = options.machinePoolsFile ? readMachinePoolDeclarations(options.machinePoolsFile) : undefined;
+  if (fromNexus && fromCache && JSON.stringify(fromNexus) !== JSON.stringify(fromCache)) throw new Error('machine-pool cache differs from Nexus resource ledger');
+  const machinePools = fromNexus ?? fromCache;
+  const assembled = assembleWarmPoolProviderConfig({ config, controlUrl: options.controlUrl, memberToken, machineTokens, machinePools });
   const selected = options.singleCandidate ? selectSingleWarmPoolCandidate(assembled, options.singleCandidate) : assembled;
   if (!options.dryRun) writeWarmPoolProviderConfig(options.output, selected);
   process.stdout.write(`${JSON.stringify({ output: options.output, config: redact(selected),

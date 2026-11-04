@@ -9,6 +9,9 @@ import { WarmPodTransport, WARM_POD_ACK, WARM_POD_EXEC, WARM_POD_READ,
   warmWorkerPodManifest, type WarmPodSpec } from '../task-orchestrator/surfaces/pod-warm-worker-pod.js';
 import type { WarmWorkerCommand } from '../task-orchestrator/surfaces/pod-warm-worker-protocol.js';
 import { createFakeKubectl } from './fake-kubectl.js';
+import { createFakeCloudVm } from './fake-cloud-vm.js';
+import { assembleWarmPoolProviderConfig, type WarmPoolProviderConfig } from '../../scripts/warm-pool-provider-config.js';
+import { activeResourcePools, beginResourceLease, declareResourcePool, readResourceLedger, reapResourceLeaseIfCurrent, recordWarmPoolPodReceipt } from '../resource-ledger/resource-ledger.js';
 
 export type WarmPoolReuseFault = 'image-pin-mismatch' | 'profile-mismatch' | 'machine-token-scope-mismatch'
   | 'detail-callback-missing';
@@ -123,12 +126,14 @@ function createProtocolBoundary(specification: WarmPodSpec, kubectl: ReturnType<
 }
 
 export async function runWarmPoolReuseSimulation(options: { runId: string; fault?: WarmPoolReuseFault;
-  transportFailure?: boolean }) {
+  transportFailure?: boolean; candidateHost?: 'pool-host-a' | 'pool-host-b'; providerConfig?: WarmPoolProviderConfig }) {
   const fault = options.fault;
-  const candidate: WarmWorkerCandidate = { host: 'pool-host-a', tier: 'standard', spec };
-  const kubernetes = createFakeKubectl({ context: spec.kubectlContext, node: spec.nodeName!, podReadinessOnCreate: true });
+  const assembledTemplate = options.providerConfig?.poolTemplates[0];
+  const candidateHost = assembledTemplate?.host ?? options.candidateHost ?? 'pool-host-a';
+  const candidate: WarmWorkerCandidate = assembledTemplate ?? { host: candidateHost, tier: 'standard', spec: { ...spec, kubectlContext: `${candidateHost}-context`, nodeName: `${candidateHost}-server-0`, name: `warm-${candidateHost}-standard-1`, workerId: `warm-${candidateHost}-standard-1-generation-1` } };
+  const kubernetes = createFakeKubectl({ context: candidate.spec.kubectlContext, node: candidate.spec.nodeName!, podReadinessOnCreate: true });
   if (fault === 'image-pin-mismatch' || fault === 'profile-mismatch' || fault === 'detail-callback-missing') {
-    const manifest = warmWorkerPodManifest(spec) as Record<string, any>;
+    const manifest = warmWorkerPodManifest(candidate.spec) as Record<string, any>;
     manifest.metadata.uid = 'preexisting-pod-uid'; manifest.metadata.resourceVersion = '1';
     manifest.status = { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] };
     if (fault === 'image-pin-mismatch' || fault === 'detail-callback-missing')
@@ -139,10 +144,10 @@ export async function runWarmPoolReuseSimulation(options: { runId: string; fault
   const primary = await createFakePrimaryControl();
   const prepareLockDirectory = mkdtempSync(join(tmpdir(), 'warm-pool-reuse-sim-'));
   const protocol: ProtocolEvidence = { requests: [], responses: [], acknowledgements: [] };
-  const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: primary.url,
+  const provider = new WarmPodProvider({ ...(options.providerConfig ?? { candidates: [candidate] }), controlUrl: primary.url,
     memberToken: primary.memberToken,
-    machineTokens: { 'pool-host-a': fault === 'machine-token-scope-mismatch'
-      ? primary.machineTokens['pool-host-b'] : primary.machineTokens['pool-host-a'] },
+    machineTokens: { [candidateHost]: fault === 'machine-token-scope-mismatch'
+      ? primary.machineTokens[candidateHost === 'pool-host-a' ? 'pool-host-b' : 'pool-host-a'] : primary.machineTokens[candidateHost as keyof typeof primary.machineTokens] },
     profileConfig: { pod: { warmPoolProfile: 'gate' } }, kubectl: kubernetes.kubectl,
     fetch: primary.fetch, prepareLockDirectory,
     observationRunIdForTest: options.runId,
@@ -180,4 +185,72 @@ export async function runWarmPoolReuseSimulation(options: { runId: string; fault
     primary.stop();
     rmSync(prepareLockDirectory, { recursive: true, force: true });
   }
+}
+
+
+/** Exercise the production simulation devices' mesh-loss contract without contacting cloud APIs. */
+export async function simulateWarmPoolMachineLossRecovery() {
+  const fleet = createFakeCloudVm();
+  const digest = key.imageDigest;
+  const lostHost = 'pool-host-a' as const;
+  const survivingHost = 'pool-host-b' as const;
+  fleet.createFromImage({ id: lostHost, imageDigest: digest, hourlyCost: 1 });
+  fleet.createFromImage({ id: survivingHost, imageDigest: digest, hourlyCost: 1 });
+  fleet.openLease(lostHost);
+  const lost = fleet.disappear(lostHost);
+  const replacement = fleet.status(survivingHost);
+  if (lost.state !== 'disappeared' || replacement.state !== 'ready' || replacement.imageDigest !== digest)
+    throw new Error('warm pool recovery requires a live same-digest mesh member');
+  fleet.openLease(survivingHost);
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'warm-pool-machine-loss-ledger-'));
+  const ledgerPath = join(ledgerDir, 'events.jsonl');
+  try {
+    declareResourcePool({ purpose: 'gate', fanoutGroupId: 'mesh-loss-v1', members: [
+      { host: lostHost, count: 1, digest, role: 'both' }, { host: survivingHost, count: 1, digest, role: 'both' }],
+      fanoutGroup: { shard: { kind: 'gate', input: 'mesh-loss-canary', result: 'gate-result', fingerprint: 'runtime-env-skill' } },
+      fingerprint: { runtime: 'bun-sim-v1', environment: 'linux-amd64', skillPacks: [] },
+      cleanup: { procedure: 'worktree-env-credential-v1', verify: 'workspace-clean-v1' } }, new Date(), ledgerPath);
+    const prior = new Date(Date.now() - 120_000);
+    const lease = beginResourceLease({ fp: 'fp_mesh_gcp1_warm', host: lostHost, lane: 'warm',
+      resources: { pods: 1 }, mission: { cell: 'WARM-POOL-DESIGN-FLEX' }, ttlMs: 60_000, now: prior }, ledgerPath);
+    const expiry = Date.parse(lease.heartbeatAt) + lease.ttlMs;
+    const reaped = reapResourceLeaseIfCurrent({ id: lease.id, expectedHeartbeatAt: lease.heartbeatAt,
+      expectedExpiresAtMs: expiry, observedAtMs: Date.now(), reason: 'machine-disappeared' }, ledgerPath);
+    const authoritativePool = activeResourcePools(readResourceLedger(ledgerPath))[0];
+    const survivingMember = authoritativePool?.members.find(member => member.host !== lostHost && member.digest === digest && member.role !== 'assigner');
+    if (!survivingMember) throw new Error('Nexus resource-ledger declaration did not retain an executable surviving mesh member');
+    const providerConfig = assembleWarmPoolProviderConfig({
+      config: { pod: { warmPoolProfile: 'gate', warmPool: { namespace: 'elanous-test',
+        imageRepository: 'registry.example/elanous', imageDigest: digest, lockHash: key.lockHash,
+        architecture: key.architecture, hostProbeUrl: 'http://host.orb.internal:10001/health',
+        prodProbeUrl: 'http://core.elanous-prod:10002/', sourceUrl: 'https://github.com/ElanvitalAI/elanous.git',
+        templates: [{ host: survivingMember.host, tier: 'standard', nodeName: `${survivingMember.host}-node` }] } },
+        harness: { imageCommit: spec.cutSha, podPool: `${survivingMember.host}-context` } },
+      controlUrl: 'https://control.example:8413', memberToken: 'd'.repeat(64),
+      machineTokens: { [survivingMember.host]: 'e'.repeat(64) }, machinePools: [authoritativePool],
+    });
+    const providerTemplate = providerConfig.poolTemplates[0];
+    if (!providerTemplate || providerTemplate.host !== survivingMember.host || providerTemplate.spec.key.imageDigest !== digest)
+      throw new Error('provider assembler ignored the surviving ledger member or digest');
+    const providerSelection = await runWarmPoolReuseSimulation({ runId: 'machine-loss-survivor-provider', providerConfig });
+    if (!providerSelection.selection?.selected || !providerSelection.selection.workerId?.startsWith('warm-' + survivingHost + '-'))
+      throw new Error('production warm provider did not select the assembled same-digest surviving host template');
+    recordWarmPoolPodReceipt({ purpose: 'ta', host: lostHost, podUid: 'sim-pod-gcp1',
+      digest, runtime: 'bun-sim-v1', environment: 'linux-amd64', skillPacks: [{ name: 'research', version: '2' }],
+      lastJob: 'crawl-shard-1', cleanupResult: { state: 'unknown', procedure: 'worktree-env-credential-v1',
+        reason: 'host-disappeared-before-cleanup', verifiedAt: new Date().toISOString() } }, new Date(), ledgerPath);
+    const ledger = readResourceLedger(ledgerPath);
+    const terminal = ledger.find(event => event.event === 'lease-reaped' && event.reason === 'machine-disappeared');
+    const receiptEvent = [...ledger].reverse().find(event => event.event === 'pool-pod-receipt');
+    const disappearance = fleet.events().find(event => event.type === 'vm-disappeared');
+    return { reason: 'machine-disappeared', lostHost: lostHost,
+      lostLeaseCount: disappearance?.type === 'vm-disappeared' ? disappearance.lostLeases : 0,
+      reassignedHost: survivingMember.host, digest, providerTemplate: { host: providerTemplate.host,
+        slotCount: providerTemplate.slotCount, imageDigest: providerTemplate.spec.key.imageDigest },
+      providerSelection: providerSelection.selection, leaseReaped: reaped,
+      ledgerReason: terminal?.event === 'lease-reaped' ? terminal.reason : null,
+      podReceipt: receiptEvent?.event === 'pool-pod-receipt' ? receiptEvent.receipt : null,
+      events: fleet.events() };
+  } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
+
 }

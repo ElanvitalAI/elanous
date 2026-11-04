@@ -116,17 +116,18 @@ export function createClassicSidetabMissionTool(
   return {
     spec: {
       name: CLASSIC_SIDETAB_MISSION_TOOL_NAME,
-      description: 'Run a stateless coding mission with the selected sidetab agent. Optionally set parallelMission for a two-hand Codex/Claude pair. Set withGrok=true to send the exact same mission to Codex, Claude Code, and Grok concurrently; omit both parallelMission and linearIssueId in this mode. For any parallel mission, omit linearIssueId because Linear progress sync only supports one sidetab mission. After one combined result notification, compare candidates, adopt the strongest answer, and explain the choice. If Grok login or startup is unavailable, continue with Codex and Claude and disclose the fallback. For parallel runs, either listed mission ID cancels all members. Return a structured result with status, body, artifacts, and id. Parent-turn cancellation does not cancel missions; explicit mission-ID cancellation or the one-hour safety timeout can stop them.',
+      description: 'Run a stateless coding mission with the selected sidetab agent. For a two-hand Codex/Claude pair, keep the original parent request in mission and provide decomposition.status=ready plus separate codex and claude briefs, each with distinct scope, deliverables, and dependencies. Split into non-overlapping work; dependencies must already be satisfied and neither child may depend on the other child output. If the work cannot run independently, set status=cannot-split and give a reason. Both child briefs are launched under this tool call ID. Set withGrok=true to send the exact same mission to Codex, Claude Code, and Grok concurrently; omit both parallelMission and linearIssueId in this mode. For any parallel mission, omit linearIssueId because Linear progress sync only supports one sidetab mission. After a Codex + Claude pair completes, combine both complementary results rather than discarding either hand. For withGrok=true, compare candidates, adopt the strongest answer, and explain the choice. If Grok login or startup is unavailable, continue with Codex and Claude and disclose the fallback. For parallel runs, either listed mission ID cancels all members. Return a structured result with status, body, artifacts, and id. Parent-turn cancellation does not cancel missions; explicit mission-ID cancellation or the one-hour safety timeout can stop them.',
       parameters: {
         type: 'object',
         properties: {
           agent: { type: 'string', enum: ['codex', 'claude'], description: 'Visible coding agent to run.' },
-          mission: { type: 'string', minLength: 1, description: 'The work to perform.' },
+          mission: { type: 'string', minLength: 1, description: 'Original parent request. For a Codex + Claude decomposition, split it into the separate briefs in decomposition.' },
           // Some strict tool callers materialize every optional property and
           // use empty sentinels instead of omitting it. Accept those at the
           // boundary; dispatch normalizes them before validating combinations.
           linearIssueId: { anyOf: [{ type: 'string' }, { type: 'null' }, { type: 'array', items: { type: 'string' }, maxItems: 0 }], description: 'Optional Linear child issue ID for a single sidetab mission only; omit or send an empty value when parallelMission or withGrok is used.' },
-          parallelMission: { anyOf: [{ type: 'string' }, { type: 'null' }, { type: 'array', items: { type: 'string' }, maxItems: 0 }], description: 'Optional second prompt for a two-hand Codex/Claude pair only; omit or send an empty value when not pairing.' },
+          parallelMission: { anyOf: [{ type: 'string' }, { type: 'null' }, { type: 'array', items: { type: 'string' }, maxItems: 0 }], description: 'Backward-compatible second prompt for an existing two-hand pair. New parent-request splits should use structured decomposition.' },
+          decomposition: { type: 'object', description: 'Required for a new parent-request split. Legacy parallelMission calls remain supported. The parent decomposes mission into non-overlapping Codex and Claude briefs; mark cannot-split and explain if parallel work is not safe.', properties: { status: { type: 'string', enum: ['ready', 'cannot-split'] }, reason: { type: 'string', description: 'Required when status=cannot-split.' }, codex: { type: 'object', properties: { scope: { type: 'string' }, deliverables: { type: 'string' }, dependsOn: { type: 'string', description: 'Prerequisite that is already satisfied, or state none. If this depends on the other child output, mark cannot-split instead.' } }, required: ['scope', 'deliverables', 'dependsOn'], additionalProperties: false }, claude: { type: 'object', properties: { scope: { type: 'string' }, deliverables: { type: 'string' }, dependsOn: { type: 'string', description: 'Prerequisite that is already satisfied, or state none. If this depends on the other child output, mark cannot-split instead.' } }, required: ['scope', 'deliverables', 'dependsOn'], additionalProperties: false } }, required: ['status'], additionalProperties: false },
           withGrok: { anyOf: [{ type: 'boolean' }, { type: 'null' }, { type: 'string', enum: [''] }, { type: 'array', items: { type: 'string' }, maxItems: 0 }], description: 'Run this exact mission concurrently with Codex, Claude Code, and Grok, then compare and adopt the strongest result; omit parallelMission and linearIssueId. Grok login failure degrades to Codex + Claude.' },
         },
         required: ['agent', 'mission'],
@@ -142,7 +143,7 @@ export function createClassicSidetabMissionTool(
       });
       if (!args || typeof args !== 'object' || Array.isArray(args)) return output('error', 'arguments must be an object');
       const input = args as Record<string, unknown>;
-      if (Object.keys(input).some(key => key !== 'agent' && key !== 'mission' && key !== 'parallelMission' && key !== 'withGrok' && key !== 'linearIssueId')) {
+      if (Object.keys(input).some(key => key !== 'agent' && key !== 'mission' && key !== 'parallelMission' && key !== 'decomposition' && key !== 'withGrok' && key !== 'linearIssueId')) {
         return output('error', 'arguments contain unsupported fields');
       }
       const normalizeOptional = (value: unknown): unknown => {
@@ -157,6 +158,7 @@ export function createClassicSidetabMissionTool(
       const normalizedLinearIssueId = normalizeOptional(input.linearIssueId);
       const normalizedWithGrok = normalizeOptional(input.withGrok);
       const requestedParallelMission = typeof normalizedParallelMission === 'string' ? normalizedParallelMission : '';
+      const decomposition = normalizeOptional(input.decomposition);
       const linearIssueId = typeof normalizedLinearIssueId === 'string' ? normalizedLinearIssueId : '';
       const withGrok = normalizedWithGrok === true;
       // Some parent tool callers duplicate the same prompt into both fields.
@@ -168,23 +170,72 @@ export function createClassicSidetabMissionTool(
       if (normalizedParallelMission !== undefined && typeof normalizedParallelMission !== 'string') return output('error', 'parallelMission must contain prompt text');
       if (normalizedLinearIssueId !== undefined && typeof normalizedLinearIssueId !== 'string') return output('error', 'linearIssueId must be omitted or contain a non-empty ID');
       if (normalizedWithGrok !== undefined && typeof normalizedWithGrok !== 'boolean') return output('error', 'withGrok must be a boolean');
+      if (decomposition !== undefined && (!decomposition || typeof decomposition !== 'object' || Array.isArray(decomposition))) return output('error', 'decomposition must describe a pair split');
+      const split = decomposition as Record<string, unknown> | undefined;
+      if (withGrok && (parallelMission || split)) return output('error', 'withGrok compares the same mission; omit parallelMission');
+      if (split && Object.keys(split).some(key => !['status', 'reason', 'codex', 'claude'].includes(key))) return output('error', 'decomposition contains unsupported fields');
+      if (split && split.status !== 'ready' && split.status !== 'cannot-split') return output('error', 'decomposition.status must be ready or cannot-split');
+      if (split?.status === 'cannot-split') {
+        const reason = typeof split.reason === 'string' ? split.reason.trim() : '';
+        return reason ? output('error', `Pair dispatch held: ${reason}`) : output('error', 'Pair dispatch held: explain why the parent request cannot be split');
+      }
+      let pairBriefs: { codex: string; claude: string } | undefined;
+      if (parallelMission && !split) {
+        const normalizeBrief = (value: string) => value.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+        if (normalizeBrief(parallelMission) === normalizeBrief(mission)) {
+          return output('error', 'Pair missions must be distinct child briefs; split the parent task before dispatch');
+        }
+        pairBriefs = agent === 'codex'
+          ? { codex: mission, claude: parallelMission }
+          : { codex: parallelMission, claude: mission };
+      }
+      if (split?.status === 'ready') {
+        const brief = (value: unknown): { scope: string; deliverables: string; dependsOn: string } | undefined => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+          const fields = value as Record<string, unknown>;
+          if (Object.keys(fields).some(key => !['scope', 'deliverables', 'dependsOn'].includes(key))) return undefined;
+          const scope = typeof fields.scope === 'string' ? fields.scope.trim() : '';
+          const deliverables = typeof fields.deliverables === 'string' ? fields.deliverables.trim() : '';
+          const dependsOn = typeof fields.dependsOn === 'string' ? fields.dependsOn.trim() : '';
+          return scope && deliverables && dependsOn ? { scope, deliverables, dependsOn } : undefined;
+        };
+        const codex = brief(split.codex);
+        const claude = brief(split.claude);
+        if (!codex || !claude) return output('error', 'Pair dispatch held: each child needs scope, deliverables, and dependencies');
+        const normalized = (value: string) => value.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+        if (normalized(codex.scope) === normalized(claude.scope) || normalized(codex.deliverables) === normalized(claude.deliverables)) {
+          return output('error', 'Pair dispatch held: Codex and Claude scopes and deliverables must be distinct');
+        }
+        const childPrompt = (hand: 'Codex' | 'Claude', child: typeof codex) => [
+          `Parent request: ${mission}`,
+          `Assigned hand: ${hand}`,
+          `Scope: ${child.scope}`,
+          `Deliverables: ${child.deliverables}`,
+          `Dependencies: ${child.dependsOn}`,
+          "Work only within this brief. Do not duplicate the other hand's scope.",
+        ].join('\n');
+        pairBriefs = { codex: childPrompt('Codex', codex), claude: childPrompt('Claude', claude) };
+      }
+      if (parallelMission && parallelMission === mission) {
+        return output('error', 'Pair missions must be distinct child briefs; split the parent task before dispatch');
+      }
       // Non-empty IDs remain single-agent only because parallel runs do not
       // support Linear progress sync.
       debug.log('agent-mission.sidetab', 'guard-input', {
         hasLinearIssueId: Boolean(linearIssueId),
-        parallelMission: Boolean(parallelMission),
+        parallelMission: Boolean(pairBriefs),
         source: normalizedLinearIssueId !== undefined
           ? (context?.linearIssueId ? 'tool-input+linear-dispatch-context' : 'tool-input')
           : context?.linearIssueId ? 'dispatch-context' : 'none',
       });
-      const parallelHasLinearIssueId = Boolean(parallelMission && (linearIssueId || context?.linearIssueId));
+      const parallelHasLinearIssueId = Boolean(pairBriefs && (linearIssueId || context?.linearIssueId));
       if (parallelHasLinearIssueId) {
         debug.log('agent-mission.sidetab', 'linear-sync-skipped-for-parallel', {
           source: linearIssueId && context?.linearIssueId ? 'tool-input+dispatch-context' : linearIssueId ? 'tool-input' : 'dispatch-context',
           reason: 'Linear progress sync is only supported for a single sidetab mission',
         }, { level: 'warn' });
       }
-      if (withGrok && parallelMission) return output('error', 'withGrok compares the same mission; omit parallelMission');
+      if (withGrok && (parallelMission || pairBriefs)) return output('error', 'withGrok compares the same mission; omit parallelMission');
       if (withGrok && !runMissionTrio) return output('error', 'Codex + Claude + Grok comparison is unavailable in this runtime');
       if (withGrok && runMissionTrio) {
         try {
@@ -197,13 +248,13 @@ export function createClassicSidetabMissionTool(
           return output('error', 'Codex + Claude + Grok missions failed before the comparison could start');
         }
       }
-      if (parallelMission && !runMissionPair) return output('error', 'parallel Codex/Claude missions are unavailable in this runtime');
-      if (parallelMission && runMissionPair) {
+      if (pairBriefs && !runMissionPair) return output('error', 'parallel Codex/Claude missions are unavailable in this runtime');
+      if (pairBriefs && runMissionPair) {
         try {
           const pairContext = context?.linearIssueId
             ? { callId: context.callId, parentSessionId: context.parentSessionId }
             : context;
-          const pair = await runMissionPair(agent, mission, parallelMission, pairContext);
+          const pair = await runMissionPair('codex', pairBriefs.codex, pairBriefs.claude, pairContext);
           const codex = pair.codex;
           const claude = pair.claude;
           const format = (name: string, result: ClassicSidetabMissionResult): string => {

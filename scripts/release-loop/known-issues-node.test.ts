@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { formatWaiverAuditComment } from './known-issues-node.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -44,15 +45,17 @@ if (process.env.KNOWN_ASK_FAIL === '1') process.exit(3);
 console.log(JSON.stringify({reply:process.env.KNOWN_ASK_REPLY}));
 `);
   chmodSync(fake, 0o755);
-  const invoke = (checklist: Array<{ id: string; title: string; evidence: string; knownIssue?: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string; outputs?: Record<string, Record<string, unknown>>; recordedWaiver?: { note: string } } = {}) => {
-    const context = { input: { version: releaseVersion, previousVersion: '0.2.6', acceptedRegressions }, outputs: { 'checklist-gate': { knownIssues: checklist }, docs: { branch: `release-docs/${releaseVersion}`, worktree: opts.worktree ?? tree }, ...(opts.recordedWaiver ? { tui: { verdict: 'waived', reason: opts.recordedWaiver.note } } : {}), ...opts.outputs } };
+  const invoke = (checklist: Array<{ id: string; title: string; evidence: string; knownIssue?: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string; outputs?: Record<string, Record<string, unknown>>; recordedWaiver?: { note: string; node?: 'tui' | 'gate'; introducedIds?: string[] } } = {}) => {
+    const waiverNode = opts.recordedWaiver?.node ?? 'tui';
+    const context = { input: { version: releaseVersion, previousVersion: '0.2.6', acceptedRegressions }, outputs: { 'checklist-gate': { knownIssues: checklist }, docs: { branch: `release-docs/${releaseVersion}`, worktree: opts.worktree ?? tree }, ...(opts.recordedWaiver ? { [waiverNode]: { verdict: 'waived', reason: opts.recordedWaiver.note } } : {}), ...opts.outputs } };
     let contextValue = JSON.stringify(context);
     if (opts.recordedWaiver) {
       const statePath = join(root, 'graph-runs/release-loop/run-test.json');
       contextValue = `${statePath}.contexts/2.json`;
       mkdirSync(`${statePath}.contexts`, { recursive: true });
+      const original = waiverNode === 'gate' ? { original: { exit: 1, output: JSON.stringify({ outcome: 'fail', introduced: opts.recordedWaiver.introducedIds }) } } : {};
       writeFileSync(statePath, JSON.stringify({ graphId: 'release-loop', runId: 'run-test', input: context.input,
-        path: ['tui', 'known-issues'], nodes: [{ nodeId: 'tui', ok: true, executed: false, waiver: { reason: opts.recordedWaiver.note } }] }));
+        path: [waiverNode, 'known-issues'], nodes: [{ nodeId: waiverNode, ok: true, executed: false, waiver: { reason: opts.recordedWaiver.note, ...original } }] }));
       writeFileSync(contextValue, JSON.stringify({ ...context, graphId: 'release-loop', runId: 'run-test', nodeId: 'known-issues' }));
     }
     const run = spawnSync('bun', [join(import.meta.dir, 'known-issues-node.ts')], {
@@ -304,6 +307,33 @@ test('a recorded waiver represents ordinary accepted IDs with the same note once
     expect(readFileSync(f.notes, 'utf8').split(`- ${note}.`)).toHaveLength(2);
     expect(() => readFileSync(f.calls)).toThrow();
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('legacy measured gate waiver without provenance metadata still contributes its accepted public note', () => {
+  const f = fixture();
+  const id = 'src/legacy.test.ts > saved measured failure';
+  const reason = 'This feature may fail in this release. Users can retry after updating.';
+  try {
+    const { code, result } = f.invoke([], [{ id, note: 'The feature fails under the saved release check.' }, { id: 'waive:gate', note: reason }], {
+      recordedWaiver: { node: 'gate', note: reason, introducedIds: [id] },
+      outputs: { gate: { verdict: 'waived', reason } },
+      reply: response([[id, 'The feature fails under the saved release check; retry after updating.']]),
+    });
+    expect(code).toBe(0);
+    expect(result.bullets).toContain('This feature may fail in this release. Users can retry after updating.');
+    expect(readFileSync(f.notes, 'utf8')).toContain('This feature may fail in this release. Users can retry after updating.');
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('release-gate-waiver');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('owner waiver audit comment safely encodes double hyphens and retains the recorded approval', () => {
+  const reason = 'Owner approved -- records may be delayed';
+  const line = formatWaiverAuditComment({ ownerWaived: true, approvedBy: 'OP', reason });
+  expect(line).toStartWith('<!-- ');
+  expect(line).toEndWith(' -->');
+  const encoded = line.slice('<!-- '.length, -' -->'.length);
+  expect(encoded).not.toContain('--');
+  expect(JSON.parse(encoded)).toMatchObject({ type: 'release-owner-waiver', approvedBy: 'OP', reason });
 });
 
 test('a model bullet cannot hide a distinct recorded waiver group with identical public wording', () => {

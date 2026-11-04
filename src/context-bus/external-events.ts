@@ -4,7 +4,7 @@ import { openSurfaceEventsDb, recordEvent } from '../domains/surface-events.js';
 
 export type ExternalEventOrigin = 'claude-code' | 'codex-agent-mission' | 'harness-child';
 export type ContextHookKind = 'claimed' | 'done' | 'asked' | 'guide-changed';
-export type ExternalEventKind = ContextHookKind | 'started' | 'finished';
+export type ExternalEventKind = ContextHookKind | 'started' | 'finished' | 'exit';
 export const CONTEXT_SUMMARY_MAX = 120;
 export const CONTEXT_SOURCE_MAX = 512;
 
@@ -21,7 +21,7 @@ export function recordExternalEvent(input: ExternalEventInput, deps: { db?: Data
   if (!['claude-code', 'codex-agent-mission', 'harness-child'].includes(input.origin)) throw new Error('invalid context origin');
   if (input.origin === 'claude-code'
     ? !['claimed', 'done', 'asked', 'guide-changed'].includes(input.kind)
-    : !['started', 'finished'].includes(input.kind)) throw new Error('invalid context kind');
+    : !['started', 'finished', 'exit'].includes(input.kind)) throw new Error('invalid context kind');
   const summary = redactSecretText(input.summary.split(/\r?\n/, 1)[0] ?? '').trim().slice(0, CONTEXT_SUMMARY_MAX);
   const source = redactSecretText(input.source.split(/\r?\n/, 1)[0] ?? '').trim();
   if (!summary) throw new Error('context summary must be one nonempty line');

@@ -24,8 +24,8 @@ Install elanous without contacting a package registry.
   --no-modify-path    do not append the elanous PATH block to a shell startup file
   --no-bootstrap-bun  fail instead of installing bun with its official installer when bun is missing
   --no-install-deps  do not install missing prerequisites with apt even when running as root
-  --no-setup          do not start first-time setup in this window after installing (interactive terminals only)
-  --yes               do not ask before updating an existing installation
+  --no-setup          do not start first-time setup in this window after installing
+  --yes               consent to installation and automatic doctor repairs without prompting
   --allow-downgrade   allow installing a version older than the one already installed
   --help, -h          show this help
 EOF
@@ -78,6 +78,20 @@ if [ -n "${ELANOUS_INSTALL_INTERACTIVE:-}" ]; then
   [ "$ELANOUS_INSTALL_INTERACTIVE" = 1 ] && INTERACTIVE=1
 elif [ -z "${CI:-}" ] && [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
   INTERACTIVE=1
+fi
+
+# Consent covers installation, PATH changes, and the subsequent doctor repairs.
+if [ "$ASSUME_YES" -ne 1 ]; then
+  ANSWER=''
+  if [ "$INTERACTIVE" -eq 1 ]; then
+    printf '%s ' "$(t 'Install elanous and automatically repair prerequisites? [y/N]' 'elanous 설치와 필수 환경 자동 복구에 동의하시겠습니까? [y/N]')"
+    if [ -n "${ELANOUS_INSTALL_ANSWER+x}" ]; then ANSWER="$ELANOUS_INSTALL_ANSWER"; else read -r ANSWER </dev/tty || ANSWER=''; fi
+    echo ''
+  fi
+  case "$ANSWER" in
+    y|Y|yes|YES|Yes) ASSUME_YES=1 ;;
+    *) echo "$(t 'Installation not started: consent required (use --yes to consent).' '설치를 시작하지 않았습니다: 동의가 필요합니다 (--yes로 동의).')" >&2; exit 1 ;;
+  esac
 fi
 
 # bun 이 없으면 공식 설치기로 먼저 깐다 — «sh 한 번이면 알아서» (claude·grok 설치기와 같은 기대).
@@ -146,24 +160,57 @@ required_command_hint() {
 # root(컨테이너·클라우드 이미지)엔 sudo 가 없는 일이 흔하다 — 안내 줄에 sudo 를 붙이면 그대로 쳐도 실패한다(09-25 베어 ubuntu:24.04 실측).
 SUDO='sudo '
 [ "$(id -u 2>/dev/null)" = 0 ] && SUDO=''
+SUDO_APT_AVAILABLE=0
+apt_prerequisites_needed() {
+  [ "$INSTALL_DEPS" -eq 1 ] || return 1
+  [ "$(required_command_family)" = debian ] || return 1
+  command -v apt-get >/dev/null 2>&1 || return 1
+  if ! command -v bun >/dev/null 2>&1 && [ "$BOOTSTRAP_BUN" -eq 1 ]; then
+    command -v curl >/dev/null 2>&1 || return 0
+    command -v unzip >/dev/null 2>&1 || return 0
+  fi
+  return 1
+}
+if [ "$SUDO" != '' ] && command -v sudo >/dev/null 2>&1 && apt_prerequisites_needed; then
+  # Only probe when a missing package may actually use apt. `sudo -l apt-get` checks
+  # authorization for apt itself; a successful `sudo -n true` alone is not enough.
+  if sudo -n -l apt-get >/dev/null 2>&1 || { [ "$INTERACTIVE" -eq 1 ] && [ -t 1 ] && [ -r /dev/tty ] && sudo -l apt-get >/dev/null; }; then
+    SUDO_APT_AVAILABLE=1
+  fi
+fi
 
 # 빠진 선행 명령을 «한 번에» 모아 한 줄로 댄다. bun 은 여기서 세지 않는다(없으면 아래에서 공식 설치기로 깐다).
 missing_prerequisites() {
   MISSING=()
   if ! command -v bun >/dev/null 2>&1 && [ "$BOOTSTRAP_BUN" -eq 1 ]; then
     command -v curl >/dev/null 2>&1 || MISSING+=(curl)
-    command -v unzip >/dev/null 2>&1 || MISSING+=(unzip)   # bun 공식 설치기가 쓴다
+    if ! command -v unzip >/dev/null 2>&1; then
+      # Root and consented sudo users on Debian can install the official Bun installer's unzip prerequisite.
+      # A non-root user without sudo can extract Bun's release archive with the Ubuntu-provided Python stdlib.
+      if { [ "$SUDO" = '' ] || [ "$SUDO_APT_AVAILABLE" -eq 1 ]; } &&
+         [ "$INSTALL_DEPS" -eq 1 ] && [ "$(required_command_family)" = debian ]; then
+        MISSING+=(unzip)
+      elif ! command -v python3 >/dev/null 2>&1; then
+        MISSING+=(unzip)
+      fi
+    fi
   fi
 }
 missing_prerequisites
 INSTALLED_DEPS=''
 DEPS_INSTALL_FAILED=0
-if [ "${#MISSING[@]}" -gt 0 ] && [ "$INSTALL_DEPS" -eq 1 ] && [ "$SUDO" = '' ] &&
-   command -v apt-get >/dev/null 2>&1 && [ "$(required_command_family)" = debian ]; then
+APT_PREFIX=()
+if [ "$SUDO" = '' ] && command -v apt-get >/dev/null 2>&1; then
+  APT_PREFIX=(apt-get)
+elif [ "$SUDO_APT_AVAILABLE" -eq 1 ]; then
+  APT_PREFIX=(sudo apt-get)
+fi
+if [ "${#MISSING[@]}" -gt 0 ] && [ "$INSTALL_DEPS" -eq 1 ] && [ "${#APT_PREFIX[@]}" -gt 0 ] &&
+   [ "$(required_command_family)" = debian ]; then
   DEPS_TO_INSTALL=("${MISSING[@]}")
   # Fresh container images ship with empty package lists — refresh once, then install without prompts.
-  if DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2 &&
-     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${DEPS_TO_INSTALL[@]}" >&2; then
+  if DEBIAN_FRONTEND=noninteractive "${APT_PREFIX[@]}" update -qq >&2 &&
+     DEBIAN_FRONTEND=noninteractive "${APT_PREFIX[@]}" install -y -qq "${DEPS_TO_INSTALL[@]}" >&2; then
     INSTALLED_DEPS="${DEPS_TO_INSTALL[*]}"
     echo "installed: $INSTALLED_DEPS" >&2
     missing_prerequisites
@@ -184,26 +231,64 @@ BUN_PIN="${ELANOUS_BUN_VERSION:-1.4.2}"
 if ! command -v bun >/dev/null 2>&1 && [ "$BOOTSTRAP_BUN" -eq 1 ]; then
   echo "bun not found — installing bun ${BUN_PIN} with its official installer (https://bun.sh/install)" >&2
   if [ "$BUN_PIN" = latest ]; then BUN_ARGS=(); else BUN_ARGS=("bun-v${BUN_PIN}"); fi
+  BUN_UNZIP_SHIM_DIR=''
+  BUN_ORIGINAL_PATH="$PATH"
+  if ! command -v unzip >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    BUN_UNZIP_SHIM_DIR="$(mktemp -d "${TMPDIR:-/tmp}/elanous-unzip-shim.XXXXXX")"
+    cat >"$BUN_UNZIP_SHIM_DIR/unzip" <<'PY'
+#!/usr/bin/env python3
+import sys
+import zipfile
+from pathlib import Path
+
+args = sys.argv[1:]
+destination = Path.cwd()
+archive = None
+index = 0
+while index < len(args):
+    arg = args[index]
+    if arg == "-d":
+        index += 1
+        destination = Path(args[index])
+    elif arg.startswith("-") and "d" in arg[1:]:
+        index += 1
+        destination = Path(args[index])
+    elif not arg.startswith("-"):
+        archive = Path(arg)
+    index += 1
+if archive is None:
+    raise SystemExit("unzip shim: archive path required")
+with zipfile.ZipFile(archive) as bundle:
+    bundle.extractall(destination)
+PY
+    chmod 755 "$BUN_UNZIP_SHIM_DIR/unzip"
+    PATH="$BUN_UNZIP_SHIM_DIR:$PATH"
+    export PATH
+    echo 'using Python zip extraction for Bun bootstrap (unzip unavailable)' >&2
+  fi
   if curl -fsSL https://bun.sh/install | bash -s ${BUN_ARGS[@]+"${BUN_ARGS[@]}"} >&2; then
     export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
   else
     echo "⚠️ bun bootstrap failed" >&2
+  fi
+  if [ -n "$BUN_UNZIP_SHIM_DIR" ]; then
+    PATH="$BUN_ORIGINAL_PATH"
+    BUN_BOOTSTRAP_BIN="${BUN_INSTALL:-$HOME/.bun}/bin"
+    if [ -x "$BUN_BOOTSTRAP_BIN/bun" ]; then PATH="$BUN_BOOTSTRAP_BIN:$PATH"; fi
+    export PATH
+    rm -rf "$BUN_UNZIP_SHIM_DIR"
   fi
 fi
 
 # Git enables repository/worktree features but is not needed to boot the installed TUI.
 # Keep this set aligned with the runtime-required entries in catalog/external-commands.yaml.
 REQUIRED_COMMANDS=(bun)
-HARNESS_COMMANDS=(gh rg codex)
 for command in "${REQUIRED_COMMANDS[@]}"; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "⛔ required command missing: $command. Install it, then rerun this script:" >&2
     required_command_hint "$command"
     exit 127
   fi
-done
-for command in "${HARNESS_COMMANDS[@]}"; do
-  command -v "$command" >/dev/null 2>&1 || echo "$(t "⚠️ harness command missing: $command (see Next below)" "⚠️ 하니스가 쓰는 명령이 없습니다: $command (아래 «다음» 참고)")" >&2
 done
 
 # bun 의 «실제 실행 파일» — PATH 의 이름이 아니라 bun 이 스스로 말하는 경로(링크를 끝까지 푼 것).
@@ -360,16 +445,6 @@ if [ -n "$INSTALLED_VERSION" ]; then
     echo "⛔ $(t "elanous $INSTALLED_VERSION is installed; $PACKAGE_VERSION is older, so nothing was changed. To go back on purpose, rerun with --allow-downgrade." "elanous $INSTALLED_VERSION 이(가) 설치돼 있고 $PACKAGE_VERSION 은(는) 더 낮은 판이라 아무것도 바꾸지 않았습니다. 일부러 내리려면 --allow-downgrade 를 붙여 다시 실행하세요.")" >&2
     exit 3
   fi
-  if [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
-    printf '%s ' "$(t "elanous $INSTALLED_VERSION is already installed. Update to $PACKAGE_VERSION? [Y/n]" "elanous $INSTALLED_VERSION 이(가) 이미 설치돼 있습니다. $PACKAGE_VERSION 로 업데이트할까요? [Y/n]")"
-    if [ -n "${ELANOUS_INSTALL_ANSWER+x}" ]; then ANSWER="$ELANOUS_INSTALL_ANSWER"; else ANSWER=""; read -r ANSWER </dev/tty || ANSWER=""; fi
-    echo ""
-    case "$ANSWER" in
-      n|N|no|NO|No|아니오|아니요)
-        echo "$(t "Left elanous $INSTALLED_VERSION as it is." "elanous $INSTALLED_VERSION 을(를) 그대로 두었습니다.")"
-        exit 0 ;;
-    esac
-  fi
 fi
 VERSION_NAME="$PACKAGE_VERSION${VERSION_SUFFIX:-}"
 VERSION_DIR="$PREFIX/versions/$VERSION_NAME"
@@ -453,60 +528,50 @@ fi
 echo "$(t "Installed elanous $VERSION at $PREFIX/bin/elanous" "elanous $VERSION 을(를) 설치했습니다: $PREFIX/bin/elanous")"
 [ -z "$INSTALLED_DEPS" ] || echo "installed: $INSTALLED_DEPS"
 
-# ── 다음 걸음 (2026-09-23 · Phase 3 「사람 손」) ─────────────────────────
-# ⛔ 설치가 끝나도 «무엇을 더 쳐야 하나»를 안 말하면, 빠뜨린 손이 나중에 «다른 원인의 얼굴»로 나타난다
-#   (예: 로그인 누락이 quota-exhausted 로 분류됐다 — 09-21 실측). 그래서 «지금 상태»로 계산해 말한다.
-#   provider 설정은 «안» 적는다 — 빈 config(auto)는 로그인만 있으면 런타임이 codex 로 고른다(#19950).
-# --no-setup keeps the prompt above but never starts setup.
 START_SETUP=$INTERACTIVE
 [ "$RUN_SETUP" -eq 1 ] || START_SETUP=0
+# A fresh installation starts first-run even from a headless SSH session; `--no-setup` remains the opt-out.
+if [ -z "$INSTALLED_VERSION" ] && [ "$RUN_SETUP" -eq 1 ]; then START_SETUP=1; fi
 
+# Run the installed copy with the same consent; never implicitly enable sudo or restart.
+if ELANOUS_INSTALL_PREFIX="$PREFIX" PATH="$PREFIX/bin:$PATH" "$PREFIX/bin/elanous" doctor --fix --yes --setup-tools --json >"$TMP/doctor-setup.json" 2>"$TMP/doctor-setup.err"; then
+  echo "$(t 'Setup: prerequisite repairs completed.' '설정: 필수 환경 복구를 완료했습니다.')"
+else
+  RETRY_BIN=""
+  RETRY_ENV_PREFIX=""
+  RETRY_ENV_PATH=""
+  printf -v RETRY_BIN '%q' "$PREFIX/bin/elanous"
+  printf -v RETRY_ENV_PREFIX 'ELANOUS_INSTALL_PREFIX=%q' "$PREFIX"
+  printf -v RETRY_ENV_PATH 'PATH=%q' "$PREFIX/bin:$PATH"
+  RETRY_COMMAND="$RETRY_ENV_PREFIX $RETRY_ENV_PATH $RETRY_BIN doctor --fix --yes --setup-tools"
+  # Only the known unprivileged git-install case is non-blocking: doctor must report an
+  # otherwise healthy setup, and the failed repair must specifically be git installation.
+  DOCTOR_RESULT_HELPER="$PREFIX/current/node_modules/elanous/scripts/install-doctor-result.ts"
+  if [ "$SUDO" != '' ] && bun "$DOCTOR_RESULT_HELPER" "$TMP/doctor-setup.json" >/dev/null 2>&1; then
+    echo "$(t "Git could not be installed without sudo; continue setup and retry later: $RETRY_COMMAND" "sudo 권한이 없어 git 자동 설치를 건너뜁니다. 설정을 계속한 뒤 나중에 다시 실행하세요: $RETRY_COMMAND")" >&2
+  else
+    echo "$(t "Setup failed; retry: $RETRY_COMMAND" "설정 실패; 다시 시도: $RETRY_COMMAND")" >&2
+    exit 1
+  fi
+fi
+
+# Keep the remaining next steps that automatic prerequisite repair does not perform.
 echo ""
 echo "$(t 'Next:' '다음:')"
-STEP=1
-# INST1 order: new shell → elanous (first-time setup, which also signs in) → missing tools → harness say.
 case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
-  *) if [ "$START_SETUP" -eq 1 ]; then :; elif [ "$MODIFY_PATH" -eq 1 ]; then echo "  $STEP) $(t "open a new shell (or: source $STARTUP)" "새 셸을 여세요(또는: source $STARTUP)")"; STEP=$((STEP + 1)); else echo "  $STEP) $(t "add $PREFIX/bin to PATH" "$PREFIX/bin 을 PATH 에 넣으세요")"; STEP=$((STEP + 1)); fi ;;
+  *) if [ "$MODIFY_PATH" -eq 1 ]; then echo "  $(t "open a new shell (or: source $STARTUP)" "새 셸을 여세요(또는: source $STARTUP)")"; else echo "  $(t "add $PREFIX/bin to PATH" "$PREFIX/bin 을 PATH 에 넣으세요")"; fi ;;
 esac
-if [ "$START_SETUP" -eq 0 ]; then
-  echo "  $STEP) $(t "Run: $PREFIX/bin/elanous   # first-time setup (in a new shell: elanous)" "실행: $PREFIX/bin/elanous   # 첫 설정(새 셸에서는: elanous)")"; STEP=$((STEP + 1))
-fi
-# 🆕 2026-09-24 빈 VM 실측: 하니스(codex 백엔드)는 Codex CLI 를 자식으로 띄우는데 빈 기계엔 codex·node 가 «둘 다» 없었다.
-#    ⚠️ 아래 설치 줄은 빈 기계에서 아직 «안 쟀다» — `elanous doctor` 의 codex 줄이 판정한다.
-if ! command -v rg >/dev/null 2>&1; then
-  if [ -z "${OS_ID:-}" ] && [ -r "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}" ]; then
-    while IFS='=' read -r key value; do
-      value="${value#\"}"; value="${value%\"}"
-      case "$key" in ID) OS_ID="$value" ;; ID_LIKE) OS_LIKE="$value" ;; esac
-    done < "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}"
-  fi
-  case "$(uname -s)" in
-    Darwin) RG_HINT='brew install ripgrep' ;;
-    Linux) case " ${OS_ID:-} ${OS_LIKE:-} " in
-      *' debian '*|*' ubuntu '*) RG_HINT='sudo apt-get install -y ripgrep' ;;
-      *' fedora '*) RG_HINT='sudo dnf install -y ripgrep' ;;
-      *) RG_HINT="$(t 'install ripgrep (rg) with your package manager' '패키지 관리자로 ripgrep(rg)을 설치하세요')" ;;
-    esac ;;
-    *) RG_HINT="$(t 'install ripgrep (rg) with your package manager' '패키지 관리자로 ripgrep(rg)을 설치하세요')" ;;
-  esac
-  echo "  $STEP) $RG_HINT"; STEP=$((STEP + 1))
-fi
-if ! command -v codex >/dev/null 2>&1; then
-  if ! command -v node >/dev/null 2>&1; then
-    echo "  $STEP) $(t 'install Node.js 20+ (the Codex CLI runs on node)   # e.g. your package manager or https://nodejs.org' 'Node.js 20 이상을 설치하세요(Codex CLI 가 node 로 돕니다)   # 예: 패키지 관리자 또는 https://nodejs.org')"; STEP=$((STEP + 1))
-  fi
-  echo "  $STEP) npm install -g @openai/codex      # $(t 'the harness drives the Codex CLI' '하니스가 Codex CLI 를 씁니다')"; STEP=$((STEP + 1))
-fi
-if ! command -v gh >/dev/null 2>&1; then
-  echo "  $STEP) $(t 'install gh, then: gh auth login   # the harness opens pull requests with it' 'gh 를 설치한 뒤: gh auth login   # 하니스가 PR 을 열 때 씁니다')"; STEP=$((STEP + 1))
-elif ! gh auth status >/dev/null 2>&1; then
-  echo "  $STEP) gh auth login                     # $(t 'the harness opens pull requests with it' '하니스가 PR 을 열 때 씁니다')"; STEP=$((STEP + 1))
+if [ "$START_SETUP" -eq 0 ]; then echo "  $(t "Run: $PREFIX/bin/elanous   # first-time setup (in a new shell: elanous)" "실행: $PREFIX/bin/elanous   # 첫 설정(새 셸에서는: elanous)")"; fi
+if PATH="$PREFIX/bin:$PATH" command -v gh >/dev/null 2>&1; then
+  if ! PATH="$PREFIX/bin:$PATH" gh auth status >/dev/null 2>&1; then echo "  gh auth login"; fi
+else
+  echo "  $(t 'install gh, then: gh auth login' 'gh 를 설치한 뒤: gh auth login')"
 fi
 if [ "$ELN_AVAILABLE" -eq 1 ]; then
-  echo "  $STEP) $(t 'eln harness say "<one line of what you want>" (or: elanous harness say)' 'eln harness say "<하고 싶은 일 한 줄>" (또는: elanous harness say)')"
+  echo "  $(t 'eln harness say "<one line of what you want>" (or: elanous harness say)' 'eln harness say "<하고 싶은 일 한 줄>" (또는: elanous harness say)')"
 else
-  echo "  $STEP) $(t 'elanous harness say "<one line of what you want>"' 'elanous harness say "<하고 싶은 일 한 줄>"')"
+  echo "  $(t 'elanous harness say "<one line of what you want>"' 'elanous harness say "<하고 싶은 일 한 줄>"')"
 fi
 echo "  $(t 'check anytime: elanous setup --non-interactive' '언제든 점검: elanous setup --non-interactive')"
 
@@ -518,17 +583,21 @@ if [ "$START_SETUP" -eq 1 ]; then
     *":$PREFIX/bin:"*) ;;
     *) echo "  $(t "(new shells will find elanous on PATH; this window uses $PREFIX/bin/elanous)" "(새 셸에서는 PATH 로 elanous 를 찾습니다 · 이 창은 $PREFIX/bin/elanous 를 씁니다)")" ;;
   esac
-  # INST3 (10-01 · node-c tmux): a wizard whose stdin is a fresh open of /dev/tty never saw a key on macOS — its event
-  # loop cannot watch that fd (the same binary started from a shell, which hands over the real tty, worked). So give it
-  # the real terminal device; fall back to /dev/tty only when there is none.
-  SETUP_TTY=/dev/tty
-  REAL_TTY="$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')"
-  case "$REAL_TTY" in
-    ''|'?'|'??') ;;
-    *) if [ -r "/dev/$REAL_TTY" ] && [ -w "/dev/$REAL_TTY" ]; then SETUP_TTY="/dev/$REAL_TTY"; fi ;;
-  esac
-  if [ -n "${ELANOUS_INSTALL_SETUP_EXEC:-}" ]; then
-    ELANOUS_INSTALL_SETUP_TTY="$SETUP_TTY" exec "$ELANOUS_INSTALL_SETUP_EXEC" "$PREFIX/bin/elanous"
+  if [ "$INTERACTIVE" -eq 1 ]; then
+    # INST3 (10-01 · node-c tmux): pass the actual tty device, not a fresh /dev/tty open.
+    SETUP_TTY=/dev/tty
+    REAL_TTY="$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')"
+    case "$REAL_TTY" in
+      ''|'?'|'??') ;;
+      *) if [ -r "/dev/$REAL_TTY" ] && [ -w "/dev/$REAL_TTY" ]; then SETUP_TTY="/dev/$REAL_TTY"; fi ;;
+    esac
+    if [ -n "${ELANOUS_INSTALL_SETUP_EXEC:-}" ]; then
+      ELANOUS_INSTALL_SETUP_TTY="$SETUP_TTY" ELANOUS_INSTALL_FIRST_RUN=1 exec "$ELANOUS_INSTALL_SETUP_EXEC" "$PREFIX/bin/elanous"
+    fi
+    ELANOUS_INSTALL_FIRST_RUN=1 exec "$PREFIX/bin/elanous" <"$SETUP_TTY"
   fi
-  exec "$PREFIX/bin/elanous" <"$SETUP_TTY"
+  if [ -n "${ELANOUS_INSTALL_SETUP_EXEC:-}" ]; then
+    ELANOUS_INSTALL_FIRST_RUN=1 exec "$ELANOUS_INSTALL_SETUP_EXEC" "$PREFIX/bin/elanous"
+  fi
+  ELANOUS_INSTALL_FIRST_RUN=1 exec "$PREFIX/bin/elanous"
 fi

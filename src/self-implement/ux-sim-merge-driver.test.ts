@@ -1,0 +1,57 @@
+import { afterEach, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { integrateTrain } from './merge-train.js';
+
+const dirs: string[] = [];
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+function run(cwd: string, ...args: string[]) { const r = spawnSync(args[0]!, args.slice(1), { cwd, encoding: 'utf8' }); return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }; }
+function git(cwd: string, ...args: string[]) { const r = run(cwd, 'git', ...args); if (r.status !== 0) throw new Error(r.stderr || r.stdout); return r.stdout.trim(); }
+const catalogPath = 'src/ux-sim/mock-scenario-catalog.json';
+const manualPath = 'docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md';
+function fixture() {
+ const repo=mkdtempSync(join(tmpdir(),'ux-sim-merge-driver-'));dirs.push(repo);git(repo,'init','-q','-b','main');git(repo,'config','user.name','test');git(repo,'config','user.email','test@localhost');
+ mkdirSync(join(repo,'scripts'),{recursive:true});mkdirSync(join(repo,'src/ux-sim'),{recursive:true});mkdirSync(join(repo,'docs/manual'),{recursive:true});
+ copyFileSync(resolve(process.cwd(),'.gitattributes'),join(repo,'.gitattributes'));copyFileSync(resolve(process.cwd(),'scripts/ux-sim-merge-driver.mjs'),join(repo,'scripts/ux-sim-merge-driver.mjs'));
+ writeFileSync(join(repo,catalogPath),JSON.stringify({devices:[],scenarios:[],worldEvents:[]},null,2)+'\n');
+ writeFileSync(join(repo,manualPath),'<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->\n| ID | 장치 | 구현 · 시험 | 진입 명령 | test logs 근거 | 최근 사용 근거 |\n|---|---|---|---|---|---|\n<!-- END GENERATED MOCK DEVICE CATALOG -->\n');
+ git(repo,'add','.');git(repo,'commit','-qm','base');return {repo,base:git(repo,'rev-parse','HEAD')};
+}
+function branch(repo:string,base:string,name:string,id:string,extraField:string){git(repo,'checkout','-q','--detach',base);git(repo,'checkout','-q','-b',name);const c=JSON.parse(readFileSync(join(repo,catalogPath),'utf8'));c.devices.push({id,name:id});c[extraField]=true;writeFileSync(join(repo,catalogPath),JSON.stringify(c,null,2)+'\n');writeFileSync(join(repo,manualPath),readFileSync(join(repo,manualPath),'utf8').replace('<!-- END GENERATED',`| ${id} | ${id} | impl | test | no | none |\n<!-- END GENERATED`));git(repo,'add','.');git(repo,'commit','-qm',name);return git(repo,'rev-parse','HEAD');}
+
+test('integrateTrain uses repository attributes to union independent catalog and appended manual assets',()=>{
+ const {repo,base}=fixture(),a=branch(repo,base,'asset-a','MD-0001','addedA'),b=branch(repo,base,'asset-b','MD-0002','addedB');
+ const merged=integrateTrain(repo,base,[{number:1,head:a},{number:2,head:b}]);expect(merged.conflicts).toEqual([]);expect(merged.commitSha).toMatch(/^[0-9a-f]{40}$/);
+ const c=JSON.parse(git(repo,'show',`${merged.commitSha}:${catalogPath}`));expect(c.devices.map((x:any)=>x.id)).toEqual(['MD-0001','MD-0002']);expect(c.addedA).toBe(true);expect(c.addedB).toBe(true);
+ const doc=run(repo,'git','show',`${merged.commitSha}:${manualPath}`).stdout;expect(doc).toContain('MD-0001');expect(doc).toContain('MD-0002');expect(doc.endsWith('\n')).toBe(true);expect(doc.endsWith('\n\n')).toBe(false);
+});
+test('integrateTrain leaves divergent contents for one stable ID conflicted',()=>{
+ const {repo,base}=fixture(),a=branch(repo,base,'same-a','MD-0099','addedA');git(repo,'checkout','-q','--detach',base);git(repo,'checkout','-q','-b','same-b');const c=JSON.parse(readFileSync(join(repo,catalogPath),'utf8'));c.devices.push({id:'MD-0099',name:'different'});writeFileSync(join(repo,catalogPath),JSON.stringify(c,null,2)+'\n');writeFileSync(join(repo,manualPath),readFileSync(join(repo,manualPath),'utf8').replace('<!-- END GENERATED','| MD-0099 | different | impl | test | no | none |\n<!-- END GENERATED'));git(repo,'add','.');git(repo,'commit','-qm','divergent same id');const b=git(repo,'rev-parse','HEAD');const result=integrateTrain(repo,base,[{number:3,head:a},{number:4,head:b}]);expect(result.conflicts).toEqual([{number:4,reason:'conflict',files:[manualPath,catalogPath]}]);
+});
+test('JSON driver preserves independent new fields and rejects dropped base array values',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'ux-sim-json-conflict-'));dirs.push(dir);const b=join(dir,'b'),o=join(dir,'o'),t=join(dir,'t'),driver=resolve(process.cwd(),'scripts/ux-sim-merge-driver.mjs');
+ writeFileSync(b,JSON.stringify({arr:[1,2]}));writeFileSync(o,JSON.stringify({arr:[2,3],x:1}));writeFileSync(t,JSON.stringify({arr:[2,4],y:2}));const r=run(dir,'node',driver,'catalog',b,o,t);expect(r.status).toBe(1);expect(r.stderr).toContain('array removal/change');expect(readFileSync(o,'utf8')).toBe(JSON.stringify({arr:[2,3],x:1}));
+ writeFileSync(o,JSON.stringify({arr:[2]}));writeFileSync(t,JSON.stringify({arr:[2]}));const sameDelete=run(dir,'node',driver,'catalog',b,o,t);expect(sameDelete.status).toBe(1);expect(sameDelete.stderr).toContain('array removal/change');
+ writeFileSync(b,JSON.stringify({arr:[1,1]}));writeFileSync(o,JSON.stringify({arr:[1]}));writeFileSync(t,JSON.stringify({arr:[1]}));const duplicateDelete=run(dir,'node',driver,'catalog',b,o,t);expect(duplicateDelete.status).toBe(1);expect(duplicateDelete.stderr).toContain('array removal/change');
+ writeFileSync(b,JSON.stringify({}));writeFileSync(o,JSON.stringify({x:1}));writeFileSync(t,JSON.stringify({y:2}));const fields=run(dir,'node',driver,'catalog',b,o,t);expect(fields.status).toBe(0);expect(JSON.parse(readFileSync(o,'utf8'))).toEqual({x:1,y:2});
+});
+test('manual driver rejects edits to a base row without modifying the side file',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'ux-sim-manual-conflict-'));dirs.push(dir);const b=join(dir,'b'),o=join(dir,'o'),t=join(dir,'t'),text='<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->\n| ID | 장치 | 구현 · 시험 | 진입 명령 | test logs 근거 | 최근 사용 근거 |\n|---|---|---|---|---|---|\n| base | base | impl | test | no | none |\n<!-- END GENERATED MOCK DEVICE CATALOG -->\n';writeFileSync(b,text);writeFileSync(o,text.replace('| base | base |','| base | changed |'));writeFileSync(t,text);const r=run(dir,'node',resolve(process.cwd(),'scripts/ux-sim-merge-driver.mjs'),'manual',b,o,t);expect(r.status).toBe(1);expect(r.stderr).toContain('manual table is not append-only');expect(readFileSync(o,'utf8')).toContain('| base | changed |');
+});
+
+test('manual driver rejects inserted rows, reordering, and non-row text',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'ux-sim-manual-shape-'));dirs.push(dir);const base=join(dir,'base'),ours=join(dir,'ours'),theirs=join(dir,'theirs'),driver=resolve(process.cwd(),'scripts/ux-sim-merge-driver.mjs');
+ const text='<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->\n| ID | 장치 | 구현 · 시험 | 진입 명령 | test logs 근거 | 최근 사용 근거 |\n|---|---|---|---|---|---|\n| a | a | impl | test | no | none |\n| b | b | impl | test | no | none |\n<!-- END GENERATED MOCK DEVICE CATALOG -->\n';
+ writeFileSync(base,text);writeFileSync(theirs,text);
+ for(const changed of [text.replace('| a | a | impl | test | no | none |\n| b | b | impl | test | no | none |','| b | b | impl | test | no | none |\n| a | a | impl | test | no | none |'),text.replace('| b | b | impl | test | no | none |','| inserted | inserted | impl | test | no | none |\n| b | b | impl | test | no | none |'),text.replace('| b | b | impl | test | no | none |','not a table row\n| b | b | impl | test | no | none |'),text.replace('| b | b | impl | test | no | none |','| short |')]){
+  writeFileSync(ours,changed);const r=run(dir,'node',driver,'manual',base,ours,theirs);expect(r.status).toBe(1);expect(readFileSync(ours,'utf8')).toBe(changed);
+ }
+});
+
+test('manual driver rejects an appended ID that changes a base row',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'ux-sim-manual-id-conflict-'));dirs.push(dir);const base=join(dir,'base'),ours=join(dir,'ours'),theirs=join(dir,'theirs'),driver=resolve(process.cwd(),'scripts/ux-sim-merge-driver.mjs');
+ const text='<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->\n| ID | 장치 | 구현 · 시험 | 진입 명령 | test logs 근거 | 최근 사용 근거 |\n|---|---|---|---|---|---|\n| base | base | impl | test | no | none |\n<!-- END GENERATED MOCK DEVICE CATALOG -->\n';
+ writeFileSync(base,text);writeFileSync(theirs,text);for(const duplicate of ['| base | changed | impl | test | no | none |','| base | base | impl | test | no | none |']){writeFileSync(ours,text.replace('<!-- END GENERATED',`${duplicate}\n<!-- END GENERATED`));const result=run(dir,'node',driver,'manual',base,ours,theirs);expect(result.status).toBe(1);expect(result.stderr).toContain('duplicates a base row');}
+});

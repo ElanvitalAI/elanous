@@ -21,7 +21,7 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(result.universe).toBe(root);
     expect(result.artifactPath).toBe(join(root, 'ux-sim', 'evidence', 'release-sim-rig-0241.json'));
     expect(existsSync(result.artifactPath)).toBe(true);
-    expect(result.cases).toHaveLength(12);
+    expect(result.cases).toHaveLength(15);
     expect(result.cases.every((item) => item.pass && item.unexpectedEdges.length === 0)).toBe(true);
     expect(result.cases.every((item) => item.dispatchedNodes.every((node) => item.path.includes(node) ||
       Object.values(item.fanOuts ?? {}).some((fanout) => Object.hasOwn(fanout.branches, node))))).toBe(true);
@@ -29,6 +29,27 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(result.cases.find((item) => item.id === 'cut-tip-moved-after-resume')).toMatchObject({
       status: 'resume-refused', dispatchedNodes: ['version-release'], checks: { mustVisit: true, mustNotVisit: true },
     });
+    expect(result.cases.find((item) => item.id === 'gate-measured-regression-waive')).toMatchObject({
+      pass: true, status: 'done', injectedEvidence: { waived: true, publishReached: true, initialStatus: 'failed' },
+    });
+    const ownerWaiverCase = result.cases.find((item) => item.id === 'owner-waive-malformed-gate-schema')!;
+    expect(ownerWaiverCase).toMatchObject({
+      pass: true, status: 'done', injectedEvidence: { ownerRecordOk: true, publishReached: true },
+    });
+    const ledgerPath = String(ownerWaiverCase.injectedEvidence?.ownerLedgerPath);
+    expect(ledgerPath).toContain(join(root, 'graph-runs', 'release-loop'));
+    const persistedRun = JSON.parse(readFileSync(ledgerPath, 'utf8')) as { nodes: Array<{ nodeId: string; waiver?: { ownerWaived?: boolean; approvedBy?: string; reason?: string } }> };
+    expect(persistedRun.nodes.find((node) => node.nodeId === 'gate')?.waiver).toMatchObject({
+      ownerWaived: true, approvedBy: 'OP', reason: ownerWaiverCase.injectedEvidence?.reason,
+    });
+    const fixtureOwnerCase = result.cases.find((item) => item.id === 'owner-waive-0246-verdict-fixture')!;
+    expect(fixtureOwnerCase).toMatchObject({ pass: true, status: 'done', injectedEvidence: { ownerRecordOk: true, releaseTailOk: true, publishReached: true } });
+    expect(fixtureOwnerCase.injectedEvidence?.introducedIds).toHaveLength(101);
+    expect(fixtureOwnerCase.injectedEvidence?.npmPublishEvidence).toMatchObject({ result: { outcome: 'ok', npm: 'published' }, publishedCommands: [expect.any(String)] });
+    expect(fixtureOwnerCase.injectedEvidence?.verifyEvidence).toMatchObject({ result: { outcome: 'ok' }, npmLatest: '0.2.46' });
+    const fixtureLedgerPath = String(fixtureOwnerCase.injectedEvidence?.ownerLedgerPath);
+    const fixtureLedger = JSON.parse(readFileSync(fixtureLedgerPath, 'utf8')) as { nodes: Array<{ nodeId: string; waiver?: { introducedIds?: string[] } }> };
+    expect(fixtureLedger.nodes.find((node) => node.nodeId === 'gate')?.waiver?.introducedIds).toHaveLength(101);
     const negativeOverlapSource = readFileSync(scenarioPath, 'utf8')
       .replace('id: release-sim-rig-0241', 'id: release-sim-negative-overlap-0245').replace(
       '      mustNotVisit: [cutoff, gate, publish]\n',
@@ -74,4 +95,4 @@ test('release simulation runs the real release graph with injected node outcomes
     setTestStateRoot(previous ?? null);
     rmSync(root, { recursive: true, force: true });
   }
-}, 30_000);
+}, 120_000);

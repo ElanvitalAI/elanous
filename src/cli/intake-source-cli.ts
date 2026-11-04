@@ -2,12 +2,14 @@ import type { Command } from 'commander';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { addSource, canonicalSeat, dueSources, expiredSource, listSources, removeSource, runDue, type RunDueDeps, type SourceKind } from '../intake-plane/intake-sources.js';
+import { addSource, canonicalSeat, dueSources, expiredSource, isManagedStarterTopicRssSource, listSources, removeSource, runDue, sourceIsDue, syncBriefingTopicSource, syncStarterTopicRssSources, type RunDueDeps, type SourceKind } from '../intake-plane/intake-sources.js';
 import { projectTopicBriefing, subscribeTopicSearch, type SubscribeTopicSearchInput } from '../intake-plane/actions.js';
 import { runIntakeIssueBriefing } from '../intake-plane/actions.js';
+import { getUserConfig } from '../user-config.js';
 
 export function registerIntakeSourceCommands(intake: Command, root: () => string = effectiveInstanceRoot,
-  deps: { subscribeTopicSearch?: (input: SubscribeTopicSearchInput, options?: { stateDir?: string; runDeps?: RunDueDeps }) => ReturnType<typeof subscribeTopicSearch> } = {}): void {
+  deps: { subscribeTopicSearch?: (input: SubscribeTopicSearchInput, options?: { stateDir?: string; runDeps?: RunDueDeps }) => ReturnType<typeof subscribeTopicSearch>;
+    starterTopics?: () => string[] | undefined } = {}): void {
   const source = intake.command('source').description('자리별 흡수 원천과 주기 등록·조회·실행');
   const fail = (error: unknown) => { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 2; };
   source.command('add')
@@ -67,14 +69,28 @@ export function registerIntakeSourceCommands(intake: Command, root: () => string
     .action(async (opts: { seat?: string; sourceId?: string; projectIssueBriefing?: boolean; telegramDryRunFile?: string; dryRun?: boolean; json?: boolean }) => {
       try {
         const seat = opts.seat === undefined ? undefined : canonicalSeat(opts.seat);
+        const stateDir = root();
+        const config = deps.starterTopics ? undefined : getUserConfig();
+        const starterTopics = deps.starterTopics ? deps.starterTopics()
+          : (config?.watch?.enabled === false ? undefined : config?.starter?.topics);
+        const starterSources = syncStarterTopicRssSources(starterTopics, stateDir, { dryRun: opts.dryRun });
         if (opts.dryRun) {
-          const sources = dueSources(new Date(), root(), opts.sourceId).filter((entry) => seat === undefined || entry.seat === seat);
+          const now = new Date();
+          const isStarterManaged = (entry: ReturnType<typeof listSources>[number]) => isManagedStarterTopicRssSource(entry)
+            || (entry.why === 'starter.topics' && entry.id.startsWith('watch-') && entry.kind === 'github-query');
+          const sources = [
+            ...dueSources(now, stateDir, opts.sourceId).filter((entry) => !isStarterManaged(entry)),
+            ...starterSources.filter((entry) => (opts.sourceId === undefined || entry.id === opts.sourceId) && sourceIsDue(entry, now)),
+          ].filter((entry) => seat === undefined || entry.seat === seat);
           if (opts.json) console.log(JSON.stringify(sources));
           else for (const entry of sources) console.log(`${entry.id}  ${entry.seat}  ${entry.kind}  ${entry.every}`);
           return;
         }
+        if (opts.sourceId === undefined && (seat === undefined || seat === 'user')) {
+          syncBriefingTopicSource(getUserConfig().intake.briefingTopic, root());
+        }
         const telegramDryRunFile = opts.telegramDryRunFile ? resolve(opts.telegramDryRunFile) : undefined;
-        const result = await runDue({ seat, sourceId: opts.sourceId, deps: { stateDir: root(),
+        const result = await runDue({ seat, sourceId: opts.sourceId, deps: { stateDir,
           ...(opts.projectIssueBriefing || telegramDryRunFile ? { projectTopicBriefing: telegramDryRunFile
             ? (registered, items, stateDir) => projectTopicBriefing(registered, items, stateDir, { telegramDryRunFile })
             : projectTopicBriefing } : {}),

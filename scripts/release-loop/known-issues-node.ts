@@ -22,7 +22,7 @@ const INTRO = 'The following issues are known in this release.';
 const resolved = /\b(?:fixed|resolved|no longer|has been addressed|is addressed|was addressed)\b/i;
 const unsafe = /[^\x20-\x7e]|#\d+|\/Users\/|\.test\.ts\b|\[(?:TC|MK|OP|UX|S|T|F|O)\]|\b(?:TC|MK|OP|UX)\s+track\b|\b(?:PR|pull request)\s*\d+\b|\b(?:scripts|src|test)\/\S+|\bfile:\/\/|(?<![\w:/])\/(?!\/)[\w.-]+(?:\/[\w.-]+)*|\b[A-Z]:\\(?:[^\s\\]+\\)*[^\s\\]+|\b(?:RFC|HANDOFF|MANUAL)-/i;
 
-type Issue = { id: string; title?: string; evidence?: string; knownIssue?: string; note?: string };
+type Issue = { id: string; title?: string; evidence?: string; knownIssue?: string; note?: string; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean };
 
 // Accepted regressions with the same public note describe one issue, even if several gates recorded it.
 function issueGroup(issue: Issue, checklistIssues: ReadonlySet<Issue>): string {
@@ -86,6 +86,11 @@ function cleanBullet(text: string): string | null {
   return line;
 }
 
+export function formatWaiverAuditComment(input: { ownerWaived?: boolean; approvedBy: string; reason: string; introducedIds?: string[] }): string {
+  const payload = JSON.stringify({ type: input.ownerWaived ? 'release-owner-waiver' : 'release-gate-waiver', approvedBy: input.approvedBy, reason: input.reason, ...(input.introducedIds ? { introducedIds: input.introducedIds } : {}) });
+  return '<!-- ' + payload.replace(/--/g, '-\\u002d') + ' -->';
+}
+
 /** A waiver is copied verbatim into public notes, so reject internal or resolved claims before resuming. */
 export function publicWaiverReason(text: string): string {
   const bullet = cleanBullet(text);
@@ -104,21 +109,30 @@ function recordedWaivers(context: GraphContext, accepted: Issue[]): Issue[] {
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (state.graphId !== 'release-loop' || state.runId !== raw.runId || state.path[visit - 1] !== 'known-issues' ||
     JSON.stringify((state.input as { acceptedRegressions?: unknown })?.acceptedRegressions ?? []) !== JSON.stringify(context.input.acceptedRegressions ?? [])) return [];
-  return accepted.filter((issue) => {
-    if (!issue.id.startsWith('waive:')) return false;
+  return accepted.flatMap((issue) => {
+    if (!issue.id.startsWith('waive:')) return [];
     const node = issue.id.slice('waive:'.length);
     const index = state.path.indexOf(node);
     const record = state.nodes[index];
     const waiver = record?.waiver;
     const originalGate = node === 'gate' ? lastJsonObject(waiver?.original.output) : undefined;
-    const measuredIdsCovered = node !== 'gate' || originalGate?.outcome !== 'fail' ||
-      (Array.isArray(originalGate.introduced) && originalGate.introduced.length > 0
-        && originalGate.introduced.every((id) => typeof id === 'string' && accepted.some((candidate) => candidate.id === id)));
-    return index >= 0 && index < visit - 1 && record?.nodeId === node && waiver !== undefined && waiver.reason === issue.note
-      && measuredIdsCovered &&
-      // The runner writes a waiver only over a failed executed node (releaseResumeWaiver); its exit may be 0 (outcome fail) or null (timeout).
-      record.ok === true && record.executed === false &&
-      context.outputs[node]?.verdict === 'waived' && context.outputs[node]?.reason === issue.note;
+    const gateIds = originalGate?.introduced;
+    const ownerIdsCovered = waiver?.ownerWaived === true && (!Array.isArray(gateIds)
+      ? waiver.introducedIds === undefined
+      : Array.isArray(waiver.introducedIds) && JSON.stringify(waiver.introducedIds) === JSON.stringify(gateIds));
+    const provenanceCovered = typeof waiver?.approvedBy === 'string' && waiver.approvedBy.length > 0
+      && Array.isArray(waiver.introducedIds) && Array.isArray(gateIds)
+      && JSON.stringify(waiver.introducedIds) === JSON.stringify(gateIds)
+      && gateIds.every((id) => typeof id === 'string' && accepted.some((candidate) => candidate.id === id));
+    const legacyCoveragePreserved = waiver?.approvedBy === undefined && waiver?.introducedIds === undefined
+      && Array.isArray(gateIds) && gateIds.length > 0
+      && gateIds.every((id) => typeof id === 'string' && accepted.some((candidate) => candidate.id === id));
+    const measuredIdsCovered = ownerIdsCovered || node !== 'gate' || originalGate?.outcome !== 'fail'
+      || provenanceCovered || legacyCoveragePreserved;
+    const persisted = index >= 0 && index < visit - 1 && record?.nodeId === node && waiver !== undefined && waiver.reason === issue.note
+      && measuredIdsCovered && record.ok === true && record.executed === false
+      && (context.outputs[node]?.verdict === (waiver?.ownerWaived ? 'owner-waived' : 'waived')) && context.outputs[node]?.reason === issue.note;
+    return persisted ? [{ ...issue, ...(node === 'gate' && waiver?.approvedBy ? { approvedBy: waiver.approvedBy, ...(waiver.ownerWaived ? { ownerWaived: true } : {}), ...(waiver.introducedIds ? { introducedIds: waiver.introducedIds } : {}) } : {}) }] : [];
   });
 }
 
@@ -240,6 +254,8 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
     if (!bullets.includes(publicBullet)) bullets.push(publicBullet);
   }
   const original = readFileSync(notes, 'utf8');
+  const auditLines = waiverIssues.filter((issue) => issue.approvedBy).map((issue) =>
+    formatWaiverAuditComment({ ownerWaived: issue.ownerWaived, approvedBy: issue.approvedBy!, reason: issue.note!, introducedIds: issue.introducedIds }));
   const heading = /^## Known issues\s*$/m;
   const match = heading.exec(original);
   let updated: string;
@@ -250,10 +266,12 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
     const end = next.exec(original)?.index ?? original.length;
     const section = original.slice(start, end);
     const additions = bullets.filter((bullet) => !section.split(/\r?\n/).some((line) => line.trim() === `- ${bullet}`));
+    const auditAdditions = auditLines.filter((line) => !section.includes(line));
     const before = original.slice(0, end);
-    updated = additions.length ? `${before}${before.endsWith('\n') ? '' : '\n'}${additions.map((bullet) => `- ${bullet}`).join('\n')}\n\n${original.slice(end)}` : original;
+    const rows = [...additions.map((bullet) => `- ${bullet}`), ...auditAdditions];
+    updated = rows.length ? `${before}${before.endsWith('\n') ? '' : '\n'}${rows.join('\n')}\n\n${original.slice(end)}` : original;
   } else {
-    updated = `${original.trimEnd()}\n\n## Known issues\n\n${INTRO}\n\n${bullets.map((bullet) => `- ${bullet}`).join('\n')}\n`;
+    updated = `${original.trimEnd()}\n\n## Known issues\n\n${INTRO}\n\n${[...bullets.map((bullet) => `- ${bullet}`), ...auditLines].join('\n')}\n`;
   }
   if (updated !== original) {
     writeFileSync(notes, updated);

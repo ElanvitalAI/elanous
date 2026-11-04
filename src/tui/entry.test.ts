@@ -66,6 +66,9 @@ const turnsSeen: string[] = [];
 const missionCalls: unknown[] = [];
 const transcript: string[] = [];
 let duringTurnHook: (() => void | Promise<void>) | null = null;
+let mockLocalChatTurnResult: { goalComplete?: boolean; goalStopReason?: string } | undefined;
+let mockBackgroundLine: string | null = null;
+let selfHealthListener: ((snapshot: import('../tui/chat/self-health-status.js').NextTuiSelfHealthSnapshot | null) => void) | null = null;
 let nextSidetabHandler: NextSidetabHandler | null = null;
 const cliStderrEvents: Array<{ data: { source: string; exitCode: number; text: string; rawBase64: string; byteLength: number } }> = [];
 
@@ -131,14 +134,18 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
     turnsSeen.push(sessionId);
     onDelta?.('첫 응답 델타');
     await duringTurnHook?.();
+    return mockLocalChatTurnResult;
   },
   closeLocalChatSession: async () => {},
   // 실물은 구독 정지 함수를 반환한다 — entry 가 backgroundSubscription.stop ??= 로 싣는 값이다.
   onLocalChatBackgroundStatus: (_sessionId: string, _onFrame: (frame: unknown) => void) => () => {},
   onLocalChatSelfHealthStatus: (
     _sessionId: string,
-    _listener: (snapshot: import('../tui/chat/self-health-status.js').NextTuiSelfHealthSnapshot | null) => void,
-  ) => () => {},
+    listener: (snapshot: import('../tui/chat/self-health-status.js').NextTuiSelfHealthSnapshot | null) => void,
+  ) => {
+    selfHealthListener = listener;
+    return () => { selfHealthListener = null; };
+  },
   localChatModel: () => 'fake-model',
 }));
 
@@ -166,7 +173,7 @@ mock.module('./input/composer.js', () => ({
 mock.module('./chat/background-job-status.js', () => ({
   BackgroundJobStatus: class {
     line(): string | null {
-      return null;
+      return mockBackgroundLine;
     }
     setSessionId(): void {}
     clear(): void {}
@@ -203,7 +210,12 @@ afterEach(() => {
   missionCalls.length = 0;
   transcript.length = 0;
   duringTurnHook = null;
+  mockLocalChatTurnResult = undefined;
+  mockBackgroundLine = null;
+  selfHealthListener = null;
   nextSidetabHandler = null;
+  mockBackgroundLine = null;
+  selfHealthListener = null;
   cliStderrEvents.length = 0;
   Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: undefined, configurable: true });
@@ -222,6 +234,52 @@ afterAll(() => {
 });
 
 describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
+  test('추가 상태 행이 있어도 그래프 진행 줄과 입력 커서가 같은 화면 행을 쓰지 않는다', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 6, configurable: true });
+    const session = createSession({ source: 'tui' });
+    setActiveSessionId(session.id);
+    mockBackgroundLine = '[graph] triage ok · failed start';
+    duringTurnHook = () => selfHealthListener?.({
+      sessionId: session.id,
+      capturedAt: Date.now(),
+      line: '설치·자격 상태 관측',
+      source: 'checkout',
+      runningSha: null,
+      installedSha: null,
+      errorCount: 0,
+      representativeError: null,
+      creditSource: null,
+      creditKnown: false,
+    });
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    submittedInputs.push('관측 행 배치');
+    mockLocalChatTurnResult = { goalComplete: false, goalStopReason: 'max_turns' };
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    try {
+      await showNextTui({ resumeSessionId: session.id, sidetabMode: 'collapsed' });
+      const rendered = transcript.join('').split('\x1b[H\x1b[2J').at(-1) ?? '';
+      const promptCursors = [...rendered.matchAll(/\x1b\[(\d+);(\d+)H\x1b\[\?25h/g)].map((match) => Number(match[1]));
+      expect(rendered).toContain(mockBackgroundLine!);
+      expect(promptCursors.length).toBeGreaterThan(0);
+      expect(Math.max(...promptCursors)).toBeLessThanOrEqual(6);
+      const screenLines = rendered.split('\n');
+      const statusRow = screenLines.findIndex((line) => line.includes(mockBackgroundLine!));
+      expect(statusRow).toBeGreaterThanOrEqual(0);
+      expect(statusRow + 1).not.toBe(Math.max(...promptCursors));
+      expect(screenLines.some((line) => line.includes('Turn cap reached'))).toBe(true);
+      expect(screenLines.some((line) => line.includes('설치·자격 상태 관측'))).toBe(false);
+      await Bun.sleep(450);
+    } finally {
+      process.stdout.write = output;
+    }
+  }, 10_000);
+
   test('sidetab session switch during a turn waits for that turn before changing sessions', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });

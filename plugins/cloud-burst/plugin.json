@@ -1,0 +1,17 @@
+{
+  "id": "cloud-burst",
+  "name": "Cloud Burst Basic",
+  "version": "0.1.0",
+  "description": "Local-first, single-cloud warm-ready expansion with TTL and post-run cost reporting.",
+  "main": "./plugin.ts",
+  "activationEvents": ["onStartup"],
+  "contributes": {
+    "commands": [
+      {
+        "name": "cloud-burst",
+        "description": "Simulate a local-first cloud burst or request live capacity through a connected provider adapter."
+      }
+    ]
+  },
+  "capabilities": []
+}

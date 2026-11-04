@@ -28,6 +28,24 @@ export function registerFleetCommands(program: Command): void {
     });
 
   fleetCmd
+    .command('resources')
+    .description('Nexus 자원 inventory와 경보를 조회한다(read-only)')
+    .option('--cost', '오늘 추정 비용과 누적 등록 비용을 출력한다')
+    .option('--json', '구조화된 자원·경보를 출력한다')
+    .action(async (opts: { cost?: boolean; json?: boolean }) => {
+      const { inspectInventory } = await import('../fleet/resource-inventory.js');
+      const snapshot = inspectInventory();
+      if (opts.json) { await writeStdoutJson(JSON.stringify({ ...snapshot, ...(opts.cost ? { cost: { today: snapshot.estimatedCostToday, cumulative: snapshot.estimatedCumulativeCost } } : {}) }, null, 2) + '\n'); return; }
+      ui.header('Fleet resources (' + snapshot.resources.length + ' registered · ' + snapshot.alerts.length + ' alerts)');
+      for (const row of snapshot.resources) {
+        const attrs = row.attrs;
+        console.log('- ' + row.name + ' · ' + String(attrs.provider) + ' · ' + String(attrs.role) + ' · owner=' + String(attrs.ownerSeat) + ' · purpose=' + String(attrs.purpose || '(없음)') + (row.expired ? ' · EXPIRED' : ''));
+      }
+      for (const alert of snapshot.alerts) ui.warn(alert.reason + ': ' + alert.message);
+      if (opts.cost) ui.info('오늘 추정 비용 $' + snapshot.estimatedCostToday.toFixed(4) + ' · 누적 기록 $' + snapshot.estimatedCumulativeCost.toFixed(4) + ' · 미산정 ' + snapshot.unpricedResources + '개');
+    });
+
+  fleetCmd
     .command('screen')
     .description('등록 elanous 인스턴스의 PTY 화면 프레임을 read-only로 조회한다')
     .option('--all', '등록 인스턴스 전체를 연합 조회한다(격리 test 기본 제외)')

@@ -9,7 +9,7 @@
 // the pattern; we trim the hook-based fallback (sandboxed envs)
 // because elanous's primary surface runs native git.
 
-import { spawnSync, execFileSync, type SpawnSyncReturns } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, rmSync, symlinkSync, lstatSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -1173,24 +1173,48 @@ export function cleanupStaleWorktreeSessions(): StaleCleanupResult {
   return { scanned, removed, kept };
 }
 
-/** Resolve the main repo root regardless of whether the caller is
- *  currently inside a secondary worktree. Needed so EnterWorktree
- *  from inside an existing worktree creates siblings of the MAIN
- *  repo, not siblings of the current worktree. */
-export function resolveMainRepoRoot(cwd: string): string | null {
+/** Resolve the main repo root when the common Git directory belongs to a
+ *  conventional checkout. Bare shared stores have no main working tree, so
+ *  the current linked worktree is the only valid root to return. */
+export function resolveMainRepoRoot(
+  cwd: string,
+  run: (cwd: string, args: string[]) => { status: number | null; stdout: string } = (directory, args) => {
+    const result = spawnSync('git', args, { cwd: directory, encoding: 'utf8', timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'] });
+    return { status: result.status, stdout: result.stdout ?? '' };
+  },
+): string | null {
   const located = findGitDir(cwd);
   if (!located) return null;
   if (!located.isWorktree) return located.root;
-  // commonGitDir is <main>/.git — strip the trailing /.git.
   const common = located.commonGitDir;
+  // Ask Git through the valid working tree, but inspect the shared store's
+  // bare flag. A bare store can itself be named `.git` (or `repo.git`).
+  const bareArgs = ['--git-dir', common, 'rev-parse', '--is-bare-repository'];
+  const bare = run(located.root, bareArgs);
+  debug.log('git-fs', 'resolve-main-repo-root-probe', {
+    cwd: located.root,
+    args: bareArgs,
+    outcome: bare.status === 0 ? 'ok' : 'failed',
+    status: bare.status,
+    stdout: bare.stdout.trim(),
+  });
+  if (bare.status !== 0 || bare.stdout.trim() === 'true') return located.root;
+  // commonGitDir is <main>/.git — strip the trailing /.git only after
+  // proving this is a non-bare repository.
   if (common.endsWith('/.git')) return common.slice(0, -'/.git'.length);
-  try {
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: dirname(common),
-      encoding: 'utf8',
-      timeout: 5_000,
-    }).trim();
-  } catch {
-    return located.root;
-  }
+  // Preserve the separate-git-dir fallback only when its parent is itself a
+  // known checkout. Never run rev-parse from an arbitrary workspace container.
+  const commonParent = dirname(common);
+  if (!findGitDir(commonParent)) return located.root;
+  const worktreeArgs = ['rev-parse', '--show-toplevel'];
+  const worktrees = run(commonParent, worktreeArgs);
+  debug.log('git-fs', 'resolve-main-repo-root-probe', {
+    cwd: commonParent,
+    args: worktreeArgs,
+    outcome: worktrees.status === 0 ? 'ok' : 'failed',
+    status: worktrees.status,
+    stdout: worktrees.stdout,
+  });
+  if (worktrees.status === 0 && worktrees.stdout.trim()) return worktrees.stdout.trim();
+  return located.root;
 }

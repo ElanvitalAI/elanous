@@ -88,6 +88,10 @@ export function inspectGateShardReceipts(root: string, expected: {
   for (const shard of expectedShards) {
     const receipt = readGateShardManifest(root, shard.id);
     if (!receipt || receipt.status !== 'complete') return { kind: 'invalid', reason: `formal shard receipt is absent or incomplete: ${shard.id}` };
+    if (receipt.version !== expected.version)
+      return { kind: 'invalid', reason: `formal shard receipt version differs: ${shard.id}` };
+    if (receipt.graphSha !== expected.graphPins.graphSha || receipt.recipeSha !== expected.graphPins.recipeSha)
+      return { kind: 'invalid', reason: `formal shard receipt graph/source pins differ: ${shard.id}` };
     if (receipt.head40 !== expected.commit || receipt.base40 !== expected.base40)
       return { kind: 'invalid', reason: `formal shard receipt baseline commit/base differs: ${shard.id}` };
     if (!receipt.graphEntry || receipt.graphEntry !== expected.graphEntry)

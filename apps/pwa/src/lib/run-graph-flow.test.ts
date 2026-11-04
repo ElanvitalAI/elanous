@@ -43,6 +43,34 @@ test('replays traversal graphEvents by adding a runtime node and replacing its a
   ]));
 });
 
+test('scenario injection provenance is retained for both declared B/C nodes', () => {
+  const withScenes: RunGraphDetail = {
+    ...graph,
+    nodes: [...graph.nodes,
+      { node_id: 'subscription-repair', kind: 'judge', recipe: 'repair', max_visits: 1 },
+      { node_id: 'headline-refresh', kind: 'researcher', recipe: 'headline', max_visits: 1 },
+    ],
+  };
+  const replayed = applyRunGraphEvents(withScenes, [
+    { seq: 12, ts: '2026-11-03T19:38:23.515Z', type: 'node-added', node: 'subscription-repair', kind: 'judge', decider: 'scenario-injection', reason: 'paid-wall recovery mock', scene: 'B' },
+    { seq: 17, ts: '2026-11-03T19:38:23.516Z', type: 'node-added', node: 'headline-refresh', kind: 'researcher', decider: 'scenario-injection', reason: 'new headline reordering mock', scene: 'C' },
+  ]);
+  expect(replayed.nodes.find((node) => node.node_id === 'subscription-repair')?.provenance).toEqual({
+    type: 'scenario-injection', scene: 'B', reason: 'paid-wall recovery mock', mock: true,
+  });
+  expect(replayed.nodes.find((node) => node.node_id === 'headline-refresh')?.provenance).toEqual({
+    type: 'scenario-injection', scene: 'C', reason: 'new headline reordering mock', mock: true,
+  });
+  const nonMock = applyRunGraphEvents(graph, [
+    { seq: 18, ts: '2026-11-03T19:38:23.517Z', type: 'node-added', node: 'verified-source', kind: 'researcher', decider: 'scenario-injection', reason: 'plugin grounded repair, not mock', scene: 'D' },
+  ]);
+  expect(nonMock.nodes.find((node) => node.node_id === 'verified-source')?.provenance?.mock).toBeUndefined();
+  expect(runGraphToFlow(replayed).nodes.filter((node) => ['subscription-repair', 'headline-refresh'].includes(node.id)).map((node) => node.data.provenance)).toMatchObject([
+    { type: 'scenario-injection', scene: 'B', reason: 'paid-wall recovery mock' },
+    { type: 'scenario-injection', scene: 'C', reason: 'new headline reordering mock' },
+  ]);
+});
+
 test('DEMO1104-ARG-ADAPTIVE-VIEW: three scene evidence stays ordered and records add, depth, repair, and hand work', () => {
   const evidence = runGraphAdaptiveEvidence([
     { seq: 6, ts: '2026-10-29T00:00:05.000Z', type: 'edge-rerouted', from: 'failed-search', outcome: '$default', was: 'failed', to: 'fallback-search', decider: 'runtime-overlay', reason: 'search failed; use alternate route' },

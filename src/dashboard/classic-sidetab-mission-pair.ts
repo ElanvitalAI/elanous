@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ClassicSidetabMissionPairResult, ClassicSidetabMissionPairSessionRegistry, ClassicSidetabMissionResult, ClassicSidetabMissionDispatchContext } from './classic-sidetab-mission.js';
 import { enqueueClassicSidetabMissionPairCompletion, type ClassicMissionNotificationEnqueue, type ClassicSidetabMissionPairCompletionResult } from './classic-sidetab-mission-job.js';
+import { readClassicSidetabPairBaseSha, sidetabCandidateProtocolPrompt } from './classic-sidetab-mission-reconcile.js';
 
 interface ClassicSidetabPairSession {
   id: string;
@@ -21,6 +22,8 @@ export interface StartClassicSidetabMissionPairDeps<Session extends ClassicSidet
   now?: () => number;
   createId?: () => string;
   timeoutMs?: number;
+  /** Test seam; production captures HEAD before either child receives its prompt. */
+  baseSha?: string;
   onComplete?: (result: ClassicSidetabMissionPairCompletionResult) => void;
 }
 
@@ -41,6 +44,9 @@ export function startClassicSidetabMissionPair<Session extends ClassicSidetabPai
   const claudeAttemptId = createId();
   const claudeSession = deps.spawnVisible('claude', claudeMissionId, claudeAttemptId);
   const codexSession = deps.spawnVisible('codex', codexMissionId, codexAttemptId);
+  const workspaceDir = codexSession?.cwd ?? claudeSession?.cwd ?? '';
+  const baseSha = deps.baseSha ?? readClassicSidetabPairBaseSha(workspaceDir);
+  const hasPinnedBaseSha = typeof baseSha === 'string' && /^[0-9a-f]{40}$/i.test(baseSha);
   const missionIds = [codexSession ? codexMissionId : undefined, claudeSession ? claudeMissionId : undefined].filter((id): id is string => Boolean(id));
   const activeCodexMissionId = codexSession ? codexMissionId : undefined;
   const activeClaudeMissionId = claudeSession ? claudeMissionId : undefined;
@@ -50,16 +56,23 @@ export function startClassicSidetabMissionPair<Session extends ClassicSidetabPai
   const codexPrompt = deps.agent === 'codex' ? deps.mission : deps.parallelMission;
   const claudePrompt = deps.agent === 'claude' ? deps.mission : deps.parallelMission;
   const startedAt = (deps.now ?? Date.now)();
-  const codexCompletion = deps.runVisible('codex', codexPrompt, codexSession, activeCodexMissionId);
-  const claudeCompletion = deps.runVisible('claude', claudePrompt, claudeSession, activeClaudeMissionId);
+  if (!hasPinnedBaseSha) {
+    for (const sessionId of sessionIds) if (deps.hasSession(sessionId)) deps.killSession(sessionId);
+  }
+  const baseCaptureFailure = 'Could not capture a valid Git base SHA; candidate missions were not started';
+  const codexCompletion = hasPinnedBaseSha
+    ? deps.runVisible('codex', sidetabCandidateProtocolPrompt(codexPrompt, baseSha), codexSession, activeCodexMissionId)
+    : Promise.resolve<ClassicSidetabMissionResult>({ ok: false, status: 'failed', error: baseCaptureFailure });
+  const claudeCompletion = hasPinnedBaseSha
+    ? deps.runVisible('claude', sidetabCandidateProtocolPrompt(claudePrompt, baseSha), claudeSession, activeClaudeMissionId)
+    : Promise.resolve<ClassicSidetabMissionResult>({ ok: false, status: 'failed', error: baseCaptureFailure });
   // callId is the parent tool invocation identity; falling back to a mission id
   // preserves queue uniqueness for embedders that do not expose a call id.
   const taskId = deps.context?.callId || activeCodexMissionId || activeClaudeMissionId || createId();
-  const workspaceDir = codexSession?.cwd ?? claudeSession?.cwd ?? '';
   const completion = missionIds.length
     ? enqueueClassicSidetabMissionPairCompletion({
-      codex: { missionId: activeCodexMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, mission: codexPrompt, workspaceDir, completion: codexCompletion },
-      claude: { missionId: activeClaudeMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, mission: claudePrompt, workspaceDir, completion: claudeCompletion },
+      codex: { missionId: activeCodexMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, mission: codexPrompt, workspaceDir, baseSha, completion: codexCompletion },
+      claude: { missionId: activeClaudeMissionId, taskId, parentSessionId: deps.context?.parentSessionId, startedAt, mission: claudePrompt, workspaceDir, baseSha, completion: claudeCompletion },
     }, deps.enqueue, deps.now, {
       timeoutMs: deps.timeoutMs,
       onTimeout: () => { for (const sessionId of sessionIds) if (deps.hasSession(sessionId)) deps.killSession(sessionId); },
@@ -74,8 +87,8 @@ export function startClassicSidetabMissionPair<Session extends ClassicSidetabPai
   return {
     result: {
       pairId: `${activeCodexMissionId ?? 'codex-unavailable'}+${activeClaudeMissionId ?? 'claude-unavailable'}`,
-      codex: codexSession ? { ok: true, status: 'running', path: '', interactionId: activeCodexMissionId } : { ok: false, status: 'failed', error: 'Codex sidetab PTY could not start' },
-      claude: claudeSession ? { ok: true, status: 'running', path: '', interactionId: activeClaudeMissionId } : { ok: false, status: 'failed', error: 'Claude sidetab PTY could not start' },
+      codex: codexSession && hasPinnedBaseSha ? { ok: true, status: 'running', path: '', interactionId: activeCodexMissionId } : { ok: false, status: 'failed', error: !hasPinnedBaseSha ? baseCaptureFailure : 'Codex sidetab PTY could not start' },
+      claude: claudeSession && hasPinnedBaseSha ? { ok: true, status: 'running', path: '', interactionId: activeClaudeMissionId } : { ok: false, status: 'failed', error: !hasPinnedBaseSha ? baseCaptureFailure : 'Claude sidetab PTY could not start' },
     },
     completion,
   };

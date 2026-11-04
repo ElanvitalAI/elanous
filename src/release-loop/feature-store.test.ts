@@ -10,6 +10,7 @@ import { addItem, checklistGate, claimItem, listChecklist, removeItem, setItem, 
 import * as features from './feature-store.js';
 import * as hqModule from '../hq/hq.js';
 import { CliUserError } from '../cli/cli-user-error.js';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 
 let dir: string;
 function setup(): string { dir = mkdtempSync(join(tmpdir(), 'release-features-')); setElanousConfigDir(dir); return dir; }
@@ -25,7 +26,7 @@ function fixture(version: string): Checklist {
   return data;
 }
 
-test('board fencing: shadow observes stale, enforce rolls back, current generation is recorded, missing and corrupt leases fail open', () => {
+test('board fencing: shadow observes stale, enforce rolls back, current generation is recorded, missing and corrupt leases fail open', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
   setup();
   const home = join(dir, 'machine');
   const leasePath = join(home, '.elanous-hq', 'lease.json');
@@ -77,9 +78,9 @@ test('board fencing: shadow observes stale, enforce rolls back, current generati
     log.mockRestore();
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
   }
-});
+}));
 
-test('board fencing reads the lease once outside the write transaction in shadow; only enforce re-reads before writing', () => {
+test('board fencing reads the lease once outside the write transaction in shadow; only enforce re-reads before writing', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
   setup();
   const home = join(dir, 'machine');
   const seenPath = join(dir, 'seen-generation');
@@ -120,9 +121,9 @@ test('board fencing reads the lease once outside the write transaction in shadow
     reads.mockRestore();
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
   }
-});
+}));
 
-test('enforce: a lease that breaks between the first read and the write is unmeasured — the write goes through without a generation', () => {
+test('enforce: a lease that breaks between the first read and the write is unmeasured — the write goes through without a generation', async () => withSimClock(Date.UTC(2026, 10, 3, 0, 0, 0), async () => {
   setup();
   const home = join(dir, 'machine');
   const leasePath = join(home, '.elanous-hq', 'lease.json');
@@ -160,7 +161,7 @@ test('enforce: a lease that breaks between the first read and the write is unmea
     log.mockRestore();
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
   }
-});
+}));
 
 test('without a seen-generation file, a broken or missing lease is still logged as unmeasured (with distinct reasons) and the write goes through', () => {
   setup();

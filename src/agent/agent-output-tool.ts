@@ -37,6 +37,7 @@ export type AgentOutputRetrievalStatus =
   | 'success'      // task reached terminal state, result available
   | 'not_ready'    // still pending/running, block=false
   | 'timeout'      // block=true, timeout elapsed before terminal
+  | 'interrupted'  // caller stopped waiting; the background task remains active
   | 'not_found';   // no task with that id in the registry
 
 export interface AgentOutputParams {
@@ -127,6 +128,8 @@ function describeStatus(
         : `task elapsed ${taskElapsedMs}ms`;
       return `AgentOutput: timeout after ${waitedMs ?? 0}ms · ${elapsed} · still ${task?.state ?? 'running'} · call again with the same taskId to continue waiting`;
     }
+    case 'interrupted':
+      return `AgentOutput: wait interrupted · still ${task?.state ?? 'running'} · call again with the same taskId to continue waiting`;
     case 'success': {
       if (!task) return 'AgentOutput: success';
       if (task.state === 'done') {
@@ -171,6 +174,8 @@ function snapshot(
 
 export interface DispatchAgentOutputDeps {
   registry?: AgentRegistry;
+  /** Stop waiting for this result without cancelling the background task. */
+  signal?: AbortSignal;
   /** Test seam — defaults to setTimeout. */
   setTimer?: (cb: () => void, ms: number) => { dispose: () => void };
   /** Test seam — defaults to Date.now. */
@@ -231,34 +236,52 @@ export async function dispatchAgentOutput(
   }
 
   const startWait = now();
+  const interrupted = (): AgentOutputResult => {
+    const current = registry.get(taskId) ?? task;
+    const taskElapsedMs = current.startedAt === undefined ? undefined : now() - current.startedAt;
+    return record(snapshot(current, 'interrupted', undefined, taskElapsedMs));
+  };
+  if (deps.signal?.aborted) return interrupted();
   return new Promise<AgentOutputResult>((resolve) => {
     let settled = false;
-    const subscription = registry.onTaskDone((t) => {
+    const signal = deps.signal;
+    let subscription: { dispose(): void } | undefined;
+    let timer: { dispose(): void } | undefined;
+    const cleanup = () => {
+      subscription?.dispose();
+      timer?.dispose();
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = (result: AgentOutputResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const onAbort = () => finish(interrupted());
+    subscription = registry.onTaskDone((t) => {
       if (settled) return;
       if (t.id !== taskId) return;
-      settled = true;
-      subscription.dispose();
-      timer.dispose();
-      resolve(record(snapshot(t, 'success')));
+      finish(record(snapshot(t, 'success')));
     });
-    const timer = setTimer(() => {
+    timer = setTimer(() => {
       if (settled) return;
-      settled = true;
-      subscription.dispose();
       const timedOutAt = now();
       const waited = timedOutAt - startWait;
       const current = registry.get(taskId);
       if (current && isTerminal(current.state)) {
         // race · terminal between listener-fire and timer-fire is rare
         // but possible if the listener queue was full · return success.
-        resolve(record(snapshot(current, 'success')));
+        finish(record(snapshot(current, 'success')));
         return;
       }
       const timedOutTask = current ?? task;
       const taskElapsedMs = timedOutTask.startedAt === undefined
         ? undefined
         : timedOutAt - timedOutTask.startedAt;
-      resolve(record(snapshot(timedOutTask, 'timeout', waited, taskElapsedMs)));
+      finish(record(snapshot(timedOutTask, 'timeout', waited, taskElapsedMs)));
     }, timeoutMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }

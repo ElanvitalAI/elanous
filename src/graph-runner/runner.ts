@@ -170,7 +170,7 @@ export interface GraphRunState {
   nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; reason?: string;
     failure?: { errorCode: string; message: string; stage: string }; decidedBy?: string; decidedAt?: string;
     startedAt?: string; endedAt?: string; seconds?: number;
-    waiver?: { reason: string; at: string; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
+    waiver?: { reason: string; at: string; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
   /** The node now running and when it started; cleared when its record is written. */
   currentNode?: { nodeId: string; startedAt: string };
   input?: unknown;
@@ -268,7 +268,7 @@ export interface GraphRunOptions {
   /** Embedded runs (a classify verdict inside self-implement) keep the per-node `[graph]` stderr lines off the caller's terminal; debug.log still records every node. */
   quiet?: boolean;
   /** Release-only: accept the recorded failed node without executing it, and expose its regression to known-issues. */
-  releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[]; unmeasured?: string };
+  releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[]; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; unmeasured?: string };
   /** Release-only: add accepted issues independently of a waiver at a restart boundary. */
   releaseAcceptedRegressions?: { requested: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[] };
   /** Release-only (GATE-HOST-EXECUTOR): run the restarted gate on this executor — recorded in `inputOverrides`, never a waiver. */
@@ -977,9 +977,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     if (options.releaseWaiver) {
       if (graphId !== 'release-loop') throw new Error('release waiver requires the release-loop graph');
-      const checked = releaseResumeWaiver(state, { from: options.fromNodeId, waive: options.releaseWaiver.nodeId, reason: options.releaseWaiver.reason, acceptedRegressions: options.releaseWaiver.requestedRegressions });
+      const checked = releaseResumeWaiver(state, { from: options.fromNodeId, waive: options.releaseWaiver.ownerWaived ? undefined : options.releaseWaiver.nodeId, ownerWaive: options.releaseWaiver.ownerWaived ? options.releaseWaiver.nodeId : undefined, reason: options.releaseWaiver.reason, acceptedRegressions: options.releaseWaiver.requestedRegressions, approvedBy: options.releaseWaiver.approvedBy });
       if (!checked || JSON.stringify(checked.acceptedRegressions) !== JSON.stringify(options.releaseWaiver.acceptedRegressions) ||
-        checked.unmeasured !== options.releaseWaiver.unmeasured) throw new Error('release waiver input changed before restart');
+        checked.unmeasured !== options.releaseWaiver.unmeasured || checked.approvedBy !== options.releaseWaiver.approvedBy ||
+        JSON.stringify(checked.introducedIds ?? []) !== JSON.stringify(options.releaseWaiver.introducedIds ?? []) || checked.ownerWaived !== options.releaseWaiver.ownerWaived) throw new Error('release waiver input changed before restart');
       if (!releaseRouteReachesKnownIssues(graph.edges, nextNode(graph.edges, options.fromNodeId, 'ok', 'ok') ?? '')) {
         throw new Error('waived node must reach known-issues before publication');
       }
@@ -1522,7 +1523,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const nodeEndedAt = new Date(Math.max(Date.now(), Date.parse(nodeStartedAt))).toISOString();
     delete state.currentNode;
     if (waiving) {
-      output = JSON.stringify({ outcome: 'ok', verdict: 'waived', summary: `waived ${current}`, reason: options.releaseWaiver!.reason });
+      output = JSON.stringify(options.releaseWaiver!.ownerWaived ? { outcome: 'pass(owner-waived)', verdict: 'owner-waived', summary: `owner waived ${current}`, reason: options.releaseWaiver!.reason, approvedBy: options.releaseWaiver!.approvedBy } : { outcome: 'ok', verdict: 'waived', summary: `waived ${current}`, reason: options.releaseWaiver!.reason });
       ok = true;
       exit = 0;
     }
@@ -1548,7 +1549,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       };
       state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && (handlerExecuted || (!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || handlerExecuted || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
         ...(failure ? { reason: failure.message, failure } : {}), ...(commandFailureReason && !failure ? { reason: commandFailureReason } : {}),
-        ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
+        ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.approvedBy === undefined ? {} : { approvedBy: options.releaseWaiver!.approvedBy }), ...(options.releaseWaiver!.ownerWaived ? { ownerWaived: true } : {}), ...(options.releaseWaiver!.introducedIds === undefined ? {} : { introducedIds: options.releaseWaiver!.introducedIds }), ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
     }

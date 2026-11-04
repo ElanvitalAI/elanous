@@ -7,7 +7,7 @@
  * destroy them.
  */
 
-export type FakeCloudVmState = 'warming' | 'ready' | 'draining' | 'parked';
+export type FakeCloudVmState = 'warming' | 'ready' | 'draining' | 'parked' | 'disappeared';
 
 export interface FakeCloudVmSpec {
   readonly id: string;
@@ -39,6 +39,7 @@ export type FakeCloudVmEvent =
   | { readonly type: 'lease-closed'; readonly id: string; readonly at: number }
   | { readonly type: 'stop-after-draining'; readonly id: string; readonly at: number }
   | { readonly type: 'stop'; readonly id: string; readonly at: number }
+  | { readonly type: 'vm-disappeared'; readonly id: string; readonly lostLeases: number; readonly at: number }
   | { readonly type: 'forbidden-terminate'; readonly id: string; readonly known: boolean; readonly protected: boolean; readonly at: number };
 
 interface VmRecord {
@@ -193,6 +194,19 @@ export function createFakeCloudVm() {
       if (vm.state !== 'ready') throw new Error(`fake-cloud-vm: new lease refused for ${id} in ${vm.state}`);
       vm.activeLeases += 1;
       events.push({ type: 'lease-opened', id, at });
+      return snapshot(vm, at);
+    },
+
+    /** Simulate an unannounced cloud/host loss; all resident leases become stale immediately. */
+    disappear(id: string): FakeCloudVmSnapshot {
+      const vm = requireVm(id);
+      const at = now();
+      const lostLeases = vm.activeLeases;
+      vm.poweredOnMs = recordPoweredTime(vm, at);
+      vm.poweredSince = undefined;
+      vm.activeLeases = 0;
+      vm.state = 'disappeared';
+      events.push({ type: 'vm-disappeared', id, lostLeases, at });
       return snapshot(vm, at);
     },
 

@@ -134,12 +134,13 @@ describe('compactSchedule — command truncation observability', () => {
         ['list-long-command', 'list-long-command', '0 7 * * 1', command, `0 7 * * 1 ${command}`],
       );
       const result = await dispatchScheduleManage({ action: 'list' }) as {
-        schedules: Array<{ id: string; command: string; command_truncated?: boolean }>;
+        schedules: Array<{ id: string; command: string; command_full?: string; command_truncated?: boolean }>;
       };
       const listed = result.schedules.find((item) => item.id === 'list-long-command');
 
       expect(listed).toEqual(expect.objectContaining({
         command: command.slice(0, 120),
+        command_full: command,
         command_truncated: true,
       }));
       expect(listed?.command).toHaveLength(120);

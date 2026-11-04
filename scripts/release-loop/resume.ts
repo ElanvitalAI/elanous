@@ -182,8 +182,24 @@ export function releaseResumeGateWaiverCoverage(
 /** Only the recorded failure at the restart boundary may be waived. `--from` is never a waiver. */
 export function releaseResumeWaiver(
   state: GraphRunState,
-  opts: { from: string; waive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[] },
-): { nodeId: string; reason: string; acceptedRegressions: AcceptedRegression[]; unmeasured?: string } | undefined {
+  opts: { from: string; waive?: string; ownerWaive?: string; reason?: string; acceptedRegressions?: AcceptedRegression[]; approvedBy?: string },
+): { nodeId: string; reason: string; acceptedRegressions: AcceptedRegression[]; approvedBy?: string; introducedIds?: string[]; unmeasured?: string; ownerWaived?: boolean } | undefined {
+  if (opts.ownerWaive !== undefined) {
+    if (opts.ownerWaive !== 'gate') throw new Error('--owner-waive currently supports only gate');
+    if (!opts.reason?.trim()) throw new Error('--owner-waive requires --reason');
+    const approvedBy = opts.approvedBy?.trim();
+    if (!approvedBy || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(approvedBy)) throw new Error('--owner-waive requires --approved-by');
+    if (opts.from !== opts.ownerWaive) throw new Error('--from must name the owner-waived node');
+    const index = state.path.indexOf(opts.ownerWaive), record = state.nodes[index];
+    if (index < 0 || state.path.lastIndexOf(opts.ownerWaive) !== index || record?.nodeId !== opts.ownerWaive || record.ok !== false || record.executed !== true || !failedAfterGate(state, index)) throw new Error('owner waiver requires the failed executable gate on the saved path');
+    const reason = opts.reason.trim();
+    const gateResult = lastJsonObject(record.output);
+    const introducedIds = Array.isArray(gateResult?.introduced) && gateResult.introduced.length > 0
+      && gateResult.introduced.every((id) => typeof id === 'string' && id.trim())
+      && new Set(gateResult.introduced).size === gateResult.introduced.length ? gateResult.introduced as string[] : undefined;
+    return { nodeId: opts.ownerWaive, reason, approvedBy, ...(introducedIds ? { introducedIds } : {}), ownerWaived: true,
+      acceptedRegressions: releaseResumeAcceptedRegressions(state, [...(opts.acceptedRegressions ?? []), { id: 'waive:gate', note: reason }]) };
+  }
   if ((opts.waive === undefined) !== (opts.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
   if (opts.waive !== undefined && !opts.waive.trim()) throw new Error('--waive must not be empty');
   if (opts.waive === undefined) return undefined;
@@ -220,8 +236,11 @@ export function releaseResumeWaiver(
     if (!/^[\x20-\x7e]+$/.test(reason) || (reason.match(/[.!?](?:\s|$)/g) ?? []).length !== 2) {
       throw new Error('--waive gate --reason must be exactly two ASCII English sentences');
     }
+    const approvedBy = opts.approvedBy?.trim();
+    if (!approvedBy || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(approvedBy))
+      throw new Error('--waive gate requires an approver identity (ELANOUS_SEAT or --approved-by)');
     if (!coverage.eligible) throw new Error(coverage.reason ?? 'gate waiver is not eligible');
-    return { nodeId: 'gate', reason,
+    return { nodeId: 'gate', reason, approvedBy, introducedIds: coverage.introducedIds,
       acceptedRegressions: releaseResumeAcceptedRegressions(state,
         [...(opts.acceptedRegressions ?? []), { id: 'waive:gate', note: reason }]) };
   }

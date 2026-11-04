@@ -68,7 +68,7 @@ export const compactSchedule = (r: ScheduleRow) => {
   return {
     id: r.id, name: r.name, cron: r.cron, interval_ms: r.interval_ms, category: r.category,
     source: r.source, enabled: !!r.enabled, run_via: r.run_via, last_run: r.last_run,
-    command: command.slice(0, 120), note: r.note ?? null,
+    command: command.slice(0, 120), command_full: command, note: r.note ?? null,
     last_status: r.last_status ?? null,
     last_exit: r.last_exit ?? null,
     last_duration_ms: r.last_duration_ms ?? null,

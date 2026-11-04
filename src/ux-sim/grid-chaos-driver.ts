@@ -2,10 +2,12 @@ import type { SimClock } from './fake-clock.js';
 import { simPodDeath, type PodDeathObservation, type PodDeathScenario } from './fault-pod-death.js';
 
 export type GridChaosAttack = 'monkey' | 'gorilla' | 'kong';
-export type GridChaosScope = 'session' | 'host' | 'grid' | 'headquarters';
+export type GridChaosScope = 'process' | 'session' | 'host' | 'grid' | 'headquarters';
 
 export interface GridChaosSession {
   id: string;
+  /** Explicit process owning this lease/session; process faults must never infer identity from the session. */
+  processId: string;
   leaseId: string;
   /** Required real fault-pod-death fixture; consumed through its production decision function. */
   podDeathScenario: PodDeathScenario;
@@ -34,6 +36,7 @@ export interface GridChaosEvent {
   readonly atMs: number;
   readonly targetGridId: string;
   readonly targetHostIds: readonly string[];
+  readonly targetProcessIds: readonly string[];
   readonly affectedSessionIds: readonly string[];
   readonly podDeathObservations: readonly PodDeathObservation[];
 }
@@ -76,6 +79,8 @@ function validateTopology(topology: GridChaosTopology): void {
         if (!session.id || sessionIds.has(session.id)) throw new Error(`grid chaos duplicate or empty session id: ${session.id}`);
         if (!session.leaseId || leaseIds.has(session.leaseId)) throw new Error(`grid chaos duplicate or empty lease id: ${session.leaseId}`);
         sessionIds.add(session.id);
+        if (typeof session.processId !== 'string' || !session.processId.trim())
+          throw new Error(`grid chaos session requires a process id: ${session.id}`);
         leaseIds.add(session.leaseId);
         if (!session.podDeathScenario) throw new Error(`grid chaos session requires a pod-death fixture: ${session.id}`);
       }
@@ -117,20 +122,20 @@ function eventTargets(input: {
   topology: GridChaosTopology;
   monkeyGrid: GridChaosGrid;
   monkeyHost: GridChaosHost;
-  monkeyScope: 'host' | 'session';
   monkeySession: GridChaosSession;
   gorillaGrid: GridChaosGrid;
 }): Omit<GridChaosEvent, 'sequence'> {
-  const { attack, topology, monkeyGrid, monkeyHost, monkeyScope, monkeySession, gorillaGrid } = input;
+  const { attack, topology, monkeyGrid, monkeyHost, monkeySession, gorillaGrid } = input;
   let scope: GridChaosScope;
   let grid: GridChaosGrid;
   let hosts: GridChaosHost[];
   let sessions: GridChaosSession[];
   if (attack === 'monkey') {
-    scope = monkeyScope;
+    scope = 'process';
     grid = monkeyGrid;
     hosts = [monkeyHost];
-    sessions = monkeyScope === 'host' ? [...monkeyHost.sessions].sort(compareId) : [monkeySession];
+    const processId = monkeySession.processId;
+    sessions = monkeyHost.sessions.filter((session) => session.processId === processId).sort(compareId);
   } else if (attack === 'gorilla') {
     scope = 'grid';
     grid = gorillaGrid;
@@ -149,6 +154,7 @@ function eventTargets(input: {
     atMs: input.atMs,
     targetGridId: grid.id,
     targetHostIds: hosts.map((host) => host.id),
+    targetProcessIds: [...new Set(sessions.map((session) => session.processId))],
     affectedSessionIds: sessions.map((session) => session.id),
     podDeathObservations: sessions.map((session) => simPodDeath(session.podDeathScenario!)),
   };
@@ -173,8 +179,9 @@ export function simulateGridChaos(input: {
   const monkeyGrid = choose(workerGrids, random);
   const gorillaGrid = choose(workerGrids.filter((grid) => grid.id !== monkeyGrid.id), random);
   const monkeyHost = choose([...monkeyGrid.hosts].sort(compareId), random);
-  const monkeyScope = random() < 0.5 ? 'session' : 'host';
-  const monkeySession = choose([...monkeyHost.sessions].sort(compareId), random);
+  const monkeyProcessIds = [...new Set(monkeyHost.sessions.map((session) => session.processId))].sort();
+  const monkeyProcessId = choose(monkeyProcessIds, random);
+  const monkeySession = monkeyHost.sessions.find((session) => session.processId === monkeyProcessId)!;
   const attacks = shuffledAttacks(random);
   const events: GridChaosResultEvent[] = [];
   const seenLeases = new Set<string>();
@@ -183,7 +190,7 @@ export function simulateGridChaos(input: {
   for (let sequence = 0; sequence < attacks.length; sequence++) {
     const attack = attacks[sequence]!;
     const raw = eventTargets({ attack, seed: input.seed, atMs: input.clock.now(), topology: input.topology,
-      monkeyGrid, monkeyHost, monkeyScope, monkeySession, gorillaGrid });
+      monkeyGrid, monkeyHost, monkeySession, gorillaGrid });
     const event: GridChaosEvent = { ...raw, sequence };
     const affectedLeaseIds = [...input.ledger.applyLoss(event)];
     for (const leaseId of affectedLeaseIds) {

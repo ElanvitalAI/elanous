@@ -118,6 +118,16 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
   if (entries !== undefined && (!Array.isArray(entries) || entries.length === 0)) return { ok: false, reason: 'review-supersedes-invalid' };
   const superseded = new Map<string, string>();
   const resolvedPriorAccepted: string[] = [];
+  const ignoredErrors: string[] = [];
+  const errorCandidates = new Set<string>();
+  for (const path of candidates) {
+    if (path === selected) continue;
+    const candidateReview = checkReview(input, { reviewResult: path }, selectedHead);
+    if (candidateReview.ok === false && (candidateReview as { ok: false; reason: string }).reason === 'review-error') {
+      errorCandidates.add(path);
+      ignoredErrors.push(basename(path));
+    }
+  }
   let selectedTime: number | undefined;
   let selectedRecord: Record<string, unknown> | undefined;
   try { selectedRecord = lastReviewRecord(input.readFile(selected)); } catch { return { ok: false, reason: 'review-unreadable' }; }
@@ -133,11 +143,13 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
     });
     if (!linkedSameHeadFailure) return { ok: false, reason: 'review-op-waiver-same-head-failure-missing' };
   }
-  if (entries?.length || hasResolvedPrior) {
+  const actionableSupersedes = (entries ?? []).some((entry) => typeof entry?.reviewResult === 'string' && !errorCandidates.has(entry.reviewResult));
+  if (actionableSupersedes || hasResolvedPrior) {
     try { selectedTime = input.reviewMtime(selected); } catch { return { ok: false, reason: 'review-attempt-time-unmeasured' }; }
     if (!Number.isFinite(selectedTime)) return { ok: false, reason: 'review-attempt-time-unmeasured' };
   }
   for (const entry of entries ?? []) {
+    if (entry && typeof entry.reviewResult === 'string' && errorCandidates.has(entry.reviewResult)) continue;
     if (!entry || typeof entry.reviewResult !== 'string' || typeof entry.reason !== 'string' || !entry.reason.trim()
       || !candidates.includes(entry.reviewResult) || entry.reviewResult === selected || superseded.has(entry.reviewResult)) {
       return { ok: false, reason: 'review-supersedes-invalid' };
@@ -156,16 +168,24 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
       if (superseded.has(path)) return { ok: false, reason: 'review-supersedes-passing' };
       continue;
     }
+    const reviewReason = (review as { ok: false; reason: string }).reason;
+    if (reviewReason === 'review-error') continue;
     if (superseded.has(path)) {
-      if (superseded.get(path) !== review.reason) return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${review.reason})` };
-      if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(review.reason)) {
-        return { ok: false, reason: `review-supersedes-not-failed: ${basename(path)} (${review.reason})` };
+      if (superseded.get(path) !== reviewReason) return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${reviewReason})` };
+      if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(reviewReason)) {
+        return { ok: false, reason: `review-supersedes-not-failed: ${basename(path)} (${reviewReason})` };
+      }
+      if (selectedRecord?.reviewer === 'OP-waiver') {
+        if (!reviewAttemptExplicitlyResolved(input, selectedRecord, path, head)) {
+          return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${reviewReason})` };
+        }
+        resolvedPriorAccepted.push(path);
       }
       continue;
     }
-    if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(review.reason)
+    if (!/^review-(verdict-fail|must-fix-[1-9][0-9]*)$/.test(reviewReason)
       || !selectedRecord || !reviewAttemptExplicitlyResolved(input, selectedRecord, path, head)) {
-      return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${review.reason})` };
+      return { ok: false, reason: `review-attempt-not-superseded: ${basename(path)} (${reviewReason})` };
     }
     resolvedPriorAccepted.push(path);
     let failedTime: number;
@@ -174,7 +194,11 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
       return { ok: false, reason: 'review-selected-not-later-than-failure' };
     }
   }
-  if (entries?.length) {
+  // A fully validated OP waiver is itself the adjudication of the linked same-head
+  // failures; requiring a second OPEN PR for those already-disposed findings deadlocks
+  // the queue. reviewAttemptExplicitlyResolved has checked each finding and evidence.
+  const adjudicatedByOpWaiver = selectedRecord?.reviewer === 'OP-waiver' && resolvedPriorAccepted.length > 0;
+  if (actionableSupersedes && !adjudicatedByOpWaiver) {
     if (!Number.isSafeInteger(e.followupPr) || (e.followupPr as number) <= 0 || e.followupPr === input.pr) {
       return { ok: false, reason: 'review-followup-pr-invalid' };
     }
@@ -183,7 +207,7 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
     let state: unknown;
     try { state = JSON.parse(response.out); } catch { return { ok: false, reason: 'review-followup-pr-unmeasured' }; }
     if ((state as { state?: unknown })?.state !== 'OPEN') return { ok: false, reason: 'review-followup-pr-not-open' };
-  } else if (e.followupPr !== undefined) {
+  } else if (!adjudicatedByOpWaiver && e.followupPr !== undefined && !entries?.every((entry) => typeof entry?.reviewResult === 'string' && errorCandidates.has(entry.reviewResult))) {
     return { ok: false, reason: 'review-followup-pr-without-supersedes' };
   }
   debug.log('pr.land', 'review-attempt-selection', {
@@ -192,6 +216,7 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
     selected,
     superseded: [...superseded.entries()].map(([reviewResult, reason]) => ({ reviewResult, reason })),
     resolvedPriorAccepted,
+    notes: ignoredErrors.map((candidate) => `ignored same-head error review candidate: ${candidate}`),
     followupPr: e.followupPr ?? null,
   });
   return { ok: true };
@@ -425,6 +450,30 @@ function reviewAttemptHasExactSameHeadFail(input: VerifyOverlapEvidenceInput, fa
     && findingList(failed.mustFix).length > 0);
 }
 
+type EvidenceReviewCheck =
+  | { ok: false; reason: string; baseTip?: string }
+  | { ok: true; reviewResult: string; evidence: Partial<OverlapEvidenceFile> };
+
+/** An error artifact is not a verdict; when the evidence points at one, find a valid same-head review. */
+function selectEvidenceReview(input: VerifyOverlapEvidenceInput, evidence: Partial<OverlapEvidenceFile>, head: string, baseTip?: string): EvidenceReviewCheck {
+  const primary = checkReview(input, evidence, head, baseTip);
+  if (primary.ok) return { ...primary, evidence };
+  const refusal = primary as { ok: false; reason: string; baseTip?: string };
+  if (refusal.reason !== 'review-error' || !input.reviewResultsDir || !input.listDir) return refusal;
+  let names: readonly string[];
+  try { names = input.listDir(input.reviewResultsDir); } catch { return primary; }
+  const filename = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-([a-f0-9]{10,40})\\.json$`, 'i');
+  for (const name of [...names].sort()) {
+    const match = filename.exec(name);
+    if (!match || !head.startsWith(match[1]!.toLowerCase())) continue;
+    const candidate = join(input.reviewResultsDir, name);
+    if (candidate === evidence.reviewResult) continue;
+    const result = checkReview(input, { reviewResult: candidate }, head, baseTip);
+    if (result.ok) return { ...result, evidence: { ...evidence, reviewResult: candidate } };
+  }
+  return primary;
+}
+
 type Checked = { ok: false; reason: string; baseTip?: string; gateBase?: string; windowCommits?: number }
   | (OverlapEvidenceVerdict & { ok: true; baseTip?: string });
 
@@ -543,9 +592,10 @@ export function verifyOverlapEvidenceVirtualRebase(input: VerifyOverlapEvidenceI
   if (gate.passed !== true) return { ok: false, reason: 'gate-not-passed' };
   if (typeof gate.head !== 'string' || gate.head.toLowerCase() !== head) return { ok: false, reason: 'gate-head-mismatch' };
   if (typeof gate.baseCommit !== 'string' || !SHA40.test(gate.baseCommit)) return { ok: false, reason: 'gate-base-unmeasured' };
-  const review = checkReview(input, evidence, head, baseTip);
-  if (!review.ok) return review;
-  const attempts = checkSelectedReviewAttempts(input, evidence, head);
+  const selectedReview = selectEvidenceReview(input, evidence, head, baseTip);
+  if (!selectedReview.ok) return selectedReview;
+  const review = selectedReview;
+  const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
   if (!attempts.ok) return attempts;
   const remote = input.run('git', ['ls-remote', input.remote, `refs/heads/${input.branch}`], { cwd: input.cwd });
   if (!remote.ok || remote.out.trim().split(/\s+/)[0]?.toLowerCase() !== baseTip.toLowerCase()) {
@@ -640,9 +690,10 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
   const landings = input.overlappingLandings ?? [];
   if (landings.length > 0 && landings.every((sha) => /^[0-9a-f]{7,40}$/i.test(sha)
     && input.run('git', ['merge-base', '--is-ancestor', sha, head], { cwd: input.cwd }).ok)) {
-    const review = checkReview(input, e, head);
-    if (!review.ok) return review;
-    const attempts = checkSelectedReviewAttempts(input, e, head);
+    const selectedReview = selectEvidenceReview(input, e, head);
+    if (!selectedReview.ok) return selectedReview;
+    const review = selectedReview;
+    const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
     return attempts.ok ? { ok: true, mode: 'already-ancestor', reviewResult: review.reviewResult } : attempts;
   }
 
@@ -660,9 +711,10 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
   const advanced = (staleReason: string): Checked => {
     const window = checkBaseWindow(input, head, baseTip, gateBase!, staleReason);
     if (!window.ok) return { ok: false, reason: window.reason, baseTip, gateBase, windowCommits: window.windowCommits };
-    const review = checkReview(input, e, head, baseTip);
-    if (!review.ok) return { ...review, gateBase, windowCommits: window.windowCommits };
-    const attempts = checkSelectedReviewAttempts(input, e, head);
+    const selectedReview = selectEvidenceReview(input, e, head, baseTip);
+    if (!selectedReview.ok) return { ...selectedReview, gateBase, windowCommits: window.windowCommits };
+    const review = selectedReview;
+    const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
     return attempts.ok
       ? { ok: true, mode: 'base-advanced-disjoint', baseTip, gateBase: gateBase!, windowCommits: window.windowCommits, reviewResult: review.reviewResult }
       : { ...attempts, gateBase, windowCommits: window.windowCommits };
@@ -682,9 +734,10 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
   }
 
   // ③ 리뷰 — 그 PR · 그 머리의 pass ⊕ must-fix 0.
-  const review = checkReview(input, e, head, baseTip);
-  if (!review.ok) return review;
-  const attempts = checkSelectedReviewAttempts(input, e, head);
+  const selectedReview = selectEvidenceReview(input, e, head, baseTip);
+  if (!selectedReview.ok) return selectedReview;
+  const review = selectedReview;
+  const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
   return attempts.ok ? { ok: true, mode: 'rebased', baseTip, reviewResult: review.reviewResult } : attempts;
 }
 
@@ -714,16 +767,23 @@ export function verifyAllSameHeadReviews(input: Pick<VerifyAncestorAutoInput, 'p
   const filename = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-([a-f0-9]{10,40})\\.json$`, 'i');
   // 같은 PR·머리 접두의 리뷰가 여럿이면 «전부» 통과해야 한다 — 내용 headCommit 이 정확히 맞아야 승인한다.
   let accepted: string | undefined;
+  const ignoredErrors: string[] = [];
   for (const name of [...names].filter((n) => {
     const match = filename.exec(n);
     return Boolean(match && match[1]!.length >= 10 && head.startsWith(match[1]!.toLowerCase()));
   }).sort()) {
     // The auto-ancestor landing path uses the same provider/forbidden-backend check as explicit evidence.
     const review = checkReview(input, { reviewResult: join(input.reviewResultsDir, name) }, head);
-    if (!review.ok) return { ok: false, reason: review.reason };
+    if (review.ok === false) {
+      const reason = (review as { ok: false; reason: string }).reason;
+      if (reason === 'review-error') { ignoredErrors.push(name); continue; }
+      return { ok: false, reason };
+    }
     accepted = review.reviewResult;
   }
-  return accepted === undefined ? { ok: false, reason: 'review-missing' } : { ok: true, reviewResult: accepted };
+  const notes = ignoredErrors.map((name) => `ignored same-head error review candidate: ${name}`);
+  if (notes.length) debug.log('pr.land', 'review-attempt-selection', { pr: input.pr, head, selected: accepted ?? null, notes });
+  return accepted === undefined ? { ok: false, reason: ignoredErrors.length ? 'review-error' : 'review-missing' } : { ok: true, reviewResult: accepted };
 }
 
 function checkAncestorAuto(input: VerifyAncestorAutoInput): AncestorAutoVerdict {

@@ -130,7 +130,7 @@ describe('DashboardSession — full ACP round-trip (Phase 4)', () => {
     });
     const texts: string[] = [];
     await session.send({ userText: text, onText: (t) => texts.push(t) });
-    expect(log).toHaveBeenCalledWith('chat.route', 'decided', expect.objectContaining({
+    expect(log).toHaveBeenCalledWith('core-turn.route', 'decided', expect.objectContaining({
       reason: 'seat-read', goalLoop: true, seat: 'OPT', seatKnown: true,
     }));
     expect(texts.some((t) => isTuiRouteLine(t))).toBe(false);

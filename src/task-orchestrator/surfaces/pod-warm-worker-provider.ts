@@ -46,7 +46,7 @@ function waitForPrepareRetry(signal?: AbortSignal): Promise<void> {
 
 export type WarmReplayInput = Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>;
 export interface WarmReplayResult { command: WarmWorkerCommand | null; transport: WarmPodTransportResult }
-export interface WarmWorkerCandidate { host: string; tier: WarmPoolTier; spec: WarmPodSpec }
+export interface WarmWorkerCandidate { host: string; tier: WarmPoolTier; spec: WarmPodSpec; slotCount?: number }
 export interface WarmPodDeleteOptions {
   apiVersion: 'v1'; kind: 'DeleteOptions'; preconditions: { uid: string };
 }
@@ -284,10 +284,24 @@ export class WarmPodProvider {
     const templates = options.poolTemplates ?? [];
     if (new Set(templates.map(candidate => `${candidate.host}/${candidate.tier}`)).size !== templates.length)
       throw new Error('duplicate warm pool template');
-    const expanded = templates.flatMap(candidate => {
-      const quota = this.quotaResolver(profile, candidate.host, candidate.tier);
-      if (!quota || !candidate.spec.nodeName) throw new Error('unmeasured warm pool template');
-      const slots = options.expandPoolTemplatesToQuota === true ? quota : 1;
+    const templateSlots = templates.map(candidate => {
+      const measuredQuota = this.quotaResolver(profile, candidate.host, candidate.tier);
+      if (!Number.isSafeInteger(measuredQuota) || measuredQuota < 1) throw new Error('unmeasured warm pool template');
+      const quota = candidate.slotCount ?? measuredQuota;
+      if (!quota || !Number.isSafeInteger(quota) || quota < 1 || !candidate.spec.nodeName) throw new Error('unmeasured warm pool template');
+      if (quota > measuredQuota) throw new Error('warm candidate quota exceeded');
+      return { candidate, quota, slots: candidate.slotCount !== undefined || options.expandPoolTemplatesToQuota === true ? quota : 1 };
+    });
+    const requestedByHost = new Map<string, number>();
+    for (const row of templateSlots) requestedByHost.set(row.candidate.host, (requestedByHost.get(row.candidate.host) ?? 0) + row.slots);
+    for (const [host, requested] of requestedByHost) {
+      const measuredHostQuotas = (['lite', 'standard'] as const)
+        .map(tier => this.quotaResolver(profile, host, tier))
+        .filter((quota): quota is number => Number.isSafeInteger(quota) && quota > 0);
+      if (measuredHostQuotas.length === 0) throw new Error('unmeasured warm pool host');
+      if (requested > Math.max(...measuredHostQuotas)) throw new Error('warm candidate quota exceeded');
+    }
+    const expanded = templateSlots.flatMap(({ candidate, slots }) => {
       return Array.from({ length: slots }, (_, index): WarmWorkerCandidate => ({
         host: candidate.host, tier: candidate.tier,
         spec: {
@@ -307,7 +321,8 @@ export class WarmPodProvider {
       }
     }
     if (this.candidates.some(candidate => !workerId(candidate.spec.workerId)
-      || !candidate.host.trim() || this.quotaResolver(profile, candidate.host, candidate.tier) < 1
+      || !candidate.host.trim() || !Number.isSafeInteger(this.quotaResolver(profile, candidate.host, candidate.tier))
+      || this.quotaResolver(profile, candidate.host, candidate.tier) < 1
       || candidate.spec.memoryLimit !== (candidate.tier === 'lite' ? '2Gi' : '16Gi')
       || !warmWorkerPodManifest(candidate.spec))) throw new Error('invalid warm candidate');
     if (new Set(this.candidates.map(candidate => candidate.spec.workerId)).size !== this.candidates.length)

@@ -3,6 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
+import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
 import { assertSimWorldOwnership, createSimWorld, destroySimWorld, listSimWorlds } from './world-store.js';
 
 const roots: string[] = [];
@@ -24,6 +25,11 @@ afterEach(() => {
 });
 
 describe('sim world lifecycle', () => {
+  test('v2 device snapshot includes every source module in the catalog', () => {
+    const catalog = loadMockScenarioCatalog();
+    const snapshots = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
+    expect([...snapshots[String(catalog.version)]!].sort()).toEqual(catalog.sourceModules.map(({ id }) => id).sort());
+  });
   test('refuses to access sim storage without an explicit isolated test universe', () => {
     priorTestRoot = getTestStateRoot();
     setTestStateRoot(null);
@@ -43,12 +49,25 @@ describe('sim world lifecycle', () => {
       configDir: join(root, 'night-train-1', 'config'),
       fixturesDir: join(root, 'night-train-1', 'fixtures'),
       tmpDir: join(root, 'night-train-1', 'tmp'),
+      devicesDir: join(root, 'night-train-1', 'devices'),
+      deviceModuleIds: loadMockScenarioCatalog().sourceModules.map(({ id }) => id),
       createdAt: '2026-11-01T12:00:00.000Z',
     });
     expect(lstatSync(world.rootDir).mode & 0o777).toBe(0o700);
     expect(lstatSync(join(world.rootDir, 'world.json')).mode & 0o777).toBe(0o600);
+    expect(lstatSync(world.devicesDir).mode & 0o777).toBe(0o700);
+    expect(readdirSync(world.devicesDir).sort()).toEqual(world.deviceModuleIds.map((id) => `${id}.json`).sort());
+    expect(world.deviceModuleIds).toEqual(loadMockScenarioCatalog().sourceModules.map(({ id }) => id));
+    const fakeClockId = world.deviceModuleIds.find((id) => id === 'MD-UX-SIM-FAKE-CLOCK-TS')!;
+    expect(lstatSync(join(world.devicesDir, `${fakeClockId}.json`)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(join(world.devicesDir, `${fakeClockId}.json`), 'utf8')))
+      .toEqual(loadMockScenarioCatalog().sourceModules.find(({ id }) => id === fakeClockId));
     expect(JSON.parse(readFileSync(join(world.rootDir, 'world.json'), 'utf8'))).toEqual({
-      format: 1, id: 'night-train-1', createdAt: '2026-11-01T12:00:00.000Z',
+      format: 1,
+      id: 'night-train-1',
+      createdAt: '2026-11-01T12:00:00.000Z',
+      deviceCatalogVersion: loadMockScenarioCatalog().deviceCatalogVersion,
+      deviceModuleIds: loadMockScenarioCatalog().sourceModules.map(({ id }) => id),
     });
     expect(listSimWorlds({ worldsDir: root })).toEqual([world]);
   });
@@ -92,6 +111,83 @@ describe('sim world lifecycle', () => {
     expect(() => destroySimWorld('incomplete', { worldsDir: root })).toThrow('layout is invalid');
     expect(() => destroySimWorld('linked', { worldsDir: root })).toThrow('refusing to destroy non-directory');
     expect(readFileSync(join(target.rootDir, 'world.json'), 'utf8')).toContain('"id": "target"');
+  });
+
+  test('lists and destroys only worlds with a complete catalog module assembly', () => {
+    const root = worldsDir();
+    const world = createSimWorld('catalog-world', { worldsDir: root });
+    const moduleId = world.deviceModuleIds[0]!;
+    const modulePath = join(world.devicesDir, `${moduleId}.json`);
+    const manifestPath = join(world.rootDir, 'world.json');
+    const original = readFileSync(modulePath, 'utf8');
+    const originalManifest = readFileSync(manifestPath, 'utf8');
+    rmSync(modulePath);
+
+    expect(listSimWorlds({ worldsDir: root })).toEqual([]);
+    expect(() => destroySimWorld('catalog-world', { worldsDir: root })).toThrow('device module files do not match');
+    expect(existsSync(world.rootDir)).toBe(true);
+
+    writeFileSync(modulePath, original, { mode: 0o600, flag: 'wx' });
+    expect(listSimWorlds({ worldsDir: root })).toEqual([world]);
+
+    const shortenedManifest = JSON.parse(originalManifest) as { deviceModuleIds: string[] };
+    shortenedManifest.deviceModuleIds = shortenedManifest.deviceModuleIds.filter((id) => id !== moduleId);
+    writeFileSync(manifestPath, `${JSON.stringify(shortenedManifest)}\n`, { mode: 0o600 });
+    rmSync(modulePath);
+
+    expect(listSimWorlds({ worldsDir: root })).toEqual([]);
+    expect(() => destroySimWorld('catalog-world', { worldsDir: root })).toThrow('does not match the catalog');
+    expect(existsSync(world.rootDir)).toBe(true);
+  });
+
+  test('keeps older empty world folders readable and destroyable', () => {
+    const root = worldsDir();
+    const world = createSimWorld('legacy-world', { worldsDir: root });
+    rmSync(world.devicesDir, { recursive: true });
+    writeFileSync(join(world.rootDir, 'world.json'), JSON.stringify({
+      format: 1, id: world.id, createdAt: world.createdAt,
+    }), { mode: 0o600 });
+
+    expect(listSimWorlds({ worldsDir: root }).map(({ id, deviceModuleIds }) => ({ id, deviceModuleIds })))
+      .toEqual([{ id: 'legacy-world', deviceModuleIds: [] }]);
+    expect(destroySimWorld('legacy-world', { worldsDir: root })).toBe(true);
+  });
+
+  test('keeps a v2 device snapshot world listable and destroyable after the catalog advances to v3', () => {
+    const root = worldsDir();
+    const world = createSimWorld('prior-v2-catalog-world', { worldsDir: root });
+    const versionedCatalogs = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
+    const priorDeviceIds = versionedCatalogs['2']!;
+    const priorDeviceIdSet = new Set(priorDeviceIds);
+    for (const id of world.deviceModuleIds) {
+      if (!priorDeviceIdSet.has(id)) rmSync(join(world.devicesDir, `${id}.json`));
+    }
+    const manifestPath = join(world.rootDir, 'world.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    writeFileSync(manifestPath, `${JSON.stringify({ ...manifest, deviceCatalogVersion: 2, deviceModuleIds: priorDeviceIds }, null, 2)}\n`);
+    expect(listSimWorlds({ worldsDir: root }).map(({ id, deviceModuleIds }) => ({ id, deviceModuleIds })))
+      .toEqual([{ id: world.id, deviceModuleIds: priorDeviceIds }]);
+    expect(destroySimWorld(world.id, { worldsDir: root })).toBe(true);
+  });
+
+  test('keeps a prior catalog-version world listable and destroyable after the catalog advances', () => {
+    const root = worldsDir();
+    const world = createSimWorld('prior-catalog-world', { worldsDir: root });
+    const catalog = loadMockScenarioCatalog();
+    const updatedCatalog = {
+      deviceCatalogVersion: catalog.deviceCatalogVersion + 1,
+      sourceModules: [...catalog.sourceModules, {
+        id: 'MD-UX-SIM-FUTURE-DEVICE-TS',
+        path: 'src/ux-sim/future-device.ts',
+        boundary: 'future catalog update test',
+        deviceIds: [],
+        integrityCertificatePresent: false,
+        integrityCertificatePath: null,
+      }],
+    };
+
+    expect(listSimWorlds({ worldsDir: root, catalogForTesting: updatedCatalog })).toEqual([world]);
+    expect(destroySimWorld(world.id, { worldsDir: root, catalogForTesting: updatedCatalog })).toBe(true);
   });
 
   test('refuses a symlinked manifest and preserves its external target', () => {

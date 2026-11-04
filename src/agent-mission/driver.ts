@@ -23,7 +23,7 @@ import { worktreeHasChanges, commitWorktree, changedFiles } from '../self-implem
 import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { emitPtyDecision, type DecisionInput } from './pty-decision.js';
-import { observeExternalEvent } from '../context-bus/external-events.js';
+import { observeExternalEvent, type ExternalEventInput } from '../context-bus/external-events.js';
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { resolvePtyWebAddress } from '../cli/pty-web-address.js';
@@ -705,6 +705,8 @@ export interface AgentMissionDeps {
   dispatchOpenPullRequest?: typeof dispatchOpenPullRequest;
   /** Optional context-journal sink for isolated missions. */
   emitContextEvent?: (input: SessionEventInput) => void;
+  /** Inject external member-observation events in tests without writing to the shared journal. */
+  emitExternalEvent?: (input: ExternalEventInput) => void;
   /** Internal continuation retains the original mission's context-event owner. */
   contextEventRun?: boolean;
   /** Carries a PR number back to the outer mission's context event. */
@@ -1880,6 +1882,10 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   let usageReemitted = false;
   let childSessionId: string | undefined;
   let sessionOutput = '';
+  let memberExitObserved = false;
+  let liveOutputObserved = true;
+  const emitExternal = deps.emitExternalEvent ?? observeExternalEvent;
+  const memberSource = (ptyId: string): string => `elanous://agent-mission/${encodeURIComponent(runId)}/${encodeURIComponent(ptyId)}`;
   let claudeCleanupTimer: ReturnType<typeof setInterval> | undefined;
   const cleanupClaude = (): void => {
     if (claudeCleanupTimer) clearInterval(claudeCleanupTimer);
@@ -1887,7 +1893,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   };
   const offLive = onPtyEvent((ev) => {
     if (ev.id !== ptyOpts.id) return;
-    if (ev.type === 'output') {
+    if (ev.type === 'output' && liveOutputObserved) {
       liveDirty = true; liveChunks += 1;
       if (backend.name === 'codex' && !childSessionId) {
         sessionOutput = (sessionOutput + ev.chunk).slice(-8192);
@@ -1898,6 +1904,11 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       offLive();
       if (liveTimer) clearInterval(liveTimer);
       cleanupClaude();
+      if (backend.name === 'codex' && !memberExitObserved) {
+        memberExitObserved = true;
+        emitExternal({ origin: 'codex-agent-mission', kind: 'exit',
+          summary: `Codex mission member exited (code ${ev.exitCode})`, source: memberSource(ptyOpts.id!) });
+      }
     }
     if (ev.type === 'exit' && backend.name === 'codex' && !usageReemitted) {
       usageReemitted = true;
@@ -1931,17 +1942,17 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     }, 1000);
     claudeCleanupTimer.unref();
   }
-  if (backend.name === 'codex') observeExternalEvent({ origin: 'codex-agent-mission', kind: 'started',
-    summary: 'Codex agent mission started', source: `elanous://agent-mission/${encodeURIComponent(runId)}/${encodeURIComponent(h.id)}` });
+  if (backend.name === 'codex') emitExternal({ origin: 'codex-agent-mission', kind: 'started',
+    summary: 'Codex agent mission started', source: memberSource(h.id) });
   let contextFinished = false;
   const finishContext = (ok: boolean): void => {
     if (contextFinished || backend.name !== 'codex') return;
     contextFinished = true;
-    observeExternalEvent({ origin: 'codex-agent-mission', kind: 'finished',
+    emitExternal({ origin: 'codex-agent-mission', kind: 'finished',
       summary: `Codex agent mission ${ok ? 'completed' : 'failed'}`,
-      source: `elanous://agent-mission/${encodeURIComponent(runId)}/${encodeURIComponent(h.id)}` });
+      source: memberSource(h.id) });
   };
-  deps.onPtyStarted?.(h, () => { if (liveTimer) clearInterval(liveTimer); offLive(); finishContext(false); cleanupClaude(); });
+  deps.onPtyStarted?.(h, () => { if (liveTimer) clearInterval(liveTimer); liveOutputObserved = false; finishContext(false); cleanupClaude(); });
   if (deps.isMissionAborted?.()) { finishContext(false); cleanupClaude(); return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
     rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' }; }
   const executorRef = buildExecutorPtyRef({

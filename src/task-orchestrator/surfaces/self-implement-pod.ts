@@ -2326,11 +2326,22 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           { encoding: 'utf8', timeout: 30_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
         return { status: result.status, stdout: result.stdout ?? '', stderr: (result.stderr ?? '') + (result.error ? String(result.error) : '') };
       };
-      const captureFailedJob = (childRunId: string): void => {
+      const captureFailedJob = (childRunId: string): { outcome: string; reason: string } => {
+        let result: { outcome: string; reason: string } = { outcome: 'failed', reason: 'capture-did-not-report' };
         try {
-          captureFailedPodJobs({ runId: ledgerRunId, job: name, childRunId, ledgerPath: runLedgerPath(ledgerRunId, ledgerDir), artifactDir: join(effectiveInstanceRoot(), 'pod-artifacts'),
-            kubectl: captureKubectl, record: (event, data) => appendRunLedgerEntry({ runId: ledgerRunId, event, data }, ledgerDir), now: options.now });
-        } catch (error) { debug.log('self-implement.pod', 'failure-capture-ledger-unavailable', { job: name, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+          let reported = false;
+          const reused = captureFailedPodJobs({ runId: ledgerRunId, job: name, childRunId, ledgerPath: runLedgerPath(ledgerRunId, ledgerDir), artifactDir: join(effectiveInstanceRoot(), 'pod-artifacts'),
+            kubectl: captureKubectl, record: (event, data) => {
+              reported = true;
+              result = { outcome: typeof data.outcome === 'string' ? data.outcome : 'failed', reason: typeof data.reason === 'string' ? data.reason : 'capture-reason-missing' };
+              appendRunLedgerEntry({ runId: ledgerRunId, event, data }, ledgerDir);
+            }, now: options.now });
+          if (!reported && reused) result = reused;
+        } catch (error) {
+          result = { outcome: 'failed', reason: 'capture-ledger-unavailable' };
+          debug.log('self-implement.pod', 'failure-capture-ledger-unavailable', { job: name, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        }
+        return result;
       };
       let recorded = false;
       let jobApplied = false;
@@ -3287,6 +3298,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         };
         // METER-POD-ROLLUP-GAP — abort 때 Job 삭제 «전»에 거둔 로그 사본(삭제 뒤엔 PARTIAL 줄도 못 읽는다).
         let abortLogs = '';
+        let abortSummaryLogs = '';
         // ⭐ 런 «도중» 원장 증분 회수 — 호스트 슈퍼바이저가 Pod 걸음을 실시간으로 본다(🅣 요청 · 힐 루프 runtime 성형의 전제).
         const follower = createPodLedgerFollower({ runId: liveChildRunId, dir: ledgerDir, now, exec: (script) => kubectl(['-n', namespace, 'exec', `job/${name}`, '-c', 'child', '--', 'sh', '-c', script]) });
         // ⭐ METER-POD-ROLLUP-GAP-3 — 런 «도중» 마지막 PARTIAL 줄을 호스트가 쥔다: Pod 가 지워지면(SIGTERM 등) 종료 로그에서 PARTIAL 이 사라진다.
@@ -3319,6 +3331,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const waitStartedAt = Date.now();
         let consecutiveJobNotFound = 0;
         let podVanished = false;
+        let stopCapture: { trigger: 'abort-signal' | 'job-not-found'; outcome: string; reason: string; lastStage: string | null; logLines: number; logBytes: number } | null = null;
         let unmeasurableSince: number | null = null;
         let unmeasurableIncidentRecorded = false;
         for (;;) {
@@ -3327,8 +3340,26 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             // METER-POD-ROLLUP-GAP — Job 삭제 «전»에 로그를 한 번 거둔다: PARTIAL 줄이 삭제와 함께 사라지면 사용량이 0 처럼 보인다.
             try {
               const captured = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child', '--tail=400']);
-              if (captured.status === 0 && captured.stdout) abortLogs = captured.stdout;
+              if (captured.status === 0 && captured.stdout) {
+                const bytes = Buffer.from(captured.stdout);
+                abortLogs = bytes.toString('utf8');
+                let start = Math.max(0, bytes.length - POD_STOP_SUMMARY_LOG_MAX_BYTES);
+                while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+                abortSummaryLogs = bytes.subarray(start).toString('utf8');
+              }
             } catch { /* 수거 실패가 abort 자체를 막아선 안 된다 */ }
+            // Observe the Job, Pod termination and logs while they still exist. A later delete
+            // or another SIGTERM must not erase the only terminal evidence.
+            const capture = captureFailedJob(liveChildRunId);
+            const lastStage = abortSummaryLogs.split(/\r?\n/u).map(line => {
+              try {
+                const row = JSON.parse(line) as Record<string, unknown>;
+                return typeof row.stage === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/u.test(row.stage) ? row.stage : null;
+              } catch { return null; }
+            }).filter((stage): stage is string => stage !== null).at(-1) ?? null;
+            stopCapture = { trigger: 'abort-signal', ...capture, lastStage,
+              logLines: abortSummaryLogs ? abortSummaryLogs.split(/\r?\n/u).filter(Boolean).length : 0,
+              logBytes: Buffer.byteLength(abortSummaryLogs) };
             kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=false']);
             state = 'aborted';
             break;
@@ -3344,6 +3375,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               state = 'failed';
               failedReason = 'JobNotFound';
               podVanished = true;
+              const capture = captureFailedJob(liveChildRunId);
+              stopCapture = { trigger: 'job-not-found', ...capture, lastStage: null, logLines: 0, logBytes: 0 };
               const facts = { job: name, childRunId: liveChildRunId, class: 'pod-vanished', consecutiveNotFound: consecutiveJobNotFound };
               debug.log('self-implement.pod', 'pod-vanished', facts, { level: 'error' });
               try {
@@ -3799,6 +3832,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const finishedRow = { job: name, run: launchRunId, ...(liveChildRunId !== launchRunId ? { childRun: liveChildRunId } : {}),
           attempt: oomRetried ? 2 : 1, phase: state, exitCode: containerExitCode,
           reason: failedReason || containerReason || (state === 'complete' ? 'complete' : 'unknown'),
+          ...(stopCapture ? { stopCapture } : {}),
           // POD-TERMINAL-EVIDENCE-JOIN: keep classifier and termination cause on this Job/childRun/attempt row.
           failureClassification: disposition?.failureClassification ?? null,
           classificationBasis: disposition?.childEvidence?.classificationBasis ?? null,
@@ -4352,6 +4386,7 @@ export function lastPodUsagePartialLine(logs: string): string | null {
 /** METER-POD-ROLLUP-GAP-3 — 호스트가 런 «도중» 거두는 PARTIAL 표본 간격(Pod 표본기 기본 5분과 맞춘다) ⊕ 그때 읽는 로그 창(표본 간격 둘 ⊕ 여유). */
 export const POD_USAGE_PARTIAL_CAPTURE_MS = 5 * 60_000;
 export const POD_USAGE_PARTIAL_CAPTURE_SINCE = '11m';
+export const POD_STOP_SUMMARY_LOG_MAX_BYTES = 64 * 1024;
 
 export function reemitPodUsage(logs: string, job: string, log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d), reprice?: PodRowReprice, missing?: { reason: PodUsageMissingReason; runId?: string | null; podExitClass?: PodExitClass | null; livePartialLine?: string | null }): number {
   const lines = logs.split('\n').reverse();

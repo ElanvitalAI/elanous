@@ -18,13 +18,15 @@ test('three origins share the chronological coord events journal without storing
       source: 'https://example.org/claim', at: base }, { db });
     recordExternalEvent({ origin: 'codex-agent-mission', kind: 'started', summary: 'Codex agent mission started',
       source: 'elanous://agent-mission/branch', at: '2026-10-02T02:00:01.000Z' }, { db });
+    recordExternalEvent({ origin: 'codex-agent-mission', kind: 'exit', summary: 'Codex mission member exited (code 7)',
+      source: 'elanous://agent-mission/run/pty', at: '2026-10-02T02:00:02.000Z' }, { db });
     recordExternalEvent({ origin: 'harness-child', kind: 'finished', summary: 'Harness child finished: completion-marker',
-      source: 'elanous://harness/run/pty', at: '2026-10-02T02:00:02.000Z' }, { db });
+      source: 'elanous://harness/run/pty', at: '2026-10-02T02:00:03.000Z' }, { db });
     recordCoordEvent({ seat: 'TC', recipients: [], all: false, kind: '보고', slot: null, deadline: null,
-      headline: 'Channel report', url: null, at: '2026-10-02T02:00:03.000Z' }, { db });
+      headline: 'Channel report', url: null, at: '2026-10-02T02:00:04.000Z' }, { db });
     const rows = listCoordEvents({ since: base }, { db });
-    expect(rows.map((r) => r.refs.seat)).toEqual(['claude-code', 'codex-agent-mission', 'harness-child', 'TC']);
-    expect(rows.map((r) => r.kind)).toEqual(['claimed', 'started', 'finished', '보고']);
+    expect(rows.map((r) => r.refs.seat)).toEqual(['claude-code', 'codex-agent-mission', 'codex-agent-mission', 'harness-child', 'TC']);
+    expect(rows.map((r) => r.kind)).toEqual(['claimed', 'started', 'exit', 'finished', '보고']);
     expect(rows[0]?.summary.length).toBe(CONTEXT_SUMMARY_MAX);
     expect(rows[0]?.refs.source).toBe('https://example.org/claim');
     expect(listCoordEvents({ since: base, seat: 'harness-child' }, { db })).toHaveLength(1);

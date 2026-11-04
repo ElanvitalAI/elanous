@@ -26,13 +26,32 @@ test('receipt baseline radius proof reaches dispatch and rejects mixed receipt h
     invalidatedShardIds: proof.invalidatedShardIds, radiusUnchangedShardIds: proof.unchangedShardIds,
     hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }],
     graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json',
-    recipeTimeoutMs: 14400000, environmentIdentity: runtimeIdentity,
+    recipeTimeoutMs: 14400000, environmentIdentity: { ...runtimeIdentity, imageDigest },
   });
   expect(actions.map(({ shardId, kind }) => [shardId, kind])).toEqual([
     ['pod-0', 'run'], ['pod-1', 'reuse'], ['pod-2', 'reuse'],
   ]);
   expect(planGateReceiptRadius({ receipts: receipts.map((row, i) => i === 2 ? { ...row, head40: '9'.repeat(40) } : row),
     tests, selectedFiles: ['src/a.test.ts'], priorCommit })).toBeNull();
+});
+
+test('dispatch reruns an unchanged-radius shard when its receipt image differs from current environment image', () => {
+  const head40 = 'a'.repeat(40), base40 = 'b'.repeat(40), fingerprint = 'c'.repeat(64);
+  const priorImage = 'sha256:' + 'd'.repeat(64), currentImage = 'sha256:' + 'e'.repeat(64);
+  const runtime = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'f'.repeat(64) };
+  const receipt: GateShardReceipt = { id: 'pod-0', files: ['src/a.test.ts'], version: '1.0.1', head40: '9'.repeat(40), base40,
+    graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
+    host: 'node-c', envKey: fingerprint + ':' + priorImage, envFingerprint: fingerprint, imageDigest: priorImage, runtimeIdentity: runtime,
+    status: 'complete', failureIds: [], errorIds: [], evidencePath: 'pod-0.json', evidenceSha256: 'a'.repeat(64), measuredAt: '2026-11-03T00:00:00.000Z', attempt: 1 };
+  const actions = planGateShardDispatch({ head40, base40, shards: [{ id: 'pod-0', files: ['src/a.test.ts'] }], receipts: [receipt],
+    radiusUnchangedShardIds: ['pod-0'], hosts: [{ id: 'node-c', platform: 'linux', available: true, reserved: false }],
+    graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
+    environmentIdentity: { ...runtime, imageDigest: currentImage } });
+  expect(actions).toMatchObject([{ kind: 'run', reason: 'environment-imageDigest-mismatch' }]);
+  const unmeasuredImage = planGateShardDispatch({ head40, base40, shards: [{ id: 'pod-0', files: ['src/a.test.ts'] }], receipts: [receipt],
+    radiusUnchangedShardIds: ['pod-0'], hosts: [{ id: 'node-c', platform: 'linux', available: true, reserved: false }],
+    graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, environmentIdentity: runtime });
+  expect(unmeasuredImage).toMatchObject([{ kind: 'run', reason: 'environment-imageDigest-mismatch' }]);
 });
 
 test('gate progress summary counts settled serial groups and records the active host group duration', () => {

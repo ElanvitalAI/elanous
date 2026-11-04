@@ -1,10 +1,11 @@
 // ── diff 밖 이행 증거 파싱 (S3 · 2026-07-29) ──────────────────────────────────
 
 import { requirePosixShellCommand } from '../platform/default-shell.js';
+import ts from 'typescript';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { linkWorktreeDependencies } from '../git-fs/worktree.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { parseSafeDecisionSignalCommand } from './decision-signal-press.js';
@@ -794,6 +795,214 @@ export function assessTddBaseHeadTest(input: {
 const TDD_TEST_PATH = /(?:^|\/)\S+\.(?:test|spec)\.[cm]?[jt]sx?$/u;
 const TDD_BASE_TEST_TIMEOUT_MS = 180_000;
 
+interface MissingExportDiagnostic { readonly name: string; readonly module: string }
+
+function missingExportDiagnostic(output: string): MissingExportDiagnostic | undefined {
+  for (const line of output.split(/\r?\n/u)) {
+    const bun = line.match(/Export named\s+["'`]([^"'`]+)["'`]\s+not found in module\s+["'`]([^"'`]+)["'`]/iu);
+    if (bun) return { name: bun[1]!, module: bun[2]! };
+    const esm = line.match(/requested module\s+["'`]([^"'`]+)["'`]\s+does not provide an export named\s+["'`]([^"'`]+)["'`]/iu);
+    if (esm) return { name: esm[2]!, module: esm[1]! };
+  }
+  return undefined;
+}
+
+function moduleCandidates(cwd: string, containingFile: string, specifier: string): string[] {
+  const resolution = ts.resolveModuleName(specifier, containingFile, {
+    allowJs: true,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    resolveJsonModule: true,
+  }, ts.sys).resolvedModule?.resolvedFileName;
+  if (resolution) return resolve(resolution).startsWith(`${resolve(cwd)}${sep}`) ? [resolve(resolution)] : [];
+  const stem = resolve(dirname(containingFile), specifier);
+  const substitutions: Record<string, string[]> = {
+    '.js': ['.ts', '.tsx', '.d.ts', '.js'], '.jsx': ['.tsx', '.ts', '.d.ts', '.jsx'],
+    '.mjs': ['.mts', '.d.mts', '.mjs'], '.cjs': ['.cts', '.d.cts', '.cjs'],
+  };
+  const extension = extname(stem);
+  const candidates = substitutions[extension]
+    ? substitutions[extension]!.map((suffix) => `${stem.slice(0, -extension.length)}${suffix}`)
+    : /\.[cm]?[jt]sx?$/u.test(stem)
+      ? [stem]
+      : [`${stem}.ts`, `${stem}.tsx`, `${stem}.mts`, `${stem}.cts`, `${stem}.js`, `${stem}.jsx`, `${stem}.mjs`, `${stem}.cjs`, join(stem, 'index.ts')];
+  return candidates.filter((candidate) => candidate.startsWith(`${resolve(cwd)}${sep}`));
+}
+
+interface NamedImportSite { readonly importer: string; readonly specifier: string; readonly candidate: string }
+
+function reachableNamedImports(input: { root: string; testFile: string; name: string }): NamedImportSite[] {
+  const pending = [resolve(input.root, input.testFile)];
+  const visited = new Set<string>();
+  const imports: NamedImportSite[] = [];
+  while (pending.length) {
+    const filePath = pending.pop()!;
+    if (visited.has(filePath) || !existsSync(filePath)) continue;
+    visited.add(filePath);
+    const source = readFileSync(filePath, 'utf8');
+    const file = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    for (const statement of file.statements) {
+      let moduleSpecifier: ts.StringLiteral | undefined;
+      if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+        moduleSpecifier = statement.moduleSpecifier;
+        const bindings = statement.importClause?.namedBindings;
+        if (statement.importClause && !statement.importClause.isTypeOnly && bindings && ts.isNamedImports(bindings)) {
+          const matching = bindings.elements.some((element) => !element.isTypeOnly && (element.propertyName?.text ?? element.name.text) === input.name);
+          for (const resolvedPath of moduleCandidates(input.root, filePath, statement.moduleSpecifier.text)) {
+            if (existsSync(resolvedPath)) {
+              if (matching) imports.push({ importer: filePath, specifier: statement.moduleSpecifier.text, candidate: resolvedPath });
+              pending.push(resolvedPath);
+            }
+          }
+        }
+      } else if (ts.isExportDeclaration(statement) && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+        moduleSpecifier = statement.moduleSpecifier;
+        if (!statement.isTypeOnly && statement.exportClause && ts.isNamedExports(statement.exportClause)
+          && statement.exportClause.elements.some((element) => !element.isTypeOnly && (element.propertyName?.text ?? element.name.text) === input.name)) {
+          for (const resolvedPath of moduleCandidates(input.root, filePath, statement.moduleSpecifier.text)) {
+            if (existsSync(resolvedPath)) imports.push({ importer: filePath, specifier: statement.moduleSpecifier.text, candidate: resolvedPath });
+          }
+        }
+      }
+      if (moduleSpecifier?.text.startsWith('.')) {
+        for (const dependency of moduleCandidates(input.root, filePath, moduleSpecifier.text)) if (existsSync(dependency)) pending.push(dependency);
+      }
+    }
+  }
+  return imports;
+}
+
+function diagnosticMatchesImport(input: { root: string; importer: string; specifier: string; diagnosticModule: string; candidate: string }): boolean {
+  if (input.diagnosticModule === input.specifier) return true;
+  const canonical = (path: string) => {
+    try { return realpathSync(path); } catch { return resolve(path); }
+  };
+  const root = canonical(input.root);
+  const candidate = canonical(input.candidate);
+  const importer = canonical(input.importer);
+  const modulePath = input.diagnosticModule.startsWith('.')
+    ? canonical(resolve(dirname(importer), input.diagnosticModule))
+    : canonical(input.diagnosticModule);
+  if (modulePath === candidate) return true;
+  const rootRelative = canonical(resolve(root, input.diagnosticModule));
+  return rootRelative.startsWith(`${root}${sep}`) && rootRelative === candidate;
+}
+
+/** Check runtime exports recursively, including binding patterns and re-export-star, without treating types as values. */
+function hasRuntimeNamedExport(input: { cwd: string; source: string; filePath: string; name: string; readModule(path: string): string | undefined }, seen = new Set<string>()): boolean {
+  const filePath = resolve(input.filePath);
+  if (seen.has(filePath)) return false;
+  seen.add(filePath);
+  const file = ts.createSourceFile(filePath, input.source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const hasExport = (node: ts.Node) => {
+    const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+    return Boolean(modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+      && !modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword || modifier.kind === ts.SyntaxKind.DeclareKeyword));
+  };
+  const bindingHasName = (binding: ts.BindingName, targetName: string): boolean => ts.isIdentifier(binding)
+    ? binding.text === targetName
+    : binding.elements.some((element) => ts.isBindingElement(element) && bindingHasName(element.name, targetName));
+  const hasLocalRuntimeBinding = (name: string, seenBindings = new Set<string>()): boolean => {
+    if (seenBindings.has(name)) return false;
+    seenBindings.add(name);
+    for (const statement of file.statements) {
+      if (ts.isImportDeclaration(statement) && statement.importClause && !statement.importClause.isTypeOnly
+        && ts.isStringLiteral(statement.moduleSpecifier)) {
+        const clause = statement.importClause;
+        const specifier = statement.moduleSpecifier.text;
+        let requested: string | undefined;
+        if (clause.name?.text === name) requested = 'default';
+        else if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings) && clause.namedBindings.name.text === name) requested = '*';
+        else if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+          const element = clause.namedBindings.elements.find((item) => !item.isTypeOnly && item.name.text === name);
+          if (element) requested = element.propertyName?.text ?? element.name.text;
+        }
+        if (!requested || requested === '*') {
+          if (requested === '*') return true;
+          continue;
+        }
+        for (const candidate of moduleCandidates(input.cwd, filePath, specifier)) {
+          const nested = input.readModule(candidate);
+          if (nested && hasRuntimeNamedExport({ ...input, source: nested, filePath: candidate, name: requested }, new Set(seen))) return true;
+        }
+      }
+      const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) : undefined;
+      if (modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword)) continue;
+      if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some((declaration) => bindingHasName(declaration.name, name))) return true;
+      if (ts.isFunctionDeclaration(statement) && statement.body && statement.name?.text === name) return true;
+      if ((ts.isClassDeclaration(statement) || ts.isModuleDeclaration(statement))
+        && statement.name && ts.isIdentifier(statement.name) && statement.name.text === name) return true;
+      if (ts.isEnumDeclaration(statement) && statement.name.text === name
+        && !ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.ConstKeyword)) return true;
+    }
+    return false;
+  };
+  const readReexport = (statement: ts.ExportDeclaration, sourceName: string): boolean => {
+    if (!statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) return hasLocalRuntimeBinding(sourceName);
+    return moduleCandidates(input.cwd, filePath, statement.moduleSpecifier.text).some((candidate) => {
+      const nested = input.readModule(candidate);
+      return nested !== undefined && hasRuntimeNamedExport({ ...input, source: nested, filePath: candidate, name: sourceName }, seen);
+    });
+  };
+  for (const statement of file.statements) {
+    if (ts.isExportDeclaration(statement)) {
+      if (statement.isTypeOnly) continue;
+      if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        const match = statement.exportClause.elements.find((element) => !element.isTypeOnly && element.name.text === input.name);
+        if (match && readReexport(statement, match.propertyName?.text ?? match.name.text)) return true;
+      } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause)) {
+        if (statement.exportClause.name.text === input.name) return true;
+      } else if (!statement.exportClause && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+        if (readReexport(statement, input.name)) return true;
+      }
+      continue;
+    }
+    const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) : undefined;
+    const isExported = Boolean(modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword));
+    const isDefault = Boolean(modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword));
+    if (input.name === 'default' && ts.isExportAssignment(statement) && !statement.isExportEquals) return true;
+    if (input.name === 'default' && isExported && isDefault
+      && ((ts.isFunctionDeclaration(statement) && Boolean(statement.body)) || ts.isClassDeclaration(statement))) return true;
+    if (!hasExport(statement)) continue;
+    if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some((declaration) => bindingHasName(declaration.name, input.name))) return true;
+    if (ts.isFunctionDeclaration(statement) && statement.body && statement.name?.text === input.name) return true;
+    if ((ts.isClassDeclaration(statement) || ts.isModuleDeclaration(statement))
+      && statement.name && ts.isIdentifier(statement.name) && statement.name.text === input.name) return true;
+    if (ts.isEnumDeclaration(statement) && statement.name.text === input.name
+      && !ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.ConstKeyword)) return true;
+  }
+  return false;
+}
+
+/** A missing named export is structural RED only when the head adds that exact runtime export from the failed module. */
+export function structuralMissingExport(input: { cwd: string; baseCwd: string; testFiles: readonly string[]; output: string }): string | undefined {
+  const diagnostic = missingExportDiagnostic(input.output);
+  if (!diagnostic) return undefined;
+  const baseRoot = resolve(input.baseCwd);
+  const headRoot = resolve(input.cwd);
+  const sites = input.testFiles.flatMap((testFile) => reachableNamedImports({ root: baseRoot, testFile, name: diagnostic.name }));
+  const matchingSites = sites.filter((site) => diagnosticMatchesImport({ root: baseRoot, importer: site.importer,
+    specifier: site.specifier, diagnosticModule: diagnostic.module, candidate: site.candidate }));
+  const baseModules = new Map<string, NamedImportSite[]>();
+  for (const site of matchingSites) baseModules.set(site.candidate, [...(baseModules.get(site.candidate) ?? []), site]);
+  if (baseModules.size !== 1) return undefined;
+  const [baseCandidate, matchingModuleSites] = [...baseModules.entries()][0]!;
+  const baseSource = existsSync(baseCandidate) ? readFileSync(baseCandidate, 'utf8') : undefined;
+  if (baseSource === undefined || hasRuntimeNamedExport({ cwd: baseRoot, source: baseSource, filePath: baseCandidate, name: diagnostic.name,
+    readModule: (path) => existsSync(path) ? readFileSync(path, 'utf8') : undefined })) return undefined;
+  for (const site of matchingModuleSites) {
+    const importerRelative = relative(baseRoot, site.importer);
+    const headImporter = resolve(headRoot, importerRelative);
+    if (!existsSync(headImporter)) continue;
+    for (const headCandidate of moduleCandidates(headRoot, headImporter, site.specifier)) {
+      const headSource = existsSync(headCandidate) ? readFileSync(headCandidate, 'utf8') : undefined;
+      if (headSource && hasRuntimeNamedExport({ cwd: headRoot, source: headSource, filePath: headCandidate, name: diagnostic.name,
+        readModule: (path) => existsSync(path) ? readFileSync(path, 'utf8') : undefined })) return diagnostic.name;
+    }
+  }
+  return undefined;
+}
+
 /** Runs the goal's planned Bun test twice: overlay the changed test on its exact base, then run on head. */
 export function runTddBaseHeadTest(input: { readonly cwd: string; readonly baseSha: string; readonly goal: string }): TddBaseHeadTestResult {
   const command = tddPlanFromGoal(input.goal).greenCommand;
@@ -852,11 +1061,22 @@ export function runTddBaseHeadTest(input: { readonly cwd: string; readonly baseS
     };
     const baseRun = run(baselineDir);
     const baseCounts = testCounts(baseRun.output);
-    if (baseRun.status === 0 || !baseCounts || baseCounts.fail === 0) {
+    const structuralRedExport = baseRun.status !== 0
+      ? structuralMissingExport({ cwd: root, baseCwd: baselineDir, testFiles: targetTests, output: baseRun.output })
+      : undefined;
+    if (baseRun.status === 0 || ((baseCounts?.fail ?? 0) === 0 && !structuralRedExport)) {
       return { accepted: false, reason: 'base-test-did-not-prove-red', command,
         ...(baseCounts ? { baseResult: `${baseCounts.pass} pass · ${baseCounts.fail} fail` } : {}) };
     }
     const headRun = run(root);
+    if (structuralRedExport) {
+      const result = assessTddBaseHeadTest({ command, baseExitCode: 1, baseOutput: '0 pass · 1 fail',
+        headExitCode: headRun.status, headOutput: headRun.output });
+      if (result.accepted) return { ...result, reason: `base-structural-red-head-green:missing-export-${structuralRedExport}`,
+        baseResult: `structural RED · base lacks export ${structuralRedExport}`,
+        transcript: result.transcript?.replace('0 pass · 1 fail', `0 pass · 1 fail (structural RED: base lacks export ${structuralRedExport})`) };
+      return result;
+    }
     return assessTddBaseHeadTest({ command, baseExitCode: baseRun.status, baseOutput: baseRun.output,
       headExitCode: headRun.status, headOutput: headRun.output });
   } catch (error) {

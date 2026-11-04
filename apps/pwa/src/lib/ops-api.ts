@@ -1,5 +1,17 @@
 import type { DaemonClient } from './daemon-client';
 
+export type TrainRejectReason = 'typecheck' | 'ratchet' | 'introduced' | 'setup-unmeasured' | 'authorization' | 'lock-owner' | 'other';
+export interface TrainThroughputTotals {
+  assigned: number; assignedPrs: number; completed: number; succeeded: number; rejected: number; failed: number;
+  rejectedByReason: Record<TrainRejectReason, number>; unmeasured: number; landed: number | null; averageWaitSeconds: number | null;
+}
+export interface TrainThroughput {
+  date: string; generatedAt: string; sourceIncomplete?: boolean; hosts: Record<string, TrainThroughputTotals>;
+  hours: Record<string, TrainThroughputTotals>; attempts: Array<{ host: string; runId: string; stage: string; prs: number[];
+    assignedAt: string; finishedAt?: string; rc?: number; detail?: string }>;
+}
+
+
 export type OpsResult<T> = { kind: 'ready'; data: T } | { kind: 'forbidden' } | { kind: 'error'; status: number };
 // startedAt/endedAt 은 GRAPH-NODE-TIMES(0.2.19 TC) 가 원장에 넣는다 — 그 전엔 없다(화면은 «시각 미기록»).
 export interface ReleaseNode { nodeId: string; ok: boolean | null; summary: string; startedAt?: string | null; endedAt?: string | null }
@@ -241,5 +253,20 @@ export function getResourceGuardian(client: DaemonClient): Promise<OpsResult<Res
     if (value.state === 'stale' && !value.stale) return null;
     if (value.state === 'failed' && (!value.stale || value.observedAt !== null || !string(value.lastFailureAt))) return null;
     return value as unknown as ResourceGuardianSnapshot;
+  });
+}
+
+export function getTrainThroughput(client: DaemonClient, date: string): Promise<OpsResult<TrainThroughput>> {
+  return get(client, `/v1/ops/train-throughput?date=${encodeURIComponent(date)}`, (value) => {
+    if (!record(value) || !string(value.date) || !string(value.generatedAt) || (value.sourceIncomplete !== undefined && typeof value.sourceIncomplete !== 'boolean') || !record(value.hosts) || !record(value.hours) || !Array.isArray(value.attempts)) return null;
+    const totals = (row: unknown): row is TrainThroughputTotals => {
+      if (!record(row)) return false;
+      const reasons = row.rejectedByReason;
+      return ['assigned','assignedPrs','completed','succeeded','rejected','failed','unmeasured'].every(key => count(row[key]))
+        && (row.landed === null || count(row.landed)) && (row.averageWaitSeconds === null || count(row.averageWaitSeconds))
+        && record(reasons) && ['typecheck','ratchet','introduced','setup-unmeasured','authorization','lock-owner','other'].every(key => count(reasons[key]));
+    };
+    if (!Object.values(value.hosts).every(totals) || !Object.values(value.hours).every(totals)) return null;
+    return value as unknown as TrainThroughput;
   });
 }

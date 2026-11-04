@@ -59,8 +59,8 @@ export async function resolveTuiDaemonLink(deps: TuiDaemonLinkDeps = {}): Promis
   // The start command must name *this* universe: a custom test root is passed as one literal shell argument.
   // A root with control characters cannot be shown safely (it would rewrite the screen): name no command at all.
   const startCommand = kind === 'test'
-    ? explicitRoot ? (CONTROL_CHARS.test(explicitRoot) ? '' : `elanous --test=${shellQuote(explicitRoot)} nexus run --hmr`) : 'elanous --test nexus run --hmr'
-    : 'elanous nexus run --hmr';
+    ? explicitRoot ? (CONTROL_CHARS.test(explicitRoot) ? '' : `elanous --test=${shellQuote(explicitRoot)} nexus run`) : 'elanous --test nexus run'
+    : 'elanous nexus run';
   let endpoint: ReturnType<NonNullable<TuiDaemonLinkDeps['endpoint']>>;
   try {
     endpoint = (deps.endpoint ?? (() => resolveDaemonEndpoint({ purpose: 'write' })))();

@@ -97,23 +97,34 @@ const decision = {
 };
 
 describe('AutopilotPanel 결정 대기 칸 (모킹 client 로 fetch 부작용 실측)', () => {
-  test('데이터 있음: 결정 2건 → «결정 대기 2건» · 탭 2개·h1 1개 불변식 유지', async () => {
-    const calls: string[] = [];
+  test('data: five decisions show total count and only the top three', async () => {
+    const calls: Array<{ transport: string; path: string; method: string }> = [];
+    const decisions = Array.from({ length: 5 }, (_, index) => ({ ...decision, id: 'd-' + (index + 1), title: index === 0 ? decision.title : 'Decision-' + (index + 1) }));
     const client = {
-      fetchJson: () => new Promise(() => {}),
-      fetchResponse: (path: string) => {
-        calls.push(path);
+      fetchJson: (path: string, init?: RequestInit) => {
+        calls.push({ transport: 'fetchJson', path, method: init?.method ?? 'GET' });
+        return new Promise(() => {});
+      },
+      fetchResponse: (path: string, init?: RequestInit) => {
+        calls.push({ transport: 'fetchResponse', path, method: init?.method ?? 'GET' });
         return path === '/v1/decisions?status=open'
-          ? Promise.resolve(new Response(JSON.stringify({ decisions: [decision, { ...decision, id: 'd-2', title: '다음 결정' }] })))
+          ? Promise.resolve(new Response(JSON.stringify({ decisions })))
           : new Promise<Response>(() => {});
       },
     } as unknown as DaemonClient;
     const renderer = await mountPanel(client);
 
-    // 칸은 패널 안에서 목록 GET 을 정확히 1번 발사한다(decide POST 는 큐 시험이 별도 단언)
-    expect(calls.filter(path => path === '/v1/decisions?status=open')).toHaveLength(1);
+    // 목록 경로의 실제 전송은 GET 한 번이며, 양쪽 transport 에서 쓰기 요청이 없다.
+    expect(calls.filter(call => call.path === '/v1/decisions?status=open')).toEqual([
+      { transport: 'fetchResponse', path: '/v1/decisions?status=open', method: 'GET' },
+    ]);
+    expect(calls.filter(call => call.method !== 'GET')).toEqual([]);
     const section = renderer.root.findByProps({ 'aria-label': '결정 대기' });
-    expect(section.findAllByType('p').map(p => String(p.props.children))).toContain('결정 대기 2건');
+    expect(section.findAllByType('p').map(p => String(p.props.children))).toContain('결정 대기 5건 · 상위 3건 표시');
+    const items = section.findAllByType('li');
+    expect(items[0]!.findByType('span').props['aria-label']).toBe(decision.title);
+    expect(items.slice(1).map(item => item.findByType('span').props['aria-label'])).toEqual(['Decision-2', 'Decision-3']);
+    expect(calls.filter(call => call.path === '/v1/decisions?status=open')).toHaveLength(1);
     expect(tabLabels(renderer)).toEqual(['Missions', '자율행동']);
     expect(renderer.root.findAllByType('h1')).toHaveLength(1);
   });
@@ -130,6 +141,25 @@ describe('AutopilotPanel 결정 대기 칸 (모킹 client 로 fetch 부작용 �
     const section = renderer.root.findByProps({ 'aria-label': '결정 대기' });
     expect(section.findAllByType('p').map(p => String(p.props.children))).toContain('열린 결정 없음');
     expect(section.findAllByProps({ role: 'alert' })).toHaveLength(0);
+    expect(tabLabels(renderer)).toEqual(['Missions', '자율행동']);
+    expect(renderer.root.findAllByType('h1')).toHaveLength(1);
+  });
+
+  test('읽기 실패는 열린 결정 0건과 구분해 alert로 남긴다', async () => {
+    const client = {
+      fetchJson: () => new Promise(() => {}),
+      fetchResponse: (path: string) => path === '/v1/decisions?status=open'
+        ? Promise.resolve(new Response('unavailable', { status: 503 }))
+        : new Promise<Response>(() => {}),
+    } as unknown as DaemonClient;
+    const renderer = await mountPanel(client);
+
+    const section = renderer.root.findByProps({ 'aria-label': '결정 대기' });
+    expect(section.findByProps({ role: 'alert' }).children.join(' ')).toContain('결정 대기 못 읽음');
+    expect(section.findByProps({ role: 'alert' }).children.join(' ')).toContain('decisions list failed: 503');
+    expect(section.findAllByType('li')).toHaveLength(0);
+    expect(section.findAllByType('p').map(p => String(p.props.children))).not.toContain('열린 결정 없음');
+    expect(renderer.root.findAllByType('p').flatMap(p => p.children.map(String))).not.toContain('열린 결정 없음');
     expect(tabLabels(renderer)).toEqual(['Missions', '자율행동']);
     expect(renderer.root.findAllByType('h1')).toHaveLength(1);
   });

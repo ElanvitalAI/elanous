@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { acquireOpSeatFlock, opSeatFlockPath, resyncTickWithReleaseProbe } from '../../src/steward/resync-tick.js';
-import { planResumeReleaseRun, recoverLandingPartialOption, resumeReleaseRun, type RecoverReleaseDeps, type RecoverReleaseResult } from './resume-release.js';
+import { planResumeReleaseRun, recoverLandingPartialOption, recoverReleaseRun, resumeReleaseRun, type RecoverReleaseDeps, type RecoverReleaseResult } from './resume-release.js';
 import { type CutBranchOptions } from './cut-branch.js';
 import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
@@ -1387,6 +1387,33 @@ function writeRecoverRun(root: string, runId: string, cut: string): { statePath:
   writeFileSync(statePath, JSON.stringify(state));
   return { statePath, original: readFileSync(statePath, 'utf8') };
 }
+
+test("release recover refuses graph or run id mismatches before side effects", async () => {
+  for (const identity of [{ graphId: "other-graph", runId: "r" }, { graphId: "release-loop", runId: "other-run" }]) {
+    const root = mkdtempSync(join(tmpdir(), "release-recover-identity-"));
+    setElanousConfigDir(root);
+    const saved = writeRecoverRun(root, "r", "a".repeat(40));
+    const state = JSON.parse(readFileSync(saved.statePath, "utf8")) as Record<string, unknown>;
+    Object.assign(state, identity);
+    writeFileSync(saved.statePath, JSON.stringify(state));
+    let cutCalls = 0;
+    let gitCalls = 0;
+    try {
+      const deps: RecoverReleaseDeps = { root,
+        git: (_args) => { gitCalls++; return ""; },
+        isAncestor: () => false,
+        cutBranch: (_options) => { cutCalls++; throw new Error("unexpected release branch write"); },
+        graph: async () => ({ status: "done", runId: "r" }) as never,
+      };
+      await expect(recoverReleaseRun({ runId: "r", pick: ["b".repeat(40)], from: "export-check" }, deps)).rejects.toThrow("run identity mismatch");
+      expect(cutCalls).toBe(0);
+      expect(gitCalls).toBe(0);
+    } finally {
+      resetElanousConfigDir();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
 
 /** The repair seat: a bare origin carrying main ⊕ release/9.9.9, and one fix commit on main to pick. */
 function buildRecoverSeat(root: string): { work: string; origin: string; cut: string; pick: string } {

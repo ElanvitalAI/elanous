@@ -1,5 +1,6 @@
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { NEXT_TUI_WAKEUP_IPC_ENV, answerWakeupCall, isWakeupCallMessage, nextTuiWakeupTool } from './next-wakeup.js';
 import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
 import { answerNextSidetabCall, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
@@ -25,6 +26,8 @@ interface TurnResult {
   error?: string;
   provider?: string;
   model?: string | null;
+  goalComplete?: boolean;
+  goalStopReason?: string;
   selfHealth?: NextTuiSelfHealthSnapshot | null;
 }
 interface WaitingTurn {
@@ -51,7 +54,7 @@ class LocalChatSession {
     // lives here because the child dies on Esc and /new. No tool registered → no IPC, env unchanged.
     const wakeupTool = nextTuiWakeupTool();
     this.child = Bun.spawn({
-      cmd: [process.execPath, cli, 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
+      cmd: [process.execPath, cli, '--config-dir', getElanousConfigDir(), 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
       env: {
         ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
@@ -272,7 +275,7 @@ export async function runLocalChatTurn(
   compact: LocalChatTurnCompact = {},
   attachments: readonly string[] = [],
   onStatus?: (line: string) => void,
-): Promise<void> {
+): Promise<{ goalComplete: boolean; goalStopReason?: string }> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
   // The REPL child reloads the session store each turn, so compacting the store here is what this
@@ -314,4 +317,8 @@ export async function runLocalChatTurn(
       });
     } catch { /* observation must not fail a completed turn */ }
   }
+  return {
+    goalComplete: result.goalComplete === true,
+    ...(typeof result.goalStopReason === 'string' ? { goalStopReason: result.goalStopReason } : {}),
+  };
 }

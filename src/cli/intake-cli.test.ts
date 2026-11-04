@@ -14,7 +14,8 @@ import type { IntakeItem } from '../intake-plane/items.js';
 import type { TaskCard } from '../task-cards/card-store.js';
 import { ingestIntakeItems, markIntakeItem, listIntakeItems } from '../intake-plane/items.js';
 import { buildIntakeDigest, seatBriefFile } from '../intake-plane/digest.js';
-import { addSource } from '../intake-plane/intake-sources.js';
+import { addSource, runDue, syncBriefingTopicSource } from '../intake-plane/intake-sources.js';
+import { buildUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import { readSavedCursor, type SavedMessage } from '../intake-plane/collect-telegram-saved.js';
@@ -299,6 +300,32 @@ test('intake digest --seat user sends only two user notes and sends an empty arr
       expect(messages[1]).toBe('흡수 0편 → 우리에게 닿는 것 0');
       expect(log).toHaveBeenCalledWith('watch.default', 'brief', { topics: 1, items: 0, sent: true });
     } finally { log.mockRestore(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('configured topic change scopes the card to articles collected for the current topic', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'topic-change-brief-'));
+  const day = '2026-11-03';
+  const topic = '2027 사업계획: 현재 주제';
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ intake: { briefingTopic: topic } }));
+    const config = buildUserConfig(join(root, 'config.json'));
+    const source = syncBriefingTopicSource(topic, root)!;
+    await runDue({ now: new Date('2026-11-03T07:00:00Z'), seat: 'user', sourceId: source.id, deps: {
+      stateDir: root,
+      fetchFeed: async () => '<rss><channel><item><title>현재 주제 기사</title><link>https://current.example/a</link><source>Current News</source></item><item><title>중복 기사</title><link>https://current.example/a</link><source>Duplicate News</source></item></channel></rss>',
+    } });
+    ingestIntakeItems(root, 'rss', [{ seat: 'user', briefingTopic: '이전 주제', publisher: 'Old News',
+      url: 'https://old.example/a', title: '이전 주제 기사', kind: 'rss' }], '2026-11-03T07:01:00Z');
+    const messages: string[] = [];
+    const result = await runIntakeDigestCli({ seat: 'user', telegram: true, day }, {
+      root, getConfig: () => config, sendTelegram: async text => { messages.push(text); return { messageId: 8001 }; },
+    });
+    expect(result.sent).toBe(true);
+    expect(messages[0]).toContain(topic);
+    expect(messages[0]).toContain('https://current.example/a');
+    expect(messages[0]).not.toContain('https://old.example/a');
+    expect(messages[0]).toContain('출처 1개');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

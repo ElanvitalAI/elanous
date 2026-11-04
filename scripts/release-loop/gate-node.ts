@@ -1283,6 +1283,55 @@ export function gateBatchTestWallSeconds(stages: Record<string, number> | undefi
   }
   return covered + to - from;
 }
+
+/** Install-slot logs are produced by the same Pod shell as stages.tsv. Keep this as a measured wait, not inferred from
+ * the broader dependency-install span. The log reports whole seconds, so callers retain that resolution. */
+export function parseGateInstallSlotWaitMs(text: string): number | undefined {
+  const waits = [...text.matchAll(/^\[gate\] install-slot (?:\d+ waited |none \(waited )(\d+(?:\.\d+)?)s\)?$/gm)]
+    .map((match) => Number(match[1]) * 1000).filter(Number.isFinite);
+  return waits.length ? waits.reduce((sum, value) => sum + value, 0) : undefined;
+}
+
+function elapsedMs(start: string | undefined, end: string | undefined): number | undefined {
+  if (!start || !end) return undefined;
+  const from = Date.parse(start), to = Date.parse(end);
+  return Number.isFinite(from) && Number.isFinite(to) && to >= from ? to - from : undefined;
+}
+
+/** Per-shard preparation timings, joined by the exact runKey already written to pod-N.json. Missing stages stay absent. */
+export function gatePreparationTimings(input: {
+  phaseTimes: Readonly<Record<string, string>>;
+  podStages?: Readonly<Record<string, number>>;
+  podLifecycle?: Readonly<Record<string, string>>;
+  admissionWaitMs?: number;
+  installSeconds?: number | null;
+  installSlotWaitMs?: number;
+}): { stagesMs: Record<string, number>; preTestMs?: number; measuredPreTestStages: string[]; missingPreTestStages: string[] } {
+  const phase = input.phaseTimes;
+  const pod = input.podStages ?? {};
+  const k8s = input.podLifecycle ?? {};
+  const measured: Record<string, number | undefined> = {
+    admissionWait: input.admissionWaitMs,
+    create: elapsedMs(phase.poolPlaced, k8s.podCreated),
+    schedule: elapsedMs(k8s.podCreated, k8s.podScheduled),
+    // Kubernetes does not expose pull-start/pull-end as Pod timestamps; this measured span includes image pull + init/container startup.
+    imageAndBoot: elapsedMs(k8s.podScheduled, k8s.childStart),
+    clone: typeof pod['prep-start'] === 'number' && typeof pod['clone-end'] === 'number' && pod['clone-end'] >= pod['prep-start']
+      ? (pod['clone-end'] - pod['prep-start']) * 1000 : undefined,
+    installSlotWait: input.installSlotWaitMs,
+    install: input.installSeconds != null && Number.isFinite(input.installSeconds) ? input.installSeconds * 1000 : undefined,
+    dependencyTotal: typeof pod['deps-start'] === 'number' && typeof pod['deps-end'] === 'number' && pod['deps-end'] >= pod['deps-start']
+      ? (pod['deps-end'] - pod['deps-start']) * 1000 : undefined,
+  };
+  const stagesMs = Object.fromEntries(Object.entries(measured).filter((entry): entry is [string, number] => entry[1] !== undefined));
+  const preTestStages = ['admissionWait', 'create', 'schedule', 'imageAndBoot', 'clone', 'dependencyTotal', 'installSlotWait', 'install'];
+  const totalStages = preTestStages.slice(0, 6);
+  const measuredPreTestStages = preTestStages.filter((stage) => stagesMs[stage] !== undefined);
+  const missingPreTestStages = preTestStages.filter((stage) => stagesMs[stage] === undefined);
+  const preTestMs = totalStages.every((stage) => stagesMs[stage] !== undefined)
+    ? totalStages.reduce((sum, stage) => sum + stagesMs[stage]!, 0) : undefined;
+  return { stagesMs, ...(preTestMs !== undefined ? { preTestMs } : {}), measuredPreTestStages, missingPreTestStages };
+}
 /**
  * GATE-POD-STALL-FAILFAST — watches one running shard Job. Armed once the source checkout line is seen; disarmed for good
  * the moment any test output exists (that shard then behaves exactly as before). Stalled = `stallSeconds` since the
@@ -1954,7 +2003,10 @@ export function gateReceiptReuseKey(receipt: GateShardReceipt | null, version: s
   if (receipt.envFingerprint !== receipt.runtimeIdentity.envFingerprint || receipt.envKey !== `${receipt.envFingerprint}:${receipt.imageDigest}`)
     return { reason: 'receipt-env-record-inconsistent' };
   if (receipt.runtimeIdentity.envFingerprint !== fingerprint) return { reason: 'environment-envFingerprint-current-fingerprint-mismatch' };
-  if (expectedImageDigest && expectedImageDigest !== currentIdentity.imageDigest) return { reason: 'environment-imageDigest-current-pin-mismatch' };
+  const currentImageDigest = expectedImageDigest ?? currentIdentity.imageDigest;
+  if (!currentImageDigest) return { reason: 'environment-imageDigest-current-pin-unmeasured' };
+  if (receipt.imageDigest !== currentImageDigest) return { reason: 'receipt-imageDigest-current-pin-mismatch' };
+  if (currentImageDigest !== currentIdentity.imageDigest) return { reason: 'environment-imageDigest-current-pin-mismatch' };
   return { envKey: receipt.envKey, reason: `environment-match; baseline=${receipt.version}@${receipt.head40.slice(0, 12)}; current=${version}@${head40.slice(0, 12)}` };
 }
 
@@ -2784,6 +2836,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           ? Math.max(0, podStages['test-end'] - podStages['test-start']) : undefined;
       const podOverheadSeconds = testWallSeconds !== undefined || (!batchIsolation && testSeconds !== undefined)
         ? Math.max(0, durationMs / 1000 - (testWallSeconds ?? testSeconds!)) : undefined;
+      const installSeconds = parseInstallSeconds(output ?? '');
+      const installSlotWaitMs = parseGateInstallSlotWaitMs(output ?? '');
+      const preparationTimings = gatePreparationTimings({ phaseTimes, podStages, podLifecycle,
+        ...(admitted ? { admissionWaitMs: admitted.waitedMs } : {}), installSeconds, ...(installSlotWaitMs !== undefined ? { installSlotWaitMs } : {}) });
       // A reused shard keeps its files as they are — rewriting would replace the measured durationMs the next release plans by.
       if (logDir && !reused && !descent) {
         mkdirSync(logDir, { recursive: true });
@@ -2810,6 +2866,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           ...(shardLoadFlaky.length ? { loadFlaky: shardLoadFlaky } : {}),
           ...(stall ? { reason: 'stall', finishedFiles: 0, stallSeconds: stall.seconds, sinceCheckoutMs: stall.sinceCheckoutMs } : timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}), files: paths, plannedSeconds: estimated(paths), deadlineSeconds: shardDeadline, shardCount: shards.length, sweepId, commit, runKey, attemptId, ...(parentAttempt ? { parentAttempt } : {}), jobExitCode: jobExitCode ?? null, jobFailed, ...(placedOn ? { host: placedOn } : {}),
           ...(Object.keys(phaseTimes).length ? { phaseTimes } : {}), ...(podStages ? { podStages } : {}),
+          preparationTimingsMs: preparationTimings,
           ...(podLifecycle && Object.keys(podLifecycle).length ? { podLifecycle } : {}),
           ...(failureCapture ? { failureCapture: {
             ...(failureCapture.podName ? { podName: failureCapture.podName } : {}),
@@ -2835,7 +2892,6 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           writeWarmJobManifest(warmPrefix, paths[0]!, commit, attemptId);
         }
       }
-      const installSeconds = parseInstallSeconds(output ?? '');
       detailsById.set(`pod-${shard}${branch}`, { ...(detailsById.get(`pod-${shard}${branch}`) ?? {}),
         ...(imageDigest ? { imageDigest } : {}), ...(runtimeIdentity ? { runtimeIdentity } : {}) });
       if (!reused) {
@@ -2845,13 +2901,14 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         }]);
       }
       // GATE-TIMEOUT-HEAL ③: a cut shard is «reason: timeout» (with the files that still finished), not a bare rc=null.
-      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, gateDeps: parseGateDeps(output ?? ''), deadlineSeconds: shardDeadline, parts: parts.length, ...(placedOn ? { host: placedOn } : {}),
+      if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, runKey, preparationTimingsMs: preparationTimings, gateDeps: parseGateDeps(output ?? ''), deadlineSeconds: shardDeadline, parts: parts.length, ...(placedOn ? { host: placedOn } : {}),
         ...(testSeconds !== undefined ? { testSeconds } : {}),
         ...(stall ? { reason: 'stall', finishedFiles: 0, stallSeconds: stall.seconds } : timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}) });
       // POD-LIFECYCLE-STAGES: the same values the shard json carries, as one `pod.lifecycle stages` line (observation only) —
       // only for a Job that came back (a launch that failed before the Job returned has no Pod to describe).
-      if (!reused && !descent && podJobName !== undefined) emitPodLifecycle(gatePodLifecycleEvent({ runId: process.env.ELANOUS_RUN_ID ?? null, podJob: podJobName, host: placedOn ?? null,
-        shard: `pod-${shard}${branch}`, attemptId, phaseTimes, podStages, podLifecycle, outcome: gatePodOutcome({ jobFailed, stalled: !!stall, timedOut, rc }) }));
+      if (!reused && !descent && podJobName !== undefined) emitPodLifecycle({ ...gatePodLifecycleEvent({ runId: process.env.ELANOUS_RUN_ID ?? null, podJob: podJobName, host: placedOn ?? null,
+        shard: `pod-${shard}${branch}`, attemptId, phaseTimes, podStages, podLifecycle, outcome: gatePodOutcome({ jobFailed, stalled: !!stall, timedOut, rc }) }),
+        runKey, preparationTimingsMs: preparationTimings });
       if (!reused && !descent) markShard(shard, { ...(installSeconds !== null ? { installSec: installSeconds } : {}), ...(rc !== undefined ? { rc } : {}), ...(timedOut ? { state: 'timeout' as const } : {}) }, [], branch);
       let clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
       const ran = clean && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/);
@@ -3831,16 +3888,24 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       const hasPoolImage = [...poolImages.values()].some((images) => images.some((image) => normalizeGateImageDigest(image) !== null));
       if (!savedDigest && !hasPoolImage) {
         let syncResults: Awaited<ReturnType<typeof syncPoolImages>>;
+        const imageSourceRoot = mkdtempSync(join(tmpdir(), 'release-gate-image-source-'));
+        const imageSourceTree = join(imageSourceRoot, 'cut');
         const stopImageSyncWatch = startReleaseStageStallWatch({ runId: pinRunId, nodeId: 'gate' }, {
           graphId: opts.graphId ?? '', dryRun: opts.dryRun === true,
         });
-        try { syncResults = await syncImages(members, podCommandImageFor([], true), opts.commit); }
-        catch (error) {
+        try {
+          check(await runner.localCommand('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, imageSourceTree], repo), 'gate image source clone');
+          check(await runner.localCommand('git', ['checkout', '--quiet', '--detach', opts.commit], imageSourceTree), 'gate image source checkout');
+          syncResults = await syncImages(members, podCommandImageFor([], true), opts.commit, {
+            buildScript: join(imageSourceTree, 'docker', 'harness', 'build.sh'),
+          });
+        } catch (error) {
           debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, decision: 'fail-closed',
             reason: 'initial-image-sync-failed', error: String(error).slice(0, 300) }, { level: 'error' });
           throw new Error('gate image pin refused: initial image sync failed');
         } finally {
           stopImageSyncWatch();
+          rmSync(imageSourceRoot, { recursive: true, force: true });
         }
         const failedSyncs = memberSpecs.filter((member) => !syncResults.get(member.context)?.ok);
         if (failedSyncs.length) {
@@ -4748,6 +4813,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
 
 export function graphGateResult(result: GateResult, graph: boolean) {
   return { ...result, ...(graph && result.outcome === 'regression' ? { outcome: 'fail' as const } : {}),
+    stalledShards: result.stalledShards ?? [], unmeasuredRecheckFiles: result.unmeasuredRecheckFiles ?? [],
+    unmeasuredErrors: result.unmeasuredErrors ?? [], abortedShards: result.abortedShards ?? 0,
     verdict: result.outcome === 'ok' ? 'pass' as const : 'fail' as const,
     summary: (result.partial ? `부분 재검 ${result.partial.files}파일(앞 게이트 ${result.partial.priorCommit.slice(0, 9)} 결과 이음) · ` : '')
       + (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed ?? '못 셈(기준선 미루기)'}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}`

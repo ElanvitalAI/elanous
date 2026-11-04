@@ -18,8 +18,10 @@ test('topic subscription registers one existing daemon schedule then immediately
       now: new Date('2026-10-30T23:00:00Z'),
       scheduleDispatch: async (args) => {
         calls.push(args);
-        if (args.action === 'list') return { schedules: [{ id: 'schedule-123', cron: '0 8 * * 1',
-          command: calls.find(call => call.action === 'create')?.command }] };
+        if (args.action === 'list') {
+          const commandFull = `${calls.find(call => call.action === 'create')?.command} >> /tmp/eln.log 2>&1`;
+          return { schedules: [{ id: 'schedule-123', cron: '0 8 * * 1', command: commandFull.slice(0, 120), command_full: commandFull, command_truncated: true }] };
+        }
         return { ok: true };
       },
       runDue: async (input) => ({ ran: [{ id: input?.sourceId ?? 'immediate', items: 5 }] }),
@@ -31,6 +33,29 @@ test('topic subscription registers one existing daemon schedule then immediately
     expect(calls[0]).toMatchObject({ cron: '0 8 * * 1', command: `eln intake source run-due --source-id ${result.source.id} --project-issue-briefing`, category: 'ingest' });
     expect(calls[2]).toMatchObject({ id: 'schedule-123', yes: true });
     expect(listSources({}, stateDir)).toHaveLength(1);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
+test('topic subscription rejects unexpected shell stages after the generated log redirect', async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'topic-subscribe-shell-stage-'));
+  const calls: Array<Record<string, unknown>> = [];
+  let createdCommand = '';
+  try {
+    await expect(subscribeTopicSearch({ seat: 'MK', topic: 'HBM supply chain', linearIssueId,
+      every: '1w', scheduleCron: '0 8 * * 1' }, {
+      stateDir,
+      scheduleDispatch: async args => {
+        calls.push(args);
+        if (args.action === 'create') { createdCommand = String(args.command); return { ok: true }; }
+        if (args.action === 'list') return { schedules: [{ id: 'unexpected-shell-stage', cron: '0 8 * * 1',
+          command_full: `${createdCommand} >> /tmp/eln.log 2>&1; touch /tmp/unrelated` }] };
+        return { ok: true };
+      },
+      runDue: async () => ({ ran: [{ id: 'unexpected' , items: 1 }] }),
+    })).rejects.toThrow('topic-search 일정이 schedule registry에 나타나지 않았다');
+    expect(calls.map(call => call.action)).not.toContain('migrate');
+    expect(calls.map(call => call.action)).not.toContain('delete');
+    expect(listSources({}, stateDir)).toHaveLength(0);
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });
 

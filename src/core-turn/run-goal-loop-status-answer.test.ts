@@ -13,6 +13,7 @@ import * as deferredModule from '../session-runtime/tier-flip.js';
 import { runGoalLoop } from './run-goal-loop.js';
 import { CORE_TOOL_SPECS } from '../domains/core-tools.js';
 import type { CoreTurnContext } from './types.js';
+import { debug } from '../debug/log.js';
 
 const realStream = llmModule.streamLLMWithTools;
 const S5_QUESTION = 'S5 상태 값이 3 맞아?';
@@ -43,6 +44,49 @@ function scriptedProvider(turns: ScriptedTurns, name = 'scripted'): { provider: 
     async *chat() {},
   };
   return { provider: p, callsSeen: () => call };
+}
+
+const knownAnswerTools: LLMToolSpec[] = [
+  { name: 'WebSearch', description: 'Search the web', parameters: { type: 'object', properties: {} } },
+  { name: 'WebFetch', description: 'Fetch a web page', parameters: { type: 'object', properties: {} } },
+  { name: 'OmniSearch', description: 'Search multiple sources', parameters: { type: 'object', properties: {} } },
+  { name: 'Agent', description: 'Delegate research', parameters: { type: 'object', properties: {} } },
+  { name: 'skill_exec', description: 'Run a skill', parameters: { type: 'object', properties: {} } },
+  readTool,
+];
+const researchToolNames = ['WebSearch', 'WebFetch', 'OmniSearch', 'Agent', 'skill_exec'];
+
+function expectResearchToolsHidden(toolNames: string[]): void {
+  expect(toolNames).toContain('Read');
+  for (const name of researchToolNames) expect(toolNames).not.toContain(name);
+}
+
+async function driveKnownAnswer(turns: ScriptedTurns, userText: string, messages: LLMMessage[] = [{ role: 'user', content: userText }]) {
+  const { provider, callsSeen } = scriptedProvider(turns, 'known-answer-fixture');
+  const seenToolNames: string[][] = [];
+  const seenMessages: LLMMessage[][] = [];
+  const dispatchedTools: string[] = [];
+  const routeReasons: Record<string, unknown>[] = [];
+  spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'core-turn.route-why') {
+      routeReasons.push({ event, ...(data && typeof data === 'object' ? data : {}) });
+    }
+  });
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (requestMessages, handlers, opts = {}) => {
+    seenMessages.push(requestMessages);
+    seenToolNames.push((opts.tools ?? []).map((tool) => tool.name));
+    return realStream(requestMessages, handlers, { ...opts, provider, maxTurns: 6 });
+  });
+  const ctx: CoreTurnContext = {
+    sessionId: 'known-answer-route-test', messages, userText, tools: knownAnswerTools,
+    dispatchTool: async (name) => { dispatchedTools.push(name); return 'fixture evidence'; },
+    signal: new AbortController().signal,
+  };
+  const result = await runGoalLoop(ctx, {
+    controlSpaceId: null, intentStallProvider: null, changedFiles: () => [],
+    attachLifecycleBridge: () => () => {}, startLivenessHeartbeat: () => () => {},
+  });
+  return { result, calls: callsSeen(), seenMessages, seenToolNames, dispatchedTools, routeReasons };
 }
 
 beforeEach(() => {
@@ -244,6 +288,73 @@ describe('goal loop status-question final answer (TUI-FINAL-ANSWER-COMPLETION ·
     expect(r.updateGoalDispatches).toBe(0);
     expect(r.result.finalText).toBe(WORK_ANSWER);
     expect(r.seenTerminal[0]).toContain('update_goal');
+  });
+});
+
+describe('CHAT-KNOWN-ANSWER-NO-RESEARCH', () => {
+  test('stable fact and contextual follow-up answer without research tools', async () => {
+    const first = await driveKnownAnswer([[{ type: 'text', delta: '단군왕검으로 전해집니다.' }]], '조선 최초 왕 리스트');
+    expect(first.result.finalText).toContain('단군왕검');
+    expect(first.calls).toBe(1);
+    expect(first.dispatchedTools).toEqual([]);
+    expectResearchToolsHidden(first.seenToolNames.flat());
+
+    const history: LLMMessage[] = [
+      { role: 'user', content: '조선 최초 왕 리스트' },
+      { role: 'assistant', content: '단군왕검은 고조선을 세운 인물로 전해집니다.' },
+      { role: 'user', content: '가장 오래 산 왕' },
+    ];
+    const followup = await driveKnownAnswer([[{ type: 'text', delta: '전승 자료로는 장수왕이 알려져 있습니다.' }]], '가장 오래 산 왕', history);
+    expect(followup.result.finalText).toContain('장수왕');
+    expect(followup.calls).toBe(1);
+    expect(followup.dispatchedTools).toEqual([]);
+    expectResearchToolsHidden(followup.seenToolNames.flat());
+    expect(followup.seenMessages[0]?.some((message) => message.role === 'assistant'
+      && message.content === '단군왕검은 고조선을 세운 인물로 전해집니다.')).toBe(true);
+  });
+
+  test.each([
+    ['최신 한국 인구를 알려줘', 'freshness'],
+    ['현재 대통령은 누구야?', 'freshness'],
+    ['광합성이 뭔가요? 출처 링크를 붙여줘', 'citations'],
+  ])('keeps research available for %s', async (question, reason) => {
+    const result = await driveKnownAnswer([[{ type: 'text', delta: '확인한 내용입니다.' }]], question);
+    expect(result.seenToolNames.flat()).toContain('WebSearch');
+    expect(result.routeReasons).toContainEqual(expect.objectContaining({ reason }));
+  });
+
+  test.each(['S5 상태 값이 3 맞아?', 'S5 값이 3 맞아?', 'S5의 값이 3 맞아?'])(
+    'keeps current workspace status question on the tool path: %s', async (question) => {
+    const result = await driveKnownAnswer([[{ type: 'text', delta: '상태를 확인했습니다.' }]], question);
+    expect(result.seenToolNames[0]).toContain('Read');
+    expect(result.routeReasons).toContainEqual(expect.objectContaining({ reason: 'not-known-answer' }));
+  });
+
+  test.each(['확실히 알지 못합니다.', '모릅니다.', '알 수 없습니다.'])(
+    'model-declared uncertainty enables research for %s and records the route reason', async (uncertainText) => {
+    const result = await driveKnownAnswer([
+      [{ type: 'text', delta: uncertainText }],
+      [{ type: 'tool_call', id: 'search-1', name: 'WebSearch', args: { query: '조선 장수 왕 수명' } }],
+      [{ type: 'text', delta: '확인한 자료에 따르면 장수왕입니다.' }],
+    ], '조선에서 가장 오래 산 왕은 누구야?');
+    expect(result.dispatchedTools).toEqual(['WebSearch']);
+    expectResearchToolsHidden(result.seenToolNames[0]!);
+    expect(result.seenToolNames[1]).toContain('WebSearch');
+    expect(result.routeReasons).toContainEqual(expect.objectContaining({ reason: 'model-uncertain' }));
+    expect(result.result.finalText).toContain('장수왕');
+  });
+
+  test('research unlocks after a nonresearch tool was used before the model declares uncertainty', async () => {
+    const result = await driveKnownAnswer([
+      [{ type: 'tool_call', id: 'read-1', name: 'Read', args: { file_path: '/tmp/context.txt' } }],
+      [{ type: 'text', delta: '모릅니다.' }],
+      [{ type: 'tool_call', id: 'search-1', name: 'WebSearch', args: { query: '조선 장수 왕 수명' } }],
+      [{ type: 'text', delta: '확인한 자료에 따르면 장수왕입니다.' }],
+    ], '조선에서 가장 오래 산 왕은 누구야?');
+    expect(result.dispatchedTools).toEqual(['Read', 'WebSearch']);
+    expectResearchToolsHidden(result.seenToolNames[0]!);
+    expect(result.seenToolNames.some((names) => names.includes('WebSearch'))).toBe(true);
+    expect(result.routeReasons).toContainEqual(expect.objectContaining({ reason: 'model-uncertain' }));
   });
 });
 

@@ -21,6 +21,27 @@ afterEach(() => {
 });
 
 describe('sim world CLI', () => {
+  test('records and lists mock device requests only inside the isolated test universe', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-device-request-cli-'));
+    roots.push(root);
+    priorTestRoot = getTestStateRoot();
+    setTestStateRoot(root);
+    const output: string[] = [];
+    const errors: string[] = [];
+    console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
+    process.exitCode = 0;
+    const program = new Command();
+    registerSimCommands(program);
+
+    await program.parseAsync(['node', 'test', 'sim', 'devices', 'request', 'SIM-DEVICE-REQUEST-NEXUS', '--boundary', 'catalog request persistence', '--nearest', 'scenario-runner', '--json']);
+    expect(JSON.parse(output.pop()!)).toMatchObject({ cellId: 'SIM-DEVICE-REQUEST-NEXUS', state: 'missing' });
+    await program.parseAsync(['node', 'test', 'sim', 'devices', '--missing', '--json']);
+    expect(JSON.parse(output.pop()!)).toMatchObject({ missing: [{ cellId: 'SIM-DEVICE-REQUEST-NEXUS' }], resolved: [] });
+    expect(errors).toEqual([]);
+    expect(process.exitCode).toBe(0);
+  });
+
   test('creates, lists, and destroys a world through the registered command', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sim-world-cli-'));
     roots.push(root);

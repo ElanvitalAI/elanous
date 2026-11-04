@@ -10,6 +10,7 @@ import { LogStore } from '../mss/logging/log-store.js';
 import { parseScenarioV0, resolveScenarioFilePath, runScenarioFile, runScenarioV0, writeScenarioEvidenceArtifact } from './scenario.js';
 import { reviewerPrecheckFixtureDocument, runAuthorReviewerPrecheckDevice } from './author-reviewer-precheck-device.js';
 import { runGraphRuntimeOverlayEventPathDevice } from './graph-runtime-overlay-event-path.js';
+import { parseGraphOverlayYaml, selectOverlays } from '../self-implement/graph-overlay-yaml.js';
 
 async function withTestState<T>(run: () => Promise<T>): Promise<T> {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'ux-sim-test-state-'));
@@ -28,7 +29,8 @@ test('graph runtime overlay is dispatched through the production observer into i
     const run = await runScenarioFile('scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml');
     expect(run.pass).toBe(true);
     expect(run.trigger).toMatchObject({ id: 'runtime-overlay-dispatch', type: 'ux.graph-runtime-overlay.evaluate', fetchCount: 1 });
-    expect(run.graphRuntimeOverlay).toEqual({ status: 'done', decisionObserved: true, overlayApplied: true });
+    expect(run.graphRuntimeOverlay).toMatchObject({ status: 'done', decisionObserved: true, overlayApplied: true });
+    expect(run.graphRuntimeOverlay?.graphEvents.map(({ type }) => type)).toEqual(['node-added', 'edge-rerouted', 'edge-rerouted']);
     expect(run.logs).toMatchObject({ pass: true, category: 'self-implement', event: 'graph-overlay-decision', expectedCount: 1, observedCount: 1,
       matchedData: { runId: run.runId, stage: 'runtime', applied: ['ux-sim-event-stream-runtime-overlay'] } });
     const store = new LogStore(join(getTestStateRoot()!, 'logs', 'logs.db'), { readonly: true });
@@ -40,6 +42,77 @@ test('graph runtime overlay is dispatched through the production observer into i
   });
 });
 
+test('DEMO1104 research ARG scenario applies the declared FX node and records runId-scoped evidence', async () => {
+  await withTestState(async () => {
+    const run = await runScenarioFile('scenarios/ux-sim/demo1104-research-arg-graph.yaml');
+    expect(run.pass).toBe(true);
+    expect(run.runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(run.graphRuntimeOverlay).toMatchObject({ status: 'done', decisionObserved: true, overlayApplied: true });
+    expect(run.graphRuntimeOverlay?.ledgerRoute).toEqual([
+      expect.objectContaining({ from: 'review', outcome: 'source_missing', to: 'fx-scenario-quantification', source: 'graph', injected: true, mockOutcome: 'source_missing' }),
+      expect.objectContaining({ from: 'fx-scenario-quantification', to: 'merge', source: 'graph', injected: true, mockOutcome: 'source_missing' }),
+    ]);
+    expect(run.graphRuntimeOverlay?.graphEvents.map(({ type }) => type)).toEqual(['node-added', 'edge-rerouted', 'edge-rerouted']);
+    expect(run.graphRuntimeOverlay?.graphEvents).toContainEqual(expect.objectContaining({ type: 'node-added', node: 'fx-scenario-quantification' }));
+    expect(run.graphRuntimeOverlay?.graphEvents).toContainEqual(expect.objectContaining({ type: 'edge-rerouted', from: 'fx-scenario-quantification', to: 'merge' }));
+    expect(run.logs).toMatchObject({ pass: true, matchedData: {
+      runId: run.runId, stage: 'runtime', applied: ['demo1104-research-arg-runtime'],
+    } });
+  });
+}, { timeout: 60_000 });
+
+test('DEMO1104 ARG overlay stays inactive when an isolated goal says FX forecast is available', async () => {
+  await withTestState(async () => {
+    const result = await runGraphRuntimeOverlayEventPathDevice(getTestStateRoot()!, randomUUID(), 'demo1104-research-arg-graph', 'fx_forecast_present', false);
+    expect(result).toMatchObject({ status: 'done', decisionObserved: true, overlayApplied: false, graphEvents: [], ledgerRoute: [] });
+  });
+}, { timeout: 60_000 });
+
+test('DEMO1104 declared overlay selects FX only for the missing-FX goal', async () => {
+  const overlayPath = 'graphs/overlays/examples/demo1104-research-arg-runtime.yaml';
+  const parsed = parseGraphOverlayYaml(readFileSync(overlayPath, 'utf8'), overlayPath);
+  expect(parsed.errors).toEqual([]);
+  expect(parsed.overlays).toHaveLength(1);
+  const overlay = parsed.overlays[0]!;
+  expect(overlay.appliesWhen).toBe('goal_id == fx_forecast_missing');
+  expect(selectOverlays([overlay], { graphId: 'self-implement', stage: 'runtime', state: { goal_id: 'fx_forecast_missing' } }).applied)
+    .toEqual([overlay]);
+  expect(selectOverlays([overlay], { graphId: 'self-implement', stage: 'runtime', state: { goal_id: 'fx_forecast_present' } }).applied)
+    .toEqual([]);
+});
+
+test('S2 burst ladder runs all purposes through fake-cloud-vm in an isolated test universe', async () => {
+  await withTestState(async () => {
+    const run = await runScenarioFile('scenarios/ux-sim/burst-ready-ladder.yaml');
+    expect(run.pass).toBe(true);
+    expect(run.burstReadyLadder).toMatchObject({
+      pass: true,
+      mockVmCount: 6,
+      forbiddenTerminateCount: 0,
+      allPreparedOneHourAhead: true,
+      allPrematureAdmissionsRejected: true,
+      allReadyBeforeAdmissionRejected: true,
+      allAdmittedReady: true,
+      allDeadlineDraining: true,
+      allPostExpiryAdmissionsRejected: true,
+      allLeasesDrainedAfterExpiry: true,
+      allPoweredOnDurationMatches: true,
+      allStoppedAfterDrain: true,
+    });
+    expect(run.burstReadyLadder?.runs.map((item) => [item.purpose, item.ttlHours])).toEqual([
+      ['gate', 2], ['gate', 4], ['implementation', 2], ['implementation', 4], ['execution', 2], ['execution', 4],
+    ]);
+    expect(run.logs).toMatchObject({
+      pass: true,
+      category: 'fleet.burst',
+      event: 'ready-ladder-completed',
+      expectedCount: 1,
+      observedCount: 1,
+      matchedData: { runId: run.runId, scenarioId: 'burst-ready-ladder', runCount: 6, mockVmCount: 6 },
+    });
+  });
+});
+
 test('graph runtime scenario fails if the production observer event is dropped before logs.db', { timeout: 30_000 }, async () => {
   await withTestState(async () => {
     const previousFault = process.env.ELANOUS_UX_SIM_TEST_FAULT;
@@ -47,7 +120,7 @@ test('graph runtime scenario fails if the production observer event is dropped b
     try {
       const run = await runScenarioFile('scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml');
       expect(run.pass).toBe(false);
-      expect(run.graphRuntimeOverlay).toEqual({ status: 'failed', decisionObserved: false, overlayApplied: false });
+      expect(run.graphRuntimeOverlay).toMatchObject({ status: 'failed', decisionObserved: false, overlayApplied: false });
       expect(run.failureReasons).toContain('graph-runtime-overlay-result-mismatch');
       expect(run.failureReasons).toContain('expected-log-event-absent');
     } finally {
@@ -66,8 +139,8 @@ test('parallel graph runtime workers keep the parent process state directory unc
         runGraphRuntimeOverlayEventPathDevice(getTestStateRoot()!, randomUUID(), 'parallel-a'),
         runGraphRuntimeOverlayEventPathDevice(getTestStateRoot()!, randomUUID(), 'parallel-b'),
       ]);
-      expect(first).toEqual({ status: 'done', decisionObserved: true, overlayApplied: true });
-      expect(second).toEqual({ status: 'done', decisionObserved: true, overlayApplied: true });
+      expect(first).toMatchObject({ status: 'done', decisionObserved: true, overlayApplied: true });
+      expect(second).toMatchObject({ status: 'done', decisionObserved: true, overlayApplied: true });
       expect(process.env.ELANOUS_STATE_DIR).toBe(initialStateDir);
     } finally {
       removeSink();

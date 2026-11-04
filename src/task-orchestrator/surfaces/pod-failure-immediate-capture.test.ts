@@ -17,10 +17,13 @@ function stage(rows: Array<{ event: string; data: Record<string, unknown> }>) {
   const kubectl = (host: string, args: readonly string[]) => {
     calls.push({ host, args: [...args] });
     if (host !== placement.host || args[0] !== '--context' || args[1] !== placement.context || args[2] !== '-n' || args[3] !== placement.namespace) return { status: 1, stdout: '', stderr: 'wrong placement' };
-    const job = args[5] === 'pods' ? args[7]?.replace('job-name=', '') : args[4] === 'logs' ? args[5]?.replace(/^pod\//, '').replace(/-pod$/, '') : args[6];
+    const eventSelector = args[4] === 'get' && args[5] === 'events' ? args[args.indexOf('--field-selector') + 1] : undefined;
+    const job = eventSelector ? jobs.find(candidate => eventSelector.includes(`uid-${candidate}`))
+      : args[5] === 'pods' ? args[7]?.replace('job-name=', '') : args[4] === 'logs' ? args[5]?.replace(/^pod\//, '').replace(/-pod$/, '') : args[6];
     if (!jobs.includes(job ?? '')) return { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs not found' };
     if (args[4] === 'get' && args[5] === 'job') return { status: 0, stdout: JSON.stringify({ metadata: { name: job, uid: `uid-${job}` }, status: { conditions: [{ type: 'Failed' }] } }), stderr: '' };
     if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: `${job}-pod`, ownerReferences: [{ uid: `uid-${job}` }] } }] }), stderr: '' };
+    if (args[4] === 'get' && args[5] === 'events') return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
     if (args[4] === 'logs') return { status: 0, stdout: `${job} log`, stderr: '' };
     return { status: 1, stdout: '', stderr: 'unsupported' };
   };
@@ -31,6 +34,68 @@ function stage(rows: Array<{ event: string; data: Record<string, unknown> }>) {
 const entered = (job: string, extra: Record<string, unknown> = {}) => ({ event: 'pod-job-applied', data: { job, childRunId: `run-${job}`, jobUid: `uid-${job}`, ...placement, ...extra } });
 
 describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
+  test('failed Job capture stores Kubernetes events alongside termination time and exit evidence', () => {
+    const job = jobs[0]!;
+    const s = stage([{ event: 'pod-child-run', data: { job, childRunId: `run-${job}`, attempt: 1 } }, entered(job)]);
+    const jobEvents = { items: [{ type: 'Warning', reason: 'BackoffLimitExceeded', lastTimestamp: '2026-11-03T05:44:41Z', message: 'job retried' }] };
+    const podEvents = { items: [
+      { type: 'Warning', reason: 'FailedScheduling', lastTimestamp: '2026-11-03T05:44:40Z', message: 'pool had no eligible node' },
+      { type: 'Warning', reason: 'FailedMount', lastTimestamp: '2026-11-03T05:44:42Z', message: 'secret volume unavailable' },
+    ] };
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { phase: 'Failed', containerStatuses: [{ name: 'child', restartCount: 0,
+          state: { terminated: { reason: 'Error', exitCode: 1, finishedAt: '2026-11-03T05:44:43Z' } } }] },
+      }] }), stderr: '' };
+      if (args[4] === 'get' && args[5] === 'events') {
+        const selector = args[args.indexOf('--field-selector') + 1] ?? '';
+        return { status: 0, stdout: JSON.stringify(selector.includes(`uid-${job}`) ? jobEvents : podEvents), stderr: '' };
+      }
+      return s.kubectl(host, args);
+    };
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record });
+    const row = s.rows().at(-1)?.data;
+    expect(row).toMatchObject({ outcome: 'collected', reason: 'job-failed', podPhase: 'Failed',
+      containerReason: 'Error', containerExitCode: 1, containerFinishedAt: '2026-11-03T05:44:43Z',
+      jobEventStatus: 'captured', podEventStatus: 'captured', jobEventCount: 1, podEventCount: 2,
+      latestEventReason: 'FailedMount', latestEventType: 'Warning', latestEventAt: '2026-11-03T05:44:42Z' });
+    expect(JSON.parse(readFileSync(String(row?.jobEventEvidence), 'utf8'))).toEqual(jobEvents);
+    expect(JSON.parse(readFileSync(String(row?.podEventEvidence), 'utf8'))).toEqual(podEvents);
+    expect(JSON.stringify(row)).not.toContain('pool had no eligible node');
+    expect(s.calls.some(call => call.args[4] === 'get' && call.args[5] === 'events')).toBe(true);
+  });
+
+  test('event read refusal is classified and its original SSH stderr is kept private', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    const podUid = `pod-${job}`;
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: podUid, ownerReferences: [{ uid: `uid-${job}` }] },
+        status: { phase: 'Failed', containerStatuses: [{ name: 'child', restartCount: 0,
+          state: { terminated: { reason: 'Error', exitCode: 255, finishedAt: '2026-11-03T05:45:00Z' } } }] },
+      }] }), stderr: '' };
+      if (args[4] === 'get' && args[5] === 'events' && args.includes(`involvedObject.uid=${podUid}`)) {
+        return { status: 255, stdout: '', stderr: 'ssh: connect to host node-b port 22: Connection refused' };
+      }
+      return s.kubectl(host, args);
+    };
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record });
+    const row = s.rows().at(-1)?.data;
+    expect(row).toMatchObject({ outcome: 'collected', podEventStatus: 'read-failed', podEventKubectlStatus: 255,
+      podEventStderrCaptureStatus: 'saved', containerExitCode: 255, containerFinishedAt: '2026-11-03T05:45:00Z' });
+    const stderr = readFileSync(String(row?.podEventStderrEvidence), 'utf8');
+    expect(stderr).toContain('Connection refused');
+    const projection = ledgerLineToLogEvent(JSON.stringify({ runId: 'incident', event: 'pod-failure-capture', data: row }), 'incident');
+    expect(projection?.data).toMatchObject({ podEventStatus: 'read-failed', podEventKubectlStatus: 255,
+      podEventStderrCaptureStatus: 'saved', containerExitCode: 255 });
+    expect(JSON.stringify(projection)).not.toContain('Connection refused');
+    expect(JSON.stringify(projection)).not.toContain(String(row?.podEventStderrEvidence));
+  });
+
   test('pod failure 요약은 허용된 로그 projection에 실리고 credential·본문·artifact path는 제외된다', () => {
     const event = ledgerLineToLogEvent(JSON.stringify({ runId: 'incident', event: 'pod-failure-capture', data: {
       job: 'si-incident', jobUid: 'uid-si-incident', childRunId: 'run-si-incident', host: 'node-b', context: 'k3d-elanous-pool',
@@ -67,14 +132,25 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
       expect(readFileSync(String(row.data.logEvidence), 'utf8')).toContain(String(row.data.job));
       expect(row.data.childRunId).toBe(`run-${row.data.job}`);
     }
-    expect(s.calls).toHaveLength(6);
+    expect(s.calls).toHaveLength(8);
     expect(s.calls.every(call => call.host === 'node-b' && call.args[1] === placement.context && call.args[3] === placement.namespace)).toBe(true);
     const firstEvidence = String(results[0]!.data.jobEvidence);
     expect(readFileSync(firstEvidence, 'utf8')).toContain(jobs[0]!);
     captureFailedPodJobs({ runId: 'incident', job: jobs[0]!, ledgerPath: s.ledger, artifactDir: s.dir, kubectl: s.kubectl, record: s.record, now: () => 2000 });
     expect(readFileSync(firstEvidence, 'utf8')).toContain(jobs[0]!);
-    expect(s.calls).toHaveLength(6);
+    expect(s.calls).toHaveLength(8);
     expect(s.rows().filter(row => row.event === 'pod-failure-capture')).toHaveLength(2);
+  });
+
+  test('완전한 기존 증거를 재사용하면 수집 성공 결과를 돌려주고 중복 조회를 하지 않는다', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    const input = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl: s.kubectl, record: s.record };
+    expect(captureFailedPodJobs(input)).toBeUndefined();
+    const calls = s.calls.length;
+    expect(captureFailedPodJobs(input)).toEqual({ outcome: 'collected', reason: 'existing-evidence-complete' });
+    expect(s.calls).toHaveLength(calls);
+    expect(s.rows().filter(row => row.event === 'pod-failure-capture')).toHaveLength(1);
   });
 
   test('collected 원장 뒤 증거 파일이 사라지면 다시 수집해 유실을 복구한다', () => {
@@ -91,7 +167,7 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
     expect(captures).toHaveLength(2);
     expect(captures[1]?.data).toMatchObject({ outcome: 'collected', reason: 'job-failed' });
     expect(readFileSync(String(captures[1]?.data.logEvidence), 'utf8')).toBe(`${job} log`);
-    expect(s.calls).toHaveLength(6);
+    expect(s.calls).toHaveLength(8);
   });
 
   test('서로 다른 placement와 불완전 placement는 kubectl 없이 fail-closed', () => {
@@ -146,7 +222,7 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
     expect(results.map(row => row.data.outcome)).toEqual(['collected', 'collected']);
     expect(results.map(row => row.data.childRunId)).toEqual([`run-${job}`, 'retry-run']);
     expect(results[0]?.data.jobEvidence).not.toBe(results[1]?.data.jobEvidence);
-    expect(s.calls).toHaveLength(6);
+    expect(s.calls).toHaveLength(8);
   });
 
   test('빈 current log 뒤 previous 로그의 터미널 요약을 attempt와 함께 기록하고 비밀·본문은 원장에 넣지 않는다', () => {
@@ -254,7 +330,7 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
     const recaptured = s.rows().at(-1)?.data;
     expect(recaptured?.outcome).toBe('collected');
     expect(readFileSync(String(recaptured?.logEvidence), 'utf8')).toBe('current container restarted\n');
-    expect(s.calls).toHaveLength(10);
+    expect(s.calls).toHaveLength(18);
   });
 
   test('current 조회 실패와 previous 캡처가 함께 있으면 current stderr를 보존하고 재시도 때 재조회한다', () => {
@@ -369,9 +445,97 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
 
   test('TTL 뒤 Job NotFound는 소멸로 기록하고 성공하지 않는다', () => {
     const s = stage([entered(jobs[0]!)]);
-    const notFound = (_host: string, args: readonly string[]) => { s.calls.push({ host: placement.host, args: [...args] }); return { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs not found' }; };
+    const events = { items: [{ type: 'Warning', reason: 'BackoffLimitExceeded', lastTimestamp: '2026-11-03T06:00:00Z', message: 'private event detail' }] };
+    const notFound = (_host: string, args: readonly string[]) => {
+      s.calls.push({ host: placement.host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'events') return { status: 0, stdout: JSON.stringify(events), stderr: '' };
+      return { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs not found' };
+    };
     captureFailedPodJobs({ runId: 'incident', job: jobs[0]!, ledgerPath: s.ledger, artifactDir: s.dir, kubectl: notFound, record: s.record, now: () => 1_801_000 });
-    expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'vanished', reason: 'job-not-found', job: jobs[0] });
+    const row = s.rows().at(-1)?.data;
+    expect(row).toMatchObject({ outcome: 'vanished', reason: 'job-not-found', job: jobs[0], jobEventStatus: 'captured',
+      jobEventCount: 1, latestEventReason: 'BackoffLimitExceeded', latestEventAt: '2026-11-03T06:00:00Z' });
+    expect(JSON.parse(readFileSync(String(row?.jobEventEvidence), 'utf8'))).toEqual(events);
+    expect(JSON.stringify(row)).not.toContain('private event detail');
+  });
+
+  test('Job 소실 뒤 추가·갱신된 이벤트를 기존 artifact에 병합한다', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    let read = 0;
+    const eventSnapshots = [
+      { items: [{ metadata: { uid: 'event-a', name: 'failed-a' }, reason: 'BackoffLimitExceeded', lastTimestamp: '2026-11-03T06:02:00Z', count: 4 }] },
+      { items: [
+        { metadata: { uid: 'event-a', name: 'failed-a' }, reason: 'StaleBackoffLimitExceeded', lastTimestamp: '2026-11-03T06:01:00Z', count: 2 },
+        { metadata: { uid: 'event-b', name: 'failed-b' }, reason: 'FailedScheduling', lastTimestamp: '2026-11-03T06:01:00Z' },
+      ] },
+    ];
+    const notFound = (_host: string, args: readonly string[]) => {
+      s.calls.push({ host: placement.host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'events') return { status: 0, stdout: JSON.stringify(eventSnapshots[Math.min(read++, 1)]), stderr: '' };
+      return { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs not found' };
+    };
+    const firstInput = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl: notFound, record: s.record, now: () => 1_801_000 };
+    const secondInput = { ...firstInput, now: () => 1_802_000 };
+    captureFailedPodJobs(firstInput);
+    expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'vanished', jobEventStatus: 'captured' });
+    const previousPath = String(s.rows().at(-1)?.data.jobEventEvidence);
+    const previousSnapshot = readFileSync(previousPath, 'utf8');
+    captureFailedPodJobs(secondInput);
+    const path = String(s.rows().at(-1)?.data.jobEventEvidence);
+    const stored = JSON.parse(readFileSync(path, 'utf8')) as { items: Array<{ metadata: { uid: string }; count?: number; reason?: string; lastTimestamp?: string }> };
+    expect(path).not.toBe(previousPath);
+    expect(readFileSync(previousPath, 'utf8')).toBe(previousSnapshot);
+    expect((JSON.parse(previousSnapshot) as { items: unknown[] }).items).toHaveLength(1);
+    expect(stored.items).toHaveLength(2);
+    expect(stored.items.find(item => item.metadata.uid === 'event-a')).toMatchObject({ count: 4, reason: 'BackoffLimitExceeded', lastTimestamp: '2026-11-03T06:02:00Z' });
+    expect(stored.items.some(item => item.metadata.uid === 'event-b')).toBe(true);
+    expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'vanished', jobEventStatus: 'captured', jobEventCount: 2,
+      latestEventReason: 'BackoffLimitExceeded', latestEventAt: '2026-11-03T06:02:00Z' });
+  });
+
+  test('event read failure is retried instead of deduped as complete', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    let eventReads = 0;
+    const kubectl = (host: string, args: readonly string[]) => {
+      s.calls.push({ host, args: [...args] });
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [{
+        metadata: { name: `${job}-pod`, uid: `pod-${job}`, ownerReferences: [{ uid: `uid-${job}` }] },
+      }] }), stderr: '' };
+      if (args[4] === 'get' && args[5] === 'events') {
+        eventReads++;
+        return eventReads === 1 ? { status: 255, stdout: '', stderr: 'ssh: connect to host node-b: Connection refused' }
+          : { status: 0, stdout: JSON.stringify({ items: [{ type: 'Warning', reason: 'FailedScheduling', eventTime: '2026-11-03T06:01:00Z' }] }), stderr: '' };
+      }
+      return s.kubectl(host, args);
+    };
+    const input = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl, record: s.record };
+    captureFailedPodJobs(input);
+    expect(s.rows().at(-1)?.data).toMatchObject({ jobEventStatus: 'read-failed' });
+    captureFailedPodJobs(input);
+    expect(s.rows().at(-1)?.data).toMatchObject({ jobEventStatus: 'captured', jobEventCount: 1, latestEventReason: 'FailedScheduling' });
+    expect(eventReads).toBe(4);
+  });
+
+  test('event artifact write failure is retried after the path becomes writable', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    const evidenceDir = join(s.dir, 'pod-failure-capture', 'incident', job, `run-${job}`);
+    mkdirSync(evidenceDir, { recursive: true });
+    const invalidSnapshot = join(evidenceDir, 'job.events.legacy.json');
+    writeFileSync(invalidSnapshot, 'invalid');
+    const notFound = (_host: string, args: readonly string[]) => args[5] === 'events'
+      ? { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' }
+      : { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs not found' };
+    const input = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, kubectl: notFound, record: s.record };
+    captureFailedPodJobs(input);
+    expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'vanished', jobEventStatus: 'write-failed' });
+    rmSync(invalidSnapshot);
+    captureFailedPodJobs(input);
+    const recovered = s.rows().at(-1)?.data;
+    expect(recovered).toMatchObject({ outcome: 'vanished', jobEventStatus: 'empty', jobEventCount: 0 });
+    expect(JSON.parse(readFileSync(String(recovered?.jobEventEvidence), 'utf8'))).toEqual({ items: [] });
   });
 
   test('Job 조회 실패는 SSH stderr 꼬리와 종료 코드를 사설 증거로 남긴다', () => {
@@ -473,7 +637,7 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
         expect(row.data).toMatchObject({ outcome: 'collected', reason: 'job-failed', runId, childRunId: 'run-child', jobUid: '12345678-1234-1234-1234-123456789abc', ...placement, capturedAt: new Date(1000).toISOString() });
         expect(readFileSync(String(row.data.logEvidence), 'utf8')).toBe(`${placement.host}:${row.data.job} log`);
       }
-      expect(reads).toHaveLength(6);
+      expect(reads).toHaveLength(8);
       expect(reads.every(read => read.host === 'node-b' && read.args[1] === placement.context && read.args[3] === placement.namespace)).toBe(true);
       const foreignJob = podJobName('foreign-host');
       appendRunLedgerEntry({ runId, event: 'pod-job-applied', data: { job: foreignJob, childRunId: 'run-child', jobUid: '12345678-1234-1234-1234-123456789abc', ...placement, host: 'other-host' } }, dir);
@@ -481,7 +645,7 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
         env: { ELANOUS_RUN_ID: runId, ELANOUS_STATE_DIR: root }, credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }), now: () => 1000 })({ spaceId: 'foreign-host', feature: 'test' }).done;
       const after = readFileSync(runLedgerPath(runId, dir), 'utf8').trim().split('\n').map(line => JSON.parse(line) as { event: string; data: Record<string, unknown> });
       expect(after.filter(row => row.event === 'pod-failure-capture' && row.data.job === foreignJob).at(-1)?.data).toMatchObject({ outcome: 'failed', reason: 'placement-conflict' });
-      expect(reads).toHaveLength(6);
+      expect(reads).toHaveLength(8);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

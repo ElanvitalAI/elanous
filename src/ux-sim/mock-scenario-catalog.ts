@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 export interface MockScenarioDevice {
   id: string;
   name: string;
+  /** Checklist requests this device explicitly covers. */
+  checklistCells?: string[];
   implementation: string[];
   tests: string[];
   target: string;
@@ -13,6 +15,16 @@ export interface MockScenarioDevice {
   logsRecorded: 'yes' | 'no' | 'conditional' | 'runner-dependent';
   eventNames: string[];
   recentUse: { observedAt: string; runId: string; event: string; scenarioId: string; command: string } | null;
+}
+
+/** File-level inventory backing the grouped, runnable device records above. */
+export interface MockScenarioSourceModule {
+  id: string;
+  path: string;
+  boundary: string;
+  deviceIds: string[];
+  integrityCertificatePresent: boolean;
+  integrityCertificatePath: string | null;
 }
 
 export interface MockScenarioEntry {
@@ -40,6 +52,7 @@ export interface MockScenarioCandidate {
 
 export interface MockScenarioCatalog {
   version: 2;
+  deviceCatalogVersion: number;
   worldEvents: Array<{ id: string; name: string; description: string }>;
   runEvidence: {
     scope: string;
@@ -49,6 +62,7 @@ export interface MockScenarioCatalog {
     artifact: string;
   };
   devices: MockScenarioDevice[];
+  sourceModules: MockScenarioSourceModule[];
   scenarios: MockScenarioEntry[];
   candidateAudit: {
     source: string;
@@ -80,6 +94,8 @@ function requireStringArray(value: unknown, path: string, allowEmpty = false): s
   return value as string[];
 }
 
+const CHECKLIST_CELL_ID = /^[A-Z0-9][A-Z0-9-]{0,79}$/;
+
 function uniqueIds(rows: unknown[], path: string): Set<string> {
   const ids = new Set<string>();
   rows.forEach((row, index) => {
@@ -94,6 +110,9 @@ function uniqueIds(rows: unknown[], path: string): Set<string> {
 /** Validate the checked-in index before CLI output or scenario metadata is consumed. */
 export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
   if (!isRecord(value) || value.version !== 2) throw new Error('mock scenario catalog must declare version: 2');
+  if (!Number.isSafeInteger(value.deviceCatalogVersion) || Number(value.deviceCatalogVersion) < 1) {
+    throw new Error('mock scenario catalog must declare a positive deviceCatalogVersion');
+  }
   if (!Array.isArray(value.devices) || !Array.isArray(value.scenarios)) {
     throw new Error('mock scenario catalog requires devices and scenarios arrays');
   }
@@ -114,9 +133,19 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
 
   const devices = value.devices.map((row, index): MockScenarioDevice => {
     if (!isRecord(row)) throw new Error(`devices[${index}] must be an object`);
+    const checklistCells = row.checklistCells === undefined
+      ? undefined
+      : requireStringArray(row.checklistCells, `devices[${index}].checklistCells`);
+    if (checklistCells && new Set(checklistCells).size !== checklistCells.length) {
+      throw new Error(`devices[${index}].checklistCells must not contain duplicates`);
+    }
+    if (checklistCells?.some((cellId) => !CHECKLIST_CELL_ID.test(cellId))) {
+      throw new Error(`devices[${index}].checklistCells must contain valid checklist IDs`);
+    }
     return {
       id: requireString(row.id, `devices[${index}].id`),
       name: requireString(row.name, `devices[${index}].name`),
+      ...(checklistCells ? { checklistCells } : {}),
       implementation: requireStringArray(row.implementation, `devices[${index}].implementation`),
       tests: requireStringArray(row.tests, `devices[${index}].tests`),
       target: requireString(row.target, `devices[${index}].target`),
@@ -126,6 +155,49 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
       logsRecorded: parseLogsRecorded(row.logsRecorded, `devices[${index}].logsRecorded`),
       eventNames: requireStringArray(row.eventNames, `devices[${index}].eventNames`, true),
       recentUse: parseRecentUse(row.recentUse, `devices[${index}].recentUse`),
+    };
+  });
+  const rawSourceModules = value.sourceModules;
+  if (!Array.isArray(rawSourceModules)) throw new Error('sourceModules must be an array');
+  const sourceModuleIds = new Set<string>();
+  const sourceModulePaths = new Set<string>();
+  const sourceModules = rawSourceModules.map((row, index): MockScenarioSourceModule => {
+    const path = `sourceModules[${index}]`;
+    if (!isRecord(row)) throw new Error(`${path} must be an object`);
+    const id = requireString(row.id, `${path}.id`);
+    const sourcePath = requireString(row.path, `${path}.path`);
+    const pathSegments = sourcePath.split('/');
+    if (!sourcePath.startsWith('src/ux-sim/') || sourcePath.includes('\\') || pathSegments.some((segment) => !segment || segment === '.' || segment === '..') || !/\.(?:ts|json)$/.test(sourcePath)) {
+      throw new Error(`${path}.path must stay inside src/ux-sim`);
+    }
+    if (sourceModulePaths.has(sourcePath)) throw new Error(`sourceModules contains duplicate path: ${sourcePath}`);
+    const expectedId = `MD-${sourcePath.replace(/^src\/ux-sim\//, 'UX-SIM-').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').toUpperCase()}`;
+    if (id !== expectedId) throw new Error(`${path}.id must match its stable MD- path name: ${expectedId}`);
+    if (sourceModuleIds.has(id)) throw new Error(`sourceModules contains duplicate id: ${id}`);
+    sourceModuleIds.add(id);
+    sourceModulePaths.add(sourcePath);
+    const deviceIds = requireStringArray(row.deviceIds, `${path}.deviceIds`);
+    if (new Set(deviceIds).size !== deviceIds.length) throw new Error(`${path}.deviceIds must not contain duplicates`);
+    for (const deviceId of deviceIds) {
+      const device = devices.find((entry) => entry.id === deviceId);
+      if (!device) throw new Error(`${path}.deviceIds references unknown device: ${deviceId}`);
+      if (!device.implementation.includes(sourcePath)) throw new Error(`${path}.path is not implemented by ${deviceId}: ${sourcePath}`);
+    }
+    if (typeof row.integrityCertificatePresent !== 'boolean') {
+      throw new Error(`${path}.integrityCertificatePresent must be boolean`);
+    }
+    const integrityCertificatePath = row.integrityCertificatePath === null
+      ? null : requireString(row.integrityCertificatePath, `${path}.integrityCertificatePath`);
+    if (row.integrityCertificatePresent !== Boolean(integrityCertificatePath)) {
+      throw new Error(`${path}.integrityCertificatePath must agree with integrityCertificatePresent`);
+    }
+    return {
+      id,
+      path: sourcePath,
+      boundary: requireString(row.boundary, `${path}.boundary`),
+      deviceIds,
+      integrityCertificatePresent: row.integrityCertificatePresent,
+      integrityCertificatePath,
     };
   });
   const scenarios = value.scenarios.map((row, index): MockScenarioEntry => {
@@ -266,8 +338,10 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
   const discovery = value.discovery;
   return {
     version: 2,
+    deviceCatalogVersion: Number(value.deviceCatalogVersion),
     worldEvents,
     devices,
+    sourceModules,
     scenarios,
     candidateAudit: {
       source: requireString(candidateAudit.source, 'candidateAudit.source'),
@@ -342,6 +416,8 @@ export function renderMockScenarioDevices(catalog: MockScenarioCatalog): string[
       `recent=${device.recentUse ? `${device.recentUse.observedAt} runId=${device.recentUse.runId} event=${device.recentUse.event} scenario=${device.recentUse.scenarioId} cmd=${device.recentUse.command}` : '(not recorded)'}`,
     ].join('\t')),
     `omission check: required=${catalog.candidateAudit.omissionCheck.requiredPaths.length} missing=${catalog.candidateAudit.omissionCheck.missingPaths.length}`,
+    'Source module registry · MD name · file boundary · integrity certificate (recorded)',
+    ...catalog.sourceModules.map((module) => `${module.id}\t${module.path}\t${module.boundary}\tdevices=${module.deviceIds.join(',')}\tcertificate=${module.integrityCertificatePresent ? module.integrityCertificatePath : 'no'}`),
   ];
 }
 
@@ -357,6 +433,12 @@ export function renderMockScenarioDeviceMarkdownTable(catalog: MockScenarioCatal
         : '기록 없음';
       return `| ${escape(device.id)} | ${escape(device.name)} | 구현: ${escape(device.implementation.join('<br>'))}<br>시험: ${escape(device.tests.join('<br>'))} | ${escape(device.entryCommands.join('<br>'))} | ${escape(device.logsRecorded)} · ${escape(device.eventNames.join(', ') || '(없음)')} | ${escape(recent)} |`;
     }),
+    '',
+    '### Source-file registry',
+    '',
+    '| MD name | Source file | Boundary | Owning device IDs | Integrity certificate recorded |',
+    '|---|---|---|---|---|',
+    ...catalog.sourceModules.map((module) => `| ${escape(module.id)} | ${escape(module.path)} | ${escape(module.boundary)} | ${escape(module.deviceIds.join(', '))} | ${module.integrityCertificatePresent ? escape(module.integrityCertificatePath ?? 'yes') : 'no'} |`),
   ];
 }
 

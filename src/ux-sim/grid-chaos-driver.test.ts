@@ -8,6 +8,7 @@ function topology(): GridChaosTopology {
     id: hostId,
     sessions: [1, 2].map((index) => ({
       id: `${hostId}-session-${index}`,
+      processId: `${hostId}-process-${index}`,
       leaseId: `${gridId}-${hostId}-lease-${index}`,
       podDeathScenario: podDeathAfterPartialScenario({
         job: `${hostId}-job-${index}`,
@@ -88,7 +89,10 @@ test('grid chaos: 10 seeds deterministically inject monkey, gorilla, and kong in
       const kong = byAttack.get('kong')!;
       expect(monkey.targetGridId).not.toBe('G0');
       expect(monkey.targetHostIds).toHaveLength(1);
-      expect(['host', 'session']).toContain(monkey.scope);
+      expect(monkey.scope).toBe('process');
+      expect(monkey.targetProcessIds).toHaveLength(1);
+      expect(monkey.affectedSessionIds).toHaveLength(1);
+      expect(monkey.targetProcessIds[0]).toContain('-process-');
       expect(gorilla.targetGridId).not.toBe('G0');
       expect(gorilla.targetHostIds).toHaveLength(2);
       expect(kong.targetGridId).toBe('G0');
@@ -121,4 +125,33 @@ test('grid chaos: rejects a missing Pod-death fixture before mutating the ledger
     .toThrow('requires a pod-death fixture');
   expect(ledger.events).toEqual([]);
   expect([...ledger.leases.values()].every((state) => state === 'active')).toBe(true);
+});
+
+test('grid chaos: requires explicit process identity before mutating the ledger', () => {
+  const input = topology();
+  Reflect.set(input.grids[1]!.hosts[0]!.sessions[0]!, 'processId', '  ');
+  const ledger = recordingLedger(input);
+  const clock = { now: () => 0, tick: () => {}, setTime: () => {}, pendingTimers: () => 0 };
+  expect(() => simulateGridChaos({ seed: 1, topology: input, ledger: ledger.ledger, clock }))
+    .toThrow('requires a process id');
+  expect(ledger.events).toEqual([]);
+  expect([...ledger.leases.values()].every((state) => state === 'active')).toBe(true);
+});
+
+test('grid chaos: monkey kills all leases attached to exactly one process', async () => {
+  const input = topology();
+  for (const host of input.grids.flatMap(({ hosts }) => hosts)) {
+    host.sessions[1]!.processId = host.sessions[0]!.processId;
+  }
+  const recorded = recordingLedger(input);
+  await withSimClock(0, async (clock) => {
+    const result = simulateGridChaos({ seed: 7, topology: input, ledger: recorded.ledger, clock });
+    const monkey = result.events.find(({ attack }) => attack === 'monkey')!;
+    const attackedHost = input.grids.flatMap(({ hosts }) => hosts).find(({ id }) => id === monkey.targetHostIds[0])!;
+    expect(monkey.scope).toBe('process');
+    expect(monkey.targetProcessIds).toEqual([attackedHost.sessions[0]!.processId]);
+    expect(monkey.affectedSessionIds).toEqual(attackedHost.sessions.map(({ id }) => id));
+    expect(monkey.affectedLeaseIds).toEqual(attackedHost.sessions.map(({ leaseId }) => leaseId));
+    expect(result.duplicateLeaseLosses).toEqual([]);
+  });
 });

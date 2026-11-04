@@ -6,8 +6,7 @@ import { tmpdir } from 'node:os';
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
 import { getTestStateRoot } from '../nexus/paths.js';
-import { createFakePrimaryControl, runWarmPoolReuseSimulation, type WarmPoolReuseFault }
-  from './warm-pool-reuse-sim.js';
+import { createFakePrimaryControl, runWarmPoolReuseSimulation, simulateWarmPoolMachineLossRecovery, type WarmPoolReuseFault } from './warm-pool-reuse-sim.js';
 
 test('fake primary preserves member and machine lease scope contract', async () => {
   const primary = await createFakePrimaryControl();
@@ -114,4 +113,13 @@ test('WARM-POOL-REUSE-SIM: production reconcile selects a gate worker; refusals 
     sink.flush(); unregister(); sink.close(); store.close();
     if (!getTestStateRoot()) rmSync(stateRoot, { recursive: true, force: true });
   }
+});
+
+
+test('WARM-POOL-REUSE-SIM: disappearing mesh member reclaims its lease and reassigns same digest', async () => {
+  const result = await simulateWarmPoolMachineLossRecovery();
+  expect(result).toMatchObject({ reason: 'machine-disappeared', lostHost: 'pool-host-a', lostLeaseCount: 1,
+    reassignedHost: 'pool-host-b', providerSelection: { selected: true, transport: 'observed', reason: 'complete', workerId: expect.stringMatching(/^warm-pool-host-b-[a-f0-9]+-standard-1$/) }, providerTemplate: { host: 'pool-host-b', slotCount: 1, imageDigest: expect.stringMatching(/^sha256:/) }, digest: expect.stringMatching(/^sha256:/), leaseReaped: true, ledgerReason: 'machine-disappeared', podReceipt: { lastJob: 'crawl-shard-1', cleanupResult: { state: 'unknown' } } });
+  expect(result.events).toContainEqual(expect.objectContaining({ type: 'vm-disappeared', id: 'pool-host-a', lostLeases: 1 }));
+  expect(result.events).toContainEqual(expect.objectContaining({ type: 'lease-opened', id: 'pool-host-b' }));
 });

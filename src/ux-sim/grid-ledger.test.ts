@@ -132,7 +132,7 @@ describe('grid-ledger', () => {
         const sessionId = `${host}-session`;
         const leaseId = `${host}-lease`;
         hostRows.push({ grid: gridId, host, sessionId, leaseId });
-        return { id: host, sessions: [{ id: sessionId, leaseId,
+        return { id: host, sessions: [{ id: sessionId, processId: `${sessionId}-process`, leaseId,
           podDeathScenario: podDeathAfterPartialScenario({ job: `${host}-job`, runId: `${host}-run` }) }] };
       }) })),
     };

@@ -12,9 +12,10 @@ import {
   buildAgentOutputTool,
   dispatchAgentOutput,
 } from '../src/agent/agent-output-tool.ts';
-import { AgentRegistry } from '../src/agent/registry.ts';
+import { AgentRegistry, globalAgentRegistry } from '../src/agent/registry.ts';
 import type { AgentDefinition, AgentTask } from '../src/agent/types.ts';
 import { debug } from '../src/debug/log.js';
+import { agentOutputRuntime } from '../src/tool-runtime/agent-output-runtime.js';
 
 function def(): AgentDefinition {
   return { name: 'output-test', systemPrompt: '' };
@@ -159,6 +160,55 @@ describe('AgentOutput tool', () => {
     expect(r.retrievalStatus).toBe('success');
     expect(r.state).toBe('done');
     expect(r.text).toBe('streamed answer');
+  });
+
+  test('aborting the parent turn stops waiting but leaves the background task running', async () => {
+    const registry = reg();
+    const task = registry.register(def(), 'slow child');
+    task.state = 'running';
+    task.startedAt = Date.now();
+    let listenerDisposed = false;
+    let timerDisposed = false;
+    const subscribe = registry.onTaskDone.bind(registry);
+    registry.onTaskDone = (listener) => {
+      const subscription = subscribe(listener);
+      return { dispose: () => { listenerDisposed = true; subscription.dispose(); } };
+    };
+    const controller = new AbortController();
+    const pending = dispatchAgentOutput(
+      { taskId: task.id, block: true, timeoutMs: DEFAULT_AGENT_OUTPUT_TIMEOUT_MS },
+      { registry, signal: controller.signal, setTimer: () => ({ dispose: () => { timerDisposed = true; } }) },
+    );
+
+    controller.abort(new Error('seat turn wall-clock cap reached'));
+    const r = await pending;
+
+    expect(r).toMatchObject({ retrievalStatus: 'interrupted', state: 'running', taskId: task.id });
+    expect(registry.get(task.id)?.state).toBe('running');
+    expect(listenerDisposed).toBe(true);
+    expect(timerDisposed).toBe(true);
+    markDone(task, 'finished in background', registry);
+    expect(await dispatchAgentOutput({ taskId: task.id }, { registry })).toMatchObject({
+      retrievalStatus: 'success', state: 'done', text: 'finished in background',
+    });
+  });
+
+  test('ToolRuntime forwards the parent turn signal to the blocking wait', async () => {
+    globalAgentRegistry.clear();
+    try {
+      const task = globalAgentRegistry.register(def(), 'runtime slow child');
+      task.state = 'running';
+      const controller = new AbortController();
+      const pending = agentOutputRuntime.run(
+        { taskId: task.id, block: true, timeoutMs: DEFAULT_AGENT_OUTPUT_TIMEOUT_MS },
+        { surface: 'tui', signal: controller.signal },
+      );
+      controller.abort();
+      await expect(pending).resolves.toMatchObject({ retrievalStatus: 'interrupted', state: 'running' });
+      expect(globalAgentRegistry.get(task.id)?.state).toBe('running');
+    } finally {
+      globalAgentRegistry.clear();
+    }
   });
 
   test('running task, block=true, timeout reports task elapsed time and retry guidance', async () => {

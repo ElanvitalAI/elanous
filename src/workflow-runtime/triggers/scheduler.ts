@@ -49,7 +49,7 @@ export interface SchedulerOpts {
   clearInterval?: (handle: IntervalHandle) => void;
   /** Inject for tests so we can avoid real cron wall-clock waits.
    *  Defaults to `node-cron`. Must return an object with `stop()`. */
-  cronSchedule?: (expr: string, cb: () => void) => CronTaskLike;
+  cronSchedule?: (expr: string, cb: () => void, timeZone: string) => CronTaskLike;
 }
 
 const MIN_INTERVAL_MS = 1_000;
@@ -65,9 +65,9 @@ export function startScheduler(opts: SchedulerOpts): SchedulerHandle {
   // 옵션을 안 넘기면 node-cron 이 프로세스 주변 TZ 를 쓰는데, launchd 데몬은 `TZ` 를
   // 물려받지 못해 환경에 따라 조용히 밀린다. 계약: src/time/format.ts
   const timeZone = resolveTimeZone().timeZone;
-  const cronScheduleFn: (expr: string, cb: () => void) => CronTaskLike =
+  const cronScheduleFn: (expr: string, cb: () => void, timeZone: string) => CronTaskLike =
     opts.cronSchedule
-    ?? ((expr, cb) => cron.schedule(expr, cb, { timezone: timeZone }) as unknown as CronTaskLike);
+    ?? ((expr, cb, zone) => cron.schedule(expr, cb, { timezone: zone }) as unknown as CronTaskLike);
 
   const handles: IntervalHandle[] = [];
   const cronTasks: CronTaskLike[] = [];
@@ -102,7 +102,7 @@ export function startScheduler(opts: SchedulerOpts): SchedulerHandle {
       }
       const task = cronScheduleFn(expr, () => {
         void opts.runWorkflow(entry);
-      });
+      }, timeZone);
       cronTasks.push(task);
     } else {
       skipped.push({

@@ -315,18 +315,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const sidetabWidth = sidetabOpen ? sidetabApi!.sidetabWidthForTerminal(columns) : 0;
     const chatColumns = columns - sidetabWidth - (sidetabOpen ? 1 : 0);
     const backgroundLine = backgroundJobs.line();
-    const footerRows = backgroundLine ? 2 : 1;
-    const history = [
-      ...logViewLines(messages, chatColumns, expandedToolBlocks),
-      ...notices.map((line) => fitLogLine(line, chatColumns)),
-      ...activity.map((line) => fitLogLine(line, chatColumns)),
-    ];
-    const bodyRows = rows - 3 - footerRows;
-    maxScroll = Math.max(0, history.length - bodyRows);
-    scroll = Math.min(scroll, maxScroll);
-    const start = Math.max(0, history.length - bodyRows - scroll);
-    const body = history.slice(start, start + bodyRows);
-    logWindow = { start, rows: bodyRows, columns: chatColumns };
+    const showSelfHealth = selfHealthLine !== null && rows >= 7;
     const title = fitLogLine(`elanous next · ${safeLogText(nextTuiTitle(session?.meta)).split('\n')[0]}`, chatColumns);
     const turnStatus = (!busy && focus === 'log'
       ? `로그 탐색 · ↑↓ 스크롤${toolFoldBlockStarts(messages, chatColumns).length > 0 ? ' · Enter 접기/펼치기' : ''} · Esc 입력`
@@ -336,17 +325,37 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       : [fitLogLine(turnStatus, chatColumns)];
     const prompt = composerViewport(editor, chatColumns);
     const header = [title, mailLine ? fitLogLine(mailLine, chatColumns) : '─'.repeat(Math.min(chatColumns, 80))];
-    if (selfHealthLine) header.push(fitLogLine(selfHealthLine, chatColumns));
+    if (showSelfHealth) header.push(fitLogLine(selfHealthLine!, chatColumns));
     if (atPicker) {
-      const limit = Math.max(1, Math.min(6, rows - 8));
-      const start = Math.max(0, Math.min(atPicker.selected - limit + 1, atPicker.candidates.length - limit));
-      const visible = atPicker.candidates.slice(start, start + limit);
-      header.push(fitLogLine(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음', chatColumns));
-      for (const [offset, candidate] of visible.entries()) {
-        header.push(fitLogLine((start + offset === atPicker.selected ? '▸' : ' ') + ' ' + candidate.label, chatColumns));
+      // Reserve the prompt, footer, and picker heading before assigning candidate rows.
+      const pickerRows = rows - header.length - footer.length - 1;
+      if (pickerRows > 0) {
+        const limit = Math.max(0, Math.min(6, pickerRows - 1));
+        const start = Math.max(0, Math.min(atPicker.selected - limit + 1, atPicker.candidates.length - limit));
+        const visible = atPicker.candidates.slice(start, start + limit);
+        header.push(fitLogLine(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음', chatColumns));
+        for (const [offset, candidate] of visible.entries()) {
+          header.push(fitLogLine((start + offset === atPicker.selected ? '▸' : ' ') + ' ' + candidate.label, chatColumns));
+        }
       }
     }
-    const lines = [...header, ...body, ...footer, prompt.line];
+    const history = [
+      ...logViewLines(messages, chatColumns, expandedToolBlocks),
+      ...notices.map((line) => fitLogLine(line, chatColumns)),
+      ...activity.map((line) => fitLogLine(line, chatColumns)),
+    ];
+    // Header rows can grow when mail, health, or picker state appears. Preserve
+    // the prompt first, then trim excess header rows before calculating history.
+    const visibleFooter = footer.slice(0, Math.max(0, Math.min(footer.length, rows - 1)));
+    const headerBudget = Math.max(0, rows - visibleFooter.length - 1);
+    const visibleHeader = header.slice(0, headerBudget);
+    const bodyRows = Math.max(0, rows - visibleHeader.length - visibleFooter.length - 1);
+    maxScroll = Math.max(0, history.length - bodyRows);
+    scroll = Math.min(scroll, maxScroll);
+    const start = Math.max(0, history.length - bodyRows - scroll);
+    const body = history.slice(start, start + bodyRows);
+    logWindow = { start, rows: bodyRows, columns: chatColumns };
+    const lines = [...visibleHeader, ...body, ...visibleFooter, prompt.line];
     const promptRow = lines.length;
     const sidetabLines = sidetabOpen
       ? sidetabApi!.formatSidetabLines(sidetabRows, sidetabSelected, sidetabWidth, Math.max(1, rows - 1), sidetabMode)
@@ -624,6 +633,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const messagesAtTurnStart = messages.length;
     // 이번 턴에 자동 압축이 있었나 — 있으면 길이 기준이 깨지므로 «마지막 사람 글 뒤» 로 판정한다.
     let turnCompacted = false;
+    let turnGoalComplete = false;
+    let turnGoalStopReason: string | undefined;
     const abort = new AbortController();
     turnAbort = abort;
     turnDone = import('../tui-client/local-chat-turn.js')
@@ -677,9 +688,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }, attachments, (line) => {
           pushNotice(line);
           render();
+        }).then((result) => {
+          turnGoalComplete = result?.goalComplete === true;
+          turnGoalStopReason = result?.goalStopReason;
         });
       })
-      .then(() => { status = `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`; })
+      .then(() => {
+        status = turnGoalStopReason === 'max_turns'
+          ? 'Turn cap reached — continue with your next input'
+          : `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`;
+      })
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         turnFailed = true;
@@ -706,11 +724,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             debug.log('tui.goal-interim', 'folded', { surface: 'next', ...shown });
           }
         } catch { /* fail-soft: 관측은 턴 정리를 막지 않는다 */ }
+        // Goal completion is terminal even when the person has already drafted the next input.
+        // A real submitted turn calls noteHumanTurn and clears this terminal state.
+        if (goalContinue && turnGoalComplete) goalContinue.noteGoalCompleted();
         // 사람이 쌓아 둔 다음 입력이 먼저다 — 대기열이 비었을 때만 골 이어가기를 잰다.
         if (goalContinue && queue.queuedSubmissions.length === 0 && editor.text.length === 0) {
           try {
-            goalContinue.noteTurnEnded({ lines: dashboardRuntime.replyLinesOfThisTurn(messages, turnCompacted ? 'after-last-user' : messagesAtTurnStart), failed: turnFailed || interrupted });
-            goalContinue.check();
+            if (!turnGoalComplete) {
+              goalContinue.noteTurnEnded({ lines: dashboardRuntime.replyLinesOfThisTurn(messages, turnCompacted ? 'after-last-user' : messagesAtTurnStart), failed: turnFailed || interrupted });
+              goalContinue.check();
+            }
           } catch { /* fail-soft: 골 이어가기는 턴 정리를 막지 않는다 */ }
         } else if (goalContinue && (queue.queuedSubmissions.length > 0 || editor.text.length > 0)) {
           debug.log('tui.proactive', 'yield-user-input', { queued: queue.queuedSubmissions.length, bufferedChars: editor.text.length });

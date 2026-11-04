@@ -1328,7 +1328,9 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--partial', 'GATE-PARTIAL — --from gate 에서 바뀐 시험 ⊕ 앞 실패 ⊕ 바뀐 코드에 import 로 닿는 시험만 다시 돈다(끝이 움직인 --from gate 는 기본 · 의심이면 전체 게이트)')
     .option('--no-partial', 'GATE-REUSE-BY-DIFF 기본 부분 재검을 끄고 전체 게이트')
     .option('--waive <node>', '저장된 실패 노드 한 개를 면제(--from 은 그 노드 그대로)')
+    .option('--owner-waive <node>', '소유자 직권으로 실패 gate를 통과하고 known issue로 기록')
     .option('--reason <text>', '면제 사유 — 공개 알려진 문제에 들어갈 사용자 영향 설명')
+    .option('--approved-by <identity>', '게이트 면제 승인자 — 기본 ELANOUS_SEAT')
     .option('--accepted-regressions <json>', '알려진 문제 추가 입력 JSON 배열 [{"id":"…","note":"…"}]')
     .option('--gate-executor <pod|host>', '다시 도는 gate 의 실행기 전환(--from gate 이전만) — 런 입력에 기록 · 면제 아님')
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 저장된 런 입력 gateRemote)')
@@ -1339,7 +1341,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout(생략 시 현재 폴더)')
     .option('--dry-run', '재개 preflight만 수행하고 런·상태 원장·시도 횟수는 변경하지 않는다')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string; approvedBy?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1351,14 +1353,20 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           }
         }
         if (o.waive !== undefined && !o.waive.trim()) throw new Error('--waive must not be empty');
-        if ((o.waive === undefined) !== (o.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
+        if (o.ownerWaive === undefined && (o.waive === undefined) !== (o.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
         if (o.shardOs !== undefined && o.shardOs !== 'darwin' && o.shardOs !== 'linux') throw new Error('--shard-os must be darwin or linux');
         const shardOs = o.shardOs as 'darwin' | 'linux' | undefined;
-        const from = o.from ?? (o.waive === 'gate' ? 'gate' : undefined);
+        const from = o.from ?? (o.waive === 'gate' || o.ownerWaive === 'gate' ? 'gate' : undefined);
         if (!from) throw new Error('--from is required unless --waive gate is used');
+        const approvedBy = o.approvedBy ?? (o.waive === 'gate' ? process.env.ELANOUS_SEAT : undefined);
+        if (o.ownerWaive !== undefined && !o.reason?.trim()) throw new Error('--owner-waive requires --reason');
+        if (o.ownerWaive !== undefined && !o.approvedBy?.trim()) throw new Error('--owner-waive requires --approved-by');
+        if (o.ownerWaive !== undefined && o.waive !== undefined) throw new Error('--owner-waive and --waive are mutually exclusive');
         const resumeOptions = { runId: o.run, from, partial: o.partial, commandRoot: o.commandRoot,
           ...(o.waive === undefined ? {} : { waive: o.waive }),
+          ...(o.ownerWaive === undefined ? {} : { ownerWaive: o.ownerWaive }),
           ...(o.reason === undefined ? {} : { reason: o.reason }),
+          ...(approvedBy === undefined ? {} : { approvedBy }),
           ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }),
           ...(o.gateExecutor === undefined ? {} : { gateExecutor: o.gateExecutor }),
           ...(o.gateHost === undefined ? {} : { gateHost: o.gateHost }),
@@ -1367,14 +1375,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           ...(o.shardHost === undefined ? {} : { shardHost: o.shardHost }),
           ...(shardOs === undefined ? {} : { shardOs }) };
         if (o.dryRun) {
-          const plan = await planResumeReleaseRun(resumeOptions, { onSource: log });
+          const plan = await planResumeReleaseRun(resumeOptions, { ...resumeDeps, onSource: log });
           const gate = plan.gatePlan.mode === 'not-run' ? 'gate 실행 없음'
             : plan.gatePlan.mode === 'partial' ? `부분 gate 계획 ${plan.partial.requested && plan.partial.applied ? `${plan.partial.files}파일` : '미상'}`
               : `전체 gate${plan.gatePlan.reason ? ` (${plan.gatePlan.reason})` : ''}`;
           log(`· 재개 preflight 통과 · ${plan.version} · ${plan.fromNode}부터 · tip ${plan.tip.to.slice(0, 12)}${plan.tip.changed ? ` (기록 tip ${plan.tip.from.slice(0, 12)}에서 이동)` : ''} · ${gate} · ${plan.priorCountKnown ? `시도 ${plan.nextAttempt}` : `새 원장 기록 ${plan.nextAttempt} (이전 횟수 미측정)`} · 실행·원장 변경 없음`);
           return plan;
         }
-        const result = await resumeReleaseRun(resumeOptions, { onSource: log });
+        const result = await resumeReleaseRun(resumeOptions, { ...resumeDeps, onSource: log });
         const executorOverride = [...(result.state.inputOverrides ?? [])].reverse().find((item) => item.kind === 'gate-executor');
         const poolOverride = [...(result.state.inputOverrides ?? [])].reverse().find((item) => item.kind === 'gate-pod-pool');
         if (o.gateExecutor !== undefined && executorOverride?.kind === 'gate-executor') log(`⇄ gate 실행기 ${executorOverride.set.gateExecutor}${executorOverride.set.gateRemote ? ` @ ${executorOverride.set.gateRemote}` : ''} (런 입력에 기록 · 면제 아님)`);

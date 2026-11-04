@@ -6,6 +6,22 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { simInProcessCli } from './in-process-cli.js';
 
+
+test('in-process CLI restores process.exitCode after a command failure', async () => {
+  const previousExitCode = process.exitCode;
+  try {
+    process.exitCode = undefined;
+    const result = await simInProcessCli(['control', 'member', '--once', '--json'], {
+      allowPaths: [['control', 'member']],
+    });
+    expect(result.exitCode).toBe(2);
+    expect(process.exitCode ?? 0).toBe(0);
+  } finally {
+    process.exitCode = previousExitCode ?? 0;
+  }
+}, 30_000);
+
+
 test('registered where action runs in an isolated universe without spawn', async () => {
   const oldArgv = process.argv;
   const oldState = process.env.ELANOUS_STATE_DIR;
@@ -62,3 +78,16 @@ test('one real CLI process confirms the same where contract at the entry boundar
     rmSync(root, { recursive: true, force: true });
   }
 }, 25_000);
+test('in-process CLI preserves a preexisting nonzero process.exitCode', async () => {
+  const previousExitCode = process.exitCode;
+  try {
+    process.exitCode = 7;
+    const result = await simInProcessCli(['control', 'member', '--once', '--json'], {
+      allowPaths: [['control', 'member']],
+    });
+    expect(result.exitCode).toBe(2);
+    expect(process.exitCode).toBe(7);
+  } finally {
+    process.exitCode = previousExitCode ?? 0;
+  }
+}, 30_000);

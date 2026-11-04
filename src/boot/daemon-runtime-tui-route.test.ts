@@ -41,7 +41,7 @@ test('daemon ACP turns keep every tool and show no route line for a lookup sente
     expect(toolSets[0]!.length).toBeGreaterThan(0);
     expect(toolSets[0]).toEqual(toolSets[1]!);
     expect(pushes.some((delta) => delta.startsWith('라우팅:'))).toBe(false);
-    expect(routeLog.mock.calls.some(([category]) => category === 'chat.route')).toBe(false);
+    expect(routeLog.mock.calls.some(([category]) => category === 'core-turn.route')).toBe(false);
   } finally {
     routeLog.mockRestore();
     resetElanousConfigDir();

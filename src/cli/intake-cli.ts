@@ -11,6 +11,7 @@ import { writeStdoutFully } from './stdout-flush.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config.js';
 import { registerIntakeSourceCommands } from './intake-source-cli.js';
 import type { IntakeItem } from '../intake-plane/items.js';
 import type { CollectSavedResult, FetchSavedMessages } from '../intake-plane/collect-telegram-saved.js';
@@ -95,6 +96,7 @@ export async function runIntakeCandidatesCli(
 
 export interface IntakeDigestCliDeps {
   root?: string;
+  getConfig?: () => UserConfig;
   annotateLens?: (root: string, day: string) => Promise<unknown>;
   buildDigest?: typeof import('../intake-plane/digest.js').buildIntakeDigest;
   sendTelegram?: (text: string) => Promise<boolean | { messageId: number }>;
@@ -160,8 +162,9 @@ export async function runIntakeDigestCli(
   opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string; seat?: string },
   deps: IntakeDigestCliDeps = {},
 ): Promise<{ sent?: boolean; empty?: boolean; arrival?: { messageId: number; absorbedIds: string[] } }> {
-  const { buildIntakeDigest, recordSeatBriefed, renderDigestMarkdown, renderDigestTelegram } = await import('../intake-plane/digest.js');
+  const { buildIntakeDigest, digestTelegramVisibleEntries, recordSeatBriefed, renderDigestMarkdown, renderDigestTelegram } = await import('../intake-plane/digest.js');
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+  const getConfig = deps.getConfig ?? getUserConfig;
   const root = deps.root ?? effectiveInstanceRoot();
   const day = opts.day ?? new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
   // A seat briefing ignores lens rows (digest drops them), so it does not pay for a lens pass over other seats' items.
@@ -177,13 +180,34 @@ export async function runIntakeDigestCli(
   const d = (deps.buildDigest ?? buildIntakeDigest)(root, day, undefined, undefined, seat);
   if (opts.telegram) {
     if (!seat && !d.absorbed.length && !d.news?.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return { empty: true }; }
-    const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
+    const renderOptions: Parameters<typeof renderDigestTelegram>[1] = {
+      ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}),
+    };
+    if (seat === 'user') {
+      const { listSources } = await import('../intake-plane/intake-sources.js');
+      const { kstDay } = await import('../intake-plane/route.js');
+      const topic = getConfig().intake.briefingTopic?.trim();
+      if (topic) {
+        const source = listSources({ seat }, root).find((entry) => entry.id === 'intake-briefing-topic-config'
+          && entry.briefingTopic === topic && entry.lastRunAt && kstDay(entry.lastRunAt) === day);
+        renderOptions.topic = topic;
+        d.absorbed = d.absorbed.filter((entry) => entry.briefingTopic === topic || entry.briefingTopics?.includes(topic));
+        if (source) {
+          const publishers = new Set(digestTelegramVisibleEntries(d).map((entry) => {
+            if (entry.publisher?.trim()) return entry.publisher.trim().toLowerCase();
+            try { return new URL(entry.url!).hostname.toLowerCase().replace(/^www\./, ''); } catch { return undefined; }
+          }).filter((publisher): publisher is string => !!publisher));
+          renderOptions.sourceCount = publishers.size;
+        }
+        renderOptions.collectedAt = source?.lastRunAt;
+      }
+    }
+    const text = renderDigestTelegram(d, renderOptions);
     const delivery = deps.sendTelegram
       ? await deps.sendTelegram(text)
       : await (async () => {
         const { sendTelegramReport } = await import('../telegram-report.js');
-        const { getUserConfig } = await import('../user-config.js');
-        return sendTelegramReport(getUserConfig(), text, { markdown: true, kind: 'intake' });
+        return sendTelegramReport(getConfig(), text, { markdown: true, kind: 'intake' });
       })();
     const sent = typeof delivery === 'boolean' ? delivery : Number.isSafeInteger(delivery.messageId) && delivery.messageId > 0;
     const arrival = typeof delivery === 'boolean' || !sent ? undefined : { messageId: delivery.messageId, absorbedIds: d.absorbed.map((entry) => entry.id) };

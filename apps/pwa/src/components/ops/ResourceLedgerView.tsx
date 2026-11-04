@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { getResourceGuardian, getResourceLedger, type OpsResult, type ResourceGuardianSnapshot, type ResourceLedger } from '@/lib/ops-api';
+import { TrainThroughputView } from './TrainThroughputView';
 
 const quantity = (value: number | null, suffix = '') => value === null ? '미측정' : `${value.toLocaleString()}${suffix}`;
 const bytes = (value: number | null) => value === null ? '미측정' : `${(value / 1024 / 1024).toFixed(0)} MiB`;
@@ -103,5 +104,5 @@ export function ResourceLedgerView(): React.ReactNode {
     setLoading(false);
   }, [client]);
   useEffect(() => { void refresh(); }, [refresh]);
-  return <ResourceLedgerContent result={result} guardianResult={guardianResult} refreshedAt={refreshedAt} onRefresh={() => void refresh()} loading={loading} />;
+  return <><TrainThroughputView /><ResourceLedgerContent result={result} guardianResult={guardianResult} refreshedAt={refreshedAt} onRefresh={() => void refresh()} loading={loading} /></>;
 }

@@ -325,6 +325,7 @@ import { runtimeOverlayRunSteps } from './runtime-overlay-run-steps.js';
 import { activeTemplate, decideTemplate, graphAuthorityFields, nodeNameForStage, overlayDecisionObservation, resolveGraphAuthorityForUserConfig, routeGate, visitBudgetOf } from './graph-authority.js';
 import type { GraphTemplate } from './graph-templates.js';
 import { defaultOverlaysDir, loadGraphOverlays, type GraphOverlaySpec } from './graph-overlay-yaml.js';
+import type { GraphTemplateSpec } from './graph-yaml.js';
 import { defaultGraphsDir, graphIdentityOf, measureL0Coverage, pipelineNodeEntryPayload } from './graph-templates.js';
 import {
   buildStageNodeContext,
@@ -1084,6 +1085,8 @@ export interface SelfImplementSeams {
   writeRunLedger?: RunLedgerWriter;
   /** Atomic sink for one accepted runtime graph overlay's structural event batch. */
   writeRunLedgerBatch?: RunLedgerBatchWriter;
+  /** Test-only mock reviewer outcome consumed by the production runtime graph selector. */
+  injectedReviewOutcomeForTesting?: (input: { readonly runId: string; readonly round: number; readonly state: Readonly<Record<string, unknown>> }) => string | undefined;
   checkUnwiredExports?: typeof findUnwiredExports;
   /** STOP-AUTOHEAL — heal action seams (live mode only runs actions given here; missing = needs-owner). */
   stopAutohealActions?: AutohealActions;
@@ -5473,7 +5476,7 @@ async function runSelfImplementInner(
    *  ⛔ **매번 «기준 선언»에서 다시 얹는다** — 이전 라운드 결과 위에 겹쳐 얹으면
    *    「이 걸음을 무엇이 만들었나」가 «누적»이 되어 사후에 못 푼다.
    *  오버레이 적용은 기존 실행 경로를 그대로 따른다. */
-  const applyRuntimeOverlays = (round: number): void => {
+  const applyRuntimeOverlays = async (round: number): Promise<void> => {
     if (!graphAuthority.enabled) return;
     // ⛔ 「지금 아는 것」만 준다 — 없는 값을 0 으로 지어내지 않는다(key-absent 가 그것을 말한다).
     let stopClass: import('./run-stop.js').RunStopClass | undefined;
@@ -5498,6 +5501,34 @@ async function runSelfImplementInner(
       stage: 'runtime',
       ...(variantSpec ? { specs: { [variantSpec.graphId]: variantSpec } } : {}),
     });
+    if (opts.seams.injectedReviewOutcomeForTesting && decision.appliedIds.length > 0) {
+      const { GRAPH_SPECS } = await import('./graph-templates.js');
+      const { applyGraphOverlays } = await import('./graph-overlay-yaml.js');
+      const { readJourneyEdge, recordJourneyEdge } = await import('../self-dev/graph-journey-route.js');
+      const baseSpec = GRAPH_SPECS[beforeRuntimeGraph.graphId];
+      if (baseSpec) {
+        const routed = applyGraphOverlays(baseSpec, graphOverlays.filter(overlay => decision.appliedIds.includes(overlay.overlayId)));
+        if (routed.ok) {
+          const outcome = opts.seams.injectedReviewOutcomeForTesting({ runId: runIdentity.runId, round, state: runtimeOverlayState });
+          if (outcome !== undefined) {
+            const routeDeps = { base: routed.template as GraphTemplateSpec, overlays: [], profiles: [] };
+            const route = readJourneyEdge('review', outcome, runtimeOverlayState, routeDeps);
+            if (!route.to) throw new Error(`injected review outcome has no graph route: ${outcome}`);
+            recordJourneyEdge(route, route.to, undefined, { runId: runIdentity.runId, injected: true, mockOutcome: outcome });
+            let from = route.to;
+            const visited = new Set([route.from, route.to]);
+            while (true) {
+              if (from === 'merge' || routed.template.terminalNodes.includes(from)) break;
+              const next = readJourneyEdge(from, 'complete', runtimeOverlayState, routeDeps);
+              if (!next.to || visited.has(next.to)) break;
+              visited.add(next.to);
+              recordJourneyEdge(next, next.to, undefined, { runId: runIdentity.runId, injected: true, mockOutcome: outcome });
+              from = next.to;
+            }
+          }
+        }
+      }
+    }
     if (decision.appliedIds.length > 0) {
       graphTemplate = decision.template;
       const structuralEvents = runtimeOverlayRunSteps({
@@ -7738,7 +7769,7 @@ async function runSelfImplementInner(
     try {
       // ⭐ 대표 지시 ③ «다이나믹» — 「실제 구현간에 다이나믹 대응으로 바꿀수 있게」.
       //   ⛔ 라운드 «시작»에 «앞을 보는 것»만 얹는다. 지난 걸음은 안 건드린다.
-      applyRuntimeOverlays(round);
+      await applyRuntimeOverlays(round);
       // ⭐ RFC §5 — 선언된 «방문 예산»을 실행이 «읽는다». ⛔ 관측만이다(막지 않는다) —
       //   「얼마나 물지」를 먼저 재야 하고, 예산부터 걸면 런이 조용히 죽는다.
       onNodeEntry(node('implement'), round);

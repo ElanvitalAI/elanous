@@ -738,6 +738,21 @@ describe('smart plugin wizard — 도구 없음 → 마켓 → 손 둘 개발 �
     mkdirSync(workspace, { recursive: true });
     const claude = packageAt(join(workspace, 'claude-scenario-plugin'), 'claude-scenario-plugin');
     const codex = packageAt(join(workspace, 'codex-scenario-plugin'), 'codex-scenario-plugin');
+    writeFileSync(join(workspace, 'one.txt'), 'one\n');
+    writeFileSync(join(workspace, 'two.txt'), 'two\n');
+    // Classic sidetab now pins both candidate prompts to the workspace HEAD.
+    execFileSync('git', ['init', '--quiet', workspace]);
+    execFileSync('git', ['-C', workspace, 'config', 'user.name', 'Fixture']);
+    execFileSync('git', ['-C', workspace, 'config', 'user.email', 'fixture@example.invalid']);
+    execFileSync('git', ['-C', workspace, 'add', '-A']);
+    execFileSync('git', ['-C', workspace, 'commit', '--quiet', '-m', 'candidate base']);
+    const baseSha = execFileSync('git', ['-C', workspace, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const candidatePatch = (agent: 'claude' | 'codex') => {
+      const file = agent === 'codex' ? 'one' : 'two';
+      return `<SIDETAB-CANDIDATE-V1 base-sha="${baseSha}">\n` +
+        `diff --git a/${file}.txt b/${file}.txt\n--- a/${file}.txt\n+++ b/${file}.txt\n@@ -1 +1 @@\n` +
+        `-${file}\n+${agent}-candidate\n</SIDETAB-CANDIDATE-V1>`;
+    };
     const canonicalCodex = realpathSync(codex);
     const runId = 'DEMO1104-SELF-PLUGIN-mock-20261031T0543KST';
     const wizardEvents: Array<{ ts: string; wizardId: string; step: string; text: string; detail?: unknown }> = [];
@@ -758,9 +773,10 @@ describe('smart plugin wizard — 도구 없음 → 마켓 → 손 둘 개발 �
           agent: 'claude', mission: prompt, parallelMission: prompt,
           spawnVisible: agent => ({ id: `${agent}-mock-pty`, cwd: workspace }),
           runVisible: async (agent, receivedPrompt) => {
-            expect(receivedPrompt).toBe(prompt);
+            expect(receivedPrompt).toContain(prompt);
+            expect(receivedPrompt).toContain(`Parent candidate protocol (base ${baseSha})`);
             const path = agent === 'claude' ? claude : codex;
-            return { ok: true, content: `Implemented local candidate.\nPLUGIN_SPEC=${path}` };
+            return { ok: true, content: `Implemented local candidate.\nPLUGIN_SPEC=${path}\n${candidatePatch(agent)}` };
           },
           registry: createClassicSidetabMissionPairSessionRegistry(),
           hasSession: () => true,

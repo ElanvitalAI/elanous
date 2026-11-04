@@ -3,7 +3,7 @@ import { classifyTuiChatIntent } from './short-question';
 
 // TUI-H1-ROUTE-WRITEVERB-FP (재점검 A · TF 10-17 #28487):
 // «도구 쓰지 말고 답해: … 첫 줄을 그대로 옮기고» 는 복사·전사 지시다 — write-verb 오탐으로
-// 코딩·구현 goal loop 로 가면 chat.route 가 route≠코딩·구현 을 결정한 것과 어긋난다.
+// 코딩·구현 goal loop 로 가면 core-turn.route 가 route≠코딩·구현 을 결정한 것과 어긋난다.
 describe('TUI-H1-ROUTE-WRITEVERB-FP · «도구 쓰지 말고 답해: … 첫 줄을 그대로 옮기고» 오탐 수정', () => {
   test('copy/no-tool directive routes away from 코딩·구현', () => {
     const verdict = classifyTuiChatIntent('도구 쓰지 말고 답해: … 첫 줄을 그대로 옮기고');

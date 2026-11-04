@@ -179,7 +179,7 @@ export async function simInProcessCli(args: readonly string[], options: InProces
       console.error = oldConsoleError;
       restoreCommand?.();
       process.argv = oldArgv;
-      process.exitCode = oldExitCode;
+      process.exitCode = oldExitCode ?? 0;
       if (oldStateEnv === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = oldStateEnv;
       setTestStateRoot(oldTestRoot ?? null);

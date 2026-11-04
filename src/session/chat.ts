@@ -43,6 +43,8 @@ import {
 // chat 툴루프를 canonical 엔진(runGoalLoop→runCoreTurn→streamLLMWithTools)으로 라우팅.
 // ACP bridge(core-turn-bridge.ts)·dashboard(runGoalLoopHook)와 동일 엔진 재사용(재발명 제거).
 import { runCoreTurn, runGoalLoop, type CoreTurnContext, type CoreTurnDispatchTool } from '../core-turn/index.js';
+import { resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
+import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
@@ -178,6 +180,10 @@ export interface RunTurnResult {
    *  prompt. Empty when the store is empty or the user text didn't
    *  match any entries. */
   memoryIds: string[];
+  /** True only when the armed goal loop accepted completion evidence. */
+  goalComplete?: boolean;
+  /** Terminal reason from the armed goal loop, used by the TUI to explain a seat cap. */
+  goalStopReason?: string;
 }
 
 export interface CreateRunTurnSessionOpts extends Partial<CreateSessionOpts> {
@@ -469,6 +475,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   let used = 0;
   const turnStartedAt = Date.now();
   let text = '';
+  let goalComplete = false;
+  let goalStopReason: string | undefined;
   // Branch — tool-loop path when caller supplies a non-empty tool
   // catalog (CLI agent surface), legacy text-only stream otherwise
   // (telegram, discord, scheduler, etc — all unchanged).
@@ -510,7 +518,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     // ⭐ substrate 통합 — goal-loop 아밍 시 canonical 엔진(runGoalLoop→runCoreTurn→
     // streamLLMWithTools)으로 라우팅. 미아밍이면 아래 기존 single-turn 경로 그대로(회귀 0).
     const goalLoopCfg = opts.userConfig.llm.goalLoop;
-    const armGoalLoop = opts.goalLoop === true || goalLoopCfg?.enabled === true;
+    const cwdSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1];
+    const envSeat = process.env.COORD_ID?.trim();
+    const seat = opts.utteranceSurface === 'tui' ? (cwdSeat ?? envSeat)?.toUpperCase() : undefined;
+    const tuiIntent = opts.utteranceSurface === 'tui'
+      ? classifyTuiChatIntent(opts.userText, { seat: seat !== undefined })
+      : undefined;
+    const armGoalLoop = opts.goalLoop === true || goalLoopCfg?.enabled === true || tuiIntent?.goalLoop === true;
     const armResearchTurn = (opts.utteranceSurface === 'tui' || opts.utteranceSurface === 'ask')
       && turnTools.length > 0 && isResearchAgentIntent(opts.userText);
     if (armGoalLoop || armResearchTurn) {
@@ -571,8 +585,19 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       };
       const maxIterations = opts.goalLoopMaxIterations ?? goalLoopCfg?.maxIterations;
       if (armGoalLoop) {
-        const gl = await runGoalLoop(coreCtx, maxIterations !== undefined ? { maxIterations } : {});
+        const cwdSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1];
+        const envSeat = process.env.COORD_ID?.trim();
+        const seat = opts.utteranceSurface === 'tui' ? (cwdSeat ?? envSeat)?.toUpperCase() : undefined;
+        const seatTurnCap = seat
+          ? { ...resolveSeatTurnCap(opts.userConfig.chat.seatTurnCap), seat }
+          : undefined;
+        const gl = await runGoalLoop(coreCtx, {
+          ...(maxIterations !== undefined ? { maxIterations } : {}),
+          ...(seatTurnCap ? { seatTurnCap } : {}),
+        });
         text = gl.finalText;
+        goalComplete = gl.goalComplete;
+        goalStopReason = gl.stopReason;
       } else {
         const coreResult = await runCoreTurn(coreCtx);
         text = coreResult.finalText;
@@ -683,6 +708,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     provider: provider.name,
     model: resolvedModel,
     memoryIds,
+    ...(goalComplete ? { goalComplete: true } : {}),
+    ...(goalStopReason ? { goalStopReason } : {}),
   };
 }
 

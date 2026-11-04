@@ -1,0 +1,32 @@
+version: 0
+id: demo1104-research-arg-graph
+isolation: test
+seed: 110403
+triggers:
+  - id: research-arg-runtime-overlay
+    type: ux.graph-runtime-overlay.evaluate
+    goal_id: fx_forecast_missing
+expect:
+  screen:
+    mode: widget
+    snapshot:
+      contains:
+        - "2027 사업계획 ARG simulation"
+        - "status=done"
+        - "decisionObserved=true"
+        - "overlayApplied=true"
+        - "selectedPath=review>fx-scenario-quantification>merge"
+        - "routeOutcome=injected:mock-outcome(source_missing)"
+        - "graphEvent0=node-added:fx-scenario-quantification"
+        - "graphEvent1=edge-rerouted:fx-scenario-quantification>merge"
+        - "graphEvent2=edge-rerouted:review>fx-scenario-quantification"
+  logs:
+    - category: self-implement
+      event: graph-overlay-decision
+      level: debug
+      count: 1
+      data:
+        runId: "$runId"
+        stage: runtime
+        applied:
+          - demo1104-research-arg-runtime

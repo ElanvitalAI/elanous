@@ -5,23 +5,35 @@ import { Frames, launch, PUBLIC_LEAK_CHECK, sleep } from './lib/cdp.js';
 import { EMPTY_STATE_PHRASES, failedApiResponse, judgeRun, judgeScene, worstSceneState, type SceneObservation, type SceneState } from './lib/rehearsal-verdict.js';
 export { EMPTY_STATE_PHRASES } from './lib/rehearsal-verdict.js';
 
-const TITLES = ['문서 아키텍처', '라이브 트레이스', '루프 에이전트', '그래프 편집기', '마법사 → 마켓', 'PTY 인텔리전스'];
+const SCENES = [
+  { id: 1, title: '문서 아키텍처' },
+  { id: 2, title: '라이브 트레이스' },
+  { id: 3, title: '루프 에이전트' },
+  { id: 4, title: '그래프 편집기' },
+  { id: 5, title: '마법사 → 마켓' },
+  { id: 6, title: 'PTY 인텔리전스' },
+] as const;
 
 export function sceneSnapshotScript(): string {
   return `(()=>{const sections=[...document.querySelectorAll('[data-inside-scene]')]; const visible=sections.filter(s=>!s.hidden && s.getClientRects().length>0); const text=visible.length===1?visible[0].innerText:''; return {sectionsInDom:sections.length,visibleScene:visible.length===1?Number(visible[0].getAttribute('data-inside-scene')):null,textLength:text.length,emptyStates:${JSON.stringify(EMPTY_STATE_PHRASES)}.filter(phrase=>text.includes(phrase))}})()`;
 }
 
-type Args = { url: string; out: string; secs: number; width: number; height: number; demo: boolean; tokenStdin: boolean };
+type Args = { url: string; out: string; secs: number; width: number; height: number; demo: boolean; tokenStdin: boolean; scene?: number };
 
 export function parseArgs(argv: string[]): Args {
   const values = new Map<string, string>();
   let demo = true;
   let tokenStdin = false;
+  let sceneSeen = false;
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
     if (key === '--no-demo') { demo = false; continue; }
     if (key === '--token-stdin') { tokenStdin = true; continue; }
-    if (!['--url', '--out', '--secs', '--size'].includes(key ?? '')) throw new Error(`알 수 없는 인자: ${key}`);
+    if (!['--url', '--out', '--secs', '--size', '--scene'].includes(key ?? '')) throw new Error(`알 수 없는 인자: ${key}`);
+    if (key === '--scene') {
+      if (sceneSeen) throw new Error('--scene은 한 번만 지정할 수 있습니다');
+      sceneSeen = true;
+    }
     const value = argv[++i];
     if (!value || value.startsWith('--')) throw new Error(`${key} 값이 필요합니다`);
     values.set(key!, value);
@@ -36,7 +48,22 @@ export function parseArgs(argv: string[]): Args {
   if (!/^\d+(?:\.\d+)?$/.test(secsText) || !Number.isFinite(secs) || secs <= 0) throw new Error('--secs는 양의 초여야 합니다');
   const size = /^(\d+)x(\d+)$/.exec(values.get('--size') ?? '1920x1080');
   if (!size || +size[1]! < 1 || +size[2]! < 1 || !Number.isSafeInteger(+size[1]!) || !Number.isSafeInteger(+size[2]!)) throw new Error('--size는 양의 WxH여야 합니다');
-  return { url: base.origin, out, secs, width: +size[1]!, height: +size[2]!, demo, tokenStdin };
+  const sceneText = values.get('--scene');
+  const scene = sceneText === undefined ? undefined : Number(sceneText);
+  if (sceneText !== undefined && !SCENES.some((configured) => String(configured.id) === sceneText)) {
+    throw new Error(`--scene은 설정된 장면 id(${SCENES.map(({ id }) => id).join(', ')}) 중 하나여야 합니다`);
+  }
+  return { url: base.origin, out, secs, width: +size[1]!, height: +size[2]!, demo, tokenStdin, ...(scene === undefined ? {} : { scene }) };
+}
+
+export function scenesForCapture(scene?: number) {
+  return scene === undefined ? SCENES : SCENES.filter((configured) => configured.id === scene);
+}
+
+function assertConfiguredScene(scene: number | undefined): void {
+  if (scene !== undefined && (!Number.isInteger(scene) || !SCENES.some((configured) => configured.id === scene))) {
+    throw new Error(`--scene은 설정된 장면 id(${SCENES.map(({ id }) => id).join(', ')}) 중 하나여야 합니다`);
+  }
 }
 
 type FrameRect = { x: number; y: number; width: number; height: number };
@@ -147,18 +174,19 @@ export async function observe(port: number) {
   };
 }
 
-export async function run(args: Args): Promise<number> {
+export async function run(args: Args, launchBrowser: typeof launch = launch): Promise<number> {
+  assertConfiguredScene(args.scene);
   mkdirSync(args.out, { recursive: true });
   const startedAt = new Date().toISOString();
   const port = 9480 + Math.floor(Math.random() * 15);
-  const cdp = await launch({ port, timeoutMs: (args.secs * 6 + 180) * 1000, width: args.width, height: args.height });
+  const cdp = await launchBrowser({ port, timeoutMs: (args.secs * 6 + 180) * 1000, width: args.width, height: args.height });
   let observer: Awaited<ReturnType<typeof observe>> | undefined;
   try {
     observer = await observe(port);
     const target = new URL('/app/inside/', args.url);
     target.searchParams.set('demo', args.demo ? '1' : '0');
     target.searchParams.set('capture', 'public');
-    target.searchParams.set('scene', '1');
+    target.searchParams.set('scene', String(args.scene ?? SCENES[0].id));
     if (args.tokenStdin) {
       const token = /elt_[A-Za-z0-9_-]{16,}/.exec(await Bun.stdin.text())?.[0];
       if (token) {
@@ -172,9 +200,10 @@ export async function run(args: Args): Promise<number> {
     await sleep(8000);
     const initialEvents = observer.take();
     const scenes = [];
-    for (let scene = 1; scene <= 6; scene++) {
+    const selectedScenes = scenesForCapture(args.scene);
+    for (const [selectedIndex, { id: scene, title }] of selectedScenes.entries()) {
       const hiddenByDemo = false;
-      if (scene !== 1) {
+      if (args.scene === undefined && scene !== SCENES[0].id) {
         await cdp.ev<boolean>(`(()=>{const n=${scene}; const nav=document.querySelector('nav[aria-label="장면 선택"]'); const button=[...(nav?.querySelectorAll('button')??[])].find(b=>b.textContent?.trim().startsWith(n+' ')); button?.click(); return !!button})()`);
         await sleep(300);
       }
@@ -200,12 +229,12 @@ export async function run(args: Args): Promise<number> {
       const { bad } = JSON.parse(await cdp.ev<string>(PUBLIC_LEAK_CHECK)) as { bad: string[] };
       const dom = worstSceneState(scene, states);
       const observed = observer.take();
-      const events = scene === 1 ? {
+      const events = selectedIndex === 0 ? {
         exceptions: [...initialEvents.exceptions, ...observed.exceptions],
         failedRequests: [...initialEvents.failedRequests, ...observed.failedRequests],
       } : observed;
       frames.toMp4(join(args.out, `scene-${scene}.mp4`), args.width, args.height);
-      const obs: SceneObservation = { scene, title: TITLES[scene - 1]!, hiddenByDemo, secs: args.secs, frames: frames.list.length, ...events, ...dom, leaks: bad, blankFrames, emptyStates: [...emptyStates] };
+      const obs: SceneObservation = { scene, title, hiddenByDemo, secs: args.secs, frames: frames.list.length, ...events, ...dom, leaks: bad, blankFrames, emptyStates: [...emptyStates] };
       const result = judgeScene(obs);
       scenes.push(result);
       console.log(`scene ${scene} ${result.verdict} ${args.secs}s frames=${result.frames}`);
@@ -236,12 +265,16 @@ export async function run(args: Args): Promise<number> {
   } finally { observer?.close(); cdp.close(); }
 }
 
+export async function runCli(argv: string[], launchBrowser: typeof launch = launch): Promise<number> {
+  return run(parseArgs(argv), launchBrowser);
+}
+
 function repoVersion(): string {
   try { return String((JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version?: unknown }).version ?? 'unknown'); }
   catch { return 'unknown'; }
 }
 
 if (import.meta.main) {
-  try { process.exitCode = await run(parseArgs(process.argv.slice(2))); }
+  try { process.exitCode = await runCli(process.argv.slice(2)); }
   catch { console.error('리허설 실행 실패'); process.exitCode = 1; }
 }
