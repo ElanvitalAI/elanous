@@ -50,7 +50,14 @@ elanous runs on **Bun** (not Node) on macOS, Linux and WSL2; Windows native Powe
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 ```
 
-The `elanous` package is also on npm (`npm i -g elanous`), but it needs **Bun 1.3.5+** on your PATH — without Bun the first run stops with "bun: No such file". The one-line installer above sets Bun up for you, so it is the simpler path.
+The npm path is two commands:
+
+```bash
+npm i -g elanous
+eln
+```
+
+npm's postinstall bootstraps the pinned Bun release into `~/.local/share/elanous/bin` and verifies its official SHA-256. If lifecycle scripts are skipped, offline, or running in CI, npm install still succeeds and the first `eln` retries the same setup. In a headless shell where postinstall was skipped, allow that retry with `ELANOUS_INSTALL_YES=1 eln`.
 
 Coming from **monad** (0.1.x)? Don't use `monad update` to move — see [Moving from monad](/getting-started/update-and-uninstall#moving-from-monad).
 
@@ -168,6 +175,7 @@ When Elanous hits an error, it sends a short report to the Elanous team so we ca
 
 ## Known limits
 
+- On Windows, npm and first-run bootstrap timeouts try `taskkill /T` and then a PowerShell process-tree walk. If both are unavailable or blocked, the launcher stops waiting and kills its direct child, but cannot guarantee that descendant tools exit. Native Job Object cleanup is tracked for 0.3.6 (`NPM-WIN-JOBOBJECT`).
 - On Linux, `node-pty` has no prebuilt binary; elanous falls back to Bun's own PTY and nothing breaks. `elanous doctor --fix --yes` rebuilds it when a C++ toolchain is present.
 - If `bun install` silently skips an optional dependency on Linux, check whether `TMPDIR` and Bun's cache are on different filesystems — `elanous doctor` reports it as `bun-tmpdir`, and `elanous doctor --fix --yes` adds the fix to your shell startup file. See [troubleshooting](/help/troubleshooting#bun-skips-an-optional-dependency).
 - If the service log says the web app is not built, set `ELANOUS_PWA_STATIC_DIR` to a built web app folder (`apps/pwa/out` in a checkout, after `elanous nexus build`).
@@ -639,6 +647,7 @@ Source: https://docs.elanous.ai/using-elanous/commands/
 | Command | What it does |
 |---|---|
 | `elanous start` | One command to begin: finds a model, starts the background service if needed and opens the web app (`--tui` for the terminal UI) |
+| `elanous bootstrap` | First-run repair: installs the safe `gh`, `rg`, and Codex tools, fixes the `PATH` block, and prints any manual system packages |
 | `elanous doctor` | Report which credentials resolve and from where, plus a readiness section (provider, `gh` sign-in, `PATH`, background service version, Linux `TMPDIR`) — `--json` for machines |
 | `elanous doctor --fix` / `--fix --yes` | Show / apply the reversible repairs (the `PATH` block, key-cache permissions, the Linux `TMPDIR` block); startup files are backed up first. A missing git is offered interactively on a terminal; everything else needs `--yes` |
 | `elanous setup` | Walk through missing setup steps (`--non-interactive` only reports) |
@@ -5167,6 +5176,36 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.3.5
+
+Source: https://docs.elanous.ai/releases/0-3-5/
+
+## Behavior changes
+
+- Pick a sentence in the aside browser and say "add this to the memo" to add it to the current memo with its source.
+- The plugin wizard starts two coding-agent side tabs with separate briefs and workspaces.
+- Show elapsed progress and cancellation guidance while the subscription device login waits during headless first-run setup.
+- Simulation Special: rehearse agent and infrastructure automation in a fake world with real Elanous code and fake boundaries. Creating and deleting a world takes seconds, not minutes, and involves no real servers or accounts.
+- Save, restore and fork a simulated world with `eln sim world snapshot`, `restore` and `fork`, then run each branch separately and compare the results.
+- Declare faults in `world.yaml` and watch whether the system recovers: kill a process (monkey) or take a host down (gorilla).
+- Inject any catalogued event into a simulated world through the same write path as production, marked as injected and refused in the real universe.
+- The public Simulation Kit ships a world format, YAML scenario guide, device catalog, CLI and example worlds. Start with `eln --test sim devices`.
+- New simulated devices for fetch, binaries, app hosting, app sign-in, speech and video providers, plus a secret canary check.
+- Replayed-versus-device fidelity checks and a coverage report show which code paths, events and devices the simulation reaches.
+- Install with one line: `npm i -g elanous` sets up Bun, initial configuration and doctor.
+- First-run setup uses a detected coding-agent subscription without asking for an API key.
+
+Plus 165 internal changes.
+
+## Known issues
+
+The following issues are known in this release.
+
+- There is no user-visible impact.
+- A release verification test used an outdated command pattern. Product behavior is unaffected.
 
 ---
 
