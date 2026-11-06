@@ -66,7 +66,10 @@ function parsePollResult(stdout: string): { readonly status: string; readonly re
   if (!parsed || typeof parsed !== 'object' || typeof (parsed as { status?: unknown }).status !== 'string') {
     throw new Error('Higgsfield poll result requires a string status.');
   }
-  const { status, result_url: resultUrl } = parsed as { readonly status: string; readonly result_url?: unknown };
+  const { status, result_url: resultUrl } = parsed as {
+    readonly status: string;
+    readonly result_url?: unknown;
+  };
   if (resultUrl !== undefined && resultUrl !== null && typeof resultUrl !== 'string') {
     throw new Error('Higgsfield poll result has an invalid result_url.');
   }

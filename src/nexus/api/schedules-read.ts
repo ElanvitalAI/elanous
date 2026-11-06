@@ -12,7 +12,7 @@ import {
 } from '../../domains/schedule-state.js';
 import { getToxRuntimeDeps } from '../../task-orchestrator/runtime-deps.js';
 import { tasksDbPath } from '../../task-orchestrator/paths.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { listScheduleRuns } from '../../domains/schedule-runs.js';
 import { listLoops } from '../../loops/registry.js';

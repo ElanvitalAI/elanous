@@ -986,7 +986,7 @@ export function getActiveAcpAllSessionsTermFrameBroadcaster():
 /** Pull a stable `kind` string off a `session/update` payload for
  *  diagnostic logging. Returns the inner `sessionUpdate` discriminator
  *  when present, otherwise `'?'`. Snapshot-only — no allocation in the
- *  off-state path because callers already gate with `debug.enabled`. */
+ *  off-state path because the caller supplies the snapshot lazily. */
 function extractUpdateKind(update: unknown): string {
   if (update && typeof update === 'object' && 'sessionUpdate' in update) {
     return String((update as { sessionUpdate: unknown }).sessionUpdate);
@@ -1124,12 +1124,10 @@ function wireAcpConnection(
     const wasNew = !set.has(peer);
     set.add(peer);
     ownedSessionIds.add(sessionId);
-    if (debug.enabled) {
-      debug.log('acp.peer.register', sessionId, {
-        peerCount: set.size,
-        wasNew,
-      });
-    }
+    debug.log('acp.peer.register', sessionId, () => ({
+      peerCount: set.size,
+      wasNew,
+    }));
     // C5d — streaming.acp flip 시 이 세션을 'acp' 구독자로 브리지(fan-out 이 ACP peer 로 도달 →
     // tg/dc 턴이 ACP 로도 스트리밍). fire-and-forget(sync registerPeer 유지)·idempotent(rejoin)·
     // fail-soft. flip OFF 면 완전 무영향(구독 미등록·bindings 무접촉).
@@ -1160,12 +1158,12 @@ function wireAcpConnection(
     const peers = sessionPeers.get(sessionId);
     const peerCount = peers?.size ?? 0;
     if (!peers || peers.size === 0) {
-      if (debug.enabled) {
-        debug.log('acp.broadcast', 'no-peers', {
+      {
+        debug.log('acp.broadcast', 'no-peers', () => ({
           sessionId,
           kind: extractUpdateKind(update),
           scope: 'connection',
-        });
+        }));
       }
       return { delivered: 0 };
     }
@@ -1198,8 +1196,8 @@ function wireAcpConnection(
       delivered += 1;
       tasks.push(p.sessionUpdate({ sessionId, update }));
     }
-    if (debug.enabled) {
-      debug.log('acp.broadcast', 'fanout', {
+    {
+      debug.log('acp.broadcast', 'fanout', () => ({
         sessionId,
         kind: extractUpdateKind(update),
         peerCount,
@@ -1208,7 +1206,7 @@ function wireAcpConnection(
         scope: 'connection',
         ...(opts2?.uiGate ? { uiGate: opts2.uiGate } : {}),
         ...(opts2?.termGate ? { termGate: opts2.termGate } : {}),
-      });
+      }));
     }
     await Promise.allSettled(tasks);
     return { delivered };
@@ -1244,13 +1242,13 @@ function wireAcpConnection(
   ): Promise<boolean> => {
     if (!sessions.has(sessionId)) return false;
     const text = formatElanousTermEnvelope({ method, payload } as Parameters<typeof formatElanousTermEnvelope>[0]);
-    if (debug.enabled) {
-      debug.log('webterm.acp', 'envelope.out', {
+    {
+      debug.log('webterm.acp', 'envelope.out', () => ({
         sessionId,
         method,
         terminalId: payload.terminalId,
         bytes: text.length,
-      });
+      }));
     }
     const { delivered } = await broadcast(
       sessionId,
@@ -1319,7 +1317,7 @@ function wireAcpConnection(
       // (iOS + PWA 동시 연결 시 어디서든 답해도 OK) 는 후속 PR.
       const peers = sessionPeers.get(sessionId);
       if (!peers || peers.size === 0) {
-        if (debug.enabled) debug.log('acp.ask.push', 'no-peers', { sessionId });
+        debug.log('acp.ask.push', 'no-peers', () => ({ sessionId }));
         return null;
       }
       let target: SessionPeer | null = null;
@@ -1327,26 +1325,26 @@ function wireAcpConnection(
         if (p.getAskCaps().askUserQuestion) { target = p; break; }
       }
       if (!target) {
-        if (debug.enabled) debug.log('acp.ask.push', 'no-cap-peer', { sessionId, peerCount: peers.size });
+        debug.log('acp.ask.push', 'no-cap-peer', () => ({ sessionId, peerCount: peers.size }));
         return null;
       }
-      if (debug.enabled) {
-        debug.log('acp.ask.push', 'request.out', {
+      {
+        debug.log('acp.ask.push', 'request.out', () => ({
           sessionId,
           askId: payload.id,
           qCount: payload.request.questions.length,
-        });
+        }));
       }
       let raw: unknown;
       try {
         raw = await target.extMethod(ELANOUS_ASK_REQUEST_METHOD, payload);
       } catch (err) {
-        if (debug.enabled) {
-          debug.log('acp.ask.push', 'request.error', {
+        {
+          debug.log('acp.ask.push', 'request.error', () => ({
             sessionId,
             askId: payload.id,
             error: redactSecretText(err instanceof Error ? err.message : String(err)),
-          }, { level: 'error' });
+          }), { level: 'error' });
         }
         // Treat peer error as cancellation — bridge gets a result it
         // can hand back to dispatchAskUserQuestion. Better than wedging
@@ -1354,13 +1352,13 @@ function wireAcpConnection(
         return { answers: {}, cancelled: true };
       }
       const result = coerceAskResult(raw);
-      if (debug.enabled) {
-        debug.log('acp.ask.push', 'response.in', {
+      {
+        debug.log('acp.ask.push', 'response.in', () => ({
           sessionId,
           askId: payload.id,
           cancelled: result.cancelled === true,
           answerKeys: Object.keys(result.answers),
-        });
+        }));
       }
       return result;
     },
@@ -1372,23 +1370,23 @@ function wireAcpConnection(
         if (!p.getAskCaps().askUserQuestion) continue;
         tasks.push(
           p.extNotification(ELANOUS_ASK_CANCEL_METHOD, payload).catch((err) => {
-            if (debug.enabled) {
-              debug.log('acp.ask.cancel', 'fanout.error', {
+            {
+              debug.log('acp.ask.cancel', 'fanout.error', () => ({
                 sessionId,
                 askId: payload.id,
                 error: err instanceof Error ? err.message : String(err),
-              }, { level: 'error' });
+              }), { level: 'error' });
             }
           }),
         );
       }
-      if (debug.enabled) {
-        debug.log('acp.ask.cancel', 'fanout.out', {
+      {
+        debug.log('acp.ask.cancel', 'fanout.out', () => ({
           sessionId,
           askId: payload.id,
           targetCount: tasks.length,
           ...(payload.reason ? { reason: payload.reason } : {}),
-        });
+        }));
       }
       await Promise.allSettled(tasks);
     },
@@ -1589,12 +1587,12 @@ function wireAcpConnection(
           && (originRaw as Record<string, unknown>).peerId !== '') {
         const newPeerId = (originRaw as Record<string, unknown>).peerId as string;
         if (peer.peerId !== newPeerId) {
-          if (debug.enabled) {
-            debug.log('acp.peer-id', 'set', {
+          {
+            debug.log('acp.peer-id', 'set', () => ({
               sessionId: req.sessionId,
               previous: peer.peerId,
               next: newPeerId,
-            });
+            }));
           }
           peer.peerId = newPeerId;
         }
@@ -1914,13 +1912,13 @@ function wireAcpConnection(
             ...promptBlocks,
             { type: 'text', text: wrapper } as unknown as ContentBlock,
           ];
-          if (debug.enabled) {
-            debug.log('acp.term-context-inject', 'selection', {
+          {
+            debug.log('acp.term-context-inject', 'selection', () => ({
               sessionId: req.sessionId,
               terminalId: termCtx.terminalId,
               selectionBytes: selectionText.length,
               selectionLines: selectionText.split('\n').length,
-            });
+            }));
           }
         } else { try {
           const { dispatchTerminalContext } = await import('../tool-runtime/web-terminal-screenshot.js');
@@ -1979,8 +1977,8 @@ function wireAcpConnection(
               } as unknown as ContentBlock,
             ];
           }
-          if (debug.enabled) {
-            debug.log('acp.term-context-inject', 'ok', {
+          {
+            debug.log('acp.term-context-inject', 'ok', () => ({
               sessionId: req.sessionId,
               terminalId: termCtx.terminalId,
               requestedMode,
@@ -1990,16 +1988,16 @@ function wireAcpConnection(
               region,
               llmHint,
               ...(ctx.kind === 'image' ? { b64Len: ctx.dataB64.length } : { textBytes: ctx.text.length }),
-            });
+            }));
           }
           } catch (e) {
             // Capture 실패 시 원래 prompt 로 진행 (regression 회피).
-            if (debug.enabled) {
-              debug.log('acp.term-context-inject', 'fail', {
+            {
+              debug.log('acp.term-context-inject', 'fail', () => ({
                 sessionId: req.sessionId,
                 terminalId: termCtx.terminalId,
                 error: String(e instanceof Error ? e.message : e),
-              }, { level: 'error' });
+              }), { level: 'error' });
             }
           }
         }
@@ -2172,11 +2170,11 @@ function wireAcpConnection(
      *  `terminal/resize` · params: { sessionId, terminalId, cols, rows }
      *      → calls PreviewTerminal.resize(cols, rows) */
     async extMethod(method, params): Promise<Record<string, unknown>> {
-      if (debug.enabled) {
-        debug.log('webterm.acp', 'extMethod.in', {
+      {
+        debug.log('webterm.acp', 'extMethod.in', () => ({
           method,
           terminalId: (params as { terminalId?: unknown })?.terminalId,
-        });
+        }));
       }
       if (method === 'elanous/session/steer') {
         const p = params as { sessionId?: unknown; text?: unknown };
@@ -2235,11 +2233,11 @@ function wireAcpConnection(
           if (p.replay === true) {
             try { snapshot = existing.render(); } catch { /* fail-soft */ }
           }
-          if (debug.enabled) {
-            debug.log('webterm.acp', 'spawn.attach', {
+          {
+            debug.log('webterm.acp', 'spawn.attach', () => ({
               sessionId: p.sessionId, terminalId: tid,
               replay: p.replay === true, snapshotBytes: snapshot?.length ?? 0,
-            });
+            }));
           }
           return {
             sessionId: p.sessionId, terminalId: tid, status: 'attached',
@@ -2282,7 +2280,7 @@ function wireAcpConnection(
         // sessionId).
         registerPreviewTerminalForWebTap(pt, p.sessionId, tid, handle);
 
-        if (debug.enabled) debug.log('webterm.acp', 'spawn.ok', { sessionId: p.sessionId, terminalId: tid, cwd, cols, rows });
+        debug.log('webterm.acp', 'spawn.ok', () => ({ sessionId: p.sessionId, terminalId: tid, cwd, cols, rows }));
         return { sessionId: p.sessionId, terminalId: tid, status: 'spawned' };
       }
       if (method === 'terminal/input') {
@@ -2300,7 +2298,7 @@ function wireAcpConnection(
         const { lookupPreviewTerminal } = await import('../web-terminal/preview-tap-registry.js');
         const pt = lookupPreviewTerminal(p.sessionId, p.terminalId);
         if (!pt) {
-          if (debug.enabled) debug.log('webterm.acp', 'input.miss', { sessionId: p.sessionId, terminalId: p.terminalId });
+          debug.log('webterm.acp', 'input.miss', () => ({ sessionId: p.sessionId, terminalId: p.terminalId }));
           return { delivered: false, reason: 'unknown_terminal' };
         }
         try { pt.write(p.data); } catch (e) {
@@ -2331,7 +2329,7 @@ function wireAcpConnection(
           debug.log('webterm.acp', 'resize.error', { terminalId: p.terminalId, reason: String(e) });
           return { delivered: false, reason: String(e) };
         }
-        if (debug.enabled) debug.log('webterm.acp', 'resize.ok', { sessionId: p.sessionId, terminalId: p.terminalId, cols: p.cols, rows: p.rows });
+        debug.log('webterm.acp', 'resize.ok', () => ({ sessionId: p.sessionId, terminalId: p.terminalId, cols: p.cols, rows: p.rows }));
         return { delivered: true, cols: p.cols, rows: p.rows };
       }
       if (method === 'terminal/list') {
@@ -2341,8 +2339,8 @@ function wireAcpConnection(
         }
         const { listPreviewTerminals } = await import('../web-terminal/preview-tap-registry.js');
         const terminals = listPreviewTerminals(p.sessionId);
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'list.ok', { sessionId: p.sessionId, count: terminals.length });
+        {
+          debug.log('webterm.acp', 'list.ok', () => ({ sessionId: p.sessionId, count: terminals.length }));
         }
         return { sessionId: p.sessionId, terminals };
       }
@@ -2363,15 +2361,15 @@ function wireAcpConnection(
           terminalId: p.terminalId,
           scale,
         });
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'screenshot.ok', {
+        {
+          debug.log('webterm.acp', 'screenshot.ok', () => ({
             sessionId: p.sessionId,
             terminalId: p.terminalId,
             cols: shot.cols,
             rows: shot.rows,
             scale,
             b64Len: shot.dataB64.length,
-          });
+          }));
         }
         return {
           sessionId: shot.sessionId,
@@ -2393,8 +2391,8 @@ function wireAcpConnection(
           await import('../web-terminal/preview-tap-registry.js');
         const pt = lookupPreviewTerminal(p.sessionId, p.terminalId);
         if (!pt) {
-          if (debug.enabled) {
-            debug.log('webterm.acp', 'destroy.miss', { sessionId: p.sessionId, terminalId: p.terminalId });
+          {
+            debug.log('webterm.acp', 'destroy.miss', () => ({ sessionId: p.sessionId, terminalId: p.terminalId }));
           }
           return { destroyed: false, reason: 'unknown_terminal' };
         }
@@ -2410,15 +2408,15 @@ function wireAcpConnection(
         // where stop returns synchronously before the kernel delivers
         // SIGCHLD. unregisterPreviewTerminalForWebTap is idempotent.
         try { pt.stop(); } catch (e) {
-          if (debug.enabled) {
-            debug.log('webterm.acp', 'destroy.stop-error', {
+          {
+            debug.log('webterm.acp', 'destroy.stop-error', () => ({
               sessionId: p.sessionId, terminalId: p.terminalId, reason: String(e),
-            }, { level: 'error' });
+            }), { level: 'error' });
           }
         }
         unregisterPreviewTerminalForWebTap(pt);
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'destroy.ok', { sessionId: p.sessionId, terminalId: p.terminalId });
+        {
+          debug.log('webterm.acp', 'destroy.ok', () => ({ sessionId: p.sessionId, terminalId: p.terminalId }));
         }
         return { destroyed: true, sessionId: p.sessionId, terminalId: p.terminalId };
       }
@@ -2433,10 +2431,10 @@ function wireAcpConnection(
           return { status: 'recording', started: true, ...r };
         } catch (e) {
           const reason = String(e instanceof Error ? e.message : e);
-          if (debug.enabled) {
-            debug.log('webterm.acp', 'record.start.error', {
+          {
+            debug.log('webterm.acp', 'record.start.error', () => ({
               sessionId: p.sessionId, terminalId: p.terminalId, reason,
-            }, { level: 'error' });
+            }), { level: 'error' });
           }
           // Soft-fail (return rather than throw) so the PWA can branch
           // on `started === false` without exception-handling boilerplate
@@ -2469,10 +2467,10 @@ function wireAcpConnection(
           };
         } catch (e) {
           const reason = String(e instanceof Error ? e.message : e);
-          if (debug.enabled) {
-            debug.log('webterm.acp', 'record.stop.error', {
+          {
+            debug.log('webterm.acp', 'record.stop.error', () => ({
               sessionId: p.sessionId, terminalId: p.terminalId, reason,
-            }, { level: 'error' });
+            }), { level: 'error' });
           }
           return { status: 'rejected', stopped: false, reason };
         }
@@ -2523,14 +2521,14 @@ function wireAcpConnection(
               }];
             })
           : [];
-        if (debug.enabled && requestedAttachmentCount !== normalizedAttachments.length) {
-          debug.log('webterm.acp', 'repl.attachments.dropped', {
+        if (requestedAttachmentCount !== normalizedAttachments.length) {
+          debug.log('webterm.acp', 'repl.attachments.dropped', () => ({
             sessionId: p.sessionId,
             terminalId: p.terminalId,
             requestedCount: requestedAttachmentCount,
             acceptedCount: normalizedAttachments.length,
             droppedCount: requestedAttachmentCount - normalizedAttachments.length,
-          });
+          }));
         }
         const { dispatchMetaCommand } = await import('../repl/dispatch-meta.js');
         const { getUserConfig } = await import('../user-config.js');
@@ -2732,8 +2730,8 @@ function wireAcpConnection(
         // with a red badge (error) or dim italic (note). The agent
         // success path returns no replSystem because the rendered
         // markdown is already mirrored as `agentResult`.
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'repl.exec', {
+        {
+          debug.log('webterm.acp', 'repl.exec', () => ({
             sessionId: p.sessionId,
             terminalId: p.terminalId,
             consumed: result.consumed,
@@ -2742,7 +2740,7 @@ function wireAcpConnection(
             sessionIdChange: result.sessionIdChange ?? null,
             tabIntent: result.tabIntent ?? null,
             injectPath: result.injectPath ?? null,
-          });
+          }));
         }
         const replSystem = classifyReplSystemOutput(result.output, agentResult !== null);
         return {
@@ -2782,13 +2780,13 @@ function wireAcpConnection(
         const aborted = opts.abortAgentTurn
           ? opts.abortAgentTurn({ sessionId: p.sessionId, terminalId: p.terminalId })
           : false;
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'agent.abort', {
+        {
+          debug.log('webterm.acp', 'agent.abort', () => ({
             sessionId: p.sessionId,
             terminalId: p.terminalId,
             aborted,
             wired: !!opts.abortAgentTurn,
-          });
+          }));
         }
         return { sessionId: p.sessionId, terminalId: p.terminalId, aborted };
       }
@@ -2816,13 +2814,13 @@ function wireAcpConnection(
         const result = opts.recordLiveCameraFrame
           ? opts.recordLiveCameraFrame(input)
           : { frameIndex: 0 };
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'live-cam.notify', {
+        {
+          debug.log('webterm.acp', 'live-cam.notify', () => ({
             sessionId: p.sessionId,
             attachmentId: p.attachmentId,
             frameIndex: result.frameIndex,
             wired: !!opts.recordLiveCameraFrame,
-          });
+          }));
         }
         return {
           sessionId: p.sessionId,
@@ -2849,13 +2847,13 @@ function wireAcpConnection(
         const { ingestDebugLogRecords } = await import('../nexus/api/debug-logs.js');
         // ⛔ 적재는 REST 와 «같은 함수»를 쓴다 — 갈리면 한쪽만 redaction 을 타게 된다.
         const out = ingestDebugLogRecords(p.records);
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'debug-logs.ingest', {
+        {
+          debug.log('webterm.acp', 'debug-logs.ingest', () => ({
             accepted: out.accepted,
             rejected: out.rejected,
             // ⭐ 이 경로로 왔다는 것 «자체»가 신호다 — HTTP 가 막혔다는 뜻이다.
             via: 'acp-fallback',
-          });
+          }));
         }
         return { ok: true, accepted: out.accepted, rejected: out.rejected };
       }
@@ -3373,8 +3371,8 @@ function wireAcpConnection(
         }
         const set = sessionPeers.get(p.sessionId);
         const count = set ? set.size : 0;
-        if (debug.enabled) {
-          debug.log('webterm.acp', 'peers.count', { sessionId: p.sessionId, count });
+        {
+          debug.log('webterm.acp', 'peers.count', () => ({ sessionId: p.sessionId, count }));
         }
         return { sessionId: p.sessionId, count };
       }
@@ -3398,8 +3396,8 @@ function wireAcpConnection(
         plainEnvelopeLogged.delete(sid);
         approvalPolicy.clearSession(sid);
       }
-      if (debug.enabled) {
-        debug.log('acp.peer.unregister', sid, { remainingPeers: remaining });
+      {
+        debug.log('acp.peer.unregister', sid, () => ({ remainingPeers: remaining }));
       }
       // C5d — 마지막 peer 이탈 시 'acp' 구독자 브리지 정리(bindings 오염 방지·gated). fire-and-forget.
       if (remaining === 0) {
@@ -3555,12 +3553,12 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
     const peers = sessionPeers.get(sessionId);
     const peerCount = peers?.size ?? 0;
     if (!peers || peers.size === 0) {
-      if (debug.enabled) {
-        debug.log('acp.broadcast', 'no-peers', {
+      {
+        debug.log('acp.broadcast', 'no-peers', () => ({
           sessionId,
           kind: extractUpdateKind(update),
           scope: 'module',
-        });
+        }));
       }
       return { delivered: 0 };
     }
@@ -3578,14 +3576,14 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
       delivered += 1;
       tasks.push(p.sessionUpdate({ sessionId, update }));
     }
-    if (debug.enabled) {
-      debug.log('acp.broadcast', 'fanout', {
+    {
+      debug.log('acp.broadcast', 'fanout', () => ({
         sessionId,
         kind: extractUpdateKind(update),
         peerCount,
         delivered,
         scope: 'module',
-      });
+      }));
     }
     await Promise.allSettled(tasks);
     return { delivered };
@@ -3681,21 +3679,21 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
       }
       if (any) fannedTo += 1;
     }
-    if (debug.enabled) {
-      debug.log('acp.termframe', 'fanout', {
+    {
+      debug.log('acp.termframe', 'fanout', () => ({
         terminalId: payload.terminalId,
         instance: payload.instance,
         frameBytes: payload.frame.length,
         fannedTo,
         delivered,
-      });
+      }));
     }
     return { delivered, fannedTo };
   };
-  if (debug.enabled) {
-    debug.log('acp.broadcaster.lifecycle', 'set', {
+  {
+    debug.log('acp.broadcaster.lifecycle', 'set', () => ({
       mode: opts.transportFactory ? 'transport' : 'stdio',
-    });
+    }));
   }
 
   if (opts.transportFactory) {
@@ -3725,8 +3723,8 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
       activeAcpAskPusher = null;
       activeAcpAllSessionsFeedbackBroadcaster = null;
       activeAcpAllSessionsTermFrameBroadcaster = null;
-      if (debug.enabled) {
-        debug.log('acp.broadcaster.lifecycle', 'clear', { mode: 'transport' });
+      {
+        debug.log('acp.broadcaster.lifecycle', 'clear', () => ({ mode: 'transport' }));
       }
     }
     return;
@@ -3754,8 +3752,8 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
     activeAcpAskPusher = null;
     activeAcpAllSessionsFeedbackBroadcaster = null;
     activeAcpAllSessionsTermFrameBroadcaster = null;
-    if (debug.enabled) {
-      debug.log('acp.broadcaster.lifecycle', 'clear', { mode: 'stdio' });
+    {
+      debug.log('acp.broadcaster.lifecycle', 'clear', () => ({ mode: 'stdio' }));
     }
   }
 }

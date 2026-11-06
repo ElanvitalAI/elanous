@@ -114,3 +114,28 @@ export function writeSecretsFileRaw(s: SecretsFile): void {
     release();
   }
 }
+
+/** Atomically merge imported values under the same lock used by set/rm. */
+export function importSecretsFileRaw(
+  secrets: Readonly<Record<string, string>>,
+  overwrite: boolean,
+  expectedConflicts?: readonly string[],
+): { imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean } {
+  const path = secretsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const release = acquireLockSync(`${path}.lock`);
+  try {
+    const file = readSecretsFile();
+    const conflicts = Object.keys(secrets).filter((id) => Object.hasOwn(file.secrets, id)).sort();
+    if (expectedConflicts && (conflicts.length !== expectedConflicts.length
+      || conflicts.some((id, index) => id !== [...expectedConflicts].sort()[index]))) {
+      return { imported: false, conflicts, changedSinceConfirmation: true };
+    }
+    if (conflicts.length && !overwrite) return { imported: false, conflicts, changedSinceConfirmation: false };
+    Object.assign(file.secrets, secrets);
+    writeSecretsFile(file);
+    return { imported: true, conflicts, changedSinceConfirmation: false };
+  } finally {
+    release();
+  }
+}

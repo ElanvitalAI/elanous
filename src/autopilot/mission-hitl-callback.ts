@@ -69,7 +69,12 @@ export function resolveMissionByHitlToken(token: string): string | null {
     const store = openAutopilotMissionsDb();
     const hit = listMissions(store, {}).find((m) => hitlToken(m.id) === token);
     return hit ? hit.id : null;
-  } catch {
+  } catch (error) {
+    try {
+      debug.log('mission.hitl.token.resolve.failed', token, { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+      // Logging is best-effort; preserve the callback's existing failure response.
+    }
     return null;
   }
 }

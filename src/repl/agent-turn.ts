@@ -26,7 +26,8 @@ import { appendWebtermContext } from '../boot/daemon-tools/webterm-context.js';
 import { createToolCwdResolver } from '../boot/tool-cwd.js';
 import { buildTerminalCapableTurn } from '../agent/terminal-surface.js';
 import { PTY_SHELL_TOOL_NAMES } from '../boot/daemon-tools/pty-shell.js';
-import { runGoalLoop, type CoreTurnContext } from '../core-turn/index.js';
+import { runGoalLoop } from '../core-turn/run-goal-loop.js';
+import type { CoreTurnContext } from '../core-turn/types.js';
 import { maybeImageBearingResult, type LLMMessage, type LLMToolSpec } from '../llm.js';
 import { buildAcpPrompt, type NormalizedAttachment } from '../acp/content-blocks.js';
 import {

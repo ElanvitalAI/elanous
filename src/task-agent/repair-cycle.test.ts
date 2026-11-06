@@ -181,6 +181,20 @@ test('exact review must-fix launches one graph-routed commit-only worker, record
   expect(launches).toHaveLength(1);
 });
 
+test('drift override keeps same-PR commit-only and no-auto-merge contract', async () => {
+  const f = fixture();
+  const launches: RepairLaunchRequest[] = [];
+  const outcome = await runRepairCycle(f.input({ goalOverride: '대상 경로: src/feature.ts\n경계: src/feature.ts만 · 오류 줄 ±20',
+    request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
+  expect(outcome.decision).toBe('repair-requested');
+  const goal = readFileSync(launches[0]!.goalFile, 'utf8');
+  expect(goal).toContain('기존 PR #30의 head');
+  expect(goal).toContain('같은 가지에서만 수리한다. 새 PR을 열지 않는다.');
+  expect(goal).toContain('commit-only 결과');
+  expect(goal).toContain('--no-auto-merge');
+  expect(goal).toContain('경계: src/feature.ts만');
+});
+
 test('same head and review stop a repeated signed gate failure before a second worker', async () => {
   const f = fixture();
   const requests: RepairLaunchRequest[] = [];

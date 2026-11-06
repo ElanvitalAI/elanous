@@ -1116,6 +1116,8 @@ export interface DefaultSeamsOptions {
    *  찾음(elanous 자신 개발엔 정상). **외부 repo 개발** 시엔 elanous repo 루트를 줘야 외부 worktree 에도
    *  elanous 에이전트가 붙는다(외부 repo 엔 elanous 바이너리 없음). */
   elanousBinRoot?: string;
+  /** Optional explicit PTY-child environment overrides for isolated fake-device runs. */
+  childEnv?: Readonly<Record<string, string>>;
   /** ★ 내부 리뷰어 seam(2026-07-21·review-gated merge) — 주입 시 reviewDiff(worktree diff → reviewPullRequest·
    *  agent-substrate·staged 하니스와 동일 엔진) 배선. 미주입 시 reviewDiff 미노출(gate 통과=바로 병합결정·
    *  리뷰 스킵). dev-harness 의 llmReview 와 동일 형태(streamLLM 래퍼). */
@@ -1960,6 +1962,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             ...(runId ? { runId } : {}),   // ★ K run-identity — 라운드 전부가 호출 1개의 runId 를 공유
             ...(shardIdentity ? { shardIdentity } : {}),
             ...(o.configDir ? { configDir: o.configDir } : {}),
+            ...(o.childEnv ? { childEnv: o.childEnv } : {}),
             ...(o.stateDir ? { stateDir: o.stateDir } : {}),
             // ⛔⭐ 뿌리를 넘길 땐 «출처»도 같이 — 한 홉이라도 빠지면 자식이 「명시」로 읽는다(`OBS-T121`)
             ...(o.stateDirSource ? { stateDirSource: o.stateDirSource } : {}),

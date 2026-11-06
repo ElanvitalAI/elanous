@@ -79,3 +79,33 @@ export function readCodexOwnerAccessMirror(
   return state!;
 }
 
+
+/** One owner account that `codex mirror push` could not ship, and why (never a token value). */
+export interface CodexMirrorSkippedAccount { account: string; reason: 'access-expiring' | 'credential-unavailable' }
+
+/**
+ * REMOTE-MIRROR-SKIP-UNUSABLE (11-05) — collect the access-only mirrors for `codex mirror push`, skipping accounts
+ * the owner cannot ship right now instead of failing the whole push. 11-05 19:41~ the owner `default` access token
+ * fell inside the 3 h window, `hostCredentials` threw for it, and every host lost the fresh `team`·`third` mirrors too.
+ * Skipped accounts are logged (`llm.codex/owner-mirror-push-skipped`); only «nothing shippable» is an error.
+ */
+export function collectCodexMirrorCredentials<T extends object>(
+  accounts: readonly string[],
+  read: (account: string) => T,
+): { mirrors: Array<T & { account: string }>; skipped: CodexMirrorSkippedAccount[] } {
+  const mirrors: Array<T & { account: string }> = [];
+  const skipped: CodexMirrorSkippedAccount[] = [];
+  for (const account of accounts) {
+    try {
+      mirrors.push({ ...read(account), account });
+    } catch (error) {
+      const reason = (error as { hoursLeft?: unknown } | null)?.hoursLeft !== undefined ? 'access-expiring' : 'credential-unavailable';
+      skipped.push({ account, reason });
+      try { debug.log('llm.codex', 'owner-mirror-push-skipped', { account, reason }, { level: 'warn' }); } catch { /* fail-soft */ }
+    }
+  }
+  if (mirrors.length === 0) {
+    throw new Error(`쓸 수 있는 주인 Codex 계정이 없다 (${skipped.map((s) => `${s.account}=${s.reason}`).join(', ')})`);
+  }
+  return { mirrors, skipped };
+}

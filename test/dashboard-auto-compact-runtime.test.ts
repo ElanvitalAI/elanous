@@ -49,7 +49,9 @@ describe('runDashboardAutoCompact', () => {
             && candidate.type === 'function_call_output' && candidate.call_id === item.call_id) }]
         : []);
     expect(cleared).toBeGreaterThan(0);
-    expect(trimmed).toBeGreaterThan(0);
+    // Archive is disabled here, so Layer 1 refuses to replace tool output
+    // with an unrecoverable budget stub; Layer 2 still preserves call/result pairs.
+    expect(trimmed).toBe(0);
     expect(prePassApplied).toBe(1);
     // The real pre-pass replaces message objects; it does not mutate the
     // saved objects. The runtime can therefore restore this slice verbatim.

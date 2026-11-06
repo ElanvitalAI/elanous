@@ -4,28 +4,11 @@
  * fetch mock 으로 list + detail (path-segment encoding) 검증.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 
 import { DaemonClient } from './daemon-client';
 import { TaskApi } from './task-api';
-
-interface FetchCall { url: string | URL }
-
-const realFetch = globalThis.fetch;
-let calls: FetchCall[] = [];
-
-function mockResponse(opts: { status: number; body: unknown }): typeof fetch {
-  return ((async (input: RequestInfo | URL) => {
-    calls.push({ url: input as string | URL });
-    return {
-      ok: opts.status >= 200 && opts.status < 300,
-      status: opts.status,
-      headers: new Headers({ 'content-type': 'application/json' }),
-      json: async () => opts.body,
-      text: async () => JSON.stringify(opts.body),
-    } as unknown as Response;
-  }) as unknown) as typeof fetch;
-}
+import { withFakeFetchDevice } from '../test-devices/fake-fetch';
 
 function makeClient(): DaemonClient {
   return new DaemonClient({
@@ -35,14 +18,9 @@ function makeClient(): DaemonClient {
   });
 }
 
-beforeEach(() => { calls = []; });
-afterEach(() => { globalThis.fetch = realFetch; });
-
 describe('TaskApi.list — GET /v1/tasks', () => {
   it('returns the daemon summary + tasks shape verbatim', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: {
+    await withFakeFetchDevice([{ url: '/v1/tasks', response: Response.json({
         summary: {
           total: 5,
           open: 3,
@@ -67,30 +45,27 @@ describe('TaskApi.list — GET /v1/tasks', () => {
             acceptanceCount: 0,
           },
         ],
-      },
+      }),
+    }], async (device) => {
+      const api = new TaskApi(makeClient());
+      const result = await api.list();
+      expect(device.calls()[0]!.url).toBe('http://localhost:31415/v1/tasks');
+      expect(result.summary.total).toBe(5);
+      expect(result.tasks[0]?.id).toBe('task-1');
     });
-    const api = new TaskApi(makeClient());
-    const result = await api.list();
-    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/tasks');
-    expect(result.summary.total).toBe(5);
-    expect(result.tasks[0]?.id).toBe('task-1');
   });
 
   it('throws on 503 not-wired', async () => {
-    globalThis.fetch = mockResponse({
-      status: 503,
-      body: { error: 'meta-api-runtime-not-wired' },
+    await withFakeFetchDevice([{ url: '/v1/tasks', response: Response.json({ error: 'meta-api-runtime-not-wired' }, { status: 503 }) }], async () => {
+      const api = new TaskApi(makeClient());
+      await expect(api.list()).rejects.toThrow(/meta-api-runtime-not-wired/);
     });
-    const api = new TaskApi(makeClient());
-    await expect(api.list()).rejects.toThrow(/meta-api-runtime-not-wired/);
   });
 });
 
 describe('TaskApi.detail — GET /v1/tasks/:taskId', () => {
   it('encodes the taskId path segment for slashes', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: {
+    await withFakeFetchDevice([{ url: '/v1/tasks/a%2Fb', response: Response.json({
         task: {
           id: 'a/b',
           createdAt: 0,
@@ -109,10 +84,11 @@ describe('TaskApi.detail — GET /v1/tasks/:taskId', () => {
         },
         executions: [],
         events: [],
-      },
+      }),
+    }], async (device) => {
+      const api = new TaskApi(makeClient());
+      await api.detail('a/b');
+      expect(device.calls()[0]!.url).toBe('http://localhost:31415/v1/tasks/a%2Fb');
     });
-    const api = new TaskApi(makeClient());
-    await api.detail('a/b');
-    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/tasks/a%2Fb');
   });
 });

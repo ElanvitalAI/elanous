@@ -8,7 +8,14 @@ elanous runs on **Bun** (not Node) on macOS, Linux and WSL2; Windows native Powe
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 ```
 
-The `elanous` package is also on npm (`npm i -g elanous`), but it needs **Bun 1.3.5+** on your PATH — without Bun the first run stops with "bun: No such file". The one-line installer above sets Bun up for you, so it is the simpler path.
+The npm path is two commands:
+
+```bash
+npm i -g elanous
+eln
+```
+
+npm's postinstall bootstraps the pinned Bun release into `~/.local/share/elanous/bin` and verifies its official SHA-256. If lifecycle scripts are skipped, offline, or running in CI, npm install still succeeds and the first `eln` retries the same setup. In a headless shell where postinstall was skipped, allow that retry with `ELANOUS_INSTALL_YES=1 eln`.
 
 Coming from **monad** (0.1.x)? Don't use `monad update` to move — see [Moving from monad](update-and-uninstall.md#moving-from-monad).
 
@@ -126,6 +133,7 @@ When Elanous hits an error, it sends a short report to the Elanous team so we ca
 
 ## Known limits
 
+- On Windows, npm and first-run bootstrap timeouts try `taskkill /T` and then a PowerShell process-tree walk. If both are unavailable or blocked, the launcher stops waiting and kills its direct child, but cannot guarantee that descendant tools exit. Native Job Object cleanup is tracked for 0.3.6 (`NPM-WIN-JOBOBJECT`).
 - On Linux, `node-pty` has no prebuilt binary; elanous falls back to Bun's own PTY and nothing breaks. `elanous doctor --fix --yes` rebuilds it when a C++ toolchain is present.
 - If `bun install` silently skips an optional dependency on Linux, check whether `TMPDIR` and Bun's cache are on different filesystems — `elanous doctor` reports it as `bun-tmpdir`, and `elanous doctor --fix --yes` adds the fix to your shell startup file. See [troubleshooting](troubleshooting.md#bun-skips-an-optional-dependency).
 - If the service log says the web app is not built, set `ELANOUS_PWA_STATIC_DIR` to a built web app folder (`apps/pwa/out` in a checkout, after `elanous nexus build`).

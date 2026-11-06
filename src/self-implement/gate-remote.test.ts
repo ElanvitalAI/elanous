@@ -21,7 +21,7 @@ const dirs: string[] = [];
 const slotDir = () => { const d = mkdtempSync(join(tmpdir(), 'gate-remote-slots-')); dirs.push(d); return d; };
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-function fakeRunner(opts: { dirty?: boolean; push?: number; ssh?: SshResult | (() => SshResult); object?: 'commit' | 'tree' | 'missing' } = {}): GateRemoteRunner & { calls: string[][]; scripts: string[] } {
+function fakeRunner(opts: { dirty?: boolean; push?: number; ssh?: SshResult | (() => SshResult); object?: 'commit' | 'tree' | 'missing'; origin?: string } = {}): GateRemoteRunner & { calls: string[][]; scripts: string[] } {
   const calls: string[][] = [];
   const scripts: string[] = [];
   return {
@@ -29,6 +29,7 @@ function fakeRunner(opts: { dirty?: boolean; push?: number; ssh?: SshResult | ((
     local(cmd, args) {
       calls.push([cmd, ...args]);
       if (args[0] === 'status') return { rc: 0, stdout: opts.dirty ? ' M src/x.ts\n' : '', stderr: '' };
+      if (args[0] === 'config') return opts.origin ? { rc: 0, stdout: `${opts.origin}\n`, stderr: '' } : { rc: 1, stdout: '', stderr: 'missing origin' };
       if (args[0] === 'cat-file') return { rc: opts.object === 'missing' ? 1 : 0, stdout: `${opts.object ?? 'commit'}\n`, stderr: '' };
       if (args[0] === 'rev-parse') {
         const ref = args.at(-1)!;
@@ -193,6 +194,28 @@ describe.each([['lockf'], ['flock']] as const)('host lock (on the host) — %s p
     expect(script).toContain(tool === 'lockf' ? 'GL="lockf -k -s -t 0"' : 'GL="flock -n"');
     expect(script).not.toContain(tool === 'lockf' ? 'flock' : 'lockf');
   });
+});
+
+test('remote gate transports canonical repository identity instead of the host-local mirror origin', () => {
+  const runner = fakeRunner({ origin: 'https://user:secret@GitHub.com/ElanvitalAI/elanous.git?token=private' });
+  const result = runOnRemote({ repo: '/repo', host: 'node-b', mirror: '~/mirror/elanous-agent.git', argv: ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local'], refs: [], installPwa: false }, runner);
+  expect(result.kind).toBe('ran');
+  expect(runner.scripts[0]).toContain(`ELANOUS_GATE_REPOSITORY_IDENTITY='https://github.com/ElanvitalAI/elanous'`);
+  expect(runner.scripts[0]).not.toContain('secret');
+  const scpRunner = fakeRunner({ origin: 'git@GitHub.com:ElanvitalAI/elanous.git?token=private#fragment' });
+  const scpResult = runOnRemote({ repo: '/repo', host: 'node-b', mirror: '~/mirror/elanous-agent.git', argv: ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local'], refs: [], installPwa: false }, scpRunner);
+  expect(scpResult.kind).toBe('ran');
+  expect(scpRunner.scripts[0]).toContain(`ELANOUS_GATE_REPOSITORY_IDENTITY='github.com/ElanvitalAI/elanous'`);
+  expect(scpRunner.scripts[0]).not.toContain('private');
+  expect(scpRunner.scripts[0]).not.toContain('fragment');
+  expect(runner.scripts[0]).toContain('git clone -q --shared --no-checkout');
+});
+
+test('remote gate omits repository identity when the caller origin cannot be normalized', () => {
+  const runner = fakeRunner({ origin: 'local-mirror-without-url-shape' });
+  const result = runOnRemote({ repo: '/repo', host: 'node-b', mirror: '~/mirror/elanous-agent.git', argv: ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local'], refs: [], installPwa: false }, runner);
+  expect(result.kind).toBe('ran');
+  expect(runner.scripts[0]).not.toContain('ELANOUS_GATE_REPOSITORY_IDENTITY=');
 });
 
 describe('host lock wiring', () => {

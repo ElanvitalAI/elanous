@@ -292,6 +292,9 @@ const registerProviderCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'provid
 const registerCatalogCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'catalog'
   ? (() => undefined)
   : (require('./cli/catalog-cli.js') as typeof import('./cli/catalog-cli.js')).registerCatalogCommands) as typeof import('./cli/catalog-cli.js').registerCatalogCommands;
+const registerAppCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'app'
+  ? (() => undefined)
+  : (require('./cli/app-cli.js') as typeof import('./cli/app-cli.js')).registerAppCommands) as typeof import('./cli/app-cli.js').registerAppCommands;
 const registerAgentCommands = (INDEX_FAST_ROOT
   ? (() => undefined)
   : (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).registerAgentCommands) as typeof import('./cli/agent-cli.js').registerAgentCommands;
@@ -736,6 +739,8 @@ async function executeHarnessSelfRun(
   }, supervisor.supervise === true
     ? {
         invocationStartedAtMs,
+        entryPoint: entranceId ?? 'harness',
+        observedRunId: runId,
         completion: initial.plan.completion,
         executePiece: async (pieceFeature, opts) => {
           const rerun = await executeDevPipelineInvocation(executePipeline, {
@@ -1400,12 +1405,16 @@ hqCmd.command('init').description('한 저장소의 bare 미러와 집 원장을
   });
 hqCmd.command('seat <role>').description('OP|MK|TC|UX 자리 워크트리 (깨끗할 때만 갱신)')
   .option('--refresh', 'origin/main으로 깨끗한 자리만 최신화')
+  .option('--host <host>', 'SSH 호스트에 자리 워크트리 생성·갱신')
+  .option('--delete', '등록된 원격 자리 워크트리 제거 (--host 등록 필수)')
   .option('--root <dir>', 'HQ 폴더')
-  .action(async (role: string, opts: { refresh?: boolean; root?: string }) => {
+  .action(async (role: string, opts: { refresh?: boolean; host?: string; delete?: boolean; root?: string }) => {
     try {
       const { hqSeat } = await import('./hq/seats.js');
-      const result = hqSeat(role, opts);
+      const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+      const result = hqSeat(role, { ...opts, home: getElanousConfigDir() });
       if (result.outcome === 'dirty') console.warn(`hq seat ${role}: dirty — refresh skipped; move edits to hq work new`);
+      else if (result.outcome === 'removed') console.log(`hq seat ${role}: removed ${result.path}`);
       else console.log(`hq seat ${role}: ${result.outcome} ${result.path}`);
     } catch (error) { console.error(`hq seat: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
@@ -5830,17 +5839,19 @@ const selfOrchestrateCmd = selfCmd
         if (childFlags.childLlmProvider?.trim()) debug.log('self-implement.pod', 'child-provider-named', { provider: childFlags.childLlmProvider.trim(), model: childFlags.childLlmModel ?? null, podProvider });
         // BEDROCK-POD-PROVIDER-DROP — provider·account 는 한 곳(podLaunchProviderOptions)에서 — 손 나열이 bedrock 을 떨궈 codex(team)로 돌았다(10-11).
         const podProviderOptions = (await import('./task-orchestrator/surfaces/pod-child-providers.js')).podLaunchProviderOptions(podProvider, { explicitPodAccount, grokApiKeyOptIn });
-        const warmReuseEvidence = () => {
+        const warmReuseIdentity = (expectedSourceSha?: string) => {
           const sourceRef = opts.base ?? 'origin/HEAD';
           const source = runGitCommand(process.cwd(), ['rev-parse', '--verify', '--quiet', '--end-of-options', `${sourceRef}^{commit}`], { encoding: 'utf8', timeout: 5_000 });
           const main = runGitCommand(process.cwd(), ['rev-parse', '--verify', '--quiet', '--end-of-options', 'refs/remotes/origin/main^{commit}'], { encoding: 'utf8', timeout: 5_000 });
           const headSha = source.status === 0 ? source.stdout.trim() : '';
           const mainSha = main.status === 0 ? main.stdout.trim() : '';
+          if (expectedSourceSha && headSha !== expectedSourceSha) return undefined;
           const identity = /^[a-f0-9]{40}$/i.test(headSha) && /^[a-f0-9]{40}$/i.test(mainSha)
             ? { head: headSha, main: mainSha } : undefined;
-          return loadWarmReuseEvidenceByConsumer(identity);
+          return identity;
         };
-        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
+        const warmReuseEvidence = () => loadWarmReuseEvidenceByConsumer(warmReuseIdentity());
+        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence, warmReuseIdentity, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -7108,6 +7119,7 @@ registerFleetCommands(program);
 // ── ops (운영 관측 — 지금 뭐 도나·이상 없나·상태 전이) ──
 registerOpsCommands(program);
 registerCatalogCommands(program);
+registerAppCommands(program);
 registerOutputsCommands(program);
 
 registerPublishCommands(program);
@@ -7204,7 +7216,7 @@ agentCmd.command('mirror')
         import('./user-config.js'), import('./hq/hq.js'), import('./task-agent/parent-host.js'),
         import('./task-orchestrator/surfaces/self-implement-pod.js'), import('./oauth/store.js'), import('./oauth/codex-account-store.js'),
       ]);
-      const { isCodexTokenOwnerHost } = await import('./oauth/codex-owner-mirror.js');
+      const { isCodexTokenOwnerHost, collectCodexMirrorCredentials } = await import('./oauth/codex-owner-mirror.js');
       if (!isCodexTokenOwnerHost(getUserConfig())) throw new Error('Codex 토큰 주인 호스트에서만 mirror push 를 실행할 수 있다');
       if (!hqFenceDecision('ledger-cli').run) throw new Error('HQ 주인 임대가 없어 Codex mirror push 를 거부한다');
       const target = parentHost.resolveParentHost({ host, cwd: process.cwd() }, { ...process.env, ELANOUS_TA_PARENT_HOST: undefined });
@@ -7212,13 +7224,14 @@ agentCmd.command('mirror')
       const accounts = accountsStore.listCodexAccountsInStore();
       if (!accounts.length) throw new Error('주인 Codex 계정이 없다');
       if (accounts.length > 16) throw new Error('Codex 계정이 16개를 넘어 미러를 안전하게 교체할 수 없다');
-      const mirrors: Array<{ account: string; elanousAuth: string; codexAuth: string }> = [];
-      for (const account of accounts) {
-        const credential = pod.hostCredentials(account.name, auth.authStorePath(), () => '', { requireExplicitChatgptAuthMode: true });
-        mirrors.push({ account: account.name, elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth });
-      }
+      // REMOTE-MIRROR-SKIP-UNUSABLE (11-05): one expiring account (default) must not drop the fresh ones.
+      const { mirrors, skipped } = collectCodexMirrorCredentials(accounts.map((account) => account.name), (name) => {
+        const credential = pod.hostCredentials(name, auth.authStorePath(), () => '', { requireExplicitChatgptAuthMode: true });
+        return { elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth };
+      });
       parentHost.installRemoteCodexCliMirror(target, mirrors);
-      console.log(`Codex 접근 미러 설치 완료 · host=${target.host} · accounts=${mirrors.length} · refresh=미포함`);
+      const skippedText = skipped.length ? ` · 건너뜀=${skipped.map((s) => `${s.account}(${s.reason})`).join(',')}` : '';
+      console.log(`Codex 접근 미러 설치 완료 · host=${target.host} · accounts=${mirrors.length}${skippedText} · refresh=미포함`);
     } catch (error) {
       console.error(`codex mirror push 실패: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
@@ -8497,6 +8510,8 @@ const selfDevCmd = program
           devOpts.supervise
             ? {
                 ...(devOpts.superviseRounds === undefined ? {} : { rounds: devCli.parsePositiveInt(devOpts.superviseRounds, '--supervise-rounds') }),
+                entryPoint: 'dev-cli',
+                observedRunId: devRunId,
                 completion: initial.plan.completion,
                 deliverableDocument: await (async () => {
                   const { resolveDevInputText, applyManualGoalEvidenceRequirement } = await import('./self-dev/dev-pipeline.js');

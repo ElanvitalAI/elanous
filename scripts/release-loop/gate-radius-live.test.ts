@@ -4,10 +4,38 @@ import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { gateRepoDigestProbeRequest, hardRehearsalGateArgs, hardRehearsalGateVersion, parseGateRepoDigestResponse, partialGateImagesMatch, planHardRehearsalRadius } from './gate-radius-live';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('receipt inheritance world replays the exact-head, radius, fingerprint and cross-host decisions', () => {
+  const world = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/release-receipt-inheritance.yaml'), 'utf8')) as {
+    kind: string; isolation: string; cases: Array<{ id: string; rehearsalHost?: string; cutHost?: string; expect: Record<string, unknown> }>;
+  };
+  expect(world).toMatchObject({ kind: 'release-gate-receipt-inheritance', isolation: 'test' });
+  const scenario = (id: string) => world.cases.find((row) => row.id === id)!;
+  const sameHead = fixture();
+  const sameHeadPlan = planHardRehearsalRadius({ ...sameHead.input, forCommit: sameHead.priorCommit });
+  expect(sameHeadPlan.plan?.files.length).toBe(scenario('same-head-zero-rerun').expect.rerunFiles as number);
+  const oneFile = fixture({ versionBump: false });
+  const radiusPlan = planHardRehearsalRadius(oneFile.input);
+  expect(radiusPlan.plan?.files).toEqual(scenario('one-file-after-rehearsal').expect.rerunFiles as string[]);
+  const damaged = fixture();
+  const mismatch = planHardRehearsalRadius({ ...damaged.input,
+    executionIdentity: { ...damaged.input.executionIdentity!, bunVersion: '1.4.3' } });
+  expect(mismatch.plan).toBeNull();
+  expect(mismatch.reason).toContain('execution identity differs');
+  const crossHost = fixture({ versionBump: false });
+  const stampPath = join(crossHost.stampDir, 'hard-5h.json');
+  const stamp = JSON.parse(readFileSync(stampPath, 'utf8')) as Record<string, unknown>;
+  stamp.selection = { remote: scenario('rehearsal-host-differs-from-cut-host').rehearsalHost };
+  writeFileSync(stampPath, JSON.stringify(stamp));
+  const crossHostPlan = planHardRehearsalRadius(crossHost.input);
+  expect(crossHostPlan.plan?.files).toEqual(scenario('rehearsal-host-differs-from-cut-host').expect.rerunFiles as string[]);
+  expect(scenario('host-disconnect-while-saving').expect).toMatchObject({ stamp: 'error', reusableReceipt: false });
+});
 
 test('gate image probe uses the registry RepoDigest paired with, but distinct from, the host-local Image ID', () => {
   const imageId = `sha256:${'a'.repeat(64)}`;
@@ -51,7 +79,7 @@ test('remote gate image probe sends Accept to a registry and parses its RepoDige
   }
 });
 
-function fixture() {
+function fixture(options: { versionBump?: boolean } = {}) {
   const repo = mkdtempSync(join(tmpdir(), 'radius-live-repo-'));
   const root = mkdtempSync(join(tmpdir(), 'radius-live-ledger-'));
   dirs.push(repo, root);
@@ -70,7 +98,7 @@ function fixture() {
   git('add', '.'); git('commit', '-qm', 'hard rehearsal');
   const priorCommit = git('rev-parse', 'HEAD');
   writeFileSync(join(repo, 'src/a.ts'), 'export const a = 2;\n');
-  writeFileSync(join(repo, 'package.json'), '{"version":"1.0.1"}\n');
+  if (options.versionBump !== false) writeFileSync(join(repo, 'package.json'), '{"version":"1.0.1"}\n');
   git('add', '.'); git('commit', '-qm', 'release cut');
   const forCommit = git('rev-parse', 'HEAD');
   const version = '1.0.1';
@@ -115,6 +143,32 @@ test('hard rehearsal evidence uses a distinct rc path; its receipt selects only 
   expect(readFileSync(join(gateDir, 'gate-verdict.json'), 'utf8')).toContain('baselineReceipt');
 });
 
+test('one source file landing after rehearsal selects only tests in its import radius', () => {
+  const { input } = fixture({ versionBump: false });
+  expect(planHardRehearsalRadius(input)).toMatchObject({
+    plan: { files: ['src/a.test.ts'] }, reason: 'hard rehearsal receipt and import radius verified',
+  });
+});
+
+test('a verified full rehearsal receipt for the exact cut SHA carries the gate with zero reruns', () => {
+  const { input, priorCommit } = fixture();
+  expect(planHardRehearsalRadius({ ...input, forCommit: priorCommit })).toMatchObject({
+    plan: { kind: 'carry', priorCommit, forCommit: priorCommit, files: [], priorFailures: [], priorErrors: [] },
+    reason: 'same-head clean rehearsal receipt verified; zero tests rerun',
+  });
+});
+
+test('receipt reuse ignores host names when immutable execution identity matches', () => {
+  const { input, stampDir } = fixture({ versionBump: false });
+  const path = join(stampDir, 'hard-5h.json');
+  const stamp = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  stamp.selection = { remote: 'aws1-rehearsal' };
+  writeFileSync(path, JSON.stringify(stamp));
+  expect(planHardRehearsalRadius({ ...input, forCommit: input.forCommit })).toMatchObject({
+    plan: { files: ['src/a.test.ts'] }, reason: 'hard rehearsal receipt and import radius verified',
+  });
+});
+
 test('missing or mismatched receipt identities return a full gate', () => {
   const { input, gateDir } = fixture();
   expect(planHardRehearsalRadius({ ...input, imageDigest: null }).plan).toBeNull();
@@ -123,6 +177,8 @@ test('missing or mismatched receipt identities return a full gate', () => {
   expect(planHardRehearsalRadius({ ...input, imageDigest: `sha256:${'a'.repeat(64)}` }).plan).toBeNull();
   expect(planHardRehearsalRadius({ ...input, executionIdentity: null }).plan).toBeNull();
   expect(planHardRehearsalRadius({ ...input, executionIdentity: { ...input.executionIdentity, bunVersion: '1.4.3' } }).plan).toBeNull();
+  expect(planHardRehearsalRadius({ ...input, executionIdentity: { ...input.executionIdentity, bunVersion: '1.4.3' } }).reason)
+    .toBe('hard rehearsal receipt or current execution identity differs');
   expect(planHardRehearsalRadius({ ...input, executionIdentity: { ...input.executionIdentity, architecture: 'arm64' } }).plan).toBeNull();
   const path = join(gateDir, 'gate-verdict.json');
   const verdict = JSON.parse(readFileSync(path, 'utf8'));
@@ -230,4 +286,19 @@ test('a later failed hard-mid prevents reuse of an earlier green hard-5h', () =>
   writeFileSync(join(stampDir, 'hard-mid.json'), JSON.stringify({ ...five, step: 'hard-mid', outcome: 'error',
     endedAt: '2026-10-20T11:00:00.000Z' }));
   expect(planHardRehearsalRadius(input)).toMatchObject({ plan: null, reason: 'latest hard rehearsal is not clean' });
+});
+
+test('GATE-RECEIPT-VALID-ON-REGRESSION: a completed rehearsal with a regression keeps passed files and re-measures only the failed one', () => {
+  const { input, stampDir, gateDir, priorCommit } = fixture();
+  const five = JSON.parse(readFileSync(join(stampDir, 'hard-5h.json'), 'utf8'));
+  const failedId = 'src/b.test.ts > broke';
+  writeFileSync(join(stampDir, 'hard-5h.json'), JSON.stringify({ ...five, outcome: 'regression',
+    hardGate: { ...five.hardGate, outcome: 'fail', introduced: [failedId] } }));
+  const verdict = JSON.parse(readFileSync(join(gateDir, 'gate-verdict.json'), 'utf8'));
+  writeFileSync(join(gateDir, 'gate-verdict.json'), JSON.stringify({ ...verdict, outcome: 'regression' }));
+  writeFileSync(join(gateDir, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: [failedId], errors: [] }));
+  const sameHead = planHardRehearsalRadius({ ...input, forCommit: priorCommit });
+  expect(sameHead.plan).toMatchObject({ priorCommit, forCommit: priorCommit, files: ['src/b.test.ts'], priorFailures: [failedId] });
+  expect(sameHead.plan?.kind).toBeUndefined();
+  expect(sameHead.reason).toContain('re-measure 1 failed file(s) only');
 });

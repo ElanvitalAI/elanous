@@ -60,10 +60,10 @@ test('dashboard boot and input do not import or read virtual windows', () => {
   const index = tuiSourceText();
   const layout = source('src/dashboard/layout-display-runtime-registration.ts');
   // 슬래시 구현 = 옛 dashboard-handlers.ts ⊕ 이사 간 src/tui/slash/**(D4b · TUI-SLASH-SPLIT-MISSION ⊕ -TERM).
-  // ⛔ 옛 파일 하나만 읽으면 옮겨 간 명령(/mission …)에 금지 VW 참조가 다시 들어와도 놓친다.
+  // ⛔ 옛 파일 하나만 읽으면 옮겨 간 명령(/term …)에 금지 VW 참조가 다시 들어와도 놓친다. (/mission 은 11-05 제거)
   const slashImpl = readTuiSources().filter(({ path }) =>
     path === 'src/dashboard/slash-runtime/dashboard-handlers.ts' || path.startsWith('src/tui/slash/'));
-  for (const moved of ['src/tui/slash/mission.ts', 'src/tui/slash/term.ts']) {
+  for (const moved of ['src/tui/slash/term.ts']) {
     expect(slashImpl.map(({ path }) => path)).toContain(moved);
   }
   const handlers = dashboardSourceText(slashImpl);

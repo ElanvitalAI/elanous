@@ -45,6 +45,8 @@ export interface WarmPodSpec {
   nodeName?: string;
   cutSha: string;
   key: WarmWorkerKey;
+  /** Runtime prerequisites independent of the image digest; source code is checked out separately. */
+  runtimeContract?: { bunVersion: string; os: 'linux'; architecture: string; requiredTools: readonly string[] };
   /** Resident worker tier. A lite Pod is capped at 2 GiB, including each request exec. */
   memoryLimit?: '2Gi' | '16Gi';
   /** Caller resolves the live host daemon endpoint; no guessed port. */
@@ -170,6 +172,65 @@ process.stdout.write('ack');`;
 export const WARM_POD_READ = `import { readFileSync } from 'node:fs';
 process.stdout.write(readFileSync(process.argv.at(-1)).toString('base64'));`;
 
+/** Read-only runtime probe for an image-drifted standing Pod. */
+export const WARM_POD_RUNTIME_PROBE = `import { accessSync, constants } from 'node:fs';
+import { delimiter, join } from 'node:path';
+const request = JSON.parse(await Bun.stdin.text());
+const tools = Object.fromEntries(request.requiredTools.map((tool) => {
+  const found = (process.env.PATH ?? '').split(delimiter).some((directory) => {
+    try { accessSync(join(directory, tool), constants.X_OK); return true; } catch { return false; }
+  });
+  return [tool, found];
+}));
+const architecture = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+process.stdout.write(JSON.stringify({ bunVersion: Bun.version, os: process.platform, architecture, tools }));`;
+
+function imageRepositoryAndDigest(image: unknown): { repository: string; digest: string } | null {
+  if (typeof image !== 'string') return null;
+  const match = /^(.*)@(sha256:[a-f0-9]{64})$/.exec(image);
+  return match ? { repository: match[1]!, digest: match[2]! } : null;
+}
+
+export function imageReferencesDifferOnlyByDigest(expected: readonly unknown[], observed: readonly unknown[]): boolean {
+  if (expected.length !== observed.length) return false;
+  let drifted = false;
+  for (let index = 0; index < expected.length; index++) {
+    const want = imageRepositoryAndDigest(expected[index]);
+    const got = imageRepositoryAndDigest(observed[index]);
+    if (!want || !got || want.repository !== got.repository) return false;
+    if (want.digest !== got.digest) drifted = true;
+  }
+  return drifted;
+}
+
+export function warmRuntimeContractMatches(expected: NonNullable<WarmPodSpec['runtimeContract']>, observed: unknown): boolean {
+  if (!observed || typeof observed !== 'object' || Array.isArray(observed)) return false;
+  const value = observed as Record<string, unknown>;
+  const tools = value.tools;
+  return value.bunVersion === expected.bunVersion && value.os === expected.os
+    && value.architecture === expected.architecture && !!tools && typeof tools === 'object' && !Array.isArray(tools)
+    && expected.requiredTools.every(tool => (tools as Record<string, unknown>)[tool] === true);
+}
+
+export function probeWarmPodRuntimeContract(spec: WarmPodSpec, kubectl: Kubectl):
+  { status: 'compatible' | 'incompatible' | 'unavailable'; observed?: unknown } {
+  const expected = spec.runtimeContract;
+  if (!expected) return { status: 'unavailable' };
+  const result = kubectl([...prefixArgs(spec), 'exec', spec.name, '-c', 'worker', '-i', '--', 'bun', '-e', WARM_POD_RUNTIME_PROBE],
+    JSON.stringify({ requiredTools: expected.requiredTools }));
+  if (result.status !== 0) {
+    // Distinguish a proven missing runtime executable from transient exec/API errors.
+    // The latter must remain unavailable so an uncertain probe never authorizes retirement.
+    if (/(?:exec:\s*)?["']?bun["']?: executable file not found(?: in \$PATH)?/i.test(result.stderr))
+      return { status: 'incompatible', observed: { missingExecutable: 'bun' } };
+    return { status: 'unavailable' };
+  }
+  try {
+    const observed = JSON.parse(result.stdout) as unknown;
+    return { status: warmRuntimeContractMatches(expected, observed) ? 'compatible' : 'incompatible', observed };
+  } catch { return { status: 'unavailable' }; }
+}
+
 function validateSpec(spec: WarmPodSpec): void {
   const publicHttpsSource = (value: string): boolean => {
     try { const url = new URL(value); return url.protocol === 'https:' && !!url.hostname
@@ -185,6 +246,12 @@ function validateSpec(spec: WarmPodSpec): void {
     || !spec.workerId || !SHA.test(spec.cutSha) || !DIGEST.test(spec.key.imageDigest)
     || !/^[a-f0-9]{64}$/.test(spec.key.lockHash) || !spec.key.context || !spec.key.architecture
     || !spec.image.endsWith(`@${spec.key.imageDigest}`)
+    || (spec.runtimeContract !== undefined && (typeof spec.runtimeContract.bunVersion !== 'string'
+      || !/^\d+\.\d+\.\d+$/.test(spec.runtimeContract.bunVersion)
+      || spec.runtimeContract.os !== 'linux' || spec.runtimeContract.architecture !== spec.key.architecture
+      || !Array.isArray(spec.runtimeContract.requiredTools) || spec.runtimeContract.requiredTools.length === 0
+      || new Set(spec.runtimeContract.requiredTools).size !== spec.runtimeContract.requiredTools.length
+      || spec.runtimeContract.requiredTools.some(tool => typeof tool !== 'string' || !/^[a-zA-Z0-9._+-]+$/.test(tool))))
     || (spec.sourceUrl === undefined) === (spec.sourceMirrorHostPath === undefined)
     || (spec.sourceUrl !== undefined && !publicHttpsSource(spec.sourceUrl))
     || (spec.sourceMirrorHostPath !== undefined && (!isAbsolute(spec.sourceMirrorHostPath)
@@ -355,7 +422,7 @@ function matchesPodManifest(pod: any, spec: WarmPodSpec): boolean {
         if (field === 'resources' && want?.resources === undefined && got?.resources
           && typeof got.resources === 'object' && !Array.isArray(got.resources)
           && Object.keys(got.resources).length === 0) continue;
-        if (!sameJson(got?.[field], want?.[field])) return false;
+        if (field !== 'image' && !sameJson(got?.[field], want?.[field])) return false;
       }
     }
   }
@@ -366,6 +433,7 @@ function matchesPodManifest(pod: any, spec: WarmPodSpec): boolean {
 export class WarmPodTransport {
   private tail: Promise<unknown> = Promise.resolve();
   private podUid: string | null = null;
+  private admittedImages: string[] | null = null;
   private quarantined = false;
   private readonly ledgerDir: string | null;
   constructor(private readonly spec: WarmPodSpec, private readonly kubectl: Kubectl = warmKubectl,
@@ -408,6 +476,33 @@ export class WarmPodTransport {
       || a?.['elanous.dev/warm-worker-id'] !== this.spec.workerId
       || a?.['elanous.dev/warm-context'] !== this.spec.key.context
       || a?.['elanous.dev/warm-architecture'] !== this.spec.key.architecture) return fallback('pod-unready');
+    const expectedImages = [...(warmWorkerPodManifest(this.spec).spec as any).initContainers,
+      ...(warmWorkerPodManifest(this.spec).spec as any).containers].map((row: any) => row.image);
+    const observedImages = [...(pod.spec?.initContainers ?? []), ...(pod.spec?.containers ?? [])].map((row: any) => row?.image);
+    if (this.admittedImages && !sameJson(observedImages, this.admittedImages)) {
+      debug.log('pod.warm', 'image-drift-refused', { workerId: this.spec.workerId,
+        podUid: uid, runId: command.runId, result: 'image-changed-after-lease-pin' }, { level: 'warn' });
+      return fallback('pod-unready');
+    }
+    const admittedImages = [...observedImages];
+    const imageDrift = expectedImages.length !== observedImages.length
+      || expectedImages.some((image: string, index: number) => image !== observedImages[index]);
+    if (imageDrift) {
+      debug.log('pod.warm', 'image-drift-refused', { workerId: this.spec.workerId,
+        podUid: uid, runId: command.runId, result: imageReferencesDifferOnlyByDigest(expectedImages, observedImages)
+          ? 'image-changed-after-lease-pin' : 'image-reference-mismatch' }, { level: 'warn' });
+      return fallback('pod-unready');
+    }
+    if (imageDrift) {
+      const compatibility = probeWarmPodRuntimeContract(this.spec, this.kubectl);
+      debug.log('pod.warm', compatibility.status === 'compatible' ? 'image-drift' : 'image-drift-refused', {
+        workerId: this.spec.workerId, podUid: uid, runId: command.runId, expectedImage: this.spec.image,
+        observedImage: pod.spec?.containers?.[0]?.image ?? null,
+        runtimeContract: compatibility.observed ?? null, result: compatibility.status,
+      }, { level: compatibility.status === 'compatible' ? 'info' : 'warn' });
+      if (compatibility.status !== 'compatible') return fallback('pod-unready');
+    }
+    this.admittedImages ??= [...observedImages];
     const nodeName = pod?.spec?.nodeName;
     if (typeof nodeName !== 'string' || !nodeName) return fallback('pod-unready');
     const sameAdmittedPod = (raw: string): boolean => {
@@ -418,6 +513,8 @@ export class WarmPodTransport {
           && sameJson(current?.metadata?.annotations, a)
           && current?.status?.phase === 'Running'
           && current?.status?.containerStatuses?.some((row: any) => row.name === 'worker' && row.ready === true)
+          && sameJson([...(current?.spec?.initContainers ?? []), ...(current?.spec?.containers ?? [])]
+            .map((row: any) => row?.image), admittedImages)
           && current?.spec?.nodeName === nodeName && matchesPodManifest(current, this.spec);
       } catch { return false; }
     };

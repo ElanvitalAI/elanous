@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { integrateTrain, planTrain, runTrain, tangledPairs, type TrainCandidate, type TrainGit, type TrainObservation } from './merge-train.js';
@@ -182,15 +182,16 @@ test('unmeasured gate or unsupported integration stops further bisect and leaves
 test('real merge-tree builds both disjoint changes, excludes a conflicting branch, and never checks out', () => {
   const { repo, base, first, second, conflict } = fixture();
   const calls: string[][] = [];
-  const injected: TrainGit = (args, cwd) => {
+  const injected: TrainGit = (args, cwd, env) => {
     calls.push([...args]);
-    const result = spawnSync('git', [...args], { cwd, encoding: 'utf8' });
+    const result = spawnSync('git', [...args], { cwd, env, encoding: 'utf8' });
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   };
   const result = integrateTrain(repo, base, [
     { number: 1, head: first }, { number: 3, head: conflict }, { number: 2, head: second },
   ], injected);
   expect(result.conflicts).toEqual([{ number: 3, reason: 'conflict', files: ['shared.txt'] }]);
+  expect(result.conflictPlans).toMatchObject([{ number: 3, files: ['shared.txt'], repairPlan: { decision: 'launch', reason: 'needs-repair' } }]);
   expect(result.commitSha).toMatch(/^[0-9a-f]{40}$/);
   expect(git(repo, 'show', `${result.commitSha}:first.txt`)).toBe('first');
   expect(git(repo, 'show', `${result.commitSha}:second.txt`)).toBe('second');
@@ -201,12 +202,108 @@ test('real merge-tree builds both disjoint changes, excludes a conflicting branc
   expect(calls.filter((args) => args.includes('commit-tree'))).toHaveLength(2);
 }, 30_000);
 
+test('merge train applies append-only conflict plans to a shadow tree and gates the preserved main-first result', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'merge-train-append-only-'));
+  dirs.push(repo);
+  git(repo, 'init', '-q', '-b', 'main');
+  git(repo, 'config', 'user.name', 'test');
+  git(repo, 'config', 'user.email', 'test@localhost');
+  writeFileSync(join(repo, 'shared.md'), 'base\n');
+  chmodSync(join(repo, 'shared.md'), 0o755);
+  git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base');
+  const base = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'checkout', '-qb', 'pr', base);
+  writeFileSync(join(repo, 'shared.md'), 'base\npr append\n');
+  chmodSync(join(repo, 'shared.md'), 0o755);
+  git(repo, 'commit', '-qam', 'pr append');
+  const prHead = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'checkout', '-q', 'main');
+  writeFileSync(join(repo, 'shared.md'), 'base\nmain append\n');
+  chmodSync(join(repo, 'shared.md'), 0o755);
+  git(repo, 'commit', '-qam', 'main append');
+  const mainHead = git(repo, 'rev-parse', 'HEAD');
+  let gatedTree = '';
+  let gatedCommitSha = '';
+  const observed: TrainObservation[] = [];
+  const result = await runTrain([{ number: 41, head: prHead, title: 'PR 41 intent', body: 'PR 41 body' }], {
+    integrate: (batch) => integrateTrain(repo, mainHead, batch),
+    gate: (commitSha) => { gatedCommitSha = commitSha; gatedTree = git(repo, 'show', `${commitSha}:shared.md`); return 'pass'; },
+    observe: (data) => { observed.push(data); },
+  });
+  expect(result.verdicts).toEqual([{ number: 41, verdict: 'pass' }]);
+  expect(gatedTree).toBe('base\nmain append\npr append');
+  expect(git(repo, 'ls-tree', gatedCommitSha, 'shared.md')).toMatch(/^100755 blob /);
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(mainHead);
+  expect(observed[0]?.conflictPlans).toMatchObject([{ number: 41, files: ['shared.md'], decision: 'automerge', reason: 'append-only' }]);
+});
+
+test('merge train carries complete repair goals for non-append conflicts without running the gate', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'merge-train-repair-plan-'));
+  dirs.push(repo);
+  git(repo, 'init', '-q', '-b', 'main');
+  git(repo, 'config', 'user.name', 'test');
+  git(repo, 'config', 'user.email', 'test@localhost');
+  writeFileSync(join(repo, 'shared.md'), 'base\n');
+  git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base');
+  const base = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'checkout', '-qb', 'pr', base);
+  writeFileSync(join(repo, 'shared.md'), 'pr changed\n');
+  git(repo, 'commit', '-qam', 'pr changed');
+  const prHead = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'checkout', '-q', 'main');
+  writeFileSync(join(repo, 'shared.md'), 'main changed\n');
+  git(repo, 'commit', '-qam', 'main changed');
+  const mainHead = git(repo, 'rev-parse', 'HEAD');
+  const candidate = { number: 42, head: prHead, title: 'PR intent title', body: 'PR body intent' };
+  const integration = integrateTrain(repo, mainHead, [candidate]);
+  expect(integration.conflicts).toHaveLength(1);
+  expect(integration.conflictPlans?.[0]?.repairPlan).toMatchObject({ decision: 'launch', reason: 'needs-repair' });
+  expect(integration.conflictPlans?.[0]?.repairPlan?.goal).toContain('MAIN (theirs)');
+  let gateCalls = 0;
+  const observed: TrainObservation[] = [];
+  const result = await runTrain([candidate], {
+    integrate: (batch) => integrateTrain(repo, mainHead, batch),
+    gate: () => { gateCalls++; return 'pass'; },
+    observe: (data) => { observed.push(data); },
+  });
+  expect(result.verdicts).toEqual([{ number: 42, verdict: 'conflict' }]);
+  expect(gateCalls).toBe(0);
+  expect(observed[0]?.conflictPlans).toMatchObject([{ number: 42, files: ['shared.md'], decision: 'launch', reason: 'needs-repair' }]);
+  expect(observed[0]?.conflictPlans?.[0]?.goal).toContain('FILE shared.md');
+  expect(observed[0]?.conflictPlans?.[0]?.goal).toContain('PR body intent');
+});
+
+test('merge train refuses to automerge symlink conflicts instead of replacing their type', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'merge-train-symlink-conflict-'));
+  dirs.push(repo);
+  git(repo, 'init', '-q', '-b', 'main');
+  git(repo, 'config', 'user.name', 'test');
+  git(repo, 'config', 'user.email', 'test@localhost');
+  symlinkSync('base-target', join(repo, 'shared.md'));
+  git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base');
+  const base = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'checkout', '-qb', 'pr', base);
+  rmSync(join(repo, 'shared.md'));
+  symlinkSync('pr-target', join(repo, 'shared.md'));
+  git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'pr link');
+  const prHead = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'checkout', '-q', 'main');
+  rmSync(join(repo, 'shared.md'));
+  symlinkSync('main-target', join(repo, 'shared.md'));
+  git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'main link');
+  const mainHead = git(repo, 'rev-parse', 'HEAD');
+  const result = integrateTrain(repo, mainHead, [{ number: 43, head: prHead }]);
+  expect(result.conflicts).toEqual([{ number: 43, reason: 'conflict', files: ['shared.md'] }]);
+  expect(result.conflictPlans).toMatchObject([{ number: 43, repairPlan: { decision: 'escalate', reason: 'conflict-file-mode-unsupported' } }]);
+  expect(git(repo, 'rev-parse', 'HEAD')).toBe(mainHead);
+});
+
 test('train integration passes UX merge drivers only to the merge-tree process', () => {
   const { repo, base, first } = fixture();
   const calls: string[][] = [];
-  const injected: TrainGit = (args, cwd) => {
+  const injected: TrainGit = (args, cwd, env) => {
     calls.push([...args]);
-    const result = spawnSync('git', [...args], { cwd, encoding: 'utf8' });
+    const result = spawnSync('git', [...args], { cwd, env, encoding: 'utf8' });
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   };
   const result = integrateTrain(repo, base, [{ number: 1, head: first }], injected);
@@ -305,3 +402,16 @@ test('shadow queue with two non-overlapping PRs runs one train gate and records 
   expect(trainCalls.some((line) => /\bgit push\b|\bupdate-ref\b|\bcheckout\b/.test(line))).toBe(false);
   expect(trainCalls.some((line) => line.includes('commit-tree'))).toBe(true);
 }, 30_000);
+
+test('runTrain routes culprit plans through tangled-pair reordering', async () => {
+  let plans: { pr: number; plan: { action: string; with?: number } }[] = [];
+  await runTrain(candidates.slice(0, 2), {
+    integrate: () => ({ commitSha: 'a'.repeat(40), conflicts: [] }),
+    gate: () => 'fail',
+    tangledPairs: [{ first: 1, then: 2, failures: 2 }],
+    classifyCulprit: () => ({ action: 'launch', goal: 'unused', boundaryFiles: [] }),
+    onCulpritPlans: value => { plans = value; },
+    observe: () => {},
+  });
+  expect(plans).toEqual([{ pr: 1, plan: { action: 'reorder', with: 2 } }, { pr: 2, plan: { action: 'reorder', with: 1 } }]);
+});

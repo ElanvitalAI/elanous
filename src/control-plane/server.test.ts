@@ -115,6 +115,75 @@ test('machine token may acquire only its own warm worker lease; unrelated paths 
     attrs: { state: 'leased', runId: 'gate-run', attemptId: 'gate-attempt' } });
 });
 
+test('only the host token can atomically expire its exact idle Pod after TTL', async () => {
+  const { root, tokens, call } = setup(heldPrimary);
+  const hostToken = issueMemberToken('local', root);
+  const otherHostToken = issueMemberToken('node-b', root);
+  const key = { context: 'local', imageDigest: 'sha256:image', lockHash: 'lock-expire', architecture: 'arm64' };
+  const worker = { workerId: 'worker-expire', machine: 'local', podUid: 'pod-expire', key, ttlMs: 10_000 };
+  expect((await call('/v1/workers/pod', hostToken, 'POST', worker)).status).toBe(200);
+  const ledgerPath = join(root, 'control', 'ledger.json');
+  const stored = JSON.parse(readFileSync(ledgerPath, 'utf8')) as Array<{ id: string; observedAt: number }>;
+  const storedRow = stored.find(row => row.id === 'pod-worker-lease:worker-expire')!;
+  storedRow.observedAt = Date.now() - worker.ttlMs - 1;
+  writeFileSync(ledgerPath, JSON.stringify(stored));
+  const resource = await (await call('/v1/resources?kind=pod-worker-lease&name=worker-expire', tokens.query)).json() as {
+    resources: Array<{ observedAt: number; ttlMs: number }>;
+  };
+  const row = resource.resources[0]!;
+  const request = { podUid: 'pod-expire', expectedObservedAt: row.observedAt,
+    expectedExpiresAtMs: row.observedAt + row.ttlMs };
+  expect((await call('/v1/leases/pod-worker/worker-expire/expire', tokens.member, 'POST', request)).status).toBe(403);
+  expect((await call('/v1/leases/pod-worker/worker-expire/expire', otherHostToken, 'POST', request)).status).toBe(403);
+  expect((await call('/v1/leases/pod-worker/worker-expire/expire', hostToken, 'POST', {
+    ...request, podUid: 'stale-uid',
+  })).status).toBe(409);
+  expect((await call('/v1/leases/pod-worker/worker-expire/expire', hostToken, 'POST', {
+    ...request, expectedObservedAt: row.observedAt - 1,
+  })).status).toBe(409);
+  const expired = await call('/v1/leases/pod-worker/worker-expire/expire', hostToken, 'POST', request);
+  expect(expired.status).toBe(200);
+  expect(await expired.json()).toMatchObject({ attrs: { state: 'reaping', reason: 'idle-ttl-expired', podUid: 'pod-expire' } });
+  expect((await call('/v1/leases/pod-worker/worker-expire/expire', hostToken, 'POST', request)).status).toBe(409);
+});
+
+test('idle Pod expiry rechecks primary after waiting for the ledger lock', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-expire-primary-lock-'));
+  roots.push(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-expire', architecture: 'arm64' };
+  const ledger = new ResourceLedger(root);
+  const observedAt = Date.now() - 100;
+  const row = ledger.registerPodWorker({ workerId: 'worker-expire-race', machine: 'node-c', podUid: 'pod-expire-race',
+    key, owner: 'host', ttlMs: 10 }, observedAt);
+  let currentGeneration = 1;
+  let freshReads = 0;
+  const control = startControlServer({ root, port: 0, requireKnownLeaseForWrites: true,
+    leaseView: { async get(options) {
+      if (options?.fresh) freshReads++;
+      return currentGeneration === 1
+        ? { holder: 'local', generation: 1, iAmHolder: true, known: true }
+        : { holder: 'other', generation: 2, iAmHolder: false, known: true };
+    } } });
+  servers.push(control);
+  const release = acquireLockSync(`${ledger.path}.lock`);
+  let response: Response;
+  try {
+    const pending = fetch(`${control.url}/v1/leases/pod-worker/worker-expire-race/expire`, {
+      method: 'POST', headers: { authorization: `Bearer ${issueMemberToken('node-c', root)}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ podUid: 'pod-expire-race', expectedObservedAt: observedAt,
+        expectedExpiresAtMs: observedAt + row.ttlMs }),
+    });
+    for (let i = 0; i < 100 && freshReads === 0; i++) await Bun.sleep(10);
+    expect(freshReads).toBe(1);
+    currentGeneration = 2;
+    release();
+    response = await pending;
+  } catch (error) { release(); throw error; }
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({ error: 'not-primary' });
+  expect(ledger.list({ name: 'worker-expire-race' })[0]?.attrs).toMatchObject({ state: 'idle', podUid: 'pod-expire-race' });
+});
+
 test('warm worker writes fail closed when there is no primary observation', async () => {
   const { root, tokens, call } = setup();
   const host = issueMemberToken('local', root);

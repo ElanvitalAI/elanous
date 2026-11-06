@@ -21,7 +21,7 @@
 // PWA `Generate connect token` 카드 (T4.D) 는 별도 POST endpoint 로 5min
 // single-use JWT 를 mint. T4.D PR 에서 이 module 에 mint-token 추가 예정.
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { homedir } from 'node:os';

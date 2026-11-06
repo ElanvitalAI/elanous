@@ -30,7 +30,7 @@
 // `reasoning` is the LLM's full response for debugging (caller can
 // hide it in production UIs).
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { discoverWorkflows } from '../../workflow-runtime/discovery.js';
 import {

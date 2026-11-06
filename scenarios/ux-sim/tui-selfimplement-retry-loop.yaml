@@ -1,0 +1,29 @@
+version: 0
+id: tui-selfimplement-retry-loop
+isolation: test
+seed: 20261104
+recording:
+  tool: SelfImplement
+  feature: retry the broken harness request
+  repeatedCalls: 24
+  invalidGoalFiles:
+    - ''
+    - missing/GOAL-retry.md
+  finalFeature: resume the unrelated old goal
+  finalGoalFile: .elanous/goals/GOAL-old-browser-selection.md
+  oldGoalTitle: Old browser selection handoff
+  fakeHarnessFailure: ImagePullBackOff while waiting for image
+  agentOutputRepeatCalls: 5
+expect:
+  currentMain:
+    invalidDispatches: more-than-3
+    managedAdmissions: more-than-1
+    oldGoalReused: true
+  repaired:
+    invalidDispatchesAtMost: 2
+    managedAdmissionsForInvalidGoals: 0
+    repeatBlockedAt: 3
+    doomLoopDetected: true
+  lateFailure:
+    visibleAsToolError: true
+    sameReasonDispatchesAtMost: 2

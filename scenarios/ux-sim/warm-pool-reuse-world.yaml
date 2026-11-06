@@ -1,0 +1,102 @@
+world: pod-reuse-core
+seed: 305
+clock:
+  start: "2026-11-05T00:00:00.000Z"
+  speed: 60
+hosts:
+  - name: pool-a
+    arch: arm64
+    cpu: 8
+    pools: [si-v1]
+    egress: true
+  - name: pool-b
+    arch: amd64
+    cpu: 4
+    pools: [si-v1]
+    egress: true
+processes:
+  - id: si-child-a
+    host: pool-a
+    releaseVersion: "0.3.5"
+    fingerprint: si-v1
+  - id: si-child-b
+    host: pool-b
+    releaseVersion: "0.3.5"
+    fingerprint: si-v1
+devices:
+  - fake-clock
+  - fake-fleet
+  - fake-cloud-vm
+  - warm-pool-reuse-sim
+  - world-runtime
+  - pod-reuse-residue-fault
+events:
+  - at: "+10s"
+    id: reuse-clean
+  - at: "+90s"
+    id: reuse-recovery
+  - at: "+2m"
+    id: reuse-residue
+  - at: "+3m"
+    id: reuse-uncertain
+injections:
+  - at: "+10s"
+    ledger:
+      - event: pod.reuse.return-decision
+        data:
+          outcome: eligible
+      - event: pod.reuse.return-decision
+        data:
+          outcome: returned
+  - at: "+90s"
+    ledger:
+      - event: pod.reuse.clean-failed
+      - event: pod.reuse.return-decision
+        data:
+          outcome: quarantined
+      - event: pod.reuse.return-decision
+        data:
+          outcome: eligible
+      - event: pod.reuse.return-decision
+        data:
+          outcome: returned
+  - at: "+2m"
+    ledger:
+      - event: pod.reuse.clean-failed
+      - event: pod.reuse.return-decision
+        data:
+          outcome: quarantined
+  - at: "+3m"
+    logs:
+      - category: pod.reuse
+        event: uncertain-exec-injected
+        data:
+          fault: timeout
+          phase: after-dispatch
+      - category: pod.reuse
+        event: uncertain-exec-injected
+        data:
+          fault: connection-lost
+          phase: after-dispatch
+      - category: pod.reuse
+        event: uncertain-exec-injected
+        data:
+          fault: result-missing
+          phase: after-dispatch
+      - category: pod.reuse
+        event: uncertain-exec-injected
+        data:
+          fault: cleanup-unknown
+          phase: after-dispatch
+chaos:
+  - at: "+1m"
+    gorilla:
+      host: pool-a
+      egress: false
+      cpu: 0
+      for: "+30s"
+expect:
+  recovers:
+    within: "+1m"
+    hitl: 0
+    lostLedger: 0

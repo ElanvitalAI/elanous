@@ -7,8 +7,9 @@ import { NEXT_MD_PATH, resolveNextMdConflict } from '../release-loop/next-md-mer
 import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
-import { integrateTrain, runTrain, type TrainCandidate, type TrainDeferred, type TrainGit } from './merge-train.js';
+import { integrateTrain, runTrain, type TrainCandidate, type TrainDeferred, type TrainGit, type TrainIntegration } from './merge-train.js';
 import { trainGateOnHost, type TrainGate } from './train-gate-remote.js';
+import type { GateRemoteRunner, GateRemoteSettings } from './gate-remote.js';
 import {
   buildTrainReachDecision,
   type TrainReachCandidate,
@@ -37,6 +38,10 @@ export type L8MergeQueueDeps = {
   command?: Command;
   /** Must identify the same shared repository across all harness processes. */
   acquire?: (cwd: string) => Promise<() => void>;
+  lock?: L8MergeQueueLockOptions;
+};
+export type L8MergeQueueLockOptions = {
+  waitMs?: number;
 };
 
 /** Per-PR shadow train record: reach group, tests, and the integrate/bisect verdict. */
@@ -88,8 +93,13 @@ export type L8ShadowQueueDeps = L8MergeQueueDeps & {
   resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>;
   /** Shadow merge train gate seam (default: trainGateOnHost over the real gate-remote runner, host node-b). */
   trainGate?: (repo: string, baseSha: string) => TrainGate;
+  /** Test seam for the external SSH/mirror boundary while retaining the production trainGateOnHost path. */
+  trainGateRunner?: GateRemoteRunner;
+  trainGateSettings?: GateRemoteSettings;
   /** Shadow merge train integration git seam (default: the queue's own command executor). */
   trainGit?: TrainGit;
+  /** Test seam for the shadow integration call, including the pinned PR intent metadata. */
+  trainIntegrate?: (repo: string, baseSha: string, batch: readonly TrainCandidate[], git: TrainGit) => TrainIntegration;
   /** Maximum PRs per shadow train batch (default 5, the reach-group capacity). */
   trainMaxBatch?: number;
   /** Reach observation seam (default: inspect each fetched PR worktree via buildTrainReachDecision). */
@@ -127,7 +137,7 @@ function writeShadowQueue(path: string, state: L8ShadowQueueState): void {
 }
 
 async function withShadowQueue<T>(cwd: string, deps: L8ShadowQueueDeps, fn: (state: L8ShadowQueueState, path: string) => Promise<T>): Promise<T> {
-  const release = await (deps.acquire ?? acquireL8MergeQueue)(cwd);
+  const release = await (deps.acquire ?? ((dir) => acquireL8MergeQueue(dir, deps.lock)))(cwd);
   try {
     const path = shadowQueuePath(cwd, deps.command ?? command);
     return await fn(readShadowQueue(path), path);
@@ -305,29 +315,33 @@ async function runShadowMergeTrain(
   base: string,
   deps: L8ShadowQueueDeps,
 ): Promise<L8ShadowVerdict | null> {
+  const trainBatch: TrainCandidate[] = [];
   for (const item of plan.batch) {
-    const view = JSON.parse(run('gh', ['pr', 'view', String(item.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'], cwd)) as {
-      headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
+    const view = JSON.parse(run('gh', ['pr', 'view', String(item.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository,title,body'], cwd)) as {
+      headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean; title?: string; body?: string;
     };
     if (view.headRefOid !== item.head || view.baseRefName !== 'main' || view.state !== 'OPEN'
       || view.isDraft !== false || view.isCrossRepository !== false) throw new Error(`queued PR #${item.number} changed or is not ready`);
+    trainBatch.push({ ...item, ...(view.title ? { title: view.title } : {}), ...(view.body ? { body: view.body } : {}) });
   }
   for (const item of plan.batch) {
     run('git', ['fetch', 'origin', `refs/pull/${item.number}/head`], cwd);
     if (run('git', ['rev-parse', 'FETCH_HEAD'], cwd) !== item.head) throw new Error(`fetched PR head changed: #${item.number}`);
   }
   const trainGit: TrainGit = deps.trainGit ?? ((args, repo) => execute('git', args, repo));
-  const gate = (deps.trainGate ?? ((repo: string, baseSha: string) => trainGateOnHost({ repo, baseSha })))(cwd, base);
-  const result = await runTrain(plan.batch, {
-    integrate: (batch) => integrateTrain(cwd, base, batch, trainGit),
+  const gate = (deps.trainGate ?? ((repo: string, baseSha: string) => trainGateOnHost(
+    { repo, baseSha, settings: deps.trainGateSettings }, deps.trainGateRunner,
+  )))(cwd, base);
+  const result = await runTrain(trainBatch, {
+    integrate: (batch) => (deps.trainIntegrate ?? integrateTrain)(cwd, base, batch, trainGit),
     gate,
     deferred: plan.deferred,
     observe: (data) => { debug.log('self-implement.merge-train', 'shadow-verdict', data); },
   });
   const at = new Date().toISOString();
-  const batchNumbers = plan.batch.map((item) => item.number);
+  const batchNumbers = trainBatch.map((item) => item.number);
   const verdicts: L8ShadowVerdict[] = result.verdicts.map((entry) => {
-    const item = plan.batch.find((candidate) => candidate.number === entry.number)!;
+    const item = trainBatch.find((candidate) => candidate.number === entry.number)!;
     const manifest = shadowPrManifest(item, group, queueSig, result.gatesRun, entry.verdict);
     return {
       number: entry.number,
@@ -591,11 +605,11 @@ const command: Command = (bin, args, cwd) => {
 };
 
 /** Serialize the whole read/integrate/test/merge transaction, not just the final push. */
-export async function acquireL8MergeQueue(cwd: string): Promise<() => void> {
+export async function acquireL8MergeQueue(cwd: string, options: L8MergeQueueLockOptions = {}): Promise<() => void> {
   const git = command('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
   if (git.status !== 0 || !git.stdout.trim()) throw new Error('merge queue common git directory unavailable');
   const slot = join(git.stdout.trim(), 'elanous-l8-merge-queue');
-  const deadline = Date.now() + 30 * 60_000;
+  const deadline = Date.now() + (options.waitMs ?? 30 * 60_000);
   for (;;) {
     try {
       mkdirSync(slot);
@@ -606,7 +620,7 @@ export async function acquireL8MergeQueue(cwd: string): Promise<() => void> {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       // Fail closed on abandoned slots: never steal a slot while a live merge can own it.
       if (Date.now() >= deadline) throw new Error('merge queue occupied for 30 minutes');
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, deadline - Date.now())));
     }
   }
 }

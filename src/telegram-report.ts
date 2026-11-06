@@ -10,7 +10,6 @@
 // reports (cron digests, autonomous-loop output, trading alerts) route to
 // the report channel while interactive Q&A stays on the main bot.
 
-import { TelegramBot } from './telegram.js';
 import { explainReportRoute, isTradingKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './domains/telegram-kind-route.js';
 export { explainReportRoute } from './domains/telegram-kind-route.js';
 export { DEFAULT_KIND_ROLES, roleForKind } from './domains/telegram-kind-route.js';
@@ -115,6 +114,7 @@ export async function sendTelegramReport(
     logReport('unrouted', { kind: opts.kind ?? null, role: why.role, reason: why.reason });
     return false;
   }
+  const { TelegramBot } = await import('./telegram.js');
   const bot = new TelegramBot({
     token: target.botToken,
     allowedUsers: [],
@@ -142,6 +142,7 @@ export async function sendReportPhoto(
 ): Promise<boolean> {
   const target = resolveReportTarget(cfg, opts.kind);
   if (!target || !photoUrl) return false;
+  const { TelegramBot } = await import('./telegram.js');
   const bot = new TelegramBot({
     token: target.botToken,
     allowedUsers: [],
@@ -163,6 +164,7 @@ export async function sendReportPhotoBuffer(
 ): Promise<boolean> {
   const target = resolveReportTarget(cfg, opts.kind);
   if (!target || !png) return false;
+  const { TelegramBot } = await import('./telegram.js');
   const bot = new TelegramBot({
     token: target.botToken,
     allowedUsers: [],

@@ -184,8 +184,9 @@ test('rehearsal recovery validates its ID and refuses ignored RC selection flags
     const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, deps);
     for (const [args, message] of [
       [['--recovery-run', '../bad'], 'invalid run id'],
-      [['--recovery-run', 'fixture', '--remote', 'node-c'], '--shards and --remote are unsupported'],
-      [['--recovery-run', 'fixture', '--shards', '12'], '--shards and --remote are unsupported'],
+      [['--recovery-run', 'fixture', '--remote', 'node-c'], '--shards, --remote, and --pod-pool are unsupported'],
+      [['--recovery-run', 'fixture', '--shards', '12'], '--shards, --remote, and --pod-pool are unsupported'],
+      [['--recovery-run', 'fixture', '--pod-pool', 'pool-aws1@aws1:12'], '--shards, --remote, and --pod-pool are unsupported'],
     ] as const) {
       lines.length = 0;
       process.exitCode = 0;

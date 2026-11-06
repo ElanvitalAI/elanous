@@ -19,7 +19,7 @@ import { existsSync, statSync, openSync, readSync, closeSync, readFileSync } fro
 import { join as joinPath } from 'node:path';
 import { nexusLogsDir } from '../paths.js';
 import type { TabRegistry } from '../state/tab-registry.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { SSE_HEARTBEAT_MS } from './sse-heartbeat.js';
 
 const STREAM_POLL_MS = 500;

@@ -142,6 +142,34 @@ exec "${realGit}" "$@"
   expect(f.git(f.repo, 'worktree', 'list', '--porcelain')).not.toContain('release-cut-branch-');
 });
 
+// PR-HEAD-FETCH-STATELESS: a release branch force-moved on origin (non-fast-forward for the local
+// tracking ref) must still be fetched with «+» and then pinned by the advertised-SHA check.
+test('--append fetches a force-moved remote release tip instead of failing on a non-fast-forward tracking ref', () => {
+  const f = fixture();
+  writeFileSync(join(f.repo, 'package.json'), '{"version":"9.9.9"}\n');
+  f.git(f.repo, 'add', 'package.json');
+  f.git(f.repo, 'commit', '-q', '-m', 'bump 9.9.9');
+  f.base = f.git(f.repo, 'rev-parse', 'HEAD');
+  f.pick = f.commit('repair.txt', 'fixed on 9.9.9\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  f.git(f.repo, 'push', '-q', 'origin', `${f.pick}:refs/heads/release/9.9.9`);
+  // A single-branch clone: the configured (forced) refspec covers main only, so git's opportunistic
+  // remote-tracking update does not rescue the explicit release refspec — only its own «+» does.
+  f.git(f.repo, 'config', 'remote.origin.fetch', '+refs/heads/main:refs/remotes/origin/main');
+  f.git(f.repo, 'fetch', '-q', 'origin', 'refs/heads/release/9.9.9:refs/remotes/origin/release/9.9.9');
+  f.git(f.repo, 'checkout', '-q', '--detach', f.base);
+  const moved = f.commit('side.txt', 'force-moved release tip\n');
+  f.git(f.repo, 'checkout', '-q', 'main');
+  f.git(f.repo, 'push', '-q', '--force', 'origin', `${moved}:refs/heads/release/9.9.9`);
+  expect(spawnSync('git', ['merge-base', '--is-ancestor', f.pick, moved], { cwd: f.repo }).status).toBe(1);
+  const added = f.commit('repair-three.txt', 'fourth\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  const appended = cutReleaseBranch({ version: '9.9.9', base: f.base, pick: [added], append: true, repoRoot: f.repo, log: () => {} });
+  expect(f.git(f.repo, 'rev-parse', 'refs/remotes/origin/release/9.9.9')).not.toBe(f.pick);
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(appended.commit!);
+  expect(f.git(f.repo, 'merge-base', '--is-ancestor', moved, appended.commit!)).toBe('');
+});
+
 test('--append refuses a pick already on the release branch and a missing branch', () => {
   const f = fixture();
   writeFileSync(join(f.repo, 'package.json'), '{"version":"9.9.9"}\n');

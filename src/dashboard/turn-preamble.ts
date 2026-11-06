@@ -1,12 +1,11 @@
 // U3c Phase 5a — consolidates the dashboard turn loop's system-message
-// builders into one sync helper shared by the ACP `getPreamble` callback
+// builders into one helper shared by the ACP `getPreamble` callback
 // and the plain-chat direct runtime entry point.
 //
 // Keeping both callers on this builder makes config and active-tool
 // propagation identical while their wiring remains independently testable.
-// All builders are sync, which keeps the `DashboardAcpBootDeps.
-// getPreamble` contract (returns `readonly LLMMessage[]`, no Promise)
-// intact.
+// Builders may remain synchronous; the ACP boot boundary also accepts
+// asynchronous preamble providers and awaits them before composing a turn.
 //
 // `turnProfile` is nullable because Phase 5a fires the getter at
 // boot time with no active turn in flight (flag OFF, idle session) —
@@ -48,7 +47,7 @@ import { buildSelfHealthLine, type InstalledRecord, type SelfHealthErrors } from
 import type { PtyBuildIdentity } from '../pty-shell/pty-manifest.js';
 
 const TUI_INTEGRATION_TOOL_SELECTION_GUIDANCE =
-  'For one explicit action in an external service, choose the narrow direct-action integration tool over any secretary or multi-step workflow tool. Use a secretary or workflow tool only when the user asks for its multi-step workflow. If no matching integration tool is active, use `ToolSearch` before inspecting local plugin, config, or CLI files. When ToolSearch finds a matching tool, call it directly. Start `StartPluginWizard` only after ToolSearch finds no matching tool for the requested capability.';
+  'For one explicit action in an external service, choose the narrow direct-action integration tool over any secretary or multi-step workflow tool. Use a secretary or workflow tool only when the user asks for its multi-step workflow. If no matching integration tool is active, use `ToolSearch` before inspecting local plugin, config, or CLI files. When ToolSearch finds a matching tool, call it directly.';
 
 type UserConfig = ReturnType<typeof getUserConfig>;
 

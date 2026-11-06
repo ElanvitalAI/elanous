@@ -4,7 +4,7 @@
 // Covers: not_found / terminal-immediate / not_ready / block+wait /
 // block+timeout / truncation.
 
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 
 import {
   AGENT_OUTPUT_TEXT_CAP_BYTES,
@@ -16,6 +16,7 @@ import { AgentRegistry, globalAgentRegistry } from '../src/agent/registry.ts';
 import type { AgentDefinition, AgentTask } from '../src/agent/types.ts';
 import { debug } from '../src/debug/log.js';
 import { agentOutputRuntime } from '../src/tool-runtime/agent-output-runtime.js';
+import { streamLLMWithTools, type LLMProvider } from '../src/llm.js';
 
 function def(): AgentDefinition {
   return { name: 'output-test', systemPrompt: '' };
@@ -99,6 +100,40 @@ describe('AgentOutput tool', () => {
     expect(r.retrievalStatus).toBe('success');
     expect(r.state).toBe('error');
     expect(r.error).toBe('boom');
+    expect(r.isError).toBe(true);
+  });
+
+  test('terminal AgentOutput failure reaches the real tool-loop doom detector', async () => {
+    const registry = reg();
+    const task = registry.register(def(), 'image wait');
+    markError(task, 'ImagePullBackOff while waiting for image', registry);
+    let providerTurns = 0;
+    let dispatches = 0;
+    const provider: LLMProvider = {
+      name: 'agent-output-late-failure-test', defaultModel: 'test-model', available: () => true,
+      async *chat() {},
+      async *streamChat(_messages, opts) {
+        providerTurns++;
+        const name = opts?.tools?.find((tool) => tool.name === 'AgentOutput')?.name ?? 'AgentOutput';
+        yield { type: 'tool_call', id: `agent-output-${providerTurns}`, name, args: { taskId: task.id } };
+      },
+    };
+    const logSpy = spyOn(debug, 'log');
+    try {
+      await streamLLMWithTools([{ role: 'user', content: 'check the managed run' }], {
+        onText() {},
+        dispatchTool: async (_name, args) => {
+          dispatches++;
+          return dispatchAgentOutput(args, { registry });
+        },
+      }, {
+        provider, model: 'test-model', tools: [buildAgentOutputTool()], maxTurns: 5,
+      });
+      expect(dispatches).toBe(2);
+      expect(logSpy.mock.calls.some((call) => call[0] === 'llm.tool-loop.retry' && call[1] === 'doom-loop-detected')).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   test('terminal task (aborted) returns success state=aborted', async () => {

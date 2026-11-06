@@ -130,6 +130,12 @@ export function createFakeGh(input: { prs: FakeGhPr[]; faults?: FakeGhFault[]; r
       if ((match = /\/commits\/([^/]+)$/.exec(path))) return json({ commit: { message: prs.find((pr) => pr.mergeSha === match![1])?.title ?? '' }, files: [] });
     }
     if (args[0] === 'pr' && args[1] === 'list') {
+      if (args.includes('--head')) {
+        const branch = args[args.indexOf('--head') + 1];
+        const open = prs.find((pr) => pr.branch === branch && !pr.closed && !pr.mergedAt);
+        if (args.includes('--jq')) return open ? `https://github.com/${repo}/pull/${open.number}` : '';
+        return json(open ? [pull(open)] : []);
+      }
       const limitIndex = args.indexOf('--limit');
       const limit = limitIndex === -1 ? 30 : Number(args[limitIndex + 1]);
       if (!Number.isSafeInteger(limit) || limit < 0) throw new Error('fake-gh: invalid --limit');
@@ -140,11 +146,49 @@ export function createFakeGh(input: { prs: FakeGhPr[]; faults?: FakeGhFault[]; r
     }
     if (args[0] === 'pr' && args[1] === 'view') {
       const pr = find(Number(args[2]));
+      const jsonIndex = args.indexOf('--json');
+      if (jsonIndex >= 0) {
+        const fields = (args[jsonIndex + 1] ?? '').split(',').filter(Boolean);
+        const values: Record<string, unknown> = {
+          number: pr.number,
+          url: `https://github.com/${repo}/pull/${pr.number}`,
+          headRefOid: pr.head ?? `head${pr.number}`,
+          baseRefName: 'main',
+          state: pr.mergedAt ? 'MERGED' : pr.closed ? 'CLOSED' : 'OPEN',
+          isDraft: pr.draft ?? false,
+          isCrossRepository: false,
+          mergeCommit: pr.mergeSha ? { oid: pr.mergeSha } : null,
+          files: pr.files!.map((path) => ({ path })),
+        };
+        return json(Object.fromEntries(fields.filter((field) => field in values).map((field) => [field, values[field]])));
+      }
       return json({ number: pr.number, state: pr.mergedAt ? 'MERGED' : pr.closed ? 'CLOSED' : 'OPEN',
         mergeCommit: pr.mergeSha ? { oid: pr.mergeSha } : null, url: `https://github.com/${repo}/pull/${pr.number}` });
     }
+    if (args[0] === 'pr' && args[1] === 'create') {
+      const valueAfter = (flag: string): string => {
+        const index = args.indexOf(flag);
+        if (index < 0 || !args[index + 1] || args[index + 1]!.startsWith('--')) throw new Error(`fake-gh: missing ${flag}`);
+        return args[index + 1]!;
+      };
+      const number = Math.max(0, ...prs.map((pr) => pr.number)) + 1;
+      const title = valueAfter('--title');
+      const branch = valueAfter('--head');
+      const body = valueAfter('--body');
+      const labels = args.flatMap((value, index) => value === '--label' && args[index + 1] ? [args[index + 1]!] : []);
+      const createdAt = now().toISOString();
+      const pr: FakeGhPr = { number, title, branch, body, labels, files: [], comments: [], createdAt, updatedAt: createdAt };
+      prs.push({ ...pr, labels: pr.labels ?? [], files: pr.files ?? [], comments: pr.comments ?? [] });
+      return `https://github.com/${repo}/pull/${number}`;
+    }
     if (args[0] === 'pr' && args[1] === 'edit') {
-      const pr = find(Number(args[2]));
+      const target = args[2] ?? '';
+      const number = Number(target) || Number(/\/pull\/(\d+)/.exec(target)?.[1]);
+      const pr = find(number);
+      const titleIndex = args.indexOf('--title');
+      const bodyIndex = args.indexOf('--body');
+      if (titleIndex >= 0 && args[titleIndex + 1]) pr.title = args[titleIndex + 1]!;
+      if (bodyIndex >= 0 && args[bodyIndex + 1]) pr.body = args[bodyIndex + 1]!;
       const add = args[args.indexOf('--add-label') + 1];
       if (args.includes('--add-label') && add && !pr.labels!.includes(add)) pr.labels!.push(add);
       args.forEach((value, index) => { if (value === '--remove-label') pr.labels = pr.labels!.filter((label) => label !== args[index + 1]); });

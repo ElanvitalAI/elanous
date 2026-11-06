@@ -14,11 +14,24 @@ providers:
   claude: { quota: exhausted }
 github: { repo: fixture-small, openPRs: 2 }
 seats: [OP, OPT]
+processes:
+  - { id: run-release, host: gcp2, releaseVersion: '0.2.45' }
+chaos:
+  - { at: '+1m', monkey: { kill: 'run-release host=gcp2', signal: TERM } }
+injections:
+  - at: '+30s'
+    ledger:
+      - { event: sim-world.ready, data: { sample: fixture } }
+expect:
+  recovers: { within: '+6m', hitl: 0, lostLedger: 0 }
 events:
   - { at: "+5m", id: dead-pid-lock }
 `);
 
-  expect(spec.devices).toEqual(['fake-kubectl', 'fake-llm', 'fake-gh', 'fake-clock', 'mail']);
+  expect(spec.devices).toEqual(['fake-kubectl', 'fake-ps', 'fake-llm', 'fake-gh', 'fake-clock', 'mail']);
+  expect(spec.processes).toEqual([{ id: 'run-release', host: 'gcp2', releaseVersion: '0.2.45' }]);
+  expect(spec.chaos).toHaveLength(1);
+  expect(spec.expect?.recovers).toEqual({ within: '+6m', hitl: 0, lostLedger: 0 });
   const { devices } = assembleWorld({ spec });
   const kubectl = devices.get('fake-kubectl') as { kubectl(args: string[]): { status: number; stdout: string } };
   expect(kubectl.kubectl(['config', 'get-contexts', 'fixture-world-gcp2-context']).status).toBe(0);

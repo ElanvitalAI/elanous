@@ -1,0 +1,9 @@
+world: hq-move
+seed: 1109
+clock: { start: "2026-11-09T06:00:00+09:00", speed: 60 }
+devices: [fake-ssh, fake-clock]
+hosts:
+  - { name: mbp, arch: arm64, cpu: 14, pools: [hq, gate, sim], egress: false }
+  - { name: node-b, arch: arm64, cpu: 32, pools: [hq, gate, sim], egress: false }
+events:
+  - { at: "+1m", id: hq-move }

@@ -230,6 +230,18 @@ test('remote advancement between ls-remote and push is rejected by the exact-hea
   expect(git(f.repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]).toBe(advanced);
 });
 
+// PR-HEAD-FETCH-STATELESS: a leftover isolated base ref from an earlier attempt (the branch had moved,
+// then was reset back to the reviewed head — non-fast-forward for that ref) must not refuse the retry.
+test('a leftover base ref that is non-fast-forward to the reviewed head is force-updated and the repair applies', () => {
+  const f = fixture();
+  git(f.child, 'push', 'origin', `${f.intermediateHead}:refs/heads/leftover`);
+  git(f.repo, 'fetch', 'origin', 'refs/heads/leftover');
+  const baseRef = `refs/elanous/repair/base/${f.pr}-${f.expectedHead.slice(0, 12)}`;
+  git(f.repo, 'update-ref', baseRef, f.intermediateHead);
+  expect(applyRepairBundle(f, f.deps)).toEqual({ ok: true, fromHead: f.expectedHead, toHead: f.result.commit, branch: 'feature' });
+  expect(git(f.repo, 'rev-parse', baseRef)).toBe(f.expectedHead);
+});
+
 test('changed PR head or malformed bundle never pushes', () => {
   const f = fixture();
   git(f.child, 'push', 'origin', `${f.intermediateHead}:refs/heads/feature`);

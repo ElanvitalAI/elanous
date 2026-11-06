@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -88,7 +88,8 @@ function second() {
 });
 
 test('main 은 옵션 없이 격리된 저장소의 docs/generated/cli-anatomy.md 에 쓰고 경로를 출력한다', () => {
-  const root = mkdtempSync(join(tmpdir(), 'cli-anatomy-main-'));
+  // macOS: tmpdir() is /var/… but the script sees its own path as /private/var/… — compare canonical paths.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cli-anatomy-main-')));
   try {
     const repoRoot = join(import.meta.dir, '..', '..');
     const scriptDir = join(root, 'scripts', 'docs');

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 import {
   isWarmPoolProfile,
   resolveWarmPoolProfile,
@@ -34,6 +35,30 @@ describe('warm-pool profile', () => {
     expect(resolveWarmPoolQuota('fixed', 'mbp', 'standard')).toBe(0);
     expect(resolveWarmPoolQuota('fixed', 'node-c', 'lite')).toBe(0);
     expect(resolveWarmPoolQuota('fixed', 'unknown-host', 'standard')).toBe(0);
+  });
+
+  test('replays observed phase signals on a fake clock without inventing a quota ratio', async () => {
+    // Snapshot from prod pod.warm evidence-supplied events: 25 requests per
+    // consumer (ta, land, gate-recheck), all marked measured:false. These are
+    // event counts, not concurrent ready/leased worker demand.
+    const observedSignals = [
+      { phase: 'feature' as const, profile: 'feature' as const, requests: 25, atMs: 0 },
+      { phase: 'landing' as const, profile: 'landing' as const, requests: 25, atMs: 3.5 * 60 * 60_000 },
+      { phase: 'gate-window' as const, profile: 'gate' as const, requests: 25, atMs: 4.5 * 60 * 60_000 },
+    ];
+    await withSimClock(Date.parse('2026-11-04T15:00:00.000Z'), clock => {
+      const replayed: Array<{ phase: string; requests: number; quota: number; time: number }> = [];
+      for (const signal of observedSignals) {
+        clock.setTime(Date.parse('2026-11-04T15:00:00.000Z') + signal.atMs);
+        replayed.push({ phase: signal.phase, requests: signal.requests,
+          quota: resolveWarmPoolQuota(signal.profile, 'node-b', 'standard'), time: clock.now() });
+      }
+      expect(replayed.map(({ phase, requests }) => [phase, requests])).toEqual([
+        ['feature', 25], ['landing', 25], ['gate-window', 25],
+      ]);
+      expect(replayed.map(({ quota }) => quota)).toEqual([16, 16, 16]);
+      expect(replayed[2]!.time - replayed[0]!.time).toBe(4.5 * 60 * 60_000);
+    });
   });
 
 });

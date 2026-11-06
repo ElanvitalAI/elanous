@@ -50,7 +50,7 @@ import {
   PTY_BUDGET_GRANT,
   TERMINAL_MISSION_DISCIPLINE,
 } from '../agent/terminal-surface.js';
-import type { CoreTurnDispatchTool } from '../core-turn/index.js';
+import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { elanousSelfAccessPrompt } from '../agent/self-ambient.js';
 import { createToolCwdResolver, type ToolCwdResolver } from './tool-cwd.js';
 import { resolveSessionProjectContext } from '../project/session-context.js';

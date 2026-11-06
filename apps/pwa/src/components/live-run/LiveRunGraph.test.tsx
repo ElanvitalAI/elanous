@@ -250,7 +250,7 @@ describe('LiveRunGraph — 390px', () => {
     expect(root.root.findByProps({ 'data-testid': 'adaptive-event-runtime-source-check' }).children).toEqual(['새로 추가']);
   });
 
-  test('무대 방문 패널은 관측된 복수 자원과 시각을 보이고 비어 있는 항목은 미계측으로 표시한다', async () => {
+  test('무대 옆 자원 패널은 원장의 방문별 자원·시간을 보이고 빈 항목은 기록 없음으로 표시한다', async () => {
     const traversal: HarnessRunTraversal = {
       ...TRAVERSAL,
       steps: [
@@ -259,14 +259,25 @@ describe('LiveRunGraph — 390px', () => {
       ],
     };
     root = await mount(1024, [], traversal, GRAPH, false, true);
+    const resourcePanel = root.root.findByProps({ 'aria-label': '노드별 자원 패널' });
+    const unrecordedResources = resourcePanel.findByProps({ 'data-testid': 'resource-visit-intake-1' });
+    expect(text(unrecordedResources)).toContain('호스트 기록 없음');
+    expect(text(unrecordedResources)).toContain('Pod 기록 없음');
+    expect(text(unrecordedResources)).toContain('모델 기록 없음');
+    expect(text(unrecordedResources)).toContain('도구·플러그인 기록 없음');
+    const recordedResources = resourcePanel.findByProps({ 'data-testid': 'resource-visit-compose-1' });
+    expect(text(recordedResources)).toContain('호스트 gcp2');
+    expect(text(recordedResources)).toContain('Pod worker-7');
+    expect(text(recordedResources)).toContain('모델 gpt-6-sol, claude-sonnet-5');
+    expect(text(recordedResources)).toContain('도구·플러그인 browser, search');
     const flow = root.root.findByType(ReactFlow);
     await act(async () => { flow.props.onNodeClick({}, { id: 'intake', type: 'live' }); });
     const panel = root.root.findByProps({ 'data-testid': 'node-detail' });
     const unmeasured = root.root.findByProps({ 'data-testid': 'visit-resources-intake-1' });
     expect(text(panel)).toContain('시각 18:00:00');
     expect(text(panel)).toContain('소요 1초');
-    expect(text(unmeasured)).toContain('호스트 미계측');
-    expect(text(unmeasured)).toContain('플러그인 미계측');
+    expect(text(unmeasured)).toContain('호스트 기록 없음');
+    expect(text(unmeasured)).toContain('도구·플러그인 기록 없음');
 
     await act(async () => { flow.props.onNodeClick({}, { id: 'compose', type: 'live' }); });
     const observed = root.root.findByProps({ 'data-testid': 'node-detail' });

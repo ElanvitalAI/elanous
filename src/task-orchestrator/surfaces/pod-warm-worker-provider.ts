@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { debug } from '../../debug/log.js';
 import { getUserConfig } from '../../user-config.js';
 import { resolveWarmPoolProfile, resolveWarmPoolQuota, type WarmPoolProfile, type WarmPoolTier } from '../../self-implement/pod-warm-pool-profile.js';
-import { WarmPodTransport, probeWarmPodContext, warmWorkerPodManifest, type WarmPodSpec, type WarmPodTransportResult } from './pod-warm-worker-pod.js';
+import { WarmPodTransport, probeWarmPodContext, probeWarmPodRuntimeContract, imageReferencesDifferOnlyByDigest, warmWorkerPodManifest, type WarmPodSpec, type WarmPodTransportResult } from './pod-warm-worker-pod.js';
 import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
 import { patchWarmLeaseMetadata, warmLeaseMetadata } from './pod-warm-provenance.js';
 import type { LogStore } from '../../mss/logging/log-store.js';
@@ -58,6 +58,8 @@ export interface WarmPodProviderOptions {
   poolTemplates?: readonly WarmWorkerCandidate[];
   /** Expand each pool template to its measured profile quota. Defaults to false. */
   expandPoolTemplatesToQuota?: boolean;
+  /** Hosts in a drain window may finish current leases but cannot prepare or acquire warm workers. */
+  drainingHosts?: readonly string[];
   /** This address is resolved by the control-plane join/primary mechanism, never guessed from a Pod context. */
   controlUrl: string;
   memberToken: string;
@@ -187,6 +189,22 @@ const fallback = (reason: 'no-candidate' | 'lease-unavailable'): WarmReplayResul
 const keyEquals = (left: WarmPodSpec['key'], right: WarmPodSpec['key']) =>
   left.context === right.context && left.imageDigest === right.imageDigest
   && left.lockHash === right.lockHash && left.architecture === right.architecture;
+
+function withObservedPodImagePin(spec: WarmPodSpec, pod: any): WarmPodSpec | null {
+  const expectedTemplate = warmWorkerPodManifest(spec).spec as any;
+  const expectedImages = [...expectedTemplate.initContainers, ...expectedTemplate.containers].map((row: any) => row.image);
+  const observedImages = [...(pod?.spec?.initContainers ?? []), ...(pod?.spec?.containers ?? [])].map((row: any) => row?.image);
+  if (expectedImages.length === observedImages.length && expectedImages.every((image: string, index: number) => image === observedImages[index]))
+    return spec;
+  if (!imageReferencesDifferOnlyByDigest(expectedImages, observedImages)) return null;
+  const workerImage = pod?.spec?.containers?.find((row: any) => row?.name === 'worker')?.image;
+  const parsed = typeof workerImage === 'string' ? /^(.*)@(sha256:[a-f0-9]{64})$/.exec(workerImage) : null;
+  if (!parsed || observedImages.some((image: unknown) => image !== workerImage)
+    || pod?.metadata?.annotations?.['elanous.dev/warm-image-digest'] !== parsed[2]
+    || pod?.spec?.containers?.find((row: any) => row?.name === 'worker')?.env
+      ?.find((row: any) => row?.name === 'WARM_IMAGE_DIGEST')?.value !== parsed[2]) return null;
+  return { ...spec, image: workerImage, key: { ...spec.key, imageDigest: parsed[2]! } };
+}
 const token = (value: string | undefined): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const workerId = (value: unknown): value is string => typeof value === 'string'
   && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(value);
@@ -268,6 +286,12 @@ export class WarmPodProvider {
   /** A gate fallback supersedes an in-flight sanitize even if its control reply is late. */
   private readonly quarantineRequested = new Set<string>();
   private readonly terminalEndLogged = new Set<string>();
+  /** Leases observed at the provider boundary; used only to report transition deltas. */
+  private readonly observedOccupancyLeases = new Map<string, { candidate: WarmWorkerCandidate; runId: string | null }>();
+  /** Pod identities returned by this provider's bounded prepare/readiness path. */
+  private readonly observedPodUids = new Map<string, string>();
+  /** Runtime-compatible existing image pins are separate from the configured recreate target. */
+  private readonly observedImagePins = new Map<string, WarmPodSpec>();
   /** While quarantine is settling, reject only that Pod incarnation after acquisition. */
   private readonly quarantiningPods = new Set<string>();
   private readonly standingWorkers = new Map<string, Promise<boolean>>();
@@ -415,6 +439,10 @@ export class WarmPodProvider {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   }
 
+  private runtimeSpec(candidate: WarmWorkerCandidate): WarmPodSpec {
+    return this.observedImagePins.get(candidate.spec.workerId) ?? candidate.spec;
+  }
+
   /** Emit one measurement leg into the shared logs.db row the other process's leg joins. */
   private recordPair(leg: 'cold' | 'warm', file: string, commit: string, host: string,
     row: Omit<WarmPreparePairLeg, 'file' | 'commit' | 'host'>): void {
@@ -429,6 +457,7 @@ export class WarmPodProvider {
   /** Prepare one named slot. A foreign or replaced Pod is never deleted. */
   async ensureStandingWorker(candidate: WarmWorkerCandidate,
     onFailure?: (decision: WarmPoolFailureDecision) => void): Promise<boolean> {
+    if (this.options.drainingHosts?.includes(candidate.host)) return false;
     const configured = this.candidates.find(row => row.host === candidate.host
       && row.spec.workerId === candidate.spec.workerId);
     if (!configured) return false;
@@ -451,10 +480,29 @@ export class WarmPodProvider {
   private async prepareStandingWorker(candidate: WarmWorkerCandidate, signal?: AbortSignal,
     onFailure?: (decision: WarmPoolFailureDecision) => void): Promise<boolean> {
     throwIfPrepareAborted(signal);
+    const startingWorkerId = candidate.spec.workerId;
     const startedAt = this.now();
     const outcome: { preexisting: boolean; podUid: string | null } = { preexisting: false, podUid: null };
     let decision: WarmPoolFailureDecision | undefined;
     let ok = await this.coldPrepare(candidate, outcome, signal, value => { decision = value; });
+    if (!ok && decision?.reason === 'runtime-contract-mismatch' && outcome.podUid) {
+      try {
+        if (await this.retireIncompatibleRuntimeWorker(candidate, outcome.podUid)) {
+          outcome.preexisting = false;
+          outcome.podUid = null;
+          decision = undefined;
+          ok = await this.coldPrepare(candidate, outcome, signal, value => { decision = value; });
+        }
+      } catch (error) {
+        debug.log('pod.warm', 'runtime-contract-reap-deferred', { host: candidate.host,
+          workerId: candidate.spec.workerId, podUid: outcome.podUid,
+          reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+      }
+    }
+    // Expiry alone never authorizes reuse or deletion. The primary ledger atomically
+    // changes only the matching expired idle UID to `reaping` before the normal UID-pinned reaper runs.
+    if (!ok && decision?.reason === 'idle-ttl-expired' && await this.expireIdleWorker(candidate))
+      decision = { stage: 'lease-registration', reason: 'quarantined-pod-needs-reap' };
     // Reaping is only relevant when normal, bounded reconciliation has found
     // this exact Pod and its ledger proves that its generation is fenced.
     // Empty slots must take the ordinary cold-create path without a namespace
@@ -474,6 +522,9 @@ export class WarmPodProvider {
       }
     }
     if (!ok) onFailure?.(decision ?? { stage: 'prepare', reason: 'decision-unavailable' });
+    if (candidate.spec.workerId !== startingWorkerId) this.observedPodUids.delete(startingWorkerId);
+    if (outcome.podUid) this.observedPodUids.set(candidate.spec.workerId, outcome.podUid);
+    else this.observedPodUids.delete(candidate.spec.workerId);
     const totalDurationMs = this.now() - startedAt;
     const gateFile = this.options.pairingGateFile;
     // An unset gate file skips the measurement row entirely instead of recording an unpaired one.
@@ -570,8 +621,33 @@ export class WarmPodProvider {
     }
   }
 
+  private async expireIdleWorker(candidate: WarmWorkerCandidate): Promise<boolean> {
+    const { host } = candidate;
+    const spec = this.runtimeSpec(candidate);
+    const credential = this.options.machineTokens?.[host];
+    if (!token(credential)) return false;
+    const query = new URLSearchParams({ kind: 'pod-worker-lease', machine: host, name: spec.workerId });
+    try {
+      const observed = await this.controlBounded(`/v1/resources?${query}`, credential, undefined,
+        WARM_CONTROL_REQUEST_TIMEOUT_MS);
+      const rows = observed.status === 200 && Array.isArray(observed.value?.resources)
+        ? observed.value.resources : null;
+      const row = rows?.length === 1 ? rows[0] : null;
+      if (!row || row.kind !== 'pod-worker-lease' || row.machine !== host || row.name !== spec.workerId
+        || row.attrs?.state !== 'idle' || row.attrs?.podUid == null || !row.attrs?.key
+        || !keyEquals(row.attrs.key, spec.key) || !Number.isSafeInteger(row.observedAt)
+        || !Number.isSafeInteger(row.ttlMs) || row.ttlMs <= 0
+        || row.attrs.idleTtlMs !== row.ttlMs || this.now() < row.observedAt + row.ttlMs) return false;
+      const expired = await this.controlBounded(`/v1/leases/pod-worker/${encodeURIComponent(spec.workerId)}/expire`,
+        credential, { podUid: row.attrs.podUid, expectedObservedAt: row.observedAt,
+          expectedExpiresAtMs: row.observedAt + row.ttlMs }, WARM_CONTROL_REQUEST_TIMEOUT_MS);
+      return expired.status === 200 && expired.value?.attrs?.state === 'reaping'
+        && expired.value?.attrs?.podUid === row.attrs.podUid;
+    } catch { return false; }
+  }
+
   /** Delete only a UID-pinned Pod whose ledger row proves quarantine and has no competing lease. */
-  private async reapQuarantinedWorker(candidate: WarmWorkerCandidate): Promise<boolean> {
+  private async reapQuarantinedWorker(candidate: WarmWorkerCandidate, allowImageDrift = false): Promise<boolean> {
     const { host, tier, spec } = candidate;
     const credential = this.options.machineTokens?.[host];
     const observeRefusal = (reason: string) => debug.log('pod.warm', 'quarantine-reap-refused', {
@@ -648,6 +724,7 @@ export class WarmPodProvider {
           && !rows.some((row: any) => row !== prior && row?.attrs?.podUid === uid)) {
           const nextId = `reap-${randomUUID().replaceAll('-', '')}`;
           this.writeRotation(`${host}/${spec.name}`, nextId);
+          this.observedImagePins.delete(spec.workerId);
           candidate.spec = { ...spec, workerId: nextId };
           debug.log('pod.warm', 'quarantine-reap-recovered', { host, tier, workerId: spec.workerId,
             nextWorkerId: nextId, pod: spec.name, podUid: uid });
@@ -659,7 +736,9 @@ export class WarmPodProvider {
     }
     if (uniqueMatches.length !== 1) { observeRefusal('ambiguous-pod-identity'); return false; }
     const pod = uniqueMatches[0];
-    const manifest = warmWorkerPodManifest(spec);
+    const identitySpec = allowImageDrift ? withObservedPodImagePin(spec, pod) : spec;
+    if (!identitySpec) { observeRefusal('image-reference-mismatch'); return false; }
+    const manifest = warmWorkerPodManifest(identitySpec);
     const expectedMetadata = manifest.metadata as { labels: Record<string, string>; annotations: Record<string, string> };
     const uid = pod?.metadata?.uid;
     if (pod?.metadata?.name !== spec.name || pod?.metadata?.namespace !== spec.namespace
@@ -669,7 +748,7 @@ export class WarmPodProvider {
       || pod.metadata.annotations?.['elanous.dev/warm-worker-id'] !== spec.workerId
       || Object.entries(expectedMetadata.labels).some(([key, value]) => pod.metadata.labels?.[key] !== value)
       || Object.entries(expectedMetadata.annotations).some(([key, value]) => pod.metadata.annotations?.[key] !== value)
-      || pod.spec?.containers?.[0]?.image !== spec.image
+      || pod.spec?.containers?.find((row: any) => row?.name === 'worker')?.image !== identitySpec.image
       || pod.spec?.containers?.[0]?.resources?.limits?.memory !== spec.memoryLimit) {
       observeRefusal('pod-identity-unproven');
       return false;
@@ -712,10 +791,72 @@ export class WarmPodProvider {
     const nextId = `reap-${randomUUID().replaceAll('-', '')}`;
     const slot = `${host}/${spec.name}`;
     this.writeRotation(slot, nextId);
+    this.observedImagePins.delete(spec.workerId);
     candidate.spec = { ...spec, workerId: nextId };
     debug.log('pod.warm', 'quarantine-reaped', { host, tier, workerId: spec.workerId,
       nextWorkerId: nextId, pod: spec.name, podUid: uid });
     return true;
+  }
+
+  /** Fence and reap only the incompatible runtime's exact idle Pod UID. */
+  private async retireIncompatibleRuntimeWorker(candidate: WarmWorkerCandidate, expectedUid: string): Promise<boolean> {
+    const { host, spec } = candidate;
+    const credential = this.options.machineTokens?.[host];
+    if (!token(credential) || !this.options.rotationStatePath) return false;
+    const result = this.options.kubectl
+      ? this.options.kubectl(['--context', spec.kubectlContext, '-n', spec.namespace, 'get', 'pod', spec.name, '-o', 'json'])
+      : spawnSync('kubectl', ['--context', spec.kubectlContext, '-n', spec.namespace, 'get', 'pod', spec.name, '-o', 'json'],
+        { encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
+    if (result.status !== 0) return false;
+    let pod: any;
+    try { pod = JSON.parse(result.stdout); } catch { return false; }
+    const identitySpec = withObservedPodImagePin(spec, pod);
+    if (!identitySpec || identitySpec === spec
+      || pod?.metadata?.name !== spec.name || pod.metadata.namespace !== spec.namespace
+      || pod.metadata.uid !== expectedUid || !pod.metadata.resourceVersion || pod.metadata.deletionTimestamp
+      || pod.metadata.ownerReferences?.length || pod.spec?.nodeName !== spec.nodeName) return false;
+    const metadata = (warmWorkerPodManifest(identitySpec) as any).metadata;
+    if (Object.entries(metadata.labels).some(([key, value]: [string, any]) => pod.metadata.labels?.[key] !== value)
+      || Object.entries(metadata.annotations).some(([key, value]: [string, any]) => pod.metadata.annotations?.[key] !== value)
+      || probeWarmPodRuntimeContract(spec, (args, input) => this.options.kubectl
+        ? this.options.kubectl(['--context', spec.kubectlContext, '-n', spec.namespace, ...args], input)
+        : spawnSync('kubectl', ['--context', spec.kubectlContext, '-n', spec.namespace, ...args],
+          { encoding: 'utf8', input, timeout: 30_000, maxBuffer: 2 * 1024 * 1024 }))
+        .status !== 'incompatible') return false;
+    const retired = await this.controlBounded(`/v1/leases/pod-worker/${encodeURIComponent(spec.workerId)}/retire`,
+      credential, { podUid: expectedUid, reason: 'runtime-contract-mismatch' }, WARM_CONTROL_REQUEST_TIMEOUT_MS);
+    if (retired.status !== 200 || retired.value?.attrs?.state !== 'quarantined'
+      || retired.value?.attrs?.podUid !== expectedUid || retired.value?.attrs?.reason !== 'runtime-contract-mismatch')
+      return false;
+    return this.reapQuarantinedWorker(candidate, true);
+  }
+
+  /** Retire only a ledger-idle Pod whose UID still matches; active work is left for normal finalize. */
+  private async retireDrainedWorker(candidate: WarmWorkerCandidate): Promise<void> {
+    const { host } = candidate;
+    const spec = this.runtimeSpec(candidate);
+    this.observedPodUids.delete(spec.workerId);
+    const credential = this.options.machineTokens?.[host];
+    if (!token(credential) || !this.options.rotationStatePath) return;
+    const kubectl = (args: readonly string[]) => this.options.kubectl
+      ? this.options.kubectl(['--context', spec.kubectlContext, '-n', spec.namespace, ...args])
+      : spawnSync('kubectl', ['--context', spec.kubectlContext, '-n', spec.namespace, ...args],
+        { encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
+    const pod = kubectl(['get', 'pod', spec.name, '-o', 'json']);
+    if (pod.status !== 0) return;
+    let value: any;
+    try { value = JSON.parse(pod.stdout); } catch { return; }
+    const uid = value?.metadata?.uid;
+    if (typeof uid !== 'string' || !uid) return;
+    this.observedPodUids.set(spec.workerId, uid);
+    const retired = await this.controlBounded(`/v1/leases/pod-worker/${encodeURIComponent(spec.workerId)}/retire`,
+      credential, { podUid: uid }, WARM_CONTROL_REQUEST_TIMEOUT_MS);
+    if (retired.status !== 200) return; // leased, stale UID, or control-plane uncertainty: never delete.
+    const reapCandidate = { ...candidate, spec };
+    if (await this.reapQuarantinedWorker(reapCandidate)) {
+      this.observedImagePins.delete(spec.workerId);
+      candidate.spec = { ...candidate.spec, workerId: reapCandidate.spec.workerId };
+    }
   }
 
   private async coldPrepare(candidate: WarmWorkerCandidate,
@@ -746,14 +887,15 @@ export class WarmPodProvider {
       || candidate.spec.name !== configured.spec.name || candidate.spec.nodeName !== configured.spec.nodeName)
       return fail('slot-validation', 'candidate-mismatch');
     throwIfPrepareAborted(signal);
-    const { spec, host } = configured;
+    let spec = configured.spec;
+    const { host } = configured;
     const nodeName = spec.nodeName;
     if (!nodeName) return fail('slot-validation', 'node-unpinned');
     const credential = this.options.machineTokens?.[host];
     if (!token(credential)) return fail('slot-validation', 'machine-credential-unavailable');
-    const manifest = warmWorkerPodManifest(spec);
-    const metadata = manifest.metadata as { labels: Record<string, string>; annotations: Record<string, string> };
-    const template = manifest.spec as Record<string, unknown>;
+    let manifest = warmWorkerPodManifest(spec);
+    let metadata = manifest.metadata as { labels: Record<string, string>; annotations: Record<string, string> };
+    let template = manifest.spec as Record<string, unknown>;
     const kubectl = (args: readonly string[], input?: string): { status: number | null; stdout: string; stderr: string; error?: NodeJS.ErrnoException } => {
       const argv = ['--context', spec.kubectlContext, '-n', spec.namespace, ...args];
       if (this.options.kubectl) {
@@ -807,7 +949,7 @@ export class WarmPodProvider {
           sameSpec((actual as Record<string, unknown>)[key], value));
       return actual === expected;
     };
-    const normalizedSpec = (actual: any): Record<string, unknown> | null => {
+    const normalizedSpec = (actual: any, allowImagePinDrift = false): Record<string, unknown> | null => {
       if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return null;
       const podSpec = { ...actual };
       const defaults: Record<string, unknown> = { dnsPolicy: 'ClusterFirst', serviceAccountName: 'default',
@@ -824,6 +966,13 @@ export class WarmPodProvider {
         podSpec[kind] = podSpec[kind].map((container: any, index: number) => {
           if (!container || typeof container !== 'object' || Array.isArray(container)) return container;
           const copy = { ...container };
+          // Image bytes are not the reuse key; actual runtime compatibility is probed below.
+          copy.image = (template[kind] as Record<string, unknown>[])[index]?.image;
+          if (allowImagePinDrift && kind === 'containers' && Array.isArray(copy.env)) {
+            const expectedEnv = ((template[kind] as Record<string, any>[])[index]?.env ?? []) as any[];
+            copy.env = copy.env.map((entry: any) => entry?.name === 'WARM_IMAGE_DIGEST'
+              ? { ...entry, value: expectedEnv.find(wanted => wanted?.name === 'WARM_IMAGE_DIGEST')?.value } : entry);
+          }
           if (copy.terminationMessagePath === '/dev/termination-log') delete copy.terminationMessagePath;
           if (copy.terminationMessagePolicy === 'File') delete copy.terminationMessagePolicy;
           const expected = (template[kind] as Record<string, unknown>[])[index];
@@ -834,15 +983,16 @@ export class WarmPodProvider {
       }
       return podSpec;
     };
-    const matches = (pod: any): boolean => typeof pod?.metadata?.uid === 'string' && !!pod.metadata.uid
+    const matches = (pod: any, allowImagePinDrift = false): boolean => typeof pod?.metadata?.uid === 'string' && !!pod.metadata.uid
       && pod.metadata.name === spec.name && pod.metadata.namespace === spec.namespace
       && !pod.metadata.deletionTimestamp
       && (pod.metadata.ownerReferences === undefined || (Array.isArray(pod.metadata.ownerReferences)
         && pod.metadata.ownerReferences.length === 0))
       && Object.entries(metadata.labels).every(([key, value]) => pod.metadata.labels?.[key] === value)
-      && Object.entries(metadata.annotations).every(([key, value]) => pod.metadata.annotations?.[key] === value)
+      && Object.entries(metadata.annotations).every(([key, value]) => allowImagePinDrift && key === 'elanous.dev/warm-image-digest'
+        ? true : pod.metadata.annotations?.[key] === value)
       && pod.spec?.nodeName === nodeName
-      && sameSpec(normalizedSpec(pod.spec), template);
+      && sameSpec(normalizedSpec(pod.spec, allowImagePinDrift), template);
     // Exact-name lookup finds the pinned candidate. A separate label query is
     // paged so physical quota accounting never needs a namespace-wide dump.
     const exactResult = kubectl(this.options.kubectl
@@ -889,12 +1039,47 @@ export class WarmPodProvider {
     let pod = uniqueHostPods[0];
     const preexisting = !!pod;
     outcome.preexisting = preexisting;
-    if (pod && !matches(pod)) {
-      const actualImage = pod.spec?.containers?.[0]?.image;
-      const actualMemory = pod.spec?.containers?.[0]?.resources?.limits?.memory;
-      const reason = actualImage !== spec.image ? 'image-pin-mismatch'
-        : actualMemory !== spec.memoryLimit ? 'profile-mismatch' : 'candidate-pod-mismatch';
-      return fail('pod-validation', reason);
+    if (!pod) this.observedImagePins.delete(spec.workerId);
+    if (pod) {
+      const adoptedSpec = withObservedPodImagePin(spec, pod);
+      const imageDrift = adoptedSpec !== spec;
+      if (!imageDrift) this.observedImagePins.delete(spec.workerId);
+      if (!adoptedSpec || (imageDrift && !matches(pod, true)) || (!imageDrift && !matches(pod))) {
+        const actualMemory = pod.spec?.containers?.[0]?.resources?.limits?.memory;
+        const reason = actualMemory !== spec.memoryLimit ? 'profile-mismatch'
+          : !adoptedSpec && (() => {
+            const expectedImages = [...(template.initContainers as any[]), ...(template.containers as any[])].map(row => row.image);
+            const observedImages = [...(pod.spec?.initContainers ?? []), ...(pod.spec?.containers ?? [])].map((row: any) => row?.image);
+            return expectedImages.length !== observedImages.length || expectedImages.some((image, index) => image !== observedImages[index]);
+          })() ? 'image-reference-mismatch' : 'candidate-pod-mismatch';
+        outcome.podUid = typeof pod.metadata?.uid === 'string' ? pod.metadata.uid : null;
+        return fail('pod-validation', reason);
+      }
+      if (imageDrift) {
+        const compatibility = probeWarmPodRuntimeContract(spec, kubectl);
+        debug.log('pod.warm', compatibility.status === 'compatible' ? 'image-drift' : 'image-drift-refused', {
+          host, workerId: spec.workerId, podUid: pod.metadata.uid,
+          ...(this.options.observationRunIdForTest ? { runId: this.options.observationRunIdForTest } : {}),
+          expectedImage: spec.image, observedImage: adoptedSpec.image,
+          runtimeContract: compatibility.observed ?? null, result: compatibility.status,
+        }, { level: compatibility.status === 'compatible' ? 'info' : 'warn' });
+        if (compatibility.status !== 'compatible') {
+          outcome.podUid = typeof pod.metadata?.uid === 'string' ? pod.metadata.uid : null;
+          return fail('runtime-contract', compatibility.status === 'incompatible'
+            ? 'runtime-contract-mismatch' : 'runtime-contract-unverified');
+        }
+        // Keep the real Pod pin in the lease and command key. Source checkout is
+        // already pinned by cutSha/lockHash; the image is only its runtime shell.
+        this.observedImagePins.set(spec.workerId, adoptedSpec);
+        spec = adoptedSpec;
+        manifest = warmWorkerPodManifest(spec);
+        metadata = manifest.metadata as { labels: Record<string, string>; annotations: Record<string, string> };
+        template = manifest.spec as Record<string, unknown>;
+        if (!matches(pod)) {
+          outcome.podUid = typeof pod.metadata?.uid === 'string' ? pod.metadata.uid : null;
+          return fail('pod-validation', 'candidate-pod-mismatch');
+        }
+      }
     }
     // Old generations still occupy memory even when their ledger rows are quarantined.
     // Count physical warm Pods on the pinned node before admitting a new one.
@@ -963,14 +1148,22 @@ export class WarmPodProvider {
       && existing.attrs?.podUid === uid
       && ['quarantined', 'timeout-fenced', 'reaping'].includes(existing.attrs?.state))
       return fail('lease-registration', 'quarantined-pod-needs-reap');
+    const sameRegisteredIdle = preexisting && existing?.kind === 'pod-worker-lease'
+      && existing.machine === host && existing.name === spec.workerId && existing.attrs?.state === 'idle'
+      && existing.attrs?.podUid === uid && existing.attrs?.key && keyEquals(existing.attrs.key, spec.key)
+      && Number.isSafeInteger(existing.observedAt) && Number.isSafeInteger(existing.ttlMs)
+      && existing.ttlMs > 0 && existing.attrs?.idleTtlMs === existing.ttlMs
+      && existing.observedAt <= this.now();
+    if (existing && sameRegisteredIdle && this.now() - existing.observedAt >= existing.ttlMs)
+      return fail('lease-registration', 'idle-ttl-expired');
     if (existing) return preexisting && existing.kind === 'pod-worker-lease'
       && existing.machine === host && existing.name === spec.workerId
       && (existing.attrs?.state === 'idle' || existing.attrs?.state === 'leased')
       && existing.attrs?.podUid === uid
       && Number.isSafeInteger(existing.observedAt) && Number.isSafeInteger(existing.ttlMs)
-      && existing.ttlMs === leaseTtlMs && existing.attrs?.idleTtlMs === leaseTtlMs
-      && existing.observedAt <= Date.now()
-      && Date.now() - existing.observedAt < existing.ttlMs
+      && existing.ttlMs > 0 && existing.attrs?.idleTtlMs === existing.ttlMs
+      && existing.observedAt <= this.now()
+      && this.now() - existing.observedAt < existing.ttlMs
       && existing.attrs?.key && keyEquals(existing.attrs.key, spec.key);
     // An unregistered Pod could have been created by anyone with namespace access.
     // Only this invocation's successful create response may become a new ledger row.
@@ -999,20 +1192,152 @@ export class WarmPodProvider {
     return this.ensureStandingWorker(candidate);
   }
 
+  private observationRunId(fallbackRunId?: string): string | null {
+    const runId = this.options.observationRunIdForTest ?? fallbackRunId ?? process.env.ELANOUS_RUN_ID;
+    return typeof runId === 'string' && runId.trim() ? runId : null;
+  }
+
+  private async readOccupancyLeaseState(candidate: WarmWorkerCandidate, podUid: string | null): Promise<'idle' | 'leased' | null> {
+    const spec = this.runtimeSpec(candidate);
+    if (!podUid) return null;
+    const credential = this.options.machineTokens?.[candidate.host];
+    if (!token(credential)) return null;
+    const query = new URLSearchParams({ kind: 'pod-worker-lease', machine: candidate.host,
+      name: spec.workerId });
+    try {
+      const response = await this.controlBounded(`/v1/resources?${query}`, credential, undefined,
+        WARM_CONTROL_REQUEST_TIMEOUT_MS);
+      if (response.status !== 200 || !Array.isArray(response.value?.resources)
+        || response.value.resources.length > 1) return null;
+      if (response.value.resources.length === 0) return null;
+      const row = response.value.resources[0];
+      if (row?.kind !== 'pod-worker-lease' || row.machine !== candidate.host || row.name !== spec.workerId
+        || !['idle', 'leased'].includes(row.attrs?.state)
+        || typeof row.attrs?.podUid !== 'string' || !row.attrs.podUid || row.attrs.podUid !== podUid || !row.attrs?.key
+        || !keyEquals(row.attrs.key, spec.key)
+        || !Number.isSafeInteger(row.observedAt) || !Number.isSafeInteger(row.ttlMs) || row.ttlMs <= 0
+        || row.observedAt > this.now() || this.now() - row.observedAt >= row.ttlMs) return null;
+      return row.attrs.state;
+    } catch { return null; }
+  }
+
+  private async logPoolOccupancy(candidateRows: readonly { candidate: WarmWorkerCandidate; prepared: boolean; podUid: string | null }[]): Promise<void> {
+    const groups = new Map<string, typeof candidateRows[number][]>();
+    for (const row of candidateRows) {
+      const key = `${row.candidate.host}\u0000${row.candidate.tier}`;
+      groups.set(key, [...(groups.get(key) ?? []), row]);
+    }
+    for (const rows of groups.values()) {
+      const { host, tier } = rows[0]!.candidate;
+      const profile = this.profile;
+      const runId = this.observationRunId();
+      const observedAtMs = this.now();
+      const observedAt = Number.isFinite(observedAtMs) ? new Date(observedAtMs).toISOString() : null;
+      if (!runId || !observedAt) {
+        debug.log('pod.warm', 'pool-occupancy', { schema: 1, profile, host, tier,
+          candidateCount: rows.length, ready: null, leased: null, measured: false,
+          consumer: 'warm-pod-provider', observedAt, reason: !runId ? 'run-id-unavailable' : 'observation-time-unavailable',
+        }, { level: 'warn' });
+        continue;
+      }
+      try {
+        const samples = await Promise.all(rows.map(async row => ({ ...row,
+          state: await this.readOccupancyLeaseState(row.candidate, row.podUid) })));
+          let ready = 0;
+          let leased = 0;
+          let complete = true;
+          for (const sample of samples) {
+            if (sample.state === 'idle') {
+              if (sample.prepared) ready++;
+            } else if (sample.state === 'leased') leased++;
+            else complete = false;
+          }
+          debug.log('pod.warm', 'pool-occupancy', { schema: 1, profile, host, tier,
+            candidateCount: rows.length, ready: complete ? ready : null, leased: complete ? leased : null,
+            measured: complete, runId, consumer: 'warm-pod-provider', observedAt,
+            ...(complete ? {} : { reason: 'occupancy-incomplete' }),
+          }, { level: complete ? 'info' : 'warn' });
+      } catch {
+          debug.log('pod.warm', 'pool-occupancy', { schema: 1, profile, host, tier,
+            candidateCount: rows.length, ready: null, leased: null, measured: false,
+            runId, consumer: 'warm-pod-provider', observedAt,
+            reason: 'occupancy-read-failed' }, { level: 'warn' });
+      }
+    }
+  }
+
+  private logLeaseAcquireWait(candidate: WarmWorkerCandidate, input: WarmReplayInput, startedAt: number,
+    status: number | null, outcome: string): void {
+    const observedAtMs = this.now();
+    const waitMs = observedAtMs - startedAt;
+    const runId = this.observationRunId(input.runId);
+    const measured = !!runId && Number.isFinite(waitMs) && waitMs >= 0 && Number.isFinite(observedAtMs);
+    debug.log('pod.warm', 'lease-acquire-wait', { schema: 1, profile: this.profile,
+      host: candidate.host, tier: candidate.tier, runId, consumer: 'warm-pod-provider',
+      observedAt: Number.isFinite(observedAtMs) ? new Date(observedAtMs).toISOString() : null,
+      waitMs: measured ? waitMs : null, status, outcome, measured,
+      ...(!measured ? { reason: !runId ? 'run-id-unavailable' : 'wait-time-unavailable' } : {}),
+    }, { level: measured ? 'info' : 'warn' });
+  }
+
+  private logLeaseOccupancyTransition(candidate: WarmWorkerCandidate, leaseId: string | undefined, generation: number | undefined,
+    podUid: string | undefined, runId: string | null, state: 'leased' | 'idle' | 'quarantined',
+    options: { unmeasuredReason?: string } = {}): void {
+    const key = JSON.stringify([candidate.spec.workerId, leaseId, generation, podUid]);
+    const prior = this.observedOccupancyLeases.get(key);
+    if (state === 'leased' && prior) return;
+    let leasedDelta: number | null;
+    let stableRunId = runId;
+    if (state === 'leased') {
+      this.observedOccupancyLeases.set(key, { candidate, runId });
+      leasedDelta = 1;
+    } else {
+      stableRunId = prior?.runId ?? runId;
+      // Keep the observed lease until cleanup is confirmed. A later confirmed transition can
+      // then close the measured interval instead of permanently losing its occupancy decrement.
+      leasedDelta = options.unmeasuredReason ? null
+        : this.observedOccupancyLeases.delete(key) ? -1 : this.terminalEndLogged.has(key) ? 0 : null;
+    }
+    const observedAtMs = this.now();
+    const measured = !options.unmeasuredReason && !!stableRunId && !!leaseId && !!podUid && leasedDelta !== null
+      && Number.isSafeInteger(generation) && Number.isFinite(observedAtMs);
+    debug.log('pod.warm', 'lease-occupancy-transition', { schema: 1, profile: this.profile,
+      host: candidate.host, tier: candidate.tier, workerId: candidate.spec.workerId,
+      leaseId: leaseId ?? null, generation: Number.isSafeInteger(generation) ? generation : null,
+      podUid: podUid ?? null, state, leasedDelta: measured ? leasedDelta : null,
+      measured, ...(stableRunId ? { runId: stableRunId } : {}), consumer: 'warm-pod-provider',
+      observedAt: Number.isFinite(observedAtMs) ? new Date(observedAtMs).toISOString() : null,
+      ...(!measured ? { reason: options.unmeasuredReason ?? (!stableRunId ? 'run-id-unavailable' : 'lease-transition-unpaired') } : {}),
+    }, { level: measured ? 'info' : 'warn' });
+  }
+
   /** One bounded reconciliation pass. Failed slots stay unavailable until a fresh worker ID is configured. */
   async reconcilePool(): Promise<WarmPoolReconcileResult> {
     const failed: string[] = [];
     let ready = 0;
-    for (const candidate of this.candidates) {
+    const occupancyRows: { candidate: WarmWorkerCandidate; prepared: boolean; podUid: string | null }[] = [];
+    const available = this.candidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host));
+    for (const candidate of this.candidates.filter(row => this.options.drainingHosts?.includes(row.host))) {
+      try { await this.retireDrainedWorker(candidate); }
+      catch (error) {
+        debug.log('pod.warm.provider', 'drain-retire-deferred', { host: candidate.host,
+          workerId: candidate.spec.workerId,
+          reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+      }
+      occupancyRows.push({ candidate, prepared: false, podUid: this.observedPodUids.get(candidate.spec.workerId) ?? null });
+    }
+    for (const candidate of available) {
       let prepared = false;
       let decision: WarmPoolFailureDecision | undefined;
       try { prepared = await this.ensureStandingWorker(candidate, value => { decision = value; }); }
       catch (error) {
+        this.observedPodUids.delete(candidate.spec.workerId);
         decision = { stage: 'prepare', reason: 'prepare-threw',
           stderr: safeWarmPoolStderr(error instanceof Error ? error.message : String(error), [
             this.options.memberToken, ...Object.values(this.options.machineTokens ?? {}),
           ]) };
       }
+      occupancyRows.push({ candidate, prepared, podUid: this.observedPodUids.get(candidate.spec.workerId) ?? null });
       if (prepared) ready++;
       else {
         failed.push(candidate.spec.workerId);
@@ -1031,8 +1356,9 @@ export class WarmPodProvider {
         pod: candidate.spec.name, ready: prepared }, { level: prepared ? 'info' : 'warn' });
     }
     const result = { profile: this.profile,
-      target: this.candidates.length, ready, failed };
+      target: available.length, ready, failed };
     debug.log('pod.warm', 'pool-reconcile', result, { level: failed.length ? 'warn' : 'info' });
+    await this.logPoolOccupancy(occupancyRows);
     return result;
   }
 
@@ -1041,7 +1367,8 @@ export class WarmPodProvider {
     const requestedAt = this.now();
     if (input.protocol !== 1 || input.envProfile !== 'gate-v1' || !Array.isArray(input.files)
       || !input.files.length || !Number.isFinite(input.deadlineAt) || input.deadlineAt <= this.now()) return fallback('no-candidate');
-    const matches = this.candidates.filter(row => row.spec.cutSha === input.cutSha);
+    const matches = this.candidates.filter(row => row.spec.cutSha === input.cutSha
+      && !this.options.drainingHosts?.includes(row.host));
     if (!matches.length) return fallback('no-candidate');
     let lastFallback: WarmReplayResult = fallback('lease-unavailable');
     // The control plane chooses an idle worker within a host/key. Probe each distinct
@@ -1049,7 +1376,8 @@ export class WarmPodProvider {
     const tried = new Set<string>();
     for (const candidate of matches) {
     if (input.deadlineAt <= this.now()) return lastFallback;
-    const { spec, host } = candidate;
+    const { host } = candidate;
+    const spec = this.runtimeSpec(candidate);
     const poolKey = `${host}/${spec.key.context}/${spec.key.imageDigest}/${spec.key.lockHash}/${spec.key.architecture}`;
     if (tried.has(poolKey)) continue;
     tried.add(poolKey);
@@ -1059,6 +1387,7 @@ export class WarmPodProvider {
     // Lease selection is a consumer action. Keep its owner at member scope so
     // finalize can release it; the machine token owns registration and sanitize.
     const acquisitionCredential = this.options.memberToken;
+    const acquisitionStartedAt = this.now();
     const acquisition = this.control('/v1/leases/pod-worker', acquisitionCredential, {
       machine: host, key: spec.key, runId: input.runId, attemptId: input.attemptId,
       ttlMs: this.options.leaseTtlMs ?? 30 * 60_000,
@@ -1076,21 +1405,26 @@ export class WarmPodProvider {
     } catch { acquisitionFailed = true; acquisitionResult = timedOut; }
     finally { if (deadlineTimer) clearTimeout(deadlineTimer); }
     if (acquisitionResult === timedOut) {
+      this.logLeaseAcquireWait(candidate, input, acquisitionStartedAt, null, acquisitionFailed ? 'error' : 'timeout');
       void acquisition.then(async late => {
+        this.logLeaseAcquireWait(candidate, input, acquisitionStartedAt, late.status, 'late-response');
         const row = late.value;
         const lateWorkerId = row?.name;
         const leaseId = row?.attrs?.leaseId;
         const generation = row?.attrs?.generation;
         const podUid = row?.attrs?.podUid;
         const lateCandidate = this.candidates.find(candidate => candidate.spec.workerId === lateWorkerId
-          && candidate.host === host && keyEquals(candidate.spec.key, spec.key));
-        if (late.status !== 200 || !lateCandidate || !row?.attrs?.key || !keyEquals(row.attrs.key, lateCandidate.spec.key)
+          && candidate.host === host && keyEquals(this.runtimeSpec(candidate).key, spec.key));
+        if (late.status !== 200 || !lateCandidate || !row?.attrs?.key
+          || !keyEquals(row.attrs.key, this.runtimeSpec(lateCandidate).key)
           || typeof leaseId !== 'string' || !leaseId
           || !Number.isSafeInteger(generation) || typeof podUid !== 'string' || !podUid) return;
-        const lateSpec = lateCandidate.spec;
+        const lateSpec = this.runtimeSpec(lateCandidate);
         const command: WarmWorkerCommand = { ...input, leaseId, generation, podUid,
           podName: lateSpec.name, podContext: lateSpec.kubectlContext, image: lateSpec.image,
           requestedAt: new Date(this.now()).toISOString(), workerId: lateSpec.workerId, key: lateSpec.key };
+        this.logLeaseOccupancyTransition(lateCandidate, leaseId, generation, podUid,
+          this.observationRunId(input.runId), 'leased');
         debug.log('pod.warm', 'lease-response-after-deadline', { workerId: command.workerId,
           leaseId, generation, podUid, runId: command.runId, attemptId: command.attemptId }, { level: 'warn' });
         debug.log('pod.provenance', 'lease-start', { pod: lateSpec.name, podUid, leaseId,
@@ -1111,12 +1445,17 @@ export class WarmPodProvider {
         catch (error) { debug.log('pod.warm', 'late-lease-quarantine-failed', { workerId: command.workerId,
           leaseId, generation, error: String(error) }, { level: 'warn' }); }
         finally { if (quarantineTimer) clearTimeout(quarantineTimer); }
-      }, error => debug.log('pod.warm', 'late-lease-response-failed', { workerId: spec.workerId,
-        runId: input.runId, attemptId: input.attemptId, error: String(error) }, { level: 'warn' }));
+      }, error => {
+        this.logLeaseAcquireWait(candidate, input, acquisitionStartedAt, null, 'late-error');
+        debug.log('pod.warm', 'late-lease-response-failed', { workerId: spec.workerId,
+          runId: input.runId, attemptId: input.attemptId, error: String(error) }, { level: 'warn' });
+      });
       if (acquisitionFailed) continue;
       return fallback('lease-unavailable');
     }
     acquired = acquisitionResult;
+    this.logLeaseAcquireWait(candidate, input, acquisitionStartedAt, acquired.status,
+      acquired.status === 200 ? 'response' : acquired.status === 409 ? 'busy' : acquired.status === 503 ? 'unavailable' : 'rejected');
     if (acquired.status === 409 || acquired.status === 503) {
       if (acquired.status === 409) {
         try {
@@ -1158,23 +1497,26 @@ export class WarmPodProvider {
     // before choosing its transport; an unknown worker must not be executed or fenced.
     const leasedCandidate = this.candidates.find(entry => entry.host === host
       && entry.spec.workerId === row.name && entry.spec.cutSha === input.cutSha
-      && keyEquals(entry.spec.key, spec.key));
+      && keyEquals(this.runtimeSpec(entry).key, spec.key));
     if (!leasedCandidate) {
       debug.log('pod.warm', 'lease-candidate-unmatched', { host, workerId: row.name,
         runId: input.runId, attemptId: input.attemptId }, { level: 'warn' });
       return fallback('lease-unavailable');
     }
-    if (!row.attrs?.key || !keyEquals(row.attrs.key, leasedCandidate.spec.key)) {
+    this.logLeaseOccupancyTransition(leasedCandidate, leasedId, generation, podUid,
+      this.observationRunId(input.runId), 'leased');
+    const leasedSpec = this.runtimeSpec(leasedCandidate);
+    if (!row.attrs?.key || !keyEquals(row.attrs.key, leasedSpec.key)) {
       const command: WarmWorkerCommand = { ...input, leaseId: leasedId, generation, podUid,
         requestedAt: new Date(this.now()).toISOString(),
-        workerId: row.name, key: leasedCandidate.spec.key };
+        workerId: row.name, key: leasedSpec.key };
       await this.quarantine(command, 'candidate-identity-mismatch', false);
       return fallback('lease-unavailable');
     }
     const command: WarmWorkerCommand = { ...input, leaseId: leasedId, generation, podUid,
-      podName: leasedCandidate.spec.name, podContext: leasedCandidate.spec.kubectlContext, image: leasedCandidate.spec.image,
+      podName: leasedSpec.name, podContext: leasedSpec.kubectlContext, image: leasedSpec.image,
       requestedAt: new Date(this.now()).toISOString(),
-      workerId: row.name, key: leasedCandidate.spec.key };
+      workerId: row.name, key: leasedSpec.key };
     if (command.deadlineAt <= this.now()) {
       debug.log('pod.warm', 'lease-response-after-deadline', { workerId: command.workerId,
         leaseId: command.leaseId, generation: command.generation, podUid: command.podUid,
@@ -1202,7 +1544,7 @@ export class WarmPodProvider {
       await this.quarantine(command, 'prior-lease-quarantine-pending', false);
       return fallback('lease-unavailable');
     }
-    const admitted = patchWarmLeaseMetadata(leasedCandidate.spec, command, 'leased', this.options.kubectl);
+    const admitted = patchWarmLeaseMetadata(leasedSpec, command, 'leased', this.options.kubectl);
     if (!admitted.ok) {
       debug.log('pod.provenance', 'lease-patch-refused', { pod: leasedCandidate.spec.name,
         podUid, leaseId: leasedId, reason: admitted.reason }, { level: 'warn' });
@@ -1213,7 +1555,7 @@ export class WarmPodProvider {
       leaseId: leasedId, runId: command.runId, attemptId: command.attemptId,
       requestedAt: command.requestedAt, metadata: warmLeaseMetadata(command).annotations });
     let transport: WarmPodTransportResult;
-    try { transport = await this.runTransport(leasedCandidate.spec, command); }
+    try { transport = await this.runTransport(leasedSpec, command); }
     catch { transport = { status: 'fallback', reason: 'exec-failed', reply: null }; }
     // Warm leg: the lease reused an already-standing Pod, so no prepare interval elapsed.
     // Only a 1-file gate has a pairing key; a multi-file gate is skipped (with its reason), never keyed by files[0].
@@ -1274,7 +1616,7 @@ export class WarmPodProvider {
     // Always verify and clear this exact Pod UID/lease metadata before telling the control plane it is reusable.
     // A missing local adoption record is not evidence that no pod-side leased state exists.
     const cleared = released
-      ? patchWarmLeaseMetadata(candidate.spec, command, 'idle', this.options.kubectl)
+      ? patchWarmLeaseMetadata(this.runtimeSpec(candidate), command, 'idle', this.options.kubectl)
       : { ok: false, reason: 'release-failed' };
     if (!cleared.ok) debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
       podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
@@ -1289,6 +1631,8 @@ export class WarmPodProvider {
       debug.log('pod.provenance', 'lease-end', { pod: candidate.spec.name, podUid: command.podUid,
         leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId,
         releasedAt: new Date(this.now()).toISOString(), result: 'sanitized' });
+      this.logLeaseOccupancyTransition(candidate, command.leaseId, command.generation, command.podUid,
+        this.observationRunId(command.runId), 'idle');
       this.terminalEndLogged.add(key);
     }
     return 'sanitized';
@@ -1327,12 +1671,20 @@ export class WarmPodProvider {
       throw new Error('warm quarantine unavailable');
     }
     const candidate = this.candidates.find(row => row.spec.workerId === command.workerId);
+    let occupancyUnmeasuredReason: string | undefined;
     if (candidate) {
-      const cleared = patchWarmLeaseMetadata(candidate.spec, command, 'quarantined', this.options.kubectl);
-      if (!cleared.ok && reason !== 'provenance-unavailable') debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
-        podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
+      const cleared = patchWarmLeaseMetadata(this.runtimeSpec(candidate), command, 'quarantined', this.options.kubectl);
+      if (!cleared.ok) {
+        occupancyUnmeasuredReason = 'lease-cleanup-unconfirmed';
+        if (reason !== 'provenance-unavailable') debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
+          podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
+      }
     }
     const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+    const occupancyCandidate = this.candidates.find(row => row.spec.workerId === command.workerId);
+    if (occupancyCandidate) this.logLeaseOccupancyTransition(occupancyCandidate, command.leaseId,
+      command.generation, command.podUid, this.observationRunId(command.runId), 'quarantined',
+      occupancyUnmeasuredReason ? { unmeasuredReason: occupancyUnmeasuredReason } : undefined);
     debug.log('pod.provenance', this.terminalEndLogged.has(key) ? 'lease-late-quarantine' : leaseStarted ? 'lease-end' : 'lease-refused', { podUid: command.podUid,
       leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId, leaseStarted,
       releasedAt: new Date(this.now()).toISOString(), result: 'quarantined', reason });

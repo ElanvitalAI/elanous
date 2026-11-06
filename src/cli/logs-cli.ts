@@ -2412,6 +2412,17 @@ const logsCmd = program.command('logs')
     process.exitCode = await runLogsCli(o);
   });
 registerLogFederationCommands(logsCmd);
+logsCmd.command('warm-reuse-stats')
+  .description('SI child Pod 반납·격리 통계를 logs.db 에서 읽기 전용 조회 (전체 기록·스토어별)')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '로그 스토어 타겟 (prod|test:<repo>|…)')
+  .option('--all', '등록된 모든 로그 스토어 연합 조회')
+  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
+  .option('--json', '구조화 JSON 출력')
+  .action(async (opts: import('./logs-warm-reuse-stats.js').LogsWarmReuseStatsOpts) => {
+    const { runLogsWarmReuseStats } = await import('./logs-warm-reuse-stats.js');
+    process.exitCode = runLogsWarmReuseStats(opts);
+  });
 // ★ 발견성 — 플래그 18개를 나열만 하면 **이미 있는 기능을 못 찾고 손으로 다시 만든다**.
 //   실측(2026-07-28): `--since 30m` 을 모른 채 `$(date -u -v-30M …)` 를 손으로 썼고(macOS 전용),
 //   `-f` 를 모른 채 폴 루프를 짰다. 그래서 예시를 **맨 앞**에 둔다(`before` = Usage 위).

@@ -263,12 +263,14 @@ export interface PluginManifestLoadResult {
 }
 
 const MANIFEST_FILES = ['plugin.json', join('.elanous-plugin', 'plugin.json'), join('.codex-plugin', 'plugin.json')];
+const CLAUDE_MANIFEST_FILE = join('.claude-plugin', 'plugin.json');
 
 export function loadPluginManifestFromDir(
   pluginDir: string,
-  fallback: { id: string; name?: string; version?: string; description?: string; main?: string },
+  fallback: { id: string; name?: string; version?: string; description?: string; main?: string; allowClaudeManifest?: boolean },
 ): PluginManifestLoadResult {
-  for (const rel of MANIFEST_FILES) {
+  const manifestFiles = fallback.allowClaudeManifest ? [...MANIFEST_FILES, CLAUDE_MANIFEST_FILE] : MANIFEST_FILES;
+  for (const rel of manifestFiles) {
     const path = join(pluginDir, rel);
     if (!existsSync(path)) continue;
     const raw = readFileSync(path, 'utf8');
@@ -282,7 +284,8 @@ export function loadPluginManifestFromDir(
       manifest: parsePluginManifest(json, {
         fallbackId: fallback.id,
         fallbackMain: fallback.main ?? './plugin.ts',
-        agentPlugin: rel === join('.codex-plugin', 'plugin.json'),
+        fallbackVersion: rel === CLAUDE_MANIFEST_FILE ? fallback.version : undefined,
+        agentPlugin: rel === join('.codex-plugin', 'plugin.json') || rel === CLAUDE_MANIFEST_FILE,
       }),
       path,
       inferred: false,
@@ -308,7 +311,7 @@ export function loadPluginManifestFromDir(
 
 export function parsePluginManifest(
   value: unknown,
-  opts: { fallbackId?: string; fallbackMain?: string; agentPlugin?: boolean } = {},
+  opts: { fallbackId?: string; fallbackMain?: string; fallbackVersion?: string; agentPlugin?: boolean } = {},
 ): PluginManifest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('plugin manifest must be an object');
@@ -319,7 +322,7 @@ export function parsePluginManifest(
   const id = normalizeId(stringOr(raw.id, (agentPlugin || opts.fallbackId === undefined)
     && typeof raw.name === 'string' && raw.name.trim() ? raw.name : opts.fallbackId), 'id');
   const name = stringOr(raw.name, id);
-  const version = stringOr(raw.version, '0.0.0');
+  const version = stringOr(raw.version, opts.fallbackVersion ?? '0.0.0');
   const main = normalizeMain(stringOr(raw.main, opts.fallbackMain ?? './plugin.ts'));
   const activationEvents = stringArrayOr(raw.activationEvents, ['onCommand']);
   const extension = parseElanousExtension(raw.extensions);

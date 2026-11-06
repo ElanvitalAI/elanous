@@ -4,7 +4,7 @@
 //    그대로 읽고, 거부 줄 원문·cardId·PR·head 를 그 간선 한 행에 묶는지만 문다.
 // 🔎 관측: `self-implement` / `graph-edge-taken` { from: merge, on: recovery, label: land-refused, to: recover, call: recover@1 }
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -14,6 +14,7 @@ import { readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-ro
 import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import type { PrManager } from '../autopilot/pr-manager.js';
+import type { RunningRunsResult } from '../self-implement/running-runs.js';
 import { createFakeBins } from '../ux-sim/fake-bin.js';
 import { bindPrLandRefusalToRecover, executeBoundPrLandRecover, PR_LAND_CARD_ID_ENV } from './pr-land-recovery.js';
 import { runQueuedLanding, type QueueLandingInput } from '../task-agent/land-queue.js';
@@ -130,6 +131,96 @@ test('pinned pr land refusal binds to recover@1 once, keeps the refusal edge, an
   });
   expect(calls).not.toContain('merge');
   expect(calls).not.toContain('upsert');
+});
+
+test('pinned heavy typecheck drift reaches the operational refusal observer with its explicit assessment', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'land-typecheck-drift-path-'));
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git('init', '-b', 'main');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'test');
+  writeFileSync(join(repo, '.gitignore'), '.state/\n');
+  writeFileSync(join(repo, 'README.md'), 'base\n');
+  git('add', '.gitignore', 'README.md');
+  git('commit', '-m', 'base');
+  const base = git('rev-parse', 'HEAD');
+  git('remote', 'add', 'origin', 'https://github.com/ElanvitalAI/elanous.git');
+  git('update-ref', 'refs/remotes/origin/main', base);
+  git('switch', '-c', 'feat/typecheck-drift');
+  writeFileSync(join(repo, 'README.md'), 'feature\n');
+  git('add', 'README.md');
+  git('commit', '-m', 'feature');
+  const head = git('rev-parse', 'HEAD');
+  const reviewResultsDir = join(repo, '.state', 'review-results');
+  mkdirSync(reviewResultsDir, { recursive: true });
+  writeFileSync(join(reviewResultsDir, `pr-${PR}-${head.slice(0, 12)}.json`), JSON.stringify({
+    pr: PR, headCommit: head, reviewed: true, verdict: 'pass', mustFix: [],
+  }));
+  const errors: string[] = [];
+  const rows: Row[] = [];
+  const off = debug.registerSink({ name: `land-typecheck-drift-${Math.random()}`, emit: (row) => {
+    if ((row.event === 'graph-edge-taken' || row.event === 'graph-edge-unresolved')
+      && (row.data as { from?: string } | undefined)?.from === 'merge') rows.push(row as Row);
+  } });
+  const counts = { running: 0, 'probable-running': 0, 'ended-unclosed': 0, unknown: 0 };
+  const observation = { runsNotYetInLedgerDuringAuthoringAreNotCounted: true as const, includesTest: null };
+  const runningRuns: RunningRunsResult = {
+    entries: [], counts, total: 0, countedStatuses: [], observation,
+    quantities: {
+      counts: { value: counts, population: 'all assessed runs', observation },
+      total: { value: 0, population: 'all assessed runs', observation },
+      entries: { value: 0, population: 'all assessed runs', observation },
+      running: { value: 0, population: 'assessed runs whose status is in countedStatuses', observation },
+    },
+    ledger: { ledgerDirectories: [], unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0, missingLedgerDirectoryCount: 0,
+      unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0 },
+    pty: { unreadable: [], observedRefCount: 0, withoutRunIdCount: 0, notCountedRefCount: 0 },
+  };
+  let heavyReason = 'gate-rc-1 · remote: stderr: [typecheck] FAIL — tsc failed with errors.';
+  try {
+    const run: NonNullable<PrLandDeps['run']> = (command, args, options) => {
+      if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/typecheck-drift', baseRefName: 'main', state: 'OPEN', isDraft: false, url: `https://github.com/example/repo/pull/${PR}` }) };
+      if (command === 'git' && args[0] === 'fetch') return { ok: true, out: '' };
+      const result = spawnSync(command, args, { cwd: options?.cwd ?? repo, encoding: 'utf8' });
+      return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
+    };
+    const code = await runPrLand({ pr: String(PR), expectedHead: head, heavyRemote: true, cwd: repo }, {
+      prodFreezeRoot, run, out: { log: () => {}, error: (message) => errors.push(message) },
+      reviewResultsDir,
+      currentBranch: () => 'feat/typecheck-drift', resolveBase: () => 'origin/main',
+      listUnfinishedRuns: () => [], queryRunningRuns: () => runningRuns,
+      listOpenPrs: () => [], isInteractive: () => false,
+      runHeavyRemote: () => ({ ok: false, source: 'unmeasured', reason: heavyReason,
+        elapsedMs: 1, evidencePath: join(root, 'gate-evidence.json'), typecheckDrift: 'drift' }),
+    });
+    expect(code).toBe(1);
+    const driftRows = rows.filter((row) => row.data?.label === 'typecheck-drift');
+    expect(driftRows).toHaveLength(1);
+    heavyReason = 'gate-rc-1 · remote: stderr: tsc passed; lint failed.';
+    const beforeLintFailure = rows.length;
+    const lintCode = await runPrLand({ pr: String(PR), expectedHead: head, heavyRemote: true, cwd: repo }, {
+      prodFreezeRoot, run, out: { log: () => {}, error: (message) => errors.push(message) },
+      reviewResultsDir, currentBranch: () => 'feat/typecheck-drift', resolveBase: () => 'origin/main',
+      listUnfinishedRuns: () => [], queryRunningRuns: () => runningRuns,
+      listOpenPrs: () => [], isInteractive: () => false,
+      runHeavyRemote: () => ({ ok: false, source: 'unmeasured', reason: heavyReason,
+        elapsedMs: 1, evidencePath: join(root, 'gate-evidence.json'), typecheckDrift: 'drift' }),
+    });
+    expect(lintCode).toBe(1);
+    expect(rows.slice(beforeLintFailure).filter((row) => row.data?.label === 'typecheck-drift')).toEqual([]);
+  } finally { off(); rmSync(root, { recursive: true, force: true }); }
+  if (!errors.some((message) => message.includes('[typecheck] FAIL'))) {
+    throw new Error(`heavy typecheck refusal was not reached; errors=${errors.join(' | ') || '(none)'}`);
+  }
+  const driftRows = rows.filter((row) => row.data?.label === 'typecheck-drift');
+  expect(driftRows[0]!.event).toBe('graph-edge-taken');
+  expect(driftRows[0]!.data).toMatchObject({ from: 'merge', on: 'refusal', label: 'typecheck-drift', to: 'main-sync', taken: 'main-sync' });
 });
 
 test('evidence cannot override edge fields or the reason', () => {

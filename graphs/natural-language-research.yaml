@@ -3,28 +3,49 @@ graph_id: natural-language-research
 version: 1
 entry_node: question-plan
 terminal_nodes: [synthesis]
+runner_inputs: [ask_text]
 
 nodes:
   - node_id: question-plan
     kind: agent
     recipe: research-question-planner
     max_visits: 1
+    contract:
+      inputs: [ask_text]
+      tools: research-llm
+      outputs: [research-contract, questions]
   - node_id: axes
     kind: agent
     recipe: research-axis-fanout
     max_visits: 1
+    contract:
+      inputs: [research-contract, questions]
+      tools: research-search
+      outputs: [evidence, gaps]
   - node_id: evidence-check
     kind: gate
     recipe: research-output-contract-check
     max_visits: 1
+    contract:
+      inputs: [research-contract, evidence]
+      tools: contract-validation
+      outputs: [outcome, gaps]
   - node_id: followup
     kind: agent
     recipe: research-gap-followup-fanout
     max_visits: 1
+    contract:
+      inputs: [gaps]
+      tools: research-search
+      outputs: [evidence]
   - node_id: synthesis
     kind: agent
     recipe: research-answer-synthesis
     max_visits: 1
+    contract:
+      inputs: [research-contract, evidence]
+      tools: research-llm
+      outputs: [answer]
 
 edges:
   - from: question-plan
@@ -33,6 +54,6 @@ edges:
     to: evidence-check
   - from: evidence-check
     on: outcome
-    map: { complete: synthesis, gap: synthesis }
+    map: { complete: synthesis, gap: followup }
   - from: followup
     to: synthesis

@@ -34,6 +34,8 @@ export interface RepairLaunchRequest {
 export interface RepairCycleInput {
   card: TaskCard; statePath: string; repo: string; pr: number; head: string; branch: string;
   mustFix: readonly string[]; liveMoves: ReadonlySet<string>; now: Date;
+  /** Existing task-card repair route can carry a bounded non-review repair goal (e.g. land typecheck drift). */
+  goalOverride?: string;
   supervisorDeficit?: SupervisorGoalDeficit;
   supervisorResult?: import('../self-implement/goal-supervisor-fill.js').SupervisorGoalFillResult;
   readRunLedger?: (runId: string) => RunLedgerEntry[] | null;
@@ -566,7 +568,9 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
   const runId = mintRunId();
   const resultPath = repairResultPath(statePath, card.id, pr, head, next, runId);
   const goalFile = resultPath.replace(/\.json$/, '.goal.txt');
-  const goal = `기존 PR #${pr}의 리뷰 때 head ${head}를 같은 가지에서 수리한다. 새 PR을 열지 말고 아래 must-fix 원문만 고쳐 commit-only 결과를 반환한다.\n\n${input.mustFix.map((item, i) => `${i + 1}. ${item}`).join('\n')}`;
+  const repairContract = `기존 PR #${pr}의 head ${head}를 기존 같은 가지에서만 수리한다. 새 PR을 열지 않는다. 요청 범위만 수정하고 commit-only 결과를 반환한다. 착지는 열차가 한다 (--no-auto-merge).`;
+  const goal = input.goalOverride ? `${repairContract}\n\n${input.goalOverride}`
+    : `${repairContract}\n\n아래 must-fix 원문만 고친다.\n${input.mustFix.map((item, i) => `${i + 1}. ${item}`).join('\n')}`;
   mkdirSync(dirname(goalFile), { recursive: true });
   writeFileSync(goalFile, goal);
   let claimed = false;

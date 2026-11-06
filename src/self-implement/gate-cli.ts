@@ -970,8 +970,11 @@ function gateReceiptIdentity(
     return { reason: 'worktree-status-unavailable' };
   }
   if (worktree.stdout.length > 0) return { reason: 'worktree-dirty' };
-  const remote = command(['config', '--get', 'remote.origin.url']);
-  const repositoryUrl = remote.status === 0 ? normalizedRepositoryUrl(remote.stdout ?? '') : undefined;
+  const remoteIdentity = process.env.ELANOUS_GATE_REMOTE_CHILD === '1'
+    ? process.env.ELANOUS_GATE_REPOSITORY_IDENTITY?.trim() : undefined;
+  const remote = remoteIdentity ? undefined : command(['config', '--get', 'remote.origin.url']);
+  const repositoryUrl = remoteIdentity && /^(?:[a-z][a-z0-9+.-]*:\/\/[^/]+\/.+|[a-z0-9.-]+\/.+)$/i.test(remoteIdentity)
+    ? remoteIdentity : remote?.status === 0 ? normalizedRepositoryUrl(remote.stdout ?? '') : undefined;
   if (!repositoryUrl) return { reason: 'repository-origin-unavailable' };
   const branch = selection.prHeadRefName?.trim() || (() => {
     const result = command(['branch', '--show-current']);

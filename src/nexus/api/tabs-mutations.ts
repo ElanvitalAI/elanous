@@ -28,7 +28,7 @@ import {
   type ChannelBotPlatform,
 } from '../kinds/channel-bot.js';
 // Surface-unification v2.2 V2.2-8 (2026-05-11) — scheduler kind retired.
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 export interface MutationContext {
   state: NexusState;

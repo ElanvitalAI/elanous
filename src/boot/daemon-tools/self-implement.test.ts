@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { _setCreateGoalAuthorDecomposeStepsForTesting, _setObserveOnlyConfigReaderForTesting, _setRecentStepCountReaderForTesting, buildLaunchedToolResult, buildObservedOnlyToolResult, buildSelfImplementDaemonSpec, buildSelfImplementSurfaceSeams, dispatchSelfImplement, dispatchSelfImplementManaged, ManagedTaskAdmissionStore, parseRecentStepCountsFromLogRows, readRecentStepCountsFromLogStore, resolveDispatchEntry, type SelfImplementLaunchedToolResult, type SelfImplementRunner } from './self-implement.js';
+import { _setCreateGoalAuthorDecomposeStepsForTesting, _setObserveOnlyConfigReaderForTesting, _setRecentStepCountReaderForTesting, buildFailedToolResult, buildLaunchedToolResult, buildObservedOnlyToolResult, buildSelfImplementDaemonSpec, buildSelfImplementSurfaceSeams, dispatchSelfImplement, dispatchSelfImplementManaged, ManagedTaskAdmissionStore, parseRecentStepCountsFromLogRows, readRecentStepCountsFromLogStore, resolveDispatchEntry, type SelfImplementLaunchedToolResult, type SelfImplementRunner } from './self-implement.js';
 import { AgentRegistry, globalAgentRegistry } from '../../agent/registry.js';
 import { TaskNotificationQueue } from '../../agent/task-notification.js';
 import { recordRunStop } from '../../self-implement/run-stop.js';
@@ -63,6 +63,12 @@ function fakeBase(over: Partial<SelfImplementSeams> = {}): SelfImplementSeams {
     ...over,
   };
 }
+
+test('runtime SelfImplement failures do not claim deterministic input is non-retryable', () => {
+  const result = buildFailedToolResult('temporary host unavailable');
+  expect(result).toMatchObject({ kind: 'failed', isError: true });
+  expect(result).not.toHaveProperty('retryable');
+});
 
 describe('resolveDispatchEntry — conservative entry fallback', () => {
   const ctx = (entry?: 'elanous-apparatus' | 'external-verbatim') => ({ cwd: '/tmp', signal: new AbortController().signal, ...(entry ? { entry } : {}) });
@@ -622,6 +628,92 @@ describe('dispatchSelfImplementManaged — nonblocking admission', () => {
   })));
   afterEach(() => setUserConfigOverlay(null));
 
+  test('rejects missing goal documents before durable admission and marks the result as a tool error', async () => {
+    const admissionRoot = mkdtempSync(join(tmpdir(), 'managed-dispatch-preflight-'));
+    managedAdmissionTestRoots.push(admissionRoot);
+    const store = new ManagedTaskAdmissionStore(admissionRoot);
+    const registry = new AgentRegistry();
+    let runnerCalls = 0;
+    const result = await dispatchSelfImplementManaged(
+      { feature: 'bad goal retry', goalFile: 'missing/GOAL-retry.md' },
+      { cwd: '/tmp', signal: new AbortController().signal, sessionId: `session-${randomUUID()}` },
+      async () => { runnerCalls += 1; throw new Error('must not run'); },
+      undefined, undefined, undefined, store, { registry },
+    );
+    expect(result).toMatchObject({ kind: 'failed', isError: true, retryable: false });
+    expect('taskId' in result).toBe(false);
+    expect(registry.list()).toHaveLength(0);
+    expect(runnerCalls).toBe(0);
+  });
+
+  test('goal-file read errors stay retryable instead of being classified as invalid input', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'managed-dispatch-goal-read-error-'));
+    managedAdmissionTestRoots.push(root);
+    const repo = join(root, 'repo');
+    const goalPath = join(repo, 'GOAL-is-a-directory.md');
+    mkdirSync(goalPath, { recursive: true });
+    const result = await dispatchSelfImplementManaged(
+      { feature: 'goal read retry', goalFile: goalPath },
+      { cwd: repo, signal: new AbortController().signal, sessionId: `session-${randomUUID()}` },
+      async () => { throw new Error('must not run'); },
+      undefined, undefined, undefined,
+      new ManagedTaskAdmissionStore(join(root, 'admissions')),
+      { registry: new AgentRegistry() },
+    );
+    expect(result).toMatchObject({ kind: 'failed', isError: true });
+    expect(result).not.toHaveProperty('retryable', false);
+    expect('taskId' in result).toBe(false);
+  });
+
+  test('a missing working directory is a retryable runtime failure, not a bad goal path', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'managed-dispatch-missing-cwd-'));
+    managedAdmissionTestRoots.push(root);
+    const repo = join(root, 'repo');
+    const missingCwd = join(root, 'removed-repo');
+    const goalFile = join(repo, 'GOAL-valid.md');
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(goalFile, '# Valid goal\n');
+    const result = await dispatchSelfImplementManaged(
+      { feature: 'cwd recovery', goalFile },
+      { cwd: missingCwd, signal: new AbortController().signal, sessionId: `session-${randomUUID()}` },
+      async () => { throw new Error('must not run'); },
+      undefined, undefined, undefined,
+      new ManagedTaskAdmissionStore(join(root, 'admissions')),
+      { registry: new AgentRegistry() },
+    );
+    expect(result).toMatchObject({ kind: 'failed', isError: true });
+    expect(result).not.toHaveProperty('retryable', false);
+    expect('taskId' in result).toBe(false);
+  });
+
+  test('accepts a valid existing goal and shows its first title before launch', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'managed-dispatch-existing-goal-'));
+    managedAdmissionTestRoots.push(root);
+    const repo = join(root, 'repo');
+    const goalDir = join(repo, '.elanous', 'goals');
+    const goalFile = join(goalDir, 'GOAL-browser-selection.md');
+    mkdirSync(goalDir, { recursive: true });
+    writeFileSync(goalFile, '# Old browser selection handoff\n\n## WHAT TO BUILD\nResume this goal.\n');
+    const registry = new AgentRegistry();
+    let runnerCalls = 0;
+    const result = await dispatchSelfImplementManaged(
+      { feature: 'resume existing goal', goalFile },
+      { cwd: repo, signal: new AbortController().signal, sessionId: `session-${randomUUID()}` },
+      async (opts) => {
+        runnerCalls++;
+        return { runId: opts.runId!, ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' };
+      },
+      undefined, undefined, undefined,
+      new ManagedTaskAdmissionStore(join(root, 'admissions')),
+      { registry },
+    );
+    expect(result).toMatchObject({ kind: 'launched', ok: true, message: expect.stringContaining('reused goal: Old browser selection handoff') });
+    if (!('taskId' in result)) throw new Error('valid existing goal did not return a task receipt');
+    for (let i = 0; i < 50 && registry.get(result.taskId)?.state !== 'done'; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runnerCalls).toBe(1);
+    expect(registry.get(result.taskId)?.state).toBe('done');
+  });
+
   test('returns an addressable queued receipt before the implementation runner completes', async () => {
     const admissionRoot = mkdtempSync(join(tmpdir(), 'managed-dispatch-admission-'));
     managedAdmissionTestRoots.push(admissionRoot);
@@ -662,24 +754,30 @@ describe('dispatchSelfImplementManaged — nonblocking admission', () => {
   test('same session and tool-call identity reuses the durable admission without launching twice', async () => {
     const admissionRoot = mkdtempSync(join(tmpdir(), 'managed-dispatch-admission-'));
     managedAdmissionTestRoots.push(admissionRoot);
+    const repo = join(admissionRoot, 'repo');
+    mkdirSync(repo, { recursive: true });
+    const goalFile = join(repo, 'GOAL-dedupe-request.md');
+    writeFileSync(goalFile, '# Dedupe request\n');
     const registry = new AgentRegistry();
     const notifications = new TaskNotificationQueue();
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let launches = 0;
-    const ctx = { cwd: '/tmp', signal: new AbortController().signal, sessionId: `session-${randomUUID()}`, toolCallId: randomUUID() };
+    const ctx = { cwd: repo, signal: new AbortController().signal, sessionId: `session-${randomUUID()}`, toolCallId: randomUUID() };
     const runner: SelfImplementRunner = async (opts) => {
       launches += 1;
       await held;
       return { runId: opts.runId!, ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' };
     };
     const store = new ManagedTaskAdmissionStore(admissionRoot);
-    const first = await dispatchSelfImplementManaged({ feature: 'dedupe request' }, ctx, runner, undefined, undefined, undefined, store, { registry, taskNotifications: notifications });
+    const first = await dispatchSelfImplementManaged({ feature: 'dedupe request', goalFile }, ctx, runner, undefined, undefined, undefined, store, { registry, taskNotifications: notifications });
     for (let i = 0; i < 20 && launches === 0; i++) await new Promise((resolve) => setTimeout(resolve, 0));
-    const second = await dispatchSelfImplementManaged({ feature: 'dedupe request' }, ctx, runner, undefined, undefined, undefined, store, { registry, taskNotifications: notifications });
+    rmSync(goalFile);
+    const second = await dispatchSelfImplementManaged({ feature: 'dedupe request', goalFile }, ctx, runner, undefined, undefined, undefined, store, { registry, taskNotifications: notifications });
     if (!('taskId' in first) || !('taskId' in second)) throw new Error('deduplicated request did not return addressable task receipts');
     expect(second.taskId).toBe(first.taskId);
     expect(second.runId).toBe(first.runId);
+    expect(second.message).toContain('reused goal: Dedupe request');
     expect(launches).toBe(1);
     release();
   });

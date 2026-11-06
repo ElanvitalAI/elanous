@@ -16,6 +16,7 @@
  * ⛔ 목록 밖은 «전부» private 에 남는다 — 이 스크립트가 무엇을 «더» 넣는 일은 없다.
  * ⛔ 원천은 `git ls-files`(추적 파일)다 — 작업 트리의 untracked·ignored 는 원리상 안 간다.
  */
+import { scanSecretCanaries, type SecretCanary } from '../src/ux-sim/secret-canary.js';
 import { computeSkillBoundaries, filterFilesBySkillVerdict, type SkillVerdict } from './skill-boundary.js';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -168,10 +169,13 @@ function assertRedactedCodeParses(file: string, before: string, after: string): 
     [{ marker, file, line: issue.line, text: issue.message }]);
 }
 
-export function applyPrivateRedactions(contents: ReadonlyMap<string, string>, redactions: readonly PrivateRedaction[]): { contents: Map<string, string>; files: number; places: number } {
+/** `onlyFiles` — leak-check 범위(--files/--path). 범위 밖 파일은 치환도 검사도 하지 않는다(어차피 안 잰다):
+ *  diff 밖 파일의 충돌이 남의 PR 을 막지 않게(PUBLIC-LEAK-GATE-DIFF-SCOPE · 11-05). `--out`(실제 내보내기)은 늘 전수. */
+export function applyPrivateRedactions(contents: ReadonlyMap<string, string>, redactions: readonly PrivateRedaction[], onlyFiles?: (file: string) => boolean): { contents: Map<string, string>; files: number; places: number } {
   const result = new Map(contents);
   let files = 0; let places = 0;
   for (const [file, text] of result) {
+    if (onlyFiles && !onlyFiles(file)) continue;
     if (text.includes('\u0000')) continue;
     assertRedactionsAvoidIdentifiers(file, text, redactions);
     let out = text; let changed = 0;
@@ -481,7 +485,30 @@ function trackedFiles(root: string): string[] {
   return spawnSyncText('git', ['-C', root, 'ls-files', '-z']).split('\0').filter(Boolean);
 }
 
-export function run(argv: readonly string[], root = resolve(import.meta.dir, '..')): number {
+function configuredSecretCanaries(raw = process.env.ELANOUS_SECRET_CANARIES): readonly SecretCanary[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); }
+  catch { throw new Error('ELANOUS_SECRET_CANARIES must be a JSON array of provider/value objects'); }
+  if (!Array.isArray(parsed) || !parsed.every((entry) => (
+    entry !== null && typeof entry === 'object'
+    && typeof entry.provider === 'string' && entry.provider.length > 0
+    && typeof entry.value === 'string' && entry.value.length > 0
+  ))) throw new Error('ELANOUS_SECRET_CANARIES must be a JSON array of provider/value objects');
+  return parsed as SecretCanary[];
+}
+
+function redactCanariesFromDiagnostic(value: string, canaries: readonly SecretCanary[]): string {
+  let redacted = value;
+  for (const canary of canaries) {
+    const forms = [canary.value, Buffer.from(canary.value).toString('base64'), encodeURIComponent(canary.value)]
+      .sort((left, right) => right.length - left.length);
+    for (const form of forms) if (form) redacted = redacted.split(form).join('[redacted]');
+  }
+  return redacted;
+}
+
+export function run(argv: readonly string[], root = resolve(import.meta.dir, '..'), canaries?: readonly SecretCanary[]): number {
   const json = argv.includes('--json');
   const all = argv.includes('--all');
   const pathIndex = argv.indexOf('--path');
@@ -530,14 +557,32 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
     const redactions = loadPrivateRedactions();
     const noPrivateList = argv.includes('--no-private-list');
     let redacted: ReturnType<typeof applyPrivateRedactions>;
-    try { redacted = redactions ? applyPrivateRedactions(transformedByRules.contents, redactions) : { contents: transformedByRules.contents, files: 0, places: 0 }; }
+    // ⭐ 범위 — --files/--path 를 주면 그 파일만(diff 범위) · 아무것도 안 주거나 --out 이면 전수.
+    const scope = out || (!onlyFiles && !pathPrefix) ? { mode: 'all' as const } : { mode: onlyFiles ? 'files' as const : 'path' as const };
+    const scopedTo = scope.mode === 'all' ? undefined : inScope;
+    try { redacted = redactions ? applyPrivateRedactions(transformedByRules.contents, redactions, scopedTo) : { contents: transformedByRules.contents, files: 0, places: 0 }; }
     catch (error) {
       console.error(`⛔ ${error instanceof Error ? error.message : String(error)}`);
       if (json && error instanceof PrivateRedactionError) console.log(JSON.stringify({ files: scanned.length,
-        leaks: error.hits.length, hits: error.hits }));
+        scope: { ...scope, files: scanned.length }, leaks: error.hits.length, hits: error.hits }));
       return 1;
     }
     const transformed = { contents: redacted.contents, counts: transformedByRules.counts };
+    let activeCanaries: readonly SecretCanary[];
+    try { activeCanaries = canaries ?? configuredSecretCanaries(); }
+    catch (error) {
+      console.error(`⛔ ${error instanceof Error ? error.message : 'invalid secret canary configuration'}`);
+      return 2;
+    }
+    const canaryScan = scanSecretCanaries(activeCanaries, [...transformed.contents].map(([path, content]) => ({
+      path,
+      content,
+      kind: 'static-export' as const,
+    })));
+    if (out && canaryScan.verdict === 'leaked') {
+      for (const match of canaryScan.matches) console.error(`⛔ secret canary detected in ${redactCanariesFromDiagnostic(match.path, activeCanaries)} (${match.encoding}); export blocked`);
+      return 1;
+    }
     const privateRedactions = { table: privateRedactionsPath(), loaded: redactions !== null, entries: redactions?.length ?? 0, files: redacted.files, places: redacted.places };
     if (redactions) console.error(`private redactions: ${redacted.files} files · ${redacted.places} places (${redactions.length} entries · ${privateRedactionsPath()})`);
     if (!redactions) console.error(`${noPrivateList ? '⚠' : '⛔'} 개인 치환표 없음(${privateRedactionsPath()}) — 이름·IP·호스트 같은 개인 식별자를 «못 봤다»${noPrivateList ? ' (--no-private-list)' : ' · rc=1 · 넘기려면 --no-private-list'}`);
@@ -565,11 +610,22 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
     const rawHits = [
       ...gitIgnoredExportFiles(root, files).filter(inScope).map((file) => ({ marker: 'export-gitignored', file, line: 0, text: '공개본 .gitignore 에 걸린다 — 커밋하면 사라진다' })),
       ...scanLeaks(root, scanned, LEAK_MARKERS, transformed.contents, realDocs),
+      ...canaryScan.matches.map((match) => ({ marker: 'secret-canary', file: redactCanariesFromDiagnostic(match.path, activeCanaries), line: 0, text: `secret canary detected (${match.encoding})` })),
       ...(redactions ? scanLeaks(root, scanned, privateIdentifierMarkers(redactions), transformed.contents, realDocs) : []),
       ...(!redactions && !noPrivateList ? [{ marker: 'private-identifiers-unchecked', file: privateRedactionsPath(), line: 0, text: 'private redaction list missing' }] : []),
-    ];
+    ].map((hit) => ({
+      ...hit,
+      file: redactCanariesFromDiagnostic(hit.file, activeCanaries),
+      text: redactCanariesFromDiagnostic(hit.text, activeCanaries),
+    }));
     const { leaks: hits, codeLiterals } = splitCodeLiteralCeoMarks(scanned, transformed.contents, rawHits);
-    const advisory = scanRuntimePaths(root, files, tracked, transformed.contents).filter((h) => inScope(h.file));
+    const advisory = scanRuntimePaths(root, files, tracked, transformed.contents)
+      .filter((h) => inScope(h.file))
+      .map((hit) => ({
+        ...hit,
+        file: redactCanariesFromDiagnostic(hit.file, activeCanaries),
+        text: redactCanariesFromDiagnostic(hit.text, activeCanaries),
+      }));
     const summary = summarizeLeaks(hits);
     const advisorySummary = summarizeLeaks(advisory);
     const beforeSummary = summarizeLeaks(before);
@@ -578,7 +634,7 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
     const truncated = shown.length < hits.length;
     if (json) {
       console.log(JSON.stringify({
-        files: scanned.length, leaks: hits.length, summary, before: { leaks: before.length, summary: beforeSummary }, transforms: transformed.counts, privateRedactions,
+        files: scanned.length, scope: { ...scope, files: scanned.length }, leaks: hits.length, summary, before: { leaks: before.length, summary: beforeSummary }, transforms: transformed.counts, privateRedactions,
         codeLiterals: { hits: codeLiterals.length, summary: summarizeLeaks(codeLiterals), items: all ? codeLiterals : codeLiterals.slice(0, limit) },
         shownHits: shown.length, truncated, omittedHits: hits.length - shown.length,
         ...(pathPrefix ? { pathPrefix } : {}), hits: shown,

@@ -114,6 +114,7 @@ import {
 import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-runtime/discovery.js';
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
+import { loadNexusAppHost } from './apps/app-host.js';
 import { startControlServer } from '../control-plane/server.js';
 import { nexusMemberMachine, startMemberHeartbeat } from '../control-plane/member.js';
 import { resolvePrimary } from '../control-plane/primary.js';
@@ -2248,6 +2249,14 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     pwaStaticDir = process.env.ELANOUS_PWA_STATIC_DIR?.trim()
       || resolvePwaStaticDir();
 
+    // NEXUS-APP-HOST-S1 — app installs live beside Nexus runtime state as
+    // `~/.elanous/nexus/apps/<slug>/{app.yaml,out/}`. Invalid apps stay
+    // unmounted without preventing the owner's Nexus API from starting.
+    const { appHost, issues: appHostIssues } = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'));
+    for (const issue of appHostIssues) {
+      debug.log('nexus.app-host', 'app-mount-rejected', issue, { level: 'warn' });
+    }
+
     // P-2D.2 — dev-proxy upstream is no longer persisted in UserConfig.
     // http-server creates its own DevProxyRuntimeRef; admin endpoint
     // (`POST /v1/nexus/admin/pwa-dev-proxy`) flips it live. Boot
@@ -3089,6 +3098,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       reloadMcpClients,
       ...(getMcpWidgetServerId ? { getMcpWidgetServerId } : {}),
       ...(pwaStaticDir ? { staticDir: pwaStaticDir } : {}),
+      appHost,
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
       // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Kubectl } from './self-implement-pod.js';
 import type { WarmWorkerCommand, WarmWorkerReply } from './pod-warm-worker-protocol.js';
-import { WarmPodTransport, probeWarmPodContext, warmWorkerPodManifest, WARM_POD_ACK, WARM_POD_EXEC, WARM_POD_INSTALL, WARM_POD_ISOLATION_PROBE, WARM_POD_PREPARE, WARM_POD_READ, type WarmPodSpec } from './pod-warm-worker-pod.js';
+import { WarmPodTransport, probeWarmPodContext, probeWarmPodRuntimeContract, warmWorkerPodManifest, WARM_POD_ACK, WARM_POD_EXEC, WARM_POD_INSTALL, WARM_POD_ISOLATION_PROBE, WARM_POD_PREPARE, WARM_POD_READ, WARM_POD_RUNTIME_PROBE, type WarmPodSpec } from './pod-warm-worker-pod.js';
 
 const cutSha = 'a'.repeat(40);
 const key = { context: 'pool-node-b', imageDigest: `sha256:${'b'.repeat(64)}`, lockHash: 'c'.repeat(64), architecture: 'amd64' };
@@ -297,6 +297,88 @@ test('host verification failure leaves the Pod request fence for a new transport
     .toMatchObject({ status: 'fallback', reason: 'worker-quarantined' });
   expect(WARM_POD_EXEC).toContain("active + '/identity'");
   expect(WARM_POD_EXEC).toContain("controlStat.uid !== Number(process.env.WARM_BRIDGE_UID)");
+});
+
+
+test('runtime compatibility probe sends its contract over exec stdin', () => {
+  const commands: string[][] = [];
+  let input: string | undefined;
+  const probeSpec: WarmPodSpec = { ...spec, runtimeContract: { bunVersion: Bun.version,
+    os: 'linux', architecture: 'amd64', requiredTools: ['bun', 'git'] } };
+  const result = probeWarmPodRuntimeContract(probeSpec, (args, body) => {
+    commands.push([...args]); input = body;
+    return { status: 0, stdout: JSON.stringify({ bunVersion: Bun.version, os: 'linux',
+      architecture: 'amd64', tools: { bun: true, git: true } }), stderr: '' };
+  });
+  expect(result.status).toBe('compatible');
+  expect(commands[0]).toContain('-i');
+  expect(commands[0]).toContain(WARM_POD_RUNTIME_PROBE);
+  expect(JSON.parse(input ?? '{}')).toEqual({ requiredTools: ['bun', 'git'] });
+});
+
+test('runtime compatibility probe marks a proven missing bun binary incompatible but transient exec failure unavailable', () => {
+  const probeSpec: WarmPodSpec = { ...spec, runtimeContract: { bunVersion: Bun.version,
+    os: 'linux', architecture: 'amd64', requiredTools: ['bun', 'git'] } };
+  expect(probeWarmPodRuntimeContract(probeSpec, () => ({ status: 1, stdout: '',
+    stderr: 'OCI runtime exec failed: exec: "bun": executable file not found in $PATH' })).status).toBe('incompatible');
+  expect(probeWarmPodRuntimeContract(probeSpec, () => ({ status: 1, stdout: '',
+    stderr: 'error: unable to upgrade connection: timeout' })).status).toBe('unavailable');
+});
+
+test('the first lease-pinned Pod read refuses a same-repository digest change before exec', async () => {
+  const pinnedKey = { ...key, imageDigest: `sha256:${'d'.repeat(64)}` };
+  const pinnedSpec: WarmPodSpec = { ...spec, key: pinnedKey,
+    image: `registry.example/elanous@${pinnedKey.imageDigest}` };
+  const pod = warmWorkerPodManifest(pinnedSpec) as any;
+  pod.metadata.uid = 'pod-uid-1'; pod.spec.nodeName = 'node-1';
+  pod.status = { phase: 'Running', containerStatuses: [{ name: 'worker', ready: true }] };
+  pod.spec.containers[0].image = `registry.example/elanous@sha256:${'e'.repeat(64)}`;
+  let execs = 0;
+  const kubectl: Kubectl = args => {
+    if (args.includes('get') && args.includes('pod')) return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
+    if (args.includes(WARM_POD_RUNTIME_PROBE)) throw new Error('post-lease digest drift must not be reprobed');
+    if (args.includes(WARM_POD_EXEC)) execs++;
+    return { status: 0, stdout: JSON.stringify(node()), stderr: '' };
+  };
+  expect(await new WarmPodTransport(pinnedSpec, kubectl).request({ ...command('first-read-drift'), key: pinnedKey }))
+    .toMatchObject({ status: 'fallback', reason: 'pod-unready' });
+  expect(execs).toBe(0);
+});
+
+test('same UID Pod image mutation after exec is rejected before accepting artifacts', async () => {
+  const oldKey = { ...key, imageDigest: `sha256:${'d'.repeat(64)}` };
+  const oldSpec: WarmPodSpec = { ...spec, key: oldKey,
+    image: `registry.example/elanous@${oldKey.imageDigest}` };
+  const request = { ...command('same-uid-image-change'), key: oldKey };
+  const initial = warmWorkerPodManifest(oldSpec) as any;
+  initial.metadata.uid = 'pod-uid-1';
+  initial.spec.nodeName = 'node-1';
+  initial.status = { phase: 'Running', containerStatuses: [{ name: 'worker', ready: true }] };
+  let podReads = 0;
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('get') && args.includes('pod')) {
+      podReads++;
+      const current = structuredClone(initial);
+      if (podReads >= 2) current.spec.containers[0].image = `registry.example/elanous@sha256:${'e'.repeat(64)}`;
+      return { status: 0, stdout: JSON.stringify(current), stderr: '' };
+    }
+    if (args.includes('node')) return { status: 0, stdout: JSON.stringify(node()), stderr: '' };
+    if (args.includes(WARM_POD_EXEC)) {
+      expect(args).toContain('-i');
+      const command = JSON.parse(input ?? '') as WarmWorkerCommand;
+      return { status: 0, stdout: JSON.stringify({ reason: 'complete', quarantineWorker: false,
+        artifactsDir: artifactsDir(command), artifactHashes: artifactHashes(command), reply: reply(command) }), stderr: '' };
+    }
+    if (args.includes(WARM_POD_READ)) {
+      const path = args.at(-1)!;
+      const suffix = path.slice(path.indexOf('file-0.') + 'file-0.'.length) as keyof ReturnType<typeof artifacts>;
+      return { status: 0, stdout: Buffer.from(artifacts(request)[suffix]).toString('base64'), stderr: '' };
+    }
+    if (args.includes(WARM_POD_ACK)) return { status: 0, stdout: 'ack', stderr: '' };
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  expect(await new WarmPodTransport(oldSpec, kubectl).request(request))
+    .toMatchObject({ status: 'fallback', reason: 'pod-replaced', reply: null });
 });
 
 test('replacement Pod or incomplete reply quarantines the transport', async () => {

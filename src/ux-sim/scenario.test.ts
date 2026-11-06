@@ -24,7 +24,7 @@ async function withTestState<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-test('graph runtime overlay is dispatched through the production observer into isolated logs.db', { timeout: 30_000 }, async () => {
+test('graph runtime overlay is dispatched through the production observer into isolated logs.db', async () => {
   await withTestState(async () => {
     const run = await runScenarioFile('scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml');
     expect(run.pass).toBe(true);
@@ -40,7 +40,7 @@ test('graph runtime overlay is dispatched through the production observer into i
       expect(JSON.parse(rows[0]!.data!)).toMatchObject({ runId: run.runId, stage: 'runtime', applied: ['ux-sim-event-stream-runtime-overlay'] });
     } finally { store.close(); }
   });
-});
+}, { timeout: 30_000 });
 
 test('DEMO1104 research ARG scenario applies the declared FX node and records runId-scoped evidence', async () => {
   await withTestState(async () => {
@@ -113,7 +113,7 @@ test('S2 burst ladder runs all purposes through fake-cloud-vm in an isolated tes
   });
 });
 
-test('graph runtime scenario fails if the production observer event is dropped before logs.db', { timeout: 30_000 }, async () => {
+test('graph runtime scenario fails if the production observer event is dropped before logs.db', async () => {
   await withTestState(async () => {
     const previousFault = process.env.ELANOUS_UX_SIM_TEST_FAULT;
     process.env.ELANOUS_UX_SIM_TEST_FAULT = 'drop-runtime-graph-event';
@@ -128,9 +128,9 @@ test('graph runtime scenario fails if the production observer event is dropped b
       else process.env.ELANOUS_UX_SIM_TEST_FAULT = previousFault;
     }
   });
-});
+}, { timeout: 30_000 });
 
-test('parallel graph runtime workers keep the parent process state directory unchanged', { timeout: 30_000 }, async () => {
+test('parallel graph runtime workers keep the parent process state directory unchanged', async () => {
   await withTestState(async () => {
     const initialStateDir = process.env.ELANOUS_STATE_DIR;
     const removeSink = debug.registerSink({ name: 'mockdev-parallel-worker-test', emit: () => {} });
@@ -146,7 +146,7 @@ test('parallel graph runtime workers keep the parent process state directory unc
       removeSink();
     }
   });
-});
+}, { timeout: 30_000 });
 
 test('YAML scenario runs the real Codex 400 path, compares widget plus stored log event, and persists seeded evidence', async () => {
   const result = await withTestState(async () => {

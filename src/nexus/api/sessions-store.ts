@@ -22,7 +22,7 @@ import { getProject } from '../../project/project-store.js';
 import { sessionRoot, updateSessionMeta } from '../../session/index.js';
 import { debug } from '../../debug/log.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 /** active(대화중) 판정 임계 — updatedAt 이 10분 내면 최근 대화중으로 표시. */
 const ACTIVE_MS = 10 * 60_000;

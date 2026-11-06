@@ -1,6 +1,6 @@
 // NEXUS · /v1/config/* routes (Phase N-3 PR μ)
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   listSwitches,
   getSwitch,

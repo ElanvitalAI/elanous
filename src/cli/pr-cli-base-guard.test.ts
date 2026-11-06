@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import { runPrLand as realRunPrLand, type PrLandDeps, type PrLandOpts } from './pr-cli.js';
 import type { HeavyRemoteInput, HeavyRemoteResult } from './pr-land-heavy-remote.js';
+import { debug } from '../debug/log.js';
 
 // LAND-BASE-MAIN-GUARD: 10-11 #26022 was squash-merged into bench/base-night-* because the base was read only AFTER the merge.
 let freezeRoot = '';
@@ -120,6 +122,77 @@ test('a reused PR whose base is main lands normally', async () => {
   expect(result.merges()).toBe(1);
   expect(result.lines).toContain(`✓ merge: squash ${PR_URL} → main`);
 });
+
+test('runPrLand records an append-only conflict shadow plan without changing refs or applying the merge', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'pr-land-conflict-shadow-'));
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'test');
+  writeFileSync(join(repo, '.gitignore'), '.state/\n');
+  writeFileSync(join(repo, 'notes.md'), 'base\n');
+  git('add', '.'); git('commit', '-qm', 'base');
+  git('checkout', '-qb', 'feature');
+  writeFileSync(join(repo, 'notes.md'), 'base\nPR line\n');
+  git('commit', '-qam', 'PR intent');
+  const head = git('rev-parse', 'HEAD');
+  git('checkout', '-q', 'main');
+  writeFileSync(join(repo, 'notes.md'), 'base\nmain line\n');
+  git('commit', '-qam', 'main intent');
+  const main = git('rev-parse', 'HEAD');
+  git('checkout', '-q', 'feature');
+  git('remote', 'add', 'origin', 'https://github.com/example/repo.git');
+  git('update-ref', 'refs/remotes/origin/main', main);
+  const reviewResultsDir = join(repo, '.state', 'review-results');
+  mkdirSync(reviewResultsDir, { recursive: true });
+  writeFileSync(join(reviewResultsDir, `pr-26022-${head.slice(0, 12)}.json`), JSON.stringify({
+    pr: 26022, headCommit: head, reviewed: true, verdict: 'pass', mustFix: [],
+  }));
+  const rows: Array<{ event: string; data?: Record<string, unknown> }> = [];
+  const commands: string[] = [];
+  const errors: string[] = [];
+  const off = debug.registerSink({ name: `pr-land-conflict-shadow-${Math.random()}`, emit: (row) => {
+    if (row.category === 'pr.land' && row.event.startsWith('conflict-')) rows.push(row as { event: string; data?: Record<string, unknown> });
+  } });
+  const manager: PrLandDeps['manager'] = {
+    findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: PR_URL }),
+    upsertPr: () => ({ ok: true, url: PR_URL, reused: true }),
+    mergePrOutcome: () => ({ ok: false, kind: 'not-merged', state: 'OPEN' }),
+  } as unknown as PrLandDeps['manager'];
+  const run: NonNullable<PrLandDeps['run']> = (command, args, options) => {
+    commands.push(`${command} ${args.join(' ')}`);
+    if (command === 'git' && args[0] === 'fetch') return { ok: true, out: '' };
+    if (command === 'gh' && args.includes('mergeable,mergeStateStatus')) return { ok: true, out: 'CONFLICTING DIRTY' };
+    if (command === 'gh' && args.includes('title,body')) return { ok: true, out: JSON.stringify({ title: 'PR title intent', body: 'PR body intent' }) };
+    if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feature', baseRefName: 'main', state: 'OPEN', isDraft: false, url: PR_URL }) };
+    const result = spawnSync(command, [...args], { cwd: options?.cwd ?? repo, encoding: 'utf8' });
+    return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
+  };
+  try {
+    const code = await realRunPrLand({ base: 'main', cwd: repo }, {
+      prodFreezeRoot: freezeRoot, manager, run, reviewResultsDir, currentBranch: () => 'feature', resolveBase: () => 'origin/main',
+      listUnfinishedRuns: () => [], listOpenPrs: () => [], isInteractive: () => false,
+      runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true,
+      runModelHardcodeGate: () => true, runDaemonPortGate: () => true, runPublicLeakGate: () => 0,
+      runExportLeakCheck: () => ({ measured: true, hits: [] }), runExportImportCheck: () => ({ measured: true, hits: [], unseen: 0 }),
+      runTestInterferenceGate: async () => 0, runLandGlobalChecks: () => true, runAndroidGate: () => true,
+      runPwaGate: () => true, runIosGate: () => true, out: { log: () => {}, error: (message) => errors.push(message) },
+    });
+    expect(code).toBe(1);
+    if (!rows.length) throw new Error(`shadow event missing; commands=${JSON.stringify(commands.filter((line) => line.startsWith('gh ') || line.startsWith('git fetch') || line.startsWith('git rev-parse')))} errors=${JSON.stringify(errors)}`);
+    expect(rows).toContainEqual(expect.objectContaining({ event: 'conflict-would-automerge', data: expect.objectContaining({
+      pr: 26022, head, base: main, files: ['notes.md'], decision: 'automerge', reason: 'append-only',
+    }) }));
+    expect(git('rev-parse', 'HEAD')).toBe(head);
+    expect(git('rev-parse', 'main')).toBe(main);
+    expect(git('show', 'HEAD:notes.md')).toBe('base\nPR line');
+    expect(git('show', 'main:notes.md')).toBe('base\nmain line');
+  } finally { off(); rmSync(repo, { recursive: true, force: true }); }
+}, 60_000);
 
 test('heavy-remote landing retries an empty final base read and observes gh stderr', async () => {
   const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: 'a'.repeat(40) }, [

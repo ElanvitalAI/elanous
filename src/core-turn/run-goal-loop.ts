@@ -32,7 +32,7 @@ import type { LLMMessage, ContentBlock, LLMToolSpec } from '../llm.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { debug } from '../debug/log.js';
 import { publishGoalLifecycle } from '../goals/loop.js';
-import { boundReadableText } from '../self-implement/orchestrator.js';
+import { boundReadableText } from '../self-implement/readable-text.js';
 import { changedFiles } from '../self-implement/seams.js';
 import { getHarnessRole, getHarnessRunId, getHarnessSpace } from '../harness/harness-space.js';
 import { CONTROL_INBOX_DIR_ENV, drainControlInbox, drainSoftStopControlInbox, enqueueControlMemo, type ControlInboxDrain, type ControlMemoPayload } from '../harness/control-inbox.js';

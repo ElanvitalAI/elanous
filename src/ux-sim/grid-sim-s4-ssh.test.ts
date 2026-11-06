@@ -20,7 +20,9 @@ describe('GRID-SIM-S4-SSH', () => {
       } }, clock });
       const startedAt = clock.now();
       let measurementCalls = 0;
-      const data = buildGridData({ poolSpec: () => 'gcp1:25', measure: (members) => {
+      const data = buildGridData({
+        readHq: () => ({ record: null, ageSeconds: null, expired: null }),
+        poolSpec: () => 'gcp1:25', measure: (members) => {
         measurementCalls++;
         const member = members.find(({ context }) => context === 'gcp1');
         if (!member) throw new Error('gcp1 missing from configured measurement pool');

@@ -142,6 +142,13 @@ function gitRunner(repo: string) {
   };
 }
 
+/** Paths whose change leaves the gate verdict and the shipped artifact untouched (release tooling, docs). */
+export function isReleaseToolingPath(path: string): boolean {
+  return path.startsWith('scripts/release-loop/') || path.startsWith('graphs/release/') || path.startsWith('docs/')
+    // the container upgrade probe: a release check harness, never part of the shipped package
+    || path.startsWith('docker/upgrade/');
+}
+
 function ancestorRunner(repo: string) {
   return (ancestor: string, descendant: string): boolean => {
     const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repo });
@@ -212,7 +219,17 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   // so use the earliest consumer in this run's recorded path rather than assuming either graph version.
   const consumers = ['export-check', 'gate'].map((node) => state.path.indexOf(node)).filter((index) => index >= 0);
   const firstConsumer = consumers.length ? Math.min(...consumers) : -1;
-  if (restartAt >= 0 && firstConsumer >= 0 && restartAt > firstConsumer) {
+  // RESUME-TOOLING-ONLY-TIP (대표 11-06 10:5x surgery): an append that touches only release *tooling* (the release-loop
+  // scripts/graphs, docs) changes nothing the gate measured or the release ships, so the earlier verdicts stand and the
+  // run may resume at the node it stopped at. Any other path keeps the old rule (restart at the first consumer).
+  let changedPaths: string[] = [];
+  if (restartAt > firstConsumer && firstConsumer >= 0) {
+    // Fail closed: if the diff cannot be read, keep the old restart rule.
+    try { changedPaths = git(['diff', '--name-only', recorded, to]).split('\n').map((l) => l.trim()).filter(Boolean); } catch { changedPaths = []; }
+  }
+  const toolingOnly = changedPaths.length > 0 && changedPaths.every(isReleaseToolingPath);
+  if (toolingOnly) debug.log('release-loop.resume', 'tip-moved-tooling-only', { runId, version, from: recorded, to, paths: changedPaths });
+  if (!toolingOnly && restartAt >= 0 && firstConsumer >= 0 && restartAt > firstConsumer) {
     throw new Error(`${branch} moved (${recorded.slice(0, 12)} → ${to.slice(0, 12)}): resume at ${state.path[firstConsumer]} or earlier — later nodes were built from the old tip`);
   }
   const stamp = (deps.now?.() ?? new Date()).toISOString().replace(/[:.]/g, '-');

@@ -71,7 +71,7 @@ describe('meta-api.ts — REST handler surface', () => {
   });
 
   test('imports emitProxyCallIntent from src/mcp/server.ts', () => {
-    expect(src).toMatch(/emitProxyCallIntent.*from\s+['"]\.\.\/\.\.\/mcp\/server(\.js)?['"]/);
+    expect(src).toMatch(/(?:emitProxyCallIntent.*from\s+['"]\.\.\/\.\.\/mcp\/server(\.js)?['"]|const\s+\{\s*emitProxyCallIntent\s*\}\s*=\s*await\s+import\(['"]\.\.\/\.\.\/mcp\/server(\.js)?['"]\))/);
   });
 });
 

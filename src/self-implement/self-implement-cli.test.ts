@@ -35,6 +35,7 @@ describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등�
     const failure = RESULT({ ok: false, stage: 'error' as never, detail: 'uncaught failure' } as never);
     const repaired = RESULT({ stage: 'merged', node: 'merge', merged: true } as never);
     const skipped: Array<Record<string, unknown>> = [];
+    const capabilities: Array<Record<string, unknown>> = [];
     const heals: Array<Record<string, unknown>> = [];
     let optInCalls = 0;
     const isolatedSupervisor = {
@@ -44,6 +45,7 @@ describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등�
     const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
       if (category === 'self-dev.supervisor' && typeof data === 'object' && data !== null) {
         if (event === 'supervisor.reason-repair-skipped') skipped.push(data as Record<string, unknown>);
+        if (event === 'reason-repair-capability') capabilities.push(data as Record<string, unknown>);
         if (event === 'supervisor-self-heal') heals.push(data as Record<string, unknown>);
       }
     });
@@ -59,6 +61,9 @@ describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등�
         ...isolatedSupervisor,
       });
       expect(skipped).toContainEqual(expect.objectContaining({ reason: 'disabled' }));
+      expect(capabilities).toContainEqual(expect.objectContaining({
+        entryPoint: 'self-implement-cli', configured: false, hasExecutePiece: true, skipReason: 'disabled',
+      }));
       expect(offCalls.calls).toHaveLength(1);
 
       setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
@@ -71,7 +76,10 @@ describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등�
       });
       expect(noRepairCapability.calls).toHaveLength(1);
       expect(skipped).toHaveLength(2);
-      expect(skipped[1]).toMatchObject({ reason: 'disabled' });
+      expect(skipped[1]).toMatchObject({ reason: 'missing-executor' });
+      expect(capabilities[1]).toMatchObject({
+        entryPoint: 'self-implement-cli', configured: true, hasExecutePiece: false, skipReason: 'missing-executor',
+      });
 
       const executeReroute = (async () => ({ result: ++optInCalls === 1 ? failure : repaired, exitCode: 0 })) as SelfImplementCliDeps['executeReroute'];
       await runSelfImplementCliCommand(feature, { ...opts(), supervise: { rounds: 2 } }, {

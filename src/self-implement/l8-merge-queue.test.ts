@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireL8MergeQueue, enqueueL8ShadowQueue, evaluateL8Integration, runL8MergeQueue, runL8ShadowQueue, statusL8ShadowQueue, type L8MergeQueueDeps, type L8ShadowQueueDeps } from './l8-merge-queue.js';
 import type { TrainReachObservation } from './train-reach-grouping.js';
+import { integrateTrain, type TrainCandidate } from './merge-train.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -467,6 +468,7 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   const checkoutBefore = git(cwd, 'rev-parse', 'HEAD');
   const calls: string[] = [];
   let hostCalls = 0;
+  const integratedBatches: TrainCandidate[][] = [];
   const execute: NonNullable<L8ShadowQueueDeps['command']> = (bin, args, dir) => {
     calls.push([bin, ...args].join(' '));
     if (bin === 'ssh' || bin === 'kubectl' || args.includes('node-b')) hostCalls++;
@@ -474,6 +476,7 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
       const number = Number(args[2]);
       return { status: 0, stdout: JSON.stringify({
         headRefOid: heads[number], baseRefName: 'main', state: 'OPEN', isDraft: false, isCrossRepository: false,
+        title: `PR ${number} intent`, body: `Body for PR ${number}`,
         files: [{ path: files[number] }],
       }), stderr: '' };
     }
@@ -484,6 +487,10 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
     acquire: async () => () => {},
     command: execute,
     observeEnqueue: () => {},
+    trainIntegrate: (repo, baseSha, batch, trainGit) => {
+      integratedBatches.push(batch.map((candidate) => ({ ...candidate })));
+      return integrateTrain(repo, baseSha, batch, trainGit);
+    },
     trainReachInspect: (candidate) => reachObservation(candidate.changedFiles, candidate.pr === '10' ? ['test/other.test.ts'] : ['test/shared.test.ts']),
   };
   for (const number of [7, 8, 9, 10]) await enqueueL8ShadowQueue(cwd, number, queueDeps);
@@ -499,6 +506,11 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   });
   expect(verdict).toMatchObject({ number: 7, verdict: 'pass', base: mainBefore, tests: ['test/shared.test.ts'] });
   expect(verdict?.detail).toContain('reach [7,8,9]');
+  expect(integratedBatches[0]?.map(({ number, title, body }) => ({ number, title, body }))).toEqual([
+    { number: 7, title: 'PR 7 intent', body: 'Body for PR 7' },
+    { number: 8, title: 'PR 8 intent', body: 'Body for PR 8' },
+    { number: 9, title: 'PR 9 intent', body: 'Body for PR 9' },
+  ]);
   expect(verdict?.manifest).toMatchObject({ number: 7, group: [7, 8, 9], reachTests: ['test/shared.test.ts'], interactionTests: ['test/shared.test.ts'], gatesRun: 5, verdict: 'pass' });
   expect(verdict?.manifest?.queueSig).toMatch(/^[0-9a-f]{64}$/);
   expect(gateBatches).toEqual([[7, 8, 9], [7], [8, 9], [8], [9]]);

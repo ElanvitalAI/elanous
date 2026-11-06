@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, releaseGatePoolStartBlock, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, resolveWarmProviderConfig, warmProviderTarget, type WarmGateControlDependencies, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, gateReceiptReuseKey, planGateRiskLaneShards, reconcileStaleGateShardBoard, parseGateInstallSlotWaitMs, gatePreparationTimings, type GateAdmission, type GateRunner } from './gate-node';
+import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, releaseGatePoolStartBlock, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, resolveWarmProviderConfig, warmProviderTarget, type WarmGateControlDependencies, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, gateReceiptReuseKey, planGateRiskLaneShards, reconcileStaleGateShardBoard, parseGateInstallSlotWaitMs, gatePreparationTimings, type GateAdmission, type GateRunner, writeGateVerdictRecord } from './gate-node';
 import { cleanRetryVerdict, failedJunitFiles } from './gate-shard-load-flaky';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { buildUserConfig, resetUserConfig } from '../../src/user-config.js';
@@ -13,7 +13,7 @@ import { debug } from '../../src/debug/log.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial';
 import { hardRehearsalGateVersion } from './gate-radius-live';
-import { gateEnvFingerprint, gateSourcePins } from './gate-baseline-receipt';
+import { gateBaselineReceipt, gateEnvFingerprint, gateSourcePins } from './gate-baseline-receipt';
 import { beginGateShardAttempt } from '../../src/release-loop/gate-shards.js';
 import { parseFailures, parseTimedOutFailures } from './gate-diff';
 import { parsePodCpu, runPodCommand, type RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
@@ -184,6 +184,74 @@ function fake(cut = [A, B, C], baseline = [A, D], cached = true) {
   };
   return { root, instanceRoot, ledgerRoot, runner, calls };
 }
+
+test('judgeGate skips the cut sweep when a complete clean hard rehearsal receipt matches the cut SHA', async () => {
+  const f = fake([], [], true);
+  const repo = join(f.root, 'same-head-repo');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  mkdirSync(join(repo, 'graphs/release'), { recursive: true });
+  mkdirSync(join(repo, 'docker/harness'), { recursive: true });
+  const files: Record<string, string> = {
+    'package.json': '{"name":"gate-receipt-fixture","version":"1.0.1"}\n',
+    'bun.lock': 'lockfileVersion = 1\n',
+    'docker/harness/Dockerfile': 'FROM ubuntu:24.04\n',
+    'graphs/release/release-loop.yaml': 'graph_id: release-loop\nversion: 1\nentry_node: gate\n',
+    'graphs/release/recipes.yaml': 'gate:\n  command: gate\n  timeout_ms: 1000\n',
+    'src/a.ts': 'export const a = 1;\n',
+    'src/a.test.ts': 'test("a", () => expect(true).toBe(true));\n',
+    'src/b.test.ts': 'test("b", () => expect(true).toBe(true));\n',
+    'src/c.test.ts': 'test("c", () => expect(true).toBe(true));\n',
+  };
+  for (const [path, body] of Object.entries(files)) {
+    mkdirSync(dirname(join(repo, path)), { recursive: true });
+    writeFileSync(join(repo, path), body);
+  }
+  const git = (...args: string[]) => {
+    const run = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (run.status !== 0) throw new Error(run.stderr);
+    return run.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.name', 'Gate receipt test'); git('config', 'user.email', 'gate-receipt@example.invalid');
+  git('add', '.'); git('commit', '-qm', 'same-head gate receipt fixture');
+  const commit = git('rev-parse', 'HEAD');
+  const baseCommit = commit;
+  const version = '1.0.1';
+  const hardGateRunId = 'hard-12345678-1234-1234-1234-123456789abc';
+  const gateVersion = hardRehearsalGateVersion(version, hardGateRunId);
+  const graphRunId = 'same-head-rehearsal-receipt';
+  const pins = gateSourcePins(repo, commit)!;
+  const envFingerprint = gateEnvFingerprint(process.env);
+  const imageDigest = `sha256:${'f'.repeat(64)}`;
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint,
+    baseImageDigest: `sha256:${'a'.repeat(64)}` };
+  const gateDir = join(f.instanceRoot, 'release', gateVersion);
+  const cutLogs = join(gateDir, 'gate-logs/cut');
+  mkdirSync(cutLogs, { recursive: true });
+  writeFileSync(join(cutLogs, 'pod-0.json'), JSON.stringify({ commit, files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'],
+    imageDigest, runtimeIdentity, shardCount: 1, sweepId: 'sweep-one', attemptId: 'attempt-one' }));
+  const baselineReceipt = gateBaselineReceipt({ root: f.instanceRoot, version: gateVersion, commit, fullSweep: true,
+    graphPins: pins, envFingerprint });
+  expect(baselineReceipt).toMatchObject({ valid: true, files: 3, shards: 1 });
+  writeFileSync(join(gateDir, 'gate-failures.json'), JSON.stringify({ commit, failures: [], errors: [] }));
+  writeGateVerdictRecord(join(gateDir, 'gate-verdict.json'), { commit, outcome: 'ok', baselineReceipt });
+  const stampDir = join(f.instanceRoot, 'release', version, 'rehearsal');
+  mkdirSync(stampDir, { recursive: true });
+  writeFileSync(join(stampDir, 'hard-5h.json'), JSON.stringify({ version, step: 'hard-5h', outcome: 'ok', sha: commit,
+    endedAt: '2026-11-05T12:00:00.000Z', hardGateRunId,
+    hardGate: { outcome: 'ok', commit, executor: 'pod', introduced: [] } }));
+  const graphRunDir = join(f.instanceRoot, 'graph-runs/release-loop');
+  mkdirSync(graphRunDir, { recursive: true });
+  writeFileSync(join(graphRunDir, `${graphRunId}.json`), JSON.stringify({ graphId: 'release-loop', runId: graphRunId,
+    graphSnapshot: { graphSha: pins.graphSha, recipesSha: pins.recipeSha } }));
+  writeFileSync(join(f.instanceRoot, 'release/1.0.0/release.json'), JSON.stringify({ sourceCommit: baseCommit }));
+  writeFileSync(join(f.instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: baseCommit, failures: [], errors: [] }));
+  const currentIdentity = { ...runtimeIdentity, imageDigest };
+  const result = await judgeGate({ ...options(f.instanceRoot), commit, baselineCommit: baseCommit, repo, graphRunId,
+    pod: { pool: 'pool-a:1', shards: 1 } }, f.runner, () => imageDigest, () => currentIdentity);
+  expect(result).toMatchObject({ outcome: 'ok', rehearsalReceiptDecision: { action: 'reuse-zero' } });
+  expect(f.calls.filter((call) => /sweep @.*\/cut(?:\s|$)/.test(call))).toHaveLength(0);
+  expect(graphGateResult(result, true).summary).toContain('same-head clean rehearsal receipt verified; zero tests rerun');
+});
 const options = (instanceRoot: string) => ({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot, ledgerRoot: join(dirname(instanceRoot), 'machine-ledger') });
 
 test('B2 formal-receipt fallback is judgeGate-scoped to complete same-run evidence', async () => {
@@ -1935,6 +2003,13 @@ test('a leaked non-zero exit under a complete clean summary is read as clean, no
   const { instanceRoot, runner } = fake();
   runner.sweep = async () => ({ rc: 2, output: 'src/a.test.ts:\n 12 pass\n 0 fail\nRan 12 tests across 1 file. [8.54s]\n' });
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'ok', introduced: [] });
+});
+
+test('graph summary carries the reason a rehearsal receipt was rejected or reused', () => {
+  const result = ({ outcome: 'ok' as const, commit: 'a'.repeat(40), introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+    knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 0,
+    rehearsalReceiptDecision: { action: 'full-sweep' as const, reason: 'hard rehearsal receipt or current execution identity differs' } }) as Parameters<typeof graphGateResult>[0];
+  expect(graphGateResult(result, true).summary).toContain('예행 영수증 full-sweep · hard rehearsal receipt or current execution identity differs');
 });
 
 test('a non-zero exit with a failure in the summary is still incomplete when the exit is not 1', async () => {
@@ -4814,7 +4889,7 @@ test('WARM-GATE-EVIDENCE-PRECUT-CANARY: validates the entire history before boun
     warmHistory: [{ version: '1.0.1', commit: CUT, baselineCommit: BASE, warmShadow: 'bad' }, ...valid] });
 });
 
-test('WARM-GATE-EVIDENCE-PRECUT-CANARY: two real-match observations enable the same-cut gate and any mismatch stays off', async () => {
+test('GATE-WARM-EVIDENCE-RECORD-WIRING: removing the production gate writer leaves no measured rows', async () => {
   for (const scenario of [
     { mismatch: false, minimum: 2, expected: { live: true, reason: 'live' } },
     { mismatch: true, minimum: 2, expected: { live: false, reason: 'recent-mismatch' } },
@@ -4864,6 +4939,8 @@ test('WARM-GATE-EVIDENCE-PRECUT-CANARY: two real-match observations enable the s
     expect(call).toBe(2);
     expect(result.decision).toMatchObject(scenario.expected);
     const saved = JSON.parse(readFileSync(historyPath, 'utf8'));
+    // This assertion exercises the production record call in gate-node's completed canary path;
+    // deleting/disconnecting that call must make the test fail, even if the decision is unchanged.
     const journal = readWarmReuseEvidence(join(instanceRoot, 'warm-reuse-evidence.jsonl'),
       { consumer: 'gate-recheck', head: CUT, main: CUT });
     expect(journal).toHaveLength(2);
@@ -5011,7 +5088,7 @@ test('gate warm provider config discovery honors env, config, and the private si
     writeFileSync(defaultPath, '{}', { mode: 0o600 });
     expect(resolveWarmProviderConfig({ pod: {} })).toEqual({ path: defaultPath, source: 'default' });
     rmSync(defaultPath);
-    expect(resolveWarmProviderConfig({ pod: {} })).toBeUndefined();
+    expect(resolveWarmProviderConfig({ pod: {} })).toEqual({ path: defaultPath, source: 'default' });
   } finally {
     restoreEnv();
     resetUserConfig();
@@ -5019,12 +5096,16 @@ test('gate warm provider config discovery honors env, config, and the private si
   }
 });
 
-test('gate warm replay falls back to a fresh job when provider config is absent', async () => {
+test('gate warm replay names the host-local provider config setup when it is missing', async () => {
   const previousEnv = process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG;
   const root = mkdtempSync(join(tmpdir(), 'gate-warm-config-missing-'));
   scratch.push(root);
   setElanousConfigDir(root);
   delete process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG;
+  const events: Array<{ event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+    if (category === 'pod.warm.control-forward') events.push({ event, data });
+  }) as typeof debug.log);
   try {
     const hooks = withWarmGateHooks({ commit: CUT, version: '1.0.1', pod: { pool: 'pool-test' } },
       { pod: { warmPoolProfile: 'gate' } });
@@ -5032,7 +5113,10 @@ test('gate warm replay falls back to a fresh job when provider config is absent'
       cutSha: CUT, deadlineAt: Date.now() + 1_000, files: ['src/a.test.ts'], envProfile: 'gate' });
     expect(replay.command).toBeNull();
     expect(replay.transport).toMatchObject({ status: 'fallback', reason: 'control-unavailable' });
+    expect(events).toContainEqual({ event: 'unavailable', data: expect.objectContaining({ reason: 'provider-config-unavailable',
+      expectedFile: 'warm-pod-provider.json', setup: expect.stringContaining('scripts/warm-pool-provider-config.ts') }) });
   } finally {
+    log.mockRestore();
     if (previousEnv === undefined) delete process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG;
     else process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG = previousEnv;
     resetUserConfig();

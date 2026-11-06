@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { loadFreshCodexAuthState } from './codex.js';
 import { debug } from '../debug/log.js';
 import '../llm.js';
-import { CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { collectCodexMirrorCredentials, CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 
 const oldEnv = {
   xdg: process.env.XDG_CONFIG_HOME,
@@ -210,5 +210,38 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
     writeMirror(path, jwt(Math.floor(Date.now() / 1000 - 1)), Date.now() - 1000);
     expectReason('expiry');
     eventLog.mockRestore();
+  });
+});
+
+describe('collectCodexMirrorCredentials (REMOTE-MIRROR-SKIP-UNUSABLE 11-05)', () => {
+  class Expiring extends Error { constructor(readonly account: string, readonly hoursLeft: number) { super(`openai-codex:${account} expiring`); } }
+
+  test('an expiring default does not drop the fresh team and third mirrors', () => {
+    const logs: unknown[][] = [];
+    const spy = spyOn(debug, 'log').mockImplementation((...args: unknown[]) => { logs.push(args); });
+    try {
+      const { mirrors, skipped } = collectCodexMirrorCredentials(['default', 'team', 'third'], (name) => {
+        if (name === 'default') throw new Expiring(name, 0.4);
+        return { elanousAuth: `e-${name}`, codexAuth: `c-${name}` };
+      });
+      expect(mirrors.map((m) => m.account)).toEqual(['team', 'third']);
+      expect(mirrors[0]).toEqual({ account: 'team', elanousAuth: 'e-team', codexAuth: 'c-team' });
+      expect(skipped).toEqual([{ account: 'default', reason: 'access-expiring' }]);
+      expect(logs.some((a) => a[0] === 'llm.codex' && a[1] === 'owner-mirror-push-skipped')).toBe(true);
+    } finally { spy.mockRestore(); }
+  });
+
+  test('other credential errors are skipped as credential-unavailable', () => {
+    const { mirrors, skipped } = collectCodexMirrorCredentials(['team', 'third'], (name) => {
+      if (name === 'team') throw new Error('auth_mode must be explicitly chatgpt');
+      return { v: name };
+    });
+    expect(mirrors).toEqual([{ v: 'third', account: 'third' }]);
+    expect(skipped).toEqual([{ account: 'team', reason: 'credential-unavailable' }]);
+  });
+
+  test('nothing shippable is still an error that names each reason', () => {
+    expect(() => collectCodexMirrorCredentials(['default'], (name) => { throw new Expiring(name, 1); }))
+      .toThrow('default=access-expiring');
   });
 });

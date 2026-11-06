@@ -27,9 +27,6 @@ import * as tuiOriginal from '../tui.js';
 import * as localChatTurnOriginal from '../tui-client/local-chat-turn.js';
 import * as composerOriginal from './input/composer.js';
 import * as backgroundJobStatusOriginal from './chat/background-job-status.js';
-import * as missionToolOriginal from '../autopilot/mission-tool.js';
-import * as intentGateOriginal from '../intent-gate/gate.js';
-import * as missionWatchOriginal from '../autopilot/mission-tui-watch.js';
 import {
   _resetDefaultControlSignalObserverForTesting,
   defaultControlSignalObserver,
@@ -47,9 +44,6 @@ const restoreTui = { ...tuiOriginal };
 const restoreLocalChatTurn = { ...localChatTurnOriginal };
 const restoreComposer = { ...composerOriginal };
 const restoreBackgroundJobStatus = { ...backgroundJobStatusOriginal };
-const restoreMissionTool = { ...missionToolOriginal };
-const restoreIntentGate = { ...intentGateOriginal };
-const restoreMissionWatch = { ...missionWatchOriginal };
 
 // readKey 가 내보낼 키 열 — 제출 한 턴 뒤 Ctrl+Q 로 TUI 를 닫는다.
 const keys: Key[] = [];
@@ -57,13 +51,10 @@ const submittedInputs: string[] = [];
 const readKeyTicks: number[] = [];
 type FakeInterval = { callback: () => void; delayMs: number; active: boolean };
 const fakeIntervals: FakeInterval[] = [];
-const readySnapshots: unknown[] = [];
-const runSnapshots: unknown[] = [];
 const timerSnapshots: boolean[][] = [];
 const loopEvents: Array<{ event: string; data: unknown }> = [];
 // 위임한 턴이 실행된 세션 키 — runLocalChatTurn 목격.
 const turnsSeen: string[] = [];
-const missionCalls: unknown[] = [];
 const transcript: string[] = [];
 let duringTurnHook: (() => void | Promise<void>) | null = null;
 let mockLocalChatTurnResult: { goalComplete?: boolean; goalStopReason?: string } | undefined;
@@ -71,37 +62,6 @@ let mockBackgroundLine: string | null = null;
 let selfHealthListener: ((snapshot: import('../tui/chat/self-health-status.js').NextTuiSelfHealthSnapshot | null) => void) | null = null;
 let nextSidetabHandler: NextSidetabHandler | null = null;
 const cliStderrEvents: Array<{ data: { source: string; exitCode: number; text: string; rawBase64: string; byteLength: number } }> = [];
-
-mock.module('../intent-gate/gate.js', () => ({
-  submitIntent: async () => ({ route: 'mission', goal: '관찰 테스트', executionModel: 'immediate', tier: 'light', heavy: false, missionId: 'apm_ready' }),
-}));
-
-mock.module('../autopilot/mission-tui-watch.js', () => ({
-  takeMissionReadySnapshot: (id: string) => { readySnapshots.push(id); return { exists: true, goal: '관찰 테스트', status: 'proposed', description: '', phases: [], executionModel: 'immediate', tier: 'light' }; },
-  createMissionWatchState: () => ({}),
-  advanceMissionWatch: (state: unknown) => ({ state, events: [{ kind: 'phases', count: 2 }], done: false }),
-  MISSION_WATCH_INTERVAL_MS: 3_000,
-  takeMissionRunSnapshot: (id: string) => { runSnapshots.push(id); return { exists: true, goal: '관찰 테스트', phases: [], runLockActive: false }; },
-  createMissionRunWatchState: () => ({}),
-  advanceMissionRunWatch: (state: unknown) => ({ state, events: [{ kind: 'progress', phase: { index: 0 }, total: 1, note: '실제 관찰 tick' }], done: false }),
-  MISSION_RUN_WATCH_INTERVAL_MS: 5_000,
-  renderMissionRunPhaseLine: () => 'phase',
-  renderMissionRunReportLines: () => ['report'],
-  renderMissionRunFooter: () => 'footer',
-  missionDescriptionDigest: () => [],
-  renderMissionPhaseBoardLines: () => [],
-}));
-
-mock.module('../autopilot/mission-tool.js', () => ({
-  dispatchAutopilotMissions: async (input: unknown) => {
-    missionCalls.push(input);
-    const request = input as { action?: string };
-    const missions = request.action === 'list'
-      ? Array.from({ length: 16 }, (_, index) => ({ id: `apm_list_${index}`, status: 'proposed', source: 'test', goal: `미션 ${index}` }))
-      : [];
-    return { count: missions.length, missions, note: missions.length ? undefined : '미션 없음' };
-  },
-}));
 
 mock.module('../tui.js', () => ({
   initTui: () => {},
@@ -203,11 +163,8 @@ afterEach(() => {
   readKeyTicks.length = 0;
   fakeIntervals.length = 0;
   timerSnapshots.length = 0;
-  readySnapshots.length = 0;
-  runSnapshots.length = 0;
   loopEvents.length = 0;
   turnsSeen.length = 0;
-  missionCalls.length = 0;
   transcript.length = 0;
   duringTurnHook = null;
   mockLocalChatTurnResult = undefined;
@@ -228,9 +185,6 @@ afterAll(() => {
   mock.module('../tui-client/local-chat-turn.js', () => restoreLocalChatTurn);
   mock.module('./input/composer.js', () => restoreComposer);
   mock.module('./chat/background-job-status.js', () => restoreBackgroundJobStatus);
-  mock.module('../autopilot/mission-tool.js', () => restoreMissionTool);
-  mock.module('../intent-gate/gate.js', () => restoreIntentGate);
-  mock.module('../autopilot/mission-tui-watch.js', () => restoreMissionWatch);
 });
 
 describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
@@ -531,39 +485,6 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     }
   }, 10_000);
 
-  test('Next 입력 경로가 /mission help·잘못된 하위명령과 read-only list를 dispatcher에 전달한다', async () => {
-    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
-    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
-    const output = process.stdout.write;
-    process.stdout.write = ((chunk: string | Uint8Array) => {
-      transcript.push(String(chunk));
-      return true;
-    }) as typeof process.stdout.write;
-    keys.push(
-      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
-      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
-      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
-      { name: 'pageup', ctrl: false, shift: false, raw: '' },
-      { name: 'escape', ctrl: false, shift: false, raw: '\\x1b' },
-      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
-      { name: 'q', ctrl: true, shift: false, raw: '\\x11' },
-    );
-    submittedInputs.push('/mission', '/mission not-a-command', '/mission list', '/mission list');
-    try {
-      await showNextTui({ resumeSessionId: createSession().id });
-      const rendered = transcript.join('');
-      const finalFrame = transcript.at(-1) ?? '';
-      expect(rendered).toContain('usage: /mission [list [status]]');
-      expect(rendered).toContain('unknown subcommand: not-a-command');
-      expect(finalFrame).toContain('apm_list_15');
-      expect(missionCalls.filter((call) => JSON.stringify(call) === JSON.stringify({ action: 'list' }))).toHaveLength(3);
-      expect(missionCalls.some((call) => JSON.stringify(call) === JSON.stringify({ action: 'list' }))).toBe(true);
-    } finally {
-      process.stdout.write = output;
-    }
-  }, 10_000);
-
   test('Next /term 입력은 가짜 세션 레지스트리로 help·list·status만 읽고 mutation은 거부한다', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
@@ -631,42 +552,6 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       expect(transcript.join('')).toContain('Ctrl+\\ 사이드탭 토글');
     } finally {
       process.stdout.write = output;
-    }
-  }, 10_000);
-
-  test('Next 입력의 new/watch가 ready·run 관찰 snapshot을 실제 폴링한다', async () => {
-    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
-    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
-    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
-    const originalSetInterval = globalThis.setInterval;
-    const originalClearInterval = globalThis.clearInterval;
-    const timerHost = globalThis as unknown as { setInterval: typeof globalThis.setInterval; clearInterval: typeof globalThis.clearInterval };
-    timerHost.setInterval = ((callback: () => void, delayMs = 0) => {
-      const timer: FakeInterval = { callback, delayMs, active: true };
-      fakeIntervals.push(timer);
-      if (delayMs === 3_000 || delayMs === 5_000) queueMicrotask(callback);
-      return timer as unknown as ReturnType<typeof setInterval>;
-    }) as typeof timerHost.setInterval;
-    timerHost.clearInterval = ((handle: ReturnType<typeof setInterval>) => {
-      (handle as unknown as FakeInterval).active = false;
-    }) as typeof timerHost.clearInterval;
-    keys.push(
-      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
-      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
-      { name: 'q', ctrl: true, shift: false, raw: '\\x11' },
-    );
-    submittedInputs.push('/mission new goal', '/mission watch apm_run');
-    readKeyTicks.push(0, 0, 1);
-    try {
-      await showNextTui({ resumeSessionId: createSession().id });
-      await Bun.sleep(10);
-      expect(readySnapshots.filter((id) => id === 'apm_ready').length).toBeGreaterThan(1);
-      expect(runSnapshots.filter((id) => id === 'apm_run').length).toBeGreaterThan(1);
-      expect(fakeIntervals.some((timer) => timer.delayMs === 3_000)).toBe(true);
-      expect(fakeIntervals.some((timer) => timer.delayMs === 5_000)).toBe(true);
-    } finally {
-      timerHost.setInterval = originalSetInterval;
-      timerHost.clearInterval = originalClearInterval;
     }
   }, 10_000);
 

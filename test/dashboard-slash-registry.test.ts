@@ -46,9 +46,11 @@ const {
 
 test('essential slashes remain registered while VW slashes are absent', () => {
   const names = buildDashboardSlashRegistry().names();
-  for (const command of ['help', 'session', 'model', 'mission', 'quit']) {
+  for (const command of ['help', 'session', 'model', 'quit']) {
     expect(names).toContain(command);
   }
+  // MISSION-FABRIC-REMOVAL(대표 11-05) — /mission 은 지웠다.
+  expect(names).not.toContain('mission');
   for (const command of ['acp-vw', 'claude-vw', 'pty-pane', 'pty-view', 'fullscreen', 'fs', 'view', 'window']) {
     expect(names).not.toContain(command);
     expect(displayedSlashCommandNames()).not.toContain(command);
@@ -1582,7 +1584,7 @@ describe('B-1.h · session/context cluster', () => {
     expect(ctx.chatLines.length).toBeGreaterThanOrEqual(1);
   });
 
-  test('retired rich commands including /scratch are absent; /help, /session and /mission remain', async () => {
+  test('retired rich commands including /scratch are absent; /help and /session remain (/mission 은 11-05 제거)', async () => {
     const reg = buildDashboardSlashRegistry();
     const { ctx } = makeFakeCtx();
     const names = new Set(reg.names());
@@ -1592,7 +1594,8 @@ describe('B-1.h · session/context cluster', () => {
     }
     expect(displayedSlashCommandNames()).not.toContain('scratch');
     expect(displayedSlashCommandNames()).not.toContain('sc');
-    for (const command of ['help', 'session', 'mission']) expect(names.has(command)).toBe(true);
+    for (const command of ['help', 'session']) expect(names.has(command)).toBe(true);
+    expect(names.has('mission')).toBe(false);
     expect((await reg.dispatch('help', [], ctx)).kind).toBe('continue');
   });
 
@@ -1614,18 +1617,10 @@ describe('B-1.h · session/context cluster', () => {
       expect(displayed.has(command), command).toBe(false);
       expect((await reg.dispatch(command, [], ctx)).kind, command).toBe('unregistered');
     }
-    for (const command of ['help', 'session', 'model', 'theme', 'mission', 'quit']) {
+    for (const command of ['help', 'session', 'model', 'theme', 'quit']) {
       expect(names.has(command), command).toBe(true);
     }
     expect(names.has('scratch')).toBe(false);
-  });
-
-  test('mission 알 수 없는 서브커맨드 → usage (DB 무접촉 경로)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx } = makeFakeCtx();
-    const r = await reg.dispatch('mission', ['bogus'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines.join('\n')).toContain('usage: /mission');
   });
 
   test('resume: 인자 없음 → 세션 픽커 오픈 (TUI 부활 S-a)', async () => {

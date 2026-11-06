@@ -35,6 +35,11 @@ function fakeRg(lines: string[]): typeof Bun.spawnSync {
   return (() => ({ stdout: new TextEncoder().encode(lines.join('\n')) })) as unknown as typeof Bun.spawnSync;
 }
 
+function ignoredPatterns(command: string[]): string[] {
+  return command.flatMap((arg, index) => arg === '--path-ignore-patterns' && command[index + 1]
+    ? [command[index + 1]!] : []);
+}
+
 describe('CDP 레인 파생', () => {
   test('rg 가 낸 시험 파일을 그대로 «정렬해» 돌려준다', () => {
     const got = deriveCdpTestPatterns({
@@ -82,16 +87,22 @@ describe('CDP 레인 — 호출부', () => {
   test('파생한 파일마다 --path-ignore-patterns 한 쌍이 bun test 에 간다', async () => {
     const cmd = await captureCmd(['--dots'], ['test/a.test.ts', 'test/b.test.ts']);
     expect(cmd.slice(0, 2)).toEqual(['bun', 'test']);
-    expect(cmd.filter((arg) => arg === '--path-ignore-patterns').length).toBe(2);
-    expect(cmd).toContain('test/a.test.ts');
-    expect(cmd).toContain('test/b.test.ts');
+    const ignored = ignoredPatterns(cmd);
+    expect(cmd.filter((arg) => arg === '--path-ignore-patterns').length).toBe(ignored.length);
+    expect(new Set(ignored).size).toBe(ignored.length);
+    expect(ignored).toContain('test/a.test.ts');
+    expect(ignored).toContain('test/b.test.ts');
     expect(cmd[cmd.length - 1]).toBe('--dots');
   });
 
   /** ⛔ 음성 대조 — 파생이 비면 «아무것도» 안 뺀다(조용히 전부를 빼거나 빈 패턴을 넣지 않는다). */
-  test('파생이 0개면 제외 인자가 하나도 안 붙는다', async () => {
+  test('파생이 0개면 CDP 제외 인자가 안 붙고 빈 패턴도 없다', async () => {
     const cmd = await captureCmd(['--dots'], []);
-    expect(cmd).toEqual(['bun', 'test', '--dots']);
+    expect(cmd.slice(0, 2)).toEqual(['bun', 'test']);
+    expect(cmd).not.toContain('test/a.test.ts');
+    expect(cmd).not.toContain('test/b.test.ts');
+    expect(ignoredPatterns(cmd).every(Boolean)).toBe(true);
+    expect(cmd[cmd.length - 1]).toBe('--dots');
   });
 
   /** ⭐ 사람이 «경로»를 직접 준 창은 「이것만 돌려라」다 — 그때는 빼지 않는다. */

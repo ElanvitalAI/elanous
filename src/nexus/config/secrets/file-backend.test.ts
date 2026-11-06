@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../../elanous-config-dir.js';
-import { fileBackend, writeSecretsFileRaw } from './file-backend.js';
+import { fileBackend, importSecretsFileRaw, writeSecretsFileRaw } from './file-backend.js';
 
 if (process.env.ELANOUS_SECRETS_RACE_WORKER === '1') {
   setElanousConfigDir(process.env.ELANOUS_SECRETS_RACE_DIR!);
@@ -48,6 +48,19 @@ test('set and delete retain other keys and keep one previous-file backup', async
   expect(readFileSync(`${path}.bak`, 'utf8')).toBe(previous);
   expect(JSON.parse(readFileSync(path, 'utf8')).secrets).toEqual({ retained: 'old' });
   expect(readdirSync(dir).sort()).toEqual(['secrets.json', 'secrets.json.bak']);
+});
+
+test('batch import checks collisions under the file lock and pins overwrite confirmation to exact names', () => {
+  writeSecretsFileRaw({ version: 1, secrets: { exa: 'fake-existing-value' } });
+  expect(importSecretsFileRaw({ exa: 'fake-new-value', tavily: 'fake-tavily-value' }, false)).toEqual({
+    imported: false, conflicts: ['exa'], changedSinceConfirmation: false,
+  });
+  expect(importSecretsFileRaw({ exa: 'fake-new-value', tavily: 'fake-tavily-value' }, true, [])).toEqual({
+    imported: false, conflicts: ['exa'], changedSinceConfirmation: true,
+  });
+  expect(importSecretsFileRaw({ exa: 'fake-new-value', tavily: 'fake-tavily-value' }, true, ['exa'])).toEqual({
+    imported: true, conflicts: ['exa'], changedSinceConfirmation: false,
+  });
 });
 
 test('simultaneously released processes serialize writes to the same secrets file', async () => {

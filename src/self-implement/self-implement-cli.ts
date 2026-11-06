@@ -290,8 +290,24 @@ export async function runSelfImplementCliCommand(
           }
         : undefined;
 
-      const reasonRepairEnabled = getUserConfig().tools.selfImplement.supervisor?.reasonRepair === true
-        && (deps.reasonRepairExecutionAvailable ?? true);
+      const reasonRepairConfigured = getUserConfig().tools.selfImplement.supervisor?.reasonRepair === true;
+      const hasReasonRepairExecutor = deps.reasonRepairExecutionAvailable ?? true;
+      const reasonRepairEnabled = reasonRepairConfigured && hasReasonRepairExecutor;
+      const reasonRepairSkipReason = !reasonRepairConfigured ? 'disabled'
+        : !hasReasonRepairExecutor ? 'missing-executor' : undefined;
+      try {
+        debug.log('self-dev.supervisor', 'reason-repair-capability', {
+          runId: result.runId ?? opts.runId ?? null,
+          entryPoint: 'self-implement-cli',
+          taskCardId: process.env.ELANOUS_TASK_CARD_ID?.trim() || null,
+          configured: reasonRepairConfigured,
+          hasExecutePiece: hasReasonRepairExecutor,
+          enabled: reasonRepairEnabled,
+          ...(reasonRepairSkipReason === undefined ? {} : { skipReason: reasonRepairSkipReason }),
+          executionKind: 'self-implement-reroute',
+          surface: 'single',
+        });
+      } catch { /* fail-open */ }
       const initialJob = singleRunAsJobResult(feature, result, reasonRepairEnabled);
       // NEEDS-HUMAN-REASON-REPAIR — 사유별 수복 골을 «실행하는» 경로인가.
       //   ⛔ 아래 rerun 이 invocation.repairGoals[taskId] 를 spec.input.text 로 그대로 실행하므로 «그렇다».
@@ -304,6 +320,7 @@ export async function runSelfImplementCliCommand(
         ...(deps.sweepPendingMerges ? { sweepPendingMerges: deps.sweepPendingMerges } : {}),
         repairGoalExecution,
         needsHumanReasonRepairExecution: reasonRepairEnabled,
+        ...(reasonRepairSkipReason === undefined ? {} : { needsHumanReasonRepairSkipReason: reasonRepairSkipReason }),
         limits,
         ...(deliverableEye ? { observeDeliverables: deliverableEye } : {}),
         ...(opts.supervise.onDecision ? { onDecision: opts.supervise.onDecision } : {}),

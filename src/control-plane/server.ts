@@ -133,7 +133,7 @@ export function startControlServer(opts: ControlServerOptions = {}): {
         const leaseRenewal = /^\/v1\/leases\/port\/([^/]+)\/heartbeat$/.exec(path);
         const workerRegister = path === '/v1/workers/pod' && method === 'POST';
         const workerAcquire = path === '/v1/leases/pod-worker' && method === 'POST';
-        const workerTransition = /^\/v1\/leases\/pod-worker\/([^/]+)\/(renew|release|sanitize|quarantine|timeout|reap)$/.exec(path);
+        const workerTransition = /^\/v1\/leases\/pod-worker\/([^/]+)\/(renew|release|sanitize|quarantine|timeout|reap|expire|retire)$/.exec(path);
         if (!resourcePath && !registerPath && !leaseRequest && !workerRegister && !workerAcquire && !(workerTransition && method === 'POST') && !(leaseDeletion && method === 'DELETE') && !(leaseRenewal && method === 'POST') && !(heartbeat && method === 'POST') && !(deletion && method === 'DELETE')) {
           return json({ error: 'not-found' }, 404);
         }
@@ -201,7 +201,21 @@ export function startControlServer(opts: ControlServerOptions = {}): {
           if (workerTransition) {
             const workerId = decodeURIComponent(workerTransition[1]!);
             if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(workerId)) throw new ResourceLedgerError(400, 'invalid-worker-id');
-            const action = workerTransition[2] as 'renew' | 'release' | 'sanitize' | 'quarantine' | 'timeout' | 'reap';
+            const action = workerTransition[2] as 'renew' | 'release' | 'sanitize' | 'quarantine' | 'timeout' | 'reap' | 'expire' | 'retire';
+            if (action === 'retire') {
+              if (!machine) throw new ResourceLedgerError(403, 'worker-retire-host-required');
+              const body = podWorkerBody(await req.json());
+              if (typeof body.podUid !== 'string' || !body.podUid.trim()) throw new ResourceLedgerError(400, 'invalid-pod-worker-retire');
+              if (body.reason !== undefined && body.reason !== 'host-drained' && body.reason !== 'runtime-contract-mismatch')
+                throw new ResourceLedgerError(400, 'invalid-worker-retire-reason');
+              const id = `pod-worker-lease:${workerId}`;
+              requireTarget(id);
+              const stale = await currentWorkerPrimary();
+              if (stale) return stale;
+              return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
+                () => ledger.retireIdlePodWorker(id, { machine, podUid: body.podUid as string,
+                  ...(body.reason ? { reason: body.reason as 'host-drained' | 'runtime-contract-mismatch' } : {}) })));
+            }
             if (action === 'reap') {
               if (!machine) throw new ResourceLedgerError(403, 'worker-reap-host-required');
               const body = podWorkerBody(await req.json());
@@ -213,6 +227,22 @@ export function startControlServer(opts: ControlServerOptions = {}): {
               if (stale) return stale;
               return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
                 () => ledger.reservePodWorkerReap(id, { machine, podUid })));
+            }
+            if (action === 'expire') {
+              if (!machine) throw new ResourceLedgerError(403, 'worker-expire-host-required');
+              const body = podWorkerBody(await req.json());
+              const { podUid, expectedObservedAt, expectedExpiresAtMs } = body;
+              if (typeof podUid !== 'string' || !podUid.trim()
+                || !Number.isSafeInteger(expectedObservedAt) || (expectedObservedAt as number) < 0
+                || !Number.isSafeInteger(expectedExpiresAtMs) || (expectedExpiresAtMs as number) < 1)
+                throw new ResourceLedgerError(400, 'invalid-pod-worker-expire');
+              const id = `pod-worker-lease:${workerId}`;
+              requireTarget(id);
+              const stale = await currentWorkerPrimary();
+              if (stale) return stale;
+              return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
+                () => ledger.expireIdlePodWorker(id, { machine, podUid, expectedObservedAt: expectedObservedAt as number,
+                  expectedExpiresAtMs: expectedExpiresAtMs as number })));
             }
             if (action === 'timeout') {
               if (scope !== 'member') throw new ResourceLedgerError(403, 'worker-timeout-scope');

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
@@ -10,13 +10,41 @@ import dnsPromises from 'node:dns/promises';
 import childProcess from 'node:child_process';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { parseSimChaos, parseSimWorld as parseSimWorldSchema, parseSimWorldExpectation, parseSimWorldInjections, parseSimWorldProcesses, type SimChaosFault, type SimRecoveryExpectation, type SimWorldApp, type SimWorldInjection, type SimWorldProcess } from './world-schema.js';
 import { createFakeGh } from './fake-gh.js';
 import { createFakeKubectl } from './fake-kubectl.js';
+import { createFakeSsh } from './fake-ssh.js';
+import { createFakeFleetDevice } from './fake-fleet.js';
+import { createFakeCloudVm } from './fake-cloud-vm.js';
+import { createFakePsDevice, type FakePsDevice } from './fake-ps.js';
 import { testFakeLlmEnabled, testFakeLlmResponse } from './fake-llm.js';
-import { withSimClock } from './fake-clock.js';
+import { withSimClock, type SimClock } from './fake-clock.js';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
 import { getTestStateRoot } from '../nexus/paths.js';
+import { injectAnyEvent, type EventMonkeyDebugRow } from './event-monkey.js';
+import { loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
+import type { HqMoveFault } from './hq-move-sim.js';
+import { isTrustedPromotionPythonBody } from '../hq/promote.js';
+
+// Capture before runInWorld's process sandbox is installed; tests can execute worlds concurrently.
+const spawnSyncForPromotion = childProcess.spawnSync;
+import { createFakeAppHost } from './fake-app-host.js';
+import { runWorldChaosSchedule, type WorldChaosAction, type WorldChaosRun, type WorldChaosScheduledEvent } from './world-chaos-runtime.js';
+import { createWorldHostChaosController } from './world-host-chaos.js';
+import { createSimWorld, destroySimWorld, listSimWorlds } from './world-store.js';
+import { applyDeviceFidelity } from './device-fidelity.js';
+import { recordSimWorldCoverage } from './sim-coverage.js';
+import { createPodReuseResidueFaultFixture } from './fault-pod-reuse-residue.js';
+import { runWarmSiReuseSimulation } from './warm-si-reuse-sim.js';
+import { podSelfImplementSpawn, type SiWarmChildAttempt } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from '../task-orchestrator/surfaces/pod-si-warm-protocol.js';
+import type { ChildPodReuseOperations } from '../task-orchestrator/surfaces/pod-child-reuse.js';
+
+/** Catalog world-event IDs map to the concrete simulation input handled by this runner. */
+const WORLD_EVENT_TO_SCENARIO_INPUT: Readonly<Record<string, string>> = {
+  'EV-0042': 'dead-pid-lock',
+} as const;
 
 export interface SimWorldSpec {
   world: string;
@@ -27,7 +55,12 @@ export interface SimWorldSpec {
   providers?: Record<string, Record<string, unknown>>;
   github?: { repo: string; openPRs: number };
   seats?: string[];
-  events: Array<{ at: string; id: string }>;
+  apps?: SimWorldApp[];
+  processes?: SimWorldProcess[];
+  events: Array<{ at: string; id: string; appAction?: 'deploy' | 'rollback'; slug?: string; version?: string }>;
+  injections?: SimWorldInjection[];
+  chaos?: SimChaosFault[];
+  expect?: { recovers: SimRecoveryExpectation };
 }
 
 export interface SimNetworkEvent { url: string; blocked: true }
@@ -38,7 +71,10 @@ export interface SimWorld {
   readonly networkEvents: SimNetworkEvent[];
 }
 
-export interface AssembledWorld { devices: Map<string, unknown> }
+export interface AssembledWorld { devices: Map<string, unknown>; appHost?: ReturnType<typeof createFakeAppHost> }
+export interface WorldExecutionRuntime {
+  runPromotionPython(source: string, home: string, env: Record<string, string>): { status: number | null; stdout: string; stderr: string };
+}
 export interface SimMailMessage { readonly from: string; readonly to: string; readonly kind: string; readonly body: string; readonly acked: boolean }
 export interface SimMailbox {
   post(message: Omit<SimMailMessage, 'acked'>): number;
@@ -49,9 +85,21 @@ export interface WorldScenarioResult {
   pass: boolean;
   observations: Array<{ event: string; verdict: string }>;
   devices: string[];
+  recovery?: WorldChaosRun;
+  verdict?: 'green' | 'yellow' | 'red';
+  fidelity?: Array<{ deviceId: string; verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] }>;
 }
 
 const WORLD_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+function worldOffsetMs(value: string): number {
+  const match = /^\+(0|[1-9]\d*)(ms|s|m|h)$/.exec(value);
+  if (!match) throw new Error(`invalid relative world offset: ${value}`);
+  const scale = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 } as const;
+  const result = Number(match[1]) * scale[match[2] as keyof typeof scale];
+  if (!Number.isSafeInteger(result)) throw new Error(`relative world offset is too large: ${value}`);
+  return result;
+}
 let activeNetworkWorld: SimWorld | undefined;
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -81,6 +129,9 @@ export function createSimMailbox(): SimMailbox {
 
 export function parseSimWorld(source: string): SimWorldSpec {
   const value = object(parseYaml(source), 'world');
+  const hasAppEvents = Array.isArray(value.events) && value.events.some((event) => !!event && typeof event === 'object' && 'appAction' in event);
+  const appWorld = value.apps !== undefined || hasAppEvents ? parseSimWorldSchema(source) : undefined;
+  const apps = appWorld?.apps;
   const id = value.world;
   if (typeof id !== 'string' || !WORLD_ID.test(id)) throw new Error('world.world must be a lowercase world id');
   const seed = value.seed ?? 0;
@@ -106,8 +157,8 @@ export function parseSimWorld(source: string): SimWorldSpec {
       if (host.arch !== 'arm64' && host.arch !== 'amd64') throw new Error(`world.hosts[${index}].arch must be arm64 or amd64`);
       if (!Number.isSafeInteger(host.cpu) || Number(host.cpu) <= 0) throw new Error(`world.hosts[${index}].cpu must be a positive integer`);
       if (!Array.isArray(host.pools) || host.pools.some((pool) => typeof pool !== 'string' || !pool.trim())) throw new Error(`world.hosts[${index}].pools must be a list of names`);
-      if (typeof host.egress !== 'boolean') throw new Error(`world.hosts[${index}].egress must be boolean`);
-      return { name: host.name, arch: host.arch, cpu: Number(host.cpu), pools: host.pools as string[], egress: host.egress };
+      if (host.egress !== undefined && typeof host.egress !== 'boolean') throw new Error(`world.hosts[${index}].egress must be boolean`);
+      return { name: host.name, arch: host.arch, cpu: Number(host.cpu), pools: host.pools as string[], egress: host.egress === true };
     });
     if (new Set(hosts.map((host) => host.name)).size !== hosts.length) throw new Error('world.hosts cannot contain duplicate names');
   }
@@ -129,7 +180,7 @@ export function parseSimWorld(source: string): SimWorldSpec {
     seats = [...new Set(value.seats as string[])];
     if (seats.length !== value.seats.length) throw new Error('world.seats cannot contain duplicate names');
   }
-  const events = value.events ?? [];
+  const events = appWorld?.events ?? value.events ?? [];
   if (!Array.isArray(events) || events.some((event) => {
     const row = event as Record<string, unknown> | null;
     return !row || typeof row.at !== 'string' || typeof row.id !== 'string';
@@ -137,9 +188,11 @@ export function parseSimWorld(source: string): SimWorldSpec {
   const devices = [...new Set([
     ...(requestedDevices as string[]),
     ...(hosts?.length ? ['fake-kubectl'] : []),
+    ...((Array.isArray(value.processes) && value.processes.length > 0) || (Array.isArray(value.chaos) && value.chaos.length > 0) ? ['fake-ps'] : []),
     ...(providers && Object.keys(providers).length ? ['fake-llm'] : []),
     ...(github ? ['fake-gh'] : []),
     ...(clock ? ['fake-clock'] : []),
+    ...(apps?.length ? ['fake-clock'] : []),
     ...(seats?.length ? ['mail'] : []),
   ])];
   if (!devices.length) throw new Error('world must declare at least one mock device or device-backed setting');
@@ -148,12 +201,23 @@ export function parseSimWorld(source: string): SimWorldSpec {
     const id = requestedName === 'fake-gh' ? 'fake-github' : requestedName === 'mail' ? 'sim-mailbox' : requestedName;
     if (!catalog.devices.some((candidate) => candidate.id === id)) throw new Error(`unknown mock device: ${requestedName}`);
   }
-  const spec: SimWorldSpec = { world: id, seed: Number(seed), devices, events: events as SimWorldSpec['events'] };
+  const processes = parseSimWorldProcesses(value.processes, hosts);
+  const chaos = parseSimChaos(value.chaos, processes, hosts);
+  const injections = parseSimWorldInjections(value.injections);
+  const expect = parseSimWorldExpectation(value.expect);
+  if (expect && !chaos?.length) throw new Error('world.expect.recovers requires world.chaos');
+  if (expect && !injections?.some((injection) => injection.ledger?.length)) {
+    throw new Error('world.expect.recovers requires injected ledger rows to measure losses');
+  }
+  const spec: SimWorldSpec = { world: id, seed: Number(seed), devices, events: events as SimWorldSpec['events'],
+    ...(injections ? { injections: [...injections] } : {}), ...(processes ? { processes: [...processes] } : {}),
+    ...(chaos ? { chaos: [...chaos] } : {}), ...(expect ? { expect } : {}) };
   if (clock) spec.clock = clock;
   if (hosts) spec.hosts = hosts;
   if (providers) spec.providers = providers;
   if (github) spec.github = github;
   if (seats) spec.seats = seats;
+  if (apps) spec.apps = [...apps];
   return spec;
 }
 
@@ -162,26 +226,84 @@ export async function createWorld(worldFile: string): Promise<SimWorld> {
   const testRoot = getTestStateRoot();
   if (!testRoot) throw new Error('sim worlds require an explicit --test universe');
   const physicalTestRoot = realpathSync(resolve(testRoot));
-  const absoluteFile = resolve(worldFile);
-  const spec = parseSimWorld(readFileSync(absoluteFile, 'utf8'));
+  const spec = parseSimWorld(readFileSync(resolve(worldFile), 'utf8'));
   assembleWorld({ spec });
   const simRoot = join(physicalTestRoot, 'sim');
-  mkdirSync(simRoot, { recursive: true });
-  const physicalSimRoot = realpathSync(simRoot);
-  const simRel = relative(physicalTestRoot, physicalSimRoot);
-  if (!simRel || simRel === '..' || simRel.startsWith(`..${sep}`) || isAbsolute(simRel)) throw new Error('sim directory escaped the test universe');
-  const root = join(physicalSimRoot, spec.world);
-  const rel = relative(physicalTestRoot, root);
-  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('world path escaped the test universe');
-  mkdirSync(root, { recursive: false, mode: 0o700 });
-  writeFileSync(join(root, 'world.json'), `${JSON.stringify(spec, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
-  return { id: spec.world, root, spec, networkEvents: [] };
+  try {
+    const info = lstatSync(simRoot);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('sim directory escaped the test universe');
+    const physicalSimRoot = realpathSync(simRoot);
+    const simRel = relative(physicalTestRoot, physicalSimRoot);
+    if (!simRel || simRel === '..' || simRel.startsWith(`..${sep}`) || isAbsolute(simRel)) throw new Error('sim directory escaped the test universe');
+    try {
+      lstatSync(join(physicalSimRoot, spec.world));
+      throw new Error(`sim world already exists: ${spec.world}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const stored = createSimWorld(spec.world);
+  try {
+    writeFileSync(join(stored.configDir, 'world.yaml'), `${JSON.stringify(spec, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    const manifestPath = join(stored.rootDir, 'world.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    writeFileSync(manifestPath, `${JSON.stringify({ ...manifest, declarationFormat: 'yaml' }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    chmodSync(manifestPath, 0o600);
+    return { id: stored.id, root: stored.rootDir, spec, networkEvents: [] };
+  } catch (error) {
+    try { destroySimWorld(stored.id); } catch { /* preserve the original creation failure */ }
+    throw error;
+  }
+}
+
+function worldAppActions(
+  spec: SimWorldSpec,
+  assembled: AssembledWorld,
+  observations: Array<{ event: string; verdict: string }>,
+): WorldChaosAction[] {
+  const host = assembled.appHost;
+  return spec.events.flatMap((event) => event.appAction ? [{
+    atMs: worldOffsetMs(event.at),
+    target: `${event.appAction}:${event.slug ?? event.id}`,
+    run: () => {
+      if (!host || !event.slug) throw new Error(`world app event requires apps and slug: ${event.id}`);
+      if (event.appAction === 'deploy') {
+        if (!event.version) throw new Error(`world deploy event requires version: ${event.id}`);
+        host.deploy(event.slug, event.version);
+      } else {
+        host.rollback(event.slug);
+      }
+      const response = host.fetch(`${event.slug}.app.sim.invalid`, '/index.html');
+      observations.push({ event: `app-${event.appAction}-${event.slug}`, verdict: response.status === 200 ? `${response.headers['x-app-version']} ${response.headers['x-app-sha256']}` : `HTTP ${response.status}` });
+    },
+  }] : []);
+}
+
+function worldInjectionEvents(world: SimWorld, runId: string, injectedRows: RunLedgerEntry[]): WorldChaosScheduledEvent[] {
+  return (world.spec.injections ?? []).map((injection, index) => ({
+    atMs: worldOffsetMs(injection.at),
+    run: (now) => {
+      const result = injectAnyEvent({
+        runId,
+        stateRoot: world.root,
+        injectionId: `inj-sim-${runId.slice(4, 16)}-${index}`,
+        ledger: injection.ledger,
+        logs: injection.logs,
+        now,
+      });
+      injectedRows.push(...result.ledgerRows);
+      return result;
+    },
+  }));
 }
 
 /** Resolve aliases against the checked-in device catalog and construct existing in-process fakes. */
-export function assembleWorld(world: Pick<SimWorld, 'spec'>): AssembledWorld {
+export function assembleWorld(world: Pick<SimWorld, 'spec'>, clock?: SimClock): AssembledWorld {
   const catalog = loadMockScenarioCatalog();
   const devices = new Map<string, unknown>();
+  const appHost = world.spec.apps?.length ? createFakeAppHost(world.spec.apps) : undefined;
   for (const requestedName of world.spec.devices) {
     const id = requestedName === 'fake-gh' ? 'fake-github' : requestedName === 'mail' ? 'sim-mailbox' : requestedName;
     const row = catalog.devices.find((candidate) => candidate.id === id);
@@ -196,9 +318,13 @@ export function assembleWorld(world: Pick<SimWorld, 'spec'>): AssembledWorld {
             const context = host.name ? `${world.spec.world}-${host.name}-context` : `${world.spec.world}-context`;
             const node = host.name ? `${world.spec.world}-${host.name}-node` : `${world.spec.world}-node`;
             const adapter = createFakeKubectl({ context, node, arch: host.arch, cpu: host.cpu, pools: host.pools });
+            adapter.setHostState({ egress: host.egress });
             devices.set(hosts.length === 1 ? requestedName : name, adapter);
           }
         }
+        break;
+      case 'fake-ps':
+        devices.set(requestedName, createFakePsDevice({ processes: world.spec.processes ?? [] }));
         break;
       case 'fake-github':
         {
@@ -213,8 +339,36 @@ export function assembleWorld(world: Pick<SimWorld, 'spec'>): AssembledWorld {
       case 'fake-llm':
         devices.set(requestedName, { enabled: testFakeLlmEnabled, response: testFakeLlmResponse, config: world.spec.providers ?? {} });
         break;
+      case 'fake-ssh':
+        {
+          const hosts = Object.fromEntries((world.spec.hosts ?? [{ name: world.spec.world, arch: 'amd64' as const, cpu: 1, pools: [], egress: false }])
+            .map((host) => [host.name, { activeSessions: 0, maxStartups: 10 }]));
+          devices.set(requestedName, createFakeSsh({ hosts, ...(clock ? { clock } : {}) }));
+        }
+        break;
       case 'fake-clock':
         devices.set(requestedName, { withClock: withSimClock, ...(world.spec.clock ?? {}) });
+        break;
+      case 'fake-fleet': {
+        const hosts = world.spec.hosts ?? [];
+        if (!hosts.length) throw new Error('fake-fleet world adapter requires declared hosts');
+        devices.set(requestedName, createFakeFleetDevice({ clusters: hosts.map((host) => ({
+          host: host.name, context: `${world.spec.world}-${host.name}-context`,
+          nodes: [`${world.spec.world}-${host.name}-node`],
+        })) }));
+        break;
+      }
+      case 'fake-cloud-vm':
+        devices.set(requestedName, createFakeCloudVm());
+        break;
+      case 'world-runtime':
+        devices.set(requestedName, { inject: injectAnyEvent });
+        break;
+      case 'pod-reuse-residue-fault':
+        devices.set(requestedName, { create: createPodReuseResidueFaultFixture });
+        break;
+      case 'warm-pool-reuse-sim':
+        devices.set(requestedName, { run: runWarmSiReuseSimulation });
         break;
       case 'sim-mailbox':
         devices.set(requestedName, createSimMailbox());
@@ -223,11 +377,368 @@ export function assembleWorld(world: Pick<SimWorld, 'spec'>): AssembledWorld {
         throw new Error(`mock device has no world adapter: ${requestedName}`);
     }
   }
-  return { devices };
+  return { devices, ...(appHost ? { appHost } : {}) };
+}
+
+export interface WarmPoolReuseWorldEvidence {
+  readonly pass: boolean;
+  readonly cleanReuse: Awaited<ReturnType<typeof runWarmSiReuseSimulation>>;
+  readonly residueReuse: Awaited<ReturnType<typeof runWarmSiReuseSimulation>>;
+  readonly residueBeforeCleanup: ReturnType<ReturnType<typeof createPodReuseResidueFaultFixture>['residue']>;
+  readonly residueAfterCleanup: ReturnType<ReturnType<typeof createPodReuseResidueFaultFixture>['residue']>;
+  readonly uncertainExecutions: readonly WarmPoolUncertainExecutionEvidence[];
+  readonly uncertainEventMonkeyRows: ReturnType<typeof injectAnyEvent>['debugRows'];
+  readonly productionLedgerRows: readonly RunLedgerEntry[];
+  readonly recovery: WorldChaosRun;
+  readonly cloudEvents: ReturnType<ReturnType<typeof createFakeCloudVm>['events']>;
+}
+
+export type WarmPoolUncertainFault = 'timeout' | 'connection-lost' | 'result-missing' | 'cleanup-unknown';
+
+export interface WarmPoolUncertainExecutionEvidence {
+  readonly fault: WarmPoolUncertainFault;
+  readonly resultCode: string | undefined;
+  readonly resultMessage: string | undefined;
+  readonly coldJobStarts: number;
+  readonly transportQuarantines: number;
+  readonly providerQuarantines: number;
+  readonly cleanupQuarantines: number;
+  readonly cleanupStops: number;
+  readonly credentialRevocations: number;
+  readonly adoptions: number;
+  readonly leaseReturns: number;
+  readonly disposition: { readonly stage?: string; readonly prNumber?: number } | undefined;
+  readonly ledgerEvents: readonly string[];
+}
+
+export async function runWarmPoolUncertainExecution(
+  injectedFault: EventMonkeyDebugRow,
+  runId: string,
+  stateRoot: string,
+  now: () => number,
+): Promise<WarmPoolUncertainExecutionEvidence> {
+  const fault = injectedFault.data.fault;
+  const allowedFaults: readonly WarmPoolUncertainFault[] = ['timeout', 'connection-lost', 'result-missing', 'cleanup-unknown'];
+  if (injectedFault.category !== 'pod.reuse' || injectedFault.event !== 'uncertain-exec-injected'
+    || injectedFault.data.injected !== true || injectedFault.data.level !== 'L0'
+    || injectedFault.data.phase !== 'after-dispatch' || typeof fault !== 'string'
+    || !allowedFaults.includes(fault as WarmPoolUncertainFault)) {
+    throw new Error('warm SI uncertain execution requires a tagged after-dispatch event-monkey L0 fault row');
+  }
+  const selectedFault = fault as WarmPoolUncertainFault;
+  const bytes = (value: string) => new TextEncoder().encode(value);
+  const payload = bytes('{"feature":"warm-pod-uncertain-exec"}');
+  const credentialBundle = bytes('isolated simulated credential');
+  const returned: SiWarmReturnedBytes = { terminal: bytes('{"ok":true,"stage":"pr-opened","prNumber":123}'),
+    ledger: bytes('{"event":"done"}\n'), log: bytes('child finished before receipt loss\n'), artifacts: [] };
+  const key = { context: 'pod-reuse-core-pool-a-context', imageDigest: `sha256:${'d'.repeat(64)}`,
+    lockHash: 'e'.repeat(64), architecture: 'arm64' };
+  const command: SiWarmCommand = { protocol: 'si-v1', runId, attemptId: `attempt-${selectedFault}`,
+    executionKey: 'a'.repeat(64), sourceSha: 'b'.repeat(40), leaseId: `lease-${selectedFault}`, generation: 1,
+    workerId: 'pod-reuse-core-worker-1', podUid: 'pod-reuse-core-pod-1', key,
+    envProfile: 'si-standard-v1', deadlineAt: now() + 60_000,
+    payloadSha256: siWarmSha256(payload), credentialBundleSha256: siWarmSha256(credentialBundle) };
+  const reply: SiWarmReply = { protocol: 'si-v1', runId, attemptId: command.attemptId,
+    executionKey: command.executionKey, sourceSha: command.sourceSha, leaseId: command.leaseId,
+    generation: command.generation, workerId: command.workerId, podUid: command.podUid, key,
+    envProfile: command.envProfile, payloadSha256: command.payloadSha256,
+    startedAt: now(), finishedAt: now() + 100, exitCode: 0,
+    terminalSha256: siWarmSha256(returned.terminal), ledgerSha256: siWarmSha256(returned.ledger),
+    logSha256: siWarmSha256(returned.log), artifacts: [] };
+  const pod = { context: key.context, namespace: 'elanous-test', name: 'warm-pod-reuse-core',
+    podUid: command.podUid, workerId: command.workerId, sourceSha: command.sourceSha,
+    imageDigest: key.imageDigest, lockHash: key.lockHash, architecture: key.architecture };
+  let transportQuarantines = 0;
+  let providerQuarantines = 0;
+  let cleanupQuarantines = 0;
+  let cleanupStops = 0;
+  let credentialRevocations = 0;
+  let adoptions = 0;
+  let leaseReturns = 0;
+  let coldJobStarts = 0;
+  const ledgerEvents: string[] = [];
+  const receipt = selectedFault === 'cleanup-unknown'
+    ? { reply, bytes: returned, cleanup: 'unknown' as const }
+    : selectedFault === 'result-missing'
+      ? { reply: null, bytes: null, cleanup: 'unknown' as const }
+      : { reply, bytes: returned, cleanup: 'clean' as const };
+  const cleanup: ChildPodReuseOperations = {
+    stopChildProcesses: async () => { cleanupStops++; return { remaining: 1 }; },
+    git: async () => { throw new Error('uncertain execution must not reach worktree cleanup'); },
+    removeRunCredentials: async () => { credentialRevocations++; return { remaining: 0 }; },
+    returnLease: async () => { leaseReturns++; },
+    quarantine: async () => { cleanupQuarantines++; },
+    observe: () => {},
+  };
+  const attempt: SiWarmChildAttempt = { leaseFenced: true, command, transport: { pod, now,
+    runner: {
+      inspect: async () => pod,
+      execute: async () => {
+        if (selectedFault === 'timeout') throw new Error('simulated SI exec timed out after dispatch');
+        if (selectedFault === 'connection-lost') throw new Error('simulated SI exec connection lost after dispatch');
+        return receipt;
+      },
+      quarantine: async () => { transportQuarantines++; return true; },
+    } }, payload, credentialBundle, cleanup,
+    quarantineUnknown: async () => { providerQuarantines++; },
+    adopt: async () => { adoptions++; },
+  };
+  const result = await podSelfImplementSpawn({
+    env: { ELANOUS_STATE_DIR: stateRoot, ELANOUS_STATE_DIR_SOURCE: 'derived', ELANOUS_RUN_ID: runId },
+    kubectl: () => { coldJobStarts++; return { status: 1, stdout: '', stderr: 'cold Job must not be dispatched after uncertain exec' }; },
+    siWarmAttempt: async () => attempt,
+    siWarmHostPostprocess: async childResult => childResult,
+    siWarmLedger: entry => { ledgerEvents.push(entry.event); },
+  })({ feature: 'warm Pod uncertain execution simulation', spaceId: `${runId}-${selectedFault}` }).done;
+  return { fault: selectedFault, resultCode: result.error?.code, resultMessage: result.error?.message,
+    coldJobStarts, transportQuarantines, providerQuarantines,
+    cleanupQuarantines, cleanupStops, credentialRevocations, adoptions, leaseReturns,
+    disposition: result.disposition ? { stage: result.disposition.stage,
+      ...(typeof result.disposition.prNumber === 'number' ? { prNumber: result.disposition.prNumber } : {}) } : undefined,
+    ledgerEvents };
+}
+
+export interface DeclaredWorldLedgerRow {
+  readonly expectedAt: number;
+  readonly event: string;
+  readonly data?: Readonly<Record<string, unknown>>;
+}
+
+/** Require a one-to-one match; order is irrelevant, duplicates and extra rows fail closed. */
+export function assertWorldLedgerMatchesDeclarations(
+  expected: readonly DeclaredWorldLedgerRow[], actual: readonly RunLedgerEntry[], label: string,
+): void {
+  const compatible = expected.map((declaration) => actual.flatMap((row, index) => {
+    if (row.event !== declaration.event || Date.parse(row.timestamp ?? '') !== declaration.expectedAt) return [];
+    if (Object.entries(declaration.data ?? {}).some(([key, value]) => JSON.stringify(row.data[key]) !== JSON.stringify(value))) return [];
+    return [index];
+  }));
+  const actualToExpected = new Array<number>(actual.length).fill(-1);
+  const assign = (expectedIndex: number, visited: boolean[]): boolean => {
+    for (const actualIndex of compatible[expectedIndex] ?? []) {
+      if (visited[actualIndex]) continue;
+      visited[actualIndex] = true;
+      if (actualToExpected[actualIndex] === -1 || assign(actualToExpected[actualIndex]!, visited)) {
+        actualToExpected[actualIndex] = expectedIndex;
+        return true;
+      }
+    }
+    return false;
+  };
+  const order = expected.map((_, index) => index).sort((left, right) => compatible[left]!.length - compatible[right]!.length);
+  for (const expectedIndex of order) {
+    if (!assign(expectedIndex, new Array<boolean>(actual.length).fill(false))) {
+      const declaration = expected[expectedIndex]!;
+      throw new Error(`${label}: missing or ambiguous ${declaration.event} at ${new Date(declaration.expectedAt).toISOString()}`);
+    }
+  }
+  const unmatched = actualToExpected.flatMap((expectedIndex, actualIndex) => expectedIndex === -1 ? [actual[actualIndex]!] : []);
+  if (unmatched.length) {
+    const details = unmatched.map((row) => `${row.event}@${row.timestamp ?? '<missing timestamp>'}`).join(', ');
+    throw new Error(`${label}: ${unmatched.length} undeclared production ledger row(s): ${details}`);
+  }
+}
+
+export function assertWarmPoolReuseSchedule(cleanAtMs: number, faultAtMs: number, faultEndsAtMs: number,
+  recoveryAtMs: number, residueAtMs: number): void {
+  if (!(cleanAtMs < faultAtMs && faultAtMs < recoveryAtMs && faultEndsAtMs <= recoveryAtMs && recoveryAtMs < residueAtMs)) {
+    throw new Error('world schedule must acquire pool-a before its outage, observe recovery after it ends, and inject residue after recovery');
+  }
+}
+
+/** Executes scheduled SI reuse and residue faults on one isolated world's fake clock. */
+export async function runWarmPoolReuseWorldScenario(world: SimWorld): Promise<WarmPoolReuseWorldEvidence> {
+  const testRoot = getTestStateRoot();
+  if (!testRoot) throw new Error('sim worlds require an explicit --test universe');
+  const owned = loadWorld(world.id);
+  if (resolve(world.root) !== owned.root || JSON.stringify(world.spec) !== JSON.stringify(owned.spec)) {
+    throw new Error('world root is not owned by the test universe');
+  }
+  const assembled = assembleWorld(owned);
+  const required = ['fake-clock', 'fake-fleet', 'fake-cloud-vm', 'warm-pool-reuse-sim', 'world-runtime', 'pod-reuse-residue-fault'];
+  for (const device of required) if (!owned.spec.devices.includes(device)) throw new Error(`warm pool reuse world requires device ${device}`);
+  if (owned.spec.events.length !== 4 || !owned.spec.events.some((event) => event.id === 'reuse-clean')
+    || !owned.spec.events.some((event) => event.id === 'reuse-recovery')
+    || !owned.spec.events.some((event) => event.id === 'reuse-residue')
+    || !owned.spec.events.some((event) => event.id === 'reuse-uncertain') || !owned.spec.hosts?.length) {
+    throw new Error('warm pool reuse world must schedule clean, recovery, residue, and uncertain-exec events on declared hosts');
+  }
+  const cleanAtMs = worldOffsetMs(owned.spec.events.find((event) => event.id === 'reuse-clean')!.at);
+  const recoveryAtMs = worldOffsetMs(owned.spec.events.find((event) => event.id === 'reuse-recovery')!.at);
+  const hostFault = owned.spec.chaos?.find((fault) => 'gorilla' in fault && fault.gorilla.host === 'pool-a');
+  if (!hostFault || !('gorilla' in hostFault)) throw new Error('warm pool reuse world requires a pool-a gorilla outage');
+  const faultAtMs = worldOffsetMs(hostFault.at);
+  const faultEndsAtMs = faultAtMs + worldOffsetMs(hostFault.gorilla.for);
+  const residueAtMs = worldOffsetMs(owned.spec.events.find((event) => event.id === 'reuse-residue')!.at);
+  assertWarmPoolReuseSchedule(cleanAtMs, faultAtMs, faultEndsAtMs, recoveryAtMs, residueAtMs);
+  for (const name of ['pool-a', 'pool-b']) if (!owned.spec.hosts!.some((host) => host.name === name)) {
+    throw new Error(`warm pool reuse world is missing host ${name}`);
+  }
+  const clockDevice = assembled.devices.get('fake-clock') as { withClock: typeof withSimClock };
+  const fleet = assembled.devices.get('fake-fleet') as ReturnType<typeof createFakeFleetDevice>;
+  const cloud = assembled.devices.get('fake-cloud-vm') as ReturnType<typeof createFakeCloudVm>;
+  const runtime = assembled.devices.get('world-runtime') as { inject: typeof injectAnyEvent };
+  const residueDevice = assembled.devices.get('pod-reuse-residue-fault') as { create: typeof createPodReuseResidueFaultFixture };
+  const reuseDevice = assembled.devices.get('warm-pool-reuse-sim') as { run: typeof runWarmSiReuseSimulation };
+  const baseTimeMs = Date.parse(owned.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
+  if (!Number.isFinite(baseTimeMs)) throw new Error('world clock start must be a valid timestamp');
+  const cloudVmIds: Record<string, string> = {};
+  return clockDevice.withClock(new Date(baseTimeMs), async (clock) => {
+    for (const host of owned.spec.hosts!) {
+      const id = `${owned.spec.world}-${host.name}-vm`;
+      cloudVmIds[host.name] = id;
+      cloud.createFromImage({ id, imageDigest: `sha256:${'d'.repeat(64)}`, hourlyCost: 1 });
+      cloud.openLease(id);
+    }
+    const runId = `run-${owned.spec.world}-reuse`;
+    const expectedRows: RunLedgerEntry[] = [];
+    let releaseActiveLease: () => void = () => {};
+    let signalActiveLease: () => void = () => {};
+    const activeLeaseReady = new Promise<void>((resolve) => { signalActiveLease = resolve; });
+    const resumeAfterHostLoss = new Promise<void>((resolve) => { releaseActiveLease = resolve; });
+    let cleanReuseTask: Promise<Awaited<ReturnType<typeof runWarmSiReuseSimulation>>> | undefined;
+    let cleanReuse: Awaited<ReturnType<typeof runWarmSiReuseSimulation>> | undefined;
+    let residueReuse: Awaited<ReturnType<typeof runWarmSiReuseSimulation>> | undefined;
+    const uncertainExecutions: WarmPoolUncertainExecutionEvidence[] = [];
+    let uncertainEventMonkeyRows: ReturnType<typeof injectAnyEvent>['debugRows'] = [];
+    let residueBeforeCleanup: ReturnType<ReturnType<typeof createPodReuseResidueFaultFixture>['residue']> | undefined;
+    let residueAfterCleanup: ReturnType<ReturnType<typeof createPodReuseResidueFaultFixture>['residue']> | undefined;
+    const available = (host: string) => fleet.hostOnline(host === 'pool-host-b' ? 'pool-b' : 'pool-a');
+    const verifyDeclaredOutput = (index: number, rows: readonly RunLedgerEntry[]) => {
+      const declared = owned.spec.injections?.[index];
+      if (!declared) throw new Error(`scheduled world event ${owned.spec.events[index]?.id} lacks output declaration`);
+      const expectedAt = baseTimeMs + worldOffsetMs(declared.at);
+      const actualRows = rows.filter((row) => Date.parse(row.timestamp ?? '') === expectedAt);
+      assertWorldLedgerMatchesDeclarations((declared.ledger ?? []).map((row) => ({ expectedAt, event: row.event, data: row.data })),
+        actualRows, `scheduled event ${owned.spec.events[index]?.id}`);
+    };
+    const scheduledEvents: WorldChaosScheduledEvent[] = owned.spec.events.map((event, index) => ({
+      atMs: worldOffsetMs(event.at),
+      run: async (now) => {
+        const injectionId = `inj-${owned.spec.world}-${index + 1}`;
+        const declared = owned.spec.injections?.[index];
+        if (!declared || worldOffsetMs(declared.at) !== worldOffsetMs(event.at)) {
+          throw new Error(`scheduled world event ${event.id} must have a same-time output declaration`);
+        }
+        if (event.id === 'reuse-uncertain') {
+          const faultLogs = declared.logs ?? [];
+          const allowedFaults: readonly WarmPoolUncertainFault[] = ['timeout', 'connection-lost', 'result-missing', 'cleanup-unknown'];
+          if (faultLogs.length !== allowedFaults.length) {
+            throw new Error('reuse-uncertain must inject exactly one timeout, connection-lost, result-missing, and cleanup-unknown event');
+          }
+          const injection = runtime.inject({ runId, stateRoot: owned.root, injectionId, logs: faultLogs, now });
+          uncertainEventMonkeyRows = injection.debugRows;
+          const injectedFaults = injection.debugRows.map((row) => {
+            const fault = row.data.fault;
+            if (row.category !== 'pod.reuse' || row.event !== 'uncertain-exec-injected'
+              || row.data.injected !== true || row.data.level !== 'L0' || row.data.phase !== 'after-dispatch'
+              || typeof fault !== 'string' || !allowedFaults.includes(fault as WarmPoolUncertainFault)) {
+              throw new Error('reuse-uncertain event-monkey row must be a tagged after-dispatch fault');
+            }
+            return fault as WarmPoolUncertainFault;
+          });
+          if (allowedFaults.some((fault) => injectedFaults.filter((candidate) => candidate === fault).length !== 1)) {
+            throw new Error('reuse-uncertain must inject exactly one timeout, connection-lost, result-missing, and cleanup-unknown event');
+          }
+          for (const fault of injectedFaults) {
+            const row = injection.debugRows.find((candidate) => candidate.data.fault === fault)!;
+            uncertainExecutions.push(await runWarmPoolUncertainExecution(row,
+              `${runId}-uncertain-${fault}`, owned.root, () => clock.now()));
+          }
+          verifyDeclaredOutput(index, []);
+          return injection;
+        } else if (event.id === 'reuse-clean') {
+          cleanReuseTask = reuseDevice.run({ runId: `${runId}-clean`, now: () => clock.now(), stateRoot: owned.root,
+            ledgerRunId: runId, ledgerRowPrefix: injectionId, includeAlternateHost: true, recoverOnAlternateHost: true,
+            hostAvailable: available,
+            hostArchitectures: {
+              'pool-host-a': owned.spec.hosts!.find((host) => host.name === 'pool-a')!.arch,
+              'pool-host-b': owned.spec.hosts!.find((host) => host.name === 'pool-b')!.arch,
+            },
+            afterAcquireAtLease: 2,
+            afterAcquire: async (host) => {
+              signalActiveLease();
+              if (host !== 'pool-host-a') throw new Error(`active SI lease unexpectedly started on ${host}`);
+              await resumeAfterHostLoss;
+            },
+          }).catch((error) => { signalActiveLease(); throw error; });
+          await activeLeaseReady;
+          verifyDeclaredOutput(index, loadRunLedger(runId, runLedgerDir(owned.root)) ?? []);
+        } else if (event.id === 'reuse-recovery') {
+          if (!cleanReuseTask) throw new Error('reuse-recovery scheduled before reuse-clean started');
+          cleanReuse = await cleanReuseTask;
+          expectedRows.push(...cleanReuse.ledgerRows);
+          verifyDeclaredOutput(index, cleanReuse.ledgerRows);
+        } else if (event.id === 'reuse-residue') {
+          const fixture = residueDevice.create();
+          try {
+            fixture.inject(`${owned.spec.world}-residue`);
+            residueBeforeCleanup = fixture.residue();
+            residueReuse = await reuseDevice.run({ runId: `${runId}-residue`, now: () => clock.now(), stateRoot: owned.root,
+              ledgerRunId: runId, ledgerRowPrefix: injectionId, residueFixture: fixture, hostAvailable: available });
+            expectedRows.push(...residueReuse.ledgerRows);
+            residueAfterCleanup = fixture.residue();
+          } finally { fixture.cleanup(); }
+        } else throw new Error(`unsupported warm pool reuse world event: ${event.id}`);
+        if (event.id === 'reuse-residue') verifyDeclaredOutput(index, residueReuse!.ledgerRows);
+        const result = runtime.inject({ runId, stateRoot: owned.root, injectionId,
+          logs: [{ category: 'pod.reuse', event: event.id, data: { scheduledAt: now().toISOString() } }], now });
+        return result;
+      },
+    }));
+    const processTable = assembled.devices.get('fake-ps') as FakePsDevice;
+    const hostChaos = createWorldHostChaosController({ world: owned.spec.world, hosts: owned.spec.hosts!,
+      devices: assembled.devices, baseTimeMs, clock, processTable, fleet, cloudVm: cloud, cloudVmIds,
+      onFaultStart: (host) => { if (host === 'pool-a') releaseActiveLease(); },
+      awaitActiveRecovery: async (host) => {
+        if (host !== 'pool-a' || !cleanReuseTask) return;
+        if (!cleanReuse) {
+          cleanReuse = await cleanReuseTask;
+          expectedRows.push(...cleanReuse.ledgerRows);
+        }
+      },
+    });
+    let recovery: WorldChaosRun;
+    try {
+      recovery = await runWorldChaosSchedule(owned.spec.chaos ?? [], owned.spec.processes ?? [],
+        owned.spec.expect?.recovers, { runId, stateRoot: owned.root, expectedRows },
+        scheduledEvents, clock, baseTimeMs, hostChaos, processTable);
+    } finally {
+      // A malformed/failed schedule must not strand the leased child behind its outage barrier.
+      releaseActiveLease();
+      await cleanReuseTask?.catch(() => undefined);
+    }
+    const productionLedgerRows = loadRunLedger(runId, runLedgerDir(owned.root)) ?? [];
+    const allDeclarations = (owned.spec.injections ?? []).flatMap((declaration) =>
+      (declaration.ledger ?? []).map((row) => ({ expectedAt: baseTimeMs + worldOffsetMs(declaration.at), event: row.event, data: row.data })));
+    assertWorldLedgerMatchesDeclarations(allDeclarations, productionLedgerRows, 'world production ledger');
+    const pass = Boolean(cleanReuse && cleanReuse.cleanupOutcomes.join(',') === 'returned,quarantined,returned'
+      && cleanReuse.leaseGenerations[0] === 1 && cleanReuse.leaseGenerations[1] === 2
+      && cleanReuse.podUids[0] === cleanReuse.podUids[1]
+      && cleanReuse.leaseHosts.join(',') === 'pool-host-a,pool-host-a,pool-host-b' && cleanReuse.recoveryHost === 'pool-host-b'
+      && residueReuse?.cleanupOutcomes.at(-1) === 'quarantined'
+      && residueReuse.retryAcquire === 'no-entry:busy'
+      && residueBeforeCleanup?.credentials.length === 1 && residueBeforeCleanup.processes.length === 1
+      && uncertainExecutions.length === 4
+      && uncertainExecutions.every((item) => item.resultCode === 'si-warm-reconcile-only'
+        && item.coldJobStarts === 0 && item.adoptions === 0 && item.leaseReturns === 0
+        && item.ledgerEvents.includes('pod-reuse-quarantined'))
+      && uncertainExecutions.find((item) => item.fault === 'timeout')?.providerQuarantines === 1
+      && uncertainExecutions.find((item) => item.fault === 'connection-lost')?.providerQuarantines === 1
+      && uncertainExecutions.find((item) => item.fault === 'result-missing')?.cleanupQuarantines === 1
+      && uncertainExecutions.find((item) => item.fault === 'cleanup-unknown')?.disposition?.stage === 'pr-opened'
+      && uncertainExecutions.find((item) => item.fault === 'cleanup-unknown')?.disposition?.prNumber === 123
+      && uncertainEventMonkeyRows.length === 4
+      && uncertainEventMonkeyRows.every((row) => row.data.injected === true && row.data.level === 'L0')
+      && recovery.evaluation?.pass);
+    return { pass, cleanReuse: cleanReuse!, residueReuse: residueReuse!, residueBeforeCleanup: residueBeforeCleanup!,
+      residueAfterCleanup: residueAfterCleanup!, uncertainExecutions, uncertainEventMonkeyRows,
+      productionLedgerRows, recovery, cloudEvents: cloud.events() };
+  });
 }
 
 /** Defense-in-depth API guards inside the sandboxed scenario executor. */
-export async function runInWorld<T>(world: SimWorld, run: () => Promise<T>): Promise<T> {
+export async function runInWorld<T>(world: SimWorld, run: (runtime: WorldExecutionRuntime) => Promise<T>): Promise<T> {
   if (activeNetworkWorld) throw new Error('sim worlds run serially while the network guard is installed');
   const originalFetch = globalThis.fetch;
   const originalHttpRequest = http.request;
@@ -357,7 +868,24 @@ export async function runInWorld<T>(world: SimWorld, run: () => Promise<T>): Pro
       bunRuntime.spawn = ((command: string | string[]) => blocked(`process://${Array.isArray(command) ? command[0] : command}`)) as unknown as typeof bunRuntime.spawn;
       bunRuntime.spawnSync = ((command: string | string[]) => blocked(`process://${Array.isArray(command) ? command[0] : command}`)) as unknown as typeof bunRuntime.spawnSync;
     }
-    return await run();
+    const runPromotionPython: WorldExecutionRuntime['runPromotionPython'] = (source, home, env) => {
+      const physicalRoot = realpathSync(world.root);
+      const requestedHome = resolve(home);
+      const rel = relative(physicalRoot, requestedHome);
+      if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('promotion script home escaped its simulated world');
+      if (!isTrustedPromotionPythonBody(source)) throw new Error('world runner refused untrusted promotion Python body');
+      const guardedBunSpawnSync = bunRuntime?.spawnSync;
+      if (bunRuntime && originalBunSpawnSync) bunRuntime.spawnSync = originalBunSpawnSync;
+      let child: ReturnType<typeof childProcess.spawnSync>;
+      try {
+        child = spawnSyncForPromotion('/usr/bin/python3', ['-'], { cwd: physicalRoot, input: source, encoding: 'utf8',
+          env: { PATH: '/usr/bin:/bin', HOME: requestedHome, ...env } });
+      } finally {
+        if (bunRuntime && guardedBunSpawnSync) bunRuntime.spawnSync = guardedBunSpawnSync;
+      }
+      return { status: child.status, stdout: String(child.stdout ?? ''), stderr: String(child.stderr ?? child.error ?? '') };
+    };
+    return await run({ runPromotionPython });
   }
   finally {
     globalThis.fetch = originalFetch;
@@ -401,19 +929,74 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
     throw new Error('world root is not owned by the test universe');
   }
   world = ownedWorld;
-  return runInWorld(world, async () => {
+  return runInWorld(world, async (runtime) => {
     const assembled = assembleWorld(world);
     const scenario = object(parseYaml(readFileSync(resolve(scenarioFile), 'utf8')), 'scenario');
     if (scenario.world !== world.id || !Array.isArray(scenario.steps)) throw new Error('scenario must target its declared world and list steps');
     const steps = scenario.steps.map((step) => object(step, 'scenario step'));
     const stepKeys = steps.map((step) => Object.keys(step).sort().join(','));
-    if (steps.length !== 2 || stepKeys[0] !== 'inject' || stepKeys[1] !== 'observe' || steps[1]?.observe !== 'release-readiness') {
-      throw new Error('scenario steps must be inject followed by observe: release-readiness');
+    if (steps.length === 1 && stepKeys[0] === 'observe' && steps[0]?.observe === 'app-host') {
+      if (!world.spec.apps?.length) throw new Error('app-host observation requires world.apps');
+      const clockDevice = assembled.devices.get('fake-clock') as { withClock?: typeof withSimClock } | undefined;
+      if (!clockDevice?.withClock) throw new Error('app-host scenario requires the fake-clock device');
+      const observations: Array<{ event: string; verdict: string }> = [];
+      const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
+      const runId = `run-${randomUUID()}`;
+      const injectedRows: RunLedgerEntry[] = [];
+      const scheduledInjections = worldInjectionEvents(world, runId, injectedRows);
+      const hasLedgerInjections = world.spec.injections?.some((injection) => injection.ledger?.length) ?? false;
+      const processTable = assembled.devices.get('fake-ps') as FakePsDevice | undefined;
+      const appActions = worldAppActions(world.spec, assembled, observations);
+      const scheduled = (world.spec.chaos?.length ?? 0) > 0 || scheduledInjections.length > 0 || appActions.length > 0;
+      const recovery = await clockDevice.withClock(new Date(baseTimeMs), (clock) => {
+        const hostChaos = world.spec.chaos?.some((fault) => 'gorilla' in fault)
+          ? createWorldHostChaosController({ world: world.spec.world, hosts: world.spec.hosts ?? [], devices: assembled.devices,
+            baseTimeMs, clock, processTable: processTable! })
+          : undefined;
+        return runWorldChaosSchedule(world.spec.chaos ?? [], world.spec.processes ?? [], world.spec.expect?.recovers,
+          hasLedgerInjections ? { runId, stateRoot: world.root, expectedRows: injectedRows } : undefined,
+          scheduledInjections, clock, baseTimeMs, hostChaos, processTable, appActions);
+      });
+      return { pass: recovery.evaluation?.pass ?? true, observations, devices: [...assembled.devices.keys()], ...(scheduled ? { recovery } : {}) };
+    }
+    if (steps.length !== 2 || stepKeys[0] !== 'inject' || stepKeys[1] !== 'observe'
+      || !['release-readiness', 'hq-move'].includes(String(steps[1]?.observe))) {
+      throw new Error('scenario steps must be inject followed by observe: release-readiness or hq-move');
     }
     const injection = steps[0]!;
     const event = object(injection.inject, 'scenario inject');
+    if (event.id === 'hq-move') {
+      if (Object.keys(event).some((key) => key !== 'id' && key !== 'fault')) throw new Error('unsupported HQ move inject field');
+      if (!world.spec.events.some((entry) => entry.id === event.id)) throw new Error('scenario event is not declared by world: hq-move');
+      if (steps[1]?.observe !== 'hq-move') throw new Error('HQ move scenario must observe hq-move');
+      const expected = object(scenario.expect, 'scenario.expect');
+      const fault = event.fault === undefined ? 'none' : event.fault;
+      if (typeof fault !== 'string' || !['none', 'target-unavailable', 'partial-copy', 'old-host-loss', 'stale-pool'].includes(fault)) {
+        throw new Error(`unsupported HQ move fault: ${String(fault)}`);
+      }
+      if (Object.keys(expected).sort().join(',') !== 'fault' || expected.fault !== fault) throw new Error('HQ move expectation must match the injected fault');
+      const runRoot = join(realpathSync(world.root), `.hq-move-${randomUUID()}`);
+      const { runHqMoveSimulation } = await import('./hq-move-sim.js');
+      const clockDevice = assembled.devices.get('fake-clock') as { withClock?: typeof withSimClock } | undefined;
+      if (!clockDevice?.withClock) throw new Error('HQ move scenario requires the declared fake-clock device');
+      const result = await clockDevice.withClock(new Date(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z'), async (clock) => {
+        const runtimeAssembly = assembleWorld(world, clock);
+        const ssh = runtimeAssembly.devices.get('fake-ssh') as ReturnType<typeof createFakeSsh> | undefined;
+        if (!ssh) throw new Error('HQ move scenario requires the declared fake-ssh device');
+        const declaration = world.spec.events.find((entry) => entry.id === event.id);
+        const offset = declaration?.at.match(/^\+(\d+)(ms|s|m|h)$/);
+        if (!offset) throw new Error(`unsupported HQ move event time: ${declaration?.at ?? 'missing'}`);
+        clock.tick(Number(offset[1]) * ({ ms: 1, s: 1_000, m: 60_000, h: 3_600_000 } as const)[offset[2] as 'ms' | 's' | 'm' | 'h']);
+        const result = await runHqMoveSimulation(runRoot, fault as HqMoveFault, { ssh, clock, runPython: runtime.runPromotionPython });
+        return { ...result, observations: [...result.observations,
+          { event: 'world-clock', verdict: new Date(clock.now()).toISOString() }] };
+      });
+      return { ...result, pass: result.pass && result.fault === expected.fault };
+    }
+    if (steps[1]?.observe !== 'release-readiness') throw new Error('scenario observe must name a supported world event');
     if (Object.keys(event).some((key) => key !== 'id' && key !== 'version')) throw new Error('unsupported scenario inject field');
-    if (event.id !== 'dead-pid-lock') throw new Error(`unsupported world event: ${String(event.id)}`);
+    const scenarioInput = typeof event.id === 'string' ? WORLD_EVENT_TO_SCENARIO_INPUT[event.id] : undefined;
+    if (scenarioInput !== 'dead-pid-lock') throw new Error(`unsupported world event: ${String(event.id)}`);
     if (!world.spec.events.some((entry) => entry.id === event.id)) throw new Error(`scenario event is not declared by world: ${String(event.id)}`);
     const version = typeof event.version === 'string' ? event.version : '0.2.45';
     if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(version)) throw new Error(`invalid release version: ${version}`);
@@ -433,34 +1016,54 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
     const pid = 2_000_000_000 - (world.spec.seed % 100_000);
     const clockDevice = assembled.devices.get('fake-clock') as { withClock?: typeof withSimClock } | undefined;
     if (!clockDevice?.withClock) throw new Error('scenario requires the fake-clock device');
-    const declaration = world.spec.events.find((entry) => entry.id === event.id);
+    const declaration = world.spec.events.find((entry) => entry.id === event.id && !entry.appAction);
     const offset = declaration?.at.match(/^\+(\d+)(ms|s|m|h)$/);
     if (!offset) throw new Error(`unsupported event time: ${declaration?.at ?? 'missing'}`);
     const eventDelay = Number(offset[1]) * ({ ms: 1, s: 1_000, m: 60_000, h: 3_600_000 } as const)[offset[2] as 'ms' | 's' | 'm' | 'h'];
     return clockDevice.withClock(new Date(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z'), async (clock) => {
-      clock.tick(eventDelay);
-      writeFileSync(lockPath, `${JSON.stringify({ pid })}\n`, { mode: 0o600, flag: 'wx' });
-      const readiness = (isAlivePid: number | undefined) => releaseReadiness(version, {
-        ledgerRoot: runRoot,
-        isPidAlive: (candidate) => candidate === isAlivePid,
-        now: () => new Date(clock.now()),
-        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),
-      });
-      const alive = readiness(pid);
-      const dead = readiness(undefined);
-      const observations = [
-        { event: 'live-pid-lock', verdict: alive.reason },
-        { event: 'dead-pid-lock', verdict: dead.reason },
-      ];
+      const observations: Array<{ event: string; verdict: string }> = [];
       const expected = object(scenario.expect, 'scenario.expect');
       const expectAlive = object(expected.livePidLock, 'scenario.expect.livePidLock');
       const expectDead = object(expected.deadPidLock, 'scenario.expect.deadPidLock');
       if (Object.keys(expected).sort().join(',') !== 'deadPidLock,livePidLock'
         || Object.keys(expectAlive).sort().join(',') !== 'ready,reason'
         || Object.keys(expectDead).sort().join(',') !== 'ready,reason') throw new Error('unsupported scenario expectation field');
-      const pass = expectAlive.ready === alive.ready && expectAlive.reason === alive.reason &&
-        expectDead.ready === dead.ready && expectDead.reason === dead.reason;
-      return { pass, observations, devices: [...assembled.devices.keys()] };
+      const runId = `run-${randomUUID()}`;
+      const injectedRows: RunLedgerEntry[] = [];
+      const scheduledInjections = worldInjectionEvents(world, runId, injectedRows);
+      const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
+      clock.setTime(baseTimeMs);
+      const processTable = assembled.devices.get('fake-ps') as FakePsDevice | undefined;
+      const hostChaos = world.spec.chaos?.some((fault) => 'gorilla' in fault)
+        ? createWorldHostChaosController({ world: world.spec.world, hosts: world.spec.hosts ?? [], devices: assembled.devices, baseTimeMs, clock, processTable: processTable! })
+        : undefined;
+      let pass = true;
+      const actions = worldAppActions(world.spec, assembled, observations);
+      const includeRecovery = actions.length > 0 || scheduledInjections.length > 0 || (world.spec.chaos?.length ?? 0) > 0;
+      const readiness = (isAlivePid: number | undefined) => releaseReadiness(version, {
+        ledgerRoot: runRoot,
+        isPidAlive: (candidate) => candidate === isAlivePid,
+        now: () => new Date(clock.now()),
+        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),
+      });
+      actions.push({ atMs: eventDelay, target: `release:${event.id}`, run: () => {
+        writeFileSync(lockPath, `${JSON.stringify({ pid })}\n`, { mode: 0o600, flag: 'wx' });
+        const alive = readiness(pid);
+        const dead = readiness(undefined);
+        pass = expectAlive.ready === alive.ready && expectAlive.reason === alive.reason &&
+          expectDead.ready === dead.ready && expectDead.reason === dead.reason;
+        observations.push({ event: 'live-pid-lock', verdict: alive.reason }, { event: 'dead-pid-lock', verdict: dead.reason });
+      } });
+      const recovery = await runWorldChaosSchedule(world.spec.chaos ?? [], world.spec.processes ?? [], world.spec.expect?.recovers,
+        world.spec.injections?.some((injection) => injection.ledger?.length)
+          ? { runId, stateRoot: world.root, expectedRows: injectedRows } : undefined,
+        scheduledInjections, clock, baseTimeMs, hostChaos, processTable, actions);
+      if (recovery?.evaluation && !recovery.evaluation.pass) pass = false;
+      if (recovery) observations.push(...recovery.observations.map((row) => ({
+        event: `chaos-${row.kind}`,
+        verdict: `${row.faultVerdict} → ${row.recoveryVerdict} (${row.recoveryMs === null ? 'unrecovered' : `${row.recoveryMs}ms`})`,
+      })));
+      return { pass, observations, devices: [...assembled.devices.keys()], ...(includeRecovery ? { recovery } : {}) };
     });
   });
 }
@@ -486,8 +1089,12 @@ function invokeSandboxedWorldRunner(world: SimWorld, scenarioFile: string, netwo
 
 export async function runWorldScenario(world: SimWorld, scenarioFile: string): Promise<WorldScenarioResult> {
   const output = invokeSandboxedWorldRunner(world, scenarioFile);
-  try { return JSON.parse(output) as WorldScenarioResult; }
+  let result: WorldScenarioResult;
+  try { result = JSON.parse(output) as WorldScenarioResult; }
   catch { throw new Error(`sim world runner returned invalid JSON: ${output}`); }
+  const completed = applyDeviceFidelity(result) as WorldScenarioResult;
+  recordSimWorldCoverage({ world, deviceIds: result.devices, pass: completed.pass, scenarioFile, observations: completed.observations });
+  return completed;
 }
 
 /** Integration probe through the same runner and OS policy used by runWorldScenario. */
@@ -500,6 +1107,10 @@ export async function verifyWorldNetworkIsolation(world: SimWorld, scenarioFile:
 export async function destroyWorld(world: SimWorld): Promise<void> {
   const owned = loadWorld(world.id);
   if (resolve(world.root) !== owned.root) throw new Error('refusing to destroy a world whose path does not match its id');
+  if (listSimWorlds().some((candidate) => candidate.id === world.id && candidate.rootDir === owned.root)) {
+    destroySimWorld(world.id);
+    return;
+  }
   rmSync(owned.root, { recursive: true, force: false });
 }
 
@@ -507,6 +1118,21 @@ export function loadWorld(id: string): SimWorld {
   const testRoot = getTestStateRoot();
   if (!testRoot) throw new Error('sim worlds require an explicit --test universe');
   if (!WORLD_ID.test(id)) throw new Error('world id must be lowercase letters, digits, and hyphens');
+  const stored = listSimWorlds().find((candidate) => candidate.id === id);
+  if (stored) {
+    const manifest = JSON.parse(readFileSync(join(stored.rootDir, 'world.json'), 'utf8')) as Record<string, unknown>;
+    if (manifest.declarationFormat !== 'yaml') {
+      throw new Error(`sim world is not a YAML declaration: ${id}`);
+    }
+    const yamlPath = join(stored.configDir, 'world.yaml');
+    const yamlInfo = lstatSync(yamlPath);
+    if (yamlInfo.isSymbolicLink() || !yamlInfo.isFile() || (yamlInfo.mode & 0o777) !== 0o600) {
+      throw new Error(`YAML world spec must be an owned 0600 file: ${yamlPath}`);
+    }
+    const spec = parseSimWorld(readFileSync(yamlPath, 'utf8'));
+    if (spec.world !== id) throw new Error('world metadata id does not match its directory');
+    return { id, root: stored.rootDir, spec, networkEvents: [] };
+  }
   const physicalTestRoot = realpathSync(resolve(testRoot));
   const physicalSimRoot = realpathSync(join(physicalTestRoot, 'sim'));
   const simRel = relative(physicalTestRoot, physicalSimRoot);

@@ -925,6 +925,46 @@ describe('mcp.handshakeTimeoutMs', () => {
   });
 });
 
+describe('aside remote target config', () => {
+  test('parses SSH target metadata without accepting credentials', () => {
+    writeConfig({ aside: {
+      targets: [
+        { id: 'mac-a', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl', 'selection'] },
+        { id: 'credential', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl'], token: 'must-not-survive' },
+      ],
+      defaultTargetId: 'mac-a',
+      contextDefaults: { research: 'mac-a' },
+      strictRedactMode: true,
+    } });
+    const config = buildUserConfig(configPath);
+    expect(config.aside).toEqual({
+      targets: [
+        { id: 'mac-a', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl', 'selection'] },
+        { id: 'credential', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl'] },
+      ],
+      defaultTargetId: 'mac-a',
+      contextDefaults: { research: 'mac-a' },
+      strictRedactMode: true,
+    });
+    expect(JSON.stringify(config.aside)).not.toContain('must-not-survive');
+  });
+
+  test('rejects invalid targets and unknown default references instead of silently enabling automatic selection', () => {
+    writeConfig({ aside: {
+      targets: [{ id: 'bad host', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl'] }],
+      defaultTargetId: 'missing',
+    } });
+    expect(() => buildUserConfig(configPath)).toThrow('aside.targets[0].id');
+    writeConfig({ aside: {
+      targets: [{ id: 'mac-a', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl'] }],
+      defaultTargetId: 'missing',
+    } });
+    expect(() => buildUserConfig(configPath)).toThrow('aside.defaultTargetId');
+    writeConfig({ aside: { targets: [], strictRedactMode: 'yes' } });
+    expect(() => buildUserConfig(configPath)).toThrow('aside.strictRedactMode');
+  });
+});
+
 describe('autoReview and ops loader', () => {
   function captureStderr(run: () => void): string {
     const chunks: string[] = [];

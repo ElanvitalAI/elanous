@@ -49,6 +49,36 @@ for (const [line, label, destination] of observedLandRefusals) {
   });
 }
 
+test('typecheck failure is classified as drift only with explicit drift context', () => {
+  const line = '✗ heavy-remote: 원격 게이트 gate-rc-1 · remote: stderr: [typecheck] FAIL — tsc failed with errors.';
+  const unrelatedGateFailure = '✗ heavy-remote: 원격 게이트 gate-rc-1 · remote: stderr: tsc passed; lint failed.';
+  const mainDeltaTypecheckFailure = '✗ heavy-remote: 원격 게이트 gate-rc-1 · remote: stderr: error: main-baseline tsc introduced 1 TypeScript diagnostic(s).';
+  const localLine = '✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.';
+  expect(classifyPrLandRefusal(line, { typecheckDrift: 'drift' })).toBe('typecheck-drift');
+  expect(classifyPrLandRefusal(localLine, { typecheckDrift: 'drift' })).toBe('typecheck-drift');
+  expect(classifyPrLandRefusal(line)).toBe('other');
+  expect(classifyPrLandRefusal(localLine)).toBe('other');
+  expect(classifyPrLandRefusal(line, { typecheckDrift: 'drift-unmeasured' })).toBe('other');
+  expect(classifyPrLandRefusal(line, { typecheckDrift: 'drift-unrelated' })).toBe('other');
+  expect(classifyPrLandRefusal(unrelatedGateFailure, { typecheckDrift: 'drift' })).toBe('other');
+  expect(classifyPrLandRefusal(mainDeltaTypecheckFailure, { typecheckDrift: 'drift' })).toBe('typecheck-drift');
+  expect(classifyPrLandRefusal('✗ heavy-remote: 원격 게이트 gate-rc-1 — 로컬 게이트로 폴백하지 않는다.', { typecheckDrift: 'drift' })).toBe('other');
+});
+
+test('observed typecheck drift uses the merge refusal edge path', () => {
+  const line = '✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.';
+  expect(readJourneyEdge('merge', 'typecheck-drift')).toMatchObject({ source: 'graph', on: 'refusal', to: 'main-sync' });
+  const rows: { event: string; data?: unknown }[] = [];
+  const off = debug.registerSink({ name: 'pr-land-typecheck-drift-refusal-test', emit: (row) => {
+    if (row.event === 'graph-edge-taken') rows.push(row);
+  } });
+  try {
+    observePrLandRefusal(line, { typecheckDrift: 'drift' });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ event: 'graph-edge-taken', data: { from: 'merge', on: 'refusal', label: 'typecheck-drift', to: 'main-sync', taken: 'main-sync' } });
+  } finally { off(); }
+});
+
 test('generic pinned preflight without draft evidence does not claim draft', () => {
   expect(classifyPrLandRefusal(cases[0][0])).toBe('other');
 });

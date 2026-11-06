@@ -34,7 +34,7 @@ describe('MAT1a CLI root maturity', () => {
     expect(Object.keys(grades).sort()).toEqual([...names, ...system.filter(name => !names.includes(name)), ...absentPrivateLedger].sort());
     const doc = readFileSync(join(import.meta.dir, '../../release/public/docs/commands.md'), 'utf8');
     const documented = new Set([...doc.matchAll(/elanous ([a-z][a-z:-]*)/g)].map(match => match[1]));
-    expect(documented.size).toBe(23);
+    expect(documented.size).toBe(24);
     expect(names.filter(name => cliRootMaturity(name) === 'stable').sort())
       .toEqual(names.filter(name => documented.has(name) || commands.find(c => c.name() === name)!.aliases().some(alias => documented.has(alias))).sort());
     expect(Object.entries(grades).filter(([, grade]) => grade === 'system').map(([name]) => name).sort()).toEqual([...system].sort());

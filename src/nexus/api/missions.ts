@@ -49,7 +49,7 @@ import {
 } from '../../autopilot/mission-trace.js';
 
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 function isMissionStatus(v: unknown): v is MissionStatus {
   return typeof v === 'string'

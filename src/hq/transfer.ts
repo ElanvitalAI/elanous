@@ -15,6 +15,7 @@ export interface TransferDeps {
   confirm: (question: string) => boolean;
   promote: (host: string) => PromoteResult;
   journalDir: string;
+  reallocatePools: (fromHost: string, toHost: string) => number | null;
 }
 
 const aliases: Record<string, string[]> = { mbp: ['mbp', 'MacBookProM5'], 'node-b': ['node-b', 'MacStudioB1'] };
@@ -32,6 +33,16 @@ PY`;
 const cronCommand = `crontab -l && printf '\\n---HQ-AUDIT---\\n' && elanous hq fence-audit --json`;
 const fenceCommand = `elanous hq fence --role cron -- sh -c 'printf "HQ_FENCE_ALLOWED:%s\\n" "$ELANOUS_HQ_GENERATION"'`;
 
+/** Shared production SSH command used for pool reassignment after host promotion. */
+export function reallocatePoolsThroughRunner(fromHost: string, toHost: string, run: SshRunner = defaultSshRunner): number | null {
+  const result = run(toHost, `ELANOUS_STATE_DIR="$HOME/.elanous-hqstate" elanous resources reassign-pools --from-host '${fromHost}' --to-host '${toHost}' --json`);
+  if (result.status !== 0) return null;
+  try {
+    const parsed = JSON.parse(result.stdout) as { ok?: unknown; reassigned?: unknown };
+    return parsed.ok === true && Number.isSafeInteger(parsed.reassigned) ? parsed.reassigned as number : null;
+  } catch { return null; }
+}
+
 export function defaultTransferDeps(): TransferDeps {
   const arbiter = getUserConfig().hq?.arbiter ?? 'cloud-vm';
   return {
@@ -46,6 +57,7 @@ export function defaultTransferDeps(): TransferDeps {
     },
     promote: (host) => promoteHq(host, true),
     journalDir: join(getElanousConfigDir(), 'hq', 'transfers'),
+    reallocatePools: (fromHost, toHost) => reallocatePoolsThroughRunner(fromHost, toHost, defaultSshRunner),
   };
 }
 
@@ -162,6 +174,12 @@ export function transferHq(direction: Direction, apply = false, deps: TransferDe
       const promoted = deps.promote(to);
       for (const line of promoted.lines) record(`⑧ promotion ${line.step}`, line.status, line.measurement);
       if (!promoted.ok) return result(false);
+      const reassigned = deps.reallocatePools(from, to);
+      if (reassigned === null) {
+        record('⑧ resource pool reallocation', 'failed', `pool ledger still references ${from}`);
+        return result(false);
+      }
+      record('⑧ resource pool reallocation', 'done', `pools=${reassigned} ${from}→${to}`);
     }
     const sourceAfter = remote(from, fenceCommand);
     const targetAfter = remote(to, fenceCommand);

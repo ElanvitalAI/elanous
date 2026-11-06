@@ -9,7 +9,7 @@
 // Phase 6 (Discovery) extends the snapshot with health-probe + rate-
 // limit data; Phase 5 stays read-mostly.
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { getCatalog } from '../../registry/loader.js';
 import {
   getLiveStore,

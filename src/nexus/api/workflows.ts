@@ -55,7 +55,7 @@ import {
   rejectApproval,
   resolveApproval,
 } from './workflow-approvals.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { publishWorkflowRunEvent } from './workflow-run-event-bridge.js';
 import { runApprovalAcrossChannels } from './workflow-approval-multi-channel.js';

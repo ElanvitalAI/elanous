@@ -29,6 +29,19 @@ describe('dashboard real user echo wiring', () => {
   test.skipIf(process.platform === 'darwin')('PTY screen preserves submitted Q2 → answer Q2 → submitted Q3 → answer Q3', async () => {
     const { startPty, unregisterPty } = await import('../src/pty-shell/registry.js');
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    // 부팅 대기 = 고정 9초가 아니라 «빈 입력창(❯)이 뜰 때까지» 폴링(상한 30초) — 빠른 호스트에선 2~3초에 끝난다.
+    const composerReady = async (pty: { renderScreen(): Promise<string> }, timeoutMs = 30_000) => {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        // 입력창이 그려진 뒤 입력 루프가 키를 받기까지 짧게 더 기다린다(첫 글자 유실 방지).
+        if (emptyComposer(await pty.renderScreen())) {
+          await sleep(500);
+          if (emptyComposer(await pty.renderScreen())) return true;
+        }
+        if (Date.now() >= deadline) return false;
+        await sleep(200);
+      }
+    };
     const dir = await mkdtemp(join(tmpdir(), 'elanous-echo-'));
     let handle: ReturnType<typeof startPty> | undefined;
     const local = await startAimockLocal((mock) => {
@@ -79,8 +92,7 @@ describe('dashboard real user echo wiring', () => {
         unsetEnv: ['ELANOUS_TEST_FAKE_LLM'],
         cols: 160, rows: 50, kind: 'shell', detach: false,
       });
-      await sleep(9000);
-      expect(emptyComposer(await handle.renderScreen())).toBe(true);
+      expect(await composerReady(handle)).toBe(true);
       handle.write('1부터 30까지 천천히 한 줄에 하나씩 써 줘. 도구는 쓰지 마.\r');
       // A FIFO classification exists only while the first turn owns the keyboard.
       // Do not accept a normal submission after the first turn has ended.
@@ -137,8 +149,7 @@ describe('dashboard real user echo wiring', () => {
         unsetEnv: ['ELANOUS_TEST_FAKE_LLM'],
         cols: 160, rows: 50, kind: 'shell', detach: false,
       });
-      await sleep(9000);
-      expect(emptyComposer(await handle.renderScreen())).toBe(true);
+      expect(await composerReady(handle)).toBe(true);
       const beforeLive = new Map(await Promise.all((await debugFiles()).map(async path => [path, (await stat(path)).size] as const)));
       handle.write('Bash 도구를 사용해서 현재 디렉터리의 파일 이름을 확인하고 설명해 줘.\r');
       await sleep(800);

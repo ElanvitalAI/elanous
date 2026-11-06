@@ -1,0 +1,14 @@
+world: hq-move
+seed: 1109
+devices:
+  - fake-ssh
+  - fake-clock
+events:
+  - at: +1m
+    id: hq-move
+steps:
+  - inject:
+      id: hq-move
+  - observe: hq-move
+expect:
+  fault: none

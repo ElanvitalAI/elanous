@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -117,6 +118,56 @@ test('read-only gate preflight selects files without running exposure, tests, ba
   expect(picked.testFiles).toEqual([]);
   expect(picked.skipTestStep).toBe(true);
   expect(called).toEqual([]);
+});
+
+test('remote checkout with a local mirror origin receives the caller repository identity for gate receipts', () => {
+  const fixture = fixtureRepository({
+    'bun.lock': '{\"lockfileVersion\":1}\n',
+    'src/a.ts': 'export const a = 1;\n',
+    'src/a.test.ts': "import { expect, test } from 'bun:test';\nimport { a } from './a.js';\ntest('a', () => expect(a).toBe(1));\n",
+  });
+  const receipts = mkdtempSync(join(tmpdir(), 'elanous-gate-origin-receipts-'));
+  const previousChild = process.env.ELANOUS_GATE_REMOTE_CHILD;
+  const previousIdentity = process.env.ELANOUS_GATE_REPOSITORY_IDENTITY;
+  try {
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { cwd: fixture.cwd, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+      return result.stdout.trim();
+    };
+    git(['config', 'user.email', 'gate-test@example.invalid']);
+    git(['config', 'user.name', 'Gate Test']);
+    git(['remote', 'add', 'origin', '/home/gate/mirrors/elanous-agent.git']);
+    git(['add', '.']); git(['commit', '-m', 'base']);
+    const base = git(['rev-parse', 'HEAD']);
+    writeFileSync(join(fixture.cwd, 'src/a.ts'), 'export const a = 2;\n');
+    git(['add', '.']); git(['commit', '-m', 'gate head']);
+    delete process.env.ELANOUS_GATE_REPOSITORY_IDENTITY;
+    process.env.ELANOUS_GATE_REMOTE_CHILD = '1';
+    const deps = {
+      changedFiles: () => ({ files: ['src/a.ts'], baseRef: base }),
+      runTests: () => ok(), runBaseline: () => ({ status: 'pass' as const, output: '', log: '' }),
+      gateReceiptDir: () => receipts, envKey: () => 'gate-test-runtime',
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+    };
+    const unavailable = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, deps);
+    expect(unavailable.lines.join('\n')).toContain('gate receipt: full radius (repository-origin-unavailable)');
+    expect(readdirSync(receipts)).toHaveLength(0);
+
+    process.env.ELANOUS_GATE_REPOSITORY_IDENTITY = 'https://github.com/ElanvitalAI/elanous';
+    const identified = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, deps);
+    expect(identified.lines.join('\n')).not.toContain('repository-origin-unavailable');
+    expect(readdirSync(receipts)).toHaveLength(1);
+    const receipt = JSON.parse(readFileSync(join(receipts, readdirSync(receipts)[0]!), 'utf8')) as { repositoryHash: string };
+    expect(receipt.repositoryHash).toBe(createHash('sha256').update('https://github.com/ElanvitalAI/elanous').digest('hex'));
+  } finally {
+    if (previousChild === undefined) delete process.env.ELANOUS_GATE_REMOTE_CHILD; else process.env.ELANOUS_GATE_REMOTE_CHILD = previousChild;
+    if (previousIdentity === undefined) delete process.env.ELANOUS_GATE_REPOSITORY_IDENTITY; else process.env.ELANOUS_GATE_REPOSITORY_IDENTITY = previousIdentity;
+    rmSync(receipts, { recursive: true, force: true });
+    fixture.dispose();
+  }
 });
 
 test('gate receipt reuses unchanged passing importer tests and --no-inherit restores full radius', () => {

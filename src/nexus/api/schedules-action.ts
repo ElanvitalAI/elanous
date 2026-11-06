@@ -9,7 +9,7 @@
 // serve 로만 노출). 파괴적 액션(delete/adopt)은 자동 백업(~/.elanous/backups) 이
 // dispatchScheduleManage 안에서 보장.
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 interface ScheduleActionBody {
   action?: string;

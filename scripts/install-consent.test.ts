@@ -24,7 +24,7 @@ test('declining installation leaves the home and prefix unchanged', () => {
   }
 });
 
-test('consent runs the installed doctor once, reports failure and permits retry', () => {
+test('consent runs the installed bootstrap once, reports failure and permits retry', () => {
   const home = mkdtempSync(join(tmpdir(), 'elanous-setup-'));
   try {
     const pkg = join(home, 'package');
@@ -40,22 +40,22 @@ test('consent runs the installed doctor once, reports failure and permits retry'
     const env = { ...process.env, HOME: home, ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_ANSWER: 'y', ELANOUS_INSTALL_LANG: 'en', RECORD: record };
     const failed = spawnSync('/bin/bash', args, { encoding: 'utf8', env: { ...env, FAIL_DOCTOR: '1' }, timeout: 120_000 });
     expect(failed.status, failed.stderr).toBe(1);
-    const retryLine = failed.stderr.split('\n').find(line => line.startsWith('Setup failed; retry:'));
+    const retryLine = failed.stderr.split('\n').find(line => line.startsWith('Bootstrap failed; retry:'));
     expect(retryLine).toBeDefined();
-    const retryCommand = retryLine!.slice('Setup failed; retry: '.length);
-    expect(retryCommand).toContain('doctor --fix --yes --setup-tools');
+    const retryCommand = retryLine!.slice('Bootstrap failed; retry: '.length);
+    expect(retryCommand).toContain('bootstrap');
     expect(existsSync(join(home, 'pwned'))).toBe(false);
     const firstCall = JSON.parse(readFileSync(record, 'utf8').split('\n')[0]);
-    expect(firstCall.args).toEqual(['doctor', '--fix', '--yes', '--setup-tools', '--json']);
+    expect(firstCall.args).toEqual(['bootstrap']);
     expect(firstCall.prefix).toBe(realpathSync(prefix));
     expect(firstCall.path.startsWith(`${realpathSync(prefix)}/bin:`)).toBe(true);
     const retry = spawnSync('/bin/bash', ['-c', retryCommand], { encoding: 'utf8', env, timeout: 120_000 });
     expect(retry.status, retry.stderr).toBe(0);
-    expect(retry.stderr).not.toContain('Setup failed; retry:');
+    expect(retry.stderr).not.toContain('Bootstrap failed; retry:');
     expect(retry.stderr).not.toContain('harness command missing');
     expect(existsSync(join(home, 'pwned'))).toBe(false);
     const calls = readFileSync(record, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    expect(calls.map(call => call.args)).toEqual([['doctor', '--fix', '--yes', '--setup-tools', '--json'], ['doctor', '--fix', '--yes', '--setup-tools']]);
+    expect(calls.map(call => call.args)).toEqual([['bootstrap'], ['bootstrap']]);
     expect(calls[1].prefix).toBe(realpathSync(prefix));
     expect(calls[1].path.startsWith(`${realpathSync(prefix)}/bin:`)).toBe(true);
   } finally {

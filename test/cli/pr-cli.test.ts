@@ -1171,6 +1171,69 @@ describe('elanous pr land', () => {
     const WINDOW_B = 'f'.repeat(40);
     const FORK = '9'.repeat(40);
     type WindowOpts = { gateBaseInHead?: boolean; gateBaseInTip?: boolean; tipLocal?: boolean; windowLog?: string; windowLogOk?: boolean };
+    function conflictingRepo(path: string) {
+      const repo = mkdtempSync(join(tmpdir(), 'pr-land-live-conflict-'));
+      git(repo, 'init', '-q', '-b', 'main');
+      git(repo, 'config', 'user.name', 'test');
+      git(repo, 'config', 'user.email', 'test@localhost');
+      mkdirSync(join(repo, path, '..'), { recursive: true });
+      writeFileSync(join(repo, path), 'base\n');
+      git(repo, 'add', path); git(repo, 'commit', '-qm', 'base');
+      const base = git(repo, 'rev-parse', 'HEAD');
+      git(repo, 'checkout', '-qb', 'feat/land', base);
+      writeFileSync(join(repo, path), 'base\npr row\n');
+      git(repo, 'commit', '-qam', 'PR row');
+      const head = git(repo, 'rev-parse', 'HEAD');
+      git(repo, 'checkout', '-q', 'main');
+      writeFileSync(join(repo, path), 'base\nmain row\n');
+      git(repo, 'commit', '-qam', 'main row');
+      const main = git(repo, 'rev-parse', 'HEAD');
+      git(repo, 'checkout', '-q', 'feat/land');
+      return { repo, path, base, head, main };
+    }
+    function liveConflictRunner(
+      fixture: ReturnType<typeof conflictingRepo>, pushed: string[], notices: string[][] = [], gitCalls: string[][] = [],
+      pushOpts: { url?: string; accept?: boolean } = {},
+    ) {
+      const { run: fallback } = pinnedRun();
+      return (cmd: string, args: readonly string[]) => {
+        const command = args.join(' ');
+        if (cmd === 'git' && args.length === 1 && args[0] === 'remote') return { ok: true, out: 'origin\n' };
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('baseRefName,url')) return { ok: true, out: JSON.stringify({ baseRefName: 'main', url: URL }) };
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,headRefName,baseRefName,state,isDraft,url')) return { ok: true, out: JSON.stringify({ headRefOid: fixture.head, headRefName: 'feat/land', baseRefName: 'main', state: 'OPEN', isDraft: false, url: URL }) };
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,state,isDraft,baseRefName')) return { ok: true, out: JSON.stringify({ headRefOid: fixture.head, state: 'OPEN', isDraft: false, baseRefName: 'main' }) };
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('title,body,headRefOid,headRefName,headRepositoryOwner,headRepository,author')) {
+          return { ok: true, out: JSON.stringify({ title: 'PR intent', body: 'append a row', headRefOid: fixture.head, headRefName: 'feat/land', headRepositoryOwner: { login: 'example' }, headRepository: { name: 'repo' }, author: { login: 'unknown-author' } }) };
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,headRefName,headRepositoryOwner,headRepository')) {
+          return { ok: true, out: JSON.stringify({ headRefOid: fixture.head, headRefName: 'feat/land', headRepositoryOwner: { login: 'example' }, headRepository: { name: 'repo' } }) };
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable,mergeStateStatus')) return { ok: true, out: 'CONFLICTING DIRTY\n' };
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) return { ok: true, out: 'CONFLICTING' };
+        if (cmd === 'git' && command === 'rev-parse HEAD') return { ok: true, out: `${fixture.head}\n` };
+        if (cmd === 'git' && command === 'rev-parse --verify origin/main') return { ok: true, out: `${fixture.main}\n` };
+        if (cmd === 'git' && command === 'rev-parse --verify refs/remotes/origin/main') return { ok: true, out: `${fixture.main}\n` };
+        if (cmd === 'git' && args[0] === 'ls-remote' && args.at(-1) === 'refs/heads/main') return { ok: true, out: `${fixture.main}\trefs/heads/main\n` };
+        if (cmd === 'git' && args[0] === 'fetch') return { ok: true, out: '' };
+        if (cmd === 'git' && command === 'remote get-url origin') return { ok: true, out: 'git@github.com:example/repo.git\n' };
+        if (cmd === 'git' && command === 'remote get-url --push origin') { gitCalls.push([...args]); return { ok: true, out: `${pushOpts.url ?? 'git@github.com:example/repo.git'}\n` }; }
+        if (cmd === 'git' && args[0] === 'check-ref-format' && args[1] === '--branch') return { ok: true, out: 'feat/land\n' };
+        if (cmd === 'git' && args[0] === 'ls-remote' && args.at(-1) === 'refs/heads/feat/land') return { ok: true, out: `${fixture.head}\trefs/heads/feat/land\n` };
+        if (cmd === 'git' && args[0] === 'push') {
+          gitCalls.push([...args]);
+          if (pushOpts.accept === false) return { ok: false, out: 'stale lease' };
+          pushed.push(args.at(-1) ?? '');
+          return { ok: true, out: '' };
+        }
+        if (cmd === 'git') {
+          gitCalls.push([...args]);
+          const result = spawnSync('git', args, { cwd: fixture.repo, encoding: 'utf8' });
+          return { ok: result.status === 0, out: result.stdout };
+        }
+        if (cmd === 'eln' && args[0] === 'msg' && args[1] === 'post') { notices.push([...args]); return { ok: true, out: '#notice' }; }
+        return fallback(cmd, args);
+      };
+    }
     function pinnedRun(opts: { ancestor?: boolean; landingAncestors?: readonly string[]; window?: WindowOpts; baseRefName?: () => string } = {}) {
       const inner = landRun(overlapLog, 'src/land.ts\n', '');
       const commands: Array<{ cmd: string; args: readonly string[] }> = [];
@@ -1226,6 +1289,131 @@ describe('elanous pr land', () => {
       return { dir, evidence };
     }
     const pinnedManager = () => fakeManager({ findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: URL }) });
+
+    it('live runPrLand pushes one append-only documentation merge per pinned head, never to main', async () => {
+      const fixture = conflictingRepo('docs/conductor/CONDUCTOR.md');
+      expect(spawnSync('git', ['merge-base', '--is-ancestor', fixture.main, fixture.head], { cwd: fixture.repo }).status).toBe(1);
+      const pushed: string[] = [];
+      const gitCalls: string[][] = [];
+      const run = liveConflictRunner(fixture, pushed, [], gitCalls);
+      const { dir, evidence } = evidenceFiles({ gateBase: fixture.base });
+      const review = join(dir, 'review-results', `TA-1-51-${fixture.head.slice(0, 12)}.json`);
+      writeFileSync(review, JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: fixture.head }));
+      writeFileSync(evidence, JSON.stringify({ pr: 51, head: fixture.head, gate: { head: fixture.head, baseCommit: fixture.base, passed: true }, reviewResult: review }));
+      const { manager } = fakeManager({ findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: URL }), mergePrOutcome: () => ({ ok: false, kind: 'not-merged', state: 'OPEN' }) });
+      const stateDir = join(isolatedStateDir, 'conflict-automerge');
+      const sink = output();
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          expect(await runPrLand({ pr: '51', expectedHead: fixture.head, overlapEvidence: evidence, cwd: fixture.repo }, {
+            ...baseDeps, manager, run, out: sink.out, conflictAutomergeStateDir: stateDir,
+            reviewResultsDir: join(dir, 'review-results'),
+          })).toBe(1);
+        }
+        if (pushed.length !== 1) throw new Error(`automerge diagnostics: pushed=${pushed.length}; ${sink.errors.join(' | ')} / ${sink.logs.join(' | ')}`);
+        expect(pushed).toHaveLength(1);
+        const pushCall = gitCalls.find((args) => args[0] === 'push');
+        expect(pushCall).toContain(`--force-with-lease=refs/heads/feat/land:${fixture.head}`);
+        expect(pushCall).toContain('git@github.com:example/repo.git');
+        const pushedRef = pushed[0]!.split(':')[1];
+        const commit = pushed[0]!.split(':')[0]!;
+        expect(pushedRef).toBe('refs/heads/feat/land');
+        expect(git(fixture.repo, 'show', `${commit}:docs/conductor/CONDUCTOR.md`)).toBe('base\nmain row\npr row');
+        expect(git(fixture.repo, 'rev-parse', 'HEAD')).toBe(fixture.head);
+        expect(git(fixture.repo, 'rev-parse', 'main')).toBe(fixture.main);
+        expect(sink.logs.join('\n')).toContain('새 head의 시험·Terra 리뷰 뒤 다시 등록');
+      } finally { rmSync(dir, { recursive: true, force: true }); rmSync(fixture.repo, { recursive: true, force: true }); }
+    });
+
+    it('refuses a push URL outside the pinned PR repository', async () => {
+      const fixture = conflictingRepo('docs/conductor/CONDUCTOR.md');
+      const pushed: string[] = [];
+      const gitCalls: string[][] = [];
+      const run = liveConflictRunner(fixture, pushed, [], gitCalls, { url: 'git@github.com:other/repo.git' });
+      const { dir, evidence } = evidenceFiles({ gateBase: fixture.base });
+      const review = join(dir, 'review-results', `TA-1-51-${fixture.head.slice(0, 12)}.json`);
+      writeFileSync(review, JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: fixture.head }));
+      writeFileSync(evidence, JSON.stringify({ pr: 51, head: fixture.head, gate: { head: fixture.head, baseCommit: fixture.base, passed: true }, reviewResult: review }));
+      const { manager } = fakeManager({ findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: URL }), mergePrOutcome: () => ({ ok: false, kind: 'not-merged', state: 'OPEN' }) });
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: fixture.head, overlapEvidence: evidence, cwd: fixture.repo }, {
+          ...baseDeps, manager, run, out: output().out, reviewResultsDir: join(dir, 'review-results'),
+        })).toBe(1);
+        expect(pushed).toHaveLength(0);
+        expect(gitCalls.some((args) => args[0] === 'push')).toBe(false);
+        expect(gitCalls.some((args) => args.join(' ') === 'remote get-url --push origin')).toBe(true);
+        expect(git(fixture.repo, 'rev-parse', 'HEAD')).toBe(fixture.head);
+        expect(git(fixture.repo, 'rev-parse', 'main')).toBe(fixture.main);
+      } finally { rmSync(dir, { recursive: true, force: true }); rmSync(fixture.repo, { recursive: true, force: true }); }
+    });
+
+    it('rejects a non-GitHub host that embeds a github.com repository path', async () => {
+      const fixture = conflictingRepo('docs/conductor/CONDUCTOR.md');
+      const pushed: string[] = [];
+      const gitCalls: string[][] = [];
+      const run = liveConflictRunner(fixture, pushed, [], gitCalls, { url: 'https://evil.example/github.com/example/repo.git' });
+      const { dir, evidence } = evidenceFiles({ gateBase: fixture.base });
+      const review = join(dir, 'review-results', `TA-1-51-${fixture.head.slice(0, 12)}.json`);
+      writeFileSync(review, JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: fixture.head }));
+      writeFileSync(evidence, JSON.stringify({ pr: 51, head: fixture.head, gate: { head: fixture.head, baseCommit: fixture.base, passed: true }, reviewResult: review }));
+      const { manager } = fakeManager({ findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: URL }), mergePrOutcome: () => ({ ok: false, kind: 'not-merged', state: 'OPEN' }) });
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: fixture.head, overlapEvidence: evidence, cwd: fixture.repo }, {
+          ...baseDeps, manager, run, out: output().out, reviewResultsDir: join(dir, 'review-results'),
+        })).toBe(1);
+        expect(pushed).toHaveLength(0);
+        expect(gitCalls.some((args) => args[0] === 'push')).toBe(false);
+        expect(git(fixture.repo, 'rev-parse', 'HEAD')).toBe(fixture.head);
+        expect(git(fixture.repo, 'rev-parse', 'main')).toBe(fixture.main);
+      } finally { rmSync(dir, { recursive: true, force: true }); rmSync(fixture.repo, { recursive: true, force: true }); }
+    });
+
+    it('uses the pinned-head lease so a concurrent remote-head change rejects the push', async () => {
+      const fixture = conflictingRepo('docs/conductor/CONDUCTOR.md');
+      const pushed: string[] = [];
+      const gitCalls: string[][] = [];
+      const run = liveConflictRunner(fixture, pushed, [], gitCalls, { accept: false });
+      const { dir, evidence } = evidenceFiles({ gateBase: fixture.base });
+      const review = join(dir, 'review-results', `TA-1-51-${fixture.head.slice(0, 12)}.json`);
+      writeFileSync(review, JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: fixture.head }));
+      writeFileSync(evidence, JSON.stringify({ pr: 51, head: fixture.head, gate: { head: fixture.head, baseCommit: fixture.base, passed: true }, reviewResult: review }));
+      const { manager } = fakeManager({ findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: URL }), mergePrOutcome: () => ({ ok: false, kind: 'not-merged', state: 'OPEN' }) });
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: fixture.head, overlapEvidence: evidence, cwd: fixture.repo }, {
+          ...baseDeps, manager, run, out: output().out, reviewResultsDir: join(dir, 'review-results'),
+        })).toBe(1);
+        const pushCall = gitCalls.find((args) => args[0] === 'push');
+        expect(pushCall).toContain(`--force-with-lease=refs/heads/feat/land:${fixture.head}`);
+        expect(pushed).toHaveLength(0);
+        expect(git(fixture.repo, 'rev-parse', 'HEAD')).toBe(fixture.head);
+        expect(git(fixture.repo, 'rev-parse', 'main')).toBe(fixture.main);
+      } finally { rmSync(dir, { recursive: true, force: true }); rmSync(fixture.repo, { recursive: true, force: true }); }
+    });
+
+    it('does not live-resolve or push a source-code conflict', async () => {
+      const fixture = conflictingRepo('src/conflict.ts');
+      const pushed: string[] = [];
+      const notices: string[][] = [];
+      const run = liveConflictRunner(fixture, pushed, notices);
+      const { dir } = evidenceFiles({ gateBase: fixture.base });
+      const review = join(dir, 'review-results', `TA-1-51-${fixture.head.slice(0, 12)}.json`);
+      writeFileSync(review, JSON.stringify({ pr: 51, verdict: 'pass', reviewed: true, mustFix: [], headCommit: fixture.head }));
+      const evidence = join(dir, 'evidence.json');
+      writeFileSync(evidence, JSON.stringify({ pr: 51, head: fixture.head, gate: { head: fixture.head, baseCommit: fixture.base, passed: true }, reviewResult: review }));
+      const { manager } = fakeManager({ findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url: URL }), mergePrOutcome: () => ({ ok: false, kind: 'not-merged', state: 'OPEN' }) });
+      const sink = output();
+      try {
+        await runPrLand({ pr: '51', expectedHead: fixture.head, overlapEvidence: evidence, cwd: fixture.repo }, {
+          ...baseDeps, manager, run, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
+          sendCodeConflictNotice: ({ recipient, body }) => { notices.push([recipient, body]); return true; },
+        });
+        if (notices.length !== 1) throw new Error(`owner notice diagnostics: ${sink.errors.join(' | ')} / ${sink.logs.join(' | ')}`);
+        expect(pushed).toHaveLength(0);
+        expect(notices).toHaveLength(1);
+        expect(notices[0]).toContain('OP');
+        expect(notices[0]!.join(' ')).toContain('src/conflict.ts');
+      } finally { rmSync(dir, { recursive: true, force: true }); rmSync(fixture.repo, { recursive: true, force: true }); }
+    });
 
     it('without --overlap-evidence the pinned refusal is unchanged', async () => {
       const { run } = pinnedRun();
@@ -4201,8 +4389,8 @@ describe('public-export-leak at landing (LEAK1)', () => {
   it('real exporter and landing gate detect a changed public leak even with a pre-existing skill boundary', async () => {
     const cwd = mkdtempSync(join(process.cwd(), '.pr-land-real-export-'));
     try {
-      for (const dir of ['scripts', 'release', 'skills/old', 'catalog', 'src/video-pipeline', 'src/util', 'src/cli']) mkdirSync(join(cwd, dir), { recursive: true });
-      for (const file of ['scripts/public-export.ts', 'scripts/skill-boundary.ts', 'scripts/open-core-boundary.ts', 'src/util/spawn-sync-output.ts', 'src/cli/stdout-json.ts']) {
+      for (const dir of ['scripts', 'release', 'skills/old', 'catalog', 'src/video-pipeline', 'src/util', 'src/cli', 'src/ux-sim']) mkdirSync(join(cwd, dir), { recursive: true });
+      for (const file of ['scripts/public-export.ts', 'scripts/skill-boundary.ts', 'scripts/open-core-boundary.ts', 'src/util/spawn-sync-output.ts', 'src/cli/stdout-json.ts', 'src/ux-sim/secret-canary.ts']) {
         copyFileSync(join(process.cwd(), file), join(cwd, file));
       }
       writeFileSync(join(cwd, 'release/public-export.yaml'), 'include: ["scripts/**", "skills/**"]\nexclude: []\nreplace: {}\nskills: core\n');

@@ -471,7 +471,11 @@ export interface LLMOpts {
     compactMessages: (
       messages: LLMMessage[],
       info: { provider: string; requestChars: number; maxChars: number },
-    ) => Promise<{ messages: LLMMessage[]; reason: string } | null>;
+    ) => Promise<{ messages: LLMMessage[]; reason: string; commit?: () => void | Promise<void> } | null>;
+    compactNext?: (
+      messages: LLMMessage[],
+      startIndex: number,
+    ) => Promise<{ messages: LLMMessage[]; reason: string; nextIndex: number } | null>;
     /** Receives compacted provider messages so the tool-loop can replace its canonical history. */
     onCompacted?: (messages: LLMMessage[]) => void | Promise<void>;
     onMeasured?: (info: {
@@ -9079,6 +9083,10 @@ export async function streamLLMWithTools(
   const seenToolCallSignatures = new Map<string, number>();
   // TUI-INITIATIVE-S ② — 같은 도구·같은 인자가 «같은 오류»로 끝난 횟수(성공하면 지운다). 아래 L-2 차단을 gpt 계열·비탐색 도구로 넓힌다.
   const erroredToolCallSignatures = new Map<string, { error: string; count: number }>();
+  // Consecutive failures by tool, independent of argument churn. A third
+  // identical failure is returned as an error without dispatching again.
+  const repeatedToolFailureStreaks = new Map<string, { fingerprint: string; count: number; message: string; failedCallSignatures: Set<string> }>();
+  let repeatBlockEventEmitted = false;
   // W3-A + extension (2026-05-03) — Broad-spot dedup map. MUST live
   // outside the turn loop so the counter persists across turns. (Bug
   // 2026-05-03 PM: original placement inside turn loop reset the map
@@ -10910,6 +10918,24 @@ export async function streamLLMWithTools(
             phaseRejected: false,
           };
         }
+        const failureStreak = repeatedToolFailureStreaks.get(call.name);
+        if (failureStreak && failureStreak.count >= 2) {
+          const repeatedFingerprint = fingerprintError(failureStreak.message, call.name);
+          // A changed request may be the repair the tool asked for (or a
+          // different taskId). Only suppress an already-failed request; a
+          // novel signature gets one preflight/dispatch attempt.
+          const callSignature = signatureOf(call);
+          if (repeatedFingerprint === failureStreak.fingerprint && failureStreak.failedCallSignatures.has(callSignature)) {
+            if (!repeatBlockEventEmitted) {
+              debug.log('llm.router', 'tool-error-repeat-blocked', { turn, tool: call.name, priorCount: failureStreak.count, reason: 'same-error-twice' }, { level: 'warn' });
+              repeatBlockEventEmitted = true;
+            }
+            return {
+              result: { message: failureStreak.message, fix: '같은 도구의 같은 실패가 두 번 연속 발생했습니다. 원인을 바꾸거나 사람에게 넘기세요.' },
+              isError: true, phaseRejected: false,
+            };
+          }
+        }
         // Codex-family same-args dedup guard (fix L-2). Scope is
         // EXPLORATORY_TOOLS only — repeating Bash/RunShell/Edit/Write
         // is often legitimate (retry after a fix, apply-then-verify,
@@ -11234,6 +11260,28 @@ export async function streamLLMWithTools(
         // 스펙을 프로바이더에 선언하지 않는다는 의도가 우회되지 않게.
         const resultSignalsError = !!result && typeof result === 'object'
           && typeof (result as { error?: unknown }).error === 'string';
+        if (!!result && typeof result === 'object' && (result as { isError?: unknown }).isError === true) isError = true;
+        const resultRecord = result && typeof result === 'object' ? result as Record<string, unknown> : undefined;
+        const surfacedFailure = [resultRecord?.reason, resultRecord?.error, resultRecord?.message, resultRecord?.output]
+          .find((value): value is string => typeof value === 'string' && value.length > 0)
+          ?? (isError ? String(result) : null);
+        if (isError && surfacedFailure) {
+          const fingerprint = fingerprintError(surfacedFailure, call.name);
+          for (const toolName of repeatedToolFailureStreaks.keys()) {
+            if (toolName !== call.name) repeatedToolFailureStreaks.delete(toolName);
+          }
+          const previous = repeatedToolFailureStreaks.get(call.name);
+          repeatedToolFailureStreaks.set(call.name, {
+            fingerprint,
+            count: previous?.fingerprint === fingerprint ? previous.count + 1 : 1,
+            message: surfacedFailure,
+            failedCallSignatures: previous?.fingerprint === fingerprint
+              ? new Set([...previous.failedCallSignatures, signatureOf(call)])
+              : new Set([signatureOf(call)]),
+          });
+        } else {
+          repeatedToolFailureStreaks.clear();
+        }
         {
           const errSig = signatureOf(call);
           const errText = resultSignalsError ? (result as { error: string }).error : isError ? String(result) : null;
@@ -11506,7 +11554,10 @@ export async function streamLLMWithTools(
         }
         const call = callsToDispatch[i]!;
         const failureDetail = stringifyDoomFailureDetail(r.result);
-        const fp = fingerprintError(r.result, call.name);
+        const resultRecord = r.result && typeof r.result === 'object' ? r.result as Record<string, unknown> : undefined;
+        const stableFailure = [resultRecord?.reason, resultRecord?.error, resultRecord?.message, resultRecord?.output]
+          .find((value): value is string => typeof value === 'string' && value.length > 0) ?? r.result;
+        const fp = fingerprintError(stableFailure, call.name);
         const status = toolErrorDoomTracker.record(fp);
         if (status === 'doom') {
           turnDoomDetected = true;
@@ -12660,6 +12711,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
                 const compactWireBody = serializeCodexResponsesWireBody(compactBody, promptCache, sessionCacheKey);
                 const compactChars = compactWireBody.length;
                 if (compactChars < requestChars) {
+                  await compacted.commit?.();
                   messages.splice(0, messages.length, ...compacted.messages);
                   await requestGuard.onCompacted?.(messages);
                   requestBody = compactBody;
@@ -12683,6 +12735,38 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
                 maxChars: requestGuard.maxChars,
                 message: error instanceof Error ? error.message : String(error),
               }, { level: 'warn' });
+            }
+            let nextIndex = 0;
+            while (requestChars > requestGuard.maxChars && requestGuard.compactNext) {
+              try {
+                const candidate = await requestGuard.compactNext(messages, nextIndex);
+                if (!candidate || candidate.nextIndex <= nextIndex) break;
+                nextIndex = candidate.nextIndex;
+                const converted = messagesToResponsesInput(candidate.messages, {
+                  acceptToolImages: codexAcceptToolImages,
+                  acceptUserMessageImages: codexAcceptUserImages,
+                  replayCodexReasoning: !useStore,
+                  stablePrefix: true,
+                });
+                const body = { ...requestBody, instructions: converted.instructions, input: converted.input };
+                const wire = serializeCodexResponsesWireBody(body, promptCache, sessionCacheKey);
+                if (wire.length >= requestChars) continue;
+                messages.splice(0, messages.length, ...candidate.messages);
+                await requestGuard.onCompacted?.(messages);
+                requestBody = body;
+                serializedWireBody = wire;
+                requestChars = wire.length;
+                requestCompacted = true;
+                requestCompactReason = requestChars > requestGuard.maxChars
+                  ? `compaction-still-over-cap:${candidate.reason}` : candidate.reason;
+              } catch (error) {
+                requestCompactReason = 'compaction-error';
+                debug.log('llm.request', 'request-size-compact-error', {
+                  provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
+                  message: error instanceof Error ? error.message : String(error),
+                }, { level: 'warn' });
+                break;
+              }
             }
           }
           requestGuard.onMeasured?.({

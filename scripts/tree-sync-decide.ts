@@ -82,7 +82,9 @@ export async function observeTreeSync(path: string, git: GitCommand = defaultGit
 
   try {
     const remoteRef = `refs/remotes/origin/${branch}`;
-    const fetch = await git(['fetch', '--quiet', 'origin', `refs/heads/${branch}:${remoteRef}`], path);
+    // PR-HEAD-FETCH-STATELESS: «+» so a force-updated remote branch is measured (as diverged) instead of refused,
+    // and no --quiet so a real fetch failure keeps its stderr in the observed error.
+    const fetch = await git(['fetch', 'origin', `+refs/heads/${branch}:${remoteRef}`], path);
     if (fetch.exitCode !== 0) throw failed(`git fetch origin ${branch}`, fetch);
     const counts = await git(['rev-list', '--left-right', '--count', `HEAD...${remoteRef}`], path);
     if (counts.exitCode !== 0) throw failed(`git rev-list HEAD...${remoteRef}`, counts);

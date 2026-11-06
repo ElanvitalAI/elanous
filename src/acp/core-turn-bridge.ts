@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 // UI-Core arc Phase U3b Step 2 — ACP server ↔ runCoreTurn bridge.
 //
 // Turns an AcpTurnContext (the minimal per-prompt shape the ACP
@@ -42,10 +41,10 @@ import { CoreTurnAuthRejectedError } from '../core-turn/auth-rejected-notice.js'
 import { globalTaskNotificationQueue, renderTaskNotificationsXml } from '../agent/task-notification.js';
 import {
   runCoreTurn,
-  runGoalLoop,
-  type CoreTurnContext,
-  type CoreTurnDispatchTool,
-} from '../core-turn/index.js';
+} from '../core-turn/run-core-turn.js';
+import type { CoreTurnContext } from '../core-turn/types.js';
+import { runGoalLoop } from '../core-turn/run-goal-loop.js';
+import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { stripGoalRepeatReadbackPreface } from '../core-turn/run-goal-loop.js';
 import { parseSeatTurnCapConfig, resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
 import { getUserConfig } from '../user-config.js';
@@ -338,9 +337,6 @@ export function bridgeCoreTurnToAcp(
       const surfaceProfile = resolveSessionSurfaceProfile({ userText: turnCtx.userText });
       const factShaped = isFactQuestion(turnCtx.userText);
       const researchTurn = isResearchAgentIntent(turnCtx.userText);
-      // TUI-RESEARCH-RUNID (0.3.4 · 11-04 대표 데모 실측): TUI 리서치는 이 ACP 브리지로 와서 #34991(chat.ts)이 닿지 않았다 —
-      // runId 가 없으면 관측기가 원장 등록을 건너뛰어 live-run 그래프·aside 동일 runId 가 끊긴다.
-      const researchRunId = researchTurn ? randomUUID() : undefined;
       // A quick research/turn lookup still keeps the fact budget. Only the
       // multi-source research/agent route needs enough rounds to compare axes.
       const factQuestion = factShaped && !armGoalLoop && surfaceProfile.id !== 'research/agent';
@@ -547,7 +543,6 @@ export function bridgeCoreTurnToAcp(
       });
       const buildCoreTurnContext = (): CoreTurnContext => ({
         sessionId: turnCtx.sessionId,
-        ...(researchRunId ? { runId: researchRunId } : {}),
         ...(originSessionId ? { originSessionId } : {}),
         ...(turnCtx.userText ? { userText: turnCtx.userText } : {}),
         surfaceProfile,

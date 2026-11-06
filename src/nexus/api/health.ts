@@ -10,7 +10,7 @@ import { resolveCurrentInstance } from '../../instance/current.js';
 import type { NexusState } from '../state/state.js';
 import type { TabRegistry } from '../state/tab-registry.js';
 import { getTestStateRoot, nexusRootDir } from '../paths.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 const UNKNOWN = 'unknown' as const;
 

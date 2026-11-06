@@ -96,7 +96,7 @@ const END_STAGES: readonly SelfImplementProgressStage[] = ['pr-opened', 'aborted
 export type SelfImplementLaunchedToolResult = SelfImplementResult & { runId: string; kind: 'launched'; message: string; next: string; missing: string[] };
 export type SelfImplementPendingToolResult = Partial<SelfImplementResult> & { kind: 'pending'; message: string; next: string; missing: string[] };
 export type SelfImplementObservedOnlyToolResult = { kind: 'observed-only'; observed: true; message: string; next: string; missing: ['runId', 'node'] };
-export type SelfImplementFailedToolResult = Partial<SelfImplementResult> & { kind: 'failed'; reason: string; message: string; next: string; missing: string[]; goalFile?: string };
+export type SelfImplementFailedToolResult = Partial<SelfImplementResult> & { kind: 'failed'; reason: string; message: string; next: string; missing: string[]; goalFile?: string; isError?: true; retryable?: false; fix?: string };
 export type SelfImplementToolResult = SelfImplementLaunchedToolResult | SelfImplementPendingToolResult | SelfImplementObservedOnlyToolResult | SelfImplementFailedToolResult;
 
 /** 하니스가 런을 맡았다 — 파일 편집은 하니스 몫이므로 모델의 직접 Write/Edit 을 문면으로 막는다. */
@@ -141,12 +141,42 @@ export function buildObservedOnlyToolResult(): SelfImplementObservedOnlyToolResu
 
 /** 거부·실패 — 이유와 다음 행동을 구조화해 모델이 재시도·포기·인계를 판단하게 한다. */
 export function buildFailedToolResult(reason: string, result?: SelfImplementResult): SelfImplementFailedToolResult {
+  return buildFailedToolResultWithFix(reason, result, '요청과 실패 이유를 확인한 뒤 필요한 입력을 고쳐 다시 요청하세요.');
+}
+
+function buildFailedToolResultWithFix(reason: string, result: SelfImplementResult | undefined, fix: string, retryable?: false): SelfImplementFailedToolResult {
   const next = result?.runId ? `eln self run ${result.runId}` : '요청과 실패 이유를 확인한 뒤 다시 요청하세요';
   return {
     ...(result ?? {}), kind: 'failed', reason, next,
     missing: [...(result?.runId ? [] : ['runId']), ...(result?.node ? [] : ['node'])],
+    isError: true, ...(retryable === false ? { retryable: false } : {}), fix,
     message: `하니스가 발사되지 않았거나 실패했습니다: ${reason} · 다음: ${next} · 이 턴에서 파일을 직접 편집하지 마세요`,
   };
+}
+
+function preflightManagedSelfImplement(args: Record<string, unknown>, cwd: string): { ok: true; goalTitle?: string } | { ok: false; result: SelfImplementFailedToolResult } {
+  const goalFileFix = 'goalFile은 저장소 안의 기존 GOAL-*.md 또는 GOAL-*.txt 경로로 지정하세요.';
+  const invalidGoalFile = () => ({ ok: false as const, result: buildFailedToolResultWithFix('SelfImplement goalFile preflight failed: expected an existing repository-local GOAL document', undefined, goalFileFix, false) });
+  const feature = typeof args.feature === 'string' ? args.feature.trim() : '';
+  if (!feature) return { ok: false, result: buildFailedToolResultWithFix('SelfImplement: `feature` is required', undefined, 'feature를 한 줄로 지정하세요.', false) };
+  if (args.goalFile === undefined) return { ok: true };
+  if (typeof args.goalFile !== 'string' || !args.goalFile.trim()) return invalidGoalFile();
+  let path: string;
+  try {
+    path = resolveResumableGoalFile(args.goalFile, cwd);
+  } catch (error) {
+    if (error instanceof InvalidResumableGoalFileError) return invalidGoalFile();
+    return { ok: false, result: buildFailedToolResult(`SelfImplement goal file could not be resolved: ${error instanceof Error ? error.message : String(error)}`) };
+  }
+  let contents: string;
+  try {
+    contents = readFileSync(path, 'utf8');
+  } catch (error) {
+    return { ok: false, result: buildFailedToolResult(`SelfImplement goal file could not be read: ${error instanceof Error ? error.message : String(error)}`) };
+  }
+  const heading = contents.match(/^#\s+(.+)\s*$/m)?.[1]?.trim();
+  if (!heading) return invalidGoalFile();
+  return { ok: true, goalTitle: heading };
 }
 
 /**
@@ -245,13 +275,22 @@ function emitGoalAuthorSummary(ux: SurfaceUx, summary: GoalAuthorSummary): void 
   ux.progress(message, { phase: 'delta' });
 }
 
+class InvalidResumableGoalFileError extends Error {}
+
 function resolveResumableGoalFile(requestedPath: string, cwd: string): string {
   const root = realpathSync(cwd);
-  const candidate = realpathSync(isAbsolute(requestedPath) ? requestedPath : resolve(root, requestedPath));
+  let candidate: string;
+  try {
+    candidate = realpathSync(isAbsolute(requestedPath) ? requestedPath : resolve(root, requestedPath));
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new InvalidResumableGoalFileError('goalFile must point to an existing repository-local GOAL document');
+    throw error;
+  }
   const relativePath = relative(root, candidate);
   if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)
     || !/^GOAL-[^/\\]+\.(?:md|txt)$/i.test(basename(candidate))) {
-    throw new Error('goalFile must point to an existing GOAL-*.md or GOAL-*.txt document inside the repository');
+    throw new InvalidResumableGoalFileError('goalFile must point to an existing GOAL-*.md or GOAL-*.txt document inside the repository');
   }
   return candidate;
 }
@@ -492,7 +531,7 @@ export async function dispatchSelfImplement(
 
 export type SelfImplementQueuedToolResult = {
   kind: 'launched'; runId: string; taskId: string; state: 'queued' | 'running' | 'done' | 'error' | 'aborted'; ok: boolean;
-  message: string; next: string; missing: [];
+  message: string; next: string; missing: []; isError?: true; retryable?: false; fix?: string;
 };
 
 type ManagedAdmissionState = 'queued' | 'running' | 'done' | 'error' | 'aborted';
@@ -503,6 +542,7 @@ export interface ManagedTaskAdmission {
   taskId: string;
   parentSessionId?: string;
   feature: string;
+  goalTitle?: string;
   state: ManagedAdmissionState;
   createdAt: number;
   updatedAt: number;
@@ -575,20 +615,41 @@ export function dispatchSelfImplementManaged(
   runtime: { taskNotifications?: TaskNotificationQueue; registry?: AgentRegistry } = {},
 ): Promise<SelfImplementQueuedToolResult | SelfImplementToolResult> {
   const feature = typeof args.feature === 'string' ? args.feature.trim() : '';
-  if (!feature) return Promise.resolve(buildFailedToolResult('SelfImplement: `feature` is required'));
   const runId = randomUUID();
   const taskId = randomUUID();
   const requestKey = ctx.sessionId && ctx.toolCallId
     ? `tool-call:${ctx.sessionId}:${ctx.toolCallId}`
     : `request:${runId}`;
-  let claim: ReturnType<ManagedTaskAdmissionStore['claim']>;
+  let priorAdmission: ManagedTaskAdmission | undefined;
   try {
-    claim = admissionStore.claim({
-      requestKey, runId, taskId, feature,
-      ...(ctx.sessionId ? { parentSessionId: ctx.sessionId } : {}), state: 'queued',
-    });
+    priorAdmission = admissionStore.get(requestKey);
   } catch (error) {
-    return Promise.resolve(buildFailedToolResult(`SelfImplement admission could not be persisted: ${error instanceof Error ? error.message : String(error)}`));
+    return Promise.resolve(buildFailedToolResult(`SelfImplement admission could not be read: ${error instanceof Error ? error.message : String(error)}`));
+  }
+  const preflight = preflightManagedSelfImplement(args, ctx.cwd);
+  if (!priorAdmission && !preflight.ok) {
+    // Another identical invocation may have claimed the durable receipt while
+    // this invocation was validating its goal file. Re-check before rejecting.
+    try {
+      priorAdmission = admissionStore.get(requestKey);
+    } catch (error) {
+      return Promise.resolve(buildFailedToolResult(`SelfImplement admission could not be read: ${error instanceof Error ? error.message : String(error)}`));
+    }
+    if (!priorAdmission) return Promise.resolve(preflight.result);
+  }
+  let claim: ReturnType<ManagedTaskAdmissionStore['claim']>;
+  if (priorAdmission) {
+    claim = { record: priorAdmission, created: false };
+  } else {
+    try {
+      claim = admissionStore.claim({
+        requestKey, runId, taskId, feature,
+        ...(preflight.ok && preflight.goalTitle ? { goalTitle: preflight.goalTitle } : {}),
+        ...(ctx.sessionId ? { parentSessionId: ctx.sessionId } : {}), state: 'queued',
+      });
+    } catch (error) {
+      return Promise.resolve(buildFailedToolResult(`SelfImplement admission could not be persisted: ${error instanceof Error ? error.message : String(error)}`));
+    }
   }
   const registry = runtime.registry ?? globalAgentRegistry;
   if (!claim.created) {
@@ -616,10 +677,11 @@ export function dispatchSelfImplementManaged(
         existingTask.error = record.error;
       }
     }
+    const reusedGoalTitle = preflight.ok ? preflight.goalTitle ?? record.goalTitle : record.goalTitle;
     return Promise.resolve({
       kind: 'launched', runId: record.runId, taskId: record.taskId, state: record.state,
       ok: record.state !== 'error' && record.state !== 'aborted',
-      message: `SelfImplement prior admission · run ${record.runId} · task ${record.taskId}${record.error ? ` · ${record.error}` : ''}`,
+      message: `SelfImplement prior admission${reusedGoalTitle ? ` · reused goal: ${reusedGoalTitle}` : ''} · run ${record.runId} · task ${record.taskId}${record.error ? ` · ${record.error}` : ''}`,
       next: `AgentOutput(${record.taskId})`, missing: [],
     });
   }
@@ -672,7 +734,7 @@ export function dispatchSelfImplementManaged(
   debug.log('daemon-tools.self-implement', 'managed-admitted', { runId, taskId: task.id, parentSessionId: ctx.sessionId ?? null });
   return Promise.resolve({
     kind: 'launched', runId, taskId: task.id, state: claim.record.state, ok: true,
-    message: `SelfImplement accepted · run ${runId} · task ${task.id}`,
+    message: `SelfImplement accepted${preflight.ok && preflight.goalTitle ? ` · reused goal: ${preflight.goalTitle}` : ''} · run ${runId} · task ${task.id}`,
     next: `AgentOutput(${task.id})`, missing: [],
   });
 }

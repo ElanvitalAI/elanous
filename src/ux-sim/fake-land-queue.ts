@@ -1,5 +1,5 @@
 /** In-process LAND-QUEUE simulator. Scheduling and verdict logic use the production train functions;
- * only git's merge-tree/commit-tree and the remote gate are replaced. */
+ * only git's merge-tree/commit-tree/ls-tree and the remote gate are replaced. */
 import { integrateTrain, runTrain, type TrainCandidate, type TrainGit, type TrainVerdict } from '../self-implement/merge-train.js';
 
 export type FakeLandQueueItem = TrainCandidate & { files: string[] };
@@ -34,7 +34,7 @@ function syntheticGit(conflicting: ReadonlySet<number>, prByHead: ReadonlyMap<st
   let commit = 0;
   const sha = (n: number) => n.toString(16).padStart(40, '0');
   return (args) => {
-    const command = args.find((arg) => arg === 'merge-tree' || arg === 'commit-tree');
+    const command = args.find((arg) => arg === 'merge-tree' || arg === 'commit-tree' || arg === 'ls-tree');
     if (command === 'merge-tree') {
       const pr = prByHead.get(args.at(-1) ?? '');
       return pr !== undefined && conflicting.has(pr)
@@ -42,6 +42,9 @@ function syntheticGit(conflicting: ReadonlySet<number>, prByHead: ReadonlyMap<st
         : { status: 0, stdout: `${sha(900 + (pr ?? 0))}\0`, stderr: '' };
     }
     if (command === 'commit-tree') return { status: 0, stdout: sha(++commit), stderr: '' };
+    // integrateTrain (SIM-CATALOG-GENERATED #35047) lists base and merged trees to guard the UX-sim catalog.
+    // The synthetic trees carry no catalog, so both listings are empty and the ordinary integration path runs.
+    if (command === 'ls-tree') return { status: 0, stdout: '', stderr: '' };
     return { status: 2, stdout: '', stderr: `unsupported fake git command: ${args[0]}` };
   };
 }

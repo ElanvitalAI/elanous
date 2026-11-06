@@ -25,7 +25,7 @@
 // cwd default: monad-agent repo root (process.cwd()) — matches user's
 // vision Q1 (agent CLI works inside monad-agent codebase by default).
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { globalDualRoleManager } from '../../acp/dual-role-manager.js';
 // 2026-05-15 — HITL adapter import 제거. agent-cli wire 의 default approver

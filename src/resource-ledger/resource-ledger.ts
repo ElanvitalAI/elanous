@@ -164,6 +164,24 @@ export function declareResourcePool(pool: MachinePoolDeclaration, now = new Date
   withLedgerLock(target, () => appendEvent({ event: 'pool-declared', at: now.toISOString(), pool: validated }, target));
 }
 
+/** Reassign active pool declarations when an HQ host is promoted; append-only history stays auditable. */
+export function reassignResourcePools(fromHost: string, toHost: string, now = new Date(), path?: string): number {
+  if (!validHost(fromHost) || !validHost(toHost) || fromHost === toHost) throw new Error('invalid resource pool host reassignment');
+  const target = path ?? resourceLedgerPath();
+  let updated = 0;
+  withLedgerLock(target, () => {
+    const pools = activeResourcePools(readResourceLedger(target));
+    for (const pool of pools) {
+      if (!pool.members.some(member => member.host === fromHost)) continue;
+      const reassigned = parseMachinePoolDeclarations({ pools: [{ ...pool,
+        members: pool.members.map(member => member.host === fromHost ? { ...member, host: toHost } : member) }] })[0]!;
+      appendEvent({ event: 'pool-declared', at: now.toISOString(), pool: reassigned }, target);
+      updated++;
+    }
+  });
+  return updated;
+}
+
 function withLedgerLock(path: string, action: () => void): void {
   const dir = dirname(path);
   if (refuseProductionLedgerWriteInTest(dir, 'resource-ledger')) return;

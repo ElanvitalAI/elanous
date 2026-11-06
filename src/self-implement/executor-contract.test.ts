@@ -3,8 +3,8 @@ import { EXECUTOR_BACKENDS, execSurfaceId, buildExecutorPtyRef, type ExecutorBac
 
 describe('executor-contract — G9 P3a 통일 계약 SSOT', () => {
   // 실 drift 방지는 컴파일 가드(_AgentBackendsAreExecutorBackends·모듈). 이 테스트는 배열 SSOT 회귀 스냅샷.
-  test('EXECUTOR_BACKENDS = elanous-chat + agent CLI 5종(회귀 스냅샷)', () => {
-    expect([...EXECUTOR_BACKENDS]).toEqual(['elanous-chat', 'codex', 'claude', 'gemini', 'grok', 'aside']);
+  test('EXECUTOR_BACKENDS = elanous-chat + all registered agent CLIs (regression snapshot)', () => {
+    expect([...EXECUTOR_BACKENDS]).toEqual(['elanous-chat', 'codex', 'claude', 'gemini', 'grok', 'aside', 'openclaw', 'hermes']);
   });
 
   test('execSurfaceId = exec:${ptyId} 규약(Q1·룩업 없는 결정적 상관)', () => {

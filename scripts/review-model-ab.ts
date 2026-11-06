@@ -42,8 +42,51 @@ function armOf(spec: string): Arm {
   return { label: spec, provider, model: s.model, effort: override ?? s.reasoningLevel };
 }
 
-function diffOf(ref: string): string {
-  return execFileSync('git', ['show', '--format=', '--unified=3', ref], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+type GitCommandRunner = (args: string[], options: { encoding: 'utf8'; maxBuffer: number; env: NodeJS.ProcessEnv }) => string;
+
+export function diffOf(ref: string, run = false, runGit: GitCommandRunner = (args, options) => execFileSync('git', args, options)): string {
+  const options = { encoding: 'utf8' as const, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0' } };
+  const unavailable = (reason: string): string => {
+    const unmeasured = `UNMEASURED: diff context for ${ref} is unavailable (${reason}).`;
+    if (run) throw new Error(`${unmeasured} --run aborted before any model review.`);
+    return unmeasured;
+  };
+  let partialClone = false;
+  let partialConfig = '';
+  try {
+    partialConfig = runGit(['config', '--get-regexp', '^(remote\\..*\\.(promisor|partialclonefilter)|extensions\\.partialclone)$'], options);
+    partialClone = partialConfig.trim().length > 0;
+  } catch (error) {
+    // `git config --get-regexp` exits 1 when no partial-clone key exists.
+    const status = typeof error === 'object' && error !== null && 'status' in error ? error.status : undefined;
+    if (status !== 1) throw error;
+  }
+  if (partialClone) {
+    // GIT_NO_LAZY_FETCH is honored by modern Git; older releases ignore it. An empty
+    // GIT_ALLOW_PROTOCOL additionally forbids every transport, so local objects remain
+    // readable on old Git while a missing object fails closed instead of fetching.
+    let raw: string;
+    try { raw = runGit(['diff-tree', '--root', '-m', '--no-commit-id', '--raw', '--no-abbrev', '-r', ref], options); }
+    catch { return unavailable('local diff objects could not be enumerated without fetching'); }
+    for (const line of raw.split('\n')) {
+      const match = line.match(/^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]+) ([0-9a-f]+) /);
+      if (!match || match[1] === '160000' || match[2] === '160000') continue;
+      for (const oid of [match[3]!, match[4]!]) {
+        if (/^0+$/.test(oid)) continue;
+        try { runGit(['cat-file', '-e', oid], options); }
+        catch { return unavailable(`diff object ${oid.slice(0, 12)} is absent locally`); }
+      }
+    }
+  }
+  try {
+    return runGit(['show', '--format=', '--unified=3', ref], options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/could not read Username|could not fetch .* from promisor remote|fatal: (?:bad object|unable to read|could not get object info)|missing blob/i.test(message)) {
+      return unavailable('a required diff object is missing locally');
+    }
+    throw error;
+  }
 }
 
 async function main(): Promise<void> {
@@ -52,7 +95,8 @@ async function main(): Promise<void> {
   const intent = arg('intent') ?? '이 변경이 그 목적을 달성하는가. 결함이 있으면 must-fix 로 든다.';
   const run = process.argv.includes('--run');
 
-  const diff = diffOf(ref);
+  const diff = diffOf(ref, run);
+  if (diff.startsWith('UNMEASURED:')) console.warn(diff);
   console.log(`\n  📏 대상 ${ref} — diff ${diff.length.toLocaleString()}자`);
   console.log(`  ⚖️  ${arms.map((a) => `${a.label} → ${a.model}·${a.effort}`).join('   ↔   ')}`);
 
@@ -81,4 +125,4 @@ async function main(): Promise<void> {
   console.log(`\n  ⛔ 한 쌍은 «분포»다 — 순위를 매기지 않는다. 여러 ref 로 돌려 그 분포를 본다.`);
 }
 
-await main();
+if (import.meta.main) await main();

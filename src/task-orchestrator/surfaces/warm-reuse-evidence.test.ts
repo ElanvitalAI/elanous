@@ -82,7 +82,7 @@ test('corruption after recent passing rows invalidates the entire evidence windo
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('actual journal rows supply measured TA evidence; missing rows stay unmeasured', () => {
+test('unpaired TA observations stay unmeasured; missing rows stay unmeasured', () => {
   const root = mkdtempSync(join(tmpdir(), 'warm-reuse-evidence-supply-'));
   const path = join(root, 'warm-reuse-evidence.jsonl');
   const head = 'a'.repeat(40);
@@ -97,13 +97,17 @@ test('actual journal rows supply measured TA evidence; missing rows stay unmeasu
       for (let index = 0; index < 3; index++) recordWarmReuseEvidence(path, {
         schema: 1, consumer, head, main, recordedAt: new Date(now - index).toISOString(),
         leaseId: `${consumer}-lease-${index}`, workerId: 'worker-live', generation: index + 1,
-        expectedLockHash: lock, workerLockHash: lock, leaseValid: true, canaryPassed: true, agree: true,
+        expectedLockHash: lock, workerLockHash: lock, leaseValid: true,
+        canaryPassed: consumer !== 'ta', agree: consumer !== 'ta',
+        ...(consumer === 'ta' ? { comparisonMeasured: false, reason: 'ta-fresh-reference-unavailable' } : {}),
       });
     }
     const evidence = loadWarmReuseEvidenceByConsumer({ head, main }, path);
     expect(decideWarmReuse('ta', { gateRecheck: true, land: true, ta: true }, evidence))
-      .toEqual({ consumer: 'ta', live: true, reason: 'live' });
-    expect(observed).toEqual(['gate-recheck', 'land', 'ta'].map((consumer) => ({ consumer, measured: true })));
+      .toEqual({ consumer: 'ta', live: false, reason: 'canary-failed' });
+    expect(observed).toEqual([
+      { consumer: 'gate-recheck', measured: true }, { consumer: 'land', measured: true }, { consumer: 'ta', measured: false },
+    ]);
 
     observed.length = 0;
     const missing = loadWarmReuseEvidenceByConsumer({ head: 'c'.repeat(40), main }, path);

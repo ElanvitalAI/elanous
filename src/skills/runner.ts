@@ -632,6 +632,8 @@ export interface ExecuteSkillOpts {
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
+  /** Optional renderer dependency seam for deterministic Mermaid dispatch tests. */
+  mermaidRenderer?: (source: string, opts?: { ascii?: boolean }) => string;
   /** Additional system-level context to prepend (e.g. dashboard state). */
   systemContext?: string;
   /**
@@ -1424,6 +1426,7 @@ async function executeSkillUnrecorded(
   type UniformCtx = {
     sessionCache: SessionCache;
     signal: AbortSignal | undefined;
+    mermaidRenderer?: ExecuteSkillOpts['mermaidRenderer'];
   };
   type UniformDispatcher = (
     args: Record<string, unknown>,
@@ -1443,8 +1446,8 @@ async function executeSkillUnrecorded(
     WebFetch: (a, c) => dispatchWebFetch(a, { signal: c.signal }),
     WebSearch: (a, c) => dispatchWebSearch(a, { signal: c.signal }),
     SetToolHint: (a) => dispatchSetToolHint(a),
-    MermaidRender: async (a) => {
-      const r = await dispatchMermaidRender(a);
+    MermaidRender: async (a, c) => {
+      const r = await dispatchMermaidRender(a, c.mermaidRenderer);
       return { output: r.output };
     },
     MermaidSyntax: async (a) => {
@@ -1697,7 +1700,11 @@ async function executeSkillUnrecorded(
     const uniform = uniformDispatchers[resolvedName];
     if (uniform) {
       const started = Date.now();
-      const result = await uniform(toolArgs, { sessionCache, signal: opts.signal });
+      const result = await uniform(toolArgs, {
+        sessionCache,
+        signal: opts.signal,
+        mermaidRenderer: opts.mermaidRenderer,
+      });
       const persisted = await persistToolOutputPreview(result.output, {
         sessionId: String(process.pid),
         toolName: resolvedName,

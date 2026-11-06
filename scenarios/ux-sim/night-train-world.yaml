@@ -10,4 +10,4 @@ providers:
 github: { repo: fixture-small, openPRs: 2 }
 seats: [OP, TC, OPT]
 events:
-  - { at: "+5m", id: dead-pid-lock }
+  - { at: "+5m", id: EV-0042 }

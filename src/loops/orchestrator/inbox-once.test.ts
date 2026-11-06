@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MsgStore } from '../../msg/msg-store.js';
-import { runCoordinatorInboxOnce } from './inbox-once.js';
+import { runCoordinatorInboxOnce, type InboxOnceOptions } from './inbox-once.js';
 import { runAskOpInboxCli } from '../../../scripts/ask-op-inbox-once.js';
 
 test('one-shot drains Telegram /ask-op, acknowledges and does not duplicate on retry', async () => {
@@ -11,7 +11,7 @@ test('one-shot drains Telegram /ask-op, acknowledges and does not duplicate on r
   try {
     const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
       body: 'Telegram /ask-op\nchatId=-100123\nquestion: Which release is next?' });
-    const input = { store, role: null, context: async () => ({ queriedAt: '2026-10-25T11:00:00Z', topic: 'release',
+    const input: InboxOnceOptions = { store, role: null, context: async () => ({ queriedAt: '2026-10-25T11:00:00Z', topic: 'release',
       facts: [{ kind: 'release', summary: '0.2.38 is next', source: 'release/checklist:0.2.38', observedAt: '2026-10-25T11:00:00Z' }], gaps: [] }) };
     expect(await runCoordinatorInboxOnce(input)).toEqual({ replied: 1, acknowledged: 1 });
     expect(store.listReplies(request.id)[0]?.body).toContain('release/checklist:0.2.38');
@@ -40,7 +40,7 @@ test('one-shot fails closed on unavailable context and does not post a second re
   try {
     const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
       body: 'Telegram /ask-op\nquestion: Which release is next?' });
-    const input = { store, role: null, context: async () => { throw Error('transient'); } };
+    const input: InboxOnceOptions = { store, role: null, context: async () => { throw Error('transient'); } };
     expect(await runCoordinatorInboxOnce(input)).toEqual({ replied: 1, acknowledged: 1 });
     expect(store.listReplies(request.id)[0]?.body).toContain('모름');
     expect(await runCoordinatorInboxOnce(input)).toEqual({ replied: 0, acknowledged: 0 });

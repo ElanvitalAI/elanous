@@ -1,10 +1,18 @@
 #!/usr/bin/env bun
 import { readFileSync } from 'node:fs';
+import { performance } from 'node:perf_hooks';
 import type { PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
+
+const MAX_FAKE_KUBECTL_HANG_MS = 1_000;
 
 /** In-memory Kubernetes boundary for real pool admission and warm-provider tests. Unknown operations fail closed. */
 export function createFakeKubectl(options: { context: string; node: string; nodes?: readonly string[]; jobState?: 'running' | 'complete';
-  failGetPods?: string; podReadinessOnCreate?: boolean; arch?: 'arm64' | 'amd64'; cpu?: number; pools?: string[] }) {
+  failGetPods?: string; podReadinessOnCreate?: boolean; uniquePodUids?: boolean; arch?: 'arm64' | 'amd64'; cpu?: number; pools?: string[];
+  hangMs?: number; unreachable?: boolean }) {
+  const hangMs = options.hangMs ?? 0;
+  if (!Number.isFinite(hangMs) || hangMs < 0 || hangMs > MAX_FAKE_KUBECTL_HANG_MS) {
+    throw new Error(`fake-kubectl hangMs must be between 0 and ${MAX_FAKE_KUBECTL_HANG_MS} milliseconds`);
+  }
   const jobs = new Map<string, Record<string, unknown>>();
   const pods = new Map<string, Record<string, any>>();
   const calls: string[][] = [];
@@ -17,11 +25,19 @@ export function createFakeKubectl(options: { context: string; node: string; node
     throw new Error('fake-kubectl requires unique, non-empty node names including the primary node');
   }
   let lease: { workerId: string; podUid: string; key: unknown; job?: string; state: 'idle' | 'leased' | 'released' | 'quarantined' } | null = null;
+  let hostState = { egress: true, cpu: options.cpu ?? 16, ready: true };
   let loseNextLeaseResponse = false;
+  let nextPodUid = 0;
   const ok = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
   const missing = (kind: string) => ({ status: 1, stdout: '', stderr: `${kind} not found` });
   const kubectl: PoolKubectl = (args, input) => {
     calls.push([...args]);
+    if (hangMs > 0) {
+      const until = performance.now() + hangMs;
+      while (performance.now() < until) { /* intentional synchronous stall */ }
+    }
+    if (options.unreachable) return { status: 1, stdout: '', stderr: 'kubectl unreachable' };
+    if (args[0] === 'config' && args[1] === 'current-context') return { status: 0, stdout: `${options.context}\n`, stderr: '' };
     if (args[0] === 'config' && args[1] === 'get-contexts')
       return args[2] === options.context ? { status: 0, stdout: `${options.context}\n`, stderr: '' } : missing('context');
     if (args[0] !== '--context' || args[1] !== options.context) return missing('context');
@@ -57,15 +73,17 @@ export function createFakeKubectl(options: { context: string; node: string; node
     if (verb === 'create' && args[args.indexOf('create') + 1] === 'secret') return ok({ kind: 'Secret' });
     if (verb === 'get' && args[at + 1] === 'ns' && args[at + 2] === 'elanous-test') return ok({ metadata: { name: 'elanous-test' } });
     if (verb === 'get' && args[at + 1] === 'nodes') return ok({ items: nodeNames.map((name) => ({ metadata: { name },
-      status: { allocatable: { memory: '64Gi', cpu: String(name === options.node ? options.cpu ?? 16 : 16) },
-        conditions: [{ type: 'Ready', status: 'True' }] } })) });
+      spec: { unschedulable: name === options.node && !hostState.ready },
+      status: { allocatable: { memory: '64Gi', cpu: String(name === options.node ? hostState.cpu : 16) },
+        conditions: [{ type: 'Ready', status: name === options.node && !hostState.ready ? 'False' : 'True' }] } })) });
     if (verb === 'get' && args[at + 1] === 'node') {
       const name = args[at + 2] ?? '';
       return nodeNames.includes(name) ? ok({ metadata: { name, labels: {
         'kubernetes.io/arch': name === options.node ? options.arch ?? 'amd64' : 'amd64',
         ...(name === options.node && options.pools?.length ? { 'elanous.dev/pools': options.pools.join(',') } : {}),
-      } }, status: { allocatable: { memory: '64Gi', cpu: String(name === options.node ? options.cpu ?? 16 : 16) },
-        conditions: [{ type: 'Ready', status: 'True' }] } }) : missing('node');
+      } }, spec: { unschedulable: name === options.node && !hostState.ready },
+      status: { allocatable: { memory: '64Gi', cpu: String(name === options.node ? hostState.cpu : 16) },
+        conditions: [{ type: 'Ready', status: name === options.node && !hostState.ready ? 'False' : 'True' }] } }) : missing('node');
     }
     if (verb === 'get' && args[at + 1] === 'jobs') return ok({ items: [...jobs.values()] });
     if (verb === 'get' && args[at + 1] === 'job') {
@@ -91,7 +109,8 @@ export function createFakeKubectl(options: { context: string; node: string; node
       try { manifest = JSON.parse(input); } catch { return missing('invalid manifest'); }
       const name = manifest.metadata?.name;
       if (typeof name !== 'string' || pods.has(name)) return missing('existing or invalid pod');
-      const created = { ...manifest, metadata: { ...manifest.metadata, uid: `${name}-uid`, resourceVersion: '1' },
+      const uid = options.uniquePodUids ? `${name}-uid-${++nextPodUid}` : `${name}-uid`;
+      const created = { ...manifest, metadata: { ...manifest.metadata, uid, resourceVersion: '1' },
         ...(options.podReadinessOnCreate ? { status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }],
           containerStatuses: [{ name: 'worker', ready: true }] } } : {}) };
       pods.set(name, created);
@@ -151,12 +170,21 @@ export function createFakeKubectl(options: { context: string; node: string; node
   };
   return {
     kubectl, calls, fetchLease, leaseCalls, jobCreates, jobDeletes,
+    hostState: () => ({ ...hostState }),
+    setHostState: (update: Partial<typeof hostState>) => { hostState = { ...hostState, ...update }; },
     setWarmLease: (value: { workerId: string; podUid: string; key: unknown; job?: string }) => {
       lease = { ...value, state: 'idle' };
     },
     loseNextLeaseResponse: () => { loseNextLeaseResponse = true; },
     warmLeaseState: () => lease?.state ?? null,
     putPod: (pod: Record<string, any>) => { pods.set(pod.metadata.name, structuredClone(pod)); },
+    getPod: (name: string) => { const pod = pods.get(name); return pod ? structuredClone(pod) : null; },
+    deletePod: (name: string, uid: string) => {
+      const pod = pods.get(name);
+      if (!pod || pod.metadata.uid !== uid) return false;
+      pods.delete(name);
+      return true;
+    },
     replacePodUid: (name: string, uid: string) => {
       const pod = pods.get(name);
       if (!pod) throw new Error(`pod not found: ${name}`);

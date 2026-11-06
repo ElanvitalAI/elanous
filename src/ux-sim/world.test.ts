@@ -14,10 +14,16 @@ import { spawnSync } from 'node:child_process';
 import { registerSimCommands } from '../cli/sim-cli.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { withSimClock } from './fake-clock.js';
-import { assembleWorld, createWorld, destroyWorld, executeWorldScenario, loadWorld, runInWorld, runWorldScenario, verifyWorldNetworkIsolation, type SimMailbox } from './world.js';
+import { compareDeviceRecording } from './device-fidelity.js';
+import { createSimWorld } from './world-store.js';
+import { assembleWorld, createWorld, destroyWorld, destroyWorldById, executeWorldScenario, loadWorld, runInWorld, runWorldScenario, verifyWorldNetworkIsolation, type SimMailbox } from './world.js';
+import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { activeResourceLeases, readResourceLedger } from '../resource-ledger/resource-ledger.js';
 
 const scenarioPath = join(import.meta.dir, '../../scenarios/ux-sim/night-train-dead-pid-lock.yaml');
 const worldPath = join(import.meta.dir, '../../scenarios/ux-sim/night-train-world.yaml');
+const hqMoveScenarioPath = join(import.meta.dir, '../../scenarios/ux-sim/sim-hq-move.yaml');
+const hqMoveWorldPath = join(import.meta.dir, '../../scenarios/ux-sim/sim-hq-move-world.yaml');
 
 async function withWorldRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
   const root = mkdtempSync(join(tmpdir(), 'sim-world-test-'));
@@ -33,7 +39,7 @@ async function withWorldRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
 test('world lifecycle is rooted in the explicit test universe and destroys only its world', async () => {
   await withWorldRoot(async (root) => {
     const world = await createWorld(worldPath);
-    expect(world.root).toBe(join(realpathSync(root), 'sim', 'night-train'));
+    expect(world.root).toBe(join(realpathSync(root), 'sim', 'worlds', 'night-train'));
     expect(existsSync(world.root)).toBe(true);
     expect(statSync(world.root).mode & 0o777).toBe(0o700);
     await destroyWorld(world);
@@ -42,11 +48,25 @@ test('world lifecycle is rooted in the explicit test universe and destroys only 
   });
 });
 
+test('YAML world lifecycle refuses an unmarked format-1 world even when it has a world.yaml config', async () => {
+  await withWorldRoot(async (root) => {
+    const stored = createSimWorld('ordinary-world');
+    const unrelatedConfig = '{"world":"ordinary-world","seed":0,"devices":[],"events":[]}\n';
+    writeFileSync(join(stored.configDir, 'world.yaml'), unrelatedConfig, { mode: 0o600 });
+
+    expect(() => loadWorld(stored.id)).toThrow('not a YAML declaration');
+    await expect(destroyWorldById(stored.id)).rejects.toThrow('not a YAML declaration');
+    expect(readFileSync(join(stored.configDir, 'world.yaml'), 'utf8')).toBe(unrelatedConfig);
+    expect(existsSync(stored.rootDir)).toBe(true);
+    expect(existsSync(root)).toBe(true);
+  });
+});
+
 test('create and load reject a sim symlink whose relative path is exactly the test-root parent', async () => {
   await withWorldRoot(async (root) => {
     symlinkSync(dirname(root), join(root, 'sim'), 'dir');
     await expect(createWorld(worldPath)).rejects.toThrow('sim directory escaped the test universe');
-    expect(() => loadWorld('night-train')).toThrow('sim directory escaped the test universe');
+    expect(() => loadWorld('night-train')).toThrow('sim world storage escaped the test universe');
   });
 });
 
@@ -113,6 +133,20 @@ test('world rejects outbound fetch before the original network function is calle
   });
 });
 
+test('world promotion runner rejects marker-only Python before executing it', async () => {
+  await withWorldRoot(async () => {
+    const world = await createWorld(worldPath);
+    const marker = join(world.root, 'escaped-marker');
+    await expect(runInWorld(world, async (runtime) => {
+      mkdirSync(join(world.root, 'promotion-home'), { recursive: true });
+      runtime.runPromotionPython(`# shutil.copy2\nfrom pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("executed")`,
+        join(world.root, 'promotion-home'), {});
+    })).rejects.toThrow('world runner refused untrusted promotion Python body');
+    expect(existsSync(marker)).toBe(false);
+    await destroyWorld(world);
+  });
+});
+
 test('scenario executor refuses a supplied world root outside the explicit test universe', async () => {
   await withWorldRoot(async () => {
     const world = await createWorld(worldPath);
@@ -140,6 +174,7 @@ test('night-train executes the real readiness path twice under the declared fake
       const first = await executeWorldScenario(world, scenarioPath);
       const second = await executeWorldScenario(world, scenarioPath);
       expect(first.pass).toBe(true);
+      expect(first.recovery).toBeUndefined();
       expect(first.observations).toEqual([
         { event: 'live-pid-lock', verdict: 'already-running' },
         { event: 'dead-pid-lock', verdict: 'ready' },
@@ -147,6 +182,53 @@ test('night-train executes the real readiness path twice under the declared fake
       expect(second).toEqual(first);
       expect(first.devices).toEqual(['fake-kubectl:node-b', 'fake-kubectl:gcp2', 'fake-llm', 'fake-gh', 'fake-clock', 'mail']);
       expect(readdirSync(world.root).filter((name) => name.startsWith('.run-'))).toHaveLength(2);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+      else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = previous;
+      await destroyWorld(world);
+    }
+  });
+});
+
+test('HQ move world executes the production host-transfer path with simulated remote boundaries', async () => {
+  await withWorldRoot(async () => {
+    const world = await createWorld(hqMoveWorldPath);
+    const previous = process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+    process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = '1';
+    try {
+      const result = await executeWorldScenario(world, hqMoveScenarioPath);
+      expect(result.pass, JSON.stringify(result)).toBe(true);
+      expect(result.observations).toEqual(expect.arrayContaining([
+        { event: 'transfer', verdict: 'complete' },
+        { event: 'state-copy', verdict: 'verified:ledger=2,worktree=1,mail=1' },
+        { event: 'lease', verdict: 'MacStudioB1@8' },
+        { event: 'source-fence', verdict: 'retired' },
+        { event: 'target-fence', verdict: 'allowed' },
+        { event: 'pool-reallocation', verdict: 'node-b' },
+        { event: 'fake-ssh-configured-hosts', verdict: 'mbp,node-b' },
+        { event: 'world-clock', verdict: '2026-11-08T21:01:00.000Z' },
+      ]));
+      expect(result.devices).toEqual(expect.arrayContaining(['fake-ssh:mbp', 'fake-ssh:node-b', 'fake-clock']));
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+      else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = previous;
+      await destroyWorld(world);
+    }
+  });
+});
+
+test('HQ move world fails visibly when its declared fake SSH target is changed', async () => {
+  await withWorldRoot(async (root) => {
+    const changedWorldPath = join(root, 'sim-hq-move-world-changed.yaml');
+    writeFileSync(changedWorldPath, readFileSync(hqMoveWorldPath, 'utf8').replace('name: node-b', 'name: studio'));
+    const world = await createWorld(changedWorldPath);
+    const previous = process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+    process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = '1';
+    try {
+      const result = await executeWorldScenario(world, hqMoveScenarioPath);
+      expect(result.pass).toBe(false);
+      expect(result.observations.find(row => row.event === 'transfer')?.verdict).not.toBe('complete');
+      expect(result.observations.find(row => row.event === 'fake-ssh-configured-hosts')?.verdict).toBe('mbp');
     } finally {
       if (previous === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
       else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = previous;
@@ -202,6 +284,27 @@ test.skipIf(process.platform !== 'darwin')('night-train injects a dead-pid run l
       expect(world.networkEvents).toEqual([]);
       expect((await runWorldScenario(world, scenarioPath)).pass).toBe(true);
       expect(readdirSync(world.root).filter((name) => name.startsWith('.run-'))).toHaveLength(2);
+    } finally { await destroyWorld(world); }
+  });
+});
+
+test.skipIf(process.platform !== 'darwin')('a failed device recording turns its declaring sim world yellow', async () => {
+  await withWorldRoot(async () => {
+    const world = await createWorld(worldPath);
+    try {
+      const comparison = compareDeviceRecording({
+        version: 1,
+        id: 'night-train-github-open-prs',
+        deviceId: 'fake-github',
+        repository: 'fixture-small',
+        recordedAt: '2026-11-04T10:00:00.000Z',
+        prs: [],
+        calls: [{ args: ['api', '/repos/fixture-small/pulls?state=open'], realResponse: '[{"recorded":true}]' }],
+      });
+      expect(comparison.passed).toBe(false);
+      const result = await runWorldScenario(world, scenarioPath);
+      expect(result).toMatchObject({ pass: false, verdict: 'yellow' });
+      expect(result.fidelity).toContainEqual({ deviceId: 'fake-gh', verdict: 'yellow', failedRecordingIds: ['night-train-github-open-prs'] });
     } finally { await destroyWorld(world); }
   });
 });
@@ -278,18 +381,194 @@ test.skipIf(process.platform !== 'darwin')('sim world CLI creates, runs, and des
     };
     try {
       await invoke('create-yaml', worldPath);
-      expect(existsSync(join(root, 'sim', 'night-train', 'world.json'))).toBe(true);
+      expect(existsSync(join(root, 'sim', 'worlds', 'night-train', 'world.json'))).toBe(true);
       await invoke('run', 'night-train', scenarioPath);
       expect(JSON.parse(output.at(-1)!)).toMatchObject({ pass: true, observations: [
         { event: 'live-pid-lock', verdict: 'already-running' },
         { event: 'dead-pid-lock', verdict: 'ready' },
       ] });
       await invoke('destroy-yaml', 'night-train');
-      expect(existsSync(join(root, 'sim', 'night-train'))).toBe(false);
+      expect(existsSync(join(root, 'sim', 'worlds', 'night-train'))).toBe(false);
     } finally {
       console.log = oldLog;
       console.error = oldError;
       rmSync(join(root, 'sim'), { recursive: true, force: true });
+    }
+  });
+});
+
+test('world.yaml orders fault and injection rows on one timeline through the production writer', async () => {
+  await withWorldRoot(async (root) => {
+    const chaosWorldPath = join(root, 'chaos-world.yaml');
+    writeFileSync(chaosWorldPath, `world: night-train
+seed: 42
+clock: { start: "2026-11-01T18:00:00+09:00", speed: 600 }
+hosts:
+  - { name: node-b, arch: arm64, cpu: 32, pools: [gate], egress: false }
+  - { name: gcp2, arch: amd64, cpu: 8, pools: [gate], egress: false }
+processes:
+  - { id: train-auto-loop, host: gcp2, releaseVersion: '0.2.45' }
+providers:
+  codex: { accounts: [default:61%] }
+devices: [fake-clock]
+events:
+  - { at: '+5m', id: EV-0042 }
+chaos:
+  - { at: '+1m', monkey: { kill: 'train-auto-loop host=gcp2', signal: KILL } }
+injections:
+  - at: '+30s'
+    ledger:
+      - event: sim-chaos.probe.started
+        data: { sample: 1 }
+      - event: sim-chaos.probe.finished
+        data: { sample: 1 }
+    logs:
+      - { category: sim-chaos, event: probe-started, data: { sample: 1 } }
+  - at: '+60100ms'
+    ledger:
+      - event: sim-chaos.probe.during-recovery
+        data: { sample: 1 }
+  - at: '+2m'
+    ledger:
+      - event: sim-chaos.probe.finished
+        data: { sample: 1 }
+expect:
+  recovers: { within: '+15m', hitl: 0, lostLedger: 0 }
+`);
+    const world = await createWorld(chaosWorldPath);
+    const previous = process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+    process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = '1';
+    try {
+      const result = await executeWorldScenario(world, scenarioPath);
+      const recovery = result.recovery;
+      expect(recovery).toBeDefined();
+      expect(result.recovery?.observations.map((row) => row.kind)).toEqual(['monkey']);
+      expect(result.recovery?.observations.map((row) => row.recoveryMs)).toEqual([250]);
+      expect(result.recovery?.observations.map((row) => row.recoveredAtMs)).toEqual([60_250]);
+      expect(result.recovery?.aggregate?.metrics.lostLedgerRows).toBe(0);
+      const persistedChaosRows = loadRunLedger(recovery!.injections[0]!.runId, runLedgerDir(world.root)) ?? [];
+      expect(new Set(persistedChaosRows.map((row) => row.data.injectionRowId)).size).toBe(4);
+      expect(persistedChaosRows.map((row) => row.timestamp)).toEqual([
+        '2026-11-01T09:00:30.000Z', '2026-11-01T09:00:30.000Z',
+        '2026-11-01T09:01:00.100Z', '2026-11-01T09:02:00.000Z',
+      ]);
+      expect(recovery!.timeline).toEqual([
+        { atMs: 30_000, kind: 'injection', target: recovery!.injections[0]?.injectionId },
+        { atMs: 60_000, kind: 'fault-start', target: 'train-auto-loop host=gcp2' },
+        { atMs: 60_100, kind: 'injection', target: recovery!.injections[1]?.injectionId },
+        { atMs: 60_250, kind: 'fault-recovery', target: 'train-auto-loop host=gcp2' },
+        { atMs: 120_000, kind: 'injection', target: recovery!.injections[2]?.injectionId },
+        { atMs: 300_000, kind: 'world-event', target: 'release:EV-0042' },
+      ]);
+      expect(result.recovery?.evaluation).toMatchObject({ pass: true, unmeasured: [] });
+      expect(result.pass).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+      else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = previous;
+      await destroyWorld(world);
+    }
+  });
+});
+
+test('world.yaml gorilla recovery uses the declared shared-clock duration and selects another host', async () => {
+  await withWorldRoot(async (root) => {
+    const chaosWorldPath = join(root, 'gorilla-clock-world.yaml');
+    writeFileSync(chaosWorldPath, `world: gorilla-clock
+seed: 9
+clock: { start: "2026-11-05T00:00:00Z", speed: 60 }
+hosts:
+  - { name: node-b, arch: arm64, cpu: 32, pools: [gate], egress: true }
+  - { name: gcp2, arch: amd64, cpu: 8, pools: [gate], egress: true }
+processes:
+  - { id: worker-a, host: gcp2, releaseVersion: '0.3.5', fingerprint: declared-a }
+  - { id: worker-b, host: gcp2, releaseVersion: '0.3.5', fingerprint: declared-b }
+devices: [fake-clock]
+events:
+  - { at: '+10m', id: EV-0042 }
+chaos:
+  - { at: '+1m', gorilla: { host: gcp2, egress: false, cpu: 0, for: '+5m' } }
+injections:
+  - at: '+30s'
+    ledger:
+      - event: sim-gorilla.probe
+        data: { sample: 1 }
+expect:
+  recovers: { within: '+5m', hitl: 0, lostLedger: 0 }
+`);
+    const world = await createWorld(chaosWorldPath);
+    const chaosScenarioPath = join(root, 'gorilla-clock-scenario.yaml');
+    writeFileSync(chaosScenarioPath, `world: gorilla-clock
+steps:
+  - inject: { id: EV-0042, version: '0.3.5' }
+  - observe: release-readiness
+expect:
+  livePidLock: { ready: false, reason: already-running }
+  deadPidLock: { ready: true, reason: ready }
+`);
+    const previous = process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+    process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = '1';
+    try {
+      const result = await executeWorldScenario(world, chaosScenarioPath);
+      expect(result.recovery?.observations).toMatchObject([{ kind: 'gorilla', faultAtMs: 60_000,
+        recoveredAtMs: 360_000, recoveryMs: 300_000, recoveryVerdict: expect.stringContaining('surviving host node-b'),
+        metrics: { hitlCount: 0 } }]);
+      expect(result.recovery?.timeline).toContainEqual({ atMs: 360_000, kind: 'fault-recovery', target: 'gcp2' });
+      expect(result.recovery?.evaluation).toMatchObject({ pass: true, failures: [], unmeasured: [] });
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+      else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = previous;
+      await destroyWorld(world);
+    }
+  });
+});
+
+test('world.yaml runs declared injections when there is no chaos block', async () => {
+  await withWorldRoot(async (root) => {
+    const injectionWorldPath = join(root, 'injection-only-world.yaml');
+    writeFileSync(injectionWorldPath, `world: night-train
+seed: 7
+devices: [fake-clock]
+events:
+  - { at: '+5m', id: EV-0042 }
+injections:
+  - at: '+1m'
+    ledger:
+      - event: sim-injection-only.completed
+        data: { source: world-yaml }
+`);
+    const world = await createWorld(injectionWorldPath);
+    const previous = process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+    process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = '1';
+    try {
+      const result = await executeWorldScenario(world, scenarioPath);
+      const receipt = result.recovery?.injections[0];
+      const injectionId = receipt?.injectionId ?? 'missing-injection-id';
+      expect(result.recovery?.timeline ?? []).toEqual([
+        { atMs: 60_000, kind: 'injection', target: injectionId },
+        { atMs: 300_000, kind: 'world-event', target: 'release:EV-0042' },
+      ]);
+      expect(receipt?.ledgerRows).toBe(1);
+      expect(loadRunLedger(receipt!.runId, runLedgerDir(world.root))?.map((row) => row.event)).toEqual(['sim-injection-only.completed']);
+      expect(loadRunLedger(receipt!.runId, runLedgerDir(world.root))?.[0]?.data.injectionRowId).toBe(`${receipt!.injectionId}:0`);
+      expect(result.pass).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+      else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = previous;
+      await destroyWorld(world);
+    }
+  });
+});
+
+test.skipIf(process.platform !== 'darwin')('coverage receipt failure fails the completed world run instead of returning success', async () => {
+  await withWorldRoot(async (root) => {
+    const world = await createWorld(worldPath);
+    const outside = mkdtempSync(join(tmpdir(), 'sim-world-coverage-outside-'));
+    symlinkSync(outside, join(root, 'sim', 'coverage'));
+    try {
+      await expect(runWorldScenario(world, scenarioPath)).rejects.toThrow('sim coverage storage escaped the explicit test universe');
+    } finally {
+      await destroyWorld(world);
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

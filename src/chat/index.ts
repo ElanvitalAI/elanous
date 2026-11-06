@@ -492,7 +492,6 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   { name: 'fork',      aliases: [],             description: 'Copy this session into a new one' },
   { name: 'rewind',    aliases: [],             description: 'Rewind — 과거 user 턴 픽커로 되감기 (원본 보존 · 새 세션 분기 · /rewind <n> 숏컷)' },
   // TUI 부활 C-a (2026-07-12): autopilot 미션 TUI 표면 — CLI 동등 단일 창구 소비.
-  { name: 'mission',   aliases: [],             description: 'Autopilot 미션 — list(+헬스) · trace <id> 계보 · arm <id> 승인 (구체화/종료는 CLI)', subcommands: ['list', 'trace', 'arm'] },
   { name: 'resume-turn', aliases: [],           description: 'Resume a paused turn checkpoint (/pause 짝 · 구 /resume)', subcommands: ['list'] },
   { name: 'context',   aliases: ['ctx'],        description: 'Show / clear / drop attached files', subcommands: ['clear', 'drop'] },
   { name: 'paste', aliases: [],             description: 'Attach clipboard image (macOS)' },

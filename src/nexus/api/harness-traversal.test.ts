@@ -51,26 +51,6 @@ describe('buildRunTraversal graph replay sequence', () => {
     expect(traversal.steps[1]?.resources).toEqual({ host: 'host-origin', pod: 'worker-pod-7', models: ['gpt-6.1-terra'] });
   });
 
-  test('projects only actual model and plugin tool calls from the visited node window', () => {
-    const traversal = buildRunTraversal(runId, [
-      row('run-origin', 0, { hostname: 'host-origin', childProvider: 'openai-codex', childModel: 'requested-model' }),
-      row('pipeline-node-entry', 1, { node: 'implement', round: 1 }),
-      row('llm-consume-start', 2, { provider: 'grok', model: 'grok-4.6', childProvider: 'grok', childModel: 'grok-4.6', llmConsumeStart: { provider: 'grok', model: 'grok-4.6' } }),
-      row('plugin-tool-call', 3, { plugin: 'linear', tool: 'elanous_linear_issue' }),
-      row('pipeline-node-entry', 4, { node: 'review', round: 1 }),
-      row('pipeline-node-entry', 5, { node: 'merge', round: 1 }),
-      row('plugin-tool-call', 6, { plugin: 'outside-window', tool: 'later-call' }),
-    ]);
-
-    expect(traversal.steps[0]?.resources).toEqual({
-      host: 'host-origin',
-      models: ['grok-4.6'],
-      plugins: ['linear/elanous_linear_issue'],
-    });
-    expect(traversal.steps[1]?.resources).toEqual({ host: 'host-origin', models: ['requested-model'] });
-    expect(traversal.steps[2]?.resources).toMatchObject({ plugins: ['outside-window/later-call'] });
-  });
-
   test('does not present a Kubernetes Job name as a Pod when run-origin has no Pod name', () => {
     const traversal = buildRunTraversal(runId, [
       row('run-origin', 0, { hostname: 'host-origin', childProvider: 'openai-codex', childModel: 'gpt-6.1-terra' }),

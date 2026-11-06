@@ -69,7 +69,8 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
     if (opts.append) {
       const advertised = remoteLine.split(/\s+/)[0] ?? '';
       if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} remote tip is not a commit SHA`);
-      git(repo, ['fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+      // PR-HEAD-FETCH-STATELESS: «+» so a moved tracking ref is never refused as non-fast-forward; the CAS is the advertised-SHA check below.
+      git(repo, ['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
       remoteTip = git(repo, ['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
       if (advertised !== remoteTip) throw new Error(`${branch} remote tip moved — fast-forward refused (no force push)`);
     }

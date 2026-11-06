@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import { debug } from '../debug/log.js';
 
 type GraphFiles = {
@@ -74,58 +75,58 @@ export function pwaReachableSrcFiles(cwd: string, { readFile = (path) => readFil
 
 export type AffectedRoots = { roots: Set<string>; failure?: undefined } | { roots?: undefined; failure: string };
 
-function astImportSpecifiers(source: ts.SourceFile): { imports: string[]; ignoredDynamic: number; failure?: string } {
-  const parseError = (source as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] }).parseDiagnostics?.[0];
-  if (parseError) return { imports: [], ignoredDynamic: 0, failure: `${source.fileName} AST 파싱 실패: ${ts.flattenDiagnosticMessageText(parseError.messageText, ' ')}` };
+function astImportSpecifiers(source: TS.SourceFile): { imports: string[]; ignoredDynamic: number; failure?: string } {
+  const parseError = (source as TS.SourceFile & { parseDiagnostics?: readonly TS.Diagnostic[] }).parseDiagnostics?.[0];
+  if (parseError) return { imports: [], ignoredDynamic: 0, failure: `${source.fileName} AST 파싱 실패: ${tsApi.flattenDiagnosticMessageText(parseError.messageText, ' ')}` };
   const imports: string[] = [];
   let ignoredDynamic = 0;
-  const literal = (node: ts.Node | undefined): string | undefined => node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) ? node.text : undefined;
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+  const literal = (node: TS.Node | undefined): string | undefined => node && (tsApi.isStringLiteral(node) || tsApi.isNoSubstitutionTemplateLiteral(node)) ? node.text : undefined;
+  const visit = (node: TS.Node): void => {
+    if (tsApi.isImportDeclaration(node) || tsApi.isExportDeclaration(node)) {
       const specifier = literal(node.moduleSpecifier);
       if (specifier) imports.push(specifier);
-    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+    } else if (tsApi.isImportEqualsDeclaration(node) && tsApi.isExternalModuleReference(node.moduleReference)) {
       const specifier = literal(node.moduleReference.expression);
       if (specifier) imports.push(specifier);
-    } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+    } else if (tsApi.isImportTypeNode(node) && tsApi.isLiteralTypeNode(node.argument)) {
       const specifier = literal(node.argument.literal);
       if (specifier) imports.push(specifier);
-    } else if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
-      || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) {
+    } else if (tsApi.isCallExpression(node) && (node.expression.kind === tsApi.SyntaxKind.ImportKeyword
+      || (tsApi.isIdentifier(node.expression) && node.expression.text === 'require'))) {
       const specifier = literal(node.arguments[0]);
       if (specifier) imports.push(specifier);
       else ignoredDynamic += 1;
     }
-    ts.forEachChild(node, visit);
+    tsApi.forEachChild(node, visit);
   };
   visit(source);
   return { imports, ignoredDynamic };
 }
 
-function reExportSpecifiers(source: ts.SourceFile): string[] {
+function reExportSpecifiers(source: TS.SourceFile): string[] {
   const importedLocals = new Map<string, string>();
   for (const statement of source.statements) {
-    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    if (!tsApi.isImportDeclaration(statement) || !tsApi.isStringLiteral(statement.moduleSpecifier)) continue;
     const from = statement.moduleSpecifier.text;
     const clause = statement.importClause;
     if (clause?.name) importedLocals.set(clause.name.text, from);
     const bindings = clause?.namedBindings;
-    if (bindings && ts.isNamespaceImport(bindings)) importedLocals.set(bindings.name.text, from);
-    if (bindings && ts.isNamedImports(bindings)) {
+    if (bindings && tsApi.isNamespaceImport(bindings)) importedLocals.set(bindings.name.text, from);
+    if (bindings && tsApi.isNamedImports(bindings)) {
       for (const element of bindings.elements) importedLocals.set(element.name.text, from);
     }
   }
   const specifiers: string[] = [];
   for (const statement of source.statements) {
-    if (ts.isExportDeclaration(statement)) {
-      if (statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) specifiers.push(statement.moduleSpecifier.text);
-      else if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+    if (tsApi.isExportDeclaration(statement)) {
+      if (statement.moduleSpecifier && tsApi.isStringLiteral(statement.moduleSpecifier)) specifiers.push(statement.moduleSpecifier.text);
+      else if (statement.exportClause && tsApi.isNamedExports(statement.exportClause)) {
         for (const element of statement.exportClause.elements) {
           const from = importedLocals.get((element.propertyName ?? element.name).text);
           if (from) specifiers.push(from);
         }
       }
-    } else if (ts.isExportAssignment(statement) && ts.isIdentifier(statement.expression)) {
+    } else if (tsApi.isExportAssignment(statement) && tsApi.isIdentifier(statement.expression)) {
       const from = importedLocals.get(statement.expression.text);
       if (from) specifiers.push(from);
     }
@@ -134,11 +135,11 @@ function reExportSpecifiers(source: ts.SourceFile): string[] {
 }
 
 /** Declarations visible without an import edge must enter every scoped program. */
-function suppliesAmbientTypes(source: ts.SourceFile): boolean {
-  if (source.fileName.endsWith('.d.ts') || !ts.isExternalModule(source)) return true;
-  const visit = (node: ts.Node): boolean => {
-    if (ts.isModuleDeclaration(node) && (node.name.text === 'global' || ts.isStringLiteral(node.name))) return true;
-    return ts.forEachChild(node, visit) ?? false;
+function suppliesAmbientTypes(source: TS.SourceFile): boolean {
+  if (source.fileName.endsWith('.d.ts') || !tsApi.isExternalModule(source)) return true;
+  const visit = (node: TS.Node): boolean => {
+    if (tsApi.isModuleDeclaration(node) && (node.name.text === 'global' || tsApi.isStringLiteral(node.name))) return true;
+    return tsApi.forEachChild(node, visit) ?? false;
   };
   return visit(source);
 }
@@ -206,8 +207,8 @@ export function reverseImportAffectedRoots(cwd: string, changed: ReadonlySet<str
   for (const file of listed) {
     const content = read(file);
     if (typeof content !== 'string') return content;
-    let source: ts.SourceFile;
-    try { source = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true); }
+    let source: TS.SourceFile;
+    try { source = tsApi.createSourceFile(file, content, tsApi.ScriptTarget.Latest, true); }
     catch (cause) { return { failure: `${file} AST 파싱 실패: ${cause instanceof Error ? cause.message : String(cause)}` }; }
     const scanned = astImportSpecifiers(source);
     if (scanned.failure) return { failure: scanned.failure };

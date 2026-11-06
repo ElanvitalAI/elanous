@@ -107,13 +107,13 @@ async function main(): Promise<number> {
 
     const nexusLog = join(work, 'nexus.log');
     const emptyCwd = mkdtempSync(join(work, 'cwd-'));
-    const child = spawn('bun', ['bin/elanous.mjs', 'nexus', 'run', '--test', '--tool-cwd', emptyCwd], {
+    const child = spawn('bun', ['bin/elanous.mjs', '--test', 'nexus', 'run', '--tool-cwd', emptyCwd], {
       cwd: worktree, env: envLiteral(NO_PROXY_ENV), detached: true, stdio: ['ignore', openSync(nexusLog, 'a'), openSync(nexusLog, 'a')],
     });
     child.unref();
     let port = '';
     await waitFor(() => {
-      const m = /nexus +:(\d+)/.exec(existsSync(nexusLog) ? readFileSync(nexusLog, 'utf8') : '');
+      const m = /(?:nexus +:|http +https?:\/\/127\.0\.0\.1:)(\d+)/.exec(existsSync(nexusLog) ? readFileSync(nexusLog, 'utf8') : '');
       if (m) port = m[1]!;
       const pid = /pid +(\d+)/.exec(existsSync(nexusLog) ? readFileSync(nexusLog, 'utf8') : '');
       if (pid) nexusPid = Number(pid[1]);
@@ -147,7 +147,7 @@ async function main(): Promise<number> {
     failure = e instanceof Error ? e.message : String(e);
     log(`could not run: ${failure}`);
   } finally {
-    if (existsSync(worktree)) run('bun', ['bin/elanous.mjs', 'nexus', 'run', '--test', '--stop'], worktree, 60_000);
+    if (existsSync(worktree)) run('bun', ['bin/elanous.mjs', '--test', 'nexus', 'run', '--stop'], worktree, 60_000);
     if (nexusPid) { try { process.kill(nexusPid, 'SIGTERM'); } catch { /* already gone */ } }
     run('git', ['worktree', 'remove', '--force', worktree], repo);
   }

@@ -5,7 +5,7 @@
 import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { debug } from '../../debug/log.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 
 interface WorkflowTemplateEntry {

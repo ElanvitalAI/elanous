@@ -601,11 +601,12 @@ test.skipIf(!ptyAvailable())('classic slash dispatch records one private-safe us
   };
   try {
     await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
-    handle.write(`/mission list ${slashSecret}\r`);
-    await wait(async () => (await handle.renderScreen()).includes(`/mission list ${slashSecret}  (`));
+    // /mission 은 11-05 제거(MISSION-FABRIC-REMOVAL) — 등록된 다른 명령(/loops 인자 과다 → usage)으로 같은 계약을 문다.
+    handle.write(`/loops a ${slashSecret}\r`);
+    await wait(async () => (await handle.renderScreen()).includes('usage: /loops [owner]'));
     handle.write('/zz-usage-probe\r');
     await wait(async () => (await handle.renderScreen()).includes('Unknown command: /zz-usage-probe'));
-    handle.write(`Please mention /mission in prose ${proseSecret}\r`);
+    handle.write(`Please mention /loops in prose ${proseSecret}\r`);
     await wait(async () => (await handle.renderScreen()).includes('natural reply complete'));
 
     const dbPath = join(root, 'logs', 'logs.db');
@@ -622,7 +623,7 @@ test.skipIf(!ptyAvailable())('classic slash dispatch records one private-safe us
     expect(events).toHaveLength(1);
     expect(events[0]!.event).toBe('dispatch');
     const payload = JSON.parse(events[0]!.data ?? 'null') as Record<string, unknown>;
-    expect(payload).toMatchObject({ command: 'mission', alias: null, surface: 'classic' });
+    expect(payload).toMatchObject({ command: 'loops', alias: null, surface: 'classic' });
     expect(typeof payload.runId).toBe('string');
     expect(typeof payload.tuiPid).toBe('number');
     expect(Object.keys(payload).sort()).toEqual(['alias', 'command', 'runId', 'surface', 'tuiPid']);

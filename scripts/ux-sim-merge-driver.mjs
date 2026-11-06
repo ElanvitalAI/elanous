@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync as writeTempFile } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 const same = isDeepStrictEqual;
@@ -106,68 +110,32 @@ function mergeCatalog(baseText, oursText, theirsText) {
   return `${JSON.stringify(mergeValue(base, ours, theirs), null, 2)}\n`;
 }
 
-function parseManual(text) {
-  const lines = text.split(/\r?\n/);
-  const begin = '<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->';
-  const end = '<!-- END GENERATED MOCK DEVICE CATALOG -->';
-  const start = lines.indexOf(begin);
-  const finish = lines.indexOf(end);
-  if (start < 0 || finish <= start) throw new Error('generated device catalog markers missing');
-  const header = lines.findIndex((line, index) => index > start && index < finish && /^\| ID \| 장치 \|/.test(line));
-  if (header < 0 || !/^\|[-| :]+\|$/.test(lines[header + 1] ?? '')) throw new Error('generated device table header missing');
-  const headerCells = lines[header].split('|').slice(1, -1).map((cell) => cell.trim());
-  if (headerCells.length !== 6 || headerCells.some((cell) => !cell)) throw new Error('generated device table must have six named columns');
-  const rows = lines.slice(header + 2, finish);
-  return { lines, start, finish, header, headerCells, rows };
-}
-
 function mergeManual(baseText, oursText, theirsText) {
-  const [base, ours, theirs] = [baseText, oursText, theirsText].map(parseManual);
-  const outsideTable = (document) => [
-    ...document.lines.slice(0, document.header + 2),
-    ...document.lines.slice(document.finish),
-  ];
-  if (!same(outsideTable(base), outsideTable(ours)) || !same(outsideTable(base), outsideTable(theirs))) {
-    throw new Error('manual non-table change');
+  const markers = (text) => {
+    const begin = '<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->';
+    const end = '<!-- END GENERATED MOCK DEVICE CATALOG -->';
+    const start = text.indexOf(begin);
+    const finish = text.indexOf(end);
+    if (start < 0 || finish < start) throw new Error('generated device catalog markers missing');
+    return { begin, end, start, finish };
+  };
+  const [base, ours, theirs] = [baseText, oursText, theirsText].map(markers);
+  const skeleton = (text, marker) => `${text.slice(0, marker.start + marker.begin.length)}\n${marker.end}${text.slice(marker.finish + marker.end.length)}`;
+  const temp = mkdtempSync(join(tmpdir(), 'ux-sim-manual-merge-'));
+  let mergedSkeleton;
+  try {
+    const paths = ['ours.md', 'base.md', 'theirs.md'].map((name) => join(temp, name));
+    [skeleton(oursText, ours), skeleton(baseText, base), skeleton(theirsText, theirs)].forEach((text, index) => writeTempFile(paths[index], text));
+    const result = spawnSync('git', ['merge-file', '--stdout', paths[0], paths[1], paths[2]], { encoding: 'utf8', timeout: 10_000 });
+    if (result.status !== 0) throw new Error(result.status === 1 ? 'manual non-generated content conflict' : `git merge-file failed: ${result.stderr || result.error?.message}`);
+    mergedSkeleton = result.stdout;
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
   }
-
-  const rowId = (row) => row.split('|')[1]?.trim();
-  function appendedRows(document) {
-    const body = document.lines.slice(document.header + 2, document.finish);
-    const baseRowsArePrefix = same(document.rows.slice(0, base.rows.length), base.rows);
-    const allRowsAreValid = body.length === document.rows.length && body.every((line) => {
-      if (!line.startsWith('|') || !line.endsWith('|')) return false;
-      const cells = line.split('|').slice(1, -1).map((cell) => cell.trim());
-      return cells.length === base.headerCells.length && Boolean(cells[0]);
-    });
-    if (!baseRowsArePrefix || !allRowsAreValid) throw new Error('manual table is not append-only');
-
-    for (const row of base.rows) {
-      if (!document.rows.includes(row)) throw new Error(`manual base row changed or removed: ${rowId(row)}`);
-    }
-    return document.rows.slice(base.rows.length);
-  }
-
-  const additions = new Map();
-  for (const row of [...appendedRows(ours), ...appendedRows(theirs)]) {
-    const id = rowId(row);
-    if (!id) throw new Error('manual appended row has no first-column ID');
-    const baseRow = base.rows.find((existingRow) => rowId(existingRow) === id);
-    if (baseRow) throw new Error(`manual appended ID duplicates a base row: ${id}`);
-    const existing = additions.get(id);
-    if (existing && existing !== row) throw new Error(`manual appended ID differs: ${id}`);
-    additions.set(id, row);
-  }
-
-  const mergedRows = [...base.rows, ...[...additions.values()].sort((left, right) => rowId(left).localeCompare(rowId(right)))];
-  const mergedLines = [
-    ...base.lines.slice(0, base.header + 2),
-    ...mergedRows,
-    ...base.lines.slice(base.finish),
-  ];
-  const newline = baseText.includes('\r\n') ? '\r\n' : '\n';
-  // split/join preserves the input's existing trailing newline (including no newline).
-  return mergedLines.join(newline);
+  const mergedMarkers = markers(mergedSkeleton);
+  // The complete marked section is generated from the merged catalog by merge-train.
+  // Keep one side here; integration regenerates it after the source catalog is merged.
+  return `${mergedSkeleton.slice(0, mergedMarkers.start)}${oursText.slice(ours.start, ours.finish + ours.end.length)}${mergedSkeleton.slice(mergedMarkers.finish + mergedMarkers.end.length)}`;
 }
 
 const [kind, basePath, oursPath, theirsPath] = process.argv.slice(2);

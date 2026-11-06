@@ -47,6 +47,8 @@ export interface AgentOutputParams {
 }
 
 export interface AgentOutputResult extends Record<string, unknown> {
+  /** Propagated through the LLM tool loop so terminal worker failures count as tool errors. */
+  isError?: true;
   /** Ambient one-liner the LLM renders ("done · 412 chars" / "still
    *  running · waited 30000ms" / "not found"). */
   output: string;
@@ -161,6 +163,7 @@ function snapshot(
     taskId: task.id,
     state: task.state,
   };
+  if (retrievalStatus === 'success' && task.state === 'error') result.isError = true;
   if (task.label !== undefined) result.label = task.label;
   if (text !== undefined) result.text = text;
   if (truncated) result.truncated = true;

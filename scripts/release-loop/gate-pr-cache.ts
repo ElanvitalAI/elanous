@@ -39,11 +39,15 @@ export function decidePrGateCache(input: PrGateCacheInput): PrGateCacheDecision 
     ({ decision, reason, files, head, base, main });
   if (!input.singlePr) return result('full', 'bundle-train');
   if (![head, base, main].every((sha) => SHA.test(sha))) return result('full', 'identity-unmeasured');
-  if (typeof raw.head40 !== 'string' || raw.head40.toLowerCase() !== head || raw.verdict !== 'passed' || raw.exitCode !== 0
+  const noTests = raw.verdict === 'skipped' && raw.artifactsUnavailable === 'no-tests' && raw.exitCode === 0
+    && raw.shards === 0 && Array.isArray(raw.shardsDetail) && raw.shardsDetail.length === 0
+    && Array.isArray(raw.cohort) && raw.cohort.length === 0;
+  const passed = raw.verdict === 'passed' && raw.exitCode === 0;
+  if (typeof raw.head40 !== 'string' || raw.head40.toLowerCase() !== head || (!passed && !noTests)
     || raw.introduced !== 0 || raw.unknown !== 0 || raw.preconditionUnmet !== 0 || raw.unrunImporters !== 0
     || (raw.remoteHost !== 'node-b' && raw.remoteHost !== 'node-c'))
     return result('full', 'author-gate-unmeasured-or-incomplete');
-  if (!Array.isArray(raw.cohort) || !raw.cohort.length || !raw.cohort.every((file) => safePath(file) && TEST.test(file)))
+  if (!noTests && (!Array.isArray(raw.cohort) || !raw.cohort.length || !raw.cohort.every((file) => safePath(file) && TEST.test(file))))
     return result('full', 'author-cohort-unmeasured');
   const cohort = [...new Set(raw.cohort as string[])];
   if (!input.baseAncestorOfHead || !input.baseAncestorOfMain) return result('full', 'base-not-ancestor');
@@ -54,6 +58,7 @@ export function decidePrGateCache(input: PrGateCacheInput): PrGateCacheDecision 
   if (changed.some((file) => INERT_DOC.test(file)) && input.inertDocsAddedOnly !== true)
     return result('full', 'main-document-change-not-addition');
   const codeChanged = changed.filter((file) => CODE.test(file));
+  if (noTests && codeChanged.length) return result('full', 'author-no-tests-main-code-change');
   if (!codeChanged.length) return result('reuse', changed.length ? 'main-doc-only-outside-radius' : 'same-content-base');
   if (input.sourceDependencyOverlap === null) return result('full', 'pr-source-radius-unmeasured');
   if (!input.affectedTests || !input.affectedTests.every((file) => safePath(file) && cohort.includes(file)))

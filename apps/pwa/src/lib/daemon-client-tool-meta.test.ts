@@ -1,29 +1,17 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 
 import { DaemonClient } from './daemon-client';
+import { withFakeFetchDevice } from '../test-devices/fake-fetch';
 
-const realFetch = globalThis.fetch;
-
-afterEach(() => {
-  globalThis.fetch = realFetch;
-});
-
-function mockSseResponse(chunks: string[]): typeof fetch {
-  return ((async () => {
-    const encoder = new TextEncoder();
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
-        controller.close();
-      },
-    });
-    return {
-      ok: true,
-      status: 200,
-      body,
-      text: async () => chunks.join(''),
-    } as unknown as Response;
-  }) as unknown) as typeof fetch;
+function sseResponse(chunks: string[]): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
 }
 
 function toolEvent(event: 'tool_call' | 'tool_call_update', data: unknown): string {
@@ -42,13 +30,14 @@ type ToolHandlers = NonNullable<Parameters<DaemonClient['agentCliPromptStream']>
 type ToolEvent = Parameters<NonNullable<ToolHandlers['onToolCall']>>[0];
 
 async function streamToolEvents(chunks: string[]): Promise<ToolEvent[]> {
-  globalThis.fetch = mockSseResponse(chunks);
-  const events: ToolEvent[] = [];
-  await makeClient().agentCliPromptStream(
-    { sessionId: 'session-1', message: 'hello' },
-    { onToolCall: (event) => events.push(event) },
-  );
-  return events;
+  return withFakeFetchDevice([{ url: '/v1/agent-cli/prompt', method: 'POST', response: () => sseResponse(chunks) }], async () => {
+    const events: ToolEvent[] = [];
+    await makeClient().agentCliPromptStream(
+      { sessionId: 'session-1', message: 'hello' },
+      { onToolCall: (event) => events.push(event) },
+    );
+    return events;
+  });
 }
 
 describe('DaemonClient.agentCliPromptStream tool metadata', () => {

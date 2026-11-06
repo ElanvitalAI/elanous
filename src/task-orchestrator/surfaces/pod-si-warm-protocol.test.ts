@@ -1,8 +1,53 @@
 import { expect, test } from 'bun:test';
-import { assessSiWarmReply, decideSiWarmNextStep, parseSiWarmCommand, parseSiWarmReply,
+import { assessSiWarmReply, decodeSiWarmArtifacts, decideSiWarmNextStep, parseSiWarmCommand, parseSiWarmReply,
   siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
 
 const bytes = (value: string) => new TextEncoder().encode(value);
+
+test('POD-REUSE-ARTIFACT-CAP rejects oversized base64 before allocating any artifact bytes', () => {
+  let allocations = 0;
+  const oversized = 'A'.repeat(Math.ceil((5 * 1024 * 1024 + 1) / 3) * 4);
+  const decoded = decodeSiWarmArtifacts([
+    { path: 'small.txt', bytes: 'c21hbGw=' },
+    { path: 'large.bin', bytes: oversized },
+  ], encoded => { allocations++; return Buffer.from(encoded, 'base64'); });
+  expect(decoded).toBeNull();
+  expect(allocations).toBe(0);
+});
+
+test('POD-REUSE-ARTIFACT-CAP accepts an artifact exactly at the per-artifact cap', () => {
+  let decodes = 0;
+  const encodedLength = Math.ceil((5 * 1024 * 1024) / 3) * 4;
+  const atCap = 'A'.repeat(encodedLength - 1) + '=';
+  const decoded = decodeSiWarmArtifacts([{ path: 'at-cap.bin', bytes: atCap }], () => {
+    decodes++;
+    return new Uint8Array();
+  });
+  expect(decoded).toHaveLength(1);
+  expect(decodes).toBe(1);
+});
+
+test('POD-REUSE-ARTIFACT-CAP preflights the aggregate limit before decoding any artifact', () => {
+  let allocations = 0;
+  const encodedLength = Math.ceil((5 * 1024 * 1024) / 3) * 4;
+  const atPerArtifactCap = 'A'.repeat(encodedLength - 1) + '=';
+  const decoded = decodeSiWarmArtifacts(Array.from({ length: 4 }, (_, index) => ({
+    path: `artifact-${index}.bin`, bytes: atPerArtifactCap,
+  })), () => { allocations++; return new Uint8Array(); });
+  expect(decoded).toHaveLength(4);
+  expect(allocations).toBe(4);
+
+  allocations = 0;
+  const oneByte = 'AA==';
+  const over = decodeSiWarmArtifacts([...Array.from({ length: 4 }, (_, index) => ({
+    path: `artifact-${index}.bin`, bytes: atPerArtifactCap,
+  })), { path: 'over.bin', bytes: oneByte }], encoded => {
+    allocations++;
+    return Buffer.from(encoded, 'base64');
+  });
+  expect(over).toBeNull();
+  expect(allocations).toBe(0);
+});
 const payload = bytes('{"feature":"change the code"}');
 const credentialBundle = bytes('private credential fixture');
 const returned: SiWarmReturnedBytes = {

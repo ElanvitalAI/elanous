@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { adoptSiWarmBytes, postprocessSiWarmChild, siWarmEligible, siWarmFallbackFiles,
+import { adoptSiWarmBytes, createSiWarmSourceShaResolver, postprocessSiWarmChild, siWarmEligible, siWarmFallbackFiles,
   siWarmExecutionKey,
   siWarmPayload } from './pod-si-warm-host.js';
 import type { SiWarmChildAttempt } from './self-implement-pod.js';
@@ -10,6 +11,99 @@ import type { SiWarmCommand, SiWarmReply } from './pod-si-warm-protocol.js';
 
 const input = { spaceId: 'space-a', feature: 'implement a small test change', base: 'main',
   autoMerge: true, openPr: true, draft: false };
+
+test('warm source SHA lookup is asynchronous and coalesces concurrent leases before a short-cache hit', async () => {
+  let now = 0;
+  let calls = 0;
+  const values = ['a'.repeat(40), 'b'.repeat(40)];
+  const resolveSourceSha = createSiWarmSourceShaResolver({
+    cacheMs: 1_000,
+    now: () => now,
+    execute: async () => {
+      calls++;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      now += 7;
+      return values[calls - 1]!;
+    },
+  });
+
+  const firstPending = resolveSourceSha('main', '/repo');
+  let eventLoopAdvanced = false;
+  queueMicrotask(() => { eventLoopAdvanced = true; });
+  const concurrentPending = resolveSourceSha('main', '/repo');
+  const [first, concurrent] = await Promise.all([firstPending, concurrentPending]);
+  expect(eventLoopAdvanced).toBe(true);
+  expect(first).toEqual({ sha: 'a'.repeat(40), cache: 'miss', durationMs: 7 });
+  expect(concurrent).toEqual({ sha: 'a'.repeat(40), cache: 'in-flight', durationMs: 7 });
+
+  const cached = await resolveSourceSha('main', '/repo');
+  expect(cached).toEqual({ sha: 'a'.repeat(40), cache: 'hit', durationMs: 0 });
+  expect(calls).toBe(1);
+
+  now += 1_000;
+  const refreshed = await resolveSourceSha('main', '/repo');
+  expect(refreshed).toMatchObject({ sha: 'b'.repeat(40), cache: 'miss' });
+  expect(calls).toBe(2);
+});
+
+test('warm source SHA cache is scoped to both checkout and revision and never caches failures', async () => {
+  let calls = 0;
+  const resolveSourceSha = createSiWarmSourceShaResolver({
+    execute: async (_cwd, revision) => {
+      calls++;
+      if (calls === 1) throw new Error('git unavailable');
+      if (calls === 2) return 'not-a-source-sha';
+      return revision === 'main^{commit}' ? 'c'.repeat(40) : 'd'.repeat(40);
+    },
+  });
+
+  await expect(resolveSourceSha('main', '/repo-a')).rejects.toThrow('git unavailable');
+  await expect(resolveSourceSha('main', '/repo-a')).rejects.toThrow('warm source SHA is invalid');
+  expect(await resolveSourceSha('main', '/repo-a')).toMatchObject({ sha: 'c'.repeat(40), cache: 'miss' });
+  expect(await resolveSourceSha('main', '/repo-b')).toMatchObject({ sha: 'c'.repeat(40), cache: 'miss' });
+  expect(await resolveSourceSha('develop', '/repo-a')).toMatchObject({ sha: 'd'.repeat(40), cache: 'miss' });
+  expect(calls).toBe(5);
+});
+
+test('default source SHA resolver invokes real Git asynchronously and refreshes a moved ref', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'si-source-sha-git-'));
+  let now = 0;
+  const resolveSourceSha = createSiWarmSourceShaResolver({ now: () => now, cacheMs: 1_000 });
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+  try {
+    git('init', '--initial-branch=main');
+    git('config', 'user.name', 'OPC Test');
+    git('config', 'user.email', 'opc-test@example.invalid');
+    writeFileSync(join(root, 'source.txt'), 'first');
+    git('add', 'source.txt');
+    git('commit', '-m', 'first');
+    const first = await resolveSourceSha('HEAD', root);
+    expect(first).toMatchObject({ sha: git('rev-parse', 'HEAD'), cache: 'miss' });
+    expect(await resolveSourceSha('HEAD', root)).toMatchObject({ sha: first.sha, cache: 'hit' });
+
+    writeFileSync(join(root, 'source.txt'), 'second');
+    git('add', 'source.txt');
+    git('commit', '-m', 'second');
+    now += 1_000;
+    const refreshed = await resolveSourceSha('HEAD', root);
+    expect(refreshed).toMatchObject({ sha: git('rev-parse', 'HEAD'), cache: 'miss' });
+    expect(refreshed.sha).not.toBe(first.sha);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('source SHA cache evicts least-recent checkout refs at its configured bound', async () => {
+  let calls = 0;
+  const resolveSourceSha = createSiWarmSourceShaResolver({
+    maxEntries: 2,
+    execute: async () => `${String.fromCharCode(97 + calls++).repeat(40)}`,
+  });
+  await resolveSourceSha('main', '/repo-a');
+  await resolveSourceSha('main', '/repo-b');
+  await resolveSourceSha('main', '/repo-c');
+  const evicted = await resolveSourceSha('main', '/repo-a');
+  expect(evicted).toMatchObject({ sha: 'd'.repeat(40), cache: 'miss' });
+  expect(calls).toBe(4);
+});
 
 test('plain SI payload preserves the cold child flags and run identity', () => {
   const result = siWarmPayload(input, { hostSupervised: true }, 'run-a', {});

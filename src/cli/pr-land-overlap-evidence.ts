@@ -31,6 +31,7 @@ import type { CmdRunner } from '../autopilot/pr-manager.js';
 import { parseReviewResultOutput } from '../task-agent/review-result-capture.js';
 import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
 import { proveReviewCarry } from './review-carry.js';
+import { buildTypefixCarryCandidate, loadTypefixCarryContext as loadProductionTypefixCarryContext, proveTypefixCarry, writeTypefixCarryReceipt, type ProveTypefixCarryInput, type TypefixCarryContextOptions, type TypefixCarryDeps, type TypefixCarryReceipt } from './review-typefix-carry.js';
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 
@@ -77,6 +78,15 @@ export interface VerifyOverlapEvidenceInput {
   reviewMtime?: (path: string) => number;
   /** Resolve the physical review path so a symlink cannot select a file outside the state directory. */
   reviewRealPath?: (path: string) => string;
+  /** Resolve evidence sources for a typefix-carry receipt; absent or incomplete context is fail-closed. */
+  loadTypefixCarryContext?: (receipt: TypefixCarryReceipt, receiptPath: string) => {
+    input: ProveTypefixCarryInput;
+    deps: TypefixCarryDeps;
+  } | null;
+  /** Persist the freshly re-proved canonical receipt only on a real landing attempt, never a dry-run. */
+  persistTypefixCarryReceipt?: boolean;
+  /** Test seam for persisted provenance stores; Git measurements and transpilation remain production code. */
+  typefixCarryEvidenceSources?: Pick<TypefixCarryContextOptions, 'readEvents' | 'readGateReceipts'>;
   /** 겹침 관문이 찾은 «겹친» 최근 착지 커밋들 — 전부 머리의 조상이면 already-ancestor. */
   overlappingLandings?: readonly string[];
 }
@@ -95,6 +105,23 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
     const match = filename.exec(name);
     return Boolean(match && head.startsWith(match[1]!.toLowerCase()));
   })) return { ok: false, reason: 'carry-new-head-review-exists' };
+  if (!e.reviewCarry && basename(selected).startsWith('typefix-carry-')) {
+    let selectedRecord: Record<string, unknown> | null | undefined;
+    try { selectedRecord = lastReviewRecord(input.readFile(selected)); } catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+    if (selectedRecord?.reviewer === 'typefix-carry') {
+      for (const name of names) {
+        const match = filename.exec(name);
+        if (!match || !head.startsWith(match[1]!.toLowerCase())) continue;
+        const candidate = join(dir, name);
+        if (candidate === selected) continue;
+        let candidateRecord: Record<string, unknown> | null | undefined;
+        try { candidateRecord = lastReviewRecord(input.readFile(candidate)); }
+        catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+        if (candidateRecord?.reviewer === 'typefix-carry') continue;
+        if (checkReview(input, { reviewResult: candidate }, head).ok) return { ok: false, reason: 'carry-new-head-review-exists' };
+      }
+    }
+  }
   const candidates = [...names].filter((name) => {
     const match = filename.exec(name);
     return Boolean(match && selectedHead.startsWith(match[1]!.toLowerCase()));
@@ -452,7 +479,42 @@ function reviewAttemptHasExactSameHeadFail(input: VerifyOverlapEvidenceInput, fa
 
 type EvidenceReviewCheck =
   | { ok: false; reason: string; baseTip?: string }
-  | { ok: true; reviewResult: string; evidence: Partial<OverlapEvidenceFile> };
+  | { ok: true; reviewResult: string; evidence: Partial<OverlapEvidenceFile>; virtualCarry?: boolean; virtualReceipt?: TypefixCarryReceipt;
+      carryEvents?: { event: 'typefix-carry-accepted' | 'typefix-carry-refused'; fields: Record<string, unknown> }[] };
+
+function persistSelectedCarry(input: VerifyOverlapEvidenceInput, selected: EvidenceReviewCheck): { ok: true } | { ok: false; reason: string } {
+  if (!selected.ok) return { ok: false, reason: 'carry-unmeasured' };
+  if (selected.virtualReceipt && input.persistTypefixCarryReceipt) {
+    if (!input.reviewResultsDir) return { ok: false, reason: 'carry-unmeasured' };
+    try {
+      const written = writeTypefixCarryReceipt(input.reviewResultsDir, selected.virtualReceipt);
+      if (written !== selected.reviewResult || input.readFile(written) !== `${JSON.stringify(selected.virtualReceipt, null, 2)}\n`) {
+        return { ok: false, reason: 'carry-unmeasured' };
+      }
+    } catch { return { ok: false, reason: 'carry-unmeasured' }; }
+  }
+  for (const item of selected.carryEvents ?? []) debug.log('pr.land', item.event, item.fields);
+  return { ok: true };
+}
+
+function checkVirtualCarryAttempts(input: VerifyOverlapEvidenceInput, evidence: Partial<OverlapEvidenceFile>, head: string): { ok: true } | { ok: false; reason: string } {
+  if (!input.reviewResultsDir || !input.listDir || !input.reviewRealPath || !evidence.reviewResult
+    || resolve(dirname(evidence.reviewResult)) !== resolve(input.reviewResultsDir)) return { ok: false, reason: 'review-attempts-unmeasured' };
+  try {
+    const dir = input.reviewRealPath(input.reviewResultsDir);
+    const parent = input.reviewRealPath(dirname(input.reviewResultsDir));
+    if (resolve(dir) !== resolve(join(parent, basename(input.reviewResultsDir)))) return { ok: false, reason: 'review-standard-dir-symlink' };
+  } catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+  let names: readonly string[];
+  try { names = input.listDir(input.reviewResultsDir); } catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+  const sameHead = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-([a-f0-9]{10,40})\\.json$`, 'i');
+  for (const name of names) {
+    const match = sameHead.exec(name);
+    if (!match || !head.startsWith(match[1]!.toLowerCase()) || name.startsWith(`typefix-carry-${input.pr}-`)) continue;
+    return { ok: false, reason: 'carry-new-head-review-exists' };
+  }
+  return { ok: true };
+}
 
 /** An error artifact is not a verdict; when the evidence points at one, find a valid same-head review. */
 function selectEvidenceReview(input: VerifyOverlapEvidenceInput, evidence: Partial<OverlapEvidenceFile>, head: string, baseTip?: string): EvidenceReviewCheck {
@@ -481,8 +543,9 @@ type Checked = { ok: false; reason: string; baseTip?: string; gateBase?: string;
 const ACCEPTED_REVIEW_VERDICTS: ReadonlySet<string> = new Set(['pass', 'warn']);
 const COMMIT_MARK = '\u0001';
 
-function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> & Partial<Pick<VerifyOverlapEvidenceInput, 'cwd' | 'remote' | 'branch'>>,
-  e: Partial<OverlapEvidenceFile>, head: string, baseTip?: string): { ok: false; reason: string; baseTip?: string } | { ok: true; reviewResult: string } {
+function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> & Partial<Pick<VerifyOverlapEvidenceInput, 'cwd' | 'remote' | 'branch' | 'reviewResultsDir' | 'loadTypefixCarryContext' | 'persistTypefixCarryReceipt' | 'typefixCarryEvidenceSources'>>,
+  e: Partial<OverlapEvidenceFile>, head: string, baseTip?: string): { ok: false; reason: string; baseTip?: string } | { ok: true; reviewResult: string; virtualCarry?: boolean; virtualReceipt?: TypefixCarryReceipt;
+    carryEvents?: { event: 'typefix-carry-accepted' | 'typefix-carry-refused'; fields: Record<string, unknown> }[] } {
   if (typeof e.reviewResult !== 'string' || !e.reviewResult) return { ok: false, reason: 'review-missing', baseTip };
   const carry = e.reviewCarry;
   const reviewHead = carry?.oldHead?.toLowerCase() ?? head;
@@ -498,8 +561,37 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
     return { ok: false, reason: 'review-path-not-for-this-pr-head', baseTip };
   }
   let text: string;
-  try { text = input.readFile(e.reviewResult); } catch { return { ok: false, reason: 'review-unreadable', baseTip }; }
-  const review = parseReviewResultOutput(text);
+  try { text = input.readFile(e.reviewResult); } catch {
+    const candidateName = `typefix-carry-${input.pr}-${head.slice(0, 12)}.json`;
+    if (basename(e.reviewResult) !== candidateName || !input.reviewResultsDir
+      || !input.cwd || !input.remote || !input.branch) return { ok: false, reason: 'review-unreadable', baseTip };
+    const contextOptions: TypefixCarryContextOptions = {
+      cwd: input.cwd, remote: input.remote, branch: input.branch, reviewResultsDir: input.reviewResultsDir,
+      ...input.typefixCarryEvidenceSources,
+    };
+    const candidate = buildTypefixCarryCandidate(input.pr, head, e.reviewResult, contextOptions);
+    if (!candidate) return { ok: false, reason: 'carry-unmeasured', baseTip };
+    const loader = input.loadTypefixCarryContext ?? ((record: TypefixCarryReceipt, path: string) =>
+      loadProductionTypefixCarryContext(record, path, contextOptions));
+    let context: ReturnType<typeof loader>;
+    try { context = loader(candidate, e.reviewResult); } catch { return { ok: false, reason: 'carry-unmeasured', baseTip }; }
+    if (!context) return { ok: false, reason: 'carry-unmeasured', baseTip };
+    const candidateEvents: { event: 'typefix-carry-accepted' | 'typefix-carry-refused'; fields: Record<string, unknown> }[] = [];
+    const proof = proveTypefixCarry(context.input, { ...context.deps, log: (event, fields) => candidateEvents.push({ event, fields }) });
+    if (!proof.ok) return { ok: false, reason: proof.reason, baseTip };
+    return { ok: true, reviewResult: e.reviewResult, virtualCarry: true, virtualReceipt: proof.receipt, carryEvents: candidateEvents };
+  }
+  let carryRecord = lastReviewRecord(text);
+  if (!carryRecord && basename(e.reviewResult).startsWith(`typefix-carry-${input.pr}-`)) {
+    try {
+      const value: unknown = JSON.parse(text);
+      if (value && typeof value === 'object' && !Array.isArray(value)
+        && (value as Record<string, unknown>).reviewer === 'typefix-carry') {
+        carryRecord = value as Record<string, unknown>;
+      }
+    } catch { /* the ordinary line-oriented review parser reports malformed evidence */ }
+  }
+  const review = parseReviewResultOutput(carryRecord?.reviewer === 'typefix-carry' ? JSON.stringify(carryRecord) : text);
   if (!review) return { ok: false, reason: 'review-no-result', baseTip };
   if (review.pr !== input.pr) return { ok: false, reason: 'review-pr-mismatch', baseTip };
   if (!review.head || review.head.toLowerCase() !== reviewHead) return { ok: false, reason: 'review-head-mismatch', baseTip };
@@ -548,6 +640,55 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
   if (review.reviewed !== true) return { ok: false, reason: 'review-not-reviewed', baseTip };
   if (review.verdict === null || !ACCEPTED_REVIEW_VERDICTS.has(review.verdict)) return { ok: false, reason: `review-verdict-${review.verdict ?? 'null'}`, baseTip };
   if (review.mustFix !== 0) return { ok: false, reason: review.mustFix === null ? 'review-must-fix-unknown' : `review-must-fix-${review.mustFix}`, baseTip };
+  const typefixCarryFilename = basename(e.reviewResult).startsWith(`typefix-carry-${input.pr}-`);
+  if (typefixCarryFilename || carryRecord?.reviewer === 'typefix-carry') {
+    const rejectCarry = (reason: string) => {
+      debug.log('pr.land', 'typefix-carry-refused', {
+        pr: input.pr, fromHead: carryRecord?.carry && typeof carryRecord.carry === 'object'
+          ? (carryRecord.carry as Record<string, unknown>).fromHead ?? null : null,
+        newHead: head, reason,
+      });
+      return { ok: false as const, reason, baseTip };
+    };
+    if (basename(e.reviewResult) !== `typefix-carry-${input.pr}-${head.slice(0, 12)}.json`) {
+      return rejectCarry('carry-unmeasured');
+    }
+    const contextLoader = input.loadTypefixCarryContext ?? (input.cwd && input.remote && input.branch && input.reviewResultsDir
+      ? (record: TypefixCarryReceipt, path: string) => loadProductionTypefixCarryContext(record, path, {
+        cwd: input.cwd!, remote: input.remote!, branch: input.branch!, reviewResultsDir: input.reviewResultsDir!,
+        ...input.typefixCarryEvidenceSources,
+      }) : undefined);
+    if (!contextLoader || carryRecord?.reviewer !== 'typefix-carry' || carryRecord.pr !== input.pr || carryRecord.headCommit !== head
+      || carryRecord.reviewed !== true || !ACCEPTED_REVIEW_VERDICTS.has(String(carryRecord.verdict))
+      || !Array.isArray(carryRecord.mustFix) || carryRecord.mustFix.length !== 0) {
+      return rejectCarry('carry-unmeasured');
+    }
+    let context: ReturnType<NonNullable<typeof input.loadTypefixCarryContext>>;
+    try { context = contextLoader(carryRecord as unknown as TypefixCarryReceipt, e.reviewResult); }
+    catch { return rejectCarry('carry-unmeasured'); }
+    if (!context || !context.input || !context.deps) return rejectCarry('carry-unmeasured');
+    const carryEvents: { event: 'typefix-carry-accepted' | 'typefix-carry-refused'; fields: Record<string, unknown> }[] = [];
+    const proof = proveTypefixCarry(context.input, {
+      ...context.deps,
+      log: (event, fields) => carryEvents.push({ event, fields }),
+    });
+    if (!proof.ok) {
+      if (carryEvents.length === 0) return rejectCarry(proof.reason);
+      for (const item of carryEvents) {
+        if (context.deps.log) context.deps.log(item.event, item.fields);
+        else debug.log('pr.land', item.event, item.fields);
+      }
+      return { ok: false, reason: proof.reason, baseTip };
+    }
+    const canonical = JSON.stringify(proof.receipt);
+    let refreshReceipt: TypefixCarryReceipt | undefined;
+    if (JSON.stringify(carryRecord) !== canonical) {
+      if (input.persistTypefixCarryReceipt && !input.reviewResultsDir) return rejectCarry('carry-unmeasured');
+      refreshReceipt = proof.receipt;
+    }
+    return { ok: true, reviewResult: e.reviewResult, carryEvents,
+      ...(refreshReceipt ? { virtualCarry: true, virtualReceipt: refreshReceipt } : {}) };
+  }
   if (acpClaudeEvidence) {
     debug.log('pr.land', 'review-acp-claude-accepted', { pr: input.pr, head, reviewResult: e.reviewResult, ...acpClaudeEvidence });
   }
@@ -595,7 +736,9 @@ export function verifyOverlapEvidenceVirtualRebase(input: VerifyOverlapEvidenceI
   const selectedReview = selectEvidenceReview(input, evidence, head, baseTip);
   if (!selectedReview.ok) return selectedReview;
   const review = selectedReview;
-  const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
+  const attempts = selectedReview.virtualCarry
+    ? checkVirtualCarryAttempts(input, selectedReview.evidence, head)
+    : checkSelectedReviewAttempts(input, selectedReview.evidence, head);
   if (!attempts.ok) return attempts;
   const remote = input.run('git', ['ls-remote', input.remote, `refs/heads/${input.branch}`], { cwd: input.cwd });
   if (!remote.ok || remote.out.trim().split(/\s+/)[0]?.toLowerCase() !== baseTip.toLowerCase()) {
@@ -612,7 +755,46 @@ export function verifyOverlapEvidenceVirtualRebase(input: VerifyOverlapEvidenceI
   if (!input.run('git', ['merge-base', '--is-ancestor', gateBase, oldBase], { cwd: input.cwd }).ok) {
     return { ok: false, reason: 'gate-base-not-ancestor-of-old-base' };
   }
+  const persistedCarry = persistSelectedCarry(input, selectedReview);
+  if (!persistedCarry.ok) return persistedCarry;
   return { ok: true, reviewResult: review.reviewResult, patchId: patch.patchId };
+}
+
+/** Proof for the narrow path where the pinned gate/review passed, but the base advanced
+ * with an overlapping append-only conflict that the normal virtual-rebase path cannot apply. */
+export function verifyAppendOnlyConflictEvidence(input: VerifyOverlapEvidenceInput, baseTip: string):
+  | { ok: false; reason: string }
+  | { ok: true; gateBase: string; reviewResult: string } {
+  const head = input.expectedHead.toLowerCase();
+  if (!SHA40.test(head) || !SHA40.test(baseTip)) return { ok: false, reason: 'conflict-evidence-invalid-sha' };
+  let raw: unknown;
+  try { raw = JSON.parse(input.readFile(input.evidencePath)); }
+  catch { return { ok: false, reason: 'evidence-unreadable' }; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'evidence-not-object' };
+  const evidence = raw as Partial<OverlapEvidenceFile>;
+  const evidencePr = typeof evidence.pr === 'number' ? evidence.pr
+    : typeof evidence.pr === 'string' && /^[0-9]+$/.test(evidence.pr) ? Number(evidence.pr) : NaN;
+  if (!Number.isSafeInteger(evidencePr) || evidencePr !== input.pr) return { ok: false, reason: 'evidence-pr-mismatch' };
+  if (typeof evidence.head !== 'string' || evidence.head.toLowerCase() !== head) return { ok: false, reason: 'evidence-head-mismatch' };
+  const gate = evidence.gate;
+  if (!gate || typeof gate !== 'object' || gate.passed !== true) return { ok: false, reason: 'gate-not-passed' };
+  if (typeof gate.head !== 'string' || gate.head.toLowerCase() !== head) return { ok: false, reason: 'gate-head-mismatch' };
+  if (typeof gate.baseCommit !== 'string' || !SHA40.test(gate.baseCommit)) return { ok: false, reason: 'gate-base-unmeasured' };
+  const gateBase = gate.baseCommit.toLowerCase();
+  if (!input.run('git', ['cat-file', '-e', `${gateBase}^{commit}`], { cwd: input.cwd }).ok
+    || !input.run('git', ['merge-base', '--is-ancestor', gateBase, head], { cwd: input.cwd }).ok
+    || !input.run('git', ['merge-base', '--is-ancestor', gateBase, baseTip], { cwd: input.cwd }).ok) {
+    return { ok: false, reason: 'gate-base-not-common-ancestor' };
+  }
+  const remote = input.run('git', ['ls-remote', input.remote, `refs/heads/${input.branch}`], { cwd: input.cwd });
+  if (!remote.ok || remote.out.trim().split(/\s+/)[0]?.toLowerCase() !== baseTip.toLowerCase()) {
+    return { ok: false, reason: 'conflict-evidence-base-advanced' };
+  }
+  const selectedReview = selectEvidenceReview(input, evidence, head, baseTip);
+  if (!selectedReview.ok) return { ok: false, reason: selectedReview.reason };
+  const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
+  if (!attempts.ok) return { ok: false, reason: attempts.reason };
+  return { ok: true, gateBase, reviewResult: selectedReview.reviewResult };
 }
 
 type WindowResult = { ok: true; windowCommits: number } | { ok: false; reason: string; windowCommits?: number };
@@ -693,8 +875,12 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
     const selectedReview = selectEvidenceReview(input, e, head);
     if (!selectedReview.ok) return selectedReview;
     const review = selectedReview;
-    const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
-    return attempts.ok ? { ok: true, mode: 'already-ancestor', reviewResult: review.reviewResult } : attempts;
+    const attempts = selectedReview.virtualCarry
+      ? checkVirtualCarryAttempts(input, selectedReview.evidence, head)
+      : checkSelectedReviewAttempts(input, selectedReview.evidence, head);
+    if (!attempts.ok) return attempts;
+    const persistedCarry = persistSelectedCarry(input, selectedReview);
+    return persistedCarry.ok ? { ok: true, mode: 'already-ancestor', reviewResult: review.reviewResult } : persistedCarry;
   }
 
   // ① 재기반 — 원격의 «지금» 끝을 읽기 전용으로 받는다(로컬 ref 를 안 바꾼다).
@@ -714,10 +900,14 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
     const selectedReview = selectEvidenceReview(input, e, head, baseTip);
     if (!selectedReview.ok) return { ...selectedReview, gateBase, windowCommits: window.windowCommits };
     const review = selectedReview;
-    const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
-    return attempts.ok
+    const attempts = selectedReview.virtualCarry
+      ? checkVirtualCarryAttempts(input, selectedReview.evidence, head)
+      : checkSelectedReviewAttempts(input, selectedReview.evidence, head);
+    if (!attempts.ok) return { ...attempts, gateBase, windowCommits: window.windowCommits };
+    const persistedCarry = persistSelectedCarry(input, selectedReview);
+    return persistedCarry.ok
       ? { ok: true, mode: 'base-advanced-disjoint', baseTip, gateBase: gateBase!, windowCommits: window.windowCommits, reviewResult: review.reviewResult }
-      : { ...attempts, gateBase, windowCommits: window.windowCommits };
+      : { ...persistedCarry, gateBase, windowCommits: window.windowCommits };
   };
   if (!ancestor.ok) {
     const notRebased = `not-rebased: ${input.remote}/${input.branch} ${baseTip.slice(0, 12)} is not an ancestor of ${head.slice(0, 12)}`;
@@ -737,8 +927,12 @@ function check(input: VerifyOverlapEvidenceInput): Checked {
   const selectedReview = selectEvidenceReview(input, e, head, baseTip);
   if (!selectedReview.ok) return selectedReview;
   const review = selectedReview;
-  const attempts = checkSelectedReviewAttempts(input, selectedReview.evidence, head);
-  return attempts.ok ? { ok: true, mode: 'rebased', baseTip, reviewResult: review.reviewResult } : attempts;
+  const attempts = selectedReview.virtualCarry
+    ? checkVirtualCarryAttempts(input, selectedReview.evidence, head)
+    : checkSelectedReviewAttempts(input, selectedReview.evidence, head);
+  if (!attempts.ok) return attempts;
+  const persistedCarry = persistSelectedCarry(input, selectedReview);
+  return persistedCarry.ok ? { ok: true, mode: 'rebased', baseTip, reviewResult: review.reviewResult } : persistedCarry;
 }
 
 export type AncestorAutoVerdict =

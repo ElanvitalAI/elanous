@@ -2305,6 +2305,22 @@ export interface McpConfig {
   widgetServerId?: string;
 }
 
+/** Aside Browser endpoints are SSH stdio MCP servers; credentials stay on each host. */
+export interface AsideRemoteTargetConfig {
+  id: string;
+  host: string;
+  command: string[];
+  enabled?: boolean;
+  capabilities: Array<'browser' | 'repl' | 'selection'>;
+}
+
+export interface AsideConfig {
+  targets: AsideRemoteTargetConfig[];
+  defaultTargetId?: string;
+  contextDefaults?: Record<string, string>;
+  strictRedactMode?: boolean;
+}
+
 // ── BackgroundReasoning LLM (W9e-FU U5 · 2026-05-12) ──────────────────
 //
 // Drives the Patcher daemon's entity-extractor + embedding-generator
@@ -2529,6 +2545,49 @@ function parseMcpConfig(raw: unknown): McpConfig | undefined {
     ...(enabled === false ? { enabled: false } : {}),
     ...spreadIfDefined('handshakeTimeoutMs', handshakeTimeoutMs),
     ...spreadIfDefined('widgetServerId', widgetServerId),
+  };
+}
+
+function parseAsideConfig(raw: unknown): AsideConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('aside must be an object');
+  const r = raw as Record<string, unknown>;
+  if (r.strictRedactMode !== undefined && typeof r.strictRedactMode !== 'boolean') {
+    throw new Error('aside.strictRedactMode must be boolean');
+  }
+  const targets: AsideRemoteTargetConfig[] = [];
+  const ids = new Set<string>();
+  if (r.targets !== undefined && !Array.isArray(r.targets)) throw new Error('aside.targets must be an array');
+  if (Array.isArray(r.targets)) for (const [index, rawTarget] of r.targets.entries()) {
+    if (!rawTarget || typeof rawTarget !== 'object' || Array.isArray(rawTarget)) throw new Error(`aside.targets[${index}] must be an object`);
+    const target = rawTarget as Record<string, unknown>;
+    if (typeof target.id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(target.id) || ids.has(target.id)) throw new Error(`aside.targets[${index}].id is invalid or duplicated`);
+    if (typeof target.host !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(target.host)) throw new Error(`aside.targets[${index}].host is invalid`);
+    if (!Array.isArray(target.command) || target.command.length === 0 || target.command.some(v => typeof v !== 'string' || !v || /[\r\n\0]/.test(v))) throw new Error(`aside.targets[${index}].command is invalid`);
+    const capabilities = Array.isArray(target.capabilities)
+      ? [...new Set(target.capabilities.filter((v): v is AsideRemoteTargetConfig['capabilities'][number] => v === 'browser' || v === 'repl' || v === 'selection'))]
+      : [];
+    if (capabilities.length === 0 || (target.enabled !== undefined && typeof target.enabled !== 'boolean')) throw new Error(`aside.targets[${index}] capabilities or enabled value is invalid`);
+    ids.add(target.id);
+    targets.push({ id: target.id, host: target.host, command: [...target.command] as string[], capabilities, ...(typeof target.enabled === 'boolean' ? { enabled: target.enabled } : {}) });
+  }
+  if (r.defaultTargetId !== undefined && (typeof r.defaultTargetId !== 'string' || !ids.has(r.defaultTargetId))) throw new Error('aside.defaultTargetId must reference a registered target');
+  const defaultTargetId = typeof r.defaultTargetId === 'string' ? r.defaultTargetId : undefined;
+  const contextDefaults: Record<string, string> = {};
+  if (r.contextDefaults !== undefined && (!r.contextDefaults || typeof r.contextDefaults !== 'object' || Array.isArray(r.contextDefaults))) throw new Error('aside.contextDefaults must be an object');
+  if (r.contextDefaults && typeof r.contextDefaults === 'object') {
+    for (const [context, id] of Object.entries(r.contextDefaults)) {
+      if (!context.trim() || typeof id !== 'string' || !ids.has(id)) throw new Error(`aside.contextDefaults.${context} must reference a registered target`);
+      contextDefaults[context] = id;
+    }
+  }
+  const strictRedactMode = r.strictRedactMode === true ? true : undefined;
+  if (targets.length === 0 && !defaultTargetId && Object.keys(contextDefaults).length === 0 && strictRedactMode === undefined) return undefined;
+  return {
+    targets,
+    ...(defaultTargetId ? { defaultTargetId } : {}),
+    ...(Object.keys(contextDefaults).length ? { contextDefaults } : {}),
+    ...(strictRedactMode ? { strictRedactMode } : {}),
   };
 }
 
@@ -4056,6 +4115,7 @@ export interface UserConfig {
   //   ToolRuntimes. Sparse — undefined or empty servers[] = no-op.
   //   See `src/nexus/boot/register-mcp-clients.ts` for the boot wire.
   mcp?: McpConfig;
+  aside?: AsideConfig;
   // W9e-FU U5 (2026-05-12) — `background-reasoning.llm.*` drives the
   // Patcher daemon's LLM callable wire. When omitted, `buildPatcherSubstrate`
   // surfaces `patcher-llm-deps-missing` and stays dormant. The resolver
@@ -5179,7 +5239,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const gateRemoteConfig = parseGateRemoteConfig(rawObj.gateRemote);
   const projects = parseProjectsConfig(rawObj.projects);
   const outboundConfig = parseOutboundConfig(rawObj.outbound);
-  return {
+  const config: UserConfig = {
     tui: {
       sidetab: tuiRaw.sidetab === 'off' || tuiRaw.sidetab === 'open' ? tuiRaw.sidetab : 'collapsed',
       ...(typeof tuiRaw.unattended === 'boolean' ? { unattended: tuiRaw.unattended } : {}),
@@ -6031,6 +6091,9 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ? rawObj.tabs as Record<string, Record<string, unknown>>
       : undefined,
   };
+  const asideConfig = parseAsideConfig(rawObj.aside);
+  if (asideConfig) config.aside = asideConfig;
+  return config;
 }
 
 function parseVwOrder(raw: unknown): Array<'acp' | 'sim' | 'iul'> {
@@ -6260,8 +6323,8 @@ export function resolveAcpHopCapFromConfig(
  *  ⑵ 별칭·래퍼로 부르면 소스 스캔이 못 본다.
  *  ⇒ 🩹 값을 «내는 자리»를 하나로 만들면 그 둘이 «구조적으로» 사라진다 — 넘길 잘못된 값이 없다.
  *  ⭐ 그리고 이 함수 하나만 런타임으로 검증하면 모든 소비처의 전달값이 같이 검증된다. */
-export function configuredWorktreeRoot(): string {
-  return getUserConfig().tools.selfImplement.worktreeRoot;
+export function configuredWorktreeRoot(configPath?: string): string {
+  return getUserConfig(configPath).tools.selfImplement.worktreeRoot;
 }
 
 export function getUserConfig(path: string = defaultPath()): UserConfig {

@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, extname, join, normalize, resolve } from 'node:path/posix';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 
 const IMPORTER_TEST_DISPLAY_LIMIT = 20;
 
@@ -71,15 +72,15 @@ const EMITTED_SOURCE_SUFFIXES: Readonly<Record<string, readonly string[]>> = {
 };
 
 function importedSpecifiers(text: string, path: string): string[] {
-  const sourceFile = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, false);
+  const sourceFile = tsApi.createSourceFile(path, text, tsApi.ScriptTarget.Latest, false);
   const specifiers: string[] = [];
-  const visit = (node: ts.Node): void => {
-    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+  const visit = (node: TS.Node): void => {
+    if ((tsApi.isImportDeclaration(node) || tsApi.isExportDeclaration(node)) && node.moduleSpecifier && tsApi.isStringLiteral(node.moduleSpecifier)) {
       specifiers.push(node.moduleSpecifier.text);
-    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0])) {
+    } else if (tsApi.isCallExpression(node) && node.expression.kind === tsApi.SyntaxKind.ImportKeyword && node.arguments.length === 1 && tsApi.isStringLiteral(node.arguments[0])) {
       specifiers.push(node.arguments[0].text);
     }
-    ts.forEachChild(node, visit);
+    tsApi.forEachChild(node, visit);
   };
   visit(sourceFile);
   return specifiers;
@@ -156,17 +157,17 @@ function isRuntimeEdgeModule(specifier: string): boolean {
 /** 시험 파일의 런타임 모듈 임포트 바인딩 — 로컬 이름 → 임포트된 이름(네임스페이스·기본 임포트는 `'*'`).
  *  ⛔⭐ 임포트 출처를 알 수 없는 수신 객체는 간선을 만들지 «않는다»(무인 리뷰 must-fix) — `db.exec(...)`·
  *  `fsMock.readFile(...)` 같은 호출 이름이 spawn·file-state 간선으로 승격되던 오탐을 고치는 자리다. */
-function runtimeEdgeImports(sourceFile: ts.SourceFile): ReadonlyMap<string, string> {
+function runtimeEdgeImports(sourceFile: TS.SourceFile): ReadonlyMap<string, string> {
   const bindings = new Map<string, string>();
   for (const statement of sourceFile.statements) {
-    if (!ts.isImportDeclaration(statement) || !statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    if (!tsApi.isImportDeclaration(statement) || !statement.moduleSpecifier || !tsApi.isStringLiteral(statement.moduleSpecifier)) continue;
     if (!isRuntimeEdgeModule(statement.moduleSpecifier.text)) continue;
     const clause = statement.importClause;
     if (!clause) continue;
     if (clause.name) bindings.set(clause.name.text, '*');
     const named = clause.namedBindings;
     if (!named) continue;
-    if (ts.isNamespaceImport(named)) bindings.set(named.name.text, '*');
+    if (tsApi.isNamespaceImport(named)) bindings.set(named.name.text, '*');
     else for (const element of named.elements) {
       if (element.isTypeOnly) continue;
       bindings.set(element.name.text, element.propertyName?.text ?? element.name.text);
@@ -179,14 +180,14 @@ function runtimeEdgeImports(sourceFile: ts.SourceFile): ReadonlyMap<string, stri
  *  - `obj.method`: 수신 객체가 런타임 모듈 바인딩이거나 전역 `Bun` 일 때만.
  *  - 맨살 `fn(...)`: 런타임 모듈의 named import 이고 «임포트된 이름»이 표에 있을 때만(`as` 별칭도 잡는다).
  *  - 정규식 리터럴(`/re/.exec`)·출처를 알 수 없는 수신 객체는 `undefined` — 간선이 아니다. */
-function declaredRuntimeEdgeKind(callee: ts.Expression, imports: ReadonlyMap<string, string>): RuntimeEdgeKind | undefined {
-  if (ts.isPropertyAccessExpression(callee)) {
+function declaredRuntimeEdgeKind(callee: TS.Expression, imports: ReadonlyMap<string, string>): RuntimeEdgeKind | undefined {
+  if (tsApi.isPropertyAccessExpression(callee)) {
     const receiver = callee.expression;
-    if (!ts.isIdentifier(receiver)) return undefined;
+    if (!tsApi.isIdentifier(receiver)) return undefined;
     if (receiver.text !== 'Bun' && !imports.has(receiver.text)) return undefined;
     return RUNTIME_EDGE_CALLS[callee.name.text];
   }
-  if (ts.isIdentifier(callee)) {
+  if (tsApi.isIdentifier(callee)) {
     const imported = imports.get(callee.text);
     if (imported === undefined || imported === '*') return undefined;
     return RUNTIME_EDGE_CALLS[imported];
@@ -196,15 +197,15 @@ function declaredRuntimeEdgeKind(callee: ts.Expression, imports: ReadonlyMap<str
 
 /** 시험 소스에서 런타임 호출을 찾아 «무엇을 지목했는지»까지 모은다. */
 function runtimeEdgeCalls(text: string, path: string): RuntimeEdgeCall[] {
-  const sourceFile = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, false);
+  const sourceFile = tsApi.createSourceFile(path, text, tsApi.ScriptTarget.Latest, false);
   const calls: RuntimeEdgeCall[] = [];
-  const literalsOf = (node: ts.Node, out: string[]): void => {
-    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) out.push(node.text);
-    else ts.forEachChild(node, (child) => literalsOf(child, out));
+  const literalsOf = (node: TS.Node, out: string[]): void => {
+    if (tsApi.isStringLiteral(node) || tsApi.isNoSubstitutionTemplateLiteral(node)) out.push(node.text);
+    else tsApi.forEachChild(node, (child) => literalsOf(child, out));
   };
   const runtimeImports = runtimeEdgeImports(sourceFile);
-  const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node)) {
+  const visit = (node: TS.Node): void => {
+    if (tsApi.isCallExpression(node)) {
       const declared = declaredRuntimeEdgeKind(node.expression, runtimeImports);
       if (declared) {
         const literals: string[] = [];
@@ -214,7 +215,7 @@ function runtimeEdgeCalls(text: string, path: string): RuntimeEdgeCall[] {
         calls.push({ kind: /^git\b/.test(command) ? 'git' : declared, literals });
       }
     }
-    ts.forEachChild(node, visit);
+    tsApi.forEachChild(node, visit);
   };
   visit(sourceFile);
   return calls;

@@ -8,6 +8,7 @@ import { failureReason } from '../../domains/repeated-failure.js';
 import { McpConnectionError } from '../../mcp/client.js';
 import { handleMcpRequest, type McpServerContext } from '../../mcp/server.js';
 import { HARNESS_RUN_ID_ENV } from '../../harness/harness-space.js';
+import { areAsideRemoteTargetsConfigured } from '../../aside/remote-targets.js';
 import { registerToolRuntime, unregisterToolRuntime } from '../../tool-runtime/registry.js';
 import type { ToolRunResult, ToolRuntime } from '../../tool-runtime/types.js';
 import {
@@ -86,6 +87,86 @@ describe('registerMcpClients handshake timeout configuration', () => {
     expect(warnings).toContainEqual(expect.stringContaining('slow was excluded after its 1ms handshake timeout'));
     expect(warnings).toContainEqual(expect.stringContaining('raise mcp.handshakeTimeoutMs or mcp.servers[].handshakeTimeoutMs, then run elanous mcp reload'));
     await handle.shutdown();
+  });
+});
+
+describe('ASIDE-REMOTE-TARGET MCP routing', () => {
+  test('boots one SSH stdio client per target and routes an explicit selection without exposing errors', async () => {
+    const spawned: string[][] = [];
+    const routed: string[] = [];
+    const handle = await registerMcpClients({
+      servers: [],
+      aside: { strictRedactMode: true, targets: [
+        { id: 'mac-a', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['selection', 'repl'] },
+        { id: 'mac-b', host: 'node-b', command: ['aside', 'mcp'], capabilities: ['selection', 'repl'] },
+      ] },
+      createClient: (spec) => {
+        spawned.push(spec.transport === 'stdio' ? spec.command : []);
+        return {
+          start: async () => {},
+          listTools: async () => [{ name: 'exec', inputSchema: { type: 'object' } }],
+          callTool: async (name, args) => {
+            routed.push(`${spec.id}:${name}:${String(args.code)}`);
+            return { content: [{ type: 'text', text: 'ELANOUS_CURRENT_SELECTION:{"text":"hello","url":"https://example.test"}; aZ9bC8dE7fGhJ2kL4mN6pQ8rT0vX5sW' }] };
+          },
+          dispose: async () => {},
+        };
+      },
+      logger: { info: () => {}, warn: () => {} },
+    });
+    expect(spawned).toEqual([
+      ['ssh', '-T', 'minim5', "'aside' 'mcp'"],
+      ['ssh', '-T', 'node-b', "'aside' 'mcp'"],
+    ]);
+    const strictResult = await handle.asideRouter!.call('aside.repl', { code: 'safe-code' }, { targetId: 'mac-b', capability: 'selection' });
+    expect(JSON.stringify(strictResult)).not.toContain('aZ9bC8dE7fGhJ2kL4mN6pQ8rT0vX5sW');
+    expect(JSON.stringify(strictResult)).toContain('[REDACTED]');
+    expect(routed).toEqual(["aside-target-mac-b:exec:safe-code"]);
+    // One NEXUS handle owns the stable aside.exec id at a time.
+    await handle.shutdown();
+    let error = '';
+    const badHandle = await registerMcpClients({
+      servers: [],
+      aside: { targets: [{ id: 'mac-secret', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl'] }] },
+      createClient: () => ({ start: async () => {}, listTools: async () => [{ name: 'exec', inputSchema: {} }], callTool: async () => { throw new Error('ghp_0123456789abcdefghijklmnopqrstuvwxyzAB private-stderr'); }, dispose: async () => {} }),
+      logger: { info: () => {}, warn: () => {} },
+    });
+    try { await badHandle.asideRouter!.call('exec', {}, { targetId: 'mac-secret', capability: 'repl' }); } catch (caught) { error = String(caught); }
+    expect(error).not.toContain('ghp_0123456789abcdefghijklmnopqrstuvwxyzAB');
+    expect(error).toContain('unavailable');
+    await badHandle.shutdown();
+  });
+
+  test('registers one stable Aside proxy and routes target_id/context through it', async () => {
+    const routed: string[] = [];
+    const registered = new Map<string, ToolRuntime>();
+    const handle = await registerMcpClients({
+      servers: [stdioServer('aside')],
+      aside: { targets: [
+        { id: 'mac-a', host: 'minim5', command: ['aside', 'mcp'], capabilities: ['repl'] },
+        { id: 'mac-b', host: 'node-b', command: ['aside', 'mcp'], capabilities: ['repl'] },
+      ], contextDefaults: { research: 'mac-a' } },
+      createClient: (spec) => ({
+        start: async () => {},
+        listTools: async () => [{ name: 'exec', inputSchema: { type: 'object', properties: { code: { type: 'string' }, context: { type: 'string' } } } }],
+        callTool: async (name, args) => {
+          routed.push(`${spec.id}:${name}:${String(args.code)}:${String(args.context ?? '')}`);
+          return { content: [{ type: 'text', text: 'ok' }] };
+        },
+        dispose: async () => {},
+      }),
+      registerRuntime: runtime => { registered.set(runtime.id, runtime); },
+      unregisterRuntime: () => undefined,
+      logger: { info: () => {}, warn: () => {} },
+    });
+    expect(areAsideRemoteTargetsConfigured()).toBe(true);
+    expect(registered.has('aside.exec')).toBe(true);
+    expect([...registered.keys()].filter(id => id === 'aside.exec')).toHaveLength(1);
+    await registered.get('aside.exec')!.run!({ code: 'explicit', __elanous_aside_route: { target_id: 'mac-b' } }, { surface: 'tui' });
+    await registered.get('aside.exec')!.run!({ code: 'context', context: 'tool-owned-context', __elanous_aside_route: { context: 'research' } }, { surface: 'tui' });
+    expect(routed).toEqual(['aside-target-mac-b:exec:explicit:', 'aside-target-mac-a:exec:context:tool-owned-context']);
+    await handle.shutdown();
+    expect(areAsideRemoteTargetsConfigured()).toBe(false);
   });
 });
 
@@ -313,10 +394,10 @@ test('Aside roundtrip returns the same-run Elanous tool result and records a run
 
     const asideExec = runtimes.find((runtime) => runtime.id === 'aside.exec');
     expect(asideExec).toBeDefined();
-    const returnedToParent = await asideExec!.run({ prompt: 'Inspect the signed-in release page.', reason: 'verify release readiness' }, {});
+    const returnedToParent = await asideExec!.run({ prompt: 'Inspect the signed-in release page.', reason: 'token-canary-secret-value' }, {});
 
     expect(asidePrompt).toContain(`elanous 런 ${runId} · 결과는 elanous 도구로 돌려라.`);
-    expect(asidePrompt).toContain('Delegation reason: verify release readiness');
+    expect(asidePrompt).toContain('Delegation reason: token-canary-secret-value');
     expect(asidePrompt).toContain('TaskGet');
     expect(asidePrompt).toContain('same runId');
     expect(taskGetRunId).toBe(runId);
@@ -324,11 +405,13 @@ test('Aside roundtrip returns the same-run Elanous tool result and records a run
     expect(resultText(returnedToParent)).toContain(`context for ${runId}`);
     expect(ledger.list(runId)).toHaveLength(2);
     expect(ledger.list(runId).map((entry) => entry.phase)).toEqual(['call', 'result']);
-    expect(ledger.list(runId)[1]).toMatchObject({ runId, toolName: 'exec', reason: 'verify release readiness', ok: true });
+    expect(ledger.list(runId)[1]).toMatchObject({ runId, toolName: 'exec', reason: '[REDACTED]', ok: true });
+    expect(JSON.stringify(ledger.list(runId))).not.toContain('token-canary-secret-value');
     expect(JSON.stringify(ledger.list(runId))).not.toContain('context for');
     expect(logs.filter((row) => row.category === 'mcp-client.aside').map((row) => [row.event, row.data?.runId])).toEqual([
       ['exec-request', runId], ['exec-result', runId],
     ]);
+    expect(JSON.stringify(logs.filter((row) => row.category === 'mcp-client.aside'))).not.toContain('token-canary-secret-value');
     expect(logs.filter((row) => row.category === 'mcp-server.aside').map((row) => [row.event, row.data?.runId, row.data?.ok])).toEqual([
       ['elanous-tool-call', runId, undefined], ['elanous-tool-result', runId, null],
     ]);

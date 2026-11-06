@@ -151,7 +151,8 @@ export async function executeSiWarmTransport(input: {
   return { boundary: 'exec-attempted', reason, measured: false, quarantineWorker: true,
     quarantineRecorded, ...(quarantineError ? { quarantineError } : {}),
     validationReason: validation.reason,
-    ...(validation.measured && validation.reason === 'match' && receipt.bytes
+    ...((validation.measured && validation.reason === 'match' || validation.terminalVerifiedForReconcile)
+      && receipt.bytes
       ? { verifiedBytesForReconcile: receipt.bytes } : {}),
     reply: null, bytes: null };
 }

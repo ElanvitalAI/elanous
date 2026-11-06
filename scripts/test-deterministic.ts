@@ -515,6 +515,30 @@ export function deriveTestFiles(deps: { spawnSync?: typeof Bun.spawnSync; cwd?: 
   return decodeSpawnOutput(result.stdout).split('\n').map((line) => line.trim()).filter((line) => BUN_TEST_FILE_PATTERN.test(line));
 }
 
+/** Test entrypoints containing only a side-effect import execute another suite a second time. */
+export function deriveImportOnlyTestFiles(deps: { cwd?: string; files?: string[] } = {}): string[] {
+  const cwd = deps.cwd ?? process.cwd();
+  const files = deps.files ?? deriveTestFiles({ cwd });
+  const discovered = new Set(files.map((file) => resolve(cwd, file)));
+  const compilerOptions: ts.CompilerOptions = {
+    allowImportingTsExtensions: true,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    target: ts.ScriptTarget.Latest,
+  };
+  return files.filter((file) => {
+    let source: string;
+    try { source = readFileSync(resolve(cwd, file), 'utf8'); } catch { return false; }
+    const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const statement = tree.statements[0];
+    if (tree.statements.length !== 1 || statement === undefined
+      || !ts.isImportDeclaration(statement) || statement.importClause !== undefined
+      || !ts.isStringLiteral(statement.moduleSpecifier)) return false;
+    const target = ts.resolveModuleName(statement.moduleSpecifier.text, resolve(cwd, file), compilerOptions, ts.sys)
+      .resolvedModule?.resolvedFileName;
+    return target !== undefined && discovered.has(resolve(target));
+  });
+}
+
 // Bun accepts both `--flag=value` and `--flag value`. The value of a test
 // option is never a file selector, even when it happens to match a file name.
 // Audited against `bun --help` and `bun test --help` in Bun 1.4.2. Bun accepts
@@ -839,17 +863,19 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   let discovered: string[] | undefined;
   const discoverTestFiles = (): string[] => discovered ??=
     [...new Set([...(deps.deriveTestFiles ?? (() => deriveTestFiles({ cwd: testCwd })))(), ...explicitFiles.files])];
+  const importOnlyAliases = explicitPaths ? [] : deriveImportOnlyTestFiles({ cwd: testCwd, files: discoverTestFiles() });
+  const ignoredTestPatterns = [...new Set([...cdpPatterns, ...importOnlyAliases])];
   // With explicit paths, parse only the files the selectors reach; files that
   // classifyExplicitTestFiles already parsed are not parsed twice.
   const scanMocks = (): string[] => {
-    if (!explicitPaths) return deriveMockModuleTestFiles({ cwd: testCwd });
+    if (!explicitPaths) return deriveMockModuleTestFiles({ cwd: testCwd, files: discoverTestFiles() });
     const classified = new Set(explicitFiles.files);
     const files = selectedTestFiles(argv, discoverTestFiles(), testCwd).filter((file) => !classified.has(file));
     return files.length === 0 ? [] : deriveMockModuleTestFiles({ cwd: testCwd, files });
   };
   const mockFiles = [...new Set([...(deps.deriveMockModuleFiles ?? scanMocks)(), ...explicitFiles.mockFiles])];
   const allTestFiles = (explicitPaths || fullBail) && mockFiles.length > 0 ? discoverTestFiles() : [];
-  let commands = planDeterministicTestCommands(argv, cdpPatterns, mockFiles, allTestFiles, testCwd);
+  let commands = planDeterministicTestCommands(argv, ignoredTestPatterns, mockFiles, allTestFiles, testCwd);
   const optionTokens = bunTestOptionTokens(argv);
   // Bun writes these outputs to one caller-selected file. Separate children
   // would overwrite each other, so preserve the caller's single-process run.
@@ -859,7 +885,7 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   const sharedOutputFallback = commands.length > 1 && sharedOutput;
   if (sharedOutputFallback) {
     report('[test-deterministic] 공유 파일 출력 옵션: mock.module 분리를 끄고 단일 Bun 시험 프로세스로 실행한다.');
-    commands = [['bun', 'test', ...cdpPatterns.flatMap((pattern) => ['--path-ignore-patterns', pattern]), ...argv]];
+    commands = [['bun', 'test', ...ignoredTestPatterns.flatMap((pattern) => ['--path-ignore-patterns', pattern]), ...argv]];
   }
   const namePatterns = [
     ...bunTestOptionValues(argv, '--test-name-pattern'),
@@ -893,6 +919,9 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   }
   if (cdpPatterns.length > 0) {
     report(`[test-deterministic] CDP 시험 ${cdpPatterns.length}개 파일을 뺐다 — bun run test:cdp 로 돈다 (파생: requireCdpBase 직접 import ⊕ 포트 9333 직접 사용).`);
+  }
+  if (importOnlyAliases.length > 0) {
+    report(`[test-deterministic] import-only 별칭 ${importOnlyAliases.length}개는 전체 시험에서 제외한다 — 명시 경로 선택은 그대로 실행한다.`);
   }
   if (!sharedOutputFallback && commands.some((cmd) => mockFiles.includes(cmd.at(-1) ?? ''))) {
     report('[test-deterministic] mock.module 시험 파일을 각자 단독 프로세스로 실행한다.');

@@ -1,11 +1,12 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
-import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, humanBreaks, parseReviewBriefLogData, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
+import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, humanBreaks, parseReviewBriefLogData, registerDoctorCommand, runBootstrap, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
 import { checkReadiness } from './doctor-readiness.js';
 import { debug } from '../debug/log.js';
 import { applySudoFixes } from './doctor-fix.js';
@@ -13,6 +14,7 @@ import { DOCTOR_SYMPTOMS, doctorVisitIncidentRoot } from '../self-implement/doct
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { recordRunExit } from '../harness/harness-incidents.js';
 import type { UserConfig } from '../user-config.js';
+import { recommendBackendTier } from '../nexus/apps/backend-tier.js';
 
 const example = [
   'ENV_ONLY=',
@@ -26,6 +28,32 @@ const example = [
 const userConfig = (apiKey = '') => ({
   registry: { discovery: { firecrawl: { apiKey } } },
 }) as UserConfig;
+
+test('doctor report shows read-only backend tier advice with estimated thresholds', () => {
+  const backendTier = recommendBackendTier({ memory: { totalBytes: 8 * 1024 ** 3, availableBytes: 4 * 1024 ** 3 }, engines: ['Colima'] });
+  const output = renderDoctorReport({ ok: true, credentials: [], externalCommands: [], backendTier });
+  expect(output).toContain('Backend tier: T1');
+  expect(output).toContain('추정 문턱');
+});
+
+test('runDoctor carries measured host tier and installed-engine advice into text and JSON report data', () => {
+  const report = runDoctor(options({
+    readiness: undefined,
+    fetchHealth: () => null,
+    readInstallPrefix: () => null,
+    codeRevision: () => undefined,
+    probeHostEnvironment: () => ({
+      substrate: null, docker: null, kubernetes: null,
+      memory: { totalBytes: 8 * 1024 ** 3, availableBytes: 4 * 1024 ** 3, source: 'simulation' },
+      engines: ['podman'],
+    }),
+  }));
+  expect(report.backendTier).toMatchObject({ tier: 'T1', engines: ['podman'] });
+  const output = renderDoctorReport(report);
+  expect(output).toContain('Backend tier: T1');
+  expect(output).toContain('Existing engines: podman');
+  expect(output).toContain('running state is not implied');
+});
 
 function options(overrides: Parameters<typeof runDoctor>[0] = {}) {
   return {
@@ -74,6 +102,114 @@ function credentialBlock(formatted: string, name: string, nextName?: string): st
 }
 
 describe('doctor CLI', () => {
+  test('bootstrap installs only the first-run tools and PATH, then uses its version marker', () => {
+    const home = mkdtempSync(join(tmpdir(), 'elanous-bootstrap-'));
+    const prefix = join(home, 'custom-tools');
+    const env = { HOME: home, SHELL: '/bin/bash', PATH: '', XDG_DATA_HOME: join(home, 'custom-xdg'), ELANOUS_INSTALL_PREFIX: prefix };
+    const installed: string[] = [];
+    const readiness: Parameters<typeof checkReadiness>[0] = {
+      platform: 'linux' as const,
+      distro: 'unknown',
+      installPrefix: prefix,
+      pathEntries: [],
+      ghOnPath: false,
+      rgOnPath: false,
+      codexOnPath: false,
+      nodeOnPath: false,
+      elanousOnPath: null,
+    };
+    try {
+      const first = runBootstrap({
+        home, env, readiness, commandExists: () => false,
+        installStaticTool: (name) => { installed.push(name); return { ok: true, detail: 'installed' }; },
+        smokeCheck: () => true,
+      });
+      expect(first.ok).toBe(true);
+      expect(first.marker).toContain(join(home, '.local', 'share', 'elanous', 'doctor-ok-'));
+      expect(first.marker).not.toContain(join(home, 'custom-xdg'));
+      expect(first.marker).not.toContain(join(home, 'custom-tools'));
+      expect(existsSync(first.marker)).toBe(true);
+      expect(existsSync(join(prefix, `bootstrap-ready-${JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version}`))).toBe(true);
+      readiness.ghOnPath = true;
+      readiness.rgOnPath = true;
+      readiness.codexOnPath = true;
+      readiness.codexCodeModeHost = true;
+      const second = runBootstrap({ home, env, readiness, commandExists: () => false,
+        installStaticTool: (name) => { installed.push(name); return { ok: true, detail: 'installed' }; },
+        smokeCheck: () => true,
+      });
+      expect(second.marker).toBe(first.marker);
+      expect(second.manual).toEqual(first.manual);
+      expect(installed).toContain('gh');
+      expect(installed).toContain('rg');
+      expect(installed).toContain('codex');
+      expect(installed).toContain('codex-code-mode-host');
+      expect(installed.length).toBe(4);
+      expect(first.manual.length).toBeLessThanOrEqual(2);
+
+      const nextPrefix = join(home, 'second-tools');
+      env.ELANOUS_INSTALL_PREFIX = nextPrefix;
+      readiness.installPrefix = nextPrefix;
+      readiness.ghOnPath = false;
+      readiness.rgOnPath = false;
+      readiness.codexOnPath = false;
+      readiness.codexCodeModeHost = false;
+      const version = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version as string;
+      mkdirSync(nextPrefix, { recursive: true });
+      writeFileSync(join(nextPrefix, `bootstrap-ready-${version}`), 'stale marker\n');
+      let failedAttempts = 0;
+      const failed = runBootstrap({ home, env, readiness, commandExists: () => false,
+        installStaticTool: () => { failedAttempts++; return { ok: false, detail: 'simulated offline failure' }; },
+        smokeCheck: () => false,
+      });
+      expect(failed.ok).toBe(false);
+      expect(failedAttempts).toBe(4);
+      expect(existsSync(join(nextPrefix, `bootstrap-ready-${version}`))).toBe(false);
+      const third = runBootstrap({ home, env, readiness, commandExists: () => false,
+        installStaticTool: (name) => { installed.push(name); return { ok: true, detail: 'installed' }; },
+        smokeCheck: () => true,
+      });
+      expect(third.ok).toBe(true);
+      expect(third.marker).toBe(first.marker);
+      expect(existsSync(join(nextPrefix, `bootstrap-ready-${version}`))).toBe(true);
+      expect(installed.length).toBeGreaterThan(4);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  const nodeVersion = spawnSync('node', ['--version'], { encoding: 'utf8' }).stdout?.trim() ?? '';
+  const node22 = nodeVersion.startsWith('v22.');
+  test.skipIf(!node22)('Node 22 launcher performs first bootstrap and writes the canonical marker', () => {
+    expect(nodeVersion).toMatch(/^v22\./);
+    const home = mkdtempSync(join(tmpdir(), 'elanous-node-bootstrap-'));
+    const markerDir = join(home, '.local', 'share', 'elanous');
+    const prefix = join(home, 'custom-tools');
+    const packageVersion = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version as string;
+    try {
+      const launcherPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../bin/elanous.cjs');
+      const result = spawnSync('node', [launcherPath, 'bootstrap'], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: home,
+          XDG_DATA_HOME: join(home, 'custom-xdg'),
+          ELANOUS_INSTALL_PREFIX: prefix,
+          ELANOUS_BUN: process.env.ELANOUS_BUN || process.execPath,
+        },
+        timeout: 10 * 60 * 1000,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('Bootstrap ready');
+      expect(result.stdout).toContain(join(markerDir, `doctor-ok-${packageVersion}`));
+      expect(existsSync(join(markerDir, `doctor-ok-${packageVersion}`))).toBe(true);
+      expect(existsSync(join(prefix, `bootstrap-ready-${packageVersion}`))).toBe(true);
+      expect(existsSync(join(prefix, `doctor-ok-${packageVersion}`))).toBe(false);
+      expect(existsSync(join(home, 'custom-xdg', 'elanous', `doctor-ok-${packageVersion}`))).toBe(false);
+      expect(existsSync(join(prefix, 'bin', 'gh'))).toBe(true);
+      expect(existsSync(join(prefix, 'bin', 'rg'))).toBe(true);
+      expect(existsSync(join(prefix, 'bin', 'codex'))).toBe(true);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }, { timeout: 600_000 });
+
   test('shared CLI options use an isolated local LLM inventory', async () => {
     const outputs: string[] = [];
     const program = new Command();

@@ -1,5 +1,10 @@
 import { spyOn } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
 import * as os from 'node:os';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { getTestStateRoot, setTestStateRoot } from '../../src/nexus/paths.js';
 
 /** A patch of process.env for one callback: a string sets the key, `undefined` removes it. */
 export type TestEnvPatch = Readonly<Record<string, string | undefined>>;
@@ -40,4 +45,29 @@ export async function withTestEnv<T>(patch: TestEnvPatch, run: () => T | Promise
 /** Bun does not refresh os.homedir() when HOME changes after process startup. */
 export async function withTestHome<T>(home: string, run: () => T | Promise<T>): Promise<T> {
   return withTestEnv({ HOME: home }, run);
+}
+
+/**
+ * Run a callback with HOME, config, and state rooted in one disposable directory.
+ * This changes process-global environment and overrides; do not call it from concurrent tests.
+ */
+export async function withIsolatedElanousRoot<T>(run: (root: string) => T | Promise<T>): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-isolated-root-'));
+  const previousConfigDir = getElanousConfigDirOverride();
+  const previousStateRoot = getTestStateRoot();
+  try {
+    return await withTestEnv({ HOME: root, ELANOUS_STATE_DIR: root, ELANOUS_CONFIG_DIR: undefined }, async () => {
+      setElanousConfigDir(root);
+      setTestStateRoot(root);
+      try {
+        return await run(root);
+      } finally {
+        if (previousConfigDir === undefined) resetElanousConfigDir();
+        else setElanousConfigDir(previousConfigDir);
+        setTestStateRoot(previousStateRoot ?? null);
+      }
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }

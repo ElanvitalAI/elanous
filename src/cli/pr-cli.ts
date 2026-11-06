@@ -1,6 +1,8 @@
-import { existsSync, realpathSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, closeSync, writeSync, realpathSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
-import { loadavg } from 'node:os';
+import { homedir, loadavg } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import {
@@ -61,10 +63,17 @@ import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { registerPrLandOptions } from './pr-land-options.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
-import { classifyPrLandRefusal, observeDirectPrLandRefusal, observePrLandRefusal } from './pr-land-refusal.js';
+import { classifyTypecheckDrift, executeDriftPlan, planDriftRepair, resolveDriftAutorepairMode, type DriftDeps } from './pr-land-drift-repair.js';
+import { loadGateReceipts } from '../self-implement/gate-receipt-registry.js';
+import { getUserConfig } from '../user-config.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { spawnElanousSync as defaultSpawnElanousSync } from '../instance/spawn-elanous.js';
+import { classifyPrLandRefusal, observeDirectPrLandRefusal, observePrLandRefusal, type PrLandRefusalContext } from './pr-land-refusal.js';
 import { bindPrLandRefusalToRecover, PR_LAND_CARD_ID_ENV } from './pr-land-recovery.js';
 import type { HeavyRemoteInput, HeavyRemoteResult } from './pr-land-heavy-remote.js';
 import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
+import { integrateTrain } from '../self-implement/merge-train.js';
 import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
 import type { TaskCard } from '../task-agent/task-hand.js';
 import { INFLIGHT_REGISTRY_FILE, removeInflightForPr } from '../pr-tool/inflight-registry.js';
@@ -114,6 +123,125 @@ export interface PrGranularityOpts {
 export const PR_LAND_MERGEABLE_UNKNOWN_RETRIES = 3;
 export const PR_LAND_MERGEABLE_UNKNOWN_WAIT_MS = 5_000;
 
+const CONFLICT_AUTOMERGE_DISABLE = new Set(['0', 'false', 'off', 'no']);
+
+function conflictAutomergeEnabled(): boolean {
+  const value = process.env.ELANOUS_PR_LAND_CONFLICT_AUTOMERGE?.trim().toLowerCase();
+  return value === undefined || !CONFLICT_AUTOMERGE_DISABLE.has(value);
+}
+
+function isAppendOnlyDocConflict(paths: readonly string[]): boolean {
+  return paths.length > 0 && paths.every((path) => path.startsWith('docs/')
+    && /\.(?:md|mdx|txt|rst|csv|tsv)$/i.test(path));
+}
+
+/** Cross-process, at-most-once claim for one pinned PR head. */
+function claimConflictAutomergeAttempt(pr: number, head: string, stateDir?: string): boolean {
+  const root = stateDir ?? join(elanousStateRoot(), 'pr-land-conflict-automerge');
+  const key = createHash('sha256').update(`${pr}:${head.toLowerCase()}`).digest('hex');
+  const file = join(root, `${key}.json`);
+  try {
+    mkdirSync(root, { recursive: true });
+    const fd = openSync(file, 'wx', 0o600);
+    try { writeSync(fd, JSON.stringify({ pr, head: head.toLowerCase(), claimedAt: new Date().toISOString() })); }
+    finally { closeSync(fd); }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+function githubOwnerRepo(raw: string): string | undefined {
+  const value = raw.trim();
+  let path: string;
+  if (value.startsWith('git@github.com:')) {
+    path = value.slice('git@github.com:'.length);
+  } else {
+    let parsed: URL;
+    try { parsed = new URL(value); } catch { return undefined; }
+    const ssh = parsed.protocol === 'ssh:';
+    if ((!ssh && parsed.protocol !== 'https:') || parsed.hostname.toLowerCase() !== 'github.com'
+      || parsed.port || parsed.search || parsed.hash || parsed.password
+      || (ssh ? parsed.username !== 'git' : parsed.username !== '')) return undefined;
+    path = parsed.pathname.replace(/^\//, '');
+  }
+  const match = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(path);
+  return match ? `${match[1]}/${match[2]}`.toLowerCase() : undefined;
+}
+
+function conflictOwnerSeat(login: string | undefined): string {
+  if (!login) return 'OP';
+  try {
+    const mapping: unknown = JSON.parse(process.env.ELANOUS_PR_CONFLICT_OWNER_MAP ?? '{}');
+    const seat = mapping && typeof mapping === 'object' ? (mapping as Record<string, unknown>)[login] : undefined;
+    return typeof seat === 'string' && ['OP', 'TC', 'MK', 'UX', 'OPT', 'OPC'].includes(seat) ? seat : 'OP';
+  } catch { return 'OP'; }
+}
+
+function notifyCodeConflictOwner(input: {
+  cwd: string; pr: number; head: string; files: readonly string[]; reason: string; login?: string;
+  send?: (input: { cwd: string; recipient: string; body: string }) => boolean;
+}): { sent: boolean; recipient: string } {
+  const recipient = conflictOwnerSeat(input.login);
+  const body = `[LAND-CONFLICT-AUTOMERGE-LIVE] PR #${input.pr} head ${input.head.slice(0, 12)} 코드 충돌은 자동 병합하지 않았습니다. 경로: ${input.files.join(' · ')} · 사유: ${input.reason} · 수리 런/주인 확인이 필요합니다.`;
+  const sent = input.send
+    ? input.send({ cwd: input.cwd, recipient, body })
+    : defaultSpawnElanousSync(['msg', 'post', '--from', 'OPC', '--to', recipient, '--kind', 'report', '--body', body], {
+      executable: 'eln', cwd: input.cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024,
+    }).status === 0;
+  return { sent, recipient };
+}
+
+function pushLiveConflictMerge(input: {
+  run: CmdRunner; cwd: string; pr: number; head: string; base: string; url: string;
+  integration: ReturnType<typeof integrateTrain>; stateDir?: string;
+}): { pushed: boolean; reason: string; branch?: string } {
+  const { run, cwd, pr, head, base, url, integration } = input;
+  if (!conflictAutomergeEnabled()) return { pushed: false, reason: 'disabled-by-ELANOUS_PR_LAND_CONFLICT_AUTOMERGE' };
+  const conflict = integration.conflictPlans?.find((entry) => entry.number === pr);
+  const repair = conflict?.repairPlan;
+  if (!conflict || repair?.decision !== 'automerge' || !repair.mergedFiles || !isAppendOnlyDocConflict(conflict.files)) {
+    return { pushed: false, reason: 'not-an-append-only-document-conflict' };
+  }
+  if (integration.unmeasured || !integration.commitSha || integration.conflicts.length) return { pushed: false, reason: 'integration-unmeasured-or-conflicted' };
+
+  const view = run('gh', ['pr', 'view', url, '--json', 'headRefOid,headRefName,headRepositoryOwner,headRepository'], { cwd });
+  let identity: { headRefOid?: string; headRefName?: string; headRepositoryOwner?: { login?: string }; headRepository?: { name?: string } } = {};
+  try { if (view.ok) identity = JSON.parse(view.out) as typeof identity; } catch { /* unavailable means refuse */ }
+  const branch = identity.headRefName;
+  const ownerRepo = identity.headRepositoryOwner?.login && identity.headRepository?.name
+    ? `${identity.headRepositoryOwner.login}/${identity.headRepository.name}`.toLowerCase() : undefined;
+  if (!branch || !/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith('-')
+    || identity.headRefOid?.toLowerCase() !== head.toLowerCase()) return { pushed: false, reason: 'pinned-pr-identity-unavailable-or-changed' };
+  const validBranch = run('git', ['check-ref-format', '--branch', branch], { cwd });
+  if (!validBranch.ok) return { pushed: false, reason: 'invalid-pr-head-branch' };
+  const pushRemote = run('git', ['remote', 'get-url', '--push', 'origin'], { cwd });
+  const pushUrls = pushRemote.ok ? pushRemote.out.trim().split(/\r?\n/).filter(Boolean) : [];
+  if (pushUrls.length !== 1 || !ownerRepo || githubOwnerRepo(pushUrls[0]!) !== ownerRepo) {
+    return { pushed: false, reason: 'pr-head-is-not-the-single-configured-push-repository' };
+  }
+  const pushUrl = pushUrls[0]!;
+  const remoteHead = run('git', ['ls-remote', '--heads', pushUrl, `refs/heads/${branch}`], { cwd });
+  const remoteSha = remoteHead.ok ? remoteHead.out.trim().split(/\s+/)[0] : undefined;
+  if (remoteSha?.toLowerCase() !== head.toLowerCase()) return { pushed: false, reason: 'remote-pr-head-changed-or-unavailable' };
+
+  const commitObject = run('git', ['cat-file', '-p', integration.commitSha], { cwd });
+  const parents = commitObject.ok
+    ? commitObject.out.split('\n').filter((line) => line.startsWith('parent ')).map((line) => line.slice('parent '.length).trim())
+    : [];
+  if (parents[0]?.toLowerCase() !== base.toLowerCase() || parents[1]?.toLowerCase() !== head.toLowerCase() || parents.length !== 2) {
+    return { pushed: false, reason: 'merge-commit-parent-order-or-pin-mismatch' };
+  }
+  let claimed = false;
+  try { claimed = claimConflictAutomergeAttempt(pr, head, input.stateDir); }
+  catch (error) { return { pushed: false, reason: `attempt-claim-unavailable:${String(error)}` }; }
+  if (!claimed) return { pushed: false, reason: 'head-already-attempted' };
+  const pushed = run('git', ['push', `--force-with-lease=refs/heads/${branch}:${head}`, pushUrl, `${integration.commitSha}:refs/heads/${branch}`], { cwd });
+  if (!pushed.ok) return { pushed: false, reason: `push-refused:${pushed.out.trim().slice(0, 240)}` };
+  return { pushed: true, reason: repair.reason, branch };
+}
+
 export interface PrLandDeps {
   manager?: PrManager;
   /** Confirmed merge cleanup; failures are observed and never undo the merge. */
@@ -124,8 +252,14 @@ export interface PrLandDeps {
   resolveBase?: (run: CmdRunner, cwd: string, explicit?: string) => string | undefined;
   currentBranch?: (cwd: string) => string | undefined;
   readFile?: (path: string) => string;
+  /** Per-head live conflict repair claim directory; tests pass an isolated directory. */
+  conflictAutomergeStateDir?: string;
+  /** Narrow test seam for the conflict-owner mail sent through spawnElanousSync. */
+  sendCodeConflictNotice?: (input: { cwd: string; recipient: string; body: string }) => boolean;
   /** 증거 파일 없는 already-ancestor 자동 판정이 리뷰 결과를 찾는 자리(기본 `<TA 상태 디렉터리>/review-results`). */
   reviewResultsDir?: string;
+  /** Test seam for persisted drift/gate receipts used by typefix-carry; production reads canonical stores. */
+  typefixCarryEvidenceSources?: VerifyOverlapEvidenceInput['typefixCarryEvidenceSources'];
   /** INFLIGHT-REGISTRY — 착지 뒤 등록부 줄을 찾을 과제 카드 상태(기본 `taskAgentStatePath()` · 등록부는 그 옆). */
   taskStatePath?: string;
   listUnfinishedRuns?: () => FederatedUnfinishedRunLedgerQuery | readonly FederatedUnfinishedRunLedgerEntry[];
@@ -134,6 +268,7 @@ export interface PrLandDeps {
   out?: { log: (message: string) => void; error: (message: string) => void };
   setExitCode?: (code: number) => void;
   runTypecheckGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
+  driftAutorepair?: { mode?: 'off' | 'shadow' | 'live'; deps?: DriftDeps; attemptsByHead?: number; attemptsByPr?: number; readAttempts?: (pr: number, head: string) => { byHead: number; byPr: number }; recordAttempt?: (pr: number, head: string) => void; launch?: (goal: string, boundaryFiles: readonly string[]) => void; escalate?: (mail: string) => void };
   runIsolationGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   runMockModuleRestoreGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   runModelHardcodeGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
@@ -1094,6 +1229,8 @@ export async function verifyPinnedOverlapDecision(input: {
       evidencePath: overlap.resolveOverlapEvidencePath(opts.overlapEvidence, cwd), pr: Number(opts.pr), expectedHead: opts.expectedHead!,
       remote: ref.remote, branch: ref.branch, cwd, run, readFile,
       reviewResultsDir: reviewResultsDir,
+      persistTypefixCarryReceipt: opts.dryRun !== true,
+      typefixCarryEvidenceSources: deps.typefixCarryEvidenceSources,
       listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
       reviewRealPath: (path) => realpathSync(path), overlappingLandings,
     };
@@ -1120,6 +1257,23 @@ export async function verifyPinnedOverlapDecision(input: {
         });
         if (patch.ok) {
           out.log(`✓ overlap-evidence: virtual-rebase — ${ref.remote}/${ref.branch} ${verdict.baseTip!.slice(0, 12)} 와 head ${opts.expectedHead!.slice(0, 12)} 충돌 없음 · patch-id ${patch.patchId.slice(0, 12)} 동일 · review pass|warn must-fix 0 (${patch.reviewResult})`);
+        } else if (measuredOverlap && !opts.dryRun) {
+          // A stale overlapping base is normally refused. Let only a fully measured, reviewed
+          // Git conflict proceed to the later conflict handler, which still refuses to land it.
+          // That handler can push only a docs append-only merge or notify the code owner.
+          const proof = overlap.verifyAppendOnlyConflictEvidence(evidenceInput, verdict.baseTip!);
+          if (proof.ok) {
+            const plan = integrateTrain(cwd, verdict.baseTip!, [{ number: Number(opts.pr), head: opts.expectedHead! }]);
+            const conflict = plan.conflictPlans?.find((entry) => entry.number === Number(opts.pr));
+            const repair = conflict?.repairPlan;
+            accepted = Boolean(conflict?.files.length && !plan.unmeasured && repair
+              && repair.decision !== 'escalate'
+              && (repair.decision !== 'automerge' || repair.mergedFiles));
+            if (accepted) {
+              out.log(`✓ overlap-evidence: measured conflict on pinned base ${verdict.baseTip!.slice(0, 12)} · gate ${proof.gateBase.slice(0, 12)} · review ${proof.reviewResult} · conflict handler will not land the PR`);
+              record('overlap-conflict-evidence', true, { pr: Number(opts.pr), head: opts.expectedHead, base: verdict.baseTip, gateBase: proof.gateBase, files: conflict!.files, decision: repair!.decision });
+            } else refuse(`✗ overlap-evidence: ${verdict.reason} · conflict plan is ${repair?.decision ?? 'unmeasured'} (${repair?.reason ?? 'conflict-analysis-unmeasured'})`);
+          } else refuse(`✗ overlap-evidence: ${verdict.reason} · conflict evidence: ${proof.reason} · virtual-rebase: ${patch.reason}`);
         } else refuse(`✗ overlap-evidence: ${verdict.reason} · virtual-rebase: ${patch.reason}`);
       } else refuse(`✗ overlap-evidence: ${verdict.reason}`);
     }
@@ -1308,6 +1462,56 @@ function inspectPinnedPr(run: CmdRunner, cwd: string, pr: number, expectedHead: 
   return { ok: reasons.length === 0, reasons, branch: value.headRefName, url: value.url, baseRefName: value.baseRefName };
 }
 
+const driftAttemptFile = (): string => join(elanousStateRoot(), 'pr-land-drift-attempts.json');
+function readDriftAttempts(pr: number, head: string): { byHead: number; byPr: number } {
+  try {
+    const state = JSON.parse(readFileSync(driftAttemptFile(), 'utf8')) as Record<string, number>;
+    return { byHead: state[`head:${head.toLowerCase()}`] ?? 0, byPr: state[`pr:${pr}`] ?? 0 };
+  } catch { return { byHead: 0, byPr: 0 }; }
+}
+function recordDriftAttempt(pr: number, head: string): void {
+  const path = driftAttemptFile();
+  let state: Record<string, number> = {};
+  try { state = JSON.parse(readFileSync(path, 'utf8')) as Record<string, number>; } catch { /* First attempt. */ }
+  state[`head:${head.toLowerCase()}`] = (state[`head:${head.toLowerCase()}`] ?? 0) + 1;
+  state[`pr:${pr}`] = (state[`pr:${pr}`] ?? 0) + 1;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(state)}\n`);
+}
+function configuredDriftMode(): 'off' | 'shadow' | 'live' {
+  try {
+    const config = getUserConfig() as unknown as { raw?: { land?: { driftAutorepair?: { mode?: unknown } } } };
+    return resolveDriftAutorepairMode(config.raw?.land?.driftAutorepair?.mode);
+  } catch { return 'live'; }
+}
+async function launchDriftRepairThroughTaskCard(input: { pr: number; head: string; repo: string; branch: string; goal: string }): Promise<void> {
+  const { cardPrNumber, readTaskAgentState, taskAgentStatePath } = await import('../task-agent/task-hand.js');
+  const statePath = taskAgentStatePath();
+  const state = readTaskAgentState<{ tasks?: Record<string, import('../task-agent/task-hand.js').TaskCard> }>(statePath);
+  const cards = Object.values(state.tasks ?? {}).filter((card) => card.status === 'launched' && cardPrNumber(card) === input.pr);
+  if (cards.length !== 1) throw new Error(`expected one launched task card for PR #${input.pr}; found ${cards.length}`);
+  const { runRepairCycle } = await import('../task-agent/repair-cycle.js');
+  const outcome = await runRepairCycle({ card: cards[0]!, statePath, repo: input.repo, pr: input.pr, head: input.head,
+    branch: input.branch, mustFix: [input.goal], goalOverride: input.goal,
+    liveMoves: new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']), now: new Date() });
+  debug.log('pr.land', 'drift-repair-task-cycle', { pr: input.pr, head: input.head, card: cards[0]!.id,
+    decision: outcome.decision, reason: outcome.reason });
+  if (outcome.decision !== 'repair-requested') throw new Error(`task-card repair cycle did not launch: ${outcome.decision} · ${outcome.reason}`);
+}
+function defaultDriftDeps(): DriftDeps {
+  const receiptDir = join(getElanousConfigDir(), 'gate-receipts');
+  return {
+    loadGateReceipts: (path) => {
+      try {
+        return readdirSync(path).filter(name => name.endsWith('.json'))
+          .flatMap(name => Object.values(loadGateReceipts(join(path, name))))
+          .reduce((registry, receipt) => ({ ...registry, [receipt.key]: receipt }), {});
+      } catch { return {}; }
+    },
+    git: (args, cwd) => { const result = spawnSync('git', [...args], { cwd, encoding: 'utf8', timeout: 30_000 }); return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }; },
+  };
+}
+
 export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): Promise<number> {
   const out = deps.out ?? liveOut;
   const landStartedAt = Date.now();
@@ -1324,13 +1528,13 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   // LAND-REFUSAL-EDGES — a pinned refusal is also bound to the recover@1 edge with its raw line and card.
   // The card arrives only through the child env set by TA defaultLand — never a shell export.
   const cardId = process.env[PR_LAND_CARD_ID_ENV]?.trim() || undefined;
-  const bindRecover = (message: string, context: { isDraft?: boolean } = {}) => {
+  const bindRecover = (message: string, context: PrLandRefusalContext = {}) => {
     const pr = Number(opts.pr);
     if (!Number.isSafeInteger(pr) || pr <= 0 || !opts.expectedHead) return undefined;
     try { return bindPrLandRefusalToRecover({ refusal: message, pr, head: opts.expectedHead, isDraft: context.isDraft, cardId }); }
     catch { return undefined; }
   };
-  const refuse = (message: string, context: { isDraft?: boolean } = {}): void => {
+  const refuse = (message: string, context: PrLandRefusalContext = {}): void => {
     out.error(message);
     observePrLandRefusal(message, context);
     const plan = bindRecover(message, context);
@@ -1347,13 +1551,13 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   };
   // A direct failure binds only when today's refusal shape is recognized — the same measured sample
   // as observeDirectPrLandRefusal (#28939). An unclassified direct error is not a landing refusal.
-  const observeDirect = (message: string): void => {
-    observeDirectPrLandRefusal(message);
-    if (classifyPrLandRefusal(message) !== 'other') bindRecover(message);
+  const observeDirect = (message: string, context: PrLandRefusalContext = {}): void => {
+    observeDirectPrLandRefusal(message, context);
+    if (classifyPrLandRefusal(message, context) !== 'other') bindRecover(message, context);
   };
-  const refuseDirect = (message: string): void => {
+  const refuseDirect = (message: string, context: PrLandRefusalContext = {}): void => {
     out.error(message);
-    observeDirect(message);
+    observeDirect(message, context);
   };
   if (opts.title !== undefined && opts.titleFile !== undefined) {
     out.error('✗ title: --title과 --title-file은 함께 사용할 수 없습니다.');
@@ -1892,7 +2096,12 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   if (opts.heavyRemote) {
     const main = overlapCheckedBase!;
     const verdict = await heavyGate(main, 'initial');
-    if (!verdict?.ok) { refuseDirect(`✗ heavy-remote: 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`); return 1; }
+    if (!verdict?.ok) {
+      const typecheckDrift = verdict?.typecheckDrift;
+      refuseDirect(`✗ heavy-remote: 원격 게이트 ${verdict?.reason ?? 'unmeasured'} — 로컬 게이트로 폴백하지 않는다.`,
+        typecheckDrift ? { typecheckDrift } : {});
+      return 1;
+    }
     verifiedHeavyBase = main;
     out.log(`✓ heavy-remote: host=${verdict.host ?? 'unknown'} head=${opts.expectedHead!.slice(0, 12)} main=${main.slice(0, 12)} source=${verdict.source} elapsed=${verdict.elapsedMs}ms`);
     out.log(`✓ typecheck-roots: ${JSON.stringify(verdict.rootPlan ?? { mode: 'not-applicable', roots: null, promoted: false, reason: 'no-root-plan-in-gate-output' })}`);
@@ -1911,11 +2120,11 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
         onShadow: ({ pod, agree }) => {
           const shadow = pod && typeof pod === 'object' ? pod as LandingPodShadowVerdict : undefined;
           const warm = shadow?.warmEvidence;
-          warmReuse.recordWarmReuseEvidence(warmReuse.warmReuseEvidencePath(), {
-            schema: 1, consumer: 'land', pr: Number(opts.pr), head: opts.expectedHead!, main, recordedAt: new Date().toISOString(),
-            ...(warm ? { ...warm, agree: warm.agree && agree } : {}),
-            ...(!warm ? { reason: shadow?.warmReason ?? 'warm-shadow-unmeasured' } : {}),
-          });
+          warmReuse.recordWarmReuseComparison({ consumer: 'land', pr: Number(opts.pr), head: opts.expectedHead!, main,
+            ...(warm ? { lease: { ...warm, agree: warm.agree && agree } } : {}),
+            comparison: { reason: warm ? (warm.agree && agree ? 'match' : 'mismatch')
+              : shadow?.warmReason ?? 'warm-shadow-unmeasured' },
+            finalized: !!warm, reason: shadow?.warmReason });
         },
       });
     }
@@ -2004,8 +2213,42 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     return recheckOverlapAtBase(currentBase);
   };
   // The production gate must receive this land invocation's --cwd, never the launching shell's cwd.
-  const typecheckOk = opts.heavyRemote || (deps.runTypecheckGate ? deps.runTypecheckGate(out) : runPrLandTypecheckGate(out, cwd));
+  const typecheckOutput: string[] = [];
+  const typecheckOut = {
+    log: (message: string) => { typecheckOutput.push(message); out.log(message); },
+    error: (message: string) => { typecheckOutput.push(message); out.error(message); },
+  };
+  const typecheckOk = opts.heavyRemote || (deps.runTypecheckGate ? deps.runTypecheckGate(typecheckOut) : runPrLandTypecheckGate(typecheckOut, cwd));
   record('typecheck', typecheckOk);
+  if (!typecheckOk) {
+    try {
+      const main = currentMain();
+      const driftDeps = deps.driftAutorepair?.deps ?? defaultDriftDeps();
+      const receiptPath = join(getElanousConfigDir(), 'gate-receipts');
+      const verdict = main && opts.expectedHead
+        ? classifyTypecheckDrift({ repo: cwd, headCommit: opts.expectedHead, failBase: main, tscOutput: typecheckOutput.join('\n'), receiptPath }, driftDeps)
+        : { verdict: 'drift-unmeasured' as const, failBase: main ?? '', errors: [], symbols: [], changedFiles: [], reason: 'head or main unavailable' };
+      debug.log('pr.land', 'drift-classified', { pr: Number(opts.pr), head: opts.expectedHead, receiptBase: verdict.receiptBase, failBase: verdict.failBase, verdict: verdict.verdict, symbols: verdict.symbols });
+      if (verdict.verdict === 'drift') {
+        debug.log('pr.land', 'drift-culprit', { pr: Number(opts.pr), head: opts.expectedHead, base: main });
+        observePrLandRefusal('✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.', { typecheckDrift: verdict.verdict });
+        const attempts = deps.driftAutorepair?.readAttempts?.(Number(opts.pr), opts.expectedHead!) ?? readDriftAttempts(Number(opts.pr), opts.expectedHead!);
+        const repair = planDriftRepair({
+          pr: Number(opts.pr), head: opts.expectedHead!, failedBase: main!, output: typecheckOutput.join('\n'), result: verdict,
+          prFiles: changedPaths ?? [],
+          attemptsByHead: attempts.byHead, attemptsByPr: attempts.byPr,
+        });
+        const mode = deps.driftAutorepair?.mode ?? configuredDriftMode();
+        const launch = deps.driftAutorepair?.launch ?? ((goal: string, boundaryFiles: readonly string[]) =>
+          launchDriftRepairThroughTaskCard({ pr: Number(opts.pr), head: opts.expectedHead!, repo: cwd,
+            branch: pinnedBranch ?? '', goal: `${goal}\n\n경계 파일: ${boundaryFiles.join(', ')}` }));
+        if (repair.action === 'launch' && mode === 'live') (deps.driftAutorepair?.recordAttempt ?? recordDriftAttempt)(Number(opts.pr), opts.expectedHead!);
+        await executeDriftPlan(repair, mode, launch,
+          deps.driftAutorepair?.escalate ?? (mail => debug.log('pr.land', 'drift-repair-escalated', { mail })));
+      }
+    } catch (error) { debug.log('pr.land', 'drift-repair-launch-failed', { pr: Number(opts.pr), head: opts.expectedHead,
+      reason: error instanceof Error ? error.message : String(error) }); }
+  }
   if (!typecheckOk) {
     // ⛔⭐ 「왜 막혔나」를 «단정하지 않는다» — 이 게이트는 불리언만 돌려주므로 여기서는 이유를 모른다.
     //   📏 실측(2026-09-05): 깨진 base 로 막혔을 때 이 줄이 「타입 에러 때문」이라고 «틀리게» 말했다.
@@ -2422,6 +2665,58 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     });
     refuse(`✗ merge: ${detail}`);
     if (mergeable === 'CONFLICTING') {
+      const shadowBase = verifiedHeavyBase ?? overlapCheckedBase ?? currentPinnedBase();
+      const shadowHead = opts.expectedHead ?? headCommit;
+      if (shadowBase && /^[a-f0-9]{40,64}$/i.test(shadowBase) && shadowHead && /^[a-f0-9]{40,64}$/i.test(shadowHead)) {
+        try {
+          const identity = run('gh', ['pr', 'view', upsert.url, '--json', 'title,body,headRefOid,headRefName,headRepositoryOwner,headRepository,author'], { cwd });
+          let prIntent: { title?: string; body?: string; headRefOid?: string; headRefName?: string; headRepositoryOwner?: { login?: string }; headRepository?: { name?: string }; author?: { login?: string } } = {};
+          try { if (identity.ok) prIntent = JSON.parse(identity.out) as typeof prIntent; } catch { /* missing intent stays explicit */ }
+          const plan = integrateTrain(cwd, shadowBase, [{
+            number: prNumber, head: shadowHead,
+            title: prIntent.title ?? title ?? '', body: prIntent.body ?? body ?? '',
+          }]);
+          const conflict = plan.conflictPlans?.find((entry) => entry.number === prNumber);
+          const repair = conflict?.repairPlan;
+          if (conflict && repair?.decision === 'automerge' && repair.mergedFiles) {
+            const live = pushLiveConflictMerge({ run, cwd, pr: prNumber, head: shadowHead, base: shadowBase, url: upsert.url, integration: plan, stateDir: deps.conflictAutomergeStateDir });
+            if (live.pushed) {
+              debug.log('pr.land', 'conflict-automerge-pushed', {
+                pr: prNumber, head: shadowHead, base: shadowBase, files: conflict.files,
+                branch: live.branch, commit: plan.commitSha, reason: live.reason,
+              });
+              record('conflict-automerge-pushed', true, { pr: prNumber, head: shadowHead, base: shadowBase, branch: live.branch, commit: plan.commitSha });
+              out.log(`✓ conflict-automerge: append-only 문서 충돌을 양쪽 부모를 보존한 커밋으로 PR 가지 ${live.branch}에 push했습니다. 새 head의 시험·Terra 리뷰 뒤 다시 등록해야 합니다.`);
+            } else {
+              debug.log('pr.land', 'conflict-would-automerge', {
+                pr: prNumber, head: shadowHead, base: shadowBase, files: conflict.files,
+                decision: repair.decision, reason: repair.reason, live: live.reason,
+              });
+            }
+          } else {
+            debug.log('pr.land', 'conflict-classified', {
+              pr: prNumber, head: shadowHead, base: shadowBase, files: conflict?.files ?? [],
+              verdict: repair?.decision === 'launch' ? 'needs-repair' : 'unmeasured', reason: repair?.reason ?? 'conflict-analysis-unavailable',
+            });
+            const files = conflict?.files ?? [];
+            if (repair?.decision === 'launch' && files.some((path) => !isAppendOnlyDocConflict([path]))) {
+              const notice = notifyCodeConflictOwner({ cwd, pr: prNumber, head: shadowHead, files, reason: repair.reason, login: prIntent.author?.login, send: deps.sendCodeConflictNotice });
+              debug.log('pr.land', 'conflict-owner-notice', { pr: prNumber, head: shadowHead, author: prIntent.author?.login ?? null, recipient: notice.recipient, sent: notice.sent });
+              record('conflict-owner-notice', notice.sent, { pr: prNumber, head: shadowHead, recipient: notice.recipient, sent: notice.sent });
+              if (!notice.sent) out.error(`  ↳ 코드 충돌 주인 우편 발송 실패 — 수신 후보 ${notice.recipient}; 자동으로 코드를 바꾸지 않았습니다.`);
+            }
+          }
+        } catch (error) {
+          try { debug.log('pr.land', 'conflict-classified', {
+            pr: prNumber, head: shadowHead, base: shadowBase, files: [], verdict: 'unmeasured',
+            reason: `shadow-analysis-failed: ${String((error as Error)?.message ?? error).slice(0, 200)}`,
+          }); } catch { /* shadow observation never replaces the landing refusal */ }
+        }
+      } else {
+        try { debug.log('pr.land', 'conflict-classified', {
+          pr: prNumber, head: shadowHead ?? null, base: shadowBase ?? null, files: [], verdict: 'unmeasured', reason: 'head-or-base-unavailable',
+        }); } catch { /* shadow observation never replaces the landing refusal */ }
+      }
       out.error('  ↳ 충돌 — 이 브랜치가 기준 브랜치의 최근 착지와 같은 줄을 고쳤다. `bun bin/elanous.mjs git fetch origin` → `bun bin/elanous.mjs git rebase origin/<기준>` 로 풀고 다시 pr land.');
     }
     return 1;

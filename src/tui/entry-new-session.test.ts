@@ -38,9 +38,9 @@ function seedTwoTurnSession(): string {
 }
 
 describe('/new command shape', () => {
-  test('accepts /new and /session new only', () => {
-    for (const text of ['/new', ' /new ', '/session new', '/session   new']) expect(isNewSessionCommand(text)).toBe(true);
-    for (const text of ['/newx', '/new 제목', '/session', '/sessions new', 'new', '/quit']) expect(isNewSessionCommand(text)).toBe(false);
+  test('accepts /new, /clear and /session new only', () => {
+    for (const text of ['/new', ' /new ', '/clear', ' /clear ', '/session new', '/session   new']) expect(isNewSessionCommand(text)).toBe(true);
+    for (const text of ['/newx', '/new 제목', '/clear title', '/session', '/sessions new', 'new', '/quit']) expect(isNewSessionCommand(text)).toBe(false);
   });
 
   test('a fresh session shows «새 대화» rather than the store placeholder', () => {

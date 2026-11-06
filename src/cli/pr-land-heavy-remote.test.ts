@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensurePrLandHeavyRemote, PR_LAND_HEAVY_HOSTS } from './pr-land-heavy-remote.js';
+import { ensurePrLandHeavyRemote, PR_LAND_HEAVY_HOSTS, validatePrLandRemoteGitReceipt, type PrLandRemoteGitRequest } from './pr-land-heavy-remote.js';
 import { GATE_REMOTE_DEFAULTS, type RemoteRunOptions } from '../self-implement/gate-remote.js';
 import { runBunShard } from '../self-dev/shard-run.js';
 import { runSelfGateCli } from '../self-implement/gate-cli.js';
@@ -15,6 +15,60 @@ const HEAD = 'a'.repeat(40);
 const MAIN = 'b'.repeat(40);
 const NEXT_MAIN = 'c'.repeat(40);
 const extraPass = Buffer.from('[pr-land-extra-gates] pass global=measured interference=measured files=2\n');
+
+test('remote git receipt contract requires matching pinned identity and result SHAs', () => {
+  const request: PrLandRemoteGitRequest = {
+    schema: 1, pr: 123, repository: 'ElanvitalAI/elanous', headRef: 'refs/heads/feature/topic',
+    head: HEAD, main: MAIN, phase: 'rebase', host: 'node-b',
+  };
+  const receipt = { ...request, ok: true, resultHead: HEAD, mergeSha: MAIN };
+  expect(validatePrLandRemoteGitReceipt(request, receipt)).toEqual({ ok: true, resultHead: HEAD, mergeSha: MAIN, remoteHeadVerification: 'pending-push' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, pr: 124 })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, host: 'untrusted' })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, host: 'untrusted' as PrLandRemoteGitRequest['host'] }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, schema: 2 as 1 }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, phase: 'clone' as PrLandRemoteGitRequest['phase'] }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, schema: 2 })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, phase: 'clone' })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, repository: 'bad repo' }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, headRef: 'feature/topic' }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, headRef: 'refs/heads/feature/a+b' }, {
+    ...receipt, headRef: 'refs/heads/feature/a+b',
+  })).toEqual({ ok: true, resultHead: HEAD, mergeSha: MAIN, remoteHeadVerification: 'pending-push' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, headRef: 'refs/heads/@' }, {
+    ...receipt, headRef: 'refs/heads/@',
+  })).toEqual({ ok: true, resultHead: HEAD, mergeSha: MAIN, remoteHeadVerification: 'pending-push' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, headRef: 'refs/heads/feature/.hidden' }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, mergeSha: NEXT_MAIN })).toEqual({ ok: false, reason: 'remote-main-mismatch' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, ok: false, reason: 'remote-push-rejected' }))
+    .toEqual({ ok: false, reason: 'remote-push-rejected' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, resultHead: 'unmeasured' }))
+    .toEqual({ ok: false, reason: 'receipt-result-unmeasured' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, resultHead: '0'.repeat(40) }))
+    .toEqual({ ok: false, reason: 'receipt-result-unmeasured' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, head: '0'.repeat(40) }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt({ ...request, main: '0'.repeat(40) }, receipt))
+    .toEqual({ ok: false, reason: 'invalid-request-identity' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, mergeSha: '0'.repeat(40) }))
+    .toEqual({ ok: false, reason: 'receipt-result-unmeasured' });
+  const pushRequest = { ...request, phase: 'push' as const };
+  const pushReceipt = { ...receipt, phase: 'push' as const, resultHead: NEXT_MAIN };
+  expect(validatePrLandRemoteGitReceipt(pushRequest, pushReceipt)).toEqual({ ok: false, reason: 'post-push-ls-remote-unmeasured' });
+  expect(validatePrLandRemoteGitReceipt(pushRequest, pushReceipt, MAIN)).toEqual({ ok: false, reason: 'post-push-head-mismatch' });
+  expect(validatePrLandRemoteGitReceipt(pushRequest, pushReceipt, NEXT_MAIN))
+    .toEqual({ ok: true, resultHead: NEXT_MAIN, mergeSha: MAIN, remoteHeadVerification: 'matched' });
+  expect(validatePrLandRemoteGitReceipt(pushRequest, pushReceipt, '0'.repeat(40)))
+    .toEqual({ ok: false, reason: 'post-push-ls-remote-unmeasured' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, ok: false, reason: { private: true } }))
+    .toEqual({ ok: false, reason: 'remote-git-failed' });
+});
 
 test('a remote pass is reused only for the same PR head and main tip', () => {
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));

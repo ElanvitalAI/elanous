@@ -17,7 +17,7 @@ test('dev runtime requires both reasonRepair opt-in and executePiece capability 
     setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
       selfImplement: { ...config.tools.selfImplement, supervisor: undefined } } }));
     await executeDevSelfRun(feature, async () => { initialCalls++; return failed; }, {
-      rounds: 2, printDecision: () => {}, executePiece: async () => { pieceCalls++; return repaired; },
+      rounds: 2, entryPoint: 'dev-cli', printDecision: () => {}, executePiece: async () => { pieceCalls++; return repaired; },
       taskAgentShadow: false, taskAgentRejudge: false, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
     });
     expect(initialCalls).toBe(1);
@@ -26,12 +26,16 @@ test('dev runtime requires both reasonRepair opt-in and executePiece capability 
       category: 'self-dev.supervisor', event: 'supervisor.reason-repair-skipped',
       data: expect.objectContaining({ reason: 'disabled' }),
     }));
+    expect(logs).toContainEqual(expect.objectContaining({
+      category: 'self-dev.supervisor', event: 'reason-repair-capability',
+      data: expect.objectContaining({ entryPoint: 'dev-cli', configured: false, hasExecutePiece: true, skipReason: 'disabled' }),
+    }));
 
     setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
       selfImplement: { ...config.tools.selfImplement, supervisor: { reasonRepair: true } } } }));
     const beforeMissingCapability = logs.length;
     await executeDevSelfRun(feature, async () => { initialCalls++; return failed; }, {
-      rounds: 2, printDecision: () => {}, taskAgentShadow: false, taskAgentRejudge: false,
+      rounds: 2, entryPoint: 'harness-ask', printDecision: () => {}, taskAgentShadow: false, taskAgentRejudge: false,
       sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
     });
     expect(initialCalls).toBe(2);
@@ -39,7 +43,11 @@ test('dev runtime requires both reasonRepair opt-in and executePiece capability 
     const missingCapabilityLogs = logs.slice(beforeMissingCapability);
     expect(missingCapabilityLogs).toContainEqual(expect.objectContaining({
       category: 'self-dev.supervisor', event: 'supervisor.reason-repair-skipped',
-      data: expect.objectContaining({ reason: 'disabled' }),
+      data: expect.objectContaining({ reason: 'missing-executor' }),
+    }));
+    expect(missingCapabilityLogs).toContainEqual(expect.objectContaining({
+      category: 'self-dev.supervisor', event: 'reason-repair-capability',
+      data: expect.objectContaining({ entryPoint: 'harness-ask', configured: true, hasExecutePiece: false, skipReason: 'missing-executor' }),
     }));
     expect(missingCapabilityLogs.filter((row) => row.event === 'supervisor-self-heal')).toEqual([]);
 

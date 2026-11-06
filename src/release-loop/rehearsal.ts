@@ -22,7 +22,7 @@ import { preflightGateExecutionIdentity, type GatePodExecutionIdentity } from '.
 export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
 export type RehearsalOutcome = 'ok' | 'regression' | 'unmeasured' | 'error' | 'no-checkout' | 'checkout-dirty' | 'superseded' | 'interrupted';
 export interface HardGateResult {
-  outcome: 'ok' | 'regression' | 'error';
+  outcome: 'ok' | 'regression' | 'unmeasured' | 'error';
   commit: string;
   executor: 'pod' | 'host' | null;
   introduced: string[];
@@ -107,6 +107,7 @@ export interface RehearsalOptions {
   apply?: boolean;
   checkout?: string;
   ledgerRoot?: string;
+  podPool?: string;
   recoveryRun?: string;
   shards?: number;
   remote?: string;
@@ -117,7 +118,7 @@ export interface RehearsalDeps {
   now?: () => Date;
   schedules?: (root: string) => ReleaseSchedule[];
   lightRc?: (version: string, checkout: string, selection: { shards?: number; remote?: string }) => Promise<LightRcResult>;
-  hardGate?: (version: string, checkout: string, sha: string, ledgerRoot: string, runId: string, remote?: string) => Promise<HardGateResult>;
+  hardGate?: (version: string, checkout: string, sha: string, ledgerRoot: string, runId: string, remote?: string, podPool?: string) => Promise<HardGateResult>;
   hardGateGraphPins?: (checkout: string, commit: string) => { graphSha: string; recipeSha: string } | null;
   hardGateIdentity?: (pool: string, env: NodeJS.ProcessEnv, commit?: string) => GatePodExecutionIdentity | null;
   hardGateSpawn?: typeof spawnHardRehearsalGate;
@@ -226,7 +227,7 @@ function parseHardRehearsalGateResult(run: ReturnType<typeof spawnSync>, logPath
   const line = output.split(/\r?\n/).reverse().find(value => value.trim().startsWith('{'));
   if (!line) throw new Error(`hard rehearsal gate produced no JSON (rc=${run.status ?? 'spawn'}${run.error ? `: ${run.error.message}` : ''}; log ${logPath})`);
   const result = JSON.parse(line) as HardGateResult;
-  if (!['ok', 'regression', 'error'].includes(result.outcome) || !Array.isArray(result.introduced)
+  if (!['ok', 'regression', 'unmeasured', 'error'].includes(result.outcome) || !Array.isArray(result.introduced)
       || result.introduced.some(item => typeof item !== 'string')) {
     throw new Error('hard rehearsal gate result lacks a valid verdict');
   }
@@ -277,17 +278,31 @@ function hardGateReceiptRecordMismatch(input: {
   return null;
 }
 
+function validateRehearsalPodPoolOverride(remote: string | undefined, podPool: string): void {
+  if (remote !== 'aws1') throw new Error('hard rehearsal --pod-pool override is reserved for --remote aws1');
+  const members = parsePodPool(podPool);
+  if (members.length !== 1 || members[0]?.sshHost !== 'aws1') {
+    throw new Error('hard rehearsal --pod-pool must isolate exactly one aws1 Pod member');
+  }
+}
+
 async function runHardGate(version: string, checkout: string, sha: string, ledgerRoot: string, runId: string,
   remote?: string, graphProbe: NonNullable<RehearsalDeps['hardGateGraphPins']> = gateSourcePins,
   identityProbe: NonNullable<RehearsalDeps['hardGateIdentity']> = preflightGateExecutionIdentity,
-  gateSpawn: NonNullable<RehearsalDeps['hardGateSpawn']> = spawnHardRehearsalGate): Promise<HardGateResult> {
+  gateSpawn: NonNullable<RehearsalDeps['hardGateSpawn']> = spawnHardRehearsalGate,
+  podPoolOverride?: string): Promise<HardGateResult> {
   const configuredPool = releaseLoopConfig().gatePodPool;
   if (!configuredPool) throw new Error('hard rehearsal requires release.loop.gatePodPool');
   const targetHost = remote ?? 'node-b';
-  const members = parsePodPool(configuredPool);
+  const selectedPool = podPoolOverride ?? configuredPool;
+  if (podPoolOverride !== undefined) validateRehearsalPodPoolOverride(targetHost, podPoolOverride);
+  const members = parsePodPool(selectedPool);
   const gateMember = members.find(member => member.sshHost === targetHost);
-  if (!gateMember) throw new Error(`hard rehearsal requires a configured Pod member for --remote ${targetHost}`);
-  const pool = configuredPool.split(',').map(part => part.trim())
+  if (!gateMember) {
+    if (podPoolOverride !== undefined) throw new Error(`hard rehearsal --pod-pool requires a Pod member for --remote ${targetHost}`);
+    throw new Error(`hard rehearsal requires a configured Pod member for --remote ${targetHost}`);
+  }
+  const pool = selectedPool.split(',').map(part => part.trim())
     .find(part => part.split(/[#:]/, 1)[0] === `${gateMember.context}@${gateMember.sshHost}`);
   if (!pool) throw new Error(`hard rehearsal cannot isolate the ${targetHost} Pod member`);
   const previous = latestPublishedPreviousVersion(version, ledgerRoot);
@@ -298,6 +313,11 @@ async function runHardGate(version: string, checkout: string, sha: string, ledge
   let identityProbeError: string | undefined;
   try { expectedIdentity = identityProbe(pool, process.env, sha); if (!expectedIdentity) identityProbeError = 'selected gate execution identity unavailable'; }
   catch (error) { identityProbeError = oneLine(error instanceof Error ? error.message : String(error)); }
+  if (podPoolOverride !== undefined && !expectedIdentity) {
+    const reason = identityProbeError ?? 'selected aws1 Pod execution identity unavailable';
+    return { outcome: 'unmeasured', commit: sha, executor: 'pod', introduced: [], preexisting: 0,
+      error: reason, receiptRecord: { available: false, reason } };
+  }
   let graphProbeError: string | undefined;
   try { graphPins = graphProbe(checkout, sha); }
   catch (error) { graphProbeError = oneLine(error instanceof Error ? error.message : String(error)); }
@@ -566,15 +586,16 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               const hardGateLog = stamp.hardGateLog;
               if (!hardGateRunId || !hardGateLog) throw new Error('hard rehearsal claim has no evidence identity');
               const hard = await (deps.hardGate ?? ((version, cwd, sha, ledger, id, host) =>
-                runHardGate(version, cwd, sha, ledger, id, host, deps.hardGateGraphPins, deps.hardGateIdentity, deps.hardGateSpawn)))
-                (plan.version, checkout, stamp.sha, root, hardGateRunId, targetHost);
+                runHardGate(version, cwd, sha, ledger, id, host, deps.hardGateGraphPins, deps.hardGateIdentity, deps.hardGateSpawn, opts.podPool)))
+                (plan.version, checkout, stamp.sha, root, hardGateRunId, targetHost, opts.podPool);
               stamp.hardGate = hard;
               if (!existsSync(hardGateLog)) writeFileSync(hardGateLog, `${JSON.stringify(hard)}\n`, { flag: 'wx', mode: 0o600 });
               if (hard.outcome !== 'error' && (hard.commit !== stamp.sha || hard.executor !== 'pod' || !Array.isArray(hard.introduced)))
                 throw new Error('hard rehearsal result did not measure pinned SHA on a Pod');
               if (hard.outcome === 'ok' && hard.introduced.length) throw new Error('hard rehearsal gate ok verdict contains introduced failures');
               stamp.outcome = hard.outcome === 'regression' && hard.introduced.length === 0 ? 'unmeasured' : hard.outcome;
-              const cause = stamp.outcome === 'unmeasured' ? 'regression verdict has no introduced IDs'
+              const cause = stamp.outcome === 'unmeasured' ? (hard.outcome === 'unmeasured'
+                ? hard.error?.trim() || 'hard rehearsal execution identity unavailable' : 'regression verdict has no introduced IDs')
                 : hard.outcome === 'error' ? hard.error?.trim() || 'gate returned error without a cause' : undefined;
               if (cause) stamp.measurementGap = { cause, runId: hardGateRunId, evidence: hardGateLog };
               const introducedCount: number | null = stamp.outcome === 'unmeasured' || stamp.outcome === 'error' ? null : hard.introduced.length;

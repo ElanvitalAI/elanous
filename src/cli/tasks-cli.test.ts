@@ -32,6 +32,12 @@ test('Pod in-place worktree opt-in reaches the remote parent without forwarding 
   expect(podParentLaunchSelectors({}, {})).toEqual({});
 });
 
+test('hidden parent-host contract probe emits this CLI build’s own compatibility facts', async () => {
+  const result = await run(['tasks', 'parent-host-contract'], {});
+  expect(result.lines).toEqual(['ledgerSchema=run-ledger-line/v1', 'parentProtocol=parent-host-facts/v1']);
+  expect(result.code).toBeUndefined();
+});
+
 test('green close current checklist scope cannot be narrowed by an old TA card', () => {
   expect(greenCloseDeclaredPaths('대상 경로: src/one.ts · src/two.ts\n완료 경계 코드: 둘 다', ['src/one.ts']))
     .toEqual(['src/one.ts', 'src/two.ts']);
@@ -1736,7 +1742,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['work-order', 'green-sweep', 'cover', 'repair-outcomes', 'outcomes', 'doctor', 'list', 'map', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['parent-host-contract', 'work-order', 'green-sweep', 'cover', 'repair-outcomes', 'outcomes', 'doctor', 'list', 'map', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
   expect(command?.commands.find((entry) => entry.name() === 'map')?.commands.map((entry) => entry.name())).toEqual(['dry-run']);
   expect(command?.commands.find((entry) => entry.name() === 'work-order')?.commands.map((entry) => entry.name())).toEqual(['build']);
 });
@@ -1802,6 +1808,56 @@ test('real detached spawn: the env handed by the launcher reaches the child (ELA
   const deadline = Date.now() + 10_000;
   while (!existsSync(out) && Date.now() < deadline) await new Promise((done) => setTimeout(done, 50));
   expect(readFileSync(out, 'utf8')).toBe('run-inherit-check-1234');
+});
+
+test('TA local fallback after rejected parent hosts uses train landing without host auto-merge', async () => {
+  const logSpy = spyOn(debug, 'log').mockImplementation(() => {});
+  const launches: Array<{ args: string[]; env?: NodeJS.ProcessEnv }> = [];
+  const spawn = ((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    launches.push({ args, env: options.env });
+    const handlers: Record<string, () => void> = {};
+    setTimeout(() => handlers.spawn?.(), 0);
+    return { pid: 42, once: (event: string, fn: () => void) => { handlers[event] = fn; }, removeListener: () => undefined, unref: () => undefined };
+  }) as unknown as DetachedSpawn;
+  const ssh = () => ({ status: 255, stdout: '', stderr: 'unreachable' });
+
+  try {
+    const result = await defaultTaskLauncher(
+      ['harness', 'say', '--substrate', 'pod', '--merge-by-host', '--auto-merge', 'goal', '--target-path', 'src/one.ts',
+        '--target-path', 'src/two.ts', '--target-path', 'src/three.ts', '--count', '4'],
+      undefined,
+      { runId: 'run-ta-local-fallback', launchId: 'tl-ta-local-fallback', env: { ELANOUS_RUN_ID: 'run-ta-local-fallback', ELANOUS_TASK_CARD_ID: 'ta-local-fallback' } },
+      { parentHost: { host: 'unreachable', cwd: '/repo' }, releaseGatePolicy: null, ssh, spawn, launchHoldActive: () => false, earlyExitWindowMs: 0, notice: () => {} },
+    );
+
+    expect(result).toEqual({ runId: 'run-ta-local-fallback' });
+    expect(launches).toHaveLength(1);
+    const argv = launches[0]!.args;
+    expect(argv).toContain('--no-auto-merge');
+    expect(argv).not.toContain('--merge-by-host');
+    expect(argv).not.toContain('--auto-merge');
+    expect(argv.filter((arg) => arg === '--target-path')).toHaveLength(3);
+    expect(argv[argv.indexOf('--count') + 1]).toBe('4');
+    expect(launches[0]!.env).toMatchObject({ ELANOUS_RUN_ID: 'run-ta-local-fallback', ELANOUS_TASK_CARD_ID: 'ta-local-fallback', ELANOUS_TA_LAND: '1' });
+  } finally { logSpy.mockRestore(); }
+});
+
+test('task-agent local launch with no configured remote parent preserves its requested merge mode', async () => {
+  let launch: { args: string[]; env?: NodeJS.ProcessEnv } | undefined;
+  const spawn = ((_command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    launch = { args, env: options.env };
+    const handlers: Record<string, () => void> = {};
+    setTimeout(() => handlers.spawn?.(), 0);
+    return { pid: 43, once: (event: string, fn: () => void) => { handlers[event] = fn; }, removeListener: () => undefined, unref: () => undefined };
+  }) as unknown as DetachedSpawn;
+
+  await defaultTaskLauncher(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'goal'], undefined,
+    { runId: 'run-ta-local-configured', launchId: 'tl-ta-local-configured', env: { ELANOUS_RUN_ID: 'run-ta-local-configured', ELANOUS_TASK_CARD_ID: 'ta-local-configured' } },
+    { parentHost: null, spawn, earlyExitWindowMs: 0 });
+
+  expect(launch?.args).toContain('--merge-by-host');
+  expect(launch?.args).not.toContain('--no-auto-merge');
+  expect(launch?.env?.ELANOUS_TA_LAND).toBeUndefined();
 });
 
 test('ORCH-LIVE-1008: the hand launcher runs the elanous CLI entry, not whatever script started this process (orchestrator tick)', async () => {

@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { debug } from '../debug/log.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
@@ -558,31 +559,31 @@ function preservationDefault(ask: string): { answer: string; exportCount: number
       const actual = realpathSync(absolute);
       const withinRepo = relative(realpathSync(process.cwd()), actual);
       if (withinRepo === '..' || withinRepo.startsWith('../') || isAbsolute(withinRepo)) continue;
-      const source = ts.createSourceFile(path, readFileSync(actual, 'utf8'), ts.ScriptTarget.Latest, true);
+      const source = tsApi.createSourceFile(path, readFileSync(actual, 'utf8'), tsApi.ScriptTarget.Latest, true);
       for (const statement of source.statements) {
-        if (ts.isExportDeclaration(statement)) {
-          if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        if (tsApi.isExportDeclaration(statement)) {
+          if (statement.exportClause && tsApi.isNamedExports(statement.exportClause)) {
             for (const element of statement.exportClause.elements) exports.push(`${path}: ${element.name.text}`);
-          } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause)) {
+          } else if (statement.exportClause && tsApi.isNamespaceExport(statement.exportClause)) {
             exports.push(`${path}: ${statement.exportClause.name.text}`);
-          } else if (!statement.exportClause && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+          } else if (!statement.exportClause && statement.moduleSpecifier && tsApi.isStringLiteral(statement.moduleSpecifier)) {
             // Names re-exported by `export *` are not resolved here; record the re-export itself so the preserved surface is explicit.
             exports.push(`${path}: * from ${statement.moduleSpecifier.text}`);
           }
-        } else if (ts.isExportAssignment(statement)) {
+        } else if (tsApi.isExportAssignment(statement)) {
           exports.push(`${path}: ${statement.isExportEquals ? 'export =' : 'default'}`);
-        } else if (ts.canHaveModifiers(statement) && ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
-          if (ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)) {
+        } else if (tsApi.canHaveModifiers(statement) && tsApi.getModifiers(statement)?.some((modifier) => modifier.kind === tsApi.SyntaxKind.ExportKeyword)) {
+          if (tsApi.getModifiers(statement)?.some((modifier) => modifier.kind === tsApi.SyntaxKind.DefaultKeyword)) {
             exports.push(`${path}: default`);
-          } else if (ts.isVariableStatement(statement)) {
-            const bindingNames = (name: ts.BindingName): string[] => ts.isIdentifier(name)
+          } else if (tsApi.isVariableStatement(statement)) {
+            const bindingNames = (name: TS.BindingName): string[] => tsApi.isIdentifier(name)
               ? [name.text]
-              : name.elements.flatMap((element) => ts.isOmittedExpression(element) ? [] : bindingNames(element.name));
+              : name.elements.flatMap((element) => tsApi.isOmittedExpression(element) ? [] : bindingNames(element.name));
             for (const declaration of statement.declarationList.declarations) {
               for (const exported of bindingNames(declaration.name)) exports.push(`${path}: ${exported}`);
             }
-          } else if ('name' in statement && statement.name && ts.isIdentifier(statement.name as ts.Node)) {
-            exports.push(`${path}: ${(statement.name as ts.Identifier).text}`);
+          } else if ('name' in statement && statement.name && tsApi.isIdentifier(statement.name as TS.Node)) {
+            exports.push(`${path}: ${(statement.name as TS.Identifier).text}`);
           }
         }
       }

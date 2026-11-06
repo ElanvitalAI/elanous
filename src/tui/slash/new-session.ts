@@ -1,4 +1,4 @@
-// `/new` (alias `/session new`) — leave a session that outgrew its context without quitting next TUI.
+// `/new` (`/clear` and `/session new` aliases) — leave the old session without quitting next TUI.
 // The old session is never deleted; only the active marker moves.
 import { debug } from '../../debug/log.js';
 import { createSession, setActiveSessionId } from '../../session/index.js';
@@ -10,7 +10,7 @@ const UNTITLED = '(new session)';
 
 export function isNewSessionCommand(text: string): boolean {
   const normalized = text.trim().split(/\s+/).join(' ');
-  return normalized === '/new' || normalized === '/session new';
+  return normalized === '/new' || normalized === '/clear' || normalized === '/session new';
 }
 
 export function nextTuiTitle(meta: { readonly title?: string } | null | undefined): string {

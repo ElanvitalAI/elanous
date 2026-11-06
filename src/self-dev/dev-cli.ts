@@ -202,6 +202,10 @@ export interface DevSelfRunSuperviseOptions {
    * 「이 호출 전의 옛 요청」으로 버려진다(🅕 관측 2026-09-25: 정지 4초 뒤 새 라운드 발사). 생략하면 함수 진입 시각.
    */
   invocationStartedAtMs?: number;
+  /** Identifies the production entrance that supplied supervisor capabilities in debug observations. */
+  entryPoint?: string;
+  /** Correlation id for capability observations; kept separate from runId because runId changes supervisor persistence. */
+  observedRunId?: string;
   rounds?: number;
   completion?: string;
   runId?: string;
@@ -1053,8 +1057,23 @@ export async function executeDevSelfRun(
     executedRounds = 1;
     if (!supervise) return { result };
 
-    const reasonRepairEnabled = getUserConfig().tools.selfImplement.supervisor?.reasonRepair === true
-      && supervise.executePiece !== undefined;
+    const reasonRepairConfigured = getUserConfig().tools.selfImplement.supervisor?.reasonRepair === true;
+    const hasPieceExecutor = supervise.executePiece !== undefined;
+    const reasonRepairEnabled = reasonRepairConfigured && hasPieceExecutor;
+    const reasonRepairSkipReason = !reasonRepairConfigured ? 'disabled'
+      : !hasPieceExecutor ? 'missing-executor' : undefined;
+    try {
+      debug.log('self-dev.supervisor', 'reason-repair-capability', {
+        runId: supervise.observedRunId ?? null,
+        entryPoint: supervise.entryPoint ?? 'unknown',
+        taskCardId: process.env.ELANOUS_TASK_CARD_ID?.trim() || null,
+        configured: reasonRepairConfigured,
+        hasExecutePiece: hasPieceExecutor,
+        enabled: reasonRepairEnabled,
+        ...(reasonRepairSkipReason === undefined ? {} : { skipReason: reasonRepairSkipReason }),
+        surface: 'dev',
+      });
+    } catch { /* fail-open */ }
     const asSupervisorJobResult = (currentFeature: string, current: SelfImplementResult) =>
       singleRunAsJobResult(currentFeature, current, reasonRepairEnabled);
     const initialJob = singleRunAsJobResult(feature, result, reasonRepairEnabled);
@@ -1131,6 +1150,7 @@ export async function executeDevSelfRun(
       // authored goal as its feature). Without that executor the rerun could only replay the same goal — declare false.
       repairGoalExecution: supervise.executePiece !== undefined,
       needsHumanReasonRepairExecution: reasonRepairEnabled,
+      ...(reasonRepairSkipReason === undefined ? {} : { needsHumanReasonRepairSkipReason: reasonRepairSkipReason }),
       enrich: (results) => hydrateDevGoalCauseObserved(
         hydrateDevDecomposeProposals(results, supervise.readProposals ?? readDecomposeProposals),
       ),

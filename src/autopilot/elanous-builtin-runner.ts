@@ -25,7 +25,7 @@
 // mission text 를 첫 user block 으로 보내므로 system context 는 thin).
 // MB-6 polish 시 mission-type-aware system prompt 추가 후보.
 
-import { runCoreTurn } from '../core-turn/index.js';
+import { runCoreTurn } from '../core-turn/run-core-turn.js';
 import type { CoreTurnDispatchTool, CoreTurnStopReason } from '../core-turn/types.js';
 import {
   acpPromptToLlmContent,

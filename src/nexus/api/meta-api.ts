@@ -79,7 +79,7 @@ import {
 import { coerceHitlCallbackAnswer, type HitlPendingCallbacks } from './hitl-runtime.js';
 import { createPwaConfirmChannel, createPwaQuestionChannel } from './hitl-pwa-channel.js';
 import type { NexusEventBus } from './event-bus.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { defaultChatEventBus } from './chat-event-bus.js';
 import { resolveSessionProjectContext } from '../../project/session-context.js';
 
@@ -2026,7 +2026,6 @@ import {
   listToolRuntimes as listRuntimeRegistry,
   getToolRuntime as getRuntimeRegistry,
 } from '../../tool-runtime/registry.js';
-import { emitProxyCallIntent } from '../../mcp/server.js';
 import type { ToolSurface as RuntimeToolSurface } from '../../tool-runtime/types.js';
 
 /** Parse `/v1/tools/<id>/call` → `<id>`. Returns null when the path
@@ -2092,6 +2091,7 @@ export async function handleRuntimeToolCall(
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
     return badRequest('args must be an object');
   }
+  const { emitProxyCallIntent } = await import('../../mcp/server.js');
   const rt = getRuntimeRegistry(toolId);
   if (!rt) {
     emitProxyCallIntent(toolId, 'rest', false, 'unknown_tool');

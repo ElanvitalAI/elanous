@@ -14,7 +14,7 @@ test('proposal auto-placement waits for both roots, then produces a rubric-ranke
   const now = new Date('2026-11-01T01:00:00.000Z');
   const rawText = 'Add a private fixture for release candidate planning.\n루브릭: A1 E1 R1 D0 M1 B0 S1 X1';
   const intake: IntakeItem = {
-    id: 'proposal-fixture-1', source: 'note', sources: ['note'], kind: 'note', title: rawText,
+    id: 'proposal-fixture-1', source: 'memo', sources: ['memo'], kind: 'note', title: rawText,
     text: rawText, observedAt: now.toISOString(), lastSeenAt: now.toISOString(), signals: {}, privacy: 'public',
     status: 'new', outputs: [],
   };

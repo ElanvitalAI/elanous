@@ -350,3 +350,56 @@ test('rejects paths outside the repository and matches other file extensions exa
   expect(selectKnowhowPack(root, '대상 경로: src/foo.go.').ids).toEqual(['K-TC-41']);
   expect(selectKnowhowPack(root, '대상 경로: src/foo.vue.').ids).toEqual(['K-TC-42']);
 });
+
+test('sim: broad file-kind goals select TC test-hygiene cards without matching unrelated source paths', () => {
+  const { root, file } = fixture();
+  writeFileSync(file, [
+    '## K-TC-01 exact path competitor',
+    '- 상황: src/loops/orchestrator.test.ts 를 직접 고친다.',
+    '- 처방: exact competitor 가 hygiene set 을 밀어내지 않는지 확인한다.',
+    '- 출처: train · 상태: active',
+    '## K-TC-58 process.env restoration',
+    '- 상황: 시험 파일(*.test.ts) src/release-loop/rehearsal.test.ts 에서 process.env 를 바꾼다.',
+    '- 처방: 이전 값을 afterEach 에서 복원한다.',
+    '- 출처: train · 상태: active',
+    '## K-TC-59 process.chdir restoration',
+    '- 상황: 시험 파일 src/hq/seats.test.ts 에서 process.chdir 을 호출한다.',
+    '- 처방: 이전 cwd 를 afterEach 에서 되돌린다.',
+    '- 출처: train · 상태: active',
+    '## K-TC-60 rules source review',
+    '- 상황: docs/_index.md 또는 .rules/00-core/delivery-and-docs.md 를 고친다. test/rules-contract.test.ts 가 이를 검사한다.',
+    '- 처방: sources 를 가리키는 .rules 문서를 같은 diff 에서 갱신한다.',
+    '- 출처: train · 상태: active',
+    '## K-TC-61 stable test identity',
+    '- 상황: 시험 파일 src/dashboard/index.test.ts 를 나누거나 옮긴다.',
+    '- 처방: 전체 시험 이름을 그대로 보존한다.',
+    '- 출처: train · 상태: active',
+    '## K-TC-62 source path glob',
+    '- 상황: src/loops/orchestrator.ts 를 고친다.',
+    '- 처방: glob 이 경로를 선택한다.',
+    '- 출처: train · 상태: active',
+    '## K-TC-63 rules root glob',
+    '- 상황: .rules/policy.md 를 고친다.',
+    '- 처방: 이 카드는 **가 0개 경로 세그먼트인 규칙 파일에도 적용된다.',
+    '- 출처: train · 상태: active',
+  ].join('\n'));
+
+  // Goal example → selected cards. This table uses the real selector and a temporary KNOWHOW source.
+  const rows = [
+    { goal: '시험 파일 수정', paths: ['src/loops/orchestrator.test.ts'], ids: ['K-TC-58', 'K-TC-59', 'K-TC-60', 'K-TC-61'] },
+    { goal: '시험 파일 경로 패턴', paths: ['src/**/*.test.ts'], ids: ['K-TC-58', 'K-TC-59', 'K-TC-60', 'K-TC-61'] },
+    { goal: '규칙 파일 패턴', paths: ['.rules/**/*.md'], ids: ['K-TC-60', 'K-TC-63'] },
+    { goal: '일반 파일 양성 glob', paths: ['src/loops/*.ts'], ids: ['K-TC-01', 'K-TC-62'] },
+    { goal: '일반 파일 음성 glob', paths: ['src/loops/*.tsx'], ids: [] },
+    { goal: '일반 구현 파일', paths: ['src/loops/orchestrator.ts'], ids: ['K-TC-62'] },
+    { goal: '다른 일반 구현 파일', paths: ['src/loops/other.ts'], ids: [] },
+    { goal: '저장소 밖 시험 패턴', paths: ['../**/*.test.ts'], ids: [] },
+  ];
+  for (const row of rows) {
+    expect([...selectKnowhowPack(root, row.goal, row.paths).ids].sort()).toEqual([...row.ids].sort());
+  }
+  const testPack = selectKnowhowPack(root, rows[0]!.goal, rows[0]!.paths);
+  expect(testPack.ids).not.toContain('K-TC-01');
+  expect(testPack.bytes).toBe(Buffer.byteLength(testPack.text, 'utf8'));
+  expect(testPack.bytes).toBeLessThanOrEqual(KNOWHOW_PACK_MAX_BYTES);
+});

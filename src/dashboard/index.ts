@@ -178,7 +178,7 @@ import {
 import { dispatchStreamingTurnTypeaheadSubmission } from './input/streaming-turn-typeahead.js';
 import { composeVertical, type LayoutZone } from '../layout/composer.js';
 import { createPromptBandRenderObserver, createPromptRowOwner, renderPromptOwnerHintRow, withPromptRowOwner } from '../display/prompt-row-owner.js';
-import type { CoreTurnDispatchTool } from '../core-turn/index.js';
+import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 // streamGrok kept as back-compat shim in chat.ts — not imported here
 // directly anymore. Dashboard runs every turn through the in-process
 // ACP pair (see `bootDashboardAcpSession`), which internally routes
@@ -976,17 +976,10 @@ import { createDashboardTerminalPopupRuntime } from './terminal-popup-runtime.js
 import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAgentMission } from './sidetab-runtime.js';
 import { visibleMissionFailureLogData } from './visible-mission-diagnostics.js';
 import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, createClassicSidetabMissionPairSessionRegistry, type ClassicSidetabHandReplyInput, type ClassicSidetabMissionAgent, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionPairResult, type ClassicSidetabMissionResult, type ClassicSidetabMissionTrioResult } from './classic-sidetab-mission.js';
-import type { ClassicSidetabMissionPairCompletionResult } from './classic-sidetab-mission-job.js';
-import type { HandTaskOptions } from '../task-agent/task-hand.js';
 import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
 import { enqueueClassicSidetabMissionCompletion, runPreparedClassicSidetabVisibleMission } from './classic-sidetab-mission-job.js';
 import { startClassicSidetabMissionPair } from './classic-sidetab-mission-pair.js';
 import { captureClassicMissionExitObservation, createClassicSidetabMissionTrioVisibleRunner, startClassicSidetabMissionTrio } from './classic-sidetab-mission-trio.js';
-import { createDashboardPluginWizardRuntimeFromSidetab, searchAvailablePluginWizardTools } from './plugin-wizard-runtime.js';
-
-/** Public dashboard composition seam used by the TUI entrypoint and its integration test. */
-export const createDashboardTuiPluginWizard = createDashboardPluginWizardRuntimeFromSidetab;
-import { TUI_PLUGIN_WIZARD_TOOL_NAME } from './plugin-wizard-tool.js';
 import { probeGrokLogin } from '../agent-mission/grok-auth-status.js';
 import { loadSidetabRows } from '../sidetab-core/model.js';
 import { toggleDashboardAssistantRenderState } from './assistant-render-state-runtime.js';
@@ -1251,7 +1244,7 @@ import {
 } from '../agent-activity-hud.js';
 import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createEscAbortPendingGate, createHarnessEscHint, routeStreamingEscapeKey } from '../esc-abort-gate.js';
 import { enqueueSoftStop, readSoftStopRequestStatus } from '../harness/control-inbox.js';
-import { setSelfImplementSoftStopSpaceObserver } from '../self-implement/self-implement-runtime.js';
+import { setSelfImplementSoftStopSpaceObserver } from '../self-implement/soft-stop-observer.js';
 import { createViEditor, type ViEditorHandle } from '../vi-editor.js';
 import { launchEditor, canLaunchEditor } from '../editor-launcher.js';
 import {
@@ -1649,16 +1642,6 @@ export interface ShowDashboardOptions {
    *  effect in in-process mode (use TUI's `/session load` for that
    *  path). */
   resumeSessionId?: string;
-  /** Internal integration-test seam. Exercises showDashboard boot and the registered RunSidetabMission dispatcher
-   *  while replacing only visible child-process execution and the downstream task hand. Never set by the CLI. */
-  pluginWizardTestOverrides?: {
-    findAvailableTools?: (capability: string) => readonly string[];
-    runPair: (agent: 'codex' | 'claude', mission: string, parallelMission: string, context?: ClassicSidetabMissionDispatchContext) => Promise<{
-      result: ClassicSidetabMissionPairResult;
-      completion: Promise<ClassicSidetabMissionPairCompletionResult>;
-    }>;
-    taskHand: (options: HandTaskOptions) => Promise<unknown>;
-  };
 }
 
 // FileIndex cache keyed by absolute cwd. A single elanous session can
@@ -3345,288 +3328,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     attachSurfaceToWorkspace(handle.surface, currentWorkspaceOwnerId());
     forkPickerHandle = display.pushModal(handle.surface);
     draw();
-  };
-
-  // TUI 부활 C-b-2 PR① — /mission new 준비(ready) 워처 + 인라인 HITL 픽커.
-  // 텔레그램 미션 UX(등록→준비완료 버튼 3행→해소)의 TUI flavor. 실행/알림은
-  // detached prepare 그대로 두고, TUI 는 store 폴링(mission-tui-watch 순수 판정)
-  // 으로 전이 시에만 chat line 을 낸다. 준비완료 → 페이즈 보드 인라인 + 픽커
-  // (승인/보류=dispatchAutopilotMissions via:'tui' · 정정=spawnMissionPrepare 재분해).
-  const missionReadyWatchTimers = new Map<string, ReturnType<typeof setInterval>>();
-  const stopMissionReadyWatch = (missionId: string): void => {
-    const t = missionReadyWatchTimers.get(missionId);
-    if (t) { clearInterval(t); missionReadyWatchTimers.delete(missionId); }
-  };
-  let missionHitlModal: SearchModalHandle | null = null;
-  let missionHitlModalHandle: { dispose: () => void } | null = null;
-  const closeMissionHitlPicker = (): void => {
-    if (missionHitlModalHandle) { try { missionHitlModalHandle.dispose(); } catch { /* ignore */ } missionHitlModalHandle = null; }
-    missionHitlModal = null;
-    draw();
-    try { promptCtl.repaint(); } catch { /* ignore */ } // C-d-1 — 하단 슬롯 반납 후 composer 복원.
-  };
-  const openMissionHitlPicker = (missionId: string, goal: string): void => {
-    if (missionHitlModal) return;
-    void (async () => {
-      const { HITL_REVISE_PRESETS } = await import('../autopilot/mission-notify.js');
-      const items: SearchItem[] = [
-        { label: '✅ 승인 — 실행 시작', payload: 'approve' },
-        { label: '⏸️ 보류 — 기록 유지·실행 안 함', payload: 'hold' },
-        ...HITL_REVISE_PRESETS.map((p): SearchItem => ({ label: `${p.label} — 재분해`, payload: `preset:${p.action}` })),
-        { label: '✏️ 직접입력 — 정정 코멘트 작성', payload: 'custom' },
-      ];
-      // Pickers share the composer bottom slot.
-      const placement = resolveDecisionPickerPlacement({ height: 14 });
-      const modalWidth = placement.width;
-      const handle = createSearchModal({
-        id: `mission-hitl:${Date.now().toString(36)}`,
-        bounds: placement.bounds,
-        ...(placement.slot ? { slot: placement.slot } : {}),
-        title: `미션 승인 — ${goal.slice(0, 48)}`,
-        width: modalWidth,
-        maxVisible: 8,
-        primaryActionLabel: 'select',
-        cancelActionLabel: 'later',
-        filterable: false,
-        onQuery: () => items,
-        onAccept: (item) => {
-          const pick = String(item.payload);
-          closeMissionHitlPicker();
-          void (async () => {
-            if (pick === 'approve' || pick === 'hold') {
-              const { dispatchAutopilotMissions } = await import('../autopilot/mission-tool.js');
-              const r = await dispatchAutopilotMissions(
-                pick === 'approve'
-                  ? { action: 'approve', id: missionId, via: 'tui' }
-                  : { action: 'cancel', id: missionId, via: 'tui', defer: true },
-              ) as { error?: string; note?: string; scheduledCron?: string };
-              chatLines.push('');
-              if (r.error) chatLines.push(C.error(`  ✗ ${r.error}`));
-              else if (pick === 'approve') {
-                chatLines.push(C.success(`  ✅ 승인 — ${r.note ?? '실행 시작'} (${missionId})`));
-                // PR ② — 즉시 집행(비예약)이면 실행 워처: 페이즈 전이·진행바·종결 리포트.
-                if (!r.scheduledCron) startMissionRunWatch(missionId);
-              } else chatLines.push(C.warning(`  ⏸️ 보류 — ${r.note ?? '기록 유지'} (${missionId})`));
-            } else if (pick.startsWith('preset:')) {
-              const { HITL_REVISE_PRESETS: presets } = await import('../autopilot/mission-notify.js');
-              const preset = presets.find((p) => `preset:${p.action}` === pick);
-              if (preset) {
-                const { spawnMissionPrepare } = await import('../autopilot/mission-prepare-spawn.js');
-                try { spawnMissionPrepare(missionId, { comment: preset.comment }); } catch { /* fail-soft */ }
-                chatLines.push('');
-                chatLines.push(C.info(`  🔧 정정 반영 중: ${preset.label} — 재분해 후 새 보드를 보여드립니다`));
-                startMissionReadyWatch(missionId);
-              }
-            } else {
-              // 직접입력 — 다음 입력 프롬프트에 /mission revise 를 prefill(고쳐서 Enter).
-              inputPrefixState.set(`/mission revise ${missionId} `);
-              chatLines.push('');
-              chatLines.push(C.muted('  ✏️ 정정 코멘트를 입력창에 이어 쓰고 Enter — /mission revise 로 재분해'));
-            }
-            chatScrollOffset = -1;
-            draw();
-          })();
-        },
-        onCancel: () => {
-          closeMissionHitlPicker();
-          chatLines.push(C.muted(`  (나중에 — 승인: /mission approve ${missionId} · 보류: /mission hold · 정정: /mission revise)`));
-          chatScrollOffset = -1;
-          draw();
-        },
-        theme: currentThemeTokens(),
-      });
-      missionHitlModal = handle;
-      attachSurfaceToWorkspace(handle.surface, currentWorkspaceOwnerId());
-      missionHitlModalHandle = display.pushModal(handle.surface);
-      draw();
-    })();
-  };
-  // P4 (2026-07-13) — 페이즈 실패 힐 픽커. 텔레그램 3층 탈출구 버튼([🔧 재구현][✂️ 분할]
-  // [✏️ 골 정정][⏭️ 건너뛰기] + (권장) 강조)의 TUI flavor — 저장 진단(diagnosis.heal)이
-  // 권장을 강조하고, 실행은 P2 의 dispatch 액션(단일 창구·via:'tui'). Esc=나중에(슬래시 안내).
-  const openMissionHealPicker = (
-    missionId: string,
-    phase: { index: number; title: string; diagnosis?: { heal: string; rootCause: string; confidence: string } },
-  ): void => {
-    if (missionHitlModal) return; // 하단 슬롯 단일 소유자 — 이미 결정 뷰가 떠 있으면 양보(슬래시로 가능).
-    void (async () => {
-      const rec = phase.diagnosis?.heal;
-      const mark = (kind: string, label: string): string => (rec === kind ? `${label} (권장)` : label);
-      const items: SearchItem[] = [
-        { label: mark('rebuild', '🔧 재구현 — 이 페이즈부터 재시도'), payload: 'rebuild' },
-        { label: mark('split', '✂️ 분할 — 단일책임 서브페이즈로 재분해'), payload: 'split' },
-        { label: mark('revise', '✏️ 골 정정 — 목표 축소·재분해(코멘트 입력)'), payload: 'revise' },
-        { label: mark('skip', '⏭️ 건너뛰기 — 기능 제외·부분 완주'), payload: 'skip' },
-      ];
-      // 권장 항목을 맨 위로(텔레그램 (권장) 강조 동형 · 픽커는 순서가 곧 강조).
-      items.sort((a, b) => Number(String(b.payload) === rec) - Number(String(a.payload) === rec));
-      const placement = resolveDecisionPickerPlacement({ height: 10 });
-      const handle = createSearchModal({
-        id: `mission-heal:${Date.now().toString(36)}`,
-        bounds: placement.bounds,
-        ...(placement.slot ? { slot: placement.slot } : {}),
-        title: `페이즈 실패 — ${phase.index}. ${phase.title.slice(0, 40)}`,
-        width: placement.width,
-        maxVisible: 5,
-        primaryActionLabel: 'select',
-        cancelActionLabel: 'later',
-        filterable: false,
-        onQuery: () => items,
-        onAccept: (item) => {
-          const pick = String(item.payload);
-          closeMissionHitlPicker();
-          void (async () => {
-            if (pick === 'revise') {
-              // 정정 코멘트는 사람 입력 — prefill 후 Enter(기존 HITL 직접입력 경로 동형).
-              inputPrefixState.set(`/mission revise ${missionId} `);
-              chatLines.push('');
-              chatLines.push(C.muted('  ✏️ 정정 코멘트를 입력창에 이어 쓰고 Enter — 실패 컨텍스트는 자동 첨부됩니다'));
-            } else {
-              const { dispatchAutopilotMissions } = await import('../autopilot/mission-tool.js');
-              const r = await dispatchAutopilotMissions({
-                action: pick, id: missionId, phase: String(phase.index), via: 'tui',
-              }) as { error?: string; note?: string };
-              chatLines.push('');
-              if (r.error) chatLines.push(C.error(`  ✗ ${r.error}`));
-              else {
-                chatLines.push(C.success(`  ${r.note ?? `${pick} 시작`}`));
-                startMissionRunWatch(missionId); // 힐 후 순회 재개를 계속 관찰.
-              }
-            }
-            chatScrollOffset = -1;
-            draw();
-          })();
-        },
-        onCancel: () => {
-          closeMissionHitlPicker();
-          chatLines.push(C.muted(`  (나중에 — /mission rebuild|split|skip ${missionId} ${phase.index} · 골 정정: /mission revise ${missionId} <코멘트>)`));
-          chatScrollOffset = -1;
-          draw();
-        },
-        theme: currentThemeTokens(),
-      });
-      missionHitlModal = handle;
-      attachSurfaceToWorkspace(handle.surface, currentWorkspaceOwnerId());
-      missionHitlModalHandle = display.pushModal(handle.surface);
-      draw();
-    })();
-  };
-  const startMissionReadyWatch = (missionId: string): void => {
-    if (missionReadyWatchTimers.has(missionId)) return;
-    void (async () => {
-      const watch = await import('../autopilot/mission-tui-watch.js');
-      const baseline = watch.takeMissionReadySnapshot(missionId);
-      let state = watch.createMissionWatchState(baseline, Date.now());
-      const timer = setInterval(() => {
-        const cur = watch.takeMissionReadySnapshot(missionId);
-        const r = watch.advanceMissionWatch(state, cur, Date.now());
-        state = r.state;
-        let readyGoal: string | null = null;
-        for (const ev of r.events) {
-          if (ev.kind === 'phases') {
-            chatLines.push(C.muted(`  🧩 분해 진행 — ${ev.count} 페이즈 (${missionId})`));
-          } else if (ev.kind === 'ready') {
-            const snap = ev.snapshot;
-            readyGoal = snap.goal;
-            chatLines.push('');
-            chatLines.push(C.accent(`❯ 미션 준비 완료 — ${snap.goal.slice(0, 64)}`));
-            // 승인 예고 — 승인하면 무엇이 일어나는지(사람의 승인 판단 근거·dogfood 지적).
-            const tierLabel = snap.tier === 'heavy' ? '무거움' : '가벼움';
-            const approveEffect = snap.executionModel === 'scheduler'
-              ? '승인 시 cron 예약(즉시 실행 아님)'
-              : '승인 시 backlog 페이즈 즉시 집행(detached)';
-            chatLines.push(C.subtext(`  · 실행모델 ${snap.executionModel || '?'} (${tierLabel}) — ${approveEffect}`));
-            for (const line of watch.missionDescriptionDigest(snap.description)) {
-              chatLines.push(line.startsWith('  ') ? C.muted(`  ${line}`) : C.subtext(`  · ${line}`));
-            }
-            for (const line of watch.renderMissionPhaseBoardLines(snap.phases, { goal: snap.goal })) {
-              chatLines.push(C.text(`  ${line}`));
-            }
-            chatLines.push(C.muted(`  검토 후 선택 — 승인 / 보류 / 정정 (Esc=나중에 · 전문: /mission trace ${missionId})`));
-          } else if (ev.kind === 'resolved-elsewhere') {
-            chatLines.push(C.muted(`  ✔ 미션 ${missionId} 은 다른 서피스에서 이미 해소됨 (status=${ev.status})`));
-          } else if (ev.kind === 'gone') {
-            chatLines.push(C.muted(`  ✔ 미션 ${missionId} 이 삭제되어 준비 워처를 종료합니다`));
-          } else if (ev.kind === 'timeout') {
-            chatLines.push(C.warning(`  ⏰ 미션 준비 워처 타임아웃 — /mission trace ${missionId} 로 확인하세요`));
-          }
-        }
-        if (r.events.length > 0) {
-          chatScrollOffset = -1;
-          draw();
-        }
-        if (r.done) {
-          stopMissionReadyWatch(missionId);
-          if (readyGoal !== null) openMissionHitlPicker(missionId, readyGoal);
-        }
-      }, watch.MISSION_WATCH_INTERVAL_MS);
-      missionReadyWatchTimers.set(missionId, timer);
-    })();
-  };
-  // PR ② — approve 후 실행 워처. 페이즈 전이 chat line(텔레그램 notifyPhaseResult
-  // 동형) + chatFooter 진행바 + 종결 리포트. 실행은 detached run-mission 그대로 —
-  // tox_tasks status 폴링(5s)만. footer 는 MISSION_FOOTER_PREFIX 소유권 판별로
-  // thinking 인디케이터와 공존(우리 것일 때만 갱신/해제).
-  const missionRunWatchTimers = new Map<string, ReturnType<typeof setInterval>>();
-  const stopMissionRunWatch = (missionId: string): void => {
-    const t = missionRunWatchTimers.get(missionId);
-    if (t) { clearInterval(t); missionRunWatchTimers.delete(missionId); }
-  };
-  const startMissionRunWatch = (missionId: string): void => {
-    if (missionRunWatchTimers.has(missionId)) return;
-    void (async () => {
-      const watch = await import('../autopilot/mission-tui-watch.js');
-      const baseline = watch.takeMissionRunSnapshot(missionId);
-      let state = watch.createMissionRunWatchState(baseline, Date.now());
-      const setFooter = (text: string | null): void => {
-        const cur = chatFooterLine.current;
-        if (cur === null || cur.startsWith(watch.MISSION_FOOTER_PREFIX)) chatFooterLine.current = text;
-      };
-      const timer = setInterval(() => {
-        const cur = watch.takeMissionRunSnapshot(missionId);
-        const r = watch.advanceMissionRunWatch(state, cur, Date.now());
-        state = r.state;
-        for (const ev of r.events) {
-          if (ev.kind === 'phase') {
-            const line = watch.renderMissionRunPhaseLine(ev);
-            chatLines.push(ev.phase.status === 'failed' ? C.error(`  ${line}`) : C.text(`  ${line}`));
-            // P4 — 실패 즉시 저장 진단 카드(🧭 왜 실패 + 💡 권장 힐·텔레그램 동형) + 힐 픽커.
-            if (ev.phase.status === 'failed') {
-              for (const dl of watch.renderMissionPhaseDiagnosisLines(ev.phase)) {
-                chatLines.push(C.subtext(`     ${dl}`));
-              }
-              openMissionHealPicker(missionId, ev.phase);
-            }
-          } else if (ev.kind === 'progress') {
-            // 페이즈 내부 변곡점(#3919 미러) — 재시도·예산 상향·opus 폴백 국면을 1줄로.
-            chatLines.push(C.muted(`  ⏳ ${ev.phase.index + 1}/${ev.total} ${ev.note.slice(0, 96)}`));
-          } else if (ev.kind === 'finished') {
-            chatLines.push('');
-            chatLines.push(C.accent(`❯ 미션 종결 — ${ev.snapshot.goal.slice(0, 64)}`));
-            for (const line of watch.renderMissionRunReportLines(ev.snapshot)) {
-              chatLines.push(line.startsWith('❌') ? C.warning(`  ${line}`) : C.text(`  ${line}`));
-            }
-            chatLines.push(C.muted(`  상세: /mission trace ${missionId}`));
-          } else if (ev.kind === 'gone') {
-            chatLines.push(C.muted(`  ✔ 미션 ${missionId} 이 삭제되어 실행 워처를 종료합니다`));
-          } else if (ev.kind === 'timeout') {
-            chatLines.push(C.warning(`  ⏰ 미션 실행 워처 타임아웃(4h) — /mission trace ${missionId} 로 확인하세요`));
-          }
-        }
-        if (r.events.length > 0) {
-          setFooter(r.done || !cur ? null : watch.renderMissionRunFooter(cur));
-          chatScrollOffset = -1;
-          draw();
-        }
-        if (r.done) {
-          setFooter(null);
-          stopMissionRunWatch(missionId);
-        }
-      }, watch.MISSION_RUN_WATCH_INTERVAL_MS);
-      missionRunWatchTimers.set(missionId, timer);
-      const first = baseline ? watch.renderMissionRunFooter(baseline) : null;
-      if (first) { setFooter(first); draw(); }
-    })();
   };
 
   // C-d-3' (2026-07-13) — 턴 중 타이핑 보존 상태 + 에코 페인터 (essential 전용).
@@ -13987,7 +13688,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         })).answer,
       });
     };
-    const pluginWizardPairCompletions = new Map<string, Promise<import('./classic-sidetab-mission-job.js').ClassicSidetabMissionPairCompletionResult>>();
     const classicSidetabMission = createDashboardClassicSidetabMissionCallbacks(async (agent, mission, context) => {
       const started = await startClassicMissionCli({
         agent,
@@ -14009,14 +13709,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         content: 'Independent sidetab job started; this conversation can continue.',
       };
     }, cancelClassicSidetabMission, async (agent, mission, parallelMission, context) => {
-      const testPair = opts.pluginWizardTestOverrides?.runPair;
-      if (testPair) {
-        const started = await testPair(agent, mission, parallelMission, context);
-        if (context?.callId?.startsWith('plugin-wizard:')) {
-          pluginWizardPairCompletions.set(context.callId, started.completion);
-        }
-        return started.result;
-      }
       for (const member of ['codex', 'claude'] as const) {
         const prepared = await prepareClassicSidetabAgentCli(member);
         if (!prepared.ready) {
@@ -14137,9 +13829,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         killSession: (sessionId) => sessionRegistry.kill(sessionId),
         enqueue: (notification) => globalTaskNotificationQueue.enqueue(notification),
       });
-      if (context?.callId?.startsWith('plugin-wizard:')) {
-        pluginWizardPairCompletions.set(context.callId, started.completion);
-      }
       void started.completion;
       return started.result;
     }, async (input) => {
@@ -14199,16 +13888,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       });
       void started.completion;
       return started.result;
-    });
-    const tuiPluginWizard = createDashboardTuiPluginWizard(classicSidetabMission, pluginWizardPairCompletions, {
-      getWorkspace: () => getSessionCwd(),
-      findAvailableTools: opts.pluginWizardTestOverrides?.findAvailableTools ?? ((capability) => {
-        const runtimeSpecs = acpToolRuntime?.listToolRuntimes('tui').map(runtime => runtime.spec) ?? [];
-        const hostSpecs = pluginHost.hostLLMTools();
-        return searchAvailablePluginWizardTools(capability, [...new Map([...runtimeSpecs, ...hostSpecs]
-          .map(spec => [spec.name, spec] as const)).values()]);
-      }),
-      ...(opts.pluginWizardTestOverrides ? { taskHand: opts.pluginWizardTestOverrides.taskHand } : {}),
     });
     disposeClassicSigquit = registerClassicSigquitHandler(() => {
       classicSidetabRuntime.beginPrefix();
@@ -15734,7 +15413,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             [...researchDefaults, ...tools].map(tool => [tool.name, tool] as const),
           ).values()];
           const classicTools = runtime ? classicSidetabMission.getTools(withSurfaceDefaults) : withSurfaceDefaults;
-          const tuiTools = tuiPluginWizard.getTools(classicTools);
+          const tuiTools = classicTools;
           return [
             ...tuiChatPersonaMessages(currentChatPersonaSessionId(), chatPersonaSelection),
             ...buildDashboardTurnPreamble({
@@ -15757,7 +15436,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         },
         getTools: ({ userText }) => {
           const runtime = acpToolRuntime;
-          if (!runtime) return tuiPluginWizard.getTools([]);
+          if (!runtime) return [];
           const tools = buildSessionRuntimeToolSpecs({
             userText,
             hostTools: pluginHost.hostLLMTools(),
@@ -15777,7 +15456,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             [...researchDefaults, ...tools].map(tool => [tool.name, tool] as const),
           ).values()];
           const classicTools = classicSidetabMission.getTools(withSurfaceDefaults);
-          const tuiTools = tuiPluginWizard.getTools(classicTools);
+          const tuiTools = classicTools;
           // ⭐ Remember this turn's catalog so a spawned sub-agent can inherit it.
           //
           //  `dispatchAgent` computes `childTools = (hostTools ?? []).filter(...)`,
@@ -15785,7 +15464,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           //  or edit anything, which is the whole point of delegating code work.
           //  Exposing `Agent` without this wiring is worse than not exposing it:
           //  the model picks a delegate that provably cannot act.
-          acpTurnToolSpecs = tuiTools.filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME && tool.name !== TUI_PLUGIN_WIZARD_TOOL_NAME);
+          acpTurnToolSpecs = tuiTools.filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME);
           return tuiTools;
         },
         // R2 essential TUI execution boundary: ACP receives the same
@@ -15802,11 +15481,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // Count at the server-side boundary, before any tool effect and
           // before the ACP notification can reach the TUI client.
           acpToolDispatchCount++;
-          const pluginWizardResult = tuiPluginWizard.dispatchTool(name, args, {
-            callId: ctx?.callId,
-            parentSessionId: ctx?.sessionId,
-          });
-          if (pluginWizardResult) return await pluginWizardResult;
           const classicMissionResult = classicSidetabMission.dispatchTool(name, args, {
             callId: ctx?.callId,
             parentSessionId: ctx?.sessionId,
@@ -15891,7 +15565,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   });
                   const specs = [...new Map(
                     [...acpTurnToolSpecs, ...childCatalog]
-                      .filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME && tool.name !== TUI_PLUGIN_WIZARD_TOOL_NAME)
+                      .filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME)
                       .map(tool => [tool.name, tool] as const),
                   ).values()];
                   return {
@@ -18116,10 +17790,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               sessionFork: {
                 openPicker: () => { openForkTimetravelPicker(); },
                 timetravel: (n) => forkTimetravelFromChatHistory(n),
-              },
-              missionTui: {
-                startReadyWatch: (missionId) => { startMissionReadyWatch(missionId); },
-                startRunWatch: (missionId) => { startMissionRunWatch(missionId); },
               },
               refreshReasoningHudSegment,
               inputSeed: {

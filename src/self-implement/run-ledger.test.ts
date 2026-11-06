@@ -5,11 +5,111 @@ import { appendRunLedgerEntry, appendRunLedgerEntryChecked, cleanupUnfinishedRun
 import * as runLedgerModule from './run-ledger.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { setOpsRootsForTesting } from '../instance/test-write-guard.js';
 import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
+import { tracedPathReferences, verbatimOriginalAsk } from './goal-author-text.js';
 
+
+describe('IMPORT-DIET-GOAL-AUTHOR-HELPERS', () => {
+  it('measures next TUI modules loaded by the real entrypoint', () => {
+    const root = mkdtempSync(join(tmpdir(), 'next-tui-runtime-graph-'));
+    const runner = join(root, 'inspect-next-tui-runtime.ts');
+    const source = `
+      import { createRequire } from 'node:module';
+      import { pathToFileURL } from 'node:url';
+      import { join } from 'node:path';
+      const require = createRequire(import.meta.url);
+      await import(pathToFileURL(join(process.cwd(), 'src/tui/entry.ts')).href);
+      const files = Object.keys(require.cache).filter((path) => path.startsWith(process.cwd() + '/src/'));
+      console.log(JSON.stringify({ count: files.length, goalAuthor: files.some((path) => path.endsWith('/src/self-implement/goal-author.ts')) }));
+    `;
+    try {
+      writeFileSync(runner, source, 'utf8');
+      const execution = Bun.spawnSync({
+        cmd: [process.execPath, runner],
+        cwd: process.cwd(),
+        env: { ...process.env, ELANOUS_CONFIG_DIR: join(root, 'config'), ELANOUS_STATE_DIR: join(root, 'state') },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      expect(execution.exitCode).toBe(0);
+      const observation = JSON.parse(execution.stdout.toString()) as { count: number; goalAuthor: boolean };
+      console.log(`next TUI runtime module observation: ${JSON.stringify(observation)}`);
+      expect(observation.goalAuthor).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps goal-author text helpers out of the loaded run-ledger production graph', () => {
+    const root = mkdtempSync(join(tmpdir(), 'run-ledger-module-graph-'));
+    const runner = join(root, 'inspect-module-graph.ts');
+    const ledgerDirectory = join(root, 'ledger');
+    const isolatedConfigDir = join(root, 'gate-config');
+    const isolatedStateDir = join(root, 'gate-state');
+    const source = `
+      import { createRequire } from 'node:module';
+      import { pathToFileURL } from 'node:url';
+      import { join } from 'node:path';
+      const require = createRequire(import.meta.url);
+      const ledger = await import(pathToFileURL(join(process.cwd(), 'src/self-implement/run-ledger.ts')).href);
+      const result = ledger.queryUnfinishedRunLedgers({ dir: process.argv[2], path: 'src/self-implement/run-ledger.ts', noCache: true });
+      const loaded = Object.keys(require.cache);
+      console.log(JSON.stringify({ entries: result.entries.length, runLedger: loaded.some((path) => path.endsWith('/src/self-implement/run-ledger.ts')), goalAuthorText: loaded.some((path) => path.endsWith('/src/self-implement/goal-author-text.ts')), goalAuthor: loaded.some((path) => path.endsWith('/src/self-implement/goal-author.ts')) }));
+    `;
+    try {
+      mkdirSync(ledgerDirectory, { recursive: true });
+      writeFileSync(runner, source, 'utf8');
+      const execution = Bun.spawnSync({
+        cmd: [process.execPath, runner, ledgerDirectory],
+        cwd: process.cwd(),
+        env: { ...process.env, ELANOUS_CONFIG_DIR: isolatedConfigDir, ELANOUS_STATE_DIR: isolatedStateDir },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      expect(execution.exitCode).toBe(0);
+      expect(JSON.parse(execution.stdout.toString())).toEqual({ entries: 0, runLedger: true, goalAuthorText: true, goalAuthor: false });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the run-ledger production path and helper exports behavior-compatible', () => {
+    const root = mkdtempSync(join(tmpdir(), 'run-ledger-goal-author-text-'));
+    const directory = join(root, 'run-ledger');
+    const goalFile = join(root, 'goal.md');
+    const id = 'run-00000000-0000-4000-8000-000000000907';
+    const document = [
+      '## TRACED PATHS',
+      '- src/traced-path.ts — implementation',
+      '',
+      'Original ask (verbatim, unmodified):',
+      '```',
+      '대상 경로: src/declared-path.ts',
+      '```',
+    ].join('\n');
+    try {
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(goalFile, document, 'utf8');
+      appendRunLedgerEntry({ runId: id, event: 'start', data: { goalFile } }, directory);
+
+      const tracedMatch = queryUnfinishedRunLedgers({ dir: directory, path: 'src/traced-path.ts', noCache: true });
+      const declaredMatch = queryUnfinishedRunLedgers({ dir: directory, path: 'src/declared-path.ts', noCache: true });
+      expect(tracedMatch.entries).toHaveLength(1);
+      expect(tracedMatch.entries[0]?.plannedPaths).toEqual(['src/traced-path.ts']);
+      expect(tracedMatch.entries[0]?.declaredPaths).toEqual(['src/declared-path.ts']);
+      expect(declaredMatch.entries).toHaveLength(1);
+      expect(declaredMatch.entries[0]?.plannedPaths).toEqual(['src/traced-path.ts']);
+      expect(declaredMatch.entries[0]?.declaredPaths).toEqual(['src/declared-path.ts']);
+      expect(tracedPathReferences(document)).toEqual([{ path: 'src/traced-path.ts', line: null, endLine: null }]);
+      expect(verbatimOriginalAsk(document)).toBe('대상 경로: src/declared-path.ts');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('run-ledger dev project annotation', () => {
   it('adds only a valid environment project to newly appended entries and preserves explicit and legacy entries', () => {

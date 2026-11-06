@@ -1090,18 +1090,6 @@ export class PluginHost {
     }
     const started = Date.now();
     debug.log('plugin.tool', name, { args, plugin: this.activeEntry?.name ?? null });
-    const runId = process.env.ELANOUS_RUN_ID?.trim();
-    if (runId) {
-      try {
-        const { appendRunLedgerEntry } = await import('../../self-implement/run-ledger.js');
-        appendRunLedgerEntry({
-          timestamp: new Date().toISOString(),
-          runId,
-          event: 'plugin-tool-call',
-          data: { plugin: this.activeEntry?.name ?? null, tool: name },
-        });
-      } catch { /* resource observation must not change tool dispatch */ }
-    }
     try {
       // Host tools can run outside any plugin context — buildContext
       // falls back to a minimal stub when activeEntry is null.

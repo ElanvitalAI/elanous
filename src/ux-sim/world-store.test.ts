@@ -25,10 +25,10 @@ afterEach(() => {
 });
 
 describe('sim world lifecycle', () => {
-  test('v2 device snapshot includes every source module in the catalog', () => {
+  test('current device snapshot includes every source module in the catalog', () => {
     const catalog = loadMockScenarioCatalog();
     const snapshots = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
-    expect([...snapshots[String(catalog.version)]!].sort()).toEqual(catalog.sourceModules.map(({ id }) => id).sort());
+    expect([...snapshots[String(catalog.deviceCatalogVersion)]!].sort()).toEqual(catalog.sourceModules.map(({ id }) => id).sort());
   });
   test('refuses to access sim storage without an explicit isolated test universe', () => {
     priorTestRoot = getTestStateRoot();

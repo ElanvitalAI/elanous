@@ -57,11 +57,25 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(result.universe).toBe(root);
     expect(result.artifactPath).toBe(join(root, 'ux-sim', 'evidence', 'release-sim-rig-0241.json'));
     expect(existsSync(result.artifactPath)).toBe(true);
-    expect(result.cases).toHaveLength(16);
+    expect(result.cases).toHaveLength(18);
     expect(result.cases.every((item) => item.pass && item.unexpectedEdges.length === 0)).toBe(true);
     expect(result.cases.every((item) => item.dispatchedNodes.every((node) => item.path.includes(node) ||
       Object.values(item.fanOuts ?? {}).some((fanout) => Object.hasOwn(fanout.branches, node))))).toBe(true);
     expect(result.table.every((row) => row.unexpectedEdges === 'none')).toBe(true);
+    const realCutoff = result.cases.find((item) => item.id === 'cutoff-notes-empty-real-cli')!;
+    expect(realCutoff).toMatchObject({ pass: true, status: 'failed', path: ['version-release', 'traffic-cut-start', 'cutoff', 'traffic-failed-restore', 'failed'],
+      injectedEvidence: { actualCli: 'version-node.ts release → node-verdict.ts cutoff → cutoff.ts' } });
+    expect(String(realCutoff.injectedEvidence.actualVersionReleaseCliOutput)).toContain('release/0.3.1');
+    expect(String(realCutoff.injectedEvidence.actualCutoffCliOutput)).toContain('cutoff notes-empty');
+    const realDocs = result.cases.find((item) => item.id === 'docs-node-real-cli-in-sim')!;
+    expect(realDocs).toMatchObject({ pass: true, status: 'done',
+      injectedEvidence: { actualCli: 'bun scripts/release-loop/docs-node.ts --json', cliStatus: 0,
+        remote: 'local-bare-only', branch: 'release-docs/0.3.1', cliOutcome: 'ok', cliBranch: 'release-docs/0.3.1',
+        notesRegistered: true, pagesRegistered: true, markerFlipped: true } });
+    expect(realDocs.path).toContain('docs');
+    expect(realDocs.path).toContain('verify');
+    expect(realDocs.path).toContain('done');
+    expect(realDocs.dispatchedNodes).toContain('docs-land');
     const appendReceiptCase = result.cases.find((item) => item.id === 'append-receipt-set-absent-and-continuous-radius')!;
     expect(appendReceiptCase).toMatchObject({
       pass: true, status: 'done', checks: { status: true, mustVisit: true, mustNotVisit: true, ledgerEvents: true },
@@ -128,8 +142,12 @@ test('release simulation runs the real release graph with injected node outcomes
     const statusRegression = await runReleaseSimRigScenario(wrongRefusalExpectation);
     expect(statusRegression.pass).toBe(false);
     expect(statusRegression.cases.find((item) => item.id === 'cut-tip-moved-after-resume')?.checks.status).toBe(false);
-    expect(result.cases.find((item) => item.id === 'gate-attribution-incomplete')?.path)
-      .toContain('traffic-failed-restore');
+    const unattributedGate = result.cases.find((item) => item.id === 'gate-attribution-incomplete')!;
+    expect(unattributedGate.path).toContain('traffic-failed-restore');
+    const unattributedRun = JSON.parse(readFileSync(unattributedGate.statePath, 'utf8')) as {
+      nodes: Array<{ nodeId: string; output?: string }>;
+    };
+    expect(JSON.parse(unattributedRun.nodes.find((node) => node.nodeId === 'gate')!.output!)).not.toHaveProperty('autoheal');
     const prefetchWarning = result.cases.find((item) => item.id === 'prefetch-warning-failure-overlaps-checklist')!;
     expect(prefetchWarning.path.indexOf('pre-gate-join')).toBeLessThan(prefetchWarning.path.indexOf('gate'));
     expect(prefetchWarning.fanOuts?.['export-check:ok']?.branches).toMatchObject({

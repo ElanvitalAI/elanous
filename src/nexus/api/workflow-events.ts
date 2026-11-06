@@ -32,7 +32,7 @@ import {
   getGlobalWorkflowDir,
   getProjectWorkflowDir,
 } from '../../workflow-runtime/discovery.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { SSE_HEARTBEAT_MS } from './sse-heartbeat.js';
 
 /** Shape of a single change event delivered over SSE. The payload is

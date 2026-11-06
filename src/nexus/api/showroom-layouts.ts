@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { SSE_HEARTBEAT_MS } from './sse-heartbeat.js';
 

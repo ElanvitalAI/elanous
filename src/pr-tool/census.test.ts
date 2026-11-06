@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { withFakeBins } from '../ux-sim/fake-bin.js';
-import { CensusDiffCache, resetCensusDiffCache, sharedCensusDiffCache, cardIdFromBody, censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, sliceMarkerFromBody, spawnParallelCommands,
+import { CensusDiffCache, DEFAULT_FILE_CENSUS_CONCURRENCY, PR_FILE_PROJECTION_LIMIT, resetCensusDiffCache, sharedCensusDiffCache, cardIdFromBody, censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, sliceMarkerFromBody, spawnParallelCommands,
   observePrLineage, type PrToolCall, type PrToolCommand, type PrToolCommandResult, type PrToolParallelCommand } from './census.js';
 
 const pr = (number: number, files: string[], extra: Record<string, unknown> = {}) => ({
@@ -19,7 +19,7 @@ function fixture(rows: ReturnType<typeof pr>[], options: { failAt?: string; file
     if (args[0] === 'pr' && args[1] === 'list') {
       calls.push('gh pr list');
       if (options.failAt) return { ok: false, out: '', err: 'projection unavailable' };
-      return { ok: true, out: JSON.stringify(rows.map(row => ({
+      return { ok: true, out: JSON.stringify(rows.slice(0, Number(args[args.indexOf('--limit') + 1])).map(row => ({
         number: row.number,
         changedFiles: options.filePages?.[row.number]?.flat().length ?? row.files.length,
         files: row.files.map(path => ({ path })),
@@ -467,12 +467,12 @@ function bigFixture(rows: ReturnType<typeof pr>[], options: { projection?: 'ok' 
       if (options.projection === 'fail') return { ok: false, out: '', err: 'GraphQL: API rate limit exceeded for installation' };
       if (options.projection === 'garbage') return { ok: true, out: '{ definitely invalid JSON' };
       if (options.projection === 'object') return { ok: true, out: '{"not":"an array"}' };
-      if (options.projection === 'unusable') return { ok: true, out: JSON.stringify(rows.map(row => ({ number: row.number, changedFiles: row.files.length + 1, files: row.files.map(path => ({ path })) }))) };
+      if (options.projection === 'unusable') return { ok: true, out: JSON.stringify(rows.slice(0, Number(args[args.indexOf('--limit') + 1])).map(row => ({ number: row.number, changedFiles: row.files.length + 1, files: row.files.map(path => ({ path })) }))) };
       if (options.projection === 'duplicate') {
-        const projected = rows.map(row => ({ number: row.number, changedFiles: row.files.length, files: row.files.map(path => ({ path })) }));
+        const projected = rows.slice(0, Number(args[args.indexOf('--limit') + 1])).map(row => ({ number: row.number, changedFiles: row.files.length, files: row.files.map(path => ({ path })) }));
         return { ok: true, out: JSON.stringify([...projected, projected[0]]) };
       }
-      return { ok: true, out: JSON.stringify(rows.map(row => ({ number: row.number, changedFiles: row.files.length, files: row.files.map(path => ({ path })) }))) };
+      return { ok: true, out: JSON.stringify(rows.slice(0, Number(args[args.indexOf('--limit') + 1])).map(row => ({ number: row.number, changedFiles: row.files.length, files: row.files.map(path => ({ path })) }))) };
     }
     if (args[0] === 'pr' && args[1] === 'diff') { counts.diff += 1; return { ok: true, out: patchFor(Number(args[2])) }; }
     const endpoint = args.find(arg => arg.startsWith('repos/')) ?? '';
@@ -498,7 +498,7 @@ const openThreeHundred = () => Array.from({ length: 300 }, (_, i) => {
   return pr(number, overlaps ? ['src/shared.ts', `src/own-${i}.ts`] : [`src/own-${i}.ts`], { head: { ref: `branch-${number}`, sha: `${number}`.padStart(40, 'c') } });
 });
 
-test('PR-CENSUS-PARALLEL 2: 300 open PRs · 5 real file overlaps → exactly 5 patches, one list call, 0 REST files, same verdict as sequential', () => {
+test('PR-CENSUS-PARALLEL 2: bounded file projection · REST fallback stays exhaustive and preserves overlap verdict', () => {
   const log = spyOn(debug, 'log').mockImplementation(() => {});
   try {
     const rows = openThreeHundred();
@@ -510,10 +510,16 @@ test('PR-CENSUS-PARALLEL 2: 300 open PRs · 5 real file overlaps → exactly 5 p
     expect(after).toEqual(before);
     expect(after.status).toBe('checked');
     if (after.status === 'checked') expect(after.prs.filter(row => row.hunks).map(row => row.number)).toEqual([1007, 1050, 1123, 1200, 1299]);
-    expect(parallel.counts).toEqual({ pulls: 1, list: 1, files: 0, diff: 5 });
-    expect(sequential.counts).toEqual({ pulls: 1, list: 1, files: 0, diff: 5 });
+    expect(parallel.counts).toEqual({ pulls: 1, list: 1, files: 200, diff: 5 });
+    expect(sequential.counts).toEqual({ pulls: 1, list: 1, files: 200, diff: 5 });
+    expect(seen.calls.map(batch => batch.length)).toEqual([200, 5]);
+    expect(seen.concurrency).toEqual([DEFAULT_FILE_CENSUS_CONCURRENCY, 6]);
+    expect(seen.calls[0]![0]!.args).toEqual(['api', '--paginate', 'repos/{owner}/{repo}/pulls/1100/files?per_page=100']);
     expect(log).toHaveBeenCalledWith('pr-tool.census', 'diff-scan', expect.objectContaining({
-      openPrs: 300, projected: 300, restFallback: 0, projectionFailed: false, fileOverlap: 5, patchFetched: 5, cacheHits: 0, concurrency: 6, status: 'checked' }));
+      openPrs: 300, projected: PR_FILE_PROJECTION_LIMIT, restFallback: 300 - PR_FILE_PROJECTION_LIMIT,
+      projectionLimit: PR_FILE_PROJECTION_LIMIT, projectionRows: PR_FILE_PROJECTION_LIMIT, projectionElapsedMs: expect.any(Number),
+      projectionFailed: false, fileOverlap: 5, patchFetched: 5, cacheHits: 0, concurrency: 6,
+      fileConcurrency: DEFAULT_FILE_CENSUS_CONCURRENCY, fileFallbackElapsedMs: expect.any(Number), status: 'checked' }));
   } finally { log.mockRestore(); }
 });
 
@@ -530,7 +536,7 @@ test('PR-CENSUS-PARALLEL 2: one-shot list fails → 300 REST file reads go throu
     expect(after).toEqual(before);
     expect(after).toEqual(reference);
     expect(parallel.counts).toEqual({ pulls: 1, list: 1, files: 300, diff: 5 });
-    expect(seen.concurrency).toEqual([6, 6]);
+    expect(seen.concurrency).toEqual([DEFAULT_FILE_CENSUS_CONCURRENCY, 6]);
     expect(seen.calls.map(batch => batch.length)).toEqual([300, 5]);
     expect(seen.calls[0]![0]!.args).toEqual(['api', '--paginate', 'repos/{owner}/{repo}/pulls/1000/files?per_page=100']);
     expect(log).toHaveBeenCalledWith('pr-tool.census', 'diff-scan', expect.objectContaining({
@@ -540,7 +546,7 @@ test('PR-CENSUS-PARALLEL 2: one-shot list fails → 300 REST file reads go throu
     log.mockClear();
     readOpenPrs(bigFixture(rows, { projection: 'garbage' }).run, { candidateFiles: ['src/shared.ts'], runParallel: reversedParallel(parallel.run, seen) });
     expect(log).toHaveBeenCalledWith('pr-tool.census', 'diff-scan', expect.objectContaining({ projectionFailed: true, projectionReason: expect.stringContaining('JSON 오류'), restFallback: 300 }));
-    for (const [projection, reason] of [['object', 'gh pr list 응답이 배열 아님'], ['unusable', 'gh pr list 300행 모두 사용 불가']] as const) {
+    for (const [projection, reason] of [['object', 'gh pr list 응답이 배열 아님'], ['unusable', `gh pr list ${PR_FILE_PROJECTION_LIMIT}행 모두 사용 불가`]] as const) {
       log.mockClear();
       const shaped = bigFixture(rows, { projection });
       expect(readOpenPrs(shaped.run, { candidateFiles: ['src/shared.ts'], runParallel: reversedParallel(shaped.run, seen) })).toEqual(reference);
@@ -549,7 +555,9 @@ test('PR-CENSUS-PARALLEL 2: one-shot list fails → 300 REST file reads go throu
     // A duplicated number counts once as skipped (the duplicate), never its first valid row.
     log.mockClear();
     readOpenPrs(bigFixture(rows, { projection: 'duplicate' }).run, { candidateFiles: ['src/shared.ts'] });
-    expect(log).toHaveBeenCalledWith('pr-tool.census', 'diff-scan', expect.objectContaining({ projectionFailed: false, projected: 300, projectionSkipped: 1, restFallback: 0 }));
+    expect(log).toHaveBeenCalledWith('pr-tool.census', 'diff-scan', expect.objectContaining({ projectionFailed: false,
+      projected: PR_FILE_PROJECTION_LIMIT, projectionSkipped: 1, restFallback: 300 - PR_FILE_PROJECTION_LIMIT,
+      projectionRows: PR_FILE_PROJECTION_LIMIT + 1 }));
   } finally { log.mockRestore(); }
 });
 

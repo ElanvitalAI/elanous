@@ -477,27 +477,9 @@ test('actual CLI child reads an item raised in an isolated state directory', () 
   });
   expect(result.status, result.stderr.slice(0, 500)).toBe(0);
   expect(JSON.parse(result.stdout.trim()).map((entry: { id: string }) => entry.id)).toContain(id);
-  const failedRaise = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'codex', '--title', 'Late question', '--category', 'scope', '--s', 'Draft.', '--c', 'Choice.', '--option', 'a=Accept:Proceed', '--option', 'b=Decline:Wait', '--skip-recommend', 'Unknown', '--pending-question', '근거: 질문 원장\n무엇이 바뀌나: 답 전달 시 재개\n기본값 시 결과: 보류 유지', '--resume-question', 'auq:lateq:abcde', '--json'], {
-    cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
-  });
-  expect(failedRaise.status, failedRaise.stderr.slice(0, 500)).toBe(0);
-  const lateId = JSON.parse(failedRaise.stdout.trim()).id;
-  const failedDecide = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'decide', lateId, 'b'], {
-    cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
-  });
-  // Recorded but not delivered: exit 3 with the failure and the retry command, never a silent success.
-  expect(failedDecide.status, failedDecide.stderr.slice(0, 500)).toBe(3);
-  expect(failedDecide.stdout).toContain(`elanous decisions retry-answer ${lateId}`);
-  expect(readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8')).toContain(`"type":"decided","id":"${lateId}"`);
-  writePendingQuestion(createPendingQuestion('auq:lateq:abcde', { questions: [{ id: 'late_choice', header: 'Scope', question: 'Choose.', options: [
-    { label: 'Accept', description: 'Proceed' }, { label: 'Decline', description: 'Wait' },
-  ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
-  const retried = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'retry-answer', lateId, '--json'], {
-    cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
-  });
-  expect(retried.status, retried.stderr.slice(0, 500)).toBe(0);
-  expect(JSON.parse(retried.stdout.trim()).choice).toBe('b');
-  expect(JSON.parse(readFileSync(join(stateDir, 'ask-user-question', 'answers', `${encodeURIComponent('auq:lateq:abcde')}.json`), 'utf8')).result.answers).toEqual({ late_choice: 'b) Decline' });
+  // 전달 실패(exit 3 · retry-answer 안내)·재전달 판정은 같은 등록 명령을 in-process 로 도는
+  // «CLI reports durable decision with failed delivery…»·«CLI decide with no pending question…» 가 잠근다.
+  // 실 자식 프로세스는 «격리 상태 디렉터리를 진입점이 읽는가» 하나만 본다(TEST-AUDIT-1105 · 자식 6 → 3).
 }, 500000);
 
 test('actual CLI list JSON over a slow pipe matches redirected bytes beyond 64 KiB', () => {

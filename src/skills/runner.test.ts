@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
@@ -27,6 +28,8 @@ const TOOL_OUTPUT = body(4);
 let streamFailure: Error | null = null;
 let streamWaitForAbort = false;
 let observedStreamSignal: AbortSignal | undefined;
+let mermaidDispatchCount = 0;
+let mermaidDispatchResult: unknown;
 let streamToolCall: { name: string; args: Record<string, unknown> } = {
   name: 'Read', args: { file_path: '/tmp/demo.txt' },
 };
@@ -58,14 +61,24 @@ const skillRunnerSpies = [
     const call = { id: 'call-1', ...streamToolCall };
     handlers.onToolCall?.(call);
     const result = call.name === 'MermaidRender'
-      ? await handlers.dispatchTool(call.name, call.args, { callId: call.id })
+      ? await handlers.dispatchTool(call.name, call.args, { callId: call.id }).then((toolResult) => {
+        mermaidDispatchCount += 1;
+        mermaidDispatchResult = toolResult;
+        return toolResult;
+      })
       : TOOL_OUTPUT;
     handlers.onToolResult?.({ id: call.id, name: call.name, result });
     return 'ok';
   }),
 ];
 
-const { executeSkill, skillFoldRenderOpts } = await import('./runner.js');
+const {
+  executeSkill,
+  skillFoldRenderOpts,
+  parseSkillMd,
+  tierMeetsMin,
+  listSkillNames,
+} = await import('./runner.js');
 
 // Every executeSkill run now appends to <state>/skills/feedback.jsonl — keep this
 // whole file on a throwaway state root (SK1 tests below nest their own).
@@ -86,10 +99,11 @@ const demoManifest: SkillManifest = {
   skillDir: '/tmp/demo-fold-skill',
 };
 
-async function runExecuteSkill(foldMode?: FoldMode) {
+async function runExecuteSkill(foldMode?: FoldMode, extraOpts: Partial<ExecuteSkillOpts> = {}) {
   const folds: Array<{ entry: LogEntry; renderOpts: RenderOpts }> = [];
   let display = '';
   const opts: ExecuteSkillOpts = {
+    ...extraOpts,
     onFoldableEntry: (entry, renderOpts) => {
       folds.push({ entry, renderOpts });
     },
@@ -188,15 +202,19 @@ describe('executeSkill final response', () => {
   }, 20_000);
 });
 
-describe('DIAG-LITE: existing mock stage dispatches MermaidRender once and returns a real render with zero Python calls', () => {
-  test('dispatches through runner.ts dispatchHostTool without invoking the fake Python binary', async () => {
+describe('DIAG-LITE: production runner executes MermaidRender with zero Python calls', () => {
+  test('dispatches through executeSkill and the production MermaidRender handler', async () => {
     const fakeBin = mkdtempSync(join(tmpdir(), 'mermaid-render-fake-bin-'));
     const pythonCallLog = join(fakeBin, 'python-calls.log');
-    const fakePython = join(fakeBin, 'python3');
     const previousPath = process.env.PATH;
-    writeFileSync(fakePython, `#!/bin/sh\nprintf 'called\\n' >> ${JSON.stringify(pythonCallLog)}\n`);
-    chmodSync(fakePython, 0o755);
+    for (const command of ['python3', 'python', 'uv']) {
+      const shimPath = join(fakeBin, command);
+      writeFileSync(shimPath, `#!/bin/sh\nprintf 'called\\n' >> ${JSON.stringify(pythonCallLog)}\nexit 97\n`);
+      chmodSync(shimPath, 0o755);
+    }
     process.env.PATH = `${fakeBin}:${previousPath ?? ''}`;
+    mermaidDispatchCount = 0;
+    mermaidDispatchResult = undefined;
     streamToolCall = {
       name: 'MermaidRender',
       args: { source: 'flowchart LR\n  A[Start] --> B[End]', format: 'ascii' },
@@ -207,17 +225,83 @@ describe('DIAG-LITE: existing mock stage dispatches MermaidRender once and retur
 
       expect(result.finalResponse).toBe('ok');
       expect(result.fullResponse).toBe(display);
+      expect(mermaidDispatchCount).toBe(1);
       expect(display).toContain('MermaidRender');
-      expect(display).toContain('Start');
-      expect(display).toContain('End');
+      const assertRenderedAsciiDiagram = (output: unknown): void => {
+        expect(typeof output).toBe('string');
+        const rendered = String(output);
+        expect(rendered).toContain('+-----+');
+        expect(rendered).toContain('|Start|');
+        expect(rendered).toContain('|End|');
+        expect(rendered).toContain('------->');
+      };
+      assertRenderedAsciiDiagram(mermaidDispatchResult);
+      streamToolCall = {
+        name: 'MermaidRender',
+        args: { source: 'flowchart LR\n  A[Start] --> B[End]', format: 'ascii' },
+      };
+      await expect(runExecuteSkill(undefined, {
+        mermaidRenderer: () => { throw new Error('forced renderer failure'); },
+      })).rejects.toThrow('mermaid render failed: forced renderer failure');
       expect(existsSync(pythonCallLog)).toBe(false);
+
+      // A malformed diagram is surfaced by the production renderer as an error, never a successful render.
+      mermaidDispatchCount = 0;
+      mermaidDispatchResult = undefined;
+      streamToolCall = { name: 'MermaidRender', args: { source: 'not a diagram', format: 'ascii' } };
+      await runExecuteSkill();
+      expect(mermaidDispatchCount).toBe(1);
+      expect(String(mermaidDispatchResult)).toStartWith('Error:');
+      expect(String(mermaidDispatchResult)).not.toContain('+-----+');
     } finally {
       streamToolCall = { name: 'Read', args: { file_path: '/tmp/demo.txt' } };
+      mermaidDispatchCount = 0;
+      mermaidDispatchResult = undefined;
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
       rmSync(fakeBin, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+const DIAG_LITE_REPO_ROOT = join(import.meta.dir, '..', '..');
+const DIAG_LITE_SKILLS_DIR = join(DIAG_LITE_REPO_ROOT, 'skills');
+
+describe('DIAG-LITE: diagram-master 계약은 실제 runner 함수로 고정한다', () => {
+  test('parseSkillMd reads the shipped SKILL.md frontmatter contract', () => {
+    expect(listSkillNames(DIAG_LITE_SKILLS_DIR)).toContain('diagram-master');
+    const manifest = parseSkillMd('diagram-master', DIAG_LITE_SKILLS_DIR);
+    expect(manifest).not.toBeNull();
+    expect(manifest!.name).toBe('diagram-master');
+    expect(manifest!.minTier).toBe('T2');
+    expect(manifest!.category).toBe('visual');
+    expect(manifest!.composes).toEqual(['show-image']);
+    expect(manifest!.description).toContain('Mermaid');
+    expect(manifest!.content).toContain('MermaidRender');
+    expect(manifest!.content).toContain('선택 애드온');
+    expect(manifest!.skillDir.endsWith(join('skills', 'diagram-master'))).toBe(true);
+  });
+
+  test('tierMeetsMin keeps the shipped T2 threshold behavior', () => {
+    expect(tierMeetsMin('T2', 'T2')).toBe(true);
+    expect(tierMeetsMin('T1', 'T2')).toBe(true);
+    expect(tierMeetsMin('T3', 'T2')).toBe(false);
+    expect(tierMeetsMin('T2', undefined)).toBe(true);
+  });
+
+  // UNMEASURED where npm is absent (the release gate Pod image ships bun only) — skipped, not counted as a pass.
+  test.skipIf(!Bun.which('npm'))('the npm package includes diagram PNG examples and excludes the optional venv', () => {
+    const output = execFileSync('npm', ['pack', '--dry-run', '--ignore-scripts', '--json'], {
+      cwd: DIAG_LITE_REPO_ROOT,
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    const packageInfo = (JSON.parse(output) as Array<{ files: Array<{ path: string }> }>)[0]!;
+    const paths = new Set(packageInfo.files.map((file) => file.path));
+    expect(paths.has('skills/diagram-master/references/examples/ref_grid_architecture.png')).toBe(true);
+    expect(paths.has('skills/diagram-master/references/examples/ref_layered_flow.png')).toBe(true);
+    expect([...paths].some((path) => path.includes('skills/diagram-master/references/.venv/'))).toBe(false);
+  }, 60_000); // npm pack --dry-run takes >5s on Linux gate Pods (0.3.5 cut)
 });
 
 type LedgerLine = { skill: string; outcome: string; failureKind?: string; runId: string };

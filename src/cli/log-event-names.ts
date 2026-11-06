@@ -1485,6 +1485,7 @@ export const KNOWN_LOG_EVENT_NAMES: ReadonlySet<string> = new Set([
   "tool-catalog-assembled",
   "tool-cwd-mismatch",
   "tool-dispatch-context",
+  "tool-error-repeat-blocked",
   "tool-filter",
   "tool-gate-evaluated",
   "tool-heartbeat",

@@ -531,7 +531,7 @@ describe('runGoalAuthorCli goal type', () => {
   });
 
   test('preserves omitted adversarial review and forwards explicit CLI selections and source to the shared decomposition seam', async () => {
-    const received: Array<{ adversarialReview?: boolean; adversarialReviewSource?: 'cli' | 'default' | 'unknown'; recentStepCounts?: readonly number[] }> = [];
+    const received: Array<{ repositoryRoot?: string; adversarialReview?: boolean; adversarialReviewSource?: 'cli' | 'default' | 'unknown'; recentStepCounts?: readonly number[] }> = [];
     const createDecomposeSteps: NonNullable<GoalAuthorCliDeps['createDecomposeSteps']> = (_signal, config = {}) => {
       received.push(config);
       return async () => [];

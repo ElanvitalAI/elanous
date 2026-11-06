@@ -27,7 +27,7 @@ import { isTerminalStatus } from '../../task-orchestrator/types.js';
 import type { MissionArc } from '../../task-orchestrator/mission.js';
 import { resolveArcs, arcForPhase } from '../../autopilot/mission-arc.js';
 import { latestBuildForPhase } from '../../autopilot/se-build-registry.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 
 interface TaskBoardCard {

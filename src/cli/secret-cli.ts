@@ -1,8 +1,14 @@
 import type { Command } from 'commander';
+import { existsSync, readFileSync, linkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
+import { chmodSync, mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import {
   currentBackendId,
   deleteSecretAsync,
   getSecretAsync,
+  importSecretBatchAsync,
   listSecretIdsAsync,
   selectBackendFromConfig,
   setSecretAsync,
@@ -10,6 +16,9 @@ import {
 import { SERVICE_KEY_CATALOG } from '../setup/service-key-catalog.js';
 import { verifyServiceKey, type ServiceKeyVerification } from '../setup/service-keys.js';
 import { createSecretPrompt } from '../onboarding/secret-prompt.js';
+import { decryptSecretBundle, encryptSecretBundle } from '../nexus/config/secrets/transfer.js';
+import { SECRETS_VERSION } from '../nexus/config/types.js';
+import { parseSecretEnvFile, renderSecretEnvExports } from '../nexus/config/secrets/env-import.js';
 
 export interface SecretCliDeps {
   isInteractive?: () => boolean;
@@ -23,6 +32,11 @@ export interface SecretCliDeps {
   initializeBackend?: () => void;
   output?: { log: (line: string) => void; error: (line: string) => void };
   setExitCode?: (code: number) => void;
+  readBundleFile?: (path: string) => Promise<string>;
+  readEnvFile?: (path: string) => Promise<string>;
+  writeBundleFile?: (path: string, contents: string) => Promise<void>;
+  syncBundle?: (host: string, contents: string) => Promise<void>;
+  importSecrets?: (secrets: Readonly<Record<string, string>>, overwrite: boolean, expectedConflicts?: readonly string[]) => Promise<{ imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean }>;
 }
 
 const SECRET_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -35,6 +49,48 @@ function redactParserErrors(command: Command): void {
   const originalError = command.error.bind(command);
   command.error = (_message, errorOptions) => originalError('secret command failed', errorOptions);
 }
+
+export function runProcess(command: string, args: string[], input?: string, stdio: 'inherit' | 'ignore' = 'ignore'): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: [input === undefined ? stdio : 'pipe', stdio, stdio] });
+    child.once('error', () => reject(new Error('credential transfer process failed')));
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error('credential transfer process failed')));
+    if (input !== undefined) {
+      if (!child.stdin) reject(new Error('credential transfer process failed'));
+      else {
+        child.stdin.once('error', () => reject(new Error('credential transfer process failed')));
+        child.stdin.end(input);
+      }
+    }
+  });
+}
+
+export async function syncEncryptedBundleOverSsh(
+  host: string,
+  contents: string,
+  run: typeof runProcess = runProcess,
+): Promise<void> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._@-]{0,253}$/.test(host)) throw new Error('invalid SSH host');
+  const remotePath = `/tmp/elanous-secret-${randomUUID()}.bundle`;
+  let uploadAttempted = false;
+  let operationFailed = false;
+  try {
+    uploadAttempted = true;
+    const remoteWrite = `umask 077; (set -C; : > '${remotePath}') && chmod 600 '${remotePath}' && cat > '${remotePath}' && if stat -f %Lp '${remotePath}' >/dev/null 2>&1; then mode=$(stat -f %Lp '${remotePath}'); else mode=$(stat -c %a '${remotePath}'); fi && test "$mode" = 600`;
+    await run('ssh', [host, remoteWrite], contents);
+    await run('ssh', ['-tt', host, 'eln', 'secret', 'import', remotePath], undefined, 'inherit');
+  } catch {
+    operationFailed = true;
+  } finally {
+    if (uploadAttempted) {
+      try { await run('ssh', [host, 'rm', '--', remotePath]); }
+      catch { throw new Error(`ELANOUS_SECRET_SYNC_CLEANUP: encrypted transfer file may remain at ${host}:${remotePath}`); }
+    }
+  }
+  if (operationFailed) throw new Error('credential transfer process failed');
+}
+
+const defaultSyncBundle = syncEncryptedBundleOverSsh;
 
 function resolveDeps(deps: SecretCliDeps) {
   return {
@@ -49,11 +105,34 @@ function resolveDeps(deps: SecretCliDeps) {
     initializeBackend: deps.initializeBackend ?? (() => { selectBackendFromConfig(); }),
     output: deps.output ?? console,
     setExitCode: deps.setExitCode ?? ((code: number) => { process.exitCode = code; }),
+    readBundleFile: deps.readBundleFile ?? (async (path) => readFileSync(path, 'utf8')),
+    readEnvFile: deps.readEnvFile ?? (async (path) => readFileSync(path, 'utf8')),
+    writeBundleFile: deps.writeBundleFile ?? (async (path, contents) => {
+      mkdirSync(dirname(path), { recursive: true });
+      const temp = `${path}.${randomUUID()}.tmp`;
+      try {
+        writeFileSync(temp, contents, { mode: 0o600, flag: 'wx' });
+        chmodSync(temp, 0o600);
+        // Never silently replace an existing encrypted transfer artifact.
+        if (existsSync(path)) throw new Error('destination exists');
+        linkSync(temp, path);
+      } finally {
+        if (existsSync(temp)) unlinkSync(temp);
+      }
+    }),
+    syncBundle: deps.syncBundle ?? defaultSyncBundle,
+    importSecrets: deps.importSecrets ?? importSecretBatchAsync,
   };
 }
 
 export function registerSecretCommands(program: Command, deps: SecretCliDeps = {}): Command {
   const cli = resolveDeps(deps);
+  const exportableSecretIds = new Set(SERVICE_KEY_CATALOG
+    .filter((entry) => entry.kind === 'api-key')
+    .flatMap((entry) => [entry.id, ...entry.envNames, ...(entry.storeIds ?? [])]));
+  const importableEnvNames = new Set(SERVICE_KEY_CATALOG
+    .filter((entry) => entry.kind === 'api-key')
+    .flatMap((entry) => entry.envNames));
   const secret = program.command('secret').description('Store and manage API keys without displaying their values.');
   // Commander shares output configuration across parent/child commands. Override
   // error handling on this command tree instead so sibling commands keep theirs.
@@ -167,6 +246,220 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
       }
     });
 
-  for (const command of [setCommand, listCommand, removeCommand, testCommand]) redactParserErrors(command);
+  const exportCommand = secret.command('export')
+    .description('Write an encrypted secret bundle; the passphrase is entered without echo.')
+    .requiredOption('--to <file>', 'Destination file (must not already exist)')
+    .allowExcessArguments(false)
+    .action(async (options: { to: string }) => {
+      if (!cli.isInteractive()) {
+        cli.output.error('secret export requires an interactive terminal');
+        cli.setExitCode(1);
+        return;
+      }
+      try {
+        cli.initializeBackend();
+        const first = await cli.promptSecret('Bundle passphrase (12+ characters): ');
+        const second = await cli.promptSecret('Repeat bundle passphrase: ');
+        if (first === undefined || second === undefined || first !== second || first.length < 12) {
+          cli.output.error('bundle passphrase was not accepted');
+          cli.setExitCode(1);
+          return;
+        }
+        const secrets: Record<string, string> = {};
+        for (const id of await cli.listSecrets()) {
+          // Unknown names and non-key catalog entries fail closed; auth stores are never exported.
+          if (!exportableSecretIds.has(id)) continue;
+          const value = await cli.getSecret(id);
+          if (value !== undefined) secrets[id] = value;
+        }
+        const contents = await encryptSecretBundle({ version: SECRETS_VERSION, secrets }, first);
+        await cli.writeBundleFile(options.to, contents);
+        cli.output.log(`exported ${Object.keys(secrets).length} secrets · encrypted · non-catalog names and rotating login credentials excluded; sign in on destination`);
+        cli.setExitCode(0);
+      } catch {
+        cli.output.error('secret export failed');
+        cli.setExitCode(1);
+      }
+    });
+
+  const importCommand = secret.command('import <file>')
+    .description('Import an encrypted secret bundle; existing names require explicit confirmation.')
+    .option('--overwrite', 'Allow replacing names already in the secret store after confirmation')
+    .allowExcessArguments(false)
+    .action(async (file: string, options: { overwrite?: boolean }) => {
+      if (!cli.isInteractive()) {
+        cli.output.error('secret import requires an interactive terminal');
+        cli.setExitCode(1);
+        return;
+      }
+      try {
+        cli.initializeBackend();
+        const passphrase = await cli.promptSecret('Bundle passphrase: ');
+        if (passphrase === undefined) {
+          cli.output.error('secret import cancelled');
+          cli.setExitCode(1);
+          return;
+        }
+        const bundle = await decryptSecretBundle(await cli.readBundleFile(file), passphrase);
+        const unsupportedIds = Object.keys(bundle.secrets).filter((id) => !exportableSecretIds.has(id));
+        if (unsupportedIds.length) {
+          cli.output.error(`bundle contains unsupported secret names: ${unsupportedIds.join(', ')}`);
+          cli.setExitCode(1);
+          return;
+        }
+        const firstImport = await cli.importSecrets(bundle.secrets, false);
+        const collisions = firstImport.conflicts;
+        if (collisions.length && !options.overwrite) {
+          cli.output.error(`name conflicts: ${collisions.join(', ')} · rerun with --overwrite to confirm`);
+          cli.setExitCode(1);
+          return;
+        }
+        if (collisions.length) {
+          cli.output.log(`replace names: ${collisions.join(', ')}`);
+          const confirmation = await cli.promptSecret(`Type exactly: REPLACE ${collisions.join(',')}`);
+          if (confirmation !== `REPLACE ${collisions.join(',')}`) {
+            cli.output.error('secret import cancelled');
+            cli.setExitCode(1);
+            return;
+          }
+        }
+        const result = collisions.length
+          ? await cli.importSecrets(bundle.secrets, true, collisions)
+          : firstImport;
+        if (!result.imported) {
+          cli.output.error(result.changedSinceConfirmation ? 'secret names changed during import confirmation' : 'secret import was not applied');
+          cli.setExitCode(1);
+          return;
+        }
+        cli.output.log(`imported ${Object.keys(bundle.secrets).length} secrets · values hidden`);
+        cli.setExitCode(0);
+      } catch (error) {
+        cli.output.error(error instanceof Error && error.message === 'ELANOUS_IMPORT_BACKEND_UNSUPPORTED'
+          ? 'atomic secret import currently requires the file backend'
+          : 'secret import failed');
+        cli.setExitCode(1);
+      }
+    });
+
+  const syncCommand = secret.command('sync <host>')
+    .description('Send an encrypted bundle over SSH; the destination prompts for its passphrase.')
+    .allowExcessArguments(false)
+    .action(async (host: string) => {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._@-]{0,253}$/.test(host)) {
+        cli.output.error('invalid SSH host');
+        cli.setExitCode(1);
+        return;
+      }
+      if (!cli.isInteractive()) {
+        cli.output.error('secret sync requires an interactive terminal');
+        cli.setExitCode(1);
+        return;
+      }
+      try {
+        cli.initializeBackend();
+        const first = await cli.promptSecret('Bundle passphrase (12+ characters): ');
+        const second = await cli.promptSecret('Repeat bundle passphrase: ');
+        if (first === undefined || second === undefined || first !== second || first.length < 12) {
+          cli.output.error('bundle passphrase was not accepted');
+          cli.setExitCode(1);
+          return;
+        }
+        const secrets: Record<string, string> = {};
+        for (const id of await cli.listSecrets()) {
+          if (!exportableSecretIds.has(id)) continue;
+          const value = await cli.getSecret(id);
+          if (value !== undefined) secrets[id] = value;
+        }
+        const contents = await encryptSecretBundle({ version: SECRETS_VERSION, secrets }, first);
+        await cli.syncBundle(host, contents);
+        cli.output.log(`synced ${Object.keys(secrets).length} secrets · encrypted · non-catalog names and rotating login credentials excluded; destination import confirmed`);
+        cli.setExitCode(0);
+      } catch (error) {
+        cli.output.error(error instanceof Error && error.message.startsWith('ELANOUS_SECRET_SYNC_CLEANUP:')
+          ? error.message.slice('ELANOUS_SECRET_SYNC_CLEANUP: '.length)
+          : 'secret sync failed');
+        cli.setExitCode(1);
+      }
+    });
+
+  const importEnvCommand = secret.command('import-env <file>')
+    .description('Absorb literal export KEY=value lines into the secret store without displaying values.')
+    .option('--overwrite', 'Allow replacing names already in the secret store after confirmation')
+    .allowExcessArguments(false)
+    .action(async (file: string, options: { overwrite?: boolean }) => {
+      if (!cli.isInteractive()) {
+        cli.output.error('secret import-env requires an interactive terminal');
+        cli.setExitCode(1);
+        return;
+      }
+      try {
+        cli.initializeBackend();
+        const secrets = parseSecretEnvFile(await cli.readEnvFile(file));
+        if (!Object.keys(secrets).length) {
+          cli.output.error('environment file contains no secret assignments');
+          cli.setExitCode(1);
+          return;
+        }
+        const unsupported = Object.keys(secrets).filter((name) => !importableEnvNames.has(name));
+        if (unsupported.length) {
+          cli.output.error(`unsupported environment variable names: ${unsupported.join(', ')}`);
+          cli.setExitCode(1);
+          return;
+        }
+        const firstImport = await cli.importSecrets(secrets, false);
+        const collisions = firstImport.conflicts;
+        if (collisions.length && !options.overwrite) {
+          cli.output.error(`name conflicts: ${collisions.join(', ')} · rerun with --overwrite to confirm`);
+          cli.setExitCode(1);
+          return;
+        }
+        if (collisions.length) {
+          cli.output.log(`replace names: ${collisions.join(', ')}`);
+          const exact = `REPLACE ${collisions.join(',')}`;
+          if (await cli.promptSecret(`Type exactly: ${exact}`) !== exact) {
+            cli.output.error('secret import-env cancelled');
+            cli.setExitCode(1);
+            return;
+          }
+        }
+        const result = collisions.length ? await cli.importSecrets(secrets, true, collisions) : firstImport;
+        if (!result.imported) {
+          cli.output.error(result.changedSinceConfirmation ? 'secret names changed during import confirmation' : 'secret import-env was not applied');
+          cli.setExitCode(1);
+          return;
+        }
+        cli.output.log(`absorbed ${Object.keys(secrets).length} environment names · values hidden · back up then empty the plaintext file`);
+        cli.setExitCode(0);
+      } catch {
+        cli.output.error('secret import-env failed');
+        cli.setExitCode(1);
+      }
+    });
+
+  const envCommand = secret.command('env')
+    .description('Print shell-quoted exports for the requested stored environment names only.')
+    .requiredOption('--names <names>', 'Comma-separated environment variable names')
+    .allowExcessArguments(false)
+    .action(async (options: { names: string }) => {
+      try {
+        cli.initializeBackend();
+        const names = options.names.split(',');
+        const secrets: Record<string, string> = {};
+        for (const name of names) {
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error('invalid environment variable name');
+          const value = await cli.getSecret(name);
+          if (value !== undefined) secrets[name] = value;
+        }
+        cli.output.log(renderSecretEnvExports(secrets, names).trimEnd());
+        cli.setExitCode(0);
+      } catch (error) {
+        cli.output.error(error instanceof Error && /^(missing secrets:|invalid environment variable name|duplicate environment variable name|at least one environment variable name)/.test(error.message)
+          ? error.message
+          : 'secret env failed');
+        cli.setExitCode(1);
+      }
+    });
+
+  for (const command of [setCommand, listCommand, removeCommand, testCommand, exportCommand, importCommand, syncCommand, importEnvCommand, envCommand]) redactParserErrors(command);
   return secret;
 }

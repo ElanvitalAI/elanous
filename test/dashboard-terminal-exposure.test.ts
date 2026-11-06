@@ -5,7 +5,6 @@ import {
   classifyModalTerminalExposure,
   classifyTerminalSessionExposure,
   classifyVwTerminalExposure,
-  resolveTerminalInteractionPolicy,
 } from '../src/dashboard/terminal-exposure.js';
 
 describe('terminal exposure classifier', () => {
@@ -50,56 +49,6 @@ describe('terminal exposure classifier', () => {
       agentInteractive: true,
     });
   });
-
-  test('interaction policy maps user-interactive to full keyboard and mouse participation', () => {
-    expect(resolveTerminalInteractionPolicy({
-      userExposure: 'user-interactive',
-      agentInteractive: true,
-    })).toEqual({
-      keyboardParticipation: 'full',
-      mouseTransport: 'full',
-      hostMouseIntentVisible: true,
-      hostInspectable: true,
-      agentWriteAllowed: true,
-    });
-  });
-
-  test('interaction policy maps observe-only to interrupt-only keyboard and discrete mouse transport', () => {
-    expect(resolveTerminalInteractionPolicy({
-      userExposure: 'observe-only',
-      agentInteractive: true,
-    })).toEqual({
-      keyboardParticipation: 'interrupt-only',
-      mouseTransport: 'discrete-only',
-      hostMouseIntentVisible: true,
-      hostInspectable: true,
-      agentWriteAllowed: true,
-    });
-  });
-
-  test('interaction policy maps hidden to inspectable but non-user-interactive posture', () => {
-    expect(resolveTerminalInteractionPolicy({
-      userExposure: 'hidden',
-      agentInteractive: true,
-    })).toEqual({
-      keyboardParticipation: 'none',
-      mouseTransport: 'none',
-      hostMouseIntentVisible: false,
-      hostInspectable: true,
-      agentWriteAllowed: true,
-    });
-  });
-
-  test('interaction policy maps unavailable to fully non-interactive posture', () => {
-    expect(resolveTerminalInteractionPolicy({
-      userExposure: 'unavailable',
-      agentInteractive: false,
-    })).toEqual({
-      keyboardParticipation: 'none',
-      mouseTransport: 'none',
-      hostMouseIntentVisible: false,
-      hostInspectable: false,
-      agentWriteAllowed: false,
-    });
-  });
+  // 상호작용 정책 표(resolveTerminalInteractionPolicy)는 src/terminal/tui-policy.ts 소유 —
+  // dashboard 는 재수출만 한다. 그 4×5 표는 test/terminal/tui-policy.test.ts 가 잠근다.
 });

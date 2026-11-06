@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
-import { tracedPathReferences, verbatimOriginalAsk } from './goal-author.js';
+import { tracedPathReferences, verbatimOriginalAsk } from './goal-author-text.js';
 import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
 import { isRunStatus } from './run-status-mapping.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';

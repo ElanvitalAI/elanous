@@ -16,7 +16,7 @@
 //   before rendering the edit form. Subsequent calls with the same
 //   token are rejected (single-use).
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   signEditInPwaToken,
   verifyEditInPwaToken,

@@ -11,7 +11,12 @@
 // file doesn't re-encode. Cache lives for the lifetime of the process.
 
 import { readFile, stat } from 'fs/promises';
-import sharp from 'sharp';
+// IMPORT-DIET-LAZY-SDK (2026-11-05): sharp(네이티브)는 이미지를 실제로 줄일 때만 싣는다.
+let sharpModule: Promise<typeof import('sharp')> | null = null;
+function loadSharp(): Promise<typeof import('sharp')> {
+  sharpModule ??= import('sharp').then((m) => m.default);
+  return sharpModule;
+}
 
 export const IMAGE_MAX_WIDTH = 1568;
 export const IMAGE_MAX_HEIGHT = 1568;
@@ -100,6 +105,7 @@ export async function resizeImage(
   buf: Buffer,
   hintedMediaType?: ImageMediaType,
 ): Promise<ResizeResult> {
+  const sharp = await loadSharp();
   const image = sharp(buf);
   const metadata = await image.metadata();
   const mediaType = mediaTypeFromFormat(

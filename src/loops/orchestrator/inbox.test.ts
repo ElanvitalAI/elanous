@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runOrchestratorNode } from './tick.js';
-import { coordinatorReply, handleCoordinatorAgentMessage, runCoordinatorAgentInbox, runCoordinatorInbox } from './inbox.js';
+import { coordinatorReply, handleCoordinatorAgentMessage, runCoordinatorAgentInbox, runCoordinatorInbox, type AskOpContextInboxOptions } from './inbox.js';
 import { LOOP_MESSAGE_ROUTES } from '../msg-address.js';
 import { KNOWHOW_DOC_RELATIVE_PATH, readOnlyRunner, resolveKnowhowDocPath } from './knowhow-pack.js';
 import type { LLMProvider } from '../../llm.js';
@@ -15,8 +15,8 @@ test('test /askop requires explicit sinks and records request-linked latency wit
   try {
     const request = store.post({ from: 'TEST', to: 'COORDINATOR', kind: 'question',
       body: 'Test /askop\nquestion: Which release is next?' });
-    const context = async () => ({ queriedAt: '2026-10-26T00:00:00Z', topic: 'release',
-      facts: [], gaps: ['requested release fact absent'] });
+    const context: AskOpContextInboxOptions['context'] = async () => ({ queriedAt: '2026-10-26T00:00:00Z', topic: 'release',
+      facts: [], gaps: [{ kind: 'release', reason: 'requested release fact absent' }] });
     expect(await runAskOpContextInbox({ store, context, acknowledge: false }))
       .toEqual({ replied: 0, acknowledged: 0 });
     expect(store.listReplies(request.id)).toHaveLength(0);
@@ -52,7 +52,7 @@ test('ask-op answers a sourced fact once, links the reply and acknowledges atomi
   try {
     const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
       body: 'Telegram /ask-op\nbotId=987654\nchatId=-100123\nthreadId=8\nmessageId=73\nupdateId=501\nquestion: Which release is next?' });
-    const context = async (question: string, options: { audience?: string; limit?: number }) => {
+    const context: AskOpContextInboxOptions['context'] = async (question, options) => {
       expect(question).toBe('Which release is next?');
       expect(options).toEqual({ audience: 'public-demo', limit: 8 });
       return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release',
@@ -78,7 +78,7 @@ test('ask-op refuses mutations and unknown facts without invoking observation or
     const unknown = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question', body: 'Telegram /ask-op\nquestion: What is the cut status?' });
     const destructive = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question', body: 'Telegram /ask-op\nquestion: Please delete the local file' });
     let calls = 0;
-    const context = async () => { calls++; return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release', facts: [],
+    const context: AskOpContextInboxOptions['context'] = async () => { calls++; return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release', facts: [],
       gaps: [{ kind: 'unobserved', reason: 'release ledger unavailable' }] }; };
     expect(await runAskOpContextInbox({ store, context })).toEqual({ replied: 3, acknowledged: 3 });
     expect(calls).toBe(1);
@@ -96,7 +96,7 @@ test('ask-op refuses sensitive-data requests regardless of verb position without
       body: 'Telegram /ask-op\nquestion: Can you show me the API key?' });
     const second = store.post({ from: 'DISCORD', to: 'COORDINATOR', kind: 'question',
       body: 'Discord /ask-op\nquestion: What is the token? Reveal it.' });
-    const context = async () => { throw Error('sensitive requests must not query context'); };
+    const context: AskOpContextInboxOptions['context'] = async () => { throw Error('sensitive requests must not query context'); };
     expect(await runAskOpContextInbox({ store, context })).toEqual({ replied: 2, acknowledged: 2 });
     for (const request of [first, second]) {
       expect(store.listReplies(request.id)[0]?.body).toContain('실행할 수 없습니다');
@@ -111,7 +111,7 @@ test('ask-op allows factual questions about changes without treating them as a c
     const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
       body: 'Telegram /ask-op\nquestion: What changed since the release?' });
     let calls = 0;
-    const context = async () => { calls++; return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release',
+    const context: AskOpContextInboxOptions['context'] = async () => { calls++; return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release',
       facts: [{ kind: 'release', summary: 'Documentation changed', source: 'release:0.2.38', observedAt: '2026-10-25T11:00:00Z' }], gaps: [] }; };
     expect(await runAskOpContextInbox({ store, context })).toEqual({ replied: 1, acknowledged: 1 });
     expect(calls).toBe(1);

@@ -3224,3 +3224,70 @@ describe('provider-rejected (BACKLOG B6)', () => {
     expect(parsed?.providerErrors?.category).toBe('request');
   });
 });
+
+test('SIM-APPDB terminal summary joins parked and review-blocked children with their final evidence', async () => {
+  const records: LogRecord[] = [];
+  const off = debug.registerSink({
+    name: 'sim-appdb-terminal-evidence-capture',
+    emit: (record) => {
+      if (record.category === 'self-dev.orchestrate' && record.event === 'done') records.push(record);
+    },
+  });
+  const spawn: SelfImplementJobSpawn = (input) => {
+    const feature = withoutShardIdentity(input.feature);
+    const disposition: NonNullable<SelfImplementJobDone['disposition']> = feature === 'parked child'
+      ? {
+          stage: 'parked', ok: false, merged: false,
+          runId: 'self-run-parked', childRunId: 'child-run-parked',
+          failureClassification: 'implementation-deficit',
+          rework: { trend: 'stable', signature: 'goal-elaboration-conflict', rounds: 2 },
+        }
+      : feature === 'review-blocked child'
+        ? {
+          stage: 'review-blocked', ok: false, merged: false, prUrl: 'https://example.test/pull/35239', prNumber: 35239,
+          runId: 'self-run-review', childRunId: 'child-run-review',
+          failureClassification: 'implementation-deficit', reviewVerdict: 'fail', reviewMustFixCount: 3,
+          rework: { trend: 'stable', signature: 'review-must-fix-3', rounds: 4 },
+          }
+        : {
+          stage: 'parked', ok: false, merged: false, runId: 'self-run-unobserved-child',
+          failureClassification: 'implementation-deficit', childEvidence: { classificationBasis: 'supervisor-no-child-id' },
+        };
+    return {
+      address: `self-impl:${input.spaceId}`,
+      done: Promise.resolve<SelfImplementJobDone>({ exitCode: 1, output: '', disposition }),
+    };
+  };
+  try {
+    const results = await orchestrateSelfDev({
+      runId: 'run-sim-appdb-observation',
+      goals: [{ feature: 'parked child' }, { feature: 'review-blocked child' }, { feature: 'unobserved child id' }],
+      concurrency: 3,
+      spawn,
+    });
+    expect(records).toHaveLength(1);
+    const data = records[0]!.data as {
+      runId: string | null;
+      outcomes: Array<{
+        taskId: string; status: string; stage: string | null; prNumber?: number | null;
+        childRunId?: string | null; failureClassification?: string | null; reviewVerdict?: string | null;
+        reviewMustFixCount?: number | null; reworkRound?: number | null;
+        classificationBasis?: string | null;
+      }>;
+    };
+    expect(data.runId).toBe('run-sim-appdb-observation');
+    const parked = data.outcomes.find((outcome) => outcome.childRunId === 'child-run-parked');
+    expect(parked).toMatchObject({ stage: 'parked', failureClassification: 'implementation-deficit', reworkRound: 2 });
+    expect(parked).toMatchObject({ reviewVerdict: null, reviewMustFixCount: null, prNumber: null });
+    const reviewBlocked = data.outcomes.find((outcome) => outcome.childRunId === 'child-run-review');
+    expect(reviewBlocked).toMatchObject({
+      stage: 'review-blocked', failureClassification: 'implementation-deficit', prNumber: 35239,
+      reviewVerdict: 'fail', reviewMustFixCount: 3, reworkRound: 4,
+    });
+    const unobserved = data.outcomes.find((outcome) => outcome.classificationBasis === 'supervisor-no-child-id');
+    expect(unobserved).toMatchObject({ childRunId: null, classificationBasis: 'supervisor-no-child-id' });
+    expect(results.map((result) => result.stage)).toEqual(['parked', 'review-blocked', 'parked']);
+  } finally {
+    off();
+  }
+});

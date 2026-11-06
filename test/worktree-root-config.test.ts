@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { buildUserConfig } from '../src/user-config.js';
+import { buildUserConfig, configuredWorktreeRoot, setUserConfigOverlay } from '../src/user-config.js';
 import { createWorktree, worktreeDirName, worktreeParentDir } from '../src/git-fs/worktree.js';
 
 function configWith(worktreeRoot: unknown) {
@@ -119,8 +119,19 @@ describe('the configured worktree root has exactly one producer (source-level)',
 // ⛔ 한계를 갈라 적는다: 소비처가 그 함수를 «부르는지»는 이제 **타입**이 답하고(필수 인자),
 //    값이 «맞는지»와 그 값이 «실제 배치»에 쓰이는지는 아래가 답한다.
 describe('configuredWorktreeRoot() — runtime', () => {
-  test('reflects the configured value and falls back to an absolute default', async () => {
-    const { configuredWorktreeRoot, setUserConfigOverlay } = await import('../src/user-config.js');
+  test('reads an explicit config path for an isolated simulation', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-wtroot-explicit-config-'));
+    const configPath = join(root, 'config.json');
+    const injected = join(root, 'isolated-worktrees');
+    try {
+      writeFileSync(configPath, JSON.stringify({ tools: { selfImplement: { worktreeRoot: injected } } }));
+      expect(configuredWorktreeRoot(configPath)).toBe(injected);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('reflects the configured value and falls back to an absolute default', () => {
     const injected = mkdtempSync(join(tmpdir(), 'elanous-wtroot-runtime-'));
     try {
       setUserConfigOverlay((c) => ({

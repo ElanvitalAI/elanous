@@ -732,8 +732,9 @@ export function registerRepoCommands(program: Command, overrides: RepoCliDeps = 
         // ⭐ stderr 는 «흘려 보낸다» — 채점기가 쪽마다 진행을 거기 적는다.
         //   🩸 2026-09-14 7판 terra: 전 쪽 채점이 5분 넘게 «말없이» 돌자 감독자가 「진행 없음」으로 판정해 재작업을 걸었다.
         //   ⛔ 게다가 'pipe' 로 받고 «안 읽으면» 버퍼가 차는 순간 자식이 멈춘다.
-        const proc = spawnWithOwnedStderr(['bun', join(scripts, script), ...args], { stdout: 'pipe' });
-        const out = await new Response(proc.stdout).text();
+        const proc = spawnWithOwnedStderr(['bun', join(scripts, script), ...args]);
+        const stdout = proc.stdout;
+        const out = stdout instanceof ReadableStream ? await new Response(stdout).text() : '';
         await proc.exited;
         return { code: proc.exitCode ?? 1, out };
       };

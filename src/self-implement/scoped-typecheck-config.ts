@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 
 export type ScopedTypecheckConfig = { config: string; cleanup: () => void };
 
@@ -31,9 +32,9 @@ export function writeScopedTypecheckConfig(
 
   // The project may include ambient declarations without importing them. Retain the
   // declaration roots selected by this tree's own config before clearing `include`.
-  const parsed = ts.readConfigFile(original, ts.sys.readFile);
-  if (parsed.error) throw new Error(ts.flattenDiagnosticMessageText(parsed.error.messageText, '\n'));
-  const project = ts.parseJsonConfigFileContent(parsed.config, ts.sys, projectDir, undefined, original);
+  const parsed = tsApi.readConfigFile(original, tsApi.sys.readFile);
+  if (parsed.error) throw new Error(tsApi.flattenDiagnosticMessageText(parsed.error.messageText, '\n'));
+  const project = tsApi.parseJsonConfigFileContent(parsed.config, tsApi.sys, projectDir, undefined, original);
   for (const file of project.fileNames) {
     if (!/\.d\.[cm]?ts$/.test(file)) continue;
     const candidate = resolve(file);

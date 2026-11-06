@@ -27,6 +27,13 @@ const toolSpecs: LLMToolSpec[] = [
 ];
 const signal = new AbortController().signal;
 
+function configWithoutNativeStructureProviderLookup(): ReturnType<typeof getUserConfig> {
+  const config = getUserConfig();
+  const tools = { ...config.tools };
+  Reflect.deleteProperty(tools, 'nativeStructure');
+  return { ...config, tools };
+}
+
 function turnProfile(surfaceId: 'research/turn' | 'research/agent') {
   const surface = resolveSessionSurfaceProfile({ preferredSurfaceId: surfaceId });
   return {
@@ -182,7 +189,7 @@ test('classic mock replay verifies tools, uses their results to redo the prior t
   const preamble = buildDashboardTurnPreamble({
     userText: correction,
     cwd,
-    userConfig: getUserConfig(),
+    userConfig: configWithoutNativeStructureProviderLookup(),
     memory: false,
     turnProfile: profile,
     enabledTools: toolSpecs.map(tool => tool.name),

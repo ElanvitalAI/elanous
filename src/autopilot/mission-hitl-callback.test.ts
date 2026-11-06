@@ -1,9 +1,87 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, spyOn } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { debug } from '../debug/log.js';
 import { hitlToken, buildHitlCallbackData, parseHitlCallbackData, HITL_REVISE_PRESETS } from './mission-notify.js';
-import { describeCronKo, describeApproval, approvalNextStepText } from './mission-hitl-callback.js';
+import { describeCronKo, describeApproval, approvalNextStepText, registerMissionHitlCallback } from './mission-hitl-callback.js';
+import type { TelegramBot, TgCallbackQuery } from '../telegram.js';
 
 // 미션 HITL 콜백 데이터 — telegram callback_data 64byte 캡 회피(한글 slug 미션 id)의 핵심.
 describe('mission HITL callback data', () => {
+  it('SWALLOW-TO-BOUNDARY: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같게 유지하고, 삭제·보호 경로는 건', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'mission-hitl-callback-'));
+    const invalidStateRoot = join(tempRoot, 'not-a-directory');
+    writeFileSync(invalidStateRoot, '');
+    const previousStateRoot = process.env.ELANOUS_STATE_DIR;
+    const logSpy = spyOn(debug, 'log');
+    logSpy.mockImplementation(() => {});
+    let callbackHandler: ((query: TgCallbackQuery) => Promise<void>) | undefined;
+    const answers: { id: string; text?: string }[] = [];
+    const bot = {
+      onCallbackQuery(handler: (query: TgCallbackQuery) => Promise<void>) {
+        callbackHandler = handler;
+        return () => {};
+      },
+      answerCallbackQuery: async (id: string, options?: { text?: string }) => {
+        answers.push({ id, ...(options?.text !== undefined ? { text: options.text } : {}) });
+      },
+    } as unknown as TelegramBot;
+    try {
+      process.env.ELANOUS_STATE_DIR = invalidStateRoot;
+      registerMissionHitlCallback(bot);
+      await callbackHandler!({ id: 'cb-1', data: 'apm-hitl:6196e5:approve' } as TgCallbackQuery);
+      expect(logSpy).toHaveBeenCalledWith(
+        'mission.hitl.token.resolve.failed',
+        '6196e5',
+        { error: expect.any(String) },
+      );
+      expect(answers).toEqual([{ id: 'cb-1', text: '만료된 미션(이미 처리?)' }]);
+    } finally {
+      if (previousStateRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateRoot;
+      logSpy.mockRestore();
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('SWALLOW-TO-BOUNDARY: debug logging failure preserves the existing callback response', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'mission-hitl-callback-log-failure-'));
+    const invalidStateRoot = join(tempRoot, 'not-a-directory');
+    writeFileSync(invalidStateRoot, '');
+    const previousStateRoot = process.env.ELANOUS_STATE_DIR;
+    const logSpy = spyOn(debug, 'log').mockImplementation((category) => {
+      if (category === 'mission.hitl.token.resolve.failed') throw new Error('log sink unavailable');
+    });
+    let callbackHandler: ((query: TgCallbackQuery) => Promise<void>) | undefined;
+    const answers: { id: string; text?: string }[] = [];
+    const bot = {
+      onCallbackQuery(handler: (query: TgCallbackQuery) => Promise<void>) {
+        callbackHandler = handler;
+        return () => {};
+      },
+      answerCallbackQuery: async (id: string, options?: { text?: string }) => {
+        answers.push({ id, ...(options?.text !== undefined ? { text: options.text } : {}) });
+      },
+    } as unknown as TelegramBot;
+    try {
+      process.env.ELANOUS_STATE_DIR = invalidStateRoot;
+      registerMissionHitlCallback(bot);
+      await callbackHandler!({ id: 'cb-log-failure', data: 'apm-hitl:6196e5:approve' } as TgCallbackQuery);
+      expect(logSpy).toHaveBeenCalledWith(
+        'mission.hitl.token.resolve.failed',
+        '6196e5',
+        { error: expect.any(String) },
+      );
+      expect(answers).toEqual([{ id: 'cb-log-failure', text: '만료된 미션(이미 처리?)' }]);
+    } finally {
+      if (previousStateRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateRoot;
+      logSpy.mockRestore();
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   // 실제 파일럿 미션 id(한글 slug 포함) — 전체를 실으면 64byte 초과.
   const koreanId = 'apm_202607112101_인프라-복원-파일럿-비투자-인프라-크_6196e5';
 

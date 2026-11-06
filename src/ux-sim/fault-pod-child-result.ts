@@ -1,9 +1,9 @@
-import { classifyPodTerminal } from '../self-dev/draft-residue.js';
+import { classifyPodTerminal, type PrTerminalRecord } from '../self-dev/draft-residue.js';
 import { podChildEvidenceLedgerRow, type PodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 
 export interface PodChildResultScenario {
   firstAttempt: Record<string, unknown>;
-  harvestAttempt: Record<string, unknown>;
+  harvestAttempt: PrTerminalRecord;
 }
 
 /** Replays a successful Kubernetes Job carrying a failed/partial child result. */

@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
-import { closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
@@ -59,6 +59,7 @@ import type { ResourceView } from '../control-plane/ledger.js';
 import { loadMachineLedger } from '../machines/machine-ledger.js';
 import { LogStore, logsDbPath, type LogStoreRow } from '../mss/logging/log-store.js';
 import { reviewBriefEvidence } from '../self-implement/review-round-brief.js';
+import { recommendBackendTier, type BackendEngine } from '../nexus/apps/backend-tier.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -136,6 +137,8 @@ export interface DoctorReport {
   externalCommandsCatalogReason?: string;
   /** 설정 파일에 남아 있는 폐기 키(설정 졸업). 로더는 값을 쓰지 않는다. 없으면 빈 배열. */
   retiredConfigKeys?: RetiredConfigKey[];
+  /** Read-only backend tier advice derived from the L0 host probes. */
+  backendTier?: ReturnType<typeof recommendBackendTier>;
 }
 
 export interface DoctorOptions {
@@ -556,6 +559,7 @@ function resolveReadinessDeps(lookup: ReadinessLookup): ReadinessDeps {
     docker: host?.docker ?? null,
     kubernetes: host?.kubernetes ?? null,
     memory: host?.memory ?? null,
+    backendTier: recommendBackendTier({ memory: host?.memory ?? null, engines: host?.engines ?? [] }),
     distro: detectDistroFamily(lookup.platform, lookup.platform === 'linux' ? readOsReleaseSafely(lookup) : null),
   };
 }
@@ -589,6 +593,7 @@ export interface HostEnvironmentProbe {
   docker: DockerProbe | null;
   kubernetes: KubernetesProbe | null;
   memory: MemoryProbe | null;
+  engines?: BackendEngine[];
 }
 
 /** 탐침 한 발의 결과. `timedOut` = 제한 시간에 걸렸다 · `error` = 돌리지 못했다(둘 다 «못 쟀다»). */
@@ -697,7 +702,13 @@ export function defaultProbeHostEnvironment(options: HostEnvironmentProbeOptions
     memory = text === null ? { totalBytes: null, availableBytes: null, source: '/proc/meminfo' } : { ...parseMeminfo(text), source: '/proc/meminfo' };
   }
 
-  return { substrate, docker, kubernetes, memory };
+  const operatingSystem = docker.info?.kind === 'engine' ? (docker.info.engine.operatingSystem ?? '').toLowerCase() : '';
+  const engines: BackendEngine[] = [];
+  if (operatingSystem.includes('orbstack') || docker.desktopApp === 'OrbStack' || (options.platform === 'darwin' && safeExists('/Applications/OrbStack.app') === true)) engines.push('OrbStack');
+  if (operatingSystem.includes('colima') || onPath('colima') === true) engines.push('Colima');
+  if (operatingSystem.includes('docker desktop') || docker.desktopApp === 'Docker' || (options.platform === 'darwin' && safeExists('/Applications/Docker.app') === true)) engines.push('Docker Desktop');
+  if (onPath('podman') === true) engines.push('podman');
+  return { substrate, docker, kubernetes, memory, engines };
 }
 
 function readOsReleaseSafely(lookup: ReadinessLookup): string | null {
@@ -728,6 +739,50 @@ export function manualCommandFixes(report: DoctorReport): string[] {
     const fix = command.status === 'broken' ? command.fix_broken ?? command.fix : command.fix;
     return fix ? [`${command.name}: manual — ${fix}`] : [];
   });
+}
+
+/** First-run, non-sudo setup used by npm and the release installer. */
+export function runBootstrap(deps: DoctorCliDeps = {}): { ok: boolean; marker: string; manual: string[] } {
+  const env = deps.env ?? process.env;
+  const home = deps.home ?? homedir();
+  const prefix = env.ELANOUS_INSTALL_PREFIX?.trim() || join(env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share'), 'elanous');
+  env.ELANOUS_INSTALL_PREFIX = prefix;
+  const pathDelimiter = deps.pathDelimiter ?? delimiter;
+  const commandExists = deps.commandExists ?? ((name: string) => env.PATH?.split(pathDelimiter).some((dir) => existsSync(join(dir, name))) ?? false);
+  const readiness = deps.readiness ?? resolveReadinessDeps({
+    env,
+    pathDelimiter,
+    platform: deps.platform ?? process.platform,
+    commandExists,
+    getConfig: () => deps.userConfig ?? (deps.getUserConfig ?? getUserConfig)(),
+    codeRevision: deps.codeRevision ?? defaultCodeRevision,
+    fetchHealth: deps.fetchHealth ?? (() => null),
+    readInstallPrefix: deps.readInstallPrefix ?? (() => prefix),
+    ghAuthStatus: deps.ghAuthStatus ?? (() => null),
+    ghVersion: deps.ghVersion ?? (() => defaultGhVersion(commandExists)),
+    tmpdirSameFsAsBunCache: deps.tmpdirSameFsAsBunCache ?? (() => defaultTmpdirSameFsAsBunCache(env)),
+    probeHostEnvironment: () => null,
+  });
+  const fixes: DoctorFixDeps = { env, home, setupTools: true, readiness, installStaticTool: deps.installStaticTool, smokeCheck: deps.smokeCheck };
+  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const version = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).version as string;
+  const markerDir = join(home, '.local', 'share', 'elanous');
+  const marker = join(markerDir, `doctor-ok-${version}`);
+  const prefixMarker = join(prefix, `bootstrap-ready-${version}`);
+  const plan = planDoctorFixes(fixes);
+  const manual = plan.manual.map((item) => item.remedy).filter((line): line is string => Boolean(line)).slice(0, 2);
+  const safeFixIds = new Set<DoctorFixItem['id']>(['install-path', 'static-tools']);
+  const pendingSafeRepair = plan.items.some((item) => safeFixIds.has(item.id) && item.status === 'fixable');
+  if (existsSync(marker) && existsSync(prefixMarker) && !pendingSafeRepair) return { ok: true, marker, manual };
+  if (pendingSafeRepair) rmSync(prefixMarker, { force: true });
+  const results = applyDoctorFixes(fixes, true, new Set<DoctorFixItem['id']>(['install-path', 'static-tools']));
+  if (results.exitCode === 0) {
+    mkdirSync(markerDir, { recursive: true });
+    mkdirSync(prefix, { recursive: true });
+    writeFileSync(marker, `${new Date().toISOString()}\n`, { mode: 0o600 });
+    writeFileSync(prefixMarker, `${new Date().toISOString()}\n`, { mode: 0o600 });
+  } else rmSync(prefixMarker, { force: true });
+  return { ok: results.exitCode === 0, marker, manual };
 }
 
 /** 이 기계의 넥서스 서비스 파일 — macOS launchd plist · Linux systemd user unit. 없으면 null · 다른 플랫폼은 undefined(못 잼). */
@@ -1134,6 +1189,7 @@ export function runDoctor(options: DoctorOptions = {}): DoctorReport {
       capabilitySummary: summarizeDoctorCapabilities(credentials),
       modes: describeModes(resolutionOptions.userConfig),
       readiness: evaluateReadiness(readiness),
+      backendTier: readiness.backendTier,
       retiredConfigKeys: findRetiredConfigKeysInFile(options.configPath, readFile),
       ...(resourceMetadata.available ? {} : { catalogMetadataUnavailable: true }),
       ...(externalCommands.available ? {} : {
@@ -1202,6 +1258,8 @@ export function formatDoctorReport(report: DoctorReport, options: { credentials?
   const satisfied = report.credentials.filter((credential) => !credential.resolved && credential.satisfiedBy !== undefined).length;
   return [
     ...formatReadiness(report.readiness),
+    ...(report.backendTier ? [`Backend tier: ${report.backendTier.tier} — ${report.backendTier.reasons.join(' ')}`] : []),
+    ...(report.backendTier ? [`Existing engines: ${report.backendTier.engines.length ? report.backendTier.engines.join(', ') : 'none detected'} (installation presence; running state is not implied)`] : []),
     ...(requiredMissing.length ? [`⛔ Required commands missing: ${requiredMissing.join(', ')}`] : []),
     `Credentials: ${resolved}/${report.credentials.length} resolved${satisfied ? ` · ${satisfied} satisfied by alternative names` : ''} · details: elanous doctor --credentials`,
     ...(options.credentials ? report.credentials.map((credential) => [
@@ -1339,6 +1397,23 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
   const registerDoctorLogSink = deps.registerDoctorLogSink ?? (async () =>
     (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('cli'));
   const flushDoctorLogs = deps.flushDoctorLogs ?? (() => debug.flush());
+  program.command('bootstrap')
+    .description('Install safe first-run tools and add elanous to PATH')
+    .action(() => {
+      try {
+        const result = runBootstrap(deps);
+        if (!result.ok) {
+          err.error('Bootstrap could not finish all safe repairs; run `eln bootstrap` again or `eln doctor --fix --yes` for details.');
+          setExitCode(1);
+          return;
+        }
+        for (const line of result.manual) out.log(`Manual (sudo may be needed): ${line}`);
+        out.log(`Bootstrap ready (${result.marker})`);
+      } catch (error) {
+        err.error(`Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+        setExitCode(1);
+      }
+    });
   const doctor = program.command('doctor')
     .description('Reports whether credentials resolve and where each resolution comes from')
     .option('--json', 'structured output');

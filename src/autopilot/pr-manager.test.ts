@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
-import { ghAutomationEnv, defaultCmdRunner, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, recordPrCreateFailureIncident, sanitizeCredentialText, stderrTailOf, type PrCreateFailureIncident, type CmdRunner, type CmdResult } from './pr-manager.js';
+import { ghAutomationEnv, defaultCmdRunner, defaultPrCreateGuard, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, recordPrCreateFailureIncident, sanitizeCredentialText, stderrTailOf, type PrCreateFailureIncident, type CmdRunner, type CmdResult } from './pr-manager.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { debug } from '../debug/log.js';
 import { cardIdFromBody, guardNewPr } from '../pr-tool/census.js';
@@ -1045,6 +1045,50 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     });
     expect(makePrManager(run).upsertPr({ ...input, base: 'origin/se/apm-x-abc' })).toMatchObject({ ok: false, reason: 'base' });
     expect(calls.some((c) => c.includes('push'))).toBe(false);
+  });
+
+  it('★ 인수 발사: 자기 base 에 upstream 이 없어도 기본 base 로 변경 파일 guard 를 측정한다', () => {
+    const { run, calls } = stubRunner({
+      '--verify --quiet refs/heads/se/apm-x-abc': { ok: true, out: 'branch-sha' },
+      'rev-parse --abbrev-ref se/apm-x-abc@{upstream}': { ok: false, out: '', err: 'fatal: no upstream configured' },
+      'rev-parse --abbrev-ref origin/HEAD': { ok: true, out: 'origin/main' },
+      '--verify --quiet origin/main': { ok: true, out: 'main-sha' },
+      'commit': { ok: true, out: '1 file changed' },
+      'rev-list --count origin/main..HEAD': { ok: true, out: '1' },
+      'diff --name-only origin/main..HEAD': { ok: true, out: 'src/x.ts\n' },
+      'diff --name-only -z origin/main...HEAD': { ok: true, out: 'src/x.ts\0' },
+      'diff --unified=0 origin/main...HEAD': { ok: true, out: 'diff --git a/src/x.ts b/src/x.ts\n@@ -0,0 +1 @@\n+x\n' },
+      'api --paginate repos/{owner}/{repo}/pulls?state=open&per_page=100': { ok: true, out: '[]' },
+      'pr list --state open --limit': { ok: true, out: '[]' },
+      'pr list': { ok: true, out: '' },
+      'pr create': { ok: true, out: 'https://github.com/o/r/pull/94' },
+    });
+    expect(makePrManager(run, defaultPrCreateGuard).upsertPr({ ...input, base: 'refs/heads/se/apm-x-abc' }))
+      .toEqual({ ok: true, url: 'https://github.com/o/r/pull/94', reused: false });
+    expect(calls).toContainEqual(['git', '-C', '/wt', 'diff', '--name-only', '-z', 'origin/main...HEAD']);
+    expect(calls).toContainEqual(['git', '-C', '/wt', 'diff', '--unified=0', 'origin/main...HEAD']);
+    expect(calls.some((call) => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(true);
+  });
+
+  it('★ 인수 발사: self-base에 upstream이 있으면 production guard가 upstream 비교를 우선한다', () => {
+    const { run, calls } = stubRunner({
+      'rev-parse --abbrev-ref se/apm-x-abc@{upstream}': { ok: true, out: 'origin/se/apm-x-abc\n' },
+      'rev-parse --abbrev-ref origin/HEAD': { ok: true, out: 'origin/main' },
+      '--verify --quiet origin/main': { ok: true, out: 'main-sha' },
+      'commit': { ok: true, out: '1 file changed' },
+      'rev-list --count origin/se/apm-x-abc..HEAD': { ok: true, out: '1' },
+      'diff --name-only origin/se/apm-x-abc..HEAD': { ok: true, out: 'src/x.ts\n' },
+      'diff --name-only -z origin/se/apm-x-abc...HEAD': { ok: true, out: 'src/x.ts\0' },
+      'diff --unified=0 origin/se/apm-x-abc...HEAD': { ok: true, out: 'diff --git a/src/x.ts b/src/x.ts\n@@ -0,0 +1 @@\n+x\n' },
+      'api --paginate repos/{owner}/{repo}/pulls?state=open&per_page=100': { ok: true, out: '[]' },
+      'pr list --state open --limit': { ok: true, out: '[]' },
+      'pr list': { ok: true, out: '' },
+      'pr create': { ok: true, out: 'https://github.com/o/r/pull/95' },
+    });
+    expect(makePrManager(run, defaultPrCreateGuard).upsertPr({ ...input, base: 'refs/heads/se/apm-x-abc' }))
+      .toEqual({ ok: true, url: 'https://github.com/o/r/pull/95', reused: false });
+    expect(calls).toContainEqual(['git', '-C', '/wt', 'diff', '--name-only', '-z', 'origin/se/apm-x-abc...HEAD']);
+    expect(calls).not.toContainEqual(['git', '-C', '/wt', 'diff', '--name-only', '-z', 'origin/main...HEAD']);
   });
 
   it('★ 인수 발사: 기존 PR이면 자기 브랜치를 --base로 쓰지 않고 push로 갱신한다', () => {

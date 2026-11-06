@@ -214,6 +214,13 @@ interface SelfDevTerminalOutcome {
   stage: string | null;
   merged: boolean | null;
   prUrl: string | null;
+  childRunId: string | null;
+  failureClassification: AbandonedClassification | null;
+  classificationBasis: string | null;
+  reviewVerdict: 'pass' | 'warn' | 'fail' | null;
+  reviewMustFixCount: number | null;
+  reworkRound: number | null;
+  prNumber: number | null;
   blockReason?: 'parent-unlanded' | 'dependency-needs-human' | 'dependency-deferred';
   parentPrNumber?: number | null;
   parentNoPr?: true;
@@ -1549,6 +1556,9 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(goalCauseObservedFromFailureClassification(disp?.failureClassification) === true
             ? { goalCauseObserved: true } : {}),
           ...(disp?.runId ? { runId: disp.runId } : {}),
+          ...(disp?.childRunId ? { childRunId: disp.childRunId } : {}),
+          ...(disp?.reviewVerdict ? { reviewVerdict: disp.reviewVerdict } : {}),
+          ...(disp?.reviewMustFixCount !== undefined ? { reviewMustFixCount: disp.reviewMustFixCount } : {}),
         });
       }
       return out;
@@ -1645,9 +1655,17 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
         stage: result.stage ?? null,
         merged: result.merged ?? null,
         prUrl: result.prUrl ?? null,
+        childRunId: result.childRunId ?? null,
+        failureClassification: result.failureClassification ?? null,
+        classificationBasis: result.classificationBasis ?? null,
+        reviewVerdict: result.reviewVerdict ?? result.selfReview?.verdict ?? null,
+        reviewMustFixCount: result.reviewMustFixCount ?? result.selfReview?.mustFixCount ?? result.reviewMustFix?.length ?? null,
+        reworkRound: result.rework?.rounds ?? null,
+        prNumber: result.prNumber ?? null,
         ...(result.blockReason ? { blockReason: result.blockReason, parentPrNumber: result.parentPrNumber ?? null, ...(result.parentNoPr ? { parentNoPr: true } : {}) } : {}),
       }));
       debug.log('self-dev.orchestrate', 'done', {
+        runId: runId ?? null,
         total: out.length,
         completed: summary.done,
         failed: summary.failed,

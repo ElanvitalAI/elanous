@@ -212,17 +212,33 @@ describe('AgentBackend — agent-agnostic PTY 추상화', () => {
   it('resolveBackend — U1 정직화: 미등록 backend 명시 지정 시 조용한 폴백 대신 명시 에러', () => {
     // 조용한 codex 폴백은 "애그노스틱한 척·실배선 단일"을 은폐 → 명시 에러로 차단(대표 지적).
     expect(() => resolveBackend('nope')).toThrow(/알 수 없는 agent backend 'nope'/);
-    expect(() => resolveBackend('claude-code')).toThrow(/등록된 backend: codex, claude, gemini, grok/);
+    expect(() => resolveBackend('claude-code')).toThrow(/등록된 backend: codex, claude, gemini, grok, aside, openclaw, hermes/);
   });
 
-  it('agentBackendNames — Aside를 포함한 다섯 backend', () => {
-    expect(agentBackendNames()).toEqual(['codex', 'claude', 'gemini', 'grok', 'aside']);
+  it('agentBackendNames — registered PTY backends', () => {
+    expect(agentBackendNames()).toEqual(['codex', 'claude', 'gemini', 'grok', 'aside', 'openclaw', 'hermes']);
   });
 });
 
 describe('resolveBackendSpawn — 선택→PTY spawn 파라미터 실행경로(U3 선택 실증)', () => {
   // driver 의 실 spawn(startPty)이 이 seam 결과의 cmd/args/env 를 그대로 넘긴다(TERM·ELANOUS_RUN_ID 만 덧댐).
   const base = { PATH: '/usr/bin', HOME: '/home/x', FOO: 'keep' };
+
+  it('OpenClaw binds its local agent workspace to the mission worktree', () => {
+    const worktree = '/tmp/agent-mission-worktree';
+    const spawn = resolveBackendSpawn(resolveBackend('openclaw'), {
+      ...base, OPENCLAW_WORKSPACE_DIR: '/home/operator/workspace',
+    }, worktree);
+    expect(spawn.env.OPENCLAW_WORKSPACE_DIR).toBe(worktree);
+    expect(spawn.args).toEqual(['chat']);
+  });
+
+  it('OpenClaw preserves the configured workspace when no mission worktree is supplied', () => {
+    const spawn = resolveBackendSpawn(resolveBackend('openclaw'), {
+      ...base, OPENCLAW_WORKSPACE_DIR: '/home/operator/workspace',
+    });
+    expect(spawn.env.OPENCLAW_WORKSPACE_DIR).toBe('/home/operator/workspace');
+  });
 
   it('선택된 backend 의 cmd/args 가 spawn 파라미터로 전달', () => {
     const cases: Array<[AgentBackend, string, string[]]> = [

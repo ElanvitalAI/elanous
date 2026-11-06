@@ -54,9 +54,12 @@ export function simPoolCap(scenario: PoolCapScenario): PoolCapObservation {
       ? { queryError: scenario.queryFailures[m.context] }
       : { running: runningOf(scenario, m.context) }),
   }));
-  if (members.some((member) => member.queryError)) return { scenario, members, recommendation: null };
+  const runningMembers = members.flatMap((member) => 'running' in member
+    ? [roomyMember(member.context, member.capacity, member.capacityDefaulted, member.running)]
+    : []);
+  if (runningMembers.length !== members.length) return { scenario, members, recommendation: null };
   const recommendation = recommendConcurrency(
-    { members: members.map((m) => roomyMember(m.context, m.capacity, m.capacityDefaulted, m.running!)) },
+    { members: runningMembers },
     { capacity: members.reduce((sum, m) => sum + m.capacity, 0), accounts: -1, perAccount: -1 },
   );
   return { scenario, members, recommendation };

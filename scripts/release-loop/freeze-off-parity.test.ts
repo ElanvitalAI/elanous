@@ -13,8 +13,8 @@ import * as unattendedNode from './unattended-release.js';
 // before the change is committed: its own scripts and src, only node_modules shared) and this checkout run the same
 // isolated scenario; the historical capture must match GOLDEN, while current behavior may add the policy selection.
 // This is a deliberate pin: a later change that alters these nodes' off-state output must update this test.
-// GOLDEN (the same capture taken from main before FREEZE1) is used only without git history (not a work tree,
-// or a shallow clone).
+// GOLDEN (the same capture taken from main before FREEZE1) is used when full historical objects are unavailable
+// (not a work tree, shallow clone, or credential-free partial clone).
 // GOLDEN provenance: captured 2026-10-04 from origin/main d958ff5b (pre-FREEZE1) by running this file's `capture` against
 // that checkout's three nodes; with git history, the test re-derives the same value from the pre-freeze base each run.
 const GOLDEN = {"gate": {"outcome": "regression", "commit": "cccccccccccccccccccccccccccccccccccccccc", "introduced": ["src/b.test.ts > B"], "preexisting": 1, "fixed": 1, "knownEnv": 0, "knownEnvCleared": [], "stalledEnv": [], "baselineSource": "instance"}, "gateCalls": ["add cccccccccccccccccccccccccccccccccccccccc @<tmp>/cut", "bun install @<tmp>/cut", "bun install @<tmp>/cut/apps/pwa", "sweep @<tmp>/cut", "bun run test:deterministic ./src/b.test.ts @<tmp>/cut", "snapshot bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb @<tmp>/baseline", "bun install @<tmp>/baseline", "bun install @<tmp>/baseline/apps/pwa", "bun run test:deterministic ./src/b.test.ts @<tmp>/baseline", "bun run test:deterministic ./src/c.test.ts @<tmp>/cut", "removeSnapshot @<tmp>/baseline", "remove @<tmp>/cut"], "publish": {"outcome": "ok", "verdict": "pass", "summary": "published v0.2.4 · 0 assets downloadable", "tag": "v0.2.4"}, "publishCalls": [["git", "show", "release-docs/0.2.4:release/public/docs/releases/0.2.4.md"], ["git", "show", "release-docs/0.2.4:website/pages.json"], ["bun", "bin/elanous.mjs", "release", "publish", "--dir", "dist", "--notes-file", "<notes>", "--yes", "--json"]], "unattended": {"input": {"gatePodPool": "pool", "version": "0.2.4", "previousVersion": "0.2.3"}, "dryRun": false, "state": {"status": "done"}}, "graphInput": {"gatePodPool": "pool", "version": "0.2.4", "previousVersion": "0.2.3"}};
@@ -106,6 +106,8 @@ function historyAvailable(): boolean {
     throw new Error(`git rev-parse failed: ${inside.stderr.trim()}`);
   }
   if (inside.stdout.trim() !== 'true') return false;
+  const partial = spawnSync('git', ['-C', REPO, 'config', '--get-regexp', '^remote\\..*\\.partialclonefilter$'], { encoding: 'utf8' });
+  if (partial.status === 0 && partial.stdout.trim()) return false;
   const shallow = spawnSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: REPO, encoding: 'utf8' });
   if (shallow.status !== 0) throw new Error(`git rev-parse --is-shallow-repository failed: ${shallow.stderr.trim()}`);
   return shallow.stdout.trim() !== 'true';
@@ -139,7 +141,7 @@ function treeAt(rev: string, expectFreeze: boolean): { dir: string; base: string
 test('freeze switch off preserves historical behavior plus explicit release-policy selection', async () => {
   if (!historyAvailable()) {
     const current = await capture({ judgeGate: gateNode.judgeGate, runPublish: publishNode.runPublish, runUnattendedRelease: unattendedNode.runUnattendedRelease }, true);
-    console.warn('freeze-off-parity: no git history (not a work tree or shallow clone) — compared with the recorded pre-FREEZE1 GOLDEN only');
+    console.warn('UNMEASURED: freeze-off-parity historical pre-FREEZE1 tree unavailable (no work tree, shallow clone, or partial clone) — current behavior compared with recorded GOLDEN');
     expect(JSON.parse(current)).toEqual(expectedCurrentWithPolicy());
     return;
   }

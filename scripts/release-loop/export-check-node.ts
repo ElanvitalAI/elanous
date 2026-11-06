@@ -41,7 +41,13 @@ export function runExportCheck(run: CommandRunner = runCommand, repoRoot = proce
         else {
           symlinkSync(join(modulesRoot, 'node_modules'), join(sourceDir, 'node_modules'), 'dir');
           const exported = run('bun', ['scripts/public-export.ts', '--out', join(out, 'export')], sourceDir);
-          if (exported.status !== 0) result = failed('export', 'public export', exported);
+          if (exported.status !== 0) {
+            result = failed('export', 'public export', exported);
+            const leakEvidence = `${exported.stdout}\n${exported.stderr}`.split(/\r?\n/u)
+              .filter((line) => /(?:absolute-home-path|kr-mobile-phone|pilot-tree|handoff-doc-link|plan-doc-link|xcode-author-header)\s/u.test(line))
+              .slice(0, 8).join('\n');
+            if (leakEvidence) result = { ...result, tail: leakEvidence.slice(-1_000) };
+          }
           else {
             step = 'build';
             const publicDir = join(out, 'export');

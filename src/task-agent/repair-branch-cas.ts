@@ -140,7 +140,8 @@ export function applyRepairBundle(request: RepairCasRequest, deps: RepairCasDeps
   // The HQ checkout need not have fetched this PR before. Pin its source commit in an isolated ref;
   // never use FETCH_HEAD, which another concurrent worker may replace.
   const baseRef = `refs/elanous/repair/base/${pr}-${expectedHead.slice(0, 12)}`;
-  if (git(['fetch', 'origin', `refs/heads/${initial.branch}:${baseRef}`]).status !== 0
+  // PR-HEAD-FETCH-STATELESS: «+» — a rebased head must reach the SHA comparison (mismatch), not die as a non-fast-forward refusal.
+  if (git(['fetch', 'origin', `+refs/heads/${initial.branch}:${baseRef}`]).status !== 0
     || git(['rev-parse', baseRef]).stdout.trim().toLowerCase() !== expectedHead.toLowerCase()) return fail('reviewed PR head fetch mismatch');
   if (git(['bundle', 'verify', bundlePath]).status !== 0) return fail('repair bundle verification failed');
   const localRef = `refs/elanous/repair/import/${pr}-${expectedHead.slice(0, 12)}-${result.commit.slice(0, 12)}`;

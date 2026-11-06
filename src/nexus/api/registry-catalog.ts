@@ -11,7 +11,7 @@
 // result and refresh on demand (no SSE here; live state belongs to
 // the resolved view).
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { getCatalog } from '../../registry/loader.js';
 import type {
   ModelSpec,

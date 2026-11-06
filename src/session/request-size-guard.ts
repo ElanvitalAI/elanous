@@ -22,8 +22,11 @@
 // history before the next tool round. A host writer may additionally persist
 // the session-facing transcript across turns.
 
+import { createHash } from 'node:crypto';
 import type { LLMMessage, LLMOpts, LLMToolSpec } from '../llm.js';
 import type { CompactProvider } from '../compact/provider.js';
+import { truncateProportional } from '../compact/truncate-proportional.js';
+import { appendArchiveEntry, archiveReferencePath, getDefaultArchiveDir, inspectArchive } from '../compact/archive.js';
 
 /** #32254 — the wire cap for Codex TUI requests (serialized body chars). */
 export const REQUEST_SIZE_MAX_CHARS = 400_000;
@@ -40,8 +43,87 @@ export interface CompactLiveMessagesOptions {
   activeModelId?: string;
   preserveLastN?: number;
   archiveEnabled?: boolean;
+  archiveDir?: string;
   /** Test seam — defaults to the real `runCompactPipeline` with the default compact provider. */
   runCompactPipeline?: RunCompactPipeline;
+}
+
+function currentUserTextIndex(messages: LLMMessage[]): number {
+  // Dashboard ACP marks the just-entered turn explicitly. That provenance
+  // wins over transcript-shaped user/tool-result messages in the same wire.
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]! as LLMMessage & { transientTurnUser?: boolean };
+    if (message.role !== 'user' || message.transientTurnUser !== true) continue;
+    const hasText = typeof message.content === 'string' ? message.content.length > 0
+      : message.content.some(block => block.type === 'text' && block.text.length > 0);
+    if (hasText) return i;
+  }
+  let turnStart = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role !== 'assistant') continue;
+    if (typeof message.content === 'string') {
+      if (message.content.length > 0) {
+        turnStart = i + 1;
+        break;
+      }
+      continue;
+    }
+    const hasToolUse = message.content.some(block => block.type === 'tool_use');
+    const hasText = message.content.some(block => block.type === 'text' && block.text.length > 0);
+    if (!hasToolUse && hasText) {
+      turnStart = i + 1;
+      break;
+    }
+  }
+  const turnToolUseIds = new Set<string>();
+  for (let i = turnStart; i < messages.length; i++) {
+    const message = messages[i]!;
+    if (message.role !== 'assistant' || typeof message.content === 'string') continue;
+    for (const block of message.content) if (block.type === 'tool_use') turnToolUseIds.add(block.id);
+  }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (i < turnStart) break;
+    if (message.role !== 'user') continue;
+    const hasText = typeof message.content === 'string' ? message.content.length > 0
+      : message.content.some(block => block.type === 'text' && block.text.length > 0);
+    if (!hasText) continue;
+    const isToolResultForThisTurn = typeof message.content !== 'string'
+      && message.content.some(block => block.type === 'tool_result' && turnToolUseIds.has(block.tool_use_id));
+    if (!isToolResultForThisTurn) return i;
+  }
+  return -1;
+}
+
+function compactMixedMessageText(messages: LLMMessage[], opts: CompactLiveMessagesOptions, includeSeparate = false): { messages: LLMMessage[]; reason: string } | null {
+  if (opts.archiveEnabled === false) return null;
+  const sessionId = opts.sessionId ?? 'default';
+  const dir = opts.archiveDir ?? getDefaultArchiveDir();
+  let changed = false;
+  const currentUserIndex = currentUserTextIndex(messages);
+  const compactText = (text: string, messageIndex: number, blockIndex?: number): string => {
+    if (text.length <= 8_000) return text;
+    const hash = createHash('sha256').update(text, 'utf16le').digest('hex');
+    const pointer = `[Full text (${text.length} chars) saved to: ${archiveReferencePath(sessionId, dir)}] [message index: ${messageIndex}${blockIndex === undefined ? '' : `, block index: ${blockIndex}`}] [sha256-utf16le: ${hash}]\n`;
+    const replacement = pointer + truncateProportional({ text, maxChars: Math.max(0, 8_000 - pointer.length) });
+    if (replacement.length >= text.length || !appendArchiveEntry({
+      ts: Date.now(), layer: 'truncate-proportional', sessionId,
+      origin: { kind: 'truncated_tail', messageIndex }, content: text, replacement,
+    }, dir)) return text;
+    changed = true;
+    return replacement;
+  };
+  const result = messages.map((message, index) => {
+    if (message.role === 'system' || index === currentUserIndex) return message;
+    if (typeof message.content === 'string') {
+      return includeSeparate ? { ...message, content: compactText(message.content, index) } : message;
+    }
+    if (!includeSeparate && !message.content.some(block => block.type === 'tool_result')) return message;
+    return { ...message, content: message.content.map((block, blockIndex) => block.type === 'text'
+      ? { ...block, text: compactText(block.text, index, blockIndex) } : block) };
+  });
+  return changed ? { messages: result, reason: 'mixed-message-text-compact' } : null;
 }
 
 /** Compact a live message list. Returns `null` when no layer changed anything. */
@@ -49,6 +131,8 @@ export async function compactLiveMessages(
   messages: LLMMessage[],
   opts: CompactLiveMessagesOptions,
 ): Promise<{ messages: LLMMessage[]; reason: string } | null> {
+  const mixed = compactMixedMessageText(messages, opts);
+  if (mixed) return mixed;
   let run = opts.runCompactPipeline;
   let provider: CompactProvider | undefined;
   if (!run) {
@@ -62,6 +146,7 @@ export async function compactLiveMessages(
     policy: {
       ...(opts.preserveLastN !== undefined ? { preserveLastN: opts.preserveLastN } : {}),
       ...(opts.archiveEnabled !== undefined ? { archiveEnabled: opts.archiveEnabled } : {}),
+      ...(opts.archiveDir !== undefined ? { archiveDir: opts.archiveDir } : {}),
     },
   });
   const diagnostics = compacted.diagnostics;
@@ -87,16 +172,75 @@ export interface CreateRequestSizeGuardOptions {
   onMeasured?: (measurement: RequestSizeMeasurement) => void;
 }
 
+function preservesActiveInstructions(before: LLMMessage[], after: LLMMessage[]): boolean {
+  const currentUser = before[currentUserTextIndex(before)];
+  const candidates = before.filter(message => (message.role === 'system'
+    && (message as LLMMessage & { transientPreamble?: boolean }).transientPreamble !== true)
+    || message === currentUser);
+  const sameProtectedContent = (left: LLMMessage, right: LLMMessage) =>
+    left.role === right.role && JSON.stringify(left.content) === JSON.stringify(right.content);
+  // A transient preamble and historical system message may intentionally
+  // have identical content. If provenance was stripped by a caller, one
+  // surviving copy still preserves that instruction; don't require twins.
+  const protectedMessages = candidates.filter((message, index) =>
+    candidates.findIndex(candidate => sameProtectedContent(candidate, message)) === index);
+  let cursor = 0;
+  for (const message of after) {
+    if (cursor < protectedMessages.length && sameProtectedContent(message, protectedMessages[cursor]!)) cursor++;
+  }
+  return cursor === protectedMessages.length;
+}
+
 export function createRequestSizeGuard(opts: CreateRequestSizeGuardOptions): RequestSizeGuard {
   let measuredProviderRequests = 0;
   return {
     maxChars: opts.maxChars ?? REQUEST_SIZE_MAX_CHARS,
     compactMessages: async (currentMessages, info) => {
+      const hasToolResults = currentMessages.some(message => Array.isArray(message.content)
+        && message.content.some(block => block.type === 'tool_result'));
+      if (hasToolResults) {
+        const mixed = compactMixedMessageText(currentMessages, opts.compactOptions(), true);
+        return mixed;
+      }
       if (measuredProviderRequests === 0 && opts.compactFirstRequest) {
         const first = await opts.compactFirstRequest(currentMessages, info);
-        if (first) return first;
+        if (first && preservesActiveInstructions(currentMessages, first.messages)) return first;
       }
-      return compactLiveMessages(currentMessages, opts.compactOptions());
+      const result = await compactLiveMessages(currentMessages, opts.compactOptions());
+      return result && preservesActiveInstructions(currentMessages, result.messages) ? result : null;
+    },
+    compactNext: async (messages, startIndex) => {
+      const options = opts.compactOptions();
+      if (options.archiveEnabled === false) return null;
+      const sessionId = options.sessionId ?? 'default';
+      const dir = options.archiveDir ?? getDefaultArchiveDir();
+      const archived = inspectArchive(sessionId, dir).entries;
+      let index = 0;
+      for (let i = 0; i < messages.length; i++) {
+        const message = messages[i]!;
+        if (!Array.isArray(message.content)) continue;
+        for (let j = 0; j < message.content.length; j++) {
+          const block = message.content[j]!;
+          if (block.type !== 'tool_result') continue;
+          const currentIndex = index++;
+          if (currentIndex < startIndex || typeof block.content !== 'string') continue;
+          if (archived.some(entry => entry.origin.kind === 'tool_result'
+            && entry.origin.tool_use_id === block.tool_use_id && entry.replacement === block.content)) continue;
+          const contentHash = createHash('sha256').update(block.content, 'utf16le').digest('hex');
+          const replacement = `[Full output (${block.content.length} chars) saved to: ${archiveReferencePath(sessionId, dir)}] [tool_use_id: ${block.tool_use_id}] [sha256-utf16le: ${contentHash}]`;
+          if (!appendArchiveEntry({
+            ts: Date.now(), layer: 'tool-output-budget', sessionId,
+            origin: { kind: 'tool_result', tool_use_id: block.tool_use_id },
+            content: block.content, replacement,
+          }, dir)) continue;
+          const content = message.content.slice();
+          content[j] = { ...block, content: replacement };
+          const candidate = messages.slice();
+          candidate[i] = { ...message, content };
+          return { messages: candidate, reason: 'archive-tool-result', nextIndex: currentIndex + 1 };
+        }
+      }
+      return null;
     },
     onMeasured: (measurement) => {
       measuredProviderRequests += 1;

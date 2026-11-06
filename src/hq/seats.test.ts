@@ -79,7 +79,8 @@ test('empty HOME: init → seat → work new → merge into bare remote → done
     { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
   expect(created.status, created.stderr).toBe(0);
   expect(created.stdout).toContain('*/5 * * * *');
-  expect(created.stdout).toContain('fetch origin');
+  expect(created.stdout).toContain('--refresh --root');
+  expect(created.stdout).not.toContain(' fetch origin &&');
   // cron's minimal PATH: the refresh command is named by absolute runtime and CLI paths, not a bare `elanous`.
   expect(created.stdout).toContain(`'${process.execPath}' '${cli}' hq seat TC --refresh`);
   expect(created.stdout).not.toContain('|| elanous ');
@@ -850,6 +851,93 @@ test('failed initial fetch can be retried after the bare remote becomes availabl
   expect(retried.status, retried.stderr).toBe(0);
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', 'refs/remotes/origin/main'])).toBe(git(['rev-parse', 'HEAD'], seed));
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).home.path).toBe(join(home, 'test-state'));
+}, 120_000);
+
+test('mirror fetch tracks main only and removes stale remote-tracking branch refs', () => {
+  const root = join(home, 'elanous-hq');
+  git(['switch', '-c', 'feature/pr-123'], seed);
+  writeFileSync(join(seed, 'feature'), 'branch-only\n');
+  git(['add', 'feature'], seed);
+  git(['commit', '-m', 'feature branch'], seed);
+  git(['push', 'origin', 'feature/pr-123'], seed);
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  const repo = join(root, 'repo.git');
+  expect(git(['--git-dir', repo, 'config', '--get-all', 'remote.origin.fetch'])).toBe('+refs/heads/main:refs/remotes/origin/main');
+  expect(git(['--git-dir', repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin'])).toBe('refs/remotes/origin/main');
+  expect(git(['--git-dir', repo, 'rev-parse', '--verify', 'refs/remotes/origin/main'])).toBe(git(['--git-dir', repo, 'rev-parse', '--verify', 'FETCH_HEAD']));
+  // A pre-existing mirror from the wildcard-fetch implementation must be migrated too.
+  git(['--git-dir', repo, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*']);
+  git(['--git-dir', repo, 'config', '--add', 'remote.origin.fetch', '+refs/tags/*:refs/tags/*']);
+  git(['--git-dir', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  git(['--git-dir', repo, 'fetch', 'origin']);
+  expect(git(['--git-dir', repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin'])).toContain('refs/remotes/origin/feature/pr-123');
+  const repeated = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(repeated.status, repeated.stderr).toBe(0);
+  expect(git(['--git-dir', repo, 'config', '--get-all', 'remote.origin.fetch'])).toBe('+refs/heads/main:refs/remotes/origin/main');
+  expect(git(['--git-dir', repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin'])).toBe('refs/remotes/origin/main');
+  expect(git(['--git-dir', repo, 'rev-parse', 'refs/remotes/origin/main'])).toBe(git(['rev-parse', 'refs/remotes/origin/main'], seed));
+}, 120_000);
+
+test('remote seat lifecycle runs on the selected SSH host and records its host without copying credentials', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  const help = hq('seat', '--help');
+  expect(help.status, help.stderr).toBe(0);
+  expect(help.stdout).toContain('--host <host>');
+  expect(help.stdout).toContain('--delete');
+  const calls: { host: string; script: string }[] = [];
+  const outcomes = ['created', 'refreshed', 'removed'];
+  const ssh = (host: string, script: string) => {
+    calls.push({ host, script });
+    return { status: 0, stdout: `HQ_SEAT_RESULT=${outcomes[calls.length - 1]}\n`, stderr: '' };
+  };
+  const created = hqSeat('OP', { root, host: 'mshq', home: join(home, 'config'), ssh });
+  expect(created).toEqual({ path: 'mshq:~/elanous-hq/seats/OP', outcome: 'created' });
+  expect(calls[0]?.host).toBe('mshq');
+  expect(calls[0]?.script).toContain('git clone --bare --filter=blob:none --single-branch --branch main');
+  expect(calls[0]?.script).toContain('+refs/heads/main:refs/remotes/origin/main');
+  expect(calls[0]?.script).toContain('gh auth setup-git');
+  expect(calls[0]?.script.indexOf('gh auth setup-git')).toBeLessThan(calls[0]?.script.indexOf('git clone --bare'));
+  const callerOrigin = git(['remote', 'get-url', 'origin'], process.cwd());
+  expect(calls[0]?.script).toContain(`git clone --bare --filter=blob:none --single-branch --branch main '${callerOrigin}'`);
+  expect(calls[0]?.script).toContain(`if [ "$remote_origin" != '${callerOrigin}' ]; then`);
+  expect(calls[0]?.script).toContain('worktree add --detach');
+  expect(calls[0]?.script).not.toMatch(/auth\.json|scp .*codex|cp .*credential/i);
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats.OP).toEqual({ host: 'mshq', path: '~/elanous-hq/seats/OP' });
+
+  const refreshed = hqSeat('OP', { root, refresh: true, ssh });
+  expect(refreshed.outcome).toBe('refreshed');
+  expect(calls[1]?.host).toBe('mshq');
+  expect(calls[1]?.script).toContain('merge-base --is-ancestor');
+  expect(calls[1]?.script).toContain('checkout --detach refs/remotes/origin/main');
+
+  const removed = hqSeat('OP', { root, delete: true, ssh });
+  expect(removed.outcome).toBe('removed');
+  expect(calls[2]?.script).toContain('worktree remove "$path"');
+  expect(calls[2]?.script).not.toContain('worktree remove --force');
+  expect(calls[2]?.script).toContain('--ignored=matching');
+  expect(calls[2]?.script).toContain('symbolic-ref --quiet HEAD');
+  expect(calls[2]?.script).toContain('merge-base --is-ancestor');
+  expect(calls[2]?.script).not.toContain('gh auth setup-git');
+  expect(calls[2]?.script).not.toContain('fetch --prune');
+  expect(calls[2]?.script).not.toContain('config --replace-all remote.origin.fetch');
+  expect(calls[2]?.script).not.toContain('update-ref --no-deref -d');
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats?.OP).toBeUndefined();
+}, 120_000);
+
+test('remote seat preserves SSH failure text and does not register a failed create', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  expect(() => hqSeat('OP', { root, host: 'mshq', ssh: () => ({ status: 255, stdout: 'stdout detail', stderr: 'ssh: connect timed out' }) }))
+    .toThrow('stderr:\nssh: connect timed out\nstdout:\nstdout detail');
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats?.OP).toBeUndefined();
 }, 120_000);
 
 test('dirty seat --refresh preserves bytes and HEAD with rc 0 and one warning', () => {

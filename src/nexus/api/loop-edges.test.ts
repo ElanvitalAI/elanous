@@ -9,13 +9,150 @@ import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from './event-bus.js';
 import { startNexusHttpServer } from './http-server.js';
-import { handleLoopEdgesGet, type LoopEdge } from './loop-edges.js';
+import { createLoopEdgesDataSource, handleLoopEdgesGet, type LoopEdge } from './loop-edges.js';
 import type { SeatRequestRow } from '../../seat-dispatch/seat-request-ledger.js';
 
 const now = new Date().toISOString();
 const earlier = new Date(Date.now() - 60_000).toISOString();
 const since = new Date(Date.now() - 120_000).toISOString();
 const path = `http://nexus.test/v1/loops/edges?since=${encodeURIComponent(since)}&limit=20`;
+
+test('async data source serves a memory snapshot, coalesces refresh, and retains stale data during refresh', async () => {
+  let clock = Date.now();
+  let reads = 0;
+  const events = [{ id: 'cached-coord', at: now, kind: '요청', text: 'PRIVATE-CACHED-BODY', summary: 'PRIVATE-CACHED-SUMMARY',
+    refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } }];
+  const request = new Request(path);
+  const source = createLoopEdgesDataSource({ ttlMs: 10, now: () => clock, deps: {
+    listCoord: () => { reads++; return events; },
+    listCards: () => [], listRunStarts: () => [], seatIds: () => ['OP', 'UX'],
+  } });
+
+  expect(await source.read(request).json()).toEqual({ edges: [] });
+  source.read(request);
+  expect(reads).toBe(0);
+  await source.waitForRefresh(request);
+  expect(reads).toBe(1);
+  const warm = await source.read(request).json() as { edges: LoopEdge[] };
+  expect(warm.edges).toEqual([{ at: now, kind: 'request', from: 'OP', to: 'UX', ref: 'cached-coord' }]);
+
+  events[0] = { ...events[0]!, id: 'next-coord' };
+  clock += 10;
+  expect(await source.read(request).json()).toEqual(warm);
+  source.read(request);
+  expect(reads).toBe(1);
+  await source.waitForRefresh(request);
+  expect(reads).toBe(2);
+  expect(await source.read(request).json()).toMatchObject({ edges: [{ ref: 'next-coord' }] });
+
+  const historicAt = '1960-01-01T00:00:00.000Z';
+  const historicRequest = new Request('http://nexus.test/v1/loops/edges?since=1900-01-01T00%3A00%3A00.000Z&ref=historic-edge&limit=500');
+  const historicSource = createLoopEdgesDataSource({ deps: {
+    listCoord: () => [{ id: 'historic-edge', at: historicAt, kind: '요청', text: '', summary: '',
+      refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } }],
+    listCards: () => [], listRunStarts: () => [], seatIds: () => ['OP', 'UX'],
+  } });
+  await historicSource.read(historicRequest).json();
+  await historicSource.waitForRefresh(historicRequest);
+  expect(await historicSource.read(historicRequest).json()).toMatchObject({ edges: [{ at: historicAt, ref: 'historic-edge' }] });
+});
+
+test('implicit recent-window reads share a stable TTL projection while keeping each exact since', async () => {
+  let clock = Date.parse('2026-01-01T01:00:15.000Z');
+  let reads = 0;
+  const request = new Request('http://nexus.test/v1/loops/edges?limit=10');
+  const source = createLoopEdgesDataSource({ now: () => clock, deps: {
+    listCoord: () => {
+      reads++;
+      return [{ id: 'window-event', at: new Date(clock).toISOString(), kind: '요청', text: '', summary: '',
+        refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } }];
+    },
+    listCards: () => [], listRunStarts: () => [], seatIds: () => ['OP', 'UX'],
+  } });
+  await source.read(request).json();
+  await source.waitForRefresh(request);
+  const warm = await source.read(request).json();
+  expect(warm).toMatchObject({ edges: [{ ref: 'window-event' }] });
+  clock += 500;
+  expect(await source.read(request).json()).toMatchObject({ edges: [{ ref: 'window-event' }] });
+  expect(reads).toBe(1);
+  source.close();
+});
+
+test('default-window filtering precedes the public cap with offset timestamps in inverse lexical order', async () => {
+  const clock = Date.parse('2026-01-01T01:00:15.000Z');
+  const oldButLexicallyNewerAt = '2026-01-01T00:01:00+00:01'; // 00:00:00Z, before the exact 00:00:15Z window start.
+  const inWindowAt = '2026-01-01T00:00:20.000Z';
+  expect(Date.parse(oldButLexicallyNewerAt)).toBeLessThan(Date.parse(inWindowAt));
+  expect(oldButLexicallyNewerAt.localeCompare(inWindowAt)).toBeGreaterThan(0);
+  const events = Array.from({ length: 500 }, (_, index) => ({ id: `pre-window-${index}`, at: oldButLexicallyNewerAt,
+    kind: '요청', text: '', summary: '', refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } }));
+  events.push({ id: 'in-window', at: inWindowAt, kind: '요청', text: '', summary: '',
+    refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } });
+  const request = new Request('http://nexus.test/v1/loops/edges?limit=1');
+  const source = createLoopEdgesDataSource({ now: () => clock, deps: {
+    listCoord: () => events, listCards: () => [], listRunStarts: () => [], seatIds: () => ['OP', 'UX'],
+  } });
+  source.read(request);
+  await source.waitForRefresh(request);
+  expect(await source.read(request).json()).toMatchObject({ edges: [{ ref: 'in-window' }] });
+  source.close();
+});
+
+test('async projection preserves an explicit year-zero since value', async () => {
+  const historicAt = '0000-01-01T00:00:00.000Z';
+  const requestUrl = new URL('http://nexus.test/v1/loops/edges');
+  requestUrl.search = new URLSearchParams({ since: '0000-01-01T00:00:00+01:00', limit: '10' }).toString();
+  const request = new Request(requestUrl);
+  const source = createLoopEdgesDataSource({ deps: {
+    listCoord: () => [{ id: 'year-zero-edge', at: historicAt, kind: '요청', text: '', summary: '',
+      refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } }],
+    listCards: () => [], listRunStarts: () => [], seatIds: () => ['OP', 'UX'],
+  } });
+
+  await source.read(request).json();
+  await source.waitForRefresh(request);
+  expect(await source.read(request).json()).toMatchObject({ edges: [{ at: historicAt, ref: 'year-zero-edge' }] });
+});
+
+test('async projection applies the caller time window before its 500-edge cap across mixed offsets', async () => {
+  const since = '2026-01-01T00:00:00.000Z';
+  const request = new Request(`http://nexus.test/v1/loops/edges?since=${encodeURIComponent(since)}&limit=1`);
+  const events = Array.from({ length: 501 }, (_, index) => {
+    const at = new Date(Date.parse(since) - (index + 1) * 1_000).toISOString();
+    return { id: `old-${index}`, at, kind: '요청', text: '', summary: '',
+      refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } };
+  });
+  events.push({ id: 'in-window-offset', at: '2026-01-01T01:00:00+01:00', kind: '요청', text: '', summary: '',
+    refs: { seat: 'OP', recipients: ['UX'], all: false, kind: '요청', slot: null, deadline: null, url: null } });
+  const source = createLoopEdgesDataSource({ deps: { listCoord: () => events, listCards: () => [], listRunStarts: () => [], seatIds: () => ['OP', 'UX'] } });
+  source.read(request);
+  await source.waitForRefresh(request);
+  expect(await source.read(request).json()).toMatchObject({ edges: [{ ref: 'in-window-offset' }] });
+  source.close();
+});
+
+test('worker construction failure releases the queued refresh and allows retry', async () => {
+  let failed = 0;
+  const source = createLoopEdgesDataSource({ createWorker: () => { throw new Error('synthetic worker constructor failure'); }, onRefreshWorkFailed: () => { failed++; } });
+  const request = new Request(path);
+  source.read(request);
+  await source.waitForRefresh(request);
+  expect(failed).toBe(1);
+  source.read(request);
+  await source.waitForRefresh(request);
+  expect(failed).toBe(2);
+  source.close();
+});
+
+test('closing settles a refresh reserved on its timer before worker creation', async () => {
+  const source = createLoopEdgesDataSource({ createWorker: () => { throw new Error('must be canceled before worker creation'); } });
+  const request = new Request(path);
+  source.read(request);
+  const refresh = source.waitForRefresh(request);
+  source.close();
+  await refresh;
+});
 
 test('three persisted sources yield only timestamp, kind, endpoints and reference, without source prose', async () => {
   const root = mkdtempSync(join(tmpdir(), 'loop-edges-'));

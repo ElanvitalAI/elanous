@@ -7,6 +7,7 @@
 | Command | What it does |
 |---|---|
 | `elanous start` | One command to begin: finds a model, starts the background service if needed and opens the web app (`--tui` for the terminal UI) |
+| `elanous bootstrap` | First-run repair: installs the safe `gh`, `rg`, and Codex tools, fixes the `PATH` block, and prints any manual system packages |
 | `elanous doctor` | Report which credentials resolve and from where, plus a readiness section (provider, `gh` sign-in, `PATH`, background service version, Linux `TMPDIR`) — `--json` for machines |
 | `elanous doctor --fix` / `--fix --yes` | Show / apply the reversible repairs (the `PATH` block, key-cache permissions, the Linux `TMPDIR` block); startup files are backed up first. A missing git is offered interactively on a terminal; everything else needs `--yes` |
 | `elanous setup` | Walk through missing setup steps (`--non-interactive` only reports) |

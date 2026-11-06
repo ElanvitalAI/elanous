@@ -25,7 +25,7 @@
 import type { ChatMessage } from '../chat/index.js';
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
 import type { RunCompactPipeline } from '../session/request-size-guard.js';
-import type { CoreTurnDispatchTool } from '../core-turn/index.js';
+import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import {
   DashboardSession,
   type DashboardRequestPermissionHandler,
@@ -114,7 +114,7 @@ export interface DashboardAcpBootDeps {
    *  Phase 5a — receives `{ userText }` so the caller can reuse the
    *  dashboard's per-turn impl-discipline + surface guidance builders
    *  (both branch on user text). */
-  getPreamble(ctx: { sessionId: string; userText: string }): readonly LLMMessage[];
+  getPreamble(ctx: { sessionId: string; userText: string }): readonly LLMMessage[] | Promise<readonly LLMMessage[]>;
   /** Current turn's tool catalog (tier-split active set). Return `[]`
    *  for text-only turns; the bridge falls through to plain
    *  streamLLM.
@@ -254,15 +254,15 @@ export async function bootDashboardAcpSession(
   const opts: DashboardSessionOptions = {
     cwd: deps.getCwd(),
     tuiRouting: true,
-    getMessages: ({ sessionId, userText }) => {
+    getMessages: async ({ sessionId, userText }) => {
       // Failed/canceled turns can skip completion. Retire both transient
       // user markers and per-turn preambles before the next serialized turn.
       clearActiveTurnMarker();
       clearTurnPreambles(sessionId);
-      const preamble = deps.getPreamble({ sessionId, userText })
+      const preamble = (await deps.getPreamble({ sessionId, userText }))
         .map(message => ({ ...message, transientPreamble: true as const }));
       turnPreambles.set(turnKey(sessionId, userText), preamble);
-      return buildTurnMessages(deps, sessionId, userText, preamble);
+      return await buildTurnMessages(deps, sessionId, userText, preamble);
     },
     getTools: ({ sessionId, userText }) => {
       const tools = [...deps.getTools({ userText })];
@@ -535,13 +535,13 @@ function isCurrentDashboardUser(
       && typeof block.text === 'string' && block.text === userText));
 }
 
-function buildTurnMessages(
+async function buildTurnMessages(
   deps: DashboardAcpBootDeps,
   sessionId: string,
   userText: string,
   turnPreamble?: readonly LLMMessage[],
-): LLMMessage[] {
-  const preamble = [...(turnPreamble ?? deps.getPreamble({ sessionId, userText }))];
+): Promise<LLMMessage[]> {
+  const preamble = [...(turnPreamble ?? await deps.getPreamble({ sessionId, userText }))];
   const history = [...deps.getChatHistory()] as unknown as LLMMessage[];
   // If the caller already appended the current user text to history,
   // the last entry IS `{ role:'user', content: userText }` and we

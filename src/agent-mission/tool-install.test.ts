@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createFakeExecutableDevice } from '../ux-sim/fake-bin.js';
 import { detectAgentCli, installMissingTool, prepareAgentCli, smokeCheck, SMOKE_CHECKS, waitForPtyCompletion, type ToolInstallDeps } from './tool-install.js';
 import { remediesFor, toolInstallLine } from '../cli/doctor-distro.js';
 
@@ -208,6 +209,33 @@ test('default installer runs asynchronously and rechecks the fake CLI before res
     expect(order).toEqual(['timer', 'verified']);
   } finally {
     rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test('AGENT-ENV-OSS-INSTALL-SIM: production installer installs a CLI fixture through the bounded fake npm device', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'agent-cli-install-sim-')));
+  const prefix = join(root, 'npm-prefix');
+  const outside = join(root, 'outside');
+  const npm = createFakeExecutableDevice({
+    npm: { installArtifacts: { prefixEnv: 'NPM_CONFIG_PREFIX', prefix, argv: ['install', '-g', '@openai/codex@latest'], files: [{ path: 'bin/codex', contents: '#!/bin/sh\ncase "$1" in\n  --version) echo "Codex 9.8.7" ;;\n  login) echo "Logged in using ChatGPT" ;;\n  *) exit 2 ;;\nesac\n' }] } },
+  });
+  try {
+    const env = { ...process.env, PATH: npm.path(join(prefix, 'bin')), HOME: root, NPM_CONFIG_PREFIX: prefix };
+    const outsideWrite = npm.run('npm', ['install', '-g', '@openai/codex@latest'], { env: { ...env, NPM_CONFIG_PREFIX: outside } });
+    expect(outsideWrite.status).toBe(78);
+    expect(existsSync(join(outside, 'bin/codex'))).toBe(false);
+    const result = await prepareAgentCli('codex', {
+      env,
+      confirmInstall: async (prompt) => prompt.includes('@openai/codex@latest'),
+    });
+    expect(result).toMatchObject({ ready: true, installation: 'installed', detection: { installed: true, version: '9.8.7', login: 'ready' } });
+    expect(npm.calls()).toEqual([
+      { name: 'npm', argv: ['install', '-g', '@openai/codex@latest'] },
+      { name: 'npm', argv: ['install', '-g', '@openai/codex@latest'] },
+    ]);
+  } finally {
+    npm.cleanup();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

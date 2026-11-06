@@ -3,23 +3,25 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as llm from '../llm.js';
-import { getUserConfig, resolveRoleLlm } from '../user-config.js';
+import { clearLaunchRoleLlmOverrides, getUserConfig, resolveRoleLlm, setLaunchRoleLlmOverrides } from '../user-config.js';
 import { defaultSeams } from './seams.js';
 
 test('goal summary passes classify usage role alongside the unchanged resolved model', async () => {
   const root = mkdtempSync(join(tmpdir(), 'goal-summary-usage-role-'));
-  const goalFile = join(root, 'goal.md');
-  writeFileSync(goalFile, '# Existing goal\n\nSummarize this goal.\n');
-  const resolved = resolveRoleLlm('classify');
-  const expectedProvider = llm.getProviderForConfig({
-    ...getUserConfig(), llm: { ...getUserConfig().llm, provider: resolved.provider, model: resolved.model },
-  });
-  const calls: Array<{ model?: string; provider?: { name: string }; reasoningEffort?: string; signal?: AbortSignal; usageRole?: string }> = [];
-  const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, _onChunk, opts) => {
-    calls.push(opts ?? {});
-    return 'A concise summary.';
-  });
+  let stream: { mockRestore: () => void } | undefined;
   try {
+    const goalFile = join(root, 'goal.md');
+    writeFileSync(goalFile, '# Existing goal\n\nSummarize this goal.\n');
+    setLaunchRoleLlmOverrides({ classify: { provider: 'openai-codex', model: 'gpt-5.1' } });
+    const resolved = resolveRoleLlm('classify');
+    const expectedProvider = llm.getProviderForConfig({
+      ...getUserConfig(), llm: { ...getUserConfig().llm, provider: resolved.provider, model: resolved.model },
+    });
+    const calls: Array<{ model?: string; provider?: { name: string }; reasoningEffort?: string; signal?: AbortSignal; usageRole?: string }> = [];
+    stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, _onChunk, opts) => {
+      calls.push(opts ?? {});
+      return 'A concise summary.';
+    });
     expect(await defaultSeams().synthesizeGoalContext!({ goalFile })).toEqual({
       goalTitle: 'Existing goal',
       goalDescription: 'A concise summary.',
@@ -31,7 +33,8 @@ test('goal summary passes classify usage role alongside the unchanged resolved m
     });
     expect(calls[0]?.signal).toBeInstanceOf(AbortSignal);
   } finally {
-    stream.mockRestore();
+    stream?.mockRestore();
+    clearLaunchRoleLlmOverrides();
     rmSync(root, { recursive: true, force: true });
   }
 });

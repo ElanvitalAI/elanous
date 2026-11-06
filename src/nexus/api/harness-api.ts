@@ -37,7 +37,7 @@ const ASK_STATUS_EVENT_TO_PHASE = {
 const ASK_STATUS_EVENTS = new Set<string>(Object.keys(ASK_STATUS_EVENT_TO_PHASE));
 const ACCEPTED_ASK_REGISTRY_LIMIT = 1_000;
 const acceptedAskIssuedAt = new Map<string, number>();
-const RUNNING_RUNS_HTTP_CACHE_TTL_MS = 120_000; // 0.3.4: federated 스캔 25~34초 — 3초는 매번 놓쳤다
+const RUNNING_RUNS_HTTP_CACHE_TTL_MS = 3_000;
 const runningRunsHttpCache = new WeakMap<typeof queryRunningRuns, { at: number; result: RunningRunsResult; body: string }>();
 
 export function rememberAcceptedAsk(acceptanceId: string, issuedAt = Date.now()): void {
@@ -129,7 +129,7 @@ function cachedRunningRuns(query: typeof queryRunningRuns, now: () => number): {
   const cached = runningRunsHttpCache.get(query);
   const requestedAt = now();
   if (cached && requestedAt - cached.at < RUNNING_RUNS_HTTP_CACHE_TTL_MS) return cached;
-  const result = query({ includeTest: false, timeBudgetMs: 3_000 }); // PWA 런 목록 — federated 스캔이 25~34초라 3초 예산 안의 부분 결과로 답한다
+  const result = query({ includeTest: false });
   const snapshot = { at: now(), result, body: JSON.stringify(result) };
   runningRunsHttpCache.set(query, snapshot);
   return snapshot;

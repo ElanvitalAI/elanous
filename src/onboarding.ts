@@ -46,7 +46,6 @@ import { loginWithCodex, CODEX_DEVICE_LOGIN_URL } from './oauth/codex.js';
 import { loginWithCodexBrowser } from './oauth/codex-browser-login.js';
 import { loadTokens } from './oauth/store.js';
 import { browserUnavailableReason } from './oauth/browser-availability.js';
-import { TelegramBot } from './telegram.js';
 import { DiscordBot } from './discord.js';
 import { pickCodexAuthMode, pickCodexModel } from './codex/setup.js';
 import { getInventory, resolveBaseUrl } from './llm/local-manager/manager.js';
@@ -1045,6 +1044,7 @@ async function askTelegram(
           const shapeErr = validateTelegramToken()(t);
           if (shapeErr) return shapeErr as string;
           try {
+            const { TelegramBot } = await import('./telegram.js');
             const bot = new TelegramBot({
               token: t, allowedUsers: [], onMessage: async () => undefined,
               fetchImpl: deps.fetchImpl,

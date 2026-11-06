@@ -1,6 +1,6 @@
 // NEXUS · /v1/registry/bindings/* HTTP routes (Phase N-3.5 PR τ)
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   setBinding,
   getBinding,

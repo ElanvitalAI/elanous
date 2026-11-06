@@ -1,7 +1,9 @@
 import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createFakeExecutableDevice } from '../ux-sim/fake-bin.js';
 import { extractInstallLines, installFromDocs, type DocInstallDeps } from './doc-guided-install.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -87,6 +89,44 @@ globalThis.fetch = async (input) => {
     expect(f.decisions.map((d) => d.split(':')[0])).toEqual(['ROUTE', 'ROUTE', 'VERIFY']);
     expect(f.decisions[0]).toContain('miller.readthedocs.io');
     expect(f.events).toEqual(['searched', 'picked-source', 'fetched', 'extracted', 'chosen', 'installed']);
+  });
+
+  test('AGENT-ENV-OSS-INSTALL-SIM: document-guided setup runs the chosen installer and smoke-checks its installed fixture', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'doc-install-sim-')));
+    const codexDoc = 'https://developers.openai.com/codex/cli/';
+    const prefix = join(root, 'prefix');
+    const npm = createFakeExecutableDevice({
+      npm: { installArtifacts: { prefixEnv: 'NPM_CONFIG_PREFIX', prefix, argv: ['install', '-g', '@openai/codex@latest'], files: [{ path: 'bin/codex', contents: '#!/bin/sh\necho Codex fixture\n' }] } },
+    });
+    const typed: string[] = [];
+    const executions: Array<{ line: string; status: number | null; stdout: string; stderr: string }> = [];
+    const env = { ...process.env, NPM_CONFIG_PREFIX: prefix, PATH: npm.path(`${join(prefix, 'bin')}:/usr/bin:/bin:/usr/sbin:/sbin`) };
+    const deps: DocInstallDeps = {
+      search: async () => ({ output: `- [Codex install](${codexDoc})`, metadata: { perEngine: {}, totalHits: 1, merge: 'interleave' } }),
+      scrape: async () => '```sh\nnpm install -g @openai/codex@latest\n```',
+      jina: async () => '',
+      typeLine: (_ref, line) => {
+        typed.push(line);
+        const executed = spawnSync('/bin/sh', ['-c', line], { encoding: 'utf8', env, timeout: 30_000 });
+        executions.push({ line, status: executed.status, stdout: executed.stdout ?? '', stderr: executed.stderr ?? '' });
+      },
+      waitIdle: () => `${executions.at(-1)?.stdout ?? ''}${executions.at(-1)?.stderr ?? ''}`,
+      log: () => {}, decision: () => {},
+    };
+    try {
+      const result = await installFromDocs({ tool: 'codex', smoke: 'codex --version', ptyRef: 'pty-1' }, deps);
+      expect(result).toMatchObject({ outcome: 'installed', line: 'npm install -g @openai/codex@latest' });
+      expect(executions.some((execution) => execution.line.startsWith('npm install -g @openai/codex@latest') && execution.status === 0)).toBe(true);
+      expect(typed.at(-1)).toContain('codex --version');
+      const smokeExecution = executions.at(-1)!;
+      expect(smokeExecution.status).toBe(0);
+      expect(smokeExecution.stdout).toContain('Codex fixture');
+      expect(smokeExecution.stdout).toMatch(/ELANOUS_SMOKE_[A-Fa-f0-9]+_END_0/);
+      expect(npm.calls()).toEqual([{ name: 'npm', argv: ['install', '-g', '@openai/codex@latest'] }]);
+    } finally {
+      npm.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('official docs whose host lacks the binary name still outrank blogs that name the tool', async () => {

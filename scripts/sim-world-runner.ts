@@ -20,7 +20,8 @@ try {
       console.log(JSON.stringify({ networkBlocked: true }));
     }
   } else {
-    const result = await executeWorldScenario(loadWorld(worldId), scenarioFile);
+    const world = loadWorld(worldId);
+    const result = await executeWorldScenario(world, scenarioFile);
     console.log(JSON.stringify(result));
   }
 } catch (error) {

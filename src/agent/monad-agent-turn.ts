@@ -18,7 +18,7 @@ import { existsSync } from 'node:fs';
 import type { UserConfig } from '../user-config.js';
 import { runTurn, type RunTurnOpts } from '../session/chat.js';
 import type { SessionSource } from '../session/index.js';
-import type { CoreTurnDispatchTool } from '../core-turn/index.js';
+import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { buildContinuationAgentTools } from '../dispatch/continuation-turn-runner.js';
 import { buildTerminalCapableTurn } from './terminal-surface.js';
 // ★ turn 조립기 통일 Phase 1(2026-07-22) — 자율tool 5종(delegate·SelfImplement·RelayShell·RunDevHarness·

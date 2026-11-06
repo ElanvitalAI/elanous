@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path/posix';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import { isTestPath } from './importer-test-index.js';
 
 export interface RouteConsumerTestIndex {
@@ -24,11 +25,11 @@ function dynamicRoutePattern(route: string): RegExp | null {
 }
 
 function testStringValues(text: string, path: string): string[] {
-  const ast = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, false);
+  const ast = tsApi.createSourceFile(path, text, tsApi.ScriptTarget.Latest, false);
   const values: string[] = [];
-  const visit = (node: ts.Node): void => {
-    if (ts.isStringLiteralLike(node)) values.push(node.text);
-    ts.forEachChild(node, visit);
+  const visit = (node: TS.Node): void => {
+    if (tsApi.isStringLiteralLike(node)) values.push(node.text);
+    tsApi.forEachChild(node, visit);
   };
   visit(ast);
   return values;
@@ -63,24 +64,24 @@ export function buildRouteConsumerTestIndex(
     if (!source.startsWith('src/') || isTestPath(source) || !/\.[cm]?[jt]sx?$/.test(source)) continue;
     const routes = new Set<string>();
     const collect = (text: string): void => {
-      const ast = ts.createSourceFile(source, text, ts.ScriptTarget.Latest, false);
-      const visit = (node: ts.Node): void => {
-        if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+      const ast = tsApi.createSourceFile(source, text, tsApi.ScriptTarget.Latest, false);
+      const visit = (node: TS.Node): void => {
+        if (tsApi.isCallExpression(node) && tsApi.isPropertyAccessExpression(node.expression)
           && /^(get|post|put|patch|delete|route|register)$/.test(node.expression.name.text)) {
           const path = node.arguments[0];
-          if (path && ts.isStringLiteralLike(path) && ROUTE_RE.test(path.text)) routes.add(path.text);
+          if (path && tsApi.isStringLiteralLike(path) && ROUTE_RE.test(path.text)) routes.add(path.text);
         }
-        if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
-          && /(?:pathname|path)$/.test(node.left.getText(ast)) && ts.isStringLiteralLike(node.right)
+        if (tsApi.isBinaryExpression(node) && node.operatorToken.kind === tsApi.SyntaxKind.EqualsEqualsEqualsToken
+          && /(?:pathname|path)$/.test(node.left.getText(ast)) && tsApi.isStringLiteralLike(node.right)
           && ROUTE_RE.test(node.right.text)) routes.add(node.right.text);
-        if (ts.isVariableDeclaration(node) && /(?:PATH|ROUTE)$/.test(node.name.getText(ast))
-          && node.initializer && ts.isStringLiteralLike(node.initializer)
+        if (tsApi.isVariableDeclaration(node) && /(?:PATH|ROUTE)$/.test(node.name.getText(ast))
+          && node.initializer && tsApi.isStringLiteralLike(node.initializer)
           && ROUTE_RE.test(node.initializer.text)) routes.add(node.initializer.text);
-        if (ts.isCaseClause(node) && ts.isStringLiteralLike(node.expression)
+        if (tsApi.isCaseClause(node) && tsApi.isStringLiteralLike(node.expression)
           && ROUTE_RE.test(node.expression.text)) routes.add(node.expression.text);
-        if (ts.isPropertyAssignment(node) && /^(path|route)$/.test(node.name.getText(ast))
-          && ts.isStringLiteralLike(node.initializer) && ROUTE_RE.test(node.initializer.text)) routes.add(node.initializer.text);
-        ts.forEachChild(node, visit);
+        if (tsApi.isPropertyAssignment(node) && /^(path|route)$/.test(node.name.getText(ast))
+          && tsApi.isStringLiteralLike(node.initializer) && ROUTE_RE.test(node.initializer.text)) routes.add(node.initializer.text);
+        tsApi.forEachChild(node, visit);
       };
       visit(ast);
     };

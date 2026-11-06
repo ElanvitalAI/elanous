@@ -209,6 +209,24 @@ test('idle expiry continues through an elapsed timeout fence', () => {
   });
 });
 
+test('idle Pod expiry atomically reserves only the exact, expired, unleased UID', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-idle-expiry-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const row = ledger.registerPodWorker({ workerId: 'worker-idle-expiry', machine: 'node-c', podUid: 'pod-expiry',
+    key, owner: 'host', ttlMs: 10 }, 100);
+  const expected = { machine: 'node-c', podUid: 'pod-expiry', expectedObservedAt: 100, expectedExpiresAtMs: 110 };
+  expect(() => ledger.expireIdlePodWorker(row.id, expected, 109)).toThrow('pod-worker-not-expired-idle');
+  expect(() => ledger.expireIdlePodWorker(row.id, { ...expected, podUid: 'replacement-uid' }, 110))
+    .toThrow('stale-expired-worker');
+  const expired = ledger.expireIdlePodWorker(row.id, expected, 110);
+  expect(expired).toMatchObject({ observedAt: 110, attrs: { state: 'reaping', reason: 'idle-ttl-expired', podUid: 'pod-expiry' } });
+  expect(() => ledger.acquirePodWorker({ key, owner: 'gate', runId: 'after-expiry', attemptId: 'attempt', ttlMs: 100 }, 110))
+    .toThrow('no-warm-worker');
+  expect(() => ledger.expireIdlePodWorker(row.id, expected, 111)).toThrow('stale-expired-worker');
+});
+
 test('a durable reap reservation blocks a timeout-fence expiry acquisition race', () => {
   const root = mkdtempSync(join(tmpdir(), 'elanous-worker-reap-reservation-'));
   roots.push(root);

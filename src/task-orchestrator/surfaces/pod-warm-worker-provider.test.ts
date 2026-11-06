@@ -114,8 +114,10 @@ test('named slots are independently reconciled and bounded by the measured host 
   }, spec: { nodeName: 'unrelated-node' } });
   const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
   const listQueries: string[][] = [];
+  const occupancyEvents: Array<{ event: string; data: any }> = [];
   const provider = newTestWarmPodProvider({ candidates, controlUrl: 'http://127.0.0.1:31413/',
     memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) },
+    observationRunIdForTest: 'occupancy-run-1',
     kubectl: (args, input) => {
       if (args[4] === 'get' && args[5] === 'pods') {
         listQueries.push([...args]);
@@ -153,7 +155,15 @@ test('named slots are independently reconciled and bounded by the measured host 
       return Response.json({ name: body.workerId, attrs: { state: 'idle', podUid: body.podUid, key } });
     },
   });
+  const occupancyLog = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && event === 'pool-occupancy') occupancyEvents.push({ event, data });
+  }) as typeof debug.log);
   expect(await provider.reconcilePool()).toMatchObject({ target: 2, ready: 2, failed: [] });
+  occupancyLog.mockRestore();
+  expect(occupancyEvents).toHaveLength(1);
+  expect(occupancyEvents[0]!.data).toMatchObject({ schema: 1, profile: 'fixed', host: 'test-host', tier: 'standard',
+    candidateCount: 2, ready: 2, leased: 0, measured: true, runId: 'occupancy-run-1',
+    consumer: 'warm-pod-provider', observedAt: expect.any(String) });
   expect(await provider.reconcilePool()).toMatchObject({ target: 2, ready: 2, failed: [] });
   expect(created).toEqual(['warm-test-host', 'warm-test-host-2']);
   const namespaceRows = [...pods.values()];
@@ -215,6 +225,41 @@ test('named slots are independently reconciled and bounded by the measured host 
   expect(() => newTestWarmPodProvider({ candidates: Array.from({ length: 5 }, (_, index) => ({
     ...candidate, spec: { ...second, name: 'warm-test-host-' + (index + 1), workerId: 'test-host-uid-' + (index + 1) },
   })), controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) })).toThrow('quota');
+});
+
+test('pool occupancy is unmeasured when the lease row is absent or belongs to an older Pod UID', async () => {
+  const currentPodUid = 'current-pod-uid';
+  const manifest = warmWorkerPodManifest(spec);
+  const podMetadata = manifest.metadata as Record<string, unknown>;
+  const pod = { ...manifest, metadata: { ...podMetadata, uid: currentPodUid },
+    status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
+  for (const ledgerCase of ['missing', 'stale-uid'] as const) {
+    const events: any[] = [];
+    const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+      memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) },
+      observationRunIdForTest: `occupancy-${ledgerCase}`,
+      kubectl: args => {
+        if (args[4] === 'get' && args[5] === 'pods') return { status: 0,
+          stdout: JSON.stringify({ kind: 'PodList', metadata: {}, items: [pod] }), stderr: '' };
+        if (args[4] === 'get' && args[5] === spec.name) return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
+        if (args[4] === 'wait') return { status: 0, stdout: '', stderr: '' };
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+      fetch: async () => Response.json({ resources: ledgerCase === 'missing' ? [] : [{
+        name: spec.workerId, kind: 'pod-worker-lease', machine: 'test-host', observedAt: Date.now(), ttlMs: 1_800_000,
+        attrs: { state: 'idle', podUid: 'previous-pod-uid', idleTtlMs: 1_800_000, key },
+      }] }),
+    });
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+      if (category === 'pod.warm' && event === 'pool-occupancy') events.push(data);
+    }) as typeof debug.log);
+    try {
+      expect(await provider.reconcilePool()).toMatchObject({ target: 1, ready: 0, failed: [spec.workerId] });
+    } finally { log.mockRestore(); }
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ candidateCount: 1, ready: null, leased: null,
+      measured: false, runId: `occupancy-${ledgerCase}`, reason: 'occupancy-incomplete' });
+  }
 });
 
 test('reconcile reaps only proven quarantined Pods, rotates IDs persistently, and restores target', async () => {
@@ -1357,9 +1402,10 @@ test('standing producer refuses a replaced Pod without create/delete and registe
     },
   });
   expect(await expired.prepareWorker(prepareSpec.workerId)).toBe(false);
-  expect(expiredCalls).toEqual(['GET /v1/resources']);
+  expect(expiredCalls).toEqual(['GET /v1/resources', 'GET /v1/resources',
+    'POST /v1/leases/pod-worker/warm-test-1-uid/expire']);
 
-  const wrongTtl = newTestWarmPodProvider({ candidates: [prepareCandidate],
+  const priorTtl = newTestWarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
     machineTokens: { 'test-host': '2'.repeat(64) },
     kubectl: args => result(args[5] === 'pods' ? { metadata: {}, items: [pod('new-uid')] } : pod('new-uid')),
@@ -1367,7 +1413,20 @@ test('standing producer refuses a replaced Pod without create/delete and registe
       name: prepareSpec.workerId, observedAt: Date.now(), ttlMs: 60_000,
       attrs: { state: 'idle', podUid: 'new-uid', key, idleTtlMs: 60_000 } }] }),
   });
-  expect(await wrongTtl.prepareWorker(prepareSpec.workerId)).toBe(false);
+  expect(await priorTtl.prepareWorker(prepareSpec.workerId)).toBe(true);
+
+  const injectedClockTtl = newTestWarmPodProvider({ candidates: [prepareCandidate],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { 'test-host': '2'.repeat(64) }, now: () => Date.now() + 120_000,
+    kubectl: args => result(args[5] === 'pods' ? { metadata: {}, items: [pod('new-uid')] } : pod('new-uid')),
+    fetch: async () => Response.json({ resources: [{ kind: 'pod-worker-lease', machine: 'test-host',
+        name: prepareSpec.workerId, observedAt: Date.now(), ttlMs: 60_000,
+        attrs: { state: 'idle', podUid: 'new-uid', key, idleTtlMs: 60_000 } }] }),
+  });
+  const coldPrepareWithInjectedClock = (injectedClockTtl as unknown as {
+    coldPrepare: (candidate: typeof prepareCandidate, outcome: { preexisting: boolean; podUid: string | null }) => Promise<boolean>;
+  }).coldPrepare.bind(injectedClockTtl);
+  expect(await coldPrepareWithInjectedClock(prepareCandidate, { preexisting: true, podUid: 'new-uid' })).toBe(false);
 
   const future = newTestWarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
@@ -1439,6 +1498,96 @@ test('provider retains the lease through gate comparison, then releases and mach
   expect(calls[1]!.token).toBe(`Bearer ${'1'.repeat(64)}`);
   expect(calls[2]!.token).toBe(`Bearer ${'2'.repeat(64)}`);
   expect(calls[1]!.body).toMatchObject({ leaseId: 'lease-1', generation: 1 });
+});
+
+test('lease occupancy transitions carry stable run identity and measured acquisition wait', async () => {
+  const events: Array<{ event: string; data: any }> = [];
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async url => new URL(String(url)).pathname === '/v1/leases/pod-worker'
+      ? Response.json(lease()) : Response.json({ attrs: { state: 'idle' } }),
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  });
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && ['lease-acquire-wait', 'lease-occupancy-transition'].includes(event))
+      events.push({ event, data });
+  }) as typeof debug.log);
+  try {
+    const result = await provider.request(input());
+    expect(result.command).not.toBeNull();
+    await provider.finalize(result.command!);
+  } finally { log.mockRestore(); }
+  expect(events.find(row => row.event === 'lease-acquire-wait')?.data).toMatchObject({
+    schema: 1, profile: 'fixed', host: 'test-host', tier: 'standard', runId: 'run-1',
+    consumer: 'warm-pod-provider', waitMs: expect.any(Number), status: 200, outcome: 'response',
+    measured: true, observedAt: expect.any(String),
+  });
+  expect(events.filter(row => row.event === 'lease-occupancy-transition').map(row => row.data))
+    .toEqual([expect.objectContaining({ state: 'leased', leasedDelta: 1, measured: true, runId: 'run-1' }),
+      expect.objectContaining({ state: 'idle', leasedDelta: -1, measured: true, runId: 'run-1' })]);
+});
+
+test('quarantine with unconfirmed Pod cleanup does not report measured lease release', async () => {
+  const events: Array<{ event: string; data: any }> = [];
+  const baseKubectl = leaseKubectl();
+  let failQuarantinePatch = false;
+  let failedPatchCalls = 0;
+  const kubectl: NonNullable<WarmPodProviderOptions['kubectl']> = args => {
+    if (failQuarantinePatch && args.includes('patch')) {
+      failedPatchCalls += 1;
+      return { status: 1, stdout: '', stderr: 'injected quarantine metadata patch failure' };
+    }
+    return baseKubectl(args);
+  };
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, kubectl,
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      return path === '/v1/leases/pod-worker' ? Response.json(lease()) : Response.json({ attrs: { state: 'quarantined' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  });
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && event === 'lease-occupancy-transition') events.push({ event, data });
+  }) as typeof debug.log);
+  let command: any;
+  try {
+    const result = await provider.request(input());
+    expect(result.command).not.toBeNull();
+    command = result.command;
+    failQuarantinePatch = true;
+    await provider.quarantine(command, 'cleanup-failure');
+    // If a later observation confirms cleanup, the original measured lease must still be paired.
+    (provider as any).logLeaseOccupancyTransition(candidate, command!.leaseId, command!.generation,
+      command!.podUid, 'run-1', 'quarantined');
+  } finally { log.mockRestore(); }
+  expect(failedPatchCalls).toBe(1);
+  expect(events.slice(0, 2).map(row => row.data)).toEqual([
+    expect.objectContaining({ state: 'leased', leasedDelta: 1, measured: true }),
+    expect.objectContaining({ state: 'quarantined', leasedDelta: null, measured: false,
+      reason: 'lease-cleanup-unconfirmed' }),
+  ]);
+  expect(events.at(-1)?.data).toMatchObject({ state: 'quarantined', leasedDelta: -1, measured: true });
+});
+
+test('lease acquisition timeout records a measured wait without inventing occupancy', async () => {
+  const events: Array<{ event: string; data: any }> = [];
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), kubectl: leaseKubectl(),
+    fetch: async () => new Promise<Response>(() => {}),
+  });
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && event === 'lease-acquire-wait') events.push({ event, data });
+  }) as typeof debug.log);
+  try {
+    const replay = await provider.request({ ...input(), deadlineAt: Date.now() + 20 });
+    expect(replay.command).toBeNull();
+    expect(replay.transport.reason).toBe('lease-unavailable');
+  } finally { log.mockRestore(); }
+  expect(events).toHaveLength(1);
+  expect(events[0]!.data).toMatchObject({ schema: 1, profile: 'fixed', host: 'test-host', tier: 'standard',
+    runId: 'run-1', consumer: 'warm-pod-provider', outcome: 'timeout', status: null,
+    measured: true, waitMs: expect.any(Number), observedAt: expect.any(String) });
 });
 
 test('a finalize without matching Pod lease metadata quarantines instead of sanitizing', async () => {

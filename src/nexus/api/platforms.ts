@@ -15,7 +15,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { readUserConfig, readSwitchValue } from '../config/user-config.js';
 import { listSecretIds } from '../config/secrets/index.js';
 import {

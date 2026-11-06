@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { isMainThread, parentPort, workerData, Worker } from 'node:worker_threads';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { listSeatRequests, type SeatRequestRow } from '../../seat-dispatch/seat-request-ledger.js';
 import { listCoordEvents } from '../../context-bus/coord-events.js';
@@ -414,8 +415,21 @@ function journeyIds(ref: string, journey: Journey): Set<string> {
   return ids;
 }
 
+function validLoopEdgesQuery(req: Request, now: number): boolean {
+  const params = new URL(req.url).searchParams;
+  const rawSince = params.get('since');
+  const since = rawSince === null ? (params.has('ref') ? 0 : now - 60 * 60 * 1000) : Date.parse(rawSince);
+  const rawLimit = params.get('limit');
+  const limit = rawLimit === null ? 100 : Number(rawLimit);
+  const ref = params.get('ref');
+  const mode = params.get('mode');
+  return !(rawSince !== null && !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(rawSince)
+    || !Number.isFinite(since) || since > now || !Number.isSafeInteger(limit) || limit < 1 || limit > 500
+    || (ref !== null && !ID.test(ref)) || (mode !== null && mode !== 'live' && mode !== 'shadow'));
+}
+
 /** GET only; project an allowlist of fields from the ledgers. Never serialize ledger records. */
-export function handleLoopEdgesGet(req: Request, deps: LoopEdgesDeps = {}): Response {
+export function handleLoopEdgesGet(req: Request, deps: LoopEdgesDeps = {}, options: { includeAll?: boolean } = {}): Response {
   const params = new URL(req.url).searchParams;
   const rawSince = params.get('since');
   const journeyRef = params.get('ref');
@@ -426,10 +440,7 @@ export function handleLoopEdgesGet(req: Request, deps: LoopEdgesDeps = {}): Resp
   const rawLimit = params.get('limit');
   const limit = rawLimit === null ? 100 : Number(rawLimit);
   const now = Date.now();
-  if (rawSince !== null && !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(rawSince)
-    || !Number.isFinite(since) || since > now || !Number.isSafeInteger(limit) || limit < 1 || limit > 500
-    || (journeyRef !== null && !ID.test(journeyRef))
-    || (handModeFilter !== null && handModeFilter !== 'live' && handModeFilter !== 'shadow')) {
+  if (!validLoopEdgesQuery(req, now)) {
     return jsonResponse({ error: 'usage: GET /v1/loops/edges?since=<ISO>&limit=<1..500>&ref=<card|run|mission id>' }, 400);
   }
   const sinceIso = new Date(since).toISOString();
@@ -500,5 +511,243 @@ export function handleLoopEdgesGet(req: Request, deps: LoopEdgesDeps = {}): Resp
   const out = edges.filter(edge => (!journey || journey.has(edge.ref))
     && (handModeFilter === null || edge.kind !== 'hand' || edge.mode === handModeFilter));
   out.sort((a, b) => b.at.localeCompare(a.at) || a.kind.localeCompare(b.kind) || a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
-  return jsonResponse({ edges: out.slice(0, limit) });
+  return jsonResponse({ edges: options.includeAll ? out : out.slice(0, limit) });
+}
+
+export const LOOP_EDGES_CACHE_TTL_MS = 30_000;
+
+export interface LoopEdgesDataSource {
+  /** Serve a memory snapshot immediately; disk and database projection runs after the response turn. */
+  read(req: Request): Response;
+  /** Resolve after the currently scheduled refresh for this request has completed. */
+  waitForRefresh(req: Request): Promise<void>;
+  close(): void;
+}
+
+export interface LoopEdgesWorkerOptions {
+  ledgerDir?: string;
+  seatIds?: string[];
+  isolatedSources?: boolean;
+}
+
+interface CachedLoopEdgesResponse {
+  body: string;
+  status: number;
+  headers: Headers;
+  at: number;
+}
+
+function loopEdgesProjection(req: Request, now: number, ttlMs: number): { key: string; request: Request; since: number; limit: number } {
+  const url = new URL(req.url);
+  const params = url.searchParams;
+  const rawSince = params.get('since');
+  const ref = params.get('ref');
+  const mode = params.get('mode');
+  const limit = params.has('limit') ? Number(params.get('limit')) : 100;
+  const since = rawSince === null ? (ref === null ? now - 60 * 60 * 1000 : 0) : Date.parse(rawSince);
+  const projected = new URLSearchParams();
+  projected.set('limit', '500');
+  if (ref !== null) {
+    projected.set('ref', ref);
+    projected.set('since', rawSince ?? new Date(0).toISOString());
+  } else if (rawSince === null && ref === null) {
+    // Default moving windows share one projection per cache TTL; read() retains each caller's exact since.
+    const bucketMs = Math.max(ttlMs, LOOP_EDGES_CACHE_TTL_MS);
+    const bucketStart = Math.floor(now / bucketMs) * bucketMs;
+    projected.set('since', new Date(bucketStart - 60 * 60 * 1000).toISOString());
+  } else projected.set('since', rawSince ?? new Date(since).toISOString());
+  if (mode !== null) projected.set('mode', mode);
+  url.search = projected.toString();
+  return { key: `${url.pathname}?${url.searchParams.toString()}`, request: new Request(url), since, limit };
+}
+
+/**
+ * Cache endpoint projections by request URL. A cold request gets an empty snapshot and schedules one
+ * refresh; expired entries remain available while one refresh runs. This keeps all ledger IO out of
+ * the HTTP request path and coalesces concurrent reads of the same projection.
+ */
+export function createLoopEdgesDataSource(options: {
+  deps?: LoopEdgesDeps;
+  ttlMs?: number;
+  now?: () => number;
+  maxEntries?: number;
+  worker?: boolean;
+  workerOptions?: LoopEdgesWorkerOptions;
+  onRefreshWorkStarted?: (isWorkerComputing: () => boolean) => void;
+  onRefreshWorkCompleted?: () => void;
+  onRefreshWorkFailed?: () => void;
+  createWorker?: (url: URL, options: { workerData: unknown }) => Worker;
+} = {}): LoopEdgesDataSource {
+  const deps = options.deps ?? {};
+  const ttlMs = options.ttlMs ?? LOOP_EDGES_CACHE_TTL_MS;
+  const now = options.now ?? Date.now;
+  const maxEntries = options.maxEntries ?? 32;
+  const useWorker = options.worker ?? options.deps === undefined;
+  const values = new Map<string, CachedLoopEdgesResponse>();
+  const pending = new Map<string, Promise<void>>();
+  const queue: Array<{ key: string; req: Request; finish: () => void }> = [];
+  const workers = new Set<Worker>();
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  let closed = false;
+  let refreshing = false;
+  let completeActive: (() => void) | null = null;
+
+  const pump = (): void => {
+    if (refreshing || closed) return;
+    const next = queue.shift();
+    if (!next) return;
+    refreshing = true;
+    const { key, req, finish } = next;
+    let completed = false;
+    const complete = (): void => {
+      if (completed) return;
+      completed = true;
+      pending.delete(key);
+      refreshing = false;
+      if (completeActive === complete) completeActive = null;
+      finish();
+      pump();
+    };
+    completeActive = complete;
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      if (closed) { complete(); return; }
+      if (useWorker) {
+        const workerState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+        let worker: Worker;
+        try {
+          worker = (options.createWorker ?? ((url, workerOptions) => new Worker(url, workerOptions)))(new URL(import.meta.url), {
+            workerData: { kind: 'loop-edges-refresh', url: req.url, workerState: workerState.buffer, ...options.workerOptions },
+          });
+          workers.add(worker);
+        } catch { options.onRefreshWorkFailed?.(); complete(); return; }
+        let settled = false;
+        const finishWorker = (snapshot?: CachedLoopEdgesResponse): void => {
+          if (settled) return;
+          settled = true;
+          workers.delete(worker);
+          if (!snapshot) options.onRefreshWorkFailed?.();
+          if (snapshot && !closed) {
+            values.delete(key);
+            values.set(key, snapshot);
+            while (values.size > maxEntries) values.delete(values.keys().next().value!);
+          }
+          complete();
+          void worker.terminate();
+        };
+        worker.on('message', (message: { stage?: unknown; body?: unknown; status?: unknown; headers?: unknown }) => {
+          if (message.stage === 'started') {
+            options.onRefreshWorkStarted?.(() => Atomics.load(workerState, 0) === 2);
+            worker.postMessage({ stage: 'continue' });
+            return;
+          }
+          if (message.stage === 'working') {
+            worker.postMessage({ stage: 'sample-ready' });
+            return;
+          }
+          if (message.stage === 'computed') { options.onRefreshWorkCompleted?.(); return; }
+          if (typeof message.body !== 'string' || typeof message.status !== 'number') return finishWorker();
+          finishWorker({ body: message.body, status: message.status,
+            headers: new Headers(message.headers as Record<string, string> | undefined), at: now() });
+        });
+        worker.once('error', () => finishWorker());
+        worker.once('exit', () => finishWorker());
+        return;
+      }
+      try {
+        const response = handleLoopEdgesGet(req, deps, { includeAll: true });
+        void response.text().then((body) => {
+          if (closed) return;
+          values.delete(key);
+          values.set(key, { body, status: response.status, headers: new Headers(response.headers), at: now() });
+          while (values.size > maxEntries) values.delete(values.keys().next().value!);
+        }).catch(() => { /* A failed projection leaves the previous snapshot intact. */ }).finally(() => {
+          complete();
+        });
+      } catch {
+        complete();
+      }
+    }, 0);
+    timers.add(timer);
+  };
+
+  const schedule = (key: string, req: Request): void => {
+    if (closed || pending.has(key) || queue.length >= maxEntries) return;
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    pending.set(key, done);
+    queue.push({ key, req, finish });
+    pump();
+  };
+
+  return {
+    read(req) {
+      const requestedAt = now();
+      if (!validLoopEdgesQuery(req, requestedAt)) return handleLoopEdgesGet(req, deps);
+      const projection = loopEdgesProjection(req, requestedAt, ttlMs);
+      const { key } = projection;
+      const cached = values.get(key);
+      if (!cached || now() - cached.at >= ttlMs) schedule(key, projection.request);
+      if (!cached) return jsonResponse({ edges: [] });
+      // Touch the entry so the bounded map evicts least recently used projections first.
+      values.delete(key);
+      values.set(key, cached);
+      const projected = JSON.parse(cached.body) as { edges?: LoopEdge[] };
+      const edges = (Array.isArray(projected.edges) ? projected.edges : []).filter((edge) => {
+        const at = Date.parse(edge.at);
+        return Number.isFinite(at) && at >= projection.since && at <= requestedAt;
+      });
+      return jsonResponse({ edges: edges.slice(0, projection.limit) }, cached.status);
+    },
+    waitForRefresh(req) {
+      const projection = loopEdgesProjection(req, now(), ttlMs);
+      return pending.get(projection.key) ?? Promise.resolve();
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+      for (const worker of workers) void worker.terminate();
+      workers.clear();
+      completeActive?.();
+      for (const entry of queue.splice(0)) { pending.delete(entry.key); entry.finish(); }
+      pending.clear();
+      refreshing = false;
+    },
+  };
+}
+
+if (!isMainThread && (workerData as { kind?: string } | undefined)?.kind === 'loop-edges-refresh') {
+  const data = workerData as { url: string; workerState: SharedArrayBuffer } & LoopEdgesWorkerOptions;
+  const workerState = new Int32Array(data.workerState);
+  const deps: LoopEdgesDeps = data.isolatedSources ? {
+    ...(data.ledgerDir ? { ledgerDir: data.ledgerDir } : {}),
+    ...(data.seatIds ? { seatIds: () => data.seatIds! } : {}),
+    listCoord: () => [], listCards: () => [], listLoopOwners: () => [], listTaskCards: () => [], listHanded: () => [],
+  } : {};
+  parentPort?.postMessage({ stage: 'started' });
+  parentPort?.once('message', (message: { stage?: string }) => {
+    if (message.stage !== 'continue') return;
+    Atomics.store(workerState, 0, 1);
+    parentPort?.postMessage({ stage: 'working' });
+    parentPort?.once('message', (ready: { stage?: string }) => {
+      if (ready.stage !== 'sample-ready') return;
+      Atomics.store(workerState, 0, 2);
+      void (async () => {
+        try {
+          const response = handleLoopEdgesGet(new Request(data.url), deps, { includeAll: true });
+          const body = await response.text();
+          Atomics.store(workerState, 0, 0);
+          parentPort?.postMessage({ stage: 'computed' });
+          parentPort?.postMessage({ stage: 'done', body, status: response.status,
+            headers: Object.fromEntries(response.headers.entries()) });
+        } catch {
+          Atomics.store(workerState, 0, 0);
+          parentPort?.postMessage({ stage: 'computed' });
+          parentPort?.postMessage({ stage: 'error', error: 'loop-edges-refresh-failed' });
+        }
+      })();
+    });
+  });
 }

@@ -3,7 +3,7 @@
 import type { NexusState } from '../state/state.js';
 import type { TabRegistry } from '../state/tab-registry.js';
 import type { TabKind } from '../kinds/types.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 // Surface-unification v2.2 V2.2-8 (2026-05-11) — 'scheduler' kind retired.
 const VALID_KINDS: ReadonlySet<TabKind> = new Set([

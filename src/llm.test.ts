@@ -394,6 +394,86 @@ test('skill_exec failure tool_result preserves its error for the parent model', 
   expect(toolResult?.type === 'tool_result' ? toolResult.content : undefined).toBe(JSON.stringify(failure));
 });
 
+test('same-error retry guard permits repaired inputs and distinct tasks, and logs once per tool loop', async () => {
+  const sequence = [
+    ['SelfImplement', { goalFile: 'missing/GOAL-a.md' }],
+    ['SelfImplement', { goalFile: 'missing/GOAL-a.md' }],
+    ['SelfImplement', { goalFile: 'missing/GOAL-a.md' }],
+    ['SelfImplement', { goalFile: 'valid/GOAL-fixed.md' }],
+    ['SelfImplement', { goalFile: 'bad/GOAL-b.md' }],
+    ['SelfImplement', { goalFile: 'bad/GOAL-c.md' }],
+    ['SelfImplement', { goalFile: 'bad/GOAL-c.md' }],
+    ['AgentOutput', { taskId: 'failed-task' }],
+    ['AgentOutput', { taskId: 'failed-task' }],
+    ['AgentOutput', { taskId: 'other-task' }],
+    ['Probe', { key: 'repeat-failure' }],
+    ['Probe', { key: 'repeat-failure' }],
+    ['Probe', { key: 'repeat-failure' }],
+    ['Probe', { key: 'recovery' }],
+  ] as const;
+  const dispatched: Array<[string, Record<string, unknown>]> = [];
+  let repeatEventCount = 0;
+  const repeatEvents = spyOn(debug, 'log').mockImplementation((category, event) => {
+    if (category === 'llm.router' && event === 'tool-error-repeat-blocked') repeatEventCount++;
+  });
+  const provider: LLMProvider = {
+    name: 'same-error-retry-guard-contract-test', defaultModel: 'test-model', available: () => true,
+    async *chat() {},
+    async *streamChat(_messages, opts) {
+      if (dispatched.length === 0) {
+        for (const [toolName, args] of sequence) {
+          const exposedName = opts?.tools?.find((tool) => tool.name === toolName)?.name;
+          yield { type: 'tool_call', id: `retry-guard-${dispatched.length}-${toolName}`, name: exposedName ?? toolName, args };
+        }
+        return;
+      }
+      yield { type: 'text', delta: 'done' };
+    },
+  };
+  try {
+    await streamLLMWithTools([{ role: 'user', content: 'retry carefully' }], {
+      onText() {},
+      dispatchTool: async (name, args) => {
+        dispatched.push([name, args]);
+        if (name === 'SelfImplement') {
+          return args.goalFile === 'valid/GOAL-fixed.md'
+            ? { ok: true }
+            : { isError: true, reason: 'SelfImplement goalFile preflight failed' };
+        }
+        if (name === 'AgentOutput') {
+          return args.taskId === 'failed-task'
+            ? { isError: true, output: 'AgentOutput: error · image wait failed' }
+            : { output: 'AgentOutput: done', state: 'done' };
+        }
+        return args.key === 'repeat-failure'
+          ? { isError: true, reason: 'Probe repeated failure' }
+          : { ok: true };
+      },
+    }, {
+      provider,
+      model: 'test-model',
+      tools: [
+        { name: 'SelfImplement', description: 'start implementation', parameters: { type: 'object', properties: { goalFile: { type: 'string' } } } },
+        { name: 'AgentOutput', description: 'retrieve a task', parameters: { type: 'object', properties: { taskId: { type: 'string' } } } },
+        { name: 'Probe', description: 'successful recovery call', parameters: { type: 'object', properties: { key: { type: 'string' } } } },
+      ],
+      maxTurns: 3,
+    });
+    expect(dispatched.filter(([name]) => name === 'SelfImplement')).toHaveLength(5);
+    expect(dispatched.filter(([name]) => name === 'AgentOutput')).toHaveLength(3);
+    expect(dispatched.filter(([name]) => name === 'Probe')).toHaveLength(3);
+    expect(dispatched.filter(([name, args]) => name === 'SelfImplement' && args.goalFile === 'missing/GOAL-a.md')).toHaveLength(2);
+    expect(dispatched.filter(([name, args]) => name === 'SelfImplement' && args.goalFile === 'bad/GOAL-c.md')).toHaveLength(1);
+    expect(dispatched.filter(([name, args]) => name === 'AgentOutput' && args.taskId === 'failed-task')).toHaveLength(2);
+    expect(dispatched.filter(([name, args]) => name === 'Probe' && args.key === 'repeat-failure')).toHaveLength(2);
+    expect(dispatched.some(([name, args]) => name === 'SelfImplement' && args.goalFile === 'valid/GOAL-fixed.md')).toBe(true);
+    expect(dispatched.some(([name, args]) => name === 'AgentOutput' && args.taskId === 'other-task')).toBe(true);
+    expect(repeatEventCount).toBe(1);
+  } finally {
+    repeatEvents.mockRestore();
+  }
+});
+
 test('Anthropic request for Claude 5.5 includes interleaved-thinking beta', async () => {
   const originalKey = process.env.ANTHROPIC_API_KEY;
   process.env.ANTHROPIC_API_KEY = 'test-key';

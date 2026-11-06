@@ -59,6 +59,8 @@ export interface HeavyRemoteResult {
   failureLogPath?: string;
   rootPlan?: RootPlanSummary | null;
   interferenceMeasured?: boolean;
+  /** Explicit same-head/base drift assessment; absent proof stays unmeasured at the caller. */
+  typecheckDrift?: 'drift' | 'drift-unmeasured' | 'drift-unrelated';
 }
 
 export interface HeavyRemoteDeps {
@@ -365,4 +367,101 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   }
   observe('heavy-remote', { ...base, outcome: 'pass', evidencePath: path, rootPlan: evidence.rootPlan, interferenceMeasured: evidence.interferenceMeasured });
   return { ok: true, host: selectedHost, source: 'remote', elapsedMs, evidencePath: path, rootPlan: evidence.rootPlan, interferenceMeasured: evidence.interferenceMeasured };
+}
+
+/** Design contract for moving pr land's local git work to an allowlisted host.
+ *
+ * This contract is deliberately not wired into the landing flow yet. GIT-IO-METER
+ * must land before a measured HQ-cost threshold can select remote execution.
+ */
+export const PR_LAND_GIT_REMOTE_HOSTS = PR_LAND_HEAVY_HOSTS;
+export type PrLandGitRemoteHost = typeof PR_LAND_GIT_REMOTE_HOSTS[number];
+export type PrLandGitPhase = 'fetch' | 'worktree' | 'rebase' | 'push';
+
+/** Immutable identity envelope: remote work is tied to the reviewed head and measured main tip. */
+export interface PrLandRemoteGitRequest {
+  schema: 1;
+  pr: number;
+  /** GitHub repository whose origin ref HQ will inspect after the remote push. */
+  repository: string;
+  /** Full PR source ref, for example refs/heads/feature/topic; never infer it from a local branch. */
+  headRef: string;
+  head: string;
+  main: string;
+  phase: PrLandGitPhase;
+  host: PrLandGitRemoteHost;
+}
+
+/** A remote receipt is a claim; HQ must still compare its SHAs with ls-remote. */
+export interface PrLandRemoteGitReceipt {
+  schema: 1;
+  pr: number;
+  repository: string;
+  headRef: string;
+  head: string;
+  main: string;
+  phase: PrLandGitPhase;
+  host: PrLandGitRemoteHost;
+  ok: boolean;
+  reason?: string;
+  resultHead?: string;
+  mergeSha?: string;
+}
+
+export type PrLandRemoteGitReceiptVerdict =
+  | { ok: true; resultHead: string; mergeSha: string; remoteHeadVerification: 'pending-push' | 'matched' }
+  | { ok: false; reason: string };
+
+const ZERO_SHA40 = /^0{40}$/u;
+const isValidSha = (value: unknown): value is string => typeof value === 'string'
+  && /^[a-f0-9]{40}$/iu.test(value) && !ZERO_SHA40.test(value);
+const isRemoteHost = (value: unknown): value is PrLandGitRemoteHost =>
+  typeof value === 'string' && PR_LAND_GIT_REMOTE_HOSTS.some((host) => host === value);
+const isGitPhase = (value: unknown): value is PrLandGitPhase =>
+  value === 'fetch' || value === 'worktree' || value === 'rebase' || value === 'push';
+const isRepository = (value: unknown): value is string =>
+  typeof value === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(value);
+const FORBIDDEN_REF_CHARS = new Set(['~', '^', ':', '?', '*', '[', '\\']);
+const isHeadRef = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !value.startsWith('refs/heads/')) return false;
+  const branch = value.slice('refs/heads/'.length);
+  return branch.length > 0 && ![...branch].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 0x20 || code === 0x7f || FORBIDDEN_REF_CHARS.has(character);
+  })
+    && !branch.startsWith('/') && !branch.endsWith('/') && !branch.endsWith('.')
+    && !branch.includes('..') && !branch.includes('//') && !branch.includes('@{')
+    && !branch.split('/').some((part) => part.startsWith('.') || part.endsWith('.lock'));
+};
+
+/**
+ * Validate receipt identity and main pin. A prepare-phase head is a local remote-host
+ * result and remains pending until push. Only after the push phase must HQ supply
+ * the post-push ls-remote observation for the requested branch.
+ */
+export function validatePrLandRemoteGitReceipt(
+  request: PrLandRemoteGitRequest,
+  receipt: unknown,
+  observedRemoteHead?: string,
+): PrLandRemoteGitReceiptVerdict {
+  if (request.schema !== 1 || !Number.isSafeInteger(request.pr) || request.pr <= 0
+    || !isRepository(request.repository) || !isHeadRef(request.headRef)
+    || !isValidSha(request.head) || !isValidSha(request.main) || !isGitPhase(request.phase)
+    || !isRemoteHost(request.host)) return { ok: false, reason: 'invalid-request-identity' };
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return { ok: false, reason: 'receipt-unmeasured' };
+  const value = receipt as Partial<PrLandRemoteGitReceipt>;
+  if (value.schema !== 1 || !Number.isSafeInteger(value.pr) || value.pr !== request.pr || value.head !== request.head || value.main !== request.main
+    || value.repository !== request.repository || value.headRef !== request.headRef
+    || !isGitPhase(value.phase) || !isRemoteHost(value.host)
+    || value.phase !== request.phase || value.host !== request.host) return { ok: false, reason: 'receipt-identity-mismatch' };
+  if (value.ok !== true) return { ok: false, reason: typeof value.reason === 'string' && value.reason.trim() ? value.reason : 'remote-git-failed' };
+  if (!isValidSha(value.resultHead) || !isValidSha(value.mergeSha)) {
+    return { ok: false, reason: 'receipt-result-unmeasured' };
+  }
+  if (value.mergeSha.toLowerCase() !== request.main.toLowerCase()) return { ok: false, reason: 'remote-main-mismatch' };
+  if (request.phase !== 'push') return { ok: true, resultHead: value.resultHead, mergeSha: value.mergeSha, remoteHeadVerification: 'pending-push' };
+  // The caller must run ls-remote against request.repository and request.headRef after push.
+  if (!isValidSha(observedRemoteHead)) return { ok: false, reason: 'post-push-ls-remote-unmeasured' };
+  if (observedRemoteHead.toLowerCase() !== value.resultHead.toLowerCase()) return { ok: false, reason: 'post-push-head-mismatch' };
+  return { ok: true, resultHead: value.resultHead, mergeSha: value.mergeSha, remoteHeadVerification: 'matched' };
 }

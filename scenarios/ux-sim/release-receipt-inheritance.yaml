@@ -1,0 +1,24 @@
+version: 1
+kind: release-gate-receipt-inheritance
+id: release-receipt-inheritance-0306
+isolation: test
+cases:
+  - id: same-head-zero-rerun
+    event: clean-full-rehearsal-receipt
+    cut: { head: same, runtime: same, host: different }
+    expect: { decision: reuse-zero, rerunFiles: 0 }
+  - id: one-file-after-rehearsal
+    event: clean-full-rehearsal-receipt
+    cut: { head: descendant, changed: [src/a.ts], runtime: same }
+    expect: { decision: partial-rerun, rerunFiles: [src/a.test.ts] }
+  - id: damaged-fingerprint-mismatch
+    event: receipt-fingerprint-mismatch
+    expect: { decision: full-sweep, reason: hard-rehearsal-receipt-or-execution-identity-differs }
+  - id: rehearsal-host-differs-from-cut-host
+    event: clean-full-rehearsal-receipt
+    rehearsalHost: aws1-rehearsal
+    cutHost: node-b
+    expect: { decision: partial-rerun, rerunFiles: [src/a.test.ts] }
+  - id: host-disconnect-while-saving
+    event: rehearsal-host-disconnect-before-stamp-commit
+    expect: { stamp: error, reusableReceipt: false }

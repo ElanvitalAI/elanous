@@ -81,6 +81,32 @@ describe('plugin installation', () => {
     expect(listInstalledPlugins(root).find(item => item.name === 'sample-plugin')?.installedAt).toBeUndefined();
   });
 
+  test('Claude plugin listing uses the installed path version and rejects manifest identity conflicts', () => {
+    const root = fixture();
+    const putClaudeManifest = (name: string, version: string, manifest: Record<string, unknown>) => {
+      const pluginPath = join(root, 'plugins', 'local', name, version);
+      mkdirSync(join(pluginPath, '.claude-plugin'), { recursive: true });
+      writeFileSync(join(pluginPath, '.claude-plugin', 'plugin.json'), JSON.stringify(manifest));
+      return pluginPath;
+    };
+    const validPath = putClaudeManifest('claude-plugin', '1.2.3', { name: 'claude-plugin', description: 'Claude package' });
+    const defaultLoad = loadPluginManifestFromDir(validPath, { id: 'claude-plugin', version: '1.2.3' });
+    expect(defaultLoad).toMatchObject({ path: null, inferred: true });
+    putClaudeManifest('name-conflict', '1.2.3', { name: 'different-plugin', version: '1.2.3' });
+    putClaudeManifest('id-name-conflict', '1.2.3', { id: 'id-name-conflict', name: 'different-plugin', version: '1.2.3' });
+    putClaudeManifest('version-conflict', '1.2.3', { name: 'version-conflict', version: '9.9.9' });
+    const genericPath = join(root, 'plugins', 'local', 'generic-plugin', '1.2.3');
+    mkdirSync(genericPath, { recursive: true });
+    writeFileSync(join(genericPath, 'plugin.json'), JSON.stringify({ id: 'generic-plugin', name: 'generic-plugin' }));
+    const codexPath = join(root, 'plugins', 'local', 'codex-plugin', '1.2.3', '.codex-plugin');
+    mkdirSync(codexPath, { recursive: true });
+    writeFileSync(join(codexPath, 'plugin.json'), JSON.stringify({ name: 'codex-plugin' }));
+
+    expect(listInstalledPlugins(root)).toEqual([{
+      name: 'claude-plugin', version: '1.2.3', market: 'local', path: validPath, sha256: null,
+    }]);
+  });
+
   test('pre-registered kinds do not hide valid nodes from another version or market', async () => {
     const root = fixture();
     const pkg = packageAt(join(root, 'source'));

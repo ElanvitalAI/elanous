@@ -11,12 +11,12 @@ import { join } from 'node:path';
 import {
   CONTINUATION_LOOP_TTL_MINUTES,
   continuationLoopId,
-  runNexus,
   NEXUS_VERSION,
 } from '../src/nexus/index.js';
 import { nexusLockPath, nexusRuntimePath } from '../src/nexus/paths.js';
 import { readNexusLock } from '../src/nexus/supervisor/lock.js';
 import { readNexusRuntime } from '../src/nexus/runtime.js';
+import { bootNexus, drainNexusBoots } from './helpers/nexus-boot.js';
 
 let tmpRoot: string;
 let prevEnv: string | undefined;
@@ -28,6 +28,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  drainNexusBoots();
   if (prevEnv === undefined) delete process.env.ELANOUS_NEXUS_DIR;
   else process.env.ELANOUS_NEXUS_DIR = prevEnv;
   try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -46,8 +47,29 @@ describe('continuation loop registry identity', () => {
 });
 
 describe('runNexus (detachForTesting)', () => {
+  test('drains un-released boots newest first, continues after a release error, and is repeatable', async () => {
+    const first = await bootNexus({ detachForTesting: true });
+    const second = await bootNexus({ detachForTesting: true, force: true });
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    const order: string[] = [];
+    const releaseFirst = first!.release;
+    const releaseSecond = second!.release;
+    first!.release = () => { order.push('first'); releaseFirst(); };
+    second!.release = () => { order.push('second'); releaseSecond(); throw new Error('release probe'); };
+
+    expect(existsSync(nexusLockPath())).toBe(true);
+    expect(existsSync(nexusRuntimePath())).toBe(true);
+    expect(() => drainNexusBoots()).toThrow(AggregateError);
+    expect(order).toEqual(['second', 'first']);
+    expect(existsSync(nexusLockPath())).toBe(false);
+    expect(existsSync(nexusRuntimePath())).toBe(false);
+    expect(() => drainNexusBoots()).not.toThrow();
+    expect(order).toEqual(['second', 'first']);
+  });
+
   test('writes lock + runtime, returns handle, release tears them down', async () => {
-    const handle = await runNexus({ detachForTesting: true });
+    const handle = await bootNexus({ detachForTesting: true });
     expect(handle).toBeDefined();
     expect(existsSync(nexusLockPath())).toBe(true);
     expect(existsSync(nexusRuntimePath())).toBe(true);
@@ -76,7 +98,7 @@ describe('runNexus (detachForTesting)', () => {
   });
 
   test('second run while first holds lock fails with NexusLockError exit', async () => {
-    const handle = await runNexus({ detachForTesting: true });
+    const handle = await bootNexus({ detachForTesting: true });
     try {
       // Simulate a second invocation by calling runNexus again — but
       // without detachForTesting it would block on signals. We use a
@@ -93,9 +115,9 @@ describe('runNexus (detachForTesting)', () => {
   });
 
   test('force=true takes over an existing lock', async () => {
-    const first = await runNexus({ detachForTesting: true });
+    const first = await bootNexus({ detachForTesting: true });
     try {
-      const second = await runNexus({ detachForTesting: true, force: true });
+      const second = await bootNexus({ detachForTesting: true, force: true });
       expect(second).toBeDefined();
       expect(readNexusLock()!.pid).toBe(process.pid);
       second!.release();

@@ -14,7 +14,7 @@ import {
   isTelegramTriggerNode,
   isWebhookTriggerNode,
 } from '../../workflow-runtime/schema.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 
 export interface TriggerSnapshotEntry {

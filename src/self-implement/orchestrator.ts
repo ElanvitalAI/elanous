@@ -2545,24 +2545,8 @@ type ChildSummaryArtifactRef = {
   readonly chars: number;
 };
 
-function truncationMarkerCandidates(originalChars: number): readonly string[] {
-  return [
-    ` [truncated; originalChars=${originalChars}]`,
-    `[truncated; originalChars=${originalChars}]`,
-    '[truncated]',
-    '…',
-  ];
-}
-
-/** 길면 머리를 남기고 잘림을 값에 적는다. 반환 길이는 모든 입력에서 `maxChars` 이하다. */
-export function boundReadableText(text: string, maxChars: number): { text: string; truncated: boolean; originalChars: number } {
-  const originalChars = text.length;
-  const limit = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 0;
-  if (originalChars <= limit) return { text, truncated: false, originalChars };
-  if (limit === 0) return { text: '', truncated: true, originalChars };
-  const marker = truncationMarkerCandidates(originalChars).find((candidate) => candidate.length <= limit) ?? '';
-  return { text: `${text.slice(0, limit - marker.length)}${marker}`, truncated: true, originalChars };
-}
+export { boundReadableText } from './readable-text.js';
+import { boundReadableText } from './readable-text.js';
 
 const IMPLEMENT_ABORT_PROGRESS_BASE = '중단 — 구현 실패';
 const IMPLEMENT_ABORT_PROGRESS_NO_TOOL_CALLS = '중단 — 구현 실패: 자식이 도구를 한 번도 부르지 않았다 (구현 이전에 죽었다)';
@@ -5662,19 +5646,6 @@ async function runSelfImplementInner(
     provider: activeProvider.provider ?? null, model: activeProvider.model ?? null, auth: activeProvider.auth ?? null,
     ...(opts.childLlm ? { configuredProvider: configuredProvider.provider ?? null, configuredModel: configuredProvider.model ?? null, modelSelectionSource: 'child' } : {}),
     ...(opts.correlationId !== undefined ? { correlationId: opts.correlationId } : {}),
-  });
-  // The traversal resource panel is scoped to the node window. Record the selected
-  // implementation model there as an explicit consume event, using the same provider
-  // resolved for this run (after child selection), rather than the requested/default model.
-  observe('llm-consume-start', {
-    provider: activeProvider.provider ?? null,
-    model: activeProvider.model ?? null,
-    childProvider: activeProvider.provider ?? null,
-    childModel: activeProvider.model ?? null,
-    llmConsumeStart: {
-      ...(activeProvider.provider ? { provider: activeProvider.provider } : {}),
-      ...(activeProvider.model ? { model: activeProvider.model } : {}),
-    },
   });
   try {
     await (s.refreshCodexQuotaSignals ?? refreshCodexQuotaSignals)();

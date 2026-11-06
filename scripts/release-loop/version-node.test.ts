@@ -21,12 +21,14 @@ const root = process.env.VERSION_NODE_TEST_ROOT;
 const stateFile = path.join(root, 'state.json');
 const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
 const args = process.argv.slice(2);
+const fetchRefspec = String(args[2] || '').replace(/^\\+/, '');
+const [fetchSource, fetchDestination] = fetchRefspec.split(':');
+const fetchDestinationValid = !fetchDestination || fetchDestination === fetchSource.replace(/^refs\\/heads\\//, 'refs/remotes/origin/');
 fs.appendFileSync(path.join(root, 'calls'), 'git ' + args.join(' ') + '\\n');
 if (args[0] === 'show' && args[1] === 'origin/main:package.json') console.log(JSON.stringify({name:'fixture',version:state.version}));
 else if (args[0] === 'show' && args[1] === (state.chosen || 'chosen-sha') + ':package.json') console.log(JSON.stringify({name:'fixture',version:state.chosenVersion || state.version}));
 else if (args[0] === 'show' && String(args[1]).endsWith(':package.json')) console.log(JSON.stringify({name:'fixture',version:state.version}));
-else if (args[0] === 'fetch' && args[2] === 'refs/heads/release/0.2.4') { state.branchFetched = true; fs.writeFileSync(stateFile, JSON.stringify(state)); }
-else if (args[0] === 'fetch' && args[1] === 'origin' && String(args[2]).startsWith('refs/heads/release/')) { state.branchFetched = true; fs.writeFileSync(stateFile, JSON.stringify(state)); }
+else if (args[0] === 'fetch' && args[1] === 'origin' && fetchSource.startsWith('refs/heads/release/') && fetchDestinationValid) { state.branchFetched = true; fs.writeFileSync(stateFile, JSON.stringify(state)); }
 else if (args[0] === 'rev-parse' && args[1] === '--verify') {
   if (state.chosenMissing && !state.branchFetched) { console.error('unknown revision'); process.exit(128); }
   const ref = String(args[2] || '');

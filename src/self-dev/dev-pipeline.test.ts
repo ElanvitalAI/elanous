@@ -299,6 +299,11 @@ describe('planDevPipeline — 순수 정규화/검증/디스패치(계약 SSOT)'
     expect(p.wired).toBe(true);
   });
 
+  it.each(['openclaw', 'hermes'] as const)('%s is PTY-only and rejects ACP transport', (backend) => {
+    expect(() => planDevPipeline(T({ executor: { kind: 'external', backend, transport: 'acp' } })))
+      .toThrow(`${backend}는 ACP transport 미지원`);
+  });
+
   it('interactive → dispatch interactive(U4b 배선됨)', () => {
     const p = planDevPipeline(T({ context: 'interactive' }));
     expect(p.dispatch).toBe('interactive');
@@ -620,7 +625,7 @@ describe('어댑터 — 계획 → 기존 성숙 함수 옵션(재발명 0)', ()
     expect(normalizeAcpResult({ backend: 'claude' }).ok).toBe(false);
   });
 
-  it('U6 — 모든 DevBackend 의 acpBackendName 이 DELEGATE_BACKENDS 에 존재(구조 검증·능력≠존재)', async () => {
+  it('U6 — ACP 지원 DevBackend 의 acpBackendName 이 DELEGATE_BACKENDS 에 존재(구조 검증·능력≠존재)', async () => {
     const { DELEGATE_BACKENDS } = await import('../boot/daemon-tools/delegate-agent.js');
     for (const b of ['codex', 'claude', 'gemini', 'grok'] as const) {
       expect(DELEGATE_BACKENDS as readonly string[]).toContain(acpBackendName(b));
@@ -3512,7 +3517,8 @@ describe('dev-pipeline — self-mission target seam forwarding', () => {
   });
 
   it('resolves a bare shared Git directory from the real worktree root without probing its parent', async () => {
-    const root = mkdtempSync(join(homedir(), '.dev-pipeline-bare-common-repo-'));
+    // git reports canonical paths; on macOS the temp HOME is /var/… → /private/var/….
+    const root = realpathSync(mkdtempSync(join(homedir(), '.dev-pipeline-bare-common-repo-')));
     const seed = join(root, 'seed');
     const bare = join(root, '.git');
     const cwd = join(root, 'worktree');
@@ -3558,7 +3564,8 @@ describe('dev-pipeline — self-mission target seam forwarding', () => {
   });
 
   it('preserves the main checkout root for linked worktrees using a separate non-bare Git directory', () => {
-    const root = mkdtempSync(join(homedir(), '.dev-pipeline-separate-git-dir-'));
+    // git reports canonical paths; on macOS the temp HOME is /var/… → /private/var/….
+    const root = realpathSync(mkdtempSync(join(homedir(), '.dev-pipeline-separate-git-dir-')));
     const main = join(root, 'main');
     const gitDir = join(main, '.git-alt');
     const linked = join(root, 'linked');

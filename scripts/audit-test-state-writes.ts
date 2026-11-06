@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative } from 'node:path';
 import ts from 'typescript';
@@ -216,7 +215,8 @@ function classificationSummary(classification: CandidateClassification): string 
 }
 
 export function august8Inventory(root = repo): Set<string> {
-  const content = execFileSync('git', ['show', `${AUGUST_8_INVENTORY_COMMIT}:${AUGUST_8_INVENTORY_PATH}`], { cwd: root, encoding: 'utf8' });
+  // Materialized from AUGUST_8_INVENTORY_COMMIT so blob:none checkouts can audit without lazy-fetch credentials.
+  const content = readFileSync(join(root, 'test', 'fixtures', 'preexist-partial-clone', 'august-8-test-home-state-write-audit-baseline.txt'), 'utf8');
   return new Set(content.split('\n').map((line) => line.trim()).filter((line) => line && !line.startsWith('#')));
 }
 

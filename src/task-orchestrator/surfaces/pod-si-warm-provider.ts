@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { lstatSync, readFileSync } from 'node:fs';
 import type { ChildPodLease, ChildPodReuseOperations } from './pod-child-reuse.js';
-import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
+import { decodeSiWarmArtifacts, siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
 import type { SiWarmExecReceipt, SiWarmFixedRunner, SiWarmPodIdentity } from './pod-si-warm-transport.js';
 import { probeWarmPodContext, type WarmPodSpec } from './pod-warm-worker-pod.js';
 import type { WarmWorkerCandidate } from './pod-warm-worker-provider.js';
@@ -45,6 +45,8 @@ export interface SiWarmProviderOptions {
   now?: () => number;
   /** Test seam. Production runs fixed kubectl argv with binary stdin. */
   exec?: (argv: readonly string[], stdin: Uint8Array, timeoutMs: number) => Promise<{ status: number | null; stdout: Uint8Array }>;
+  /** Test seam. Observe artifact decoder calls at the provider boundary. */
+  decodeArtifactForTest?: (encoded: string) => Uint8Array | null;
   /** A trusted host canary must confirm the fixed si-v1 runner in this exact source Pod. Missing proof is no entry. */
   siRunnerReady?: (spec: WarmPodSpec) => boolean;
   /** Durable host observation hook for ambiguous control-plane transitions. */
@@ -357,8 +359,8 @@ export class SiWarmPodProvider {
         const wire = parseJson(result.stdout);
         const b = wire?.bytes;
         const terminal = decodeBytes(b?.terminal), ledger = decodeBytes(b?.ledger), log = decodeBytes(b?.log);
-        const artifacts = Array.isArray(b?.artifacts) ? b.artifacts.map((part: any) =>
-          ({ path: part?.path, bytes: decodeBytes(part?.bytes) })) : null;
+        const artifacts = decodeSiWarmArtifacts(b?.artifacts,
+          encoded => (this.options.decodeArtifactForTest ?? decodeBytes)(encoded));
         if (!terminal || !ledger || !log || !artifacts || artifacts.some((part: any) =>
           typeof part.path !== 'string' || !part.bytes)) return { reply: null, bytes: null, cleanup: 'unknown' };
         return { reply: wire.reply, bytes: { terminal, ledger, log, artifacts },
@@ -393,7 +395,7 @@ export class SiWarmPodProvider {
         }
       },
       quarantine: async (lease, receipt) => { assertLease(lease); await quarantine(receipt.reason); },
-      observe: (event, data) => debug.log('pod.reuse', event, data),
+      observe: (event, data) => this.observe(event, data),
     };
     return { leaseFenced: true, command, transport: { pod, runner, now: this.now },
       payload: input.payload, credentialBundle: input.credentialBundle,

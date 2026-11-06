@@ -45,6 +45,8 @@ export interface CompactSessionOpts {
    *  the context is. Below-threshold histories may still no-op if there is
    *  nothing to summarize. */
   force?: boolean;
+  /** Prepare the rewritten session without persisting it until accepted. */
+  prepareOnly?: boolean;
 }
 
 export interface CompactSessionResult {
@@ -60,6 +62,8 @@ export interface CompactSessionResult {
   layer3Applied: boolean;
   /** How many drop-oldest retries the overflow guard consumed. */
   overflowRetries: number;
+  preparedMessages?: SerializedMessage[];
+  commit?: () => void;
 }
 
 /** SerializedMessage → LLM wire role. Mirrors chat.ts `toLLM`: tool
@@ -182,7 +186,8 @@ export async function compactSessionHistory(
 
   const ts = new Date().toISOString();
   const rewritten = result.messages.map(m => toSerialized(m, ts));
-  rewriteSessionMessages(sessionId, rewritten, opts.root);
+  const commit = () => rewriteSessionMessages(sessionId, rewritten, opts.root);
+  if (!opts.prepareOnly) commit();
   return {
     fired: true,
     reason: decision.reason,
@@ -192,5 +197,6 @@ export async function compactSessionHistory(
     ratio: decision.ratio,
     layer3Applied: result.diagnostics.layer3SummaryApplied === 1,
     overflowRetries,
+    ...(opts.prepareOnly ? { preparedMessages: rewritten, commit } : {}),
   };
 }

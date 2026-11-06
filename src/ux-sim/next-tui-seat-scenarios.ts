@@ -1,4 +1,4 @@
-// N03 key-sequence scenarios for next TUI (`/new` · `/compact`) on the network-free fake LLM.
+// N03 key-sequence scenarios for next TUI (`/new` · `/clear` · `/compact`) on the network-free fake LLM.
 // The TUI under test is whatever executable/entry is given (installed `elanous.mjs` or a tree's
 // `bin/elanous.mjs`); this file only types keys, seeds the store through the real session API,
 // and reads the universe back through the same binary's `logs` CLI.
@@ -15,7 +15,7 @@ import {
   TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 
-export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4', 'next-seat-turn-cap'] as const;
+export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-clear-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4', 'next-seat-turn-cap'] as const;
 export type NextTuiScenario = (typeof NEXT_TUI_SCENARIOS)[number];
 
 export interface NextTuiScenarioSpec {
@@ -97,14 +97,17 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   const reply = spec.reply ?? DEFAULT_REPLY;
   const base = {
     executable: spec.executable,
-    args: [spec.entry, '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
+    args: [spec.entry, '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
     root,
     rows: 24,
     cols: 80,
     ...(spec.expectedBinarySha256 ? { expectedBinarySha256: spec.expectedBinarySha256 } : {}),
     env: {
-      ELANOUS_SESSION_ROOT: join(root, 'sessions'), [TEST_FAKE_LLM_ENV]: '1', [TEST_FAKE_LLM_RESPONSE_ENV]: reply,
+      ELANOUS_SESSION_ROOT: join(root, 'sessions'), [TEST_FAKE_LLM_ENV]: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1', [TEST_FAKE_LLM_RESPONSE_ENV]: reply,
       ELANOUS_CONFIG_DIR: root, ELANOUS_STATE_DIR: root,
+      ...(spec.scenario === 'next-clear-session' ? {
+        [TEST_FAKE_LLM_DELAY_MS_ENV]: '3000', [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '넷째 메시지',
+      } : {}),
       ...(seatTurnCapScenario ? { COORD_ID: 'UX' } : {}),
     },
     ready: { label: 'boot', until: (s: string) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료') },
@@ -260,16 +263,17 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     return { scenario: spec.scenario, universe: root, run, store: { sessionId: id, userContent: content, modelContent }, logs, checks };
   }
 
-  if (spec.scenario === 'next-new-session') {
+  if (spec.scenario === 'next-new-session' || spec.scenario === 'next-clear-session') {
+    const newSessionCommand = spec.scenario === 'next-clear-session' ? '/clear' : '/new';
     // Step 1–2: two turns · step 3: /new · step 4: one turn · step 5: a turn with /new typed while it is busy.
     let oldId = '';
     const steps: SeatPtyStep[] = [
       { label: 'after message 1', text: '첫 메시지', until: done(1) },
       { label: 'before /new (2 messages)', text: '둘째 메시지', until: done(2) },
-      { label: 'after /new', text: '/new', until: (s) => /새 대화 · 이전 = [0-9a-f]{8}/.test(s) },
+      { label: `after ${newSessionCommand}`, text: newSessionCommand, until: (s) => /새 대화 · 이전 = [0-9a-f]{8}/.test(s) },
       { label: 'after message 3 (new session)', text: '셋째 메시지', until: done(1, '셋째 메시지') },
       // `/new` lands while the 4th turn is in flight: the TUI must refuse it and keep the session.
-      { label: 'busy /new', chunks: ['넷째 메시지', '\r', '/new\r'], until: (s) => s.includes('응답 중에는 /new') || done(2, '넷째 메시지')(s) },
+      { label: `busy ${newSessionCommand}`, chunks: ['넷째 메시지', '\r', `${newSessionCommand}\r`], until: (s) => s.includes('응답 중에는 /new') || done(2, '넷째 메시지')(s) },
       { label: 'after busy turn', until: done(2, '넷째 메시지') },
     ];
     const run = await mockSeatPtySequence({ ...base, steps });
@@ -283,7 +287,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     oldId = fromTo.from;
     const store = { oldId, newId: fromTo.to, active: ids.active, oldUser: oldId ? userTexts(root, oldId) : [], newUser: fromTo.to ? userTexts(root, fromTo.to) : [] };
     const routes = events.filter((e) => e.category === 'llm.route-decision' && e.event === 'local-chat-executed').map((e) => parseData<{ provider: string; sessionId: string }>(e.data));
-    const afterNew = run.frames.find((f) => f.label === 'after /new')?.screen ?? '';
+    const afterNew = run.frames.find((f) => f.label === `after ${newSessionCommand}`)?.screen ?? '';
     const checks = {
       screenClearedWithNewTitle: afterNew.includes('elanous next · 새 대화') && !afterNew.includes('첫 메시지') && !afterNew.includes(reply),
       statusNamesPrevious: Boolean(oldId) && afterNew.includes(`새 대화 · 이전 = ${oldId.slice(0, 8)}`),

@@ -16,7 +16,7 @@
 // state VISUALLY — tmux status bars, htop gauges, btop graphs, neovim
 // statuslines that ANSI strip would destroy.
 
-import sharp from 'sharp';
+// IMPORT-DIET-LAZY-SDK (2026-11-05): sharp(네이티브)는 실제로 그릴 때만 싣는다.
 
 export interface SvgToPngOpts {
   /** Target PNG width in pixels; aspect preserved. Omit for SVG-native. */
@@ -35,6 +35,7 @@ export async function svgToPng(
   svg: string,
   opts: SvgToPngOpts = {},
 ): Promise<Buffer> {
+  const { default: sharp } = await import('sharp');
   let pipe = sharp(Buffer.from(svg, 'utf8'));
   if (opts.width !== undefined || opts.height !== undefined) {
     pipe = pipe.resize({

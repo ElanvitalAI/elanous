@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import { importCandidates } from './pwa-import-graph.js';
 
 export interface UnwiredExport {
@@ -90,47 +91,47 @@ function productionFiles(cwd: string): string[] {
   return files;
 }
 
-function sourceFile(file: string, content: string): ts.SourceFile {
+function sourceFile(file: string, content: string): TS.SourceFile {
   const absolute = resolve(file);
-  return ts.createSourceFile(absolute, content, ts.ScriptTarget.Latest, true, absolute.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  return tsApi.createSourceFile(absolute, content, tsApi.ScriptTarget.Latest, true, absolute.endsWith('.tsx') ? tsApi.ScriptKind.TSX : tsApi.ScriptKind.TS);
 }
 
-function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
-  const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+function hasModifier(node: TS.Node, kind: TS.SyntaxKind): boolean {
+  const modifiers = tsApi.canHaveModifiers(node) ? tsApi.getModifiers(node) : undefined;
   return !!modifiers?.some((modifier) => modifier.kind === kind);
 }
 
 /** True when the statement produces a value at runtime (not ambient, not erased). */
-function isRuntimeDeclaration(statement: ts.Statement): boolean {
-  if (hasModifier(statement, ts.SyntaxKind.DeclareKeyword)) return false;
-  if (ts.isFunctionDeclaration(statement)) return !!statement.body;
-  if (ts.isEnumDeclaration(statement)) return !hasModifier(statement, ts.SyntaxKind.ConstKeyword);
-  return ts.isClassDeclaration(statement) || ts.isVariableStatement(statement);
+function isRuntimeDeclaration(statement: TS.Statement): boolean {
+  if (hasModifier(statement, tsApi.SyntaxKind.DeclareKeyword)) return false;
+  if (tsApi.isFunctionDeclaration(statement)) return !!statement.body;
+  if (tsApi.isEnumDeclaration(statement)) return !hasModifier(statement, tsApi.SyntaxKind.ConstKeyword);
+  return tsApi.isClassDeclaration(statement) || tsApi.isVariableStatement(statement);
 }
 
 /** Public export name → local binding name (null when the default export has no local name). */
-function exportedValues(source: ts.SourceFile): Map<string, string | null> {
+function exportedValues(source: TS.SourceFile): Map<string, string | null> {
   const names = new Map<string, string | null>();
   for (const statement of source.statements) {
-    const exported = hasModifier(statement, ts.SyntaxKind.ExportKeyword);
-    const isDefault = hasModifier(statement, ts.SyntaxKind.DefaultKeyword);
+    const exported = hasModifier(statement, tsApi.SyntaxKind.ExportKeyword);
+    const isDefault = hasModifier(statement, tsApi.SyntaxKind.DefaultKeyword);
     if (exported && isRuntimeDeclaration(statement)) {
-      if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement)) {
+      if (tsApi.isFunctionDeclaration(statement) || tsApi.isClassDeclaration(statement) || tsApi.isEnumDeclaration(statement)) {
         if (isDefault) names.set('default', statement.name?.text ?? null);
         else if (statement.name) names.set(statement.name.text, statement.name.text);
       }
-      if (ts.isVariableStatement(statement)) {
+      if (tsApi.isVariableStatement(statement)) {
         for (const declaration of statement.declarationList.declarations) {
-          if (ts.isIdentifier(declaration.name)) names.set(declaration.name.text, declaration.name.text);
+          if (tsApi.isIdentifier(declaration.name)) names.set(declaration.name.text, declaration.name.text);
         }
       }
     }
-    if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
-      if (!ts.isIdentifier(statement.expression)) names.set('default', null);
+    if (tsApi.isExportAssignment(statement) && !statement.isExportEquals) {
+      if (!tsApi.isIdentifier(statement.expression)) names.set('default', null);
       else if (bindingIdentifier(source, statement.expression.text)) names.set('default', statement.expression.text);
     }
-    if (ts.isExportDeclaration(statement) && !statement.isTypeOnly && !statement.moduleSpecifier
-      && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+    if (tsApi.isExportDeclaration(statement) && !statement.isTypeOnly && !statement.moduleSpecifier
+      && statement.exportClause && tsApi.isNamedExports(statement.exportClause)) {
       for (const element of statement.exportClause.elements) {
         const localName = (element.propertyName ?? element.name).text;
         // Re-exporting a type alias, interface or ambient binding creates no runtime value.
@@ -141,53 +142,53 @@ function exportedValues(source: ts.SourceFile): Map<string, string | null> {
   return names;
 }
 
-const checkerCache = new WeakMap<ts.SourceFile, ts.TypeChecker>();
+const checkerCache = new WeakMap<TS.SourceFile, TS.TypeChecker>();
 
-function checkerFor(source: ts.SourceFile): ts.TypeChecker {
+function checkerFor(source: TS.SourceFile): TS.TypeChecker {
   const cached = checkerCache.get(source);
   if (cached) return cached;
-  const options: ts.CompilerOptions = { noResolve: true, noLib: true, target: ts.ScriptTarget.Latest };
-  const host = ts.createCompilerHost(options);
+  const options: TS.CompilerOptions = { noResolve: true, noLib: true, target: tsApi.ScriptTarget.Latest };
+  const host = tsApi.createCompilerHost(options);
   const getSourceFile = host.getSourceFile.bind(host);
   host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
     resolve(fileName) === source.fileName
       ? source
       : getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
-  const program = ts.createProgram([source.fileName], options, host);
+  const program = tsApi.createProgram([source.fileName], options, host);
   const checker = program.getTypeChecker();
   checkerCache.set(source, checker);
   return checker;
 }
 
 /** The runtime binding for `name` in this file, or undefined (types and ambient declarations have none). */
-function bindingIdentifier(source: ts.SourceFile, name: string): ts.Identifier | undefined {
-  const fromBindingName = (node: ts.BindingName): ts.Identifier | undefined => {
-    if (ts.isIdentifier(node)) return node.text === name ? node : undefined;
+function bindingIdentifier(source: TS.SourceFile, name: string): TS.Identifier | undefined {
+  const fromBindingName = (node: TS.BindingName): TS.Identifier | undefined => {
+    if (tsApi.isIdentifier(node)) return node.text === name ? node : undefined;
     for (const element of node.elements) {
-      if (ts.isOmittedExpression(element)) continue;
+      if (tsApi.isOmittedExpression(element)) continue;
       const found = fromBindingName(element.name);
       if (found) return found;
     }
     return undefined;
   };
   for (const statement of source.statements) {
-    if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)
-      || ts.isEnumDeclaration(statement)) && statement.name?.text === name) {
+    if ((tsApi.isFunctionDeclaration(statement) || tsApi.isClassDeclaration(statement)
+      || tsApi.isEnumDeclaration(statement)) && statement.name?.text === name) {
       if (isRuntimeDeclaration(statement)) return statement.name;
       continue;
     }
-    if (ts.isVariableStatement(statement) && isRuntimeDeclaration(statement)) {
+    if (tsApi.isVariableStatement(statement) && isRuntimeDeclaration(statement)) {
       for (const declaration of statement.declarationList.declarations) {
         const found = fromBindingName(declaration.name);
         if (found) return found;
       }
     }
-    if (ts.isImportDeclaration(statement) && statement.importClause && !statement.importClause.isTypeOnly) {
+    if (tsApi.isImportDeclaration(statement) && statement.importClause && !statement.importClause.isTypeOnly) {
       const clause = statement.importClause;
       if (clause.name?.text === name) return clause.name;
-      if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)
+      if (clause.namedBindings && tsApi.isNamespaceImport(clause.namedBindings)
         && clause.namedBindings.name.text === name) return clause.namedBindings.name;
-      if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+      if (clause.namedBindings && tsApi.isNamedImports(clause.namedBindings)) {
         const found = clause.namedBindings.elements.find((element) => !element.isTypeOnly && element.name.text === name)?.name;
         if (found) return found;
       }
@@ -196,18 +197,18 @@ function bindingIdentifier(source: ts.SourceFile, name: string): ts.Identifier |
   return undefined;
 }
 
-function isClassExtends(node: ts.Node): boolean {
+function isClassExtends(node: TS.Node): boolean {
   const parent = node.parent;
-  if (!parent || !ts.isExpressionWithTypeArguments(parent) || parent.expression !== node) return false;
+  if (!parent || !tsApi.isExpressionWithTypeArguments(parent) || parent.expression !== node) return false;
   const clause = parent.parent;
-  return ts.isHeritageClause(clause) && clause.token === ts.SyntaxKind.ExtendsKeyword
-    && (ts.isClassDeclaration(clause.parent) || ts.isClassExpression(clause.parent));
+  return tsApi.isHeritageClause(clause) && clause.token === tsApi.SyntaxKind.ExtendsKeyword
+    && (tsApi.isClassDeclaration(clause.parent) || tsApi.isClassExpression(clause.parent));
 }
 
-function inTypePosition(node: ts.Node): boolean {
+function inTypePosition(node: TS.Node): boolean {
   if (isClassExtends(node)) return false;
   for (let parent = node.parent; parent; parent = parent.parent) {
-    if (ts.isTypeNode(parent)) return true;
+    if (tsApi.isTypeNode(parent)) return true;
   }
   return false;
 }
@@ -217,49 +218,49 @@ function inTypePosition(node: ts.Node): boolean {
  * registered, rendered, read from, returned or extended. A bare reference
  * (`void fresh`, `fresh;`, `const alias = fresh`) does not.
  */
-function isConsumingReference(node: ts.Expression): boolean {
-  let expression: ts.Node = node;
-  while (expression.parent && (ts.isParenthesizedExpression(expression.parent) || ts.isNonNullExpression(expression.parent)
-    || ts.isAsExpression(expression.parent) || ts.isSatisfiesExpression(expression.parent)
-    || ts.isTypeAssertionExpression(expression.parent))) expression = expression.parent;
+function isConsumingReference(node: TS.Expression): boolean {
+  let expression: TS.Node = node;
+  while (expression.parent && (tsApi.isParenthesizedExpression(expression.parent) || tsApi.isNonNullExpression(expression.parent)
+    || tsApi.isAsExpression(expression.parent) || tsApi.isSatisfiesExpression(expression.parent)
+    || tsApi.isTypeAssertionExpression(expression.parent))) expression = expression.parent;
   const parent = expression.parent;
   if (!parent) return false;
   if (isClassExtends(expression)) return true;
-  if (ts.isCallExpression(parent) || ts.isNewExpression(parent)) {
+  if (tsApi.isCallExpression(parent) || tsApi.isNewExpression(parent)) {
     return parent.expression === expression || !!parent.arguments?.some((argument) => argument === expression);
   }
-  if (ts.isTaggedTemplateExpression(parent)) return parent.tag === expression;
-  if (ts.isJsxOpeningElement(parent) || ts.isJsxSelfClosingElement(parent)) return parent.tagName === expression;
-  if (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) return parent.expression === expression;
-  if (ts.isSpreadElement(parent) || ts.isArrayLiteralExpression(parent) || ts.isShorthandPropertyAssignment(parent)
-    || ts.isJsxExpression(parent) || ts.isDecorator(parent) || ts.isReturnStatement(parent)) return true;
-  if (ts.isPropertyAssignment(parent)) return parent.initializer === expression;
-  if (ts.isArrowFunction(parent)) return parent.body === expression;
+  if (tsApi.isTaggedTemplateExpression(parent)) return parent.tag === expression;
+  if (tsApi.isJsxOpeningElement(parent) || tsApi.isJsxSelfClosingElement(parent)) return parent.tagName === expression;
+  if (tsApi.isPropertyAccessExpression(parent) || tsApi.isElementAccessExpression(parent)) return parent.expression === expression;
+  if (tsApi.isSpreadElement(parent) || tsApi.isArrayLiteralExpression(parent) || tsApi.isShorthandPropertyAssignment(parent)
+    || tsApi.isJsxExpression(parent) || tsApi.isDecorator(parent) || tsApi.isReturnStatement(parent)) return true;
+  if (tsApi.isPropertyAssignment(parent)) return parent.initializer === expression;
+  if (tsApi.isArrowFunction(parent)) return parent.body === expression;
   return false;
 }
 
-function hasBindingUse(source: ts.SourceFile, binding: ts.Identifier): boolean {
+function hasBindingUse(source: TS.SourceFile, binding: TS.Identifier): boolean {
   const checker = checkerFor(source);
   const symbol = checker.getSymbolAtLocation(binding);
   if (!symbol) return false;
   let used = false;
-  const visit = (node: ts.Node): void => {
+  const visit = (node: TS.Node): void => {
     if (used) return;
-    if (ts.isIdentifier(node) && node !== binding) {
+    if (tsApi.isIdentifier(node) && node !== binding) {
       const parent = node.parent;
       // Declarations, export lists and property keys do not consume a value.
-      if (!(('name' in parent) && parent.name === node && !ts.isShorthandPropertyAssignment(parent))
-        && !ts.isImportSpecifier(parent)
-        && !ts.isImportClause(parent)
-        && !ts.isNamespaceImport(parent)
-        && !ts.isExportSpecifier(parent)
-        && !(ts.isPropertyAccessExpression(parent) && parent.name === node)
-        && !(ts.isPropertyAssignment(parent) && parent.name === node)
+      if (!(('name' in parent) && parent.name === node && !tsApi.isShorthandPropertyAssignment(parent))
+        && !tsApi.isImportSpecifier(parent)
+        && !tsApi.isImportClause(parent)
+        && !tsApi.isNamespaceImport(parent)
+        && !tsApi.isExportSpecifier(parent)
+        && !(tsApi.isPropertyAccessExpression(parent) && parent.name === node)
+        && !(tsApi.isPropertyAssignment(parent) && parent.name === node)
         && !inTypePosition(node)
         && checker.getSymbolAtLocation(node) === symbol
         && isConsumingReference(node)) used = true;
     }
-    ts.forEachChild(node, visit);
+    tsApi.forEachChild(node, visit);
   };
   visit(source);
   return used;
@@ -271,31 +272,31 @@ function resolvesTo(importer: string, specifier: string, target: string, availab
   return importCandidates(base).find((candidate) => available.has(candidate)) === target;
 }
 
-function consumesExport(source: ts.SourceFile, importer: string, target: string, name: string, available: ReadonlySet<string>, cwd: string): boolean {
+function consumesExport(source: TS.SourceFile, importer: string, target: string, name: string, available: ReadonlySet<string>, cwd: string): boolean {
   for (const statement of source.statements) {
-    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)
+    if (!tsApi.isImportDeclaration(statement) || !tsApi.isStringLiteral(statement.moduleSpecifier)
       || !resolvesTo(importer, statement.moduleSpecifier.text, target, available, cwd)) continue;
     const clause = statement.importClause;
     if (!clause || clause.isTypeOnly) continue;
     if (name === 'default' && clause.name && hasBindingUse(source, clause.name)) return true;
     const bindings = clause.namedBindings;
-    if (bindings && ts.isNamedImports(bindings)) {
+    if (bindings && tsApi.isNamedImports(bindings)) {
       for (const element of bindings.elements) {
         if (element.isTypeOnly || (element.propertyName ?? element.name).text !== name) continue;
         if (hasBindingUse(source, element.name)) return true;
       }
     }
-    if (bindings && ts.isNamespaceImport(bindings)) {
+    if (bindings && tsApi.isNamespaceImport(bindings)) {
       const checker = checkerFor(source);
       const namespaceSymbol = checker.getSymbolAtLocation(bindings.name);
       let used = false;
-      const visit = (node: ts.Node): void => {
+      const visit = (node: TS.Node): void => {
         if (used) return;
-        if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)
+        if (tsApi.isPropertyAccessExpression(node) && tsApi.isIdentifier(node.expression)
           && node.name.text === name && !inTypePosition(node)
           && checker.getSymbolAtLocation(node.expression) === namespaceSymbol
           && isConsumingReference(node)) used = true;
-        ts.forEachChild(node, visit);
+        tsApi.forEachChild(node, visit);
       };
       visit(source);
       if (used) return true;
@@ -309,7 +310,7 @@ export function findUnwiredExports(input: WiringCheckInput): WiringCheckResult {
   const cwd = resolve(input.cwd);
   const readFile = input.readFile ?? ((file: string) => readFileSync(file, 'utf8'));
   const candidates: { file: string; name: string; localName: string | null }[] = [];
-  const parsedChanged = new Map<string, ts.SourceFile>();
+  const parsedChanged = new Map<string, TS.SourceFile>();
   try {
     for (const file of [...new Set(input.changedFiles)]) {
       if (!SOURCE.test(file) || TEST.test(file) || ENTRYPOINT.test(file)) continue;

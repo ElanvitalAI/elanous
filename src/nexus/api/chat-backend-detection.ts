@@ -19,7 +19,7 @@
 // PWA's "I just exported the env, refresh the card" flow (the
 // SettingsPanel calls this on mount + on the explicit refresh button).
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   buildQuickSetupSnapshot,
   type QuickSetupRenderOpts,

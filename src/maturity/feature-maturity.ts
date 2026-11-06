@@ -60,7 +60,7 @@ export const FEATURE_MATURITY = {
   },
   // Canonical CLI command names only; aliases inherit their command's grade.
   cliRoot: {
-    preview: 'beta', pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta', catalog: 'beta',
+    preview: 'beta', pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta', catalog: 'beta', app: 'beta',
     where: 'stable', bench: 'beta', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
     pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', runs: 'beta', live: 'beta',
     research: 'beta', release: 'beta', rfc: 'beta', know: 'beta', life: 'beta', freeze: 'beta', herdr: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',
@@ -69,7 +69,7 @@ export const FEATURE_MATURITY = {
     a2a: 'beta', plugin: 'stable', make: 'beta', skills: 'beta', connect: 'beta', import: 'beta',
     persona: 'beta', team: 'beta', 'team-set': 'beta', market: 'beta', directive: 'stable', connector: 'beta', storyboard: 'beta',
     python: 'beta', 'self-update': 'stable', 'measure-fabric-arc-ab': 'beta', mcp: 'beta',
-    relay: 'beta', 'telegram-test': 'beta', telegram: 'beta', 'discord-test': 'beta',
+    relay: 'beta', 'telegram-test': 'beta', telegram: 'beta', 'discord-test': 'beta', bootstrap: 'stable',
     sync: 'beta', status: 'beta', git: 'beta', gh: 'beta', repro: 'system',
     theme: 'beta', history: 'beta', inspect: 'beta', autopilot: 'beta', memory: 'beta',
     decide: 'beta', 'ax-screen': 'beta', 'decide-recipe': 'beta', signals: 'beta',
@@ -109,7 +109,6 @@ export const FEATURE_MATURITY = {
     session: 'stable',
     fork: 'stable',
     rewind: 'stable',
-    mission: 'beta',
     'resume-turn': 'beta',
     context: 'stable',
     paste: 'stable',

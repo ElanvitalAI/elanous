@@ -24,7 +24,7 @@ import { homedir } from 'node:os';
 import { readdirSync, realpathSync, statSync } from 'node:fs';
 import { createProject, listProjects } from '../../project/project-store.js';
 import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
-import { buildGridData, type GridDeps } from './grid.js';
+import { createGridDataSource, type GridDataSource, type GridDeps } from './grid.js';
 import { createDraftMetricsSource, type DraftMetricsSource } from './draft-metrics.js';
 import { DECISIONS_PATH, handleDecisions, type DecisionsRouteDeps } from './decisions-route.js';
 import { OPS_BOARD_PATH, handleOpsBoard, type OpsBoardDeps } from './ops-board-route.js';
@@ -38,6 +38,7 @@ import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { machineForToken } from '../../control-plane/member-tokens.js';
 import { handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
 import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
+import type { NexusAppHost } from '../apps/app-host.js';
 
 export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 import type { TabRegistry } from '../state/tab-registry.js';
@@ -175,7 +176,7 @@ import {
 import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
 import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
 import { handleHarnessRunTraversalGet } from './harness-traversal.js';
-import { handleLoopEdgesGet } from './loop-edges.js';
+import { createLoopEdgesDataSource, type LoopEdgesDataSource } from './loop-edges.js';
 import { handleLoopResourcesGet } from './loop-resources.js';
 import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js';
 import { dispatchPersonaRoute } from './personas.js';
@@ -578,6 +579,9 @@ export interface NexusHttpServerOpts {
   /** T5.A — directory served at /app/* (PWA static export). When omitted,
    *  /app/* returns 404 — boot wiring without the PWA build keeps working. */
   staticDir?: string;
+  /** NEXUS-APP-HOST-S1 — app static exports are routed only on their dedicated
+   *  `<slug>.app.localhost` hostname. Known app hosts never fall through to PWA/API routes. */
+  appHost?: NexusAppHost;
   /** P-2D.2 — runtime mutable ref for the dev-proxy upstream.
    *  Replaced the static `devProxy: {upstream}` option so admin
    *  HTTP calls (`POST /v1/nexus/admin/pwa-dev-proxy`) can flip the
@@ -762,6 +766,8 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
   // P-2D.2 — every request reads from this ref. Admin endpoint
   // mutates it. When the caller didn't pass one we own the lifecycle.
   const devProxyRef: DevProxyRuntimeRef = opts.devProxyRef ?? createDevProxyRuntimeRef();
+  const gridDataSource = createGridDataSource({ deps: opts.grid });
+  const loopEdgesDataSource = createLoopEdgesDataSource();
 
   let server: ReturnType<typeof Bun.serve> | null = null;
   let resolvedPort = -1;
@@ -822,7 +828,7 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
         // Bun 기본 128 MB 로는 현장 업로드(파일 200 MB · 요청 500 MB · JSON base64)가 못 들어온다.
         maxRequestBodySize: FIELD_SERVER_MAX_BODY_BYTES,
         fetch: async (req: Request, srv: unknown) =>
-          (await routeRequest(req, opts, srv as BunServerLike, bridge, devProxyRef, { hostname, port })) ??
+          (await routeRequest(req, opts, srv as BunServerLike, bridge, devProxyRef, { hostname, port }, gridDataSource, loopEdgesDataSource)) ??
           new Response(null, { status: 101 }),
         ...(websocketHandler ? { websocket: websocketHandler } : {}),
       } as unknown as Parameters<typeof Bun.serve>[0];
@@ -855,6 +861,8 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
     stop() {
       stopInsideRelay();
       try { server!.stop(true); } catch { /* idempotent */ }
+      loopEdgesDataSource.close();
+      opts.appHost?.close();
       setInProcessOutbound(null);
     },
   };
@@ -1010,12 +1018,18 @@ export async function routeRequest(
     hostname: opts.hostname ?? '127.0.0.1',
     port: opts.startPort ?? DEFAULT_NEXUS_HTTP_PORT,
   },
+  gridDataSource?: GridDataSource,
+  loopEdgesDataSource?: LoopEdgesDataSource,
 ): Promise<Response | undefined> {
   // Register peer context before any HTTP handler reaches checkAuth. Missing
   // requestIP is explicitly unknown so same-origin headers fail closed.
   registerAuthPeerAddress(req, (server as BunServerLike & {
     requestIP?: (request: Request) => { address: string } | null;
   }).requestIP?.(req)?.address);
+  // NEXUS-APP-HOST-S1 — app host is a separate hostname/origin from the PWA.
+  // Handle it before owner API routing; an app-host request must never reach /v1.
+  const appResponse = opts.appHost?.handle(req);
+  if (appResponse) return appResponse;
   // Mission lines use a scoped per-mission bearer issued by the mission
   // parent, not the owner/API bearer checked by the general scope guard.
   if (new URL(req.url).pathname.startsWith('/v1/missions/')) {
@@ -1515,7 +1529,7 @@ export async function routeRequest(
   if (pathname === '/v1/loops/edges' && method === 'GET') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
     if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return handleLoopEdgesGet(req);
+    return (loopEdgesDataSource ?? createLoopEdgesDataSource()).read(req);
   }
 
   if (pathname === '/v1/harness/runs' && method === 'GET') {
@@ -1658,11 +1672,11 @@ export async function routeRequest(
     });
   }
 
-  // routeRequest is the live GET-only caller of buildGridData; keep it behind the owner auth gate.
+  // routeRequest is the live GET-only caller of the cached grid snapshot; keep it behind the owner auth gate.
   if (pathname === '/v1/grid') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
-    return jsonResponse(buildGridData(opts.grid));
+    return jsonResponse((gridDataSource ?? createGridDataSource({ deps: opts.grid })).read());
   }
   // DRAFT-METRIC: answers from memory; a stale/cold cache starts one background collection (never per request).
   if (pathname === '/v1/drafts/metrics') {

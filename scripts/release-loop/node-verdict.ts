@@ -84,7 +84,9 @@ export function cutoffNotesEmpty(data: Record<string, unknown> | undefined): boo
 export function pwaNodeArgs(commit: string, input: Record<string, unknown>): string[] {
   const remote = input.pwaRemote;
   if (remote !== undefined && (typeof remote !== 'string' || !remote.trim())) throw new Error(`release.loop.pwaRemote must be an ssh host: ${String(remote)}`);
-  return ['scripts/release-loop/pwa-scenarios-node.ts', '--commit', commit, '--with-costly', '--json',
+  // C1 (costly) needs a live model, but the node always builds a fresh isolated test universe with no LLM credentials,
+  // so it can never pass there. Opt in with run input `pwaWithCostly: true` (until a mock-model device replaces it).
+  return ['scripts/release-loop/pwa-scenarios-node.ts', '--commit', commit, ...(input.pwaWithCostly === true ? ['--with-costly'] : []), '--json',
     ...(typeof remote === 'string' ? ['--remote', remote.trim()] : [])];
 }
 

@@ -22,10 +22,8 @@
 
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
 import { debug } from '../debug/log.js';
-import {
-  runCoreTurn,
-  type CoreTurnDispatchTool,
-} from '../core-turn/index.js';
+import { runCoreTurn } from '../core-turn/run-core-turn.js';
+import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import type { AcpServerOptions, AcpTurnContext } from './server.js';
 import { DEFAULT_BRIDGE_ABORT_POLL_MS } from './core-turn-bridge.js';
 import { globalDualRoleManager } from './dual-role-manager.js';

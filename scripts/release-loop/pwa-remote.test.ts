@@ -41,8 +41,8 @@ test('PWA node entrypoint passes default, valid override, and invalid-value fall
       '#!/bin/sh',
       `printf '%s\\t%s\\n' "\${ELANOUS_CDP_ATTACH_TIMEOUT_MS-}" "$*" >> "$PWA_TEST_CAPTURE"`,
       'case "$*" in',
-      '  *"nexus run --test --stop"*) exit 0 ;;',
-      '  *"nexus run --test"*) printf \'nexus :%s\\n\' "$PWA_TEST_PORT" ;;',
+      '  *"--test nexus run --stop"*) exit 0 ;;',
+      '  *"--test nexus run"*) printf \'nexus :%s\\n\' "$PWA_TEST_PORT" ;;',
       '  *"nexus build"*) exit 0 ;;',
       '  *"createScenarios"*) printf \'[{"id":"PWA-TEST","costly":false}]\\n\' ;;',
       '  *"scripts/pwa-scenarios.ts"*) printf \'{"results":[{"id":"PWA-TEST","pass":true}]}\\n\' ;;',
@@ -162,8 +162,9 @@ test('entry point: `pwa-scenarios-node.ts --remote` prints the host verdict as i
 }, 120_000);
 
 test('release.loop.pwaRemote is the one setting: absent = today argv, set = --remote', () => {
-  expect(pwaNodeArgs(SHA, {})).toEqual(['scripts/release-loop/pwa-scenarios-node.ts', '--commit', SHA, '--with-costly', '--json']);
-  expect(pwaNodeArgs(SHA, { pwaRemote: ' node-b ' })).toEqual(['scripts/release-loop/pwa-scenarios-node.ts', '--commit', SHA, '--with-costly', '--json', '--remote', 'node-b']);
+  expect(pwaNodeArgs(SHA, {})).toEqual(['scripts/release-loop/pwa-scenarios-node.ts', '--commit', SHA, '--json']);
+  expect(pwaNodeArgs(SHA, { pwaWithCostly: true })).toEqual(['scripts/release-loop/pwa-scenarios-node.ts', '--commit', SHA, '--with-costly', '--json']);
+  expect(pwaNodeArgs(SHA, { pwaRemote: ' node-b ' })).toEqual(['scripts/release-loop/pwa-scenarios-node.ts', '--commit', SHA, '--json', '--remote', 'node-b']);
   expect(() => pwaNodeArgs(SHA, { pwaRemote: '' })).toThrow('release.loop.pwaRemote');
 });
 
@@ -266,7 +267,7 @@ test('config → argv: buildReleaseRunInput({ pwaRemote }) reaches pwaNodeArgs a
     writeFileSync(join(ledger, 'release', '0.2.35', 'release.json'), JSON.stringify({ version: '0.2.35', publishedAt: '2026-10-20T06:00:00Z' }));
     const input = buildReleaseRunInput('0.2.36', { ledgerRoot: ledger, config: { gatePodPool: 'k3d-elanous-pool:4', pwaRemote: 'node-b' } });
     expect(input.pwaRemote).toBe('node-b');
-    expect(pwaNodeArgs(SHA, input as unknown as Record<string, unknown>)).toEqual(['scripts/release-loop/pwa-scenarios-node.ts', '--commit', SHA, '--with-costly', '--json', '--remote', 'node-b']);
+    expect(pwaNodeArgs(SHA, input as unknown as Record<string, unknown>)).toEqual(['scripts/release-loop/pwa-scenarios-node.ts', '--commit', SHA, '--json', '--remote', 'node-b']);
     const without = buildReleaseRunInput('0.2.36', { ledgerRoot: ledger, config: { gatePodPool: 'k3d-elanous-pool:4' } });
     expect(pwaNodeArgs(SHA, without as unknown as Record<string, unknown>)).not.toContain('--remote');
   } finally { rmSync(ledger, { recursive: true, force: true }); }

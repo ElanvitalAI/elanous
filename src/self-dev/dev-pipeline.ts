@@ -19,7 +19,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { benchArmBranchForBase } from '../bench/bench.js';
 import { readFileSync } from 'node:fs';
-import { dispatchTask, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
+import type { DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { getNestDepth } from '../agent/nest-depth.js';
 import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 import { appendEvidenceLocationRequirement, extractVerbatimOriginalAsk, formatGoalFileLintFinding, inspectAskDecisionSignalMarker, inspectGoalDoneBoundary, leadingGoalMetadata, lintGoalFile, markdownSection, parseGoalId, parseGoalType, tracedPathReferences, SUPERSEDED_BY_LINE, type GoalFileLintFinding, type GoalFileLintResult } from '../self-implement/goal-author.js';
@@ -185,11 +185,8 @@ export interface DevChatOpts {
 
 // ── spec 축 (PLAN §2) ──
 export type DevInput = { text: string } | { file: string };
-/** ⛔⭐ `aside` 는 2026-08-24 `#12488` 로 agent-mission 백엔드에 «등록»됐는데 이 합집합에는 안 들어왔다.
- *  ⇒ `mission-cli.ts:82` 가 `agentBackend.name` 을 그대로 넘겨 저장소 «전역» tsc 빨강이 났고,
- *    그 빨강이 대상 경로와 «무관한» 런의 게이트를 막았다(130차 실물: run-a3862983 이 그것으로 중단).
- *  📌 등록과 합집합은 «같이» 움직여야 한다 — 한쪽만 늘리면 조용히 빨강이 된다. */
-export type DevBackend = 'codex' | 'claude' | 'gemini' | 'grok' | 'aside';
+/** agent-mission PTY backend names. ACP remains a supported subset; OpenClaw/Hermes are PTY-only. */
+export type DevBackend = 'codex' | 'claude' | 'gemini' | 'grok' | 'aside' | 'openclaw' | 'hermes';
 export type DevTransport = 'pty' | 'acp';
 /** executor 2단 모델 — self(특수 갈래) | external(backend×transport). */
 export type DevExecutor =
@@ -358,6 +355,9 @@ export function planDevPipeline(spec: DevPipelineSpec): ResolvedDevPlan {
     !spec.executor || spec.executor.kind === 'self'
       ? { kind: 'self' }
       : { kind: 'external', backend: spec.executor.backend, transport: spec.executor.transport ?? 'pty' };
+  if (executor.kind === 'external' && executor.transport === 'acp' && (executor.backend === 'openclaw' || executor.backend === 'hermes')) {
+    throw new DevPipelineError(`${executor.backend}는 ACP transport 미지원 — PTY를 사용하라`);
+  }
 
   const context: DevDispatchMode = spec.context ?? 'mission'; // 개발 파이프라인 기본 mission
   // concurrency 는 executor(orchestrateSelfDev)의 관심사 — 여기서 기본값을 발명하지 않는다(undefined 보존 →
@@ -543,6 +543,7 @@ export function planDevPipeline(spec: DevPipelineSpec): ResolvedDevPlan {
 
 /** DevBackend → ACP delegate backend 이름 — ACP 에서 codex 는 codex-app-server(그 외 동일). */
 export function acpBackendName(b: DevBackend): string {
+  if (b === 'openclaw' || b === 'hermes') throw new DevPipelineError(`${b}는 ACP transport 미지원 — PTY를 사용하라`);
   return b === 'codex' ? 'codex-app-server' : b;
 }
 
@@ -965,7 +966,7 @@ export interface DevHarnessDispatchArgs extends Record<string, unknown> {
 }
 
 export interface DevPipelineDeps {
-  dispatchTask?: typeof dispatchTask;
+  dispatchTask?: (typeof import('../execution-loop/dispatch-task.js'))['dispatchTask'];
   dispatchTaskDeps?: DispatchTaskDeps;
   /** Caller has already recorded this dispatch decision at an outer entrance. */
   skipDispatchTask?: boolean;
@@ -2071,14 +2072,17 @@ async function observeDevTaskDispatch(spec: DevPipelineSpec, plan: ResolvedDevPl
         deps.dispatchTaskDeps?.onCardCreated?.(cardId);
       },
     };
-    const work = Promise.resolve().then(() => (deps.dispatchTask ?? dispatchTask)({
+    const work = Promise.resolve().then(async () => {
+      const dispatchTask = deps.dispatchTask ?? (await import('../execution-loop/dispatch-task.js')).dispatchTask;
+      return dispatchTask({
       goalId: goalId ?? `request-${createHash('sha256').update(goalText).digest('hex').slice(0, 32)}`,
       title: goalText.split(/\r?\n/, 1)[0]?.trim() || 'Untitled request',
       goalText,
       targetPaths: 'file' in plan.input ? tracedPathReferences(goalText).map((reference) => reference.path) : [],
       spec,
       ...(spec.runId ? { runKey: spec.runId } : {}),
-    }, dispatchDeps));
+    }, dispatchDeps);
+    });
     // The default dispatcher bounds its gates to five seconds. Await its completed
     // observation so short-lived callers cannot exit before decisions reach the card.
     // Injected dispatchers retain an outer timeout to protect the original launch.

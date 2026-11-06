@@ -1498,14 +1498,15 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--checkout <dir>', '깨끗한 git 체크아웃(기본 ELANOUS_REHEARSAL_GIT_CWD)')
     .option('--shards <n>', '시험 분할 수')
     .option('--remote <host>', '게이트 호스트')
+    .option('--pod-pool <spec>', 'aws1 예행 전용 단일 Pod 멤버(기본 release.loop.gatePodPool)')
     .option('--recovery-run <id>', '기존 실패 release-loop 런을 gate에서 명시적으로 재개(기본 예약 틱과 분리)')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { apply?: boolean; checkout?: string; shards?: string; remote?: string; recoveryRun?: string; json?: boolean }) => {
+    .action(async (o: { apply?: boolean; checkout?: string; shards?: string; remote?: string; podPool?: string; recoveryRun?: string; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         const ledgerRoot = scheduleLedgerRoot();
         if (o.recoveryRun !== undefined) {
           if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(o.recoveryRun)) throw new Error('release rehearsal recovery: invalid run id');
-          if (o.shards !== undefined || o.remote !== undefined) throw new Error('release rehearsal recovery: --shards and --remote are unsupported; use the saved gate settings');
+          if (o.shards !== undefined || o.remote !== undefined || o.podPool !== undefined) throw new Error('release rehearsal recovery: --shards, --remote, and --pod-pool are unsupported; use the saved gate settings');
           const resumeOptions = { runId: o.recoveryRun, from: 'gate', commandRoot: o.checkout ?? process.cwd() };
           if (!o.apply) {
             const plan = await planResumeReleaseRun(resumeOptions, resumeDeps);
@@ -1521,7 +1522,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           }
         }
         if (o.apply && !mayWriteLedger('release rehearsal tick', false, ledgerRoot)) throw new Error('release rehearsal tick: ledger write denied');
-        const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, shards: o.shards === undefined ? undefined : Number(o.shards), remote: o.remote, recoveryRun: o.recoveryRun, ledgerRoot }, {
+        const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, shards: o.shards === undefined ? undefined : Number(o.shards), remote: o.remote, podPool: o.podPool, recoveryRun: o.recoveryRun, ledgerRoot }, {
           ...rehearsalDeps,
           resumeGate: rehearsalDeps.resumeGate ?? (async (runId, checkout) => {
             const resumed = await resumeReleaseRun({ runId, from: 'gate', commandRoot: checkout }, resumeDeps);

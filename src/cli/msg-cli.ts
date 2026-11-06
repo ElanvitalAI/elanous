@@ -394,14 +394,20 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
   registerMsgListCommand(msg, { openStore: open, cacheReads: deps.openStore === undefined, out, setExitCode });
 
-  msg.command('ack [id]').description('Explicitly acknowledge messages through this ID for one recipient')
-    .option('--to <seat>').option('--json')
-    .action((id: string | undefined, opts: CommonOptions & { to?: string }) => run(() => {
+  msg.command('ack [id]').description('Acknowledge one message with --id, or acknowledge through --through')
+    .option('--to <seat>').option('--id <id>', 'acknowledge exactly one message').option('--through <id>', 'acknowledge all messages through this ID').option('--json')
+    .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string; through?: string }) => run(() => {
       const to = seat(opts.to, '--to');
-      if (id === undefined) throw new Error('message ID is required');
-      const cursor = integer(id, 'message ID', 0, 0, Number.MAX_SAFE_INTEGER);
-      const acknowledged = withStore(store => store.ack(to, cursor));
-      emit({ recipient: to, cursor: acknowledged }, opts.json, () => out.log(`${to} acknowledged through #${acknowledged}`));
+      if (Number(Boolean(opts.id)) + Number(Boolean(opts.through)) + Number(Boolean(positional)) !== 1) throw new Error('choose exactly one of positional ID, --id, or --through');
+      if (opts.id !== undefined) {
+        const id = integer(opts.id, '--id', 1, 1, Number.MAX_SAFE_INTEGER);
+        withStore(store => store.ackMessage(to, id));
+        emit({ recipient: to, id, status: 'acked' }, opts.json, () => out.log(`${to} acknowledged #${id}`));
+        return;
+      }
+      const through = integer(opts.through ?? positional, opts.through === undefined ? 'message ID' : '--through', 0, 0, Number.MAX_SAFE_INTEGER);
+      const acknowledged = withStore(store => store.ack(to, through));
+      emit(opts.through === undefined ? { recipient: to, cursor: acknowledged } : { recipient: to, through: acknowledged }, opts.json, () => out.log(`${to} acknowledged through #${acknowledged}`));
     })());
 
   msg.command('unread').description('Show recipients with unacknowledged messages')

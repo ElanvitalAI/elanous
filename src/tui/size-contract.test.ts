@@ -38,7 +38,6 @@ test('next entry imports no dashboard module and legacy imports do not grow', ()
     'input/pickers.ts:../../dashboard/finder-feedback-runtime.js',
     'input/pickers.ts:../../dashboard/modals/preview.js',
     'input/pickers.ts:../../dashboard/transfer-feedback-runtime.js',
-    'slash/mission.ts:../../dashboard/slash-runtime/registry.js',
     'slash/term.ts:../../dashboard/input/terminal-modal-router.js',
     'slash/term.ts:../../dashboard/slash-runtime/registry.js',
     'slash/term.ts:../../dashboard/term-slash-runtime.js',

@@ -239,6 +239,32 @@ export class ResourceLedger {
     });
   }
 
+  /** Atomically fences an expired idle Pod so it cannot be leased while its UID-pinned deletion runs. */
+  expireIdlePodWorker(id: string, request: { machine: string; podUid: string; expectedObservedAt: number;
+    expectedExpiresAtMs: number }, now?: number): ResourceRecord {
+    return this.mutate(() => {
+      const at = now ?? Date.now();
+      const rows = this.read();
+      const index = rows.findIndex(row => row.id === id && row.kind === 'pod-worker-lease');
+      if (index < 0) throw new ResourceLedgerError(404, 'not-found');
+      const row = rows[index]!;
+      const attrs = workerAttrs(row);
+      const expiresAtMs = row.observedAt + row.ttlMs;
+      if (row.machine !== request.machine || attrs.podUid !== request.podUid
+        || row.observedAt !== request.expectedObservedAt || expiresAtMs !== request.expectedExpiresAtMs)
+        throw new ResourceLedgerError(409, 'stale-expired-worker');
+      if (attrs.state !== 'idle' || attrs.leaseId || !Number.isSafeInteger(row.observedAt)
+        || !Number.isSafeInteger(row.ttlMs) || row.ttlMs <= 0 || at < expiresAtMs)
+        throw new ResourceLedgerError(409, 'pod-worker-not-expired-idle');
+      const next: ResourceRecord = { ...row,
+        attrs: { ...attrs, state: 'reaping', reason: 'idle-ttl-expired' } as unknown as Record<string, unknown>,
+        observedAt: at };
+      rows[index] = next;
+      this.write(rows);
+      return next;
+    });
+  }
+
   acquirePodWorker(request: { machine?: string; key: PodWorkerKey; owner: string; runId: string; attemptId: string; ttlMs: number }, now?: number): ResourceRecord {
     return this.mutate(() => {
     const at = now ?? Date.now();
@@ -377,6 +403,27 @@ export class ResourceLedger {
     rows[index] = next;
     this.write(rows);
     return next;
+    });
+  }
+
+  retireIdlePodWorker(id: string, request: { machine: string; podUid: string; reason?: 'host-drained' | 'runtime-contract-mismatch' }, now = Date.now()): ResourceRecord {
+    return this.mutate(() => {
+      const rows = this.read();
+      const index = rows.findIndex(row => row.id === id && row.kind === 'pod-worker-lease');
+      if (index < 0) throw new ResourceLedgerError(404, 'not-found');
+      const row = rows[index]!;
+      const attrs = workerAttrs(row);
+      if (row.machine !== request.machine) throw new ResourceLedgerError(403, 'machine-scope');
+      if (!request.podUid || attrs.podUid !== request.podUid) throw new ResourceLedgerError(409, 'pod-uid-mismatch');
+      const reason = request.reason ?? 'host-drained';
+      if (reason !== 'host-drained' && reason !== 'runtime-contract-mismatch')
+        throw new ResourceLedgerError(400, 'invalid-worker-retire-reason');
+      if (attrs.state === 'quarantined' && attrs.reason === reason) return row;
+      if (attrs.state !== 'idle') throw new ResourceLedgerError(409, 'worker-not-idle');
+      const next = { ...row, attrs: { ...attrs, state: 'quarantined', reason }, observedAt: now };
+      rows[index] = next as ResourceRecord;
+      this.write(rows);
+      return next as ResourceRecord;
     });
   }
 

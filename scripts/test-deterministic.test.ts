@@ -3,10 +3,11 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   cleanupTemporaryRoot,
   classifyExplicitTestFiles,
+  deriveImportOnlyTestFiles,
   deriveMockModuleTestFiles,
   deriveTestFiles,
   effectiveTestCwd,
@@ -40,7 +41,18 @@ setDefaultTimeout(60_000);
 const source = readFileSync('scripts/test-deterministic.ts', 'utf8');
 const envSource = readFileSync('scripts/lib/deterministic-env.ts', 'utf8');
 const script = join(import.meta.dir, 'test-deterministic.ts');
+const repositoryImportOnlyAliases = [
+  'src/boot/ws-bridge.test.ts',
+  'scripts/install.ps1.test.ts',
+  'scripts/lib/nl-routing-measurement.test.ts',
+  'test/pwa-sessions-service.test.ts',
+];
 const cleanups: Array<() => void> = [];
+
+function pathIgnorePatterns(command: string[]): string[] {
+  return command.flatMap((arg, index) => arg === '--path-ignore-patterns' && command[index + 1]
+    ? [command[index + 1]!] : []).sort();
+}
 
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
@@ -336,7 +348,7 @@ describe('scripts/test-deterministic.ts preservation', () => {
     expect(source).toContain('detached: true');
     // ⛔ 이 칸이 지키는 «뜻»은 「사람이 준 argv 가 bun test 까지 그대로 간다」다.
     //   2026-09-24: CDP 레인 분리로 그 앞에 ...ignoreArgs 가 붙었다 — argv 통과는 그대로다.
-    expect(source).toContain('let commands = planDeterministicTestCommands(argv, cdpPatterns, mockFiles, allTestFiles, testCwd)');
+    expect(source).toContain('let commands = planDeterministicTestCommands(argv, ignoredTestPatterns, mockFiles, allTestFiles, testCwd)');
     expect(source).toContain('for (const cmd of commands)');
     expect(source).toContain("join(tempBase(), TEMP_ROOT_PREFIX)");
     expect(source).toContain("export const TEMP_ROOT_PREFIX = 'elanous-deterministic-test-';");
@@ -780,7 +792,10 @@ describe('runDeterministicTests core.bare guard', () => {
       },
     });
     expect(code).toBe(1);
-    expect(messages).toEqual(['[test-deterministic] core.bare changed false -> false,true; restore failed: expected false, got false,true']);
+    expect(messages).toEqual([
+      '[test-deterministic] import-only 별칭 4개는 전체 시험에서 제외한다 — 명시 경로 선택은 그대로 실행한다.',
+      '[test-deterministic] core.bare changed false -> false,true; restore failed: expected false, got false,true',
+    ]);
   });
 
   test('checks the shared config only once after a normal child exit', async () => {
@@ -812,11 +827,82 @@ describe('runDeterministicTests core.bare guard', () => {
       spawn: () => ({ pid: process.pid, exited: Promise.resolve(0), kill: () => true }),
     });
     expect(code).toBe(0);
-    expect(messages).toEqual([]);
+    expect(messages).toEqual(['[test-deterministic] import-only 별칭 4개는 전체 시험에서 제외한다 — 명시 경로 선택은 그대로 실행한다.']);
   });
 });
 
 describe('mock.module process isolation', () => {
+  test('full-suite planning skips import-only aliases while explicit path selection still runs them', () => {
+    const root = makeRoot();
+    mkdirSync(join(root, 'test'));
+    const alias = 'test/alias.test.ts';
+    const canonical = 'test/canonical.test.ts';
+    const otherAliases = [
+      'test/alias-one.test.ts',
+      'test/alias-two.test.ts',
+      'test/alias-three.test.ts',
+    ];
+    writeFileSync(join(root, alias), "// historical path\nimport './canonical.test.ts';\n");
+    writeFileSync(join(root, canonical), "import { test } from 'bun:test';\ntest('canonical', () => {});\n");
+    for (const file of otherAliases) {
+      mkdirSync(join(root, file, '..'), { recursive: true });
+      writeFileSync(join(root, file), "import './canonical.test.ts';\n");
+    }
+
+    const allAliases = [alias, ...otherAliases];
+    expect(deriveImportOnlyTestFiles({ cwd: root, files: [...allAliases, canonical] })).toEqual(allAliases);
+    const repositoryAliases = [
+      'scripts/lib/nl-routing-measurement.test.ts',
+      'scripts/install.ps1.test.ts',
+      'src/boot/ws-bridge.test.ts',
+      'test/pwa-sessions-service.test.ts',
+    ];
+    const repositoryTargets = [
+      'scripts/nl-routing-measurement.test.ts',
+      'scripts/install-ps1.test.ts',
+      'test/ws-bridge-auth.test.ts',
+      'apps/pwa/src/lib/sessions-service.test.ts',
+    ];
+    const repositoryRoot = resolve(import.meta.dir, '..');
+    expect(deriveImportOnlyTestFiles({
+      cwd: repositoryRoot,
+      files: [...repositoryAliases, ...repositoryTargets],
+    })).toEqual(repositoryAliases);
+    expect(planDeterministicTestCommands(['--dots'], repositoryAliases, [], [], repositoryRoot)).toEqual([
+      ['bun', 'test', ...repositoryAliases.flatMap((file) => ['--path-ignore-patterns', file]), '--dots'],
+    ]);
+    expect(planDeterministicTestCommands([repositoryAliases[0]!], [], [], [...repositoryAliases, ...repositoryTargets], repositoryRoot)).toEqual([
+      ['bun', 'test', repositoryAliases[0]!],
+    ]);
+    expect(planDeterministicTestCommands([alias], [], [], [...allAliases, canonical], root)).toEqual([
+      ['bun', 'test', alias],
+    ]);
+  });
+
+  test('running every real historical alias explicitly executes its canonical tests', () => {
+    const aliases = [
+      { path: 'scripts/lib/nl-routing-measurement.test.ts', testName: 'fail-closed before corpus loading when observe-only is disabled' },
+      { path: 'scripts/install.ps1.test.ts', testName: 'uses the Bash installer required-command data and it matches the catalog' },
+      { path: 'src/boot/ws-bridge.test.ts', testName: 'Authorization: Bearer wins over subprotocol' },
+      { path: 'test/pwa-sessions-service.test.ts', testName: 'maps store fields onto the picker summary shape' },
+    ];
+    const reportDir = trackRoot(mkdtempSync(join(tmpdir(), 'elanous-alias-junit-')));
+    for (const alias of aliases) {
+      const reportFile = join(reportDir, `${aliases.indexOf(alias)}.xml`);
+      const result = spawnSync(process.execPath, [
+        'run', script,
+        '--reporter=junit', `--reporter-outfile=${reportFile}`,
+        `--test-name-pattern=${alias.testName}`, alias.path,
+      ], {
+        cwd: resolve(import.meta.dir, '..'), encoding: 'utf8', timeout: 120_000,
+      });
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(result.status, `${alias.path}: ${output.slice(-2_000)}`).toBe(0);
+      expect(existsSync(reportFile), `${alias.path} must produce a JUnit report`).toBe(true);
+      expect(readFileSync(reportFile, 'utf8'), `${alias.path} must execute its canonical test`).toContain(`name="${alias.testName}"`);
+    }
+  }, 480_000);
+
   test('discovers module mocks across Bun test name forms and extensions', () => {
     const root = makeRoot();
     for (const dir of ['src', 'test', 'plugins']) mkdirSync(join(root, dir));
@@ -1433,10 +1519,11 @@ describe('mock.module process isolation', () => {
       waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
     });
     expect(code).toBe(0);
-    expect(commands).toEqual([
-      ['bun', 'test', '--path-ignore-patterns', cdp, '--path-ignore-patterns', mock, '--pass-with-no-tests', '--preload', './setup.ts'],
-      ['bun', 'test', '--preload', './setup.ts', mock],
-    ]);
+    expect(commands).toHaveLength(2);
+    expect(commands[0]?.slice(0, 2)).toEqual(['bun', 'test']);
+    expect(pathIgnorePatterns(commands[0] ?? [])).toEqual([cdp, ...repositoryImportOnlyAliases, mock].sort());
+    expect(commands[0]?.slice(-3)).toEqual(['--pass-with-no-tests', '--preload', './setup.ts']);
+    expect(commands[1]).toEqual(['bun', 'test', '--preload', './setup.ts', mock]);
   });
 
   test('keeps Bun global value options from becoming test selectors', () => {
@@ -1467,10 +1554,11 @@ describe('mock.module process isolation', () => {
       waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
     });
     expect(code).toBe(0);
-    expect(commands).toEqual([
-      ['bun', 'test', '--path-ignore-patterns', cdp, '--path-ignore-patterns', mock, '--pass-with-no-tests', '--env-file', '.env.test'],
-      ['bun', 'test', '--env-file', '.env.test', mock],
-    ]);
+    expect(commands).toHaveLength(2);
+    expect(commands[0]?.slice(0, 2)).toEqual(['bun', 'test']);
+    expect(pathIgnorePatterns(commands[0] ?? [])).toEqual([cdp, ...repositoryImportOnlyAliases, mock].sort());
+    expect(commands[0]?.slice(-3)).toEqual(['--pass-with-no-tests', '--env-file', '.env.test']);
+    expect(commands[1]).toEqual(['bun', 'test', '--env-file', '.env.test', mock]);
   });
 
   test('runs each selected mock in a separate child and combines nonzero results', async () => {

@@ -1,6 +1,6 @@
 import type { PodPoolMember, PoolKubectl } from './pod-pool.js';
 import { debug } from '../../debug/log.js';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -838,4 +838,81 @@ function admissionByUsage(measure: PoolLeaseMeasure, goalBytes: number, explicit
   const admitBytes = fallback !== null || observedBytes === null ? goalBytes
     : Math.min(goalBytes, Math.max(requestBytes, POD_SI_ADMISSION_CAP_BYTES === null ? observedBytes : Math.min(observedBytes, POD_SI_ADMISSION_CAP_BYTES)));
   return { samples: samples.length, p95Bytes, admitBytes, fallback };
+}
+
+export type PoolLeaseAsyncKubectl = (args: readonly string[]) => Promise<ReturnType<PoolKubectl>>;
+
+function leaseKubectlAsync(args: readonly string[], timeoutMs: number): Promise<ReturnType<PoolKubectl>> {
+  const env = { ...process.env };
+  for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[key];
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const proc = spawn('kubectl', [...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const finish = (result: ReturnType<PoolKubectl>) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      finish({ status: null, stdout, stderr: 'kubectl timeout' });
+    }, timeoutMs);
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > LEASE_KUBECTL_MAX_BUFFER) {
+        proc.kill('SIGKILL');
+        finish({ status: null, stdout: '', stderr: `kubectl output too large (maxBuffer=${LEASE_KUBECTL_MAX_BUFFER})` });
+      }
+    });
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > LEASE_KUBECTL_MAX_BUFFER) {
+        proc.kill('SIGKILL');
+        finish({ status: null, stdout: '', stderr: `kubectl output too large (maxBuffer=${LEASE_KUBECTL_MAX_BUFFER})` });
+      }
+    });
+    proc.once('error', (error) => finish({ status: null, stdout, stderr: String(error) }));
+    proc.once('close', (status) => finish({ status, stdout, stderr }));
+  });
+}
+
+/** GRID-only async snapshot. All GETs and pool members are concurrent; the sync admission API remains unchanged. */
+export async function measurePoolLeaseAsync(
+  members: readonly PodPoolMember[],
+  deps: { kubectl?: PoolLeaseAsyncKubectl; timeoutMs?: number } = {},
+): Promise<PoolLeaseMeasure> {
+  const timeoutMs = deps.timeoutMs ?? 3_000;
+  const kubectl = deps.kubectl ?? ((args) => leaseKubectlAsync(args, timeoutMs));
+  const measured = await Promise.all(members.map(async (member): Promise<PodLeaseMember> => {
+    const base = ['--context', member.context, '--request-timeout=3s'];
+    const requests = [
+      [...base, 'get', 'nodes', '-o', 'json'],
+      [...base, '-n', 'elanous-test', 'get', 'jobs', '-l', 'elanous.substrate=pod', '-o', 'json'],
+      [...base, 'get', 'pods', '--all-namespaces', '-o', 'json'],
+    ];
+    const results = await Promise.all(requests.map((args) => new Promise<ReturnType<PoolKubectl>>((resolve) => {
+      const timer = setTimeout(() => resolve({ status: null, stdout: '', stderr: 'kubectl timeout' }), timeoutMs);
+      kubectl(args).then((result) => { clearTimeout(timer); resolve(result); }, (error: unknown) => {
+        clearTimeout(timer);
+        resolve({ status: null, stdout: '', stderr: error instanceof Error ? error.message : String(error) });
+      });
+    })));
+    const failed = results.find((result) => result.status !== 0);
+    if (failed) return {
+      context: member.context, capacity: member.capacity,
+      ...(member.capacityDefaulted ? { capacityDefaulted: true } : {}),
+      running: null, pending: null, unleasedRunning: null, memoryLimitBytes: null,
+      allocatableMemoryBytes: null, allocatableCpuMillicores: null, availableMemoryByNodeBytes: null,
+      reason: failed.stderr.trim() || `kubectl exited ${failed.status}`,
+    };
+    let index = 0;
+    return measurePoolLease([member], {
+      skipDnsProbe: true,
+      kubectl: () => results[index++]!,
+    }).members[0]!;
+  }));
+  return { members: measured };
 }

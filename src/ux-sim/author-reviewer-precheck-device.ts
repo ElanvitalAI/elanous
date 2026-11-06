@@ -8,8 +8,8 @@ export interface AuthorReviewerPrecheckDeviceResult {
   status: 'skipped' | 'completed' | 'rejected-soft' | 'failed-soft';
   originalDocument: string;
   revisedDocument: string;
-  appliedFixes: string[];
-  unappliedItems: string[];
+  appliedFixes: readonly string[];
+  unappliedItems: readonly string[];
 }
 
 const ORIGINAL_ASK = 'The result has a measurable criterion and an observable source.';

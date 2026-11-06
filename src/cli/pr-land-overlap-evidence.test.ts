@@ -1,10 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { resolveOverlapEvidencePath, verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence, verifyOverlapEvidenceVirtualRebase } from './pr-land-overlap-evidence.js';
 import { runPrLand } from './pr-cli.js';
+import { loadTypefixCarryContext, proveTypefixCarry, type ProveTypefixCarryInput, type TypefixCarryDeps, type TypefixCarryReceipt } from './review-typefix-carry.js';
+import { computeReceiptKey, GATE_RECEIPT_SCHEMA, type GateReceipt } from '../self-implement/gate-receipt-registry.js';
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -33,6 +37,246 @@ const STD_DIR = '/state/review-results';
 const COMMIT_MARK = '\u0001';
 
 describe('CLI overlap evidence path', () => {
+  test('runPrLand generates and verifies the carry from measured repair evidence', async () => {
+    const observed: Array<{ category: string; event: string; data?: unknown }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { observed.push({ category, event, data }); });
+    const root = mkdtempSync(join(tmpdir(), 'typefix-carry-production-'));
+    const cwd = join(root, 'repo'); const bare = join(root, 'remote.git'); const reviewResultsDir = join(root, '.elanous', 'review-results');
+    mkdirSync(cwd, { recursive: true }); mkdirSync(reviewResultsDir, { recursive: true });
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(result.stderr);
+      return result.stdout.trim();
+    };
+    try {
+      spawnSync('git', ['init', '--bare', bare], { cwd: root, encoding: 'utf8' });
+      git('init', '-b', 'main'); git('config', 'user.name', 'Typefix Carry Test'); git('config', 'user.email', 'typefix-carry@example.test');
+      git('remote', 'add', 'origin', bare);
+      writeFileSync(join(cwd, 'tsconfig.json'), JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'ESNext' } }));
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'src/value.ts'), 'export const answer = 0;\n');
+      git('add', '.'); git('commit', '-m', 'Merge pull request #26342 from fixture/overlap');
+      const base = git('rev-parse', 'HEAD'); git('push', 'origin', 'main');
+      git('fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+      git('checkout', '-b', 'reviewed-pr');
+      writeFileSync(join(cwd, 'src/value.ts'), 'export const answer = 42;\nexport const retained = true;\n');
+      git('add', 'src/value.ts'); git('commit', '-m', 'PR source');
+      const fromHead = git('rev-parse', 'HEAD');
+      const priorPath = join(reviewResultsDir, `card-${PR}-${fromHead.slice(0, 12)}.json`);
+      const priorText = JSON.stringify({ pr: PR, headCommit: fromHead, reviewed: true, verdict: 'pass', mustFix: [] });
+      writeFileSync(priorPath, priorText);
+      writeFileSync(join(cwd, 'src/value.ts'), 'export const answer: number = 42;\nexport const retained = true;\n');
+      git('add', 'src/value.ts'); git('commit', '-m', 'type annotation repair');
+      const newHead = git('rev-parse', 'HEAD');
+      const gateIdentity = { headCommit: newHead, baseCommit: base, bunVersion: 'bun-test', lockfileHash: 'absent',
+        radiusFiles: ['src/value.ts'], checks: [`typecheck@${base}`, 'changed-tests'], envFingerprint: 'a'.repeat(64) };
+      const gate: GateReceipt = { ...gateIdentity, schema: GATE_RECEIPT_SCHEMA, key: computeReceiptKey(gateIdentity, 'passed'), verdict: 'passed', savedAt: new Date(0).toISOString() };
+      const receiptPath = join(reviewResultsDir, `typefix-carry-${PR}-${newHead.slice(0, 12)}.json`);
+      const sources = {
+        readEvents: () => [
+          { category: 'pr.land', event: 'drift-classified', data: { pr: PR, head: fromHead, verdict: 'drift' } },
+          { category: 'pr.land', event: 'drift-repair-launched', data: { pr: PR, runId: 'repair-run-test', fromHead } },
+          { category: 'pr.land', event: 'drift-repair-landed', data: { pr: PR, runId: 'repair-run-test', fromHead, newHead, baseSha: base } },
+        ],
+        readGateReceipts: () => ({ [gate.key]: gate }),
+      };
+      writeFileSync(join(cwd, '.git', 'evidence.json'), JSON.stringify({ pr: PR, head: newHead, reviewResult: receiptPath }));
+      const evidencePath = join(cwd, '.git', 'evidence.json');
+      const url = `https://github.com/example/repo/pull/${PR}`;
+      const run: CmdRunner = (cmd, args, opts) => {
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          const value = args.includes('--jq') ? 'CONFLICTING' : JSON.stringify({ headRefOid: newHead, headRefName: 'reviewed-pr',
+            baseRefName: 'main', state: 'OPEN', isDraft: false, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', url });
+          return { ok: true, out: value, err: '' };
+        }
+        if (cmd === 'gh') return { ok: false, out: '', err: 'external GitHub mutation stubbed in test' };
+        if (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url' && args[2] === 'origin') return { ok: true, out: 'https://github.com/example/repo.git', err: '' };
+        if (cmd === 'git' && args[0] === 'ls-remote') return { ok: true, out: `${base}\trefs/heads/main\n`, err: '' };
+        const result = spawnSync(cmd, [...args], { cwd: opts?.cwd ?? cwd, encoding: 'utf8' });
+        return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
+      };
+      const dryRunVerdict = verifyOverlapEvidence({
+        evidencePath, pr: PR, expectedHead: newHead, remote: 'origin', branch: 'main', cwd, run,
+        readFile: (path) => path === evidencePath ? readFileSync(path, 'utf8')
+          : path === priorPath ? readFileSync(path, 'utf8') : (() => { throw new Error('virtual carry receipt must not be read from disk'); })(),
+        reviewResultsDir, listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
+        reviewRealPath: (path) => realpathSync(path), overlappingLandings: [base],
+        persistTypefixCarryReceipt: false, typefixCarryEvidenceSources: sources,
+      });
+      if (!dryRunVerdict.ok || (dryRunVerdict.ok && dryRunVerdict.mode !== 'already-ancestor') || existsSync(receiptPath)) {
+        console.error(`[typefix-carry-test] dry-run mismatch; verdict=${JSON.stringify(dryRunVerdict)} receiptExists=${existsSync(receiptPath)}`);
+      }
+      expect(dryRunVerdict).toMatchObject({ ok: true, mode: 'already-ancestor' });
+      expect(existsSync(receiptPath)).toBe(false);
+      const competingReviewPath = join(reviewResultsDir, `card-${PR}-${newHead.slice(0, 12)}.json`);
+      writeFileSync(competingReviewPath, review(newHead));
+      const rejectedCarry = verifyOverlapEvidence({
+        evidencePath, pr: PR, expectedHead: newHead, remote: 'origin', branch: 'main', cwd, run,
+        readFile: (path) => path === evidencePath || path === priorPath || path === competingReviewPath
+          ? readFileSync(path, 'utf8') : (() => { throw new Error(`unexpected read: ${path}`); })(),
+        reviewResultsDir, listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
+        reviewRealPath: (path) => realpathSync(path), overlappingLandings: [base],
+        persistTypefixCarryReceipt: true, typefixCarryEvidenceSources: sources,
+      });
+      expect(rejectedCarry).toMatchObject({ ok: false, reason: 'carry-new-head-review-exists' });
+      expect(existsSync(receiptPath)).toBe(false);
+      rmSync(competingReviewPath);
+      const manager = {
+        findPrForBranch: () => url, findPrForBranchOutcome: () => ({ status: 'ok OUTPUT', url }),
+        upsertPr: () => ({ ok: true, url, reused: true }), closePr: () => true, mergePr: () => false,
+        mergePrOutcome: () => ({ ok: false, kind: 'not-merged', state: 'OPEN' }),
+      };
+      const preflightDiagnostics: string[] = [];
+      preflightDiagnostics.push(`head=${git('rev-parse', 'HEAD')} status=${JSON.stringify(git('status', '--porcelain'))}`);
+      preflightDiagnostics.push(`pr=${run('gh', ['pr', 'view', String(PR), '--json', 'headRefOid,headRefName,baseRefName,state,isDraft,url'], { cwd }).out}`);
+      const messages: string[] = [];
+      const runWithEvidence = async (readGateReceipts: typeof sources.readGateReceipts) => runPrLand({
+        pr: String(PR), expectedHead: newHead, overlapEvidence: '.git/evidence.json', cwd,
+      }, {
+        manager: manager as never, run, resolveBase: () => 'origin/main', currentBranch: () => 'reviewed-pr',
+        reviewResultsDir, listOpenPrs: () => [], decideOverlapLanding: () => ({ outcome: 'unavailable', channel: 'all-failed', interactive: false }),
+        typefixCarryEvidenceSources: { ...sources, readGateReceipts },
+        runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true,
+        runModelHardcodeGate: () => true, runDaemonPortGate: () => true, runTestInterferenceGate: async () => 0,
+        runLandGlobalChecks: () => true, runAndroidGate: () => true, runIosGate: () => true, runPwaGate: () => true,
+        runPublicLeakGate: () => 0, runExportLeakCheck: () => ({ measured: true, hits: [] }),
+        runExportImportCheck: () => ({ measured: true, hits: [], unseen: 0 }), prodFreezeRoot: join(root, 'freeze'),
+        out: { log: (line) => messages.push(line), error: (line) => messages.push(line) },
+      });
+      const code = await runWithEvidence(sources.readGateReceipts);
+      if (code === 0) console.error(`[typefix-carry-test] unexpected zero exit; messages=${JSON.stringify(messages)} events=${JSON.stringify(observed)}`);
+      expect(code).not.toBe(0); // The mocked merge boundary refuses after overlap evidence has been accepted.
+      if (!observed.some((row) => row.category === 'pr.land' && row.event === 'typefix-carry-accepted')) {
+        const diagnostic = `carry acceptance event missing; preflight=${JSON.stringify(preflightDiagnostics)} messages=${JSON.stringify(messages)} events=${JSON.stringify(observed)}`;
+        console.error(`[typefix-carry-test] ${diagnostic}`);
+        throw new Error(diagnostic);
+      }
+      expect(observed.some((row) => row.category === 'pr.land' && row.event === 'typefix-carry-accepted')).toBe(true);
+      if (!observed.some((row) => row.category === 'pr.land' && row.event === 'overlap-evidence'
+        && row.data !== null && typeof row.data === 'object' && 'reason' in row.data && row.data.reason === 'already-ancestor')) {
+        const diagnostic = `already-ancestor event missing; messages=${JSON.stringify(messages)} events=${JSON.stringify(observed)}`;
+        console.error(`[typefix-carry-test] ${diagnostic}`);
+        throw new Error(diagnostic);
+      }
+      const generated = JSON.parse(readFileSync(receiptPath, 'utf8')) as TypefixCarryReceipt;
+      if (generated.reviewer !== 'typefix-carry' || generated.carry?.fromHead !== fromHead
+        || generated.carry?.repairRunId !== 'repair-run-test' || generated.carry?.gateReceipt?.headCommit !== newHead
+        || generated.carry?.gateReceipt?.baseCommit !== base
+        || JSON.stringify(generated.carry?.delta) !== JSON.stringify({ files: ['src/value.ts'], added: 1, removed: 1 })) {
+        console.error(`[typefix-carry-test] generated receipt mismatch; receipt=${JSON.stringify(generated)}`);
+      }
+      expect(generated.reviewer).toBe('typefix-carry');
+      expect(generated.carry).toMatchObject({ fromHead, repairRunId: 'repair-run-test', gateReceipt: { headCommit: newHead, baseCommit: base } });
+      expect(generated.carry.delta).toEqual({ files: ['src/value.ts'], added: 1, removed: 1 });
+
+      const tsconfigPath = join(cwd, 'tsconfig.json');
+      const ordinaryTsconfig = readFileSync(tsconfigPath, 'utf8');
+      writeFileSync(tsconfigPath, JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'ESNext', emitDecoratorMetadata: true } }));
+      try {
+        const metadataContext = loadTypefixCarryContext(generated, receiptPath, {
+          cwd, remote: 'origin', branch: 'main', reviewResultsDir,
+          readEvents: sources.readEvents, readGateReceipts: sources.readGateReceipts,
+        });
+        expect(metadataContext).not.toBeNull();
+        expect(metadataContext?.deps.transpile('class Example {}', 'src/value.ts')).toBeNull();
+
+        const unrelatedBase = 'a'.repeat(40);
+        const unrelatedIdentity = { ...gateIdentity, baseCommit: unrelatedBase, checks: [`typecheck@${unrelatedBase}`, 'changed-tests'] };
+        const unrelatedGate: GateReceipt = { ...unrelatedIdentity, schema: GATE_RECEIPT_SCHEMA,
+          key: computeReceiptKey(unrelatedIdentity, 'passed'), verdict: 'passed', savedAt: new Date(0).toISOString() };
+        const unrelatedReceipt: TypefixCarryReceipt = { ...generated,
+          carry: { ...generated.carry, gateReceipt: { headCommit: newHead, baseCommit: unrelatedBase, key: unrelatedGate.key } } };
+        const unrelatedEvents = sources.readEvents().map((row) => row.event === 'drift-repair-landed'
+          ? { ...row, data: { ...(row.data as Record<string, unknown>), baseSha: unrelatedBase } } : row);
+        expect(loadTypefixCarryContext(unrelatedReceipt, receiptPath, {
+          cwd, remote: 'origin', branch: 'main', reviewResultsDir,
+          readEvents: () => unrelatedEvents, readGateReceipts: () => ({ [unrelatedGate.key]: unrelatedGate }),
+        })).toBeNull();
+      } finally { writeFileSync(tsconfigPath, ordinaryTsconfig); }
+
+      writeFileSync(receiptPath, `${JSON.stringify({ ...generated, staleMarker: true }, null, 2)}\n`);
+      const staleReceiptDryRun = verifyOverlapEvidence({
+        evidencePath, pr: PR, expectedHead: newHead, remote: 'origin', branch: 'main', cwd, run,
+        readFile: (path) => path === evidencePath || path === priorPath || path === receiptPath
+          ? readFileSync(path, 'utf8') : (() => { throw new Error(`unexpected read: ${path}`); })(),
+        reviewResultsDir, listDir: (dir) => readdirSync(dir), reviewMtime: (path) => statSync(path).mtimeMs,
+        reviewRealPath: (path) => realpathSync(path), overlappingLandings: [base],
+        persistTypefixCarryReceipt: false, typefixCarryEvidenceSources: sources,
+      });
+      expect(staleReceiptDryRun).toMatchObject({ ok: true, mode: 'already-ancestor' });
+      expect(readFileSync(receiptPath, 'utf8')).toContain('"staleMarker": true');
+
+      rmSync(receiptPath);
+      messages.length = 0;
+      const rejected = await runWithEvidence(() => ({}));
+      if (rejected !== 1 || !messages.some((line) => line.includes('carry-unmeasured'))) {
+        console.error(`[typefix-carry-test] rejection mismatch; code=${rejected} messages=${JSON.stringify(messages)}`);
+      }
+      expect(rejected).toBe(1);
+      expect(messages.some((line) => line.includes('carry-unmeasured'))).toBe(true);
+      expect(() => readFileSync(receiptPath, 'utf8')).toThrow();
+    } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('re-proves a typefix-carry receipt before accepting it as the selected review', () => {
+    const fromHead = '1'.repeat(40);
+    const base = '3'.repeat(40);
+    const source = 'export const answer: number = 42;';
+    const priorReview = JSON.stringify({ pr: PR, headCommit: fromHead, reviewed: true, verdict: 'pass', mustFix: [] });
+    const carryInput: ProveTypefixCarryInput = {
+      pr: PR, fromHead, newHead: HEAD, fromReview: `/state/review-results/card-${PR}-${fromHead.slice(0, 12)}.json`,
+      fromReviewSha256: createHash('sha256').update(priorReview).digest('hex'), fromReviewVerdict: 'pass', fromReviewMustFix: [],
+      driftReceipt: { pr: PR, head: fromHead, verdict: 'drift' },
+      repairRun: { runId: 'repair-run', fromHead, newHead: HEAD, baseSha: base },
+    };
+    const carryDeps: TypefixCarryDeps = {
+      readReview: () => priorReview, validatePriorVerdict: () => true,
+      measure: () => ({
+        commits: [{ sha: HEAD, parents: [fromHead], kind: 'repair' }], mergeCommit: null,
+        mergeParent2IsOriginMainAncestor: null, repairCommit: HEAD,
+        delta: [{ path: 'src/value.ts', status: 'modified', binary: false, added: 1, removed: 1, assertionChanged: false }],
+        originalPrFiles: ['src/value.ts'], virtualSources: { 'src/value.ts': source }, newSources: { 'src/value.ts': source },
+        gateReceipt: { headCommit: HEAD, baseCommit: base, key: 'gate-key', typecheck: 'PASS', prTests: 'PASS' }, requiredBase: base,
+      }),
+      transpile: () => 'export const answer = 42;',
+    };
+    const proof = proveTypefixCarry(carryInput, carryDeps);
+    expect(proof.ok).toBe(true);
+    if (!proof.ok) return;
+    const name = `typefix-carry-${PR}-${HEAD.slice(0, 12)}.json`;
+    const path = `${STD_DIR}/${name}`;
+    const receiptText = JSON.stringify(proof.receipt);
+    const reviewName = `card-${PR}-${HEAD.slice(0, 12)}.json`;
+    const evidenceInput = {
+      evidencePath: '/evidence.json', pr: PR, expectedHead: HEAD, remote: 'origin', branch: 'main', cwd: '/repo',
+      run: () => ({ ok: true, out: '', err: '' }), reviewResultsDir: STD_DIR, listDir: () => [name],
+      reviewMtime: () => 1, reviewRealPath: (value: string) => value, overlappingLandings: ['abcdef1234567'],
+      loadTypefixCarryContext: () => ({ input: carryInput, deps: carryDeps }),
+      readFile: (file: string) => file === '/evidence.json' ? JSON.stringify({ pr: PR, head: HEAD, reviewResult: path })
+        : file === `${STD_DIR}/${reviewName}` ? review(HEAD) : receiptText,
+    };
+    const result = verifyOverlapEvidence(evidenceInput);
+    expect(result).toEqual({ ok: true, mode: 'already-ancestor', reviewResult: path });
+    const removedReviewer = { ...proof.receipt };
+    delete (removedReviewer as { reviewer?: string }).reviewer;
+    for (const tampered of [
+      JSON.stringify(removedReviewer),
+      JSON.stringify({ ...proof.receipt, reviewer: 'ordinary-review' }),
+    ]) {
+      const rejected = verifyOverlapEvidence({
+        ...evidenceInput,
+        readFile: (file: string) => file === '/evidence.json' ? JSON.stringify({ pr: PR, head: HEAD, reviewResult: path }) : tampered,
+      });
+      expect(rejected).toEqual({ ok: false, reason: 'carry-unmeasured' });
+    }
+    const currentHeadReviewWins = verifyOverlapEvidence({
+      ...evidenceInput, listDir: () => [name, reviewName],
+    });
+    expect(currentHeadReviewWins).toEqual({ ok: false, reason: 'carry-new-head-review-exists' });
+    const unmeasured = verifyOverlapEvidence({ ...evidenceInput, loadTypefixCarryContext: undefined });
+    expect(unmeasured).toEqual({ ok: false, reason: 'carry-unmeasured' });
+  });
+
   test('resolves a relative --overlap-evidence path under the selected repository cwd', () => {
     expect(resolveOverlapEvidencePath('.state/overlap.json', '/work/target')).toBe('/work/target/.state/overlap.json');
     expect(resolveOverlapEvidencePath('/absolute/evidence.json', '/work/target')).toBe('/absolute/evidence.json');

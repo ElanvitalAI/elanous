@@ -18,11 +18,11 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
   expect(parseMockScenarioCatalog(catalog)).toEqual(catalog);
   expect(catalog.scenarios.map((scenario) => scenario.id)).toEqual([
     'UX-MS-01', 'UX-MS-02', 'RELEASE-GRAPH-PREPUB-FANOUT', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
-    'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11', 'UX-MS-12', 'NIGHT-TRAIN-DEAD-PID-LOCK',
-    'AUTHOR-PRECHECK-APPLIED', 'AUTHOR-PRECHECK-REJECTED-UNPROVABLE', 'SAFE-PUBLIC-COPY-PUBLISH-REDACTION', 'SW-FREEZE',
+    'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11', 'UX-MS-12', 'NIGHT-TRAIN-DEAD-PID-LOCK', 'AUTHOR-PRECHECK-APPLIED',
+    'AUTHOR-PRECHECK-REJECTED-UNPROVABLE', 'SAFE-PUBLIC-COPY-PUBLISH-REDACTION', 'SW-FREEZE', 'SIM-HQ-MOVE', 'SIM-CHAIN-LAND',
   ]);
   expect(catalog.runEvidence.scope).toContain('ScenarioV0 YAML runs only');
-  expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107']);
+  expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107', 'hq-move']);
 
   const implementation = new Set(catalog.devices.flatMap((device) => device.implementation));
   for (const path of implementation) expect(existsSync(join(REPO, path))).toBe(true);

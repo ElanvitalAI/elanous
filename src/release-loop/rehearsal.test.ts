@@ -1,4 +1,5 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
+import * as fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
@@ -13,7 +14,8 @@ import type { LightRcResult } from './light-rc.js';
 import { setSchedule, type ReleaseSchedule } from './release-schedule.js';
 import { spawnHardRehearsalGate, planRehearsal as livePlanRehearsal, rehearsalLeakFailureDetail, runRehearsalLeakCheck, runRehearsalTick, sanitizeRehearsalLeakDetail, type HardGateResult, type RehearsalDeps, type StepId } from './rehearsal.js';
 import { planRehearsalShards } from './rehearsal-shard-plan.js';
-import { hardRehearsalGateVersion } from '../../scripts/release-loop/gate-radius-live.js';
+import { writeGateVerdictRecord } from '../../scripts/release-loop/gate-node.js';
+import { hardRehearsalGateVersion, planHardRehearsalRadius } from '../../scripts/release-loop/gate-radius-live.js';
 
 const cut = '2026-10-10T13:00:00Z';
 const schedule = { version: '0.2.23', cutAt: cut, publishAt: '2026-10-10T15:30:00Z' } as ReleaseSchedule;
@@ -64,11 +66,13 @@ function publicExportLeakCheckout(fileName: string, exclude: string[] = [], incl
   mkdirSync(dirname(join(checkout, relativePath)), { recursive: true });
   mkdirSync(join(checkout, 'scripts'));
   mkdirSync(join(checkout, 'src', 'util'), { recursive: true });
+  mkdirSync(join(checkout, 'src', 'ux-sim'), { recursive: true });
   writeFileSync(join(checkout, 'release', 'public-export.yaml'), `include: [${JSON.stringify(include)}]\nexclude: ${JSON.stringify(exclude)}\nreplace: {}\n`);
   writeFileSync(join(checkout, relativePath), `private ${mark} value\n`);
   copyFileSync(resolve(import.meta.dir, '../..', 'scripts', 'public-export.ts'), join(checkout, 'scripts', 'public-export.ts'));
   symlinkSync(resolve(import.meta.dir, '../..', 'scripts', 'skill-boundary.ts'), join(checkout, 'scripts', 'skill-boundary.ts'));
   symlinkSync(resolve(import.meta.dir, '../..', 'src', 'util', 'spawn-sync-output.ts'), join(checkout, 'src', 'util', 'spawn-sync-output.ts'));
+  symlinkSync(resolve(import.meta.dir, '../..', 'src', 'ux-sim', 'secret-canary.ts'), join(checkout, 'src', 'ux-sim', 'secret-canary.ts'));
   symlinkSync(resolve(import.meta.dir, '../..', 'node_modules'), join(checkout, 'node_modules'), 'dir');
   spawnSync('git', ['init', '-q'], { cwd: checkout });
   spawnSync('git', ['add', 'release/public-export.yaml', relativePath], { cwd: checkout });
@@ -118,11 +122,43 @@ test('an ok Pod verdict with introduced failures is recorded as an error', async
   expect(result.measurementGap.cause).toContain('ok verdict contains introduced failures');
 });
 
+test.serial('a rehearsal host disconnect during receipt save leaves an error stamp with no reusable gate receipt', async () => {
+  const world = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/release-receipt-inheritance.yaml'), 'utf8')) as {
+    cases: Array<{ id: string; expect: { stamp: string; reusableReceipt: boolean } }>;
+  };
+  const expected = world.cases.find((row) => row.id === 'host-disconnect-while-saving')!.expect;
+  const realRename = fs.renameSync;
+  const failedRename = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+    if (String(to).endsWith('/gate-verdict.json')) throw new Error('remote host disconnected while saving gate receipt');
+    return realRename(from, to);
+  });
+  let fixture: Awaited<ReturnType<typeof runDefaultHardGateFixture>>;
+  try { fixture = await runDefaultHardGateFixture(); }
+  finally { failedRename.mockRestore(); }
+  const saved = fixture.state;
+  expect(saved).toMatchObject({ outcome: expected.stamp, summary: expect.stringContaining('remote host disconnected while saving gate receipt') });
+  expect(saved).not.toHaveProperty('hardGate');
+  expect(Object.hasOwn(saved, 'hardGate')).toBe(expected.reusableReceipt);
+  expect(saved.measurementGap.cause).toContain('remote host disconnected while saving gate receipt');
+  const gateVersion = hardRehearsalGateVersion(schedule.version, saved.hardGateRunId!);
+  const gateDir = join(fixture.root, 'release', gateVersion);
+  expect(existsSync(join(gateDir, 'gate-verdict.json'))).toBe(false);
+  expect(readdirSync(gateDir).filter((name) => name.startsWith('.gate-verdict-') && name.endsWith('.tmp'))).toEqual([]);
+  const rejected = planHardRehearsalRadius({ root: fixture.root, repo: '/fake/checkout', version: schedule.version,
+    forCommit: fixture.sha, graphPins: { graphSha: 'd'.repeat(64), recipeSha: 'e'.repeat(64) },
+    envFingerprint: fixture.runtimeIdentity.envFingerprint, imageDigest: fixture.digest,
+    executionIdentity: { ...fixture.runtimeIdentity, imageDigest: fixture.digest, baseImageDigest: `sha256:${'f'.repeat(64)}` } });
+  expect(rejected).toMatchObject({ plan: null, reason: 'latest hard rehearsal is not clean' });
+});
+
 async function runDefaultHardGateFixture(options: {
   pool?: string;
+  remote?: string;
+  podPool?: string;
   receiptRuntime?: { bunVersion: string; platform: string; architecture: string; envFingerprint: string };
   graphProbeThrows?: string;
   identityProbeThrows?: string;
+  identityUnavailable?: boolean;
   omitGateVerdict?: boolean;
   omitGraphSha?: boolean;
 } = {}) {
@@ -144,11 +180,12 @@ async function runDefaultHardGateFixture(options: {
   setElanousConfigDir(root);
   const h = harness(at(300));
   let argv: string[] = [];
+  let identityPool: string | undefined;
   h.deps.leakCheck = () => ({ status: 0 });
   h.deps.git = args => ({ rc: 0, stdout: args[0] === 'rev-parse' ? sha : '' });
   h.deps.hardGate = undefined;
   h.deps.hardGateGraphPins = () => { if (options.graphProbeThrows) throw new Error(options.graphProbeThrows); return graphPins; };
-  h.deps.hardGateIdentity = () => { if (options.identityProbeThrows) throw new Error(options.identityProbeThrows); return { ...runtimeIdentity, imageDigest: digest }; };
+  h.deps.hardGateIdentity = pool => { identityPool = pool; if (options.identityProbeThrows) throw new Error(options.identityProbeThrows); return options.identityUnavailable ? null : { ...runtimeIdentity, imageDigest: digest }; };
   h.deps.hardGateSpawn = gate => {
     argv = gate.args;
     const versionIndex = gate.args.indexOf('--version');
@@ -157,12 +194,12 @@ async function runDefaultHardGateFixture(options: {
     mkdirSync(join(root, 'release', gateVersion), { recursive: true });
     receipt.version = gateVersion;
     if (options.omitGraphSha) delete (receipt as { graphSha?: string }).graphSha;
-    if (!options.omitGateVerdict) writeFileSync(join(root, 'release', gateVersion, 'gate-verdict.json'), JSON.stringify(gateVerdict));
+    if (!options.omitGateVerdict) writeGateVerdictRecord(join(root, 'release', gateVersion, 'gate-verdict.json'), gateVerdict);
     writeFileSync(gate.logPath, JSON.stringify({ outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 }) + '\\n');
     return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 };
   };
-  await runRehearsalTick({ ledgerRoot: root, checkout, apply: true, remote: 'aws2' }, h.deps);
-  return { root, sha, digest, runtimeIdentity, receipt, gateVerdict, releaseVerdict, originalVerdict, state: stamp(root, 'hard-5h'), argv };
+  await runRehearsalTick({ ledgerRoot: root, checkout, apply: true, remote: options.remote ?? 'aws2', podPool: options.podPool }, h.deps);
+  return { root, sha, digest, runtimeIdentity, receipt, gateVerdict, releaseVerdict, originalVerdict, state: stamp(root, 'hard-5h'), argv, identityPool };
 }
 
 test('default hard gate subprocess preserves args, state environment, and verdict parsing', () => {
@@ -190,6 +227,41 @@ test('default hard rehearsal targets the requested Pod and writes a complete str
       version: gateVersion, commit: fixture.sha, head40: fixture.sha, graphSha: 'd'.repeat(64), recipeSha: 'e'.repeat(64),
       imageDigest: fixture.digest, envFingerprint: fixture.runtimeIdentity.envFingerprint, executionIdentity: fixture.runtimeIdentity,
     } });
+});
+
+test('aws1 hard rehearsal accepts an explicit isolated Pod member outside the release gate pool', async () => {
+  const fixture = await runDefaultHardGateFixture({ pool: 'pool-node-b@node-b:20', remote: 'aws1',
+    podPool: 'pool-aws1@aws1:12#k3d-elanous-registry:5050' });
+  expect(fixture.identityPool).toBe('pool-aws1@aws1:12#k3d-elanous-registry:5050');
+  expect(fixture.argv.slice(fixture.argv.indexOf('--pod-pool'), fixture.argv.indexOf('--pod-pool') + 2))
+    .toEqual(['--pod-pool', 'pool-aws1@aws1:12#k3d-elanous-registry:5050']);
+  expect(fixture.state).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'aws1' }, hardGate: { receiptRecord: { available: true } } });
+});
+
+test.each([
+  ['empty pool', ''],
+  ['multiple members', 'pool-aws1@aws1:12,pool-node-b@node-b:20'],
+])('aws1 hard rehearsal refuses an explicit %s without launching gate-node', async (_label, podPool) => {
+  const fixture = await runDefaultHardGateFixture({ pool: 'pool-node-b@node-b:20', remote: 'aws1', podPool });
+  expect(fixture.state.outcome).toBe('error');
+  expect(fixture.argv).toEqual([]);
+});
+
+test('aws1 hard rehearsal rejects an explicit Pod pool that does not isolate aws1', async () => {
+  const fixture = await runDefaultHardGateFixture({ pool: 'pool-node-b@node-b:20', remote: 'aws1', podPool: 'pool-minim5@minim5:12' });
+  expect(fixture.state.outcome).toBe('error');
+  expect(fixture.state.summary).toContain('hard rehearsal --pod-pool must isolate exactly one aws1 Pod member');
+  expect(fixture.argv).toEqual([]);
+});
+
+test('an unavailable injected aws1 Pod ends unmeasured without falling back or launching gate-node', async () => {
+  const fixture = await runDefaultHardGateFixture({ pool: 'pool-node-b@node-b:20', remote: 'aws1',
+    podPool: 'pool-aws1@aws1:12#k3d-elanous-registry:5050', identityUnavailable: true });
+  expect(fixture.state).toMatchObject({ outcome: 'unmeasured', selection: { remote: 'aws1' },
+    hardGate: { outcome: 'unmeasured', error: 'selected gate execution identity unavailable', receiptRecord: { available: false } } });
+  expect(fixture.state.measurementGap.cause).toBe('selected gate execution identity unavailable');
+  expect(fixture.identityPool).toBe('pool-aws1@aws1:12#k3d-elanous-registry:5050');
+  expect(fixture.argv).toEqual([]);
 });
 
 test('hard rehearsal rejects a writer record whose selected-host architecture differs', async () => {
@@ -1232,20 +1304,24 @@ test('production release CLI retries the same RC after a preflight shortage with
   const checkout = join(root, 'checkout');
   mkdirSync(join(checkout, 'scripts'), { recursive: true });
   mkdirSync(join(checkout, 'src', 'util'), { recursive: true });
+  mkdirSync(join(checkout, 'src', 'ux-sim'), { recursive: true });
   mkdirSync(join(checkout, 'release'), { recursive: true });
   writeFileSync(join(checkout, 'release', 'public-export.yaml'), 'include: ["src/**"]\nexclude: []\nreplace: {}\n');
   writeFileSync(join(checkout, 'src', 'plain.txt'), 'public content\n');
-  for (const file of ['scripts/public-export.ts', 'scripts/skill-boundary.ts', 'src/util/spawn-sync-output.ts'])
+  copyFileSync(join(repo, 'scripts/public-export.ts'), join(checkout, 'scripts', 'public-export.ts'));
+  for (const file of ['scripts/skill-boundary.ts', 'src/util/spawn-sync-output.ts', 'src/ux-sim/secret-canary.ts'])
     symlinkSync(join(repo, file), join(checkout, file));
   symlinkSync(join(repo, 'node_modules'), join(checkout, 'node_modules'), 'dir');
-  writeFileSync(join(checkout, '.gitignore'), 'node_modules\nscripts/\nsrc/util/\n');
+  writeFileSync(join(checkout, '.gitignore'), 'node_modules\nscripts/\nsrc/util/\nsrc/ux-sim/\n');
   const git = (...args: string[]) => spawnSync('git', args, { cwd: checkout, encoding: 'utf8' });
   expect(git('init', '-q', '-b', 'main').status).toBe(0);
   expect(git('add', '.gitignore', 'release/public-export.yaml', 'src/plain.txt').status).toBe(0);
   expect(git('-c', 'user.name=Rehearsal Test', '-c', 'user.email=rehearsal@example.invalid', 'commit', '-qm', 'fixture').status).toBe(0);
   expect(git('remote', 'add', 'origin', checkout).status).toBe(0);
   const version = '99.2.23';
-  const cutAt = new Date(Date.now() + 7 * 60 * 60_000).toISOString();
+  // Keep both real CLI ticks inside the due window; an exact seven-hour boundary
+  // can pass before the second process starts and turn the retry into not-yet.
+  const cutAt = new Date(Date.now() + 6 * 60 * 60_000).toISOString();
   setSchedule(version, { cutAt }, 'test', root);
   const dir = join(root, 'release', version, 'rehearsal');
   mkdirSync(dir, { recursive: true });
@@ -1260,17 +1336,25 @@ test('production release CLI retries the same RC after a preflight shortage with
   const run = () => {
     const startedAt = Date.now();
     // Two sequential children must fit within the enclosing 300 s test budget.
+    const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_EXPORT_REDACTIONS: join(root, 'empty-redactions.tsv'),
+      ELANOUS_LEAK_HOME_USER: 'rehearsal-fixture' };
+    // The gate runner may export an ignored legacy config variable that points at its state directory.
+    // This CLI fixture supplies --config-dir explicitly; do not let the legacy variable contaminate its child.
+    delete env.ELANOUS_CONFIG_DIR;
+    const probeOut = mkdtempSync(join(root, 'export-probe-'));
+    const probe = spawnSync('bun', ['scripts/public-export.ts', '--out', join(probeOut, 'export'), '--json', '--all'],
+      { cwd: checkout, encoding: 'utf8', timeout: 60_000, env });
+    expect(probe.status, `fixture export probe failed: stdout=${probe.stdout ?? ''} stderr=${probe.stderr ?? ''}`).toBe(0);
     const result = spawnSync('bun', args, { cwd: repo, encoding: 'utf8', timeout: 135_000,
-      env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_EXPORT_REDACTIONS: join(root, 'empty-redactions.tsv'),
-        ELANOUS_LEAK_HOME_USER: 'rehearsal-fixture' } });
+      env });
     if (result.status === null) throw new Error(`rehearsal CLI did not exit: code=${(result.error as NodeJS.ErrnoException | undefined)?.code ?? 'none'} signal=${result.signal ?? 'none'} elapsedMs=${Date.now() - startedAt}`);
     return result;
   };
   writeFileSync(join(root, 'empty-redactions.tsv'), '');
   const first = run(), afterFirst = existsSync(stage);
   const second = run(), afterSecond = existsSync(stage);
-  expect(first.status).toBe(1);
-  expect(second.status).toBe(1);
+  expect(first.status, `first tick stdout=${first.stdout} stderr=${first.stderr}`).toBe(1);
+  expect(second.status, `first tick stdout=${first.stdout} stderr=${first.stderr} stageAfterFirst=${afterFirst}; second tick stdout=${second.stdout} stderr=${second.stderr}`).toBe(1);
   const one = JSON.parse(first.stdout) as { ok: boolean; status: string; run: string; stamps: Array<{ outcome: string; summary: string; shardPlan: { gatePlanShards: number | null } }> };
   const two = JSON.parse(second.stdout) as typeof one;
   expect(one).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ shardPlan: { gatePlanShards: null } }] });

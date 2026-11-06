@@ -1,24 +1,10 @@
 // 조율자 격상 P1 foundation — 채널 reducer 프리미티브 + arcHint 손실 차단 검증.
 import { test, expect, describe } from 'bun:test';
-import { reduceChannel, applyChannelUpdate, applyChannelUpdates, effectiveArcHint, MISSION_CHANNEL_REDUCERS, cursorUpdate, readCursor, signalUpdate, readSignal } from './mission-state-channels.js';
+import { applyChannelUpdate, applyChannelUpdates, effectiveArcHint, MISSION_CHANNEL_REDUCERS, cursorUpdate, readCursor, signalUpdate, readSignal } from './mission-state-channels.js';
 
 describe('mission-state-channels — reducer 프리미티브(P1 foundation)', () => {
-  test('lastValue — 새 값으로 덮어씀', () => {
-    expect(reduceChannel('lastValue', { a: 1 }, { b: 2 })).toEqual({ b: 2 });
-    expect(reduceChannel('lastValue', 5, undefined)).toBeUndefined();
-  });
-
-  test('append — 배열에 누적(스칼라·배열 모두)', () => {
-    expect(reduceChannel('append', undefined, 'x')).toEqual(['x']);
-    expect(reduceChannel('append', ['x'], 'y')).toEqual(['x', 'y']);
-    expect(reduceChannel('append', ['x'], ['y', 'z'])).toEqual(['x', 'y', 'z']);
-  });
-
-  test('append — null/undefined 는 이력을 덮지 않는다(손실 방지)', () => {
-    expect(reduceChannel('append', ['x'], undefined)).toEqual(['x']);
-    expect(reduceChannel('append', ['x'], null)).toEqual(['x']);
-  });
-
+  // reduceChannel 은 src/agent-substrate/state-channels.ts 의 재수출 — 순수 reducer 표(lastValue·append·null 보존)는
+  // src/agent-substrate/state-channels.test.ts 가 잠근다. 여기서는 미션 스키마(arcHint=append)와 손실 체인만 본다.
   test('arcHint 는 append 채널(스키마)', () => {
     expect(MISSION_CHANNEL_REDUCERS.arcHint).toBe('append');
     expect(MISSION_CHANNEL_REDUCERS.decisions).toBe('lastValue');

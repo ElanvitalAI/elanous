@@ -32,7 +32,7 @@ import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'n
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 const STREAM_POLL_MS = 500;
 /** HTTP 응답 보호 상한 — 무한정 큰 응답을 막는다. 로컬 직독(CLI)에는 걸지 않는다. */

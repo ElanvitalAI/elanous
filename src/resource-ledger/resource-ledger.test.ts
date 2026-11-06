@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
 import { activeResourceLeases, activeResourcePools, beginResourceLease, declareResourcePool, endResourceLease, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordWarmPoolPodReceipt,
-  reconcileResourceLeases, reapResourceLeaseIfCurrent, resourceMatrix, type ResourceLease, type ResourceMeasurement } from './resource-ledger.js';
+  reconcileResourceLeases, reapResourceLeaseIfCurrent, resourceMatrix, reassignResourcePools, type ResourceLease, type ResourceMeasurement } from './resource-ledger.js';
 import { buildResourceLedgerSnapshot, collectResourceMeasurement, registerResourceLedgerCommands, type ResourceCommandRunner } from '../cli/resource-ledger-cli.js';
 import { Command } from 'commander';
 
@@ -34,6 +34,19 @@ test('Nexus resource ledger retains validated pool declarations independently of
   declareResourcePool(pool, new Date('2026-11-02T00:00:00Z'), path);
   expect(activeResourcePools(readResourceLedger(path))).toEqual([pool]);
   expect(activeResourceLeases(readResourceLedger(path))).toEqual([]);
+});
+
+test('HQ pool reassignment appends a new authoritative declaration and leaves prior ledger history intact', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-reassign-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const pool = { purpose: 'ta' as const, fanoutGroupId: 'hq-move-v1',
+    members: [{ host: 'mbp', count: 2, digest: 'sha256:' + 'a'.repeat(64), role: 'both' as const }],
+    fanoutGroup: { shard: { kind: 'skill' as const, input: 'move', result: 'moved', fingerprint: 'hq-move-v1' } },
+    fingerprint: { runtime: 'bun', environment: 'sim', skillPacks: [] }, cleanup: { procedure: 'clean', verify: 'verified' } };
+  declareResourcePool(pool, new Date('2026-11-09T00:00:00Z'), path);
+  expect(reassignResourcePools('mbp', 'node-b', new Date('2026-11-09T00:01:00Z'), path)).toBe(1);
+  expect(activeResourcePools(readResourceLedger(path))[0]?.members[0]?.host).toBe('node-b');
+  expect(readResourceLedger(path)).toHaveLength(2);
 });
 
 test('lease C/U/D appends an auditable history and active view reflects terminal endRun', () => {

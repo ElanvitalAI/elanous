@@ -1,7 +1,7 @@
 // NEXUS · /v1/nexus/templates routes (Phase N-3 PR κ)
 
 import type { TabRegistry } from '../state/tab-registry.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   listTemplates,
   loadTemplate,

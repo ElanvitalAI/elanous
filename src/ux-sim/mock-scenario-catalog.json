@@ -1,29 +1,397 @@
 {
-  "version": 2,
-  "deviceCatalogVersion": 3,
-  "worldEvents": [
-    {
-      "id": "EV-0042",
-      "name": "Dead process lock",
-      "description": "Inject a stale process lock into a simulated world."
+  "candidateAudit": {
+    "source": "~/elanous-hq/seat-state/OP/MOCK-DEVICES-INVENTORY-1031.md §3 + targeted fake-Telegram consumer scan",
+    "baseCommit": "533845484cf2c901cfee902a3586354278e7cae8",
+    "sourceRows": 36,
+    "existingPaths": 35,
+    "catalogAdditions": [
+      {
+        "path": "src/ux-sim/safe-public-copy-publish.ts",
+        "reason": "Post-inventory registration for SW-PUBLIC-COPY-LIVE-FU; the source snapshot and base commit remain unchanged."
+      },
+      {
+        "path": "src/ux-sim/seminar-rehearsal.test.ts",
+        "reason": "Post-inventory catalog addition for backlog SW-FREEZE; it extends the existing first-run-and-seminar device and records the repeated-run freeze scenario."
+      },
+      {
+        "path": "src/ux-sim/aside-feedback-loop.ts",
+        "reason": "DEMO1104-ASIDE-FEEDBACK-LOOP mock regression for the live feedback-cycle trial."
+      }
+    ],
+    "excludedPaths": 27,
+    "sourceExclusions": [
+      {
+        "path": "scenarios/ux-sim/MK-MS-01.yaml",
+        "reason": "Separately registered by open PR #34039 (MK-MS-01 E4 sequence); keep it outside this 33-candidate registration to avoid duplicate catalog ownership."
+      }
+    ],
+    "omissionCheck": {
+      "requiredPaths": [
+        "test/ux-sim/aimock-local.ts",
+        "test/telegram-surface-hitl.test.ts",
+        "src/ux-sim/safe-public-copy-publish.ts"
+      ],
+      "missingPaths": []
     },
-    {
-      "id": "EV-0107",
-      "name": "Host reboot",
-      "description": "Inject a host reboot into a simulated world."
-    }
-  ],
-  "runEvidence": {
-    "scope": "ScenarioV0 YAML runs only; catalog entries reference reusable devices/tests, and list/show/devices do not execute them",
-    "runId": "uuid per execution",
-    "event": {
-      "category": "ux.sim.scenario",
-      "name": "completed"
-    },
-    "persistence": "ScenarioV0 and device logsRecorded=yes refer to rows persisted in the isolated test instance logs/logs.db (not production ~/.elanous/logs.db); eventNames lists persisted category/event pairs only, while debug-spy-only observations do not count.",
-    "artifact": "<test-state>/ux-sim/evidence/<scenario>-seed-<seed>-run-<runId>.json"
+    "candidates": [
+      {
+        "path": "scripts/tui-sim-bench.ts",
+        "disposition": "excluded",
+        "entryCommand": "not-applicable: benchmark requires an explicitly selected goal and provider",
+        "logsRecorded": "no",
+        "logsDetail": "Benchmark is not run by catalog discovery.",
+        "excludeReason": "Measurement/benchmark tool, not a mock device."
+      },
+      {
+        "path": "scripts/tui-sim.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun scripts/tui-sim.ts start --id mock-catalog-example --test",
+        "logsRecorded": "conditional",
+        "logsDetail": "Writes its own simulation artifacts, not ScenarioV0 logs.",
+        "excludeReason": "Standalone TUI driver; separate artifact contract."
+      },
+      {
+        "path": "scripts/ux-sim.ts",
+        "disposition": "already-indexed",
+        "entryCommand": "bun scripts/ux-sim.ts list",
+        "logsRecorded": "conditional",
+        "logsDetail": "ScenarioV0 runs log completion; list/show are read-only.",
+        "deviceId": "scenario-runner"
+      },
+      {
+        "path": "scripts/voice-dogfood-sim.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun run scripts/voice-dogfood-sim.ts",
+        "logsRecorded": "no",
+        "logsDetail": "No ScenarioV0 logs.db contract.",
+        "excludeReason": "Product dogfood script, not a reusable fake-device contract."
+      },
+      {
+        "path": "scripts/voice-pwa-sim.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun run scripts/voice-pwa-sim.ts",
+        "logsRecorded": "no",
+        "logsDetail": "No ScenarioV0 logs.db contract.",
+        "excludeReason": "PWA voice dogfood script, not an isolated reusable device."
+      },
+      {
+        "path": "scripts/release-loop/gate-autoheal-sim-evidence.ts",
+        "disposition": "device",
+        "entryCommand": "bun scripts/release-loop/gate-autoheal-sim-evidence.ts",
+        "logsRecorded": "yes",
+        "logsDetail": "Writes release-loop events to isolated logs.db with runId.",
+        "deviceId": "release-graph-rig",
+        "scenarioIds": [
+          "UX-MS-02"
+        ]
+      },
+      {
+        "path": "scripts/release-loop/gate-node-sim.ts",
+        "disposition": "device",
+        "entryCommand": "bun test scripts/release-loop/gate-node-sim.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Pure decision result asserted by test; no persistent event.",
+        "deviceId": "release-graph-rig",
+        "scenarioIds": [
+          "UX-MS-02"
+        ]
+      },
+      {
+        "path": "scripts/release-loop/tui-sim-node.ts",
+        "disposition": "excluded",
+        "entryCommand": "called by release-loop tui-sim graph node; no standalone CLI",
+        "logsRecorded": "no",
+        "logsDetail": "Node result/artifact only.",
+        "excludeReason": "Graph-node adapter for TUI measurements, not an independent mock device."
+      },
+      {
+        "path": "scripts/lib/pwa-scenarios/acp-replay.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test scripts/lib/pwa-scenarios/acp-replay.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Browser/E2E cell result, not ScenarioV0 logs.",
+        "excludeReason": "Live-browser PWA runner support; not a mock device."
+      },
+      {
+        "path": "scripts/lib/pwa-scenarios/cdp-driver.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun scripts/pwa-scenarios.ts --base-url http://127.0.0.1:31455 --shots ./shots",
+        "logsRecorded": "no",
+        "logsDetail": "Writes optional screenshots and cell output through the PWA runner; no logs.db row.",
+        "excludeReason": "Live-browser PWA runner support; not a mock device."
+      },
+      {
+        "path": "scripts/lib/pwa-scenarios/runner.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test scripts/lib/pwa-scenarios/runner.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Browser/E2E cell result, not ScenarioV0 logs.",
+        "excludeReason": "Live-browser PWA runner support; not a mock device."
+      },
+      {
+        "path": "scripts/lib/pwa-scenarios/scenarios.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test scripts/lib/pwa-scenarios/scenarios.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Browser/E2E cell result, not ScenarioV0 logs.",
+        "excludeReason": "Live-browser PWA runner support; not a mock device."
+      },
+      {
+        "path": "test/fixtures/acp-initialize-stub.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test test/acp-client-observability.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "The consuming ACP test asserts protocol behavior; fixture emits no app logs.db row.",
+        "excludeReason": "Protocol fixture only; no independent scenario entry."
+      },
+      {
+        "path": "test/fixtures/mock-lsp-server.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test test/lsp-client.test.ts test/lsp-operations-dispatch.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "The consuming LSP tests assert protocol behavior; fixture emits no app logs.db row.",
+        "excludeReason": "Protocol fixture only; no independent scenario entry."
+      },
+      {
+        "path": "test/helpers/intake-fake-repo.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test test/intake-plane-check-common-name.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "The consumer test asserts temporary-repository behavior.",
+        "excludeReason": "Test helper, not a simulation device."
+      },
+      {
+        "path": "test/ux-sim/aimock-local.ts",
+        "disposition": "already-indexed",
+        "entryCommand": "bun test src/ux-sim/aimock-local.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Test server interactions are asserted by tests, not app logs.db.",
+        "deviceId": "support-fakes"
+      },
+      {
+        "path": "scenarios/dashboard-default.yaml",
+        "disposition": "excluded",
+        "entryCommand": "not-applicable: consumed by the Playground renderer; no direct scenario CLI",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
+        "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
+      },
+      {
+        "path": "scenarios/heap-graph.yaml",
+        "disposition": "excluded",
+        "entryCommand": "not-applicable: consumed by the Playground renderer; no direct scenario CLI",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
+        "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
+      },
+      {
+        "path": "scenarios/iul-timeline-viewer.yaml",
+        "disposition": "excluded",
+        "entryCommand": "not-applicable: consumed by the IUL timeline viewer; no direct scenario CLI",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
+        "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
+      },
+      {
+        "path": "scenarios/ux-sim/provider-4xx-no-provider.yaml",
+        "disposition": "scenario",
+        "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/provider-4xx-no-provider.yaml",
+        "logsRecorded": "yes",
+        "logsDetail": "ux.sim.scenario/completed in test logs.db; expects llm.codex/request-rejected-shape.",
+        "deviceId": "scenario-runner",
+        "scenarioIds": [
+          "UX-MS-11"
+        ]
+      },
+      {
+        "path": "scenarios/ux-sim/release-sim-rig.yaml",
+        "disposition": "already-indexed",
+        "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/release-sim-rig.yaml",
+        "logsRecorded": "yes",
+        "logsDetail": "ScenarioV0 completion row is stored in isolated test logs.db; the evidence artifact is a separate JSON file.",
+        "deviceId": "release-graph-rig",
+        "scenarioIds": [
+          "UX-MS-02",
+          "RELEASE-GRAPH-PREPUB-FANOUT"
+        ]
+      },
+      {
+        "path": "tests/scenarios/4provider-feature-impl.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/4provider-feature-impl.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/capability-level-11.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/capability-level-11.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/codex-baseline.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/codex-baseline.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/codex-opus-2way.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/codex-opus-2way.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/codex-variance-w5f.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/codex-variance-w5f.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/multi-turn-cache-rate.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/multi-turn-cache-rate.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/repl-rotation-chain.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/repl-rotation-chain.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/repl-self-debug-arc.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/repl-self-debug-arc.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "tests/scenarios/repl-tool-doom-recovery.yaml",
+        "disposition": "excluded",
+        "entryCommand": "eln repl --new --json --scenario tests/scenarios/repl-tool-doom-recovery.yaml",
+        "logsRecorded": "runner-dependent",
+        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+      },
+      {
+        "path": "src/playground-scenario/default-scenarios.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test src/playground-scenario/",
+        "logsRecorded": "no",
+        "logsDetail": "Scenario constants consumed by Playground tests.",
+        "excludeReason": "Product demo inputs, not mock-device implementation."
+      },
+      {
+        "path": "src/playground-scenario/fake-harness.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test src/playground-scenario/",
+        "logsRecorded": "no",
+        "logsDetail": "In-memory test harness consumed by Playground tests.",
+        "excludeReason": "Test helper, no independent reusable mock interface."
+      },
+      {
+        "path": "src/showroom/outbound/channels/stubs.ts",
+        "disposition": "excluded",
+        "entryCommand": "bun test src/showroom/outbound/channels/",
+        "logsRecorded": "no",
+        "logsDetail": "Stub results asserted by channel tests.",
+        "excludeReason": "Outbound channel stub, not a UX simulation device."
+      },
+      {
+        "path": "test/telegram-surface-hitl.test.ts",
+        "disposition": "already-indexed",
+        "entryCommand": "bun test test/telegram-surface-hitl.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "The test drives an in-memory fake TelegramBot and asserts captured interactions; it does not write app logs.db.",
+        "deviceId": "support-fakes"
+      },
+      {
+        "path": "src/ux-sim/author-reviewer-precheck-device.ts",
+        "disposition": "device",
+        "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/author-reviewer-precheck-applied.yaml",
+        "logsRecorded": "yes",
+        "logsDetail": "Production validator events are persisted in isolated test logs.db with CLI-minted runId; ScenarioV0 evidence is separate.",
+        "deviceId": "author-reviewer-precheck",
+        "scenarioIds": [
+          "AUTHOR-PRECHECK-APPLIED",
+          "AUTHOR-PRECHECK-REJECTED-UNPROVABLE"
+        ]
+      },
+      {
+        "path": "src/ux-sim/safe-public-copy-publish.ts",
+        "disposition": "scenario",
+        "entryCommand": "bun test src/ux-sim/safe-public-copy-publish.test.ts test/nexus/api/markdown-publish.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "The test captures the production handler receipt and temporary artifact; fake S3 returns unavailable, with no logs.db or external writes.",
+        "deviceId": "support-fakes",
+        "scenarioIds": [
+          "SAFE-PUBLIC-COPY-PUBLISH-REDACTION"
+        ]
+      },
+      {
+        "path": "src/ux-sim/seminar-rehearsal.test.ts",
+        "disposition": "scenario",
+        "entryCommand": "bun test src/ux-sim/seminar-rehearsal.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "The test drives simSeminarRehearsal and createSimWorld in a fake-clock scope; persisted state is inspected under an isolated --test root.",
+        "deviceId": "first-run-and-seminar",
+        "scenarioIds": [
+          "SW-FREEZE"
+        ]
+      },
+      {
+        "path": "src/ux-sim/aside-feedback-loop.ts",
+        "disposition": "already-indexed",
+        "entryCommand": "bun test src/ux-sim/aside-feedback-loop.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "No runtime logs; real secretary runtime and topic subscription functions run with injected external edges.",
+        "deviceId": "aside-feedback-loop"
+      }
+    ]
   },
+  "deviceCatalogVersion": 6,
   "devices": [
+    {
+      "id": "SIM-FAKE-PROVIDERS-AV",
+      "name": "Fake ElevenLabs TTS and STT providers",
+      "implementation": [
+        "src/ux-sim/fake-elevenlabs.ts",
+        "src/ux-sim/fake-stt.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-provider-av.test.ts"
+      ],
+      "target": "Loopback ElevenLabs TTS and deterministic fingerprint-based STT provider contracts",
+      "inputs": [
+        "API key and text",
+        "recording bytes and language",
+        "failure, delay, and empty transcript variants"
+      ],
+      "observations": [
+        "TTS status, Retry-After, deterministic audio bytes, and request records",
+        "STT sha256 fingerprint, transcript, language, and error code"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-provider-av.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
     {
       "id": "codex-wire-capture",
       "name": "Codex Responses wire capture mock",
@@ -46,6 +414,95 @@
       ],
       "entryCommands": [
         "bun test test/llm-codex-prompt-cache-prefix.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-app-auth",
+      "name": "Fake app invitation and session authentication",
+      "implementation": [
+        "src/ux-sim/fake-app-auth.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-auth.test.ts"
+      ],
+      "target": "Signed app-scoped invitation acceptance and temporary-token-backed host-only sessions",
+      "inputs": [
+        "app slug",
+        "inviter identity",
+        "signed invitation and expiry",
+        "session verification or revocation"
+      ],
+      "observations": [
+        "invitation acceptance status and inviter record",
+        "__Host- Secure Path=/ cookie without Domain",
+        "tampered, cross-app, expired, uninvited and revoked requests rejected"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-app-auth.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-app-traffic",
+      "name": "Fake app traffic caps and admin kill switch",
+      "implementation": [
+        "src/ux-sim/fake-app-traffic.ts",
+        "src/ux-sim/fake-clock.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-traffic.test.ts",
+        "src/ux-sim/fake-clock.test.ts"
+      ],
+      "target": "Per-app request and response byte accounting with warning, throttle, block, window reset, and immediate admin stream termination",
+      "inputs": [
+        "app slug and request/response byte counts",
+        "accounting window and ordered traffic thresholds",
+        "admin block and unblock operations"
+      ],
+      "observations": [
+        "per-app byte totals and warning/throttle/block decisions",
+        "window reset restores the app traffic allowance",
+        "admin block rejects new requests and closes active streams",
+        "neighbor apps remain unaffected; ledger stores byte counts and status only"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-app-traffic.test.ts src/ux-sim/fake-clock.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-app-realtime",
+      "name": "Fake app realtime contract matrix",
+      "implementation": [
+        "src/ux-sim/fake-app-realtime.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-realtime.test.ts"
+      ],
+      "target": "App-slug-scoped row-change SSE contract matrix run on the real NexusEventBus reference port (createNexusEventBusAppRealtimePortFactory) and injected port factories",
+      "inputs": [
+        "insert, update, and delete changes",
+        "subscriber count and latency limit",
+        "Last-Event-ID reconnection",
+        "slow subscriber buffer limit",
+        "explicit subscriber, latency, and buffer limits"
+      ],
+      "observations": [
+        "NexusEventBus app.row.* events carried by the real bus",
+        "SSE id, event, and data frames",
+        "delivery latency",
+        "app isolation and replay",
+        "slow subscriber disconnection and cleanup"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-app-realtime.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -79,10 +536,44 @@
       "recentUse": null
     },
     {
+      "id": "fake-fetch",
+      "name": "Fake fetch route device",
+      "implementation": [
+        "src/ux-sim/fake-fetch.ts",
+        "apps/pwa/src/test-devices/fake-fetch.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-fetch.test.ts",
+        "apps/pwa/src/lib/daemon-client.seat-request.test.ts",
+        "apps/pwa/src/lib/daemon-client-tool-meta.test.ts",
+        "apps/pwa/src/lib/task-api.test.ts"
+      ],
+      "target": "globalThis.fetch boundary with exact method and URL/path routes; never falls through to the network",
+      "inputs": [
+        "request URL and method",
+        "route response or response factory",
+        "request headers and body"
+      ],
+      "observations": [
+        "request URL, method, headers, and body",
+        "matched route and response status",
+        "unmatched route failures",
+        "global fetch restoration after success or error"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-fetch.test.ts",
+        "bun test apps/pwa/src/lib/daemon-client.seat-request.test.ts apps/pwa/src/lib/daemon-client-tool-meta.test.ts apps/pwa/src/lib/task-api.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
       "id": "fake-executable",
       "name": "Fake executable and PATH",
       "implementation": [
-        "src/ux-sim/fake-bin.ts"
+        "src/ux-sim/fake-bin.ts",
+        "src/ux-sim/fake-bin-install-helper.mjs"
       ],
       "tests": [
         "src/ux-sim/fake-bin.test.ts"
@@ -96,7 +587,12 @@
         "signal",
         "delay",
         "argv",
-        "caller PATH"
+        "caller PATH",
+        "exact install prefix",
+        "declared relative installation artifacts",
+        "canonical exact install prefix",
+        "installer argv",
+        "deterministic inherited-pipe barrier for path replacement tests"
       ],
       "observations": [
         "spawn arguments",
@@ -105,10 +601,45 @@
         "spawn error",
         "unknown executable/stdout capture refusal",
         "no parent-PATH fallback after shim cleanup",
-        "temporary PATH cleanup"
+        "temporary PATH cleanup",
+        "install-prefix mismatch refusal",
+        "fixture artifacts confined to the exact configured prefix",
+        "installer argv mismatch refusal",
+        "prefix and artifact symlink refusal",
+        "install failure and write failure receipts",
+        "ancestor symlink replacement cannot redirect descriptor-relative O_NOFOLLOW artifact writes"
       ],
       "entryCommands": [
         "bun test src/ux-sim/fake-bin.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-payment",
+      "name": "Fake payment gateway",
+      "implementation": [
+        "src/ux-sim/fake-payment.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-payment.test.ts"
+      ],
+      "target": "In-process payment gateway, signed webhooks, subscription recovery and bounded refunds",
+      "inputs": [
+        "checkout approval, decline or cancellation",
+        "HMAC-signed webhook events",
+        "injected billing time and card validity",
+        "integer minor-unit payment and refund amounts"
+      ],
+      "observations": [
+        "payment outcomes and webhook idempotency",
+        "forged webhook rejection without state changes",
+        "retry, grace, suspension and card-update recovery",
+        "full, partial and refused excess refunds"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-payment.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -175,10 +706,12 @@
       "id": "fake-kubectl",
       "name": "Fake kubectl",
       "implementation": [
-        "src/ux-sim/fake-kubectl.ts"
+        "src/ux-sim/fake-kubectl.ts",
+        "src/ux-sim/world-host-chaos.ts"
       ],
       "tests": [
-        "src/ux-sim/fake-kubectl.test.ts"
+        "src/ux-sim/fake-kubectl.test.ts",
+        "src/ux-sim/world-host-chaos.test.ts"
       ],
       "target": "Pod and Job query/termination boundary",
       "inputs": [
@@ -198,10 +731,40 @@
       "recentUse": null
     },
     {
+      "id": "fault-nexus-stall",
+      "name": "Nexus synchronous stall fault",
+      "implementation": [
+        "src/ux-sim/fault-nexus-stall.ts",
+        "src/ux-sim/fake-kubectl.ts",
+        "src/ux-sim/dashboard-event-loop-stall-monitor-device.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fault-nexus-stall.test.ts"
+      ],
+      "target": "Production Nexus grid consumer with synchronous kubectl delay and unreachable faults",
+      "inputs": [
+        "finite kubectl hang duration",
+        "unreachable kubectl switch",
+        "maximum event-loop lag"
+      ],
+      "observations": [
+        "production buildGridData result",
+        "kubectl call records",
+        "event-loop ping lag samples and maximum"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fault-nexus-stall.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
       "id": "warm-pool-reuse-sim",
       "name": "Warm pool gate reuse with fake primary control",
       "implementation": [
         "src/ux-sim/warm-pool-reuse-sim.ts",
+        "src/ux-sim/warm-pool-reuse-switch-sim.ts",
         "src/ux-sim/fake-kubectl.ts",
         "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
       ],
@@ -306,6 +869,36 @@
       ],
       "entryCommands": [
         "bun test src/ux-sim/fake-clock.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-dns-cert",
+      "name": "Fake DNS and DNS-01 certificate device",
+      "implementation": [
+        "src/ux-sim/fake-dns-cert.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-dns-cert.test.ts"
+      ],
+      "target": "Isolated wildcard DNS zone and DNS-01 certificate issuance, failure, and renewal contracts",
+      "inputs": [
+        "relay edge target",
+        "TXT propagation delay and timeout",
+        "simulated issuance limit and CAA policy",
+        "fake-clock time"
+      ],
+      "observations": [
+        "single wildcard record and write counters",
+        "single-label wildcard matching",
+        "ACME TXT writes and certificate result",
+        "failure card and preserved certificate",
+        "renewal at the 30-day boundary"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-dns-cert.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -429,56 +1022,131 @@
       "id": "fake-land-queue",
       "name": "Fake landing queue",
       "implementation": [
-        "src/ux-sim/fake-land-queue.ts"
+        "src/ux-sim/fake-land-queue.ts",
+        "src/ux-sim/chain-land.ts",
+        "src/ux-sim/fake-gh.ts",
+        "src/ux-sim/fake-bin.ts",
+        "src/self-implement/l8-merge-queue.ts",
+        "src/self-implement/merge-train.ts"
       ],
       "tests": [
-        "src/ux-sim/fake-land-queue.test.ts"
+        "src/ux-sim/fake-land-queue.test.ts",
+        "src/ux-sim/chain-land.test.ts"
       ],
-      "target": "landing train scheduling",
+      "target": "production runL8ShadowQueue end-to-end with real temporary Git, fake GitHub CLI and simulated remote gate responses",
       "inputs": [
-        "load",
-        "gate verdict",
-        "priority",
-        "cut window",
-        "conflict"
+        "PR queue entries",
+        "multi-host integrated gate outcomes",
+        "failed or unmeasured remote gate",
+        "real stale queue-lock directory"
       ],
       "observations": [
-        "queue choice",
-        "wait/reject reason",
-        "slot availability"
+        "production queue ledger readback",
+        "real Git integration commands",
+        "per-host gate calls",
+        "persisted per-PR verdicts",
+        "stale lock leaves queue pending"
       ],
       "entryCommands": [
-        "bun test src/ux-sim/fake-land-queue.test.ts"
+        "bun test src/ux-sim/fake-land-queue.test.ts",
+        "bun test src/ux-sim/chain-land.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
       "recentUse": null
     },
     {
+      "entryCommands": [
+        "bun test src/ux-sim/world.test.ts",
+        "bun test src/ux-sim/world-snapshot.test.ts",
+        "bun test src/ux-sim/world.test.ts src/ux-sim/world-chaos-runtime.test.ts src/ux-sim/world-host-chaos.test.ts src/ux-sim/world-snapshot.test.ts src/ux-sim/event-monkey.test.ts",
+        "bun test src/ux-sim/world.test.ts src/ux-sim/world-chaos-runtime.test.ts src/ux-sim/event-monkey.test.ts",
+        "bun test src/ux-sim/world-host-chaos.test.ts",
+        "bun test src/ux-sim/warm-si-reuse-sim.test.ts",
+        "bun test src/ux-sim/fake-app-host.test.ts"
+      ],
+      "eventNames": [
+        "pod.reuse/uncertain-exec-injected"
+      ],
       "id": "world-runtime",
-      "name": "Isolated simulation world assembly and lifecycle",
       "implementation": [
         "src/ux-sim/world.ts",
         "src/cli/sim-cli.ts",
         "scripts/sim-world-runner.ts",
-        "scenarios/ux-sim/night-train-dead-pid-lock.yaml"
+        "scenarios/ux-sim/night-train-dead-pid-lock.yaml",
+        "src/ux-sim/world-snapshot.ts",
+        "src/ux-sim/world-chaos-runtime.ts",
+        "src/ux-sim/event-monkey.ts",
+        "src/self-implement/run-ledger.ts",
+        "src/ux-sim/world-host-chaos.ts",
+        "src/ux-sim/sim-coverage.ts",
+        "src/task-orchestrator/surfaces/self-implement-pod.ts",
+        "src/task-orchestrator/surfaces/pod-si-warm-transport.ts",
+        "scenarios/ux-sim/warm-pool-reuse-world.yaml",
+        "src/ux-sim/hq-move-sim.ts",
+        "scenarios/ux-sim/sim-hq-move.yaml",
+        "src/ux-sim/fake-app-host.ts"
       ],
-      "tests": [
-        "src/ux-sim/world.test.ts"
-      ],
-      "target": "named catalog-device assembly, test-root world lifecycle, OS-enforced network denial, and dead-pid lock event injection",
       "inputs": [
         "world YAML",
         "catalog device ids",
-        "dead-pid-lock event"
+        "dead-pid-lock event",
+        "scheduled arbitrary ledger/log injections",
+        "declared monkey schedule, injection schedule and recovery budget",
+        "warm SI timeout, connection loss, missing result, and uncertain cleanup",
+        "dead-pid-lock or hq-move event",
+        "optional migration fault"
       ],
+      "logsRecorded": "yes",
+      "name": "Isolated simulation world assembly and lifecycle",
       "observations": [
         "world directory lifecycle",
         "blocked network attempts",
-        "release readiness verdict"
+        "release readiness verdict",
+        "convergence time, HITL events and lost ledger rows",
+        "per-world run code paths, event kinds, device fingerprints, and coverage report",
+        "SI reconcile-only classification, no duplicate cold Job, quarantine, and preserved verified PR disposition",
+        "lease generation and old/new host fences",
+        "state-copy result and migrated pool owner"
+      ],
+      "recentUse": null,
+      "target": "named catalog-device assembly, test-root world lifecycle, OS-enforced network denial, declared monkey faults on a shared fake-time timeline, and arbitrary world injections through the production ledger writer; SI uncertain-exec injection uses L0 fault records through production host transport and reconcile-only boundary; named catalog-device assembly, test-root lifecycle and OS-enforced network denial; dead-pid-lock and HQ transfer scenarios under fake host/clock edges; shared-timeline monkey faults, ledger/log injections, and app-host deploy/rollback",
+      "tests": [
+        "src/ux-sim/world.test.ts",
+        "src/ux-sim/world-snapshot.test.ts",
+        "src/ux-sim/world-chaos-runtime.test.ts",
+        "src/ux-sim/event-monkey.test.ts",
+        "src/ux-sim/world-host-chaos.test.ts",
+        "src/ux-sim/warm-si-reuse-sim.test.ts",
+        "src/ux-sim/fake-app-host.test.ts"
+      ]
+    },
+    {
+      "id": "secret-canary",
+      "name": "Provider secret leak canary",
+      "checklistCells": [
+        "SIM-CANARY"
+      ],
+      "implementation": [
+        "src/ux-sim/secret-canary.ts"
+      ],
+      "tests": [
+        "src/ux-sim/secret-canary.test.ts"
+      ],
+      "target": "provider credential leakage across public artifacts",
+      "inputs": [
+        "provider list",
+        "artifact path and content",
+        "secret backend storage path and content"
+      ],
+      "observations": [
+        "leak paths and encoding",
+        "searched location count",
+        "searched UTF-8 byte count",
+        "clean or indeterminate verdict"
       ],
       "entryCommands": [
-        "bun test src/ux-sim/world.test.ts"
+        "bun test src/ux-sim/secret-canary.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -640,7 +1308,7 @@
         "scripts/release-loop/gate-flow-sim.test.ts",
         "scripts/release-loop/gate-node-sim.test.ts"
       ],
-      "target": "release graph routing, fan-out joins, resume and failure paths",
+      "target": "release graph routing, fan-out joins and resume failures; the cutoff notes-empty case runs the version-release, graph cutoff and cutoff CLIs against an isolated local Git world",
       "inputs": [
         "node outcomes",
         "branch overlap delays",
@@ -900,7 +1568,8 @@
         "src/ux-sim/subagent-tools-device.ts",
         "src/ux-sim/task-agent-parent-host-device.ts",
         "src/ux-sim/task-agent-rejudge-on-head-device.ts",
-        "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.ts"
+        "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.ts",
+        "src/ux-sim/tool-async-fail-loop.ts"
       ],
       "tests": [
         "src/ux-sim/boot-daemon-tools-pty-shell-device.test.ts",
@@ -916,7 +1585,8 @@
         "src/ux-sim/subagent-tools-device.test.ts",
         "src/ux-sim/task-agent-parent-host-device.test.ts",
         "src/ux-sim/task-agent-rejudge-on-head-device.test.ts",
-        "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.test.ts"
+        "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.test.ts",
+        "src/ux-sim/tool-async-fail-loop.test.ts"
       ],
       "target": "selected product, PTY, agent and orchestration seams",
       "inputs": [
@@ -932,7 +1602,8 @@
         "stop reason"
       ],
       "entryCommands": [
-        "bun test src/ux-sim/boot-daemon-tools-pty-shell-device.test.ts src/ux-sim/cli-config-audit-device.test.ts src/ux-sim/computer-use.test.ts src/ux-sim/dashboard-event-loop-stall-monitor-device.test.ts src/ux-sim/event-monkey.test.ts src/ux-sim/goal-device.test.ts src/ux-sim/onboarding-first-run-device.test.ts src/ux-sim/resume-picker-device.test.ts src/ux-sim/self-implement-author-clarification.test.ts src/ux-sim/skills-tools-shell-device.test.ts src/ux-sim/subagent-tools-device.test.ts src/ux-sim/task-agent-parent-host-device.test.ts src/ux-sim/task-agent-rejudge-on-head-device.test.ts src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.test.ts"
+        "bun test src/ux-sim/boot-daemon-tools-pty-shell-device.test.ts src/ux-sim/cli-config-audit-device.test.ts src/ux-sim/computer-use.test.ts src/ux-sim/dashboard-event-loop-stall-monitor-device.test.ts src/ux-sim/event-monkey.test.ts src/ux-sim/goal-device.test.ts src/ux-sim/onboarding-first-run-device.test.ts src/ux-sim/resume-picker-device.test.ts src/ux-sim/self-implement-author-clarification.test.ts src/ux-sim/skills-tools-shell-device.test.ts src/ux-sim/subagent-tools-device.test.ts src/ux-sim/task-agent-parent-host-device.test.ts src/ux-sim/task-agent-rejudge-on-head-device.test.ts src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.test.ts",
+        "bun test src/ux-sim/tool-async-fail-loop.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -1042,6 +1713,7 @@
         "src/ux-sim/term-slash-device.test.ts",
         "test/telegram-surface-hitl.test.ts",
         "src/ux-sim/safe-public-copy-publish.test.ts",
+        "src/ux-sim/install-consent-device.test.ts",
         "test/nexus/api/markdown-publish.test.ts"
       ],
       "target": "local fake LLM server, browser/linear fakes, service-key setup, terminal slash device and test CLI instance; safe launch-copy redaction and real Markdown publish/serve handlers with isolated storage",
@@ -1066,7 +1738,8 @@
       "entryCommands": [
         "bun test src/ux-sim/aimock-local.test.ts",
         "bun test test/telegram-surface-hitl.test.ts",
-        "bun test src/ux-sim/safe-public-copy-publish.test.ts test/nexus/api/markdown-publish.test.ts"
+        "bun test src/ux-sim/safe-public-copy-publish.test.ts test/nexus/api/markdown-publish.test.ts",
+        "bun test src/ux-sim/install-consent-device.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -1142,10 +1815,12 @@
       "id": "sim-universe-world-lifecycle",
       "name": "Isolated simulation world lifecycle",
       "implementation": [
-        "src/ux-sim/world-store.ts"
+        "src/ux-sim/world-store.ts",
+        "src/ux-sim/world-snapshot.ts"
       ],
       "tests": [
         "src/ux-sim/world-store.test.ts",
+        "src/ux-sim/world-snapshot.test.ts",
         "src/cli/sim-cli.test.ts"
       ],
       "target": "test-root-contained world create/list/destroy lifecycle and ownership checks",
@@ -1161,7 +1836,7 @@
         "rejected ownership and path-boundary violations"
       ],
       "entryCommands": [
-        "bun test src/ux-sim/world-store.test.ts src/cli/sim-cli.test.ts"
+        "bun test src/ux-sim/world-store.test.ts src/ux-sim/world-snapshot.test.ts src/cli/sim-cli.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -1172,21 +1847,27 @@
       "name": "Simulation world YAML schema",
       "implementation": [
         "src/ux-sim/world-schema.ts",
+        "src/ux-sim/event-monkey.ts",
+        "src/ux-sim/fake-app-host.ts",
         "src/ux-sim/mock-scenario-catalog.ts"
       ],
       "tests": [
         "src/ux-sim/world-schema.test.ts",
         "src/ux-sim/mock-scenario-catalog.test.ts"
       ],
-      "target": "RFC A2 world declaration shape plus catalog-backed device and event reference validation",
+      "target": "RFC A2 world declaration, arbitrary ledger/log injections and chaos/recovery shape plus catalog-backed device and event reference validation",
       "inputs": [
         "world YAML",
+        "arbitrary ledger/log injection declarations",
+        "chaos fault schedule",
+        "expect.recovers budgets",
         "registered mock device IDs",
         "registered world event IDs"
       ],
       "observations": [
         "normalized world specification",
         "field-path shape errors",
+        "fault and recovery budget validation",
         "unknown device and event reference errors"
       ],
       "entryCommands": [
@@ -1318,902 +1999,286 @@
       "logsRecorded": "no",
       "eventNames": [],
       "recentUse": null
+    },
+    {
+      "id": "device-fidelity",
+      "name": "Recorded device fidelity comparison",
+      "implementation": [
+        "src/ux-sim/device-fidelity.ts"
+      ],
+      "tests": [
+        "src/ux-sim/device-fidelity.test.ts"
+      ],
+      "target": "Compare recorded real GitHub API responses against replay through the production fake-github device and gate sim verdicts by device fidelity",
+      "inputs": [
+        "versioned JSON real-response recording",
+        "device id, request argv and recorded response",
+        "isolated test universe"
+      ],
+      "observations": [
+        "per-call response hashes and match verdict",
+        "durable per-recording/device status",
+        "sim world green to yellow downgrade for a mismatched device"
+      ],
+      "entryCommands": [
+        "eln --test sim fidelity compare <recording.json>",
+        "eln --test sim fidelity status <device-id>"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "install-consent",
+      "name": "Release installer consent simulation",
+      "implementation": [
+        "src/ux-sim/install-consent-device.ts"
+      ],
+      "tests": [
+        "src/ux-sim/install-consent-device.test.ts"
+      ],
+      "target": "Release install consent refusal and production release verify installer arguments",
+      "inputs": [
+        "isolated HOME and prefix",
+        "fake command runner",
+        "release verify inputs"
+      ],
+      "observations": [
+        "refusal creates no install prefix",
+        "e2e and release verify pass installer consent flags"
+      ],
+      "entryCommands": [
+        "bun scripts/ux-sim.ts install-consent",
+        "bun test src/ux-sim/install-consent-device.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "warm-si-reuse-sim",
+      "name": "Implementation child SI warm Pod reuse chain",
+      "implementation": [
+        "src/ux-sim/warm-si-reuse-sim.ts",
+        "src/ux-sim/warm-pool-reuse-sim.ts",
+        "src/ux-sim/fake-kubectl.ts",
+        "src/task-orchestrator/surfaces/pod-si-warm-provider.ts",
+        "src/task-orchestrator/surfaces/pod-child-reuse.ts",
+        "src/ux-sim/warm-pool-reuse-switch-sim.ts"
+      ],
+      "tests": [
+        "src/ux-sim/warm-si-reuse-sim.test.ts"
+      ],
+      "target": "Production SI warm lease acquisition and child cleanup/return against isolated fake Kubernetes and primary control boundaries",
+      "inputs": [
+        "isolated runId",
+        "registered SI worker",
+        "fixed runner maintenance receipt",
+        "optional child process residue"
+      ],
+      "observations": [
+        "lease generation and Pod UID",
+        "release and sanitize transitions",
+        "returned or quarantined cleanup result"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/warm-si-reuse-sim.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "pod-reuse-residue-fault",
+      "name": "POD reuse residue fault injection",
+      "implementation": [
+        "src/ux-sim/fault-pod-reuse-residue.ts",
+        "src/ux-sim/temp-git-remote.ts",
+        "src/ux-sim/fake-ps.ts",
+        "src/task-orchestrator/surfaces/pod-child-reuse.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fault-pod-reuse-residue.test.ts",
+        "src/ux-sim/pod-reuse-clean-state.test.ts"
+      ],
+      "target": "POD child reuse cleanup: inject prior-round residue, run the production cleanup path, and observe lease return eligibility",
+      "inputs": [
+        "safe run IDs",
+        "real temporary Git checkout",
+        "real child processes",
+        "fake-ps process inventory"
+      ],
+      "observations": [
+        "tracked and untracked Git residue before cleanup",
+        "run credential and live child process before cleanup",
+        "empty Git, credential, fake-ps, and child-process observations before each lease return"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fault-pod-reuse-residue.test.ts src/ux-sim/pod-reuse-clean-state.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-ps",
+      "name": "Fake process table",
+      "implementation": [
+        "src/ux-sim/fake-ps.ts",
+        "src/ux-sim/world-host-chaos.ts"
+      ],
+      "tests": [
+        "src/ux-sim/world-host-chaos.test.ts",
+        "src/ux-sim/world-chaos-runtime.test.ts"
+      ],
+      "target": "world process inventory used by monkey signals and host-wide gorilla failure",
+      "inputs": [
+        "declared processes",
+        "process kill and re-registration operations"
+      ],
+      "observations": [
+        "live process rows by host",
+        "PID liveness",
+        "declared process fingerprints after host recovery"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/world-host-chaos.test.ts src/ux-sim/world-chaos-runtime.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-app-storage",
+      "name": "Fake app-scoped object storage contract matrix",
+      "checklistCells": [
+        "SIM-APPSTORAGE"
+      ],
+      "implementation": [
+        "src/ux-sim/fake-app-storage.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-storage.test.ts"
+      ],
+      "target": "App-scoped upload, quota, media-type, signed URL, anonymous rate-limit, and provider-error decisions against the real local ObjectStore boundary",
+      "inputs": [
+        "app slug and relative object key",
+        "bytes and content type",
+        "app quota and anonymous upload rate",
+        "signed PUT URL, expiry, and method",
+        "fake S3 RunFn error response"
+      ],
+      "observations": [
+        "all stored keys stay under apps/<slug>/",
+        "path escape and invalid media type rejection",
+        "quota rejection leaves prior bytes unchanged",
+        "valid signed upload and expiry, signature, or method rejection",
+        "per-app anonymous upload limit",
+        "provider 403 rejection and retryable 5xx status",
+        "byte-and-status-only ledger with no request body"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-app-storage.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "backend-tier-device",
+      "name": "Backend tier advice host profiles",
+      "implementation": [
+        "src/ux-sim/backend-tier-device.ts"
+      ],
+      "tests": [
+        "src/ux-sim/backend-tier-device.test.ts"
+      ],
+      "target": "Fake host profiles drive backend tier advice without probing or changing the machine",
+      "inputs": [
+        "host profile (cores, memory, disk)"
+      ],
+      "observations": [
+        "recommended backend tier and reason"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/backend-tier-device.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-higgsfield",
+      "name": "Fake Higgsfield generation CLI",
+      "implementation": [
+        "src/ux-sim/fake-higgsfield.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-higgsfield.test.ts"
+      ],
+      "target": "Higgsfield generation calls answered by a local fake so media pipelines run without the real service",
+      "inputs": [
+        "generate request and model"
+      ],
+      "observations": [
+        "fake job id and media URL"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-higgsfield.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "temp-git-repo",
+      "name": "Temporary Git repository fixture",
+      "implementation": [
+        "src/ux-sim/temp-git-repo.ts"
+      ],
+      "tests": [
+        "src/ux-sim/temp-git-repo.test.ts"
+      ],
+      "target": "Throwaway Git repositories with real commits for simulation tests that need history",
+      "inputs": [
+        "commits and branches to create"
+      ],
+      "observations": [
+        "repository path with the requested history"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/temp-git-repo.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
     }
   ],
-  "sourceModules": [
-    {
-      "id": "MD-UX-SIM-ASIDE-FEEDBACK-LOOP-TS",
-      "path": "src/ux-sim/aside-feedback-loop.ts",
-      "boundary": "Runs the deterministic aside feedback loop through the production Linear secretary and topic-subscription paths, with research, capture, network and schedule edges injected.",
-      "deviceIds": [
-        "aside-feedback-loop"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-AUTHOR-REVIEWER-PRECHECK-DEVICE-TS",
-      "path": "src/ux-sim/author-reviewer-precheck-device.ts",
-      "boundary": "author reviewer precheck device: Uses the real reviewer parser/validator and its real event writer, with the only model boundary faked.",
-      "deviceIds": [
-        "author-reviewer-precheck"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-BOOT-DAEMON-TOOLS-PTY-SHELL-DEVICE-TS",
-      "path": "src/ux-sim/boot-daemon-tools-pty-shell-device.ts",
-      "boundary": "Stages and inspects production PTY-shell startup, including argv validation and launch outcomes.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-BROWSER-HAND-TS",
-      "path": "src/ux-sim/browser-hand.ts",
-      "boundary": "browser hand: Run the real BrowserHand coordinator and performBrowserAction with only browser and Linear I/O faked.",
-      "deviceIds": [
-        "support-fakes"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-CLASSIC-TUI-SEAT-SCENARIOS-TS",
-      "path": "src/ux-sim/classic-tui-seat-scenarios.ts",
-      "boundary": "Runs the classic TUI first-run, authoring and scripted interaction scenarios against the real CLI in a pinned isolated universe, then captures screen and persisted-state evidence.",
-      "deviceIds": [
-        "first-run-and-seminar"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-CLI-CONFIG-AUDIT-DEVICE-TS",
-      "path": "src/ux-sim/cli-config-audit-device.ts",
-      "boundary": "Runs the real CLI config-audit command with controlled config fixtures and records its warnings, proposed edits and command result.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-CODEX-WIRE-CAPTURE-TS",
-      "path": "src/ux-sim/codex-wire-capture.ts",
-      "boundary": "codex wire capture: Fetch-boundary mock for Codex Responses wire-contract tests.",
-      "deviceIds": [
-        "codex-wire-capture"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-COMPUTER-USE-TS",
-      "path": "src/ux-sim/computer-use.ts",
-      "boundary": "Feeds declared click trajectories into the production computer-use dispatcher and records action attribution and observations without inventing coordinates.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-DASHBOARD-EVENT-LOOP-STALL-MONITOR-DEVICE-TS",
-      "path": "src/ux-sim/dashboard-event-loop-stall-monitor-device.ts",
-      "boundary": "Advances a staged clock through due monitor tasks and streamed keypress samples, recording event-loop lag and task ordering from the production monitor path.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-DRAFT-INVENTORY-BUILDER-TS",
-      "path": "src/ux-sim/draft-inventory-builder.ts",
-      "boundary": "draft inventory builder: Deterministic synthetic inventory; both production draft triage functions run for every case.",
-      "deviceIds": [
-        "draft-inventory"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-EVENT-MONKEY-TS",
-      "path": "src/ux-sim/event-monkey.ts",
-      "boundary": "Declares the run-ledger fault-event catalog and seeded monkey/gorilla/kong attack kinds consumed by the grid chaos simulator.",
-      "deviceIds": [
-        "product-devices",
-        "author-reviewer-precheck"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-BIN-TS",
-      "path": "src/ux-sim/fake-bin.ts",
-      "boundary": "Creates a temporary PATH shim for declared executables and records argv, output, exit status, signals and cleanup.",
-      "deviceIds": [
-        "fake-executable"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-BROWSER-PAGE-TS",
-      "path": "src/ux-sim/fake-browser-page.ts",
-      "boundary": "CDP page navigation: inject fake page lifecycle, evaluate, click, and screenshot at BrowserActionDeps while production browser actions run.",
-      "deviceIds": [
-        "support-fakes"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-CLOCK-TS",
-      "path": "src/ux-sim/fake-clock.ts",
-      "boundary": "Replaces process-local Date and timers with an explicitly advanced clock for deterministic scheduled-callback and elapsed-time behavior.",
-      "deviceIds": [
-        "fake-clock",
-        "fake-cloud-vm",
-        "grid-chaos-driver"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-BURST-READY-LADDER-SIM-TS",
-      "path": "src/ux-sim/burst-ready-ladder-sim.ts",
-      "boundary": "Runs the purpose-specific burst warm-up and TTL scenario through the production fake-cloud-vm state machine and fake clock without provider calls.",
-      "deviceIds": [
-        "fake-cloud-vm"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-CLOUD-VM-TS",
-      "path": "src/ux-sim/fake-cloud-vm.ts",
-      "boundary": "Models image-based VM create/resume/stop, lease draining, powered-on cost and capacity-tier choice using deterministic state transitions; it never calls a cloud provider.",
-      "deviceIds": [
-        "fake-cloud-vm"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-FLEET-TS",
-      "path": "src/ux-sim/fake-fleet.ts",
-      "boundary": "Composes independent host SSH scripts and per-context Kubernetes fixtures, recording ordered calls, latency and failures for multi-host release-gate tests.",
-      "deviceIds": [
-        "fake-fleet"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-GH-TS",
-      "path": "src/ux-sim/fake-gh.ts",
-      "boundary": "fake gh: GitHub data at the CLI boundary; sweep decisions remain in the production callers.",
-      "deviceIds": [
-        "fake-github"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-HERDR-TS",
-      "path": "src/ux-sim/fake-herdr.ts",
-      "boundary": "Models herdr pane lifecycle, agent reports, missing-report faults and handoff timeouts without starting panes.",
-      "deviceIds": [
-        "fake-herdr"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-KUBECTL-TS",
-      "path": "src/ux-sim/fake-kubectl.ts",
-      "boundary": "Provides an in-memory Kubernetes API for production pool-admission and warm-provider callers; unknown kubectl operations fail closed.",
-      "deviceIds": [
-        "fake-kubectl",
-        "warm-pool-reuse-sim",
-        "fake-fleet"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-LAND-QUEUE-TS",
-      "path": "src/ux-sim/fake-land-queue.ts",
-      "boundary": "fake land queue: In-process LAND-QUEUE simulator. Scheduling and verdict logic use the production train functions; only git's merge-tree/commit-tree and the remote gate are replaced.",
-      "deviceIds": [
-        "fake-land-queue"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-LINEAR-DEVICE-TS",
-      "path": "src/ux-sim/fake-linear-device.ts",
-      "boundary": "Implements the Linear API response boundary used by the production browser-hand coordinator, capturing requests without network access.",
-      "deviceIds": [
-        "support-fakes"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-LLM-TS",
-      "path": "src/ux-sim/fake-llm.ts",
-      "boundary": "fake llm: Deterministic, network-free LLM for gate tests without provider credentials. The opt-in is deliberately explicit; production never selects this provider.",
-      "deviceIds": [
-        "fake-llm"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-SSH-TS",
-      "path": "src/ux-sim/fake-ssh.ts",
-      "boundary": "Implements GateTools.ssh with scripted host responses, latency, timeout and SCP disconnect outcomes; it opens no SSH connection.",
-      "deviceIds": [
-        "fake-ssh"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAKE-TELEGRAM-VIDEO-TS",
-      "path": "src/ux-sim/fake-telegram-video.ts",
-      "boundary": "Implements an in-memory Telegram sendVideo endpoint that records multipart requests and returns scripted delivery receipts or rejection responses.",
-      "deviceIds": [
-        "telegram-video-receipt"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-CRED-EXPIRY-TS",
-      "path": "src/ux-sim/fault-cred-expiry.ts",
-      "boundary": "Grok subscription expiry: temporary HOME credentials, fake-clock refresh outcomes, and production grokLaunchReadiness/podGrokSubscriptionUsable decisions.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-GLM-NO-CREDENTIAL-TS",
-      "path": "src/ux-sim/fault-glm-no-credential.ts",
-      "boundary": "Runs the production Z.ai provider-selection and launch-readiness path with the credential absent, then records whether the real caller refuses launch and why.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-NEEDS-HUMAN-REASON-REPAIR-TS",
-      "path": "src/ux-sim/fault-needs-human-reason-repair.ts",
-      "boundary": "fault needs human reason repair: Runs the production supervisor with one injected failure per repair reason.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-NEXTMOVE-DISPATCH-TS",
-      "path": "src/ux-sim/fault-nextmove-dispatch.ts",
-      "boundary": "Injects nextmove-dispatch fixtures into the production decision path and renders the observed classification with its evidence command.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-POD-CHILD-RESULT-TS",
-      "path": "src/ux-sim/fault-pod-child-result.ts",
-      "boundary": "fault pod child result: Replays a successful Kubernetes Job carrying a failed/partial child result.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-POD-CODEX-503-TS",
-      "path": "src/ux-sim/fault-pod-codex-503.ts",
-      "boundary": "Injects a child-endpoint Codex HTTP 503 and competing Z.ai response to verify production fallback and surfaced result.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-POD-DEATH-TS",
-      "path": "src/ux-sim/fault-pod-death.ts",
-      "boundary": "Replays pod termination and partial-output variants, then observes production classification of final, partial, missing and unparsable child results.",
-      "deviceIds": [
-        "fault-injection",
-        "grid-chaos-driver"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-POOL-CAP-TS",
-      "path": "src/ux-sim/fault-pool-cap.ts",
-      "boundary": "Pod pool capacity: compare omitted :N default capacity with explicit caps through production parsePodPool and recommendConcurrency.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-SCOPE-ESCAPE-LIFT-TS",
-      "path": "src/ux-sim/fault-scope-escape-lift.ts",
-      "boundary": "Builds child-result fixtures for abandoned, scope-stop and implementation-deficit classifications to test production result lifting.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-SQLITE-BUSY-TS",
-      "path": "src/ux-sim/fault-sqlite-busy.ts",
-      "boundary": "SQLite write lock: hold a real local BEGIN IMMEDIATE lock across LogStore.insertBatch, then observe buffered-row recovery.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FAULT-TUI-400-AUTOHEAL-TS",
-      "path": "src/ux-sim/fault-tui-400-autoheal.ts",
-      "boundary": "Supplies captured Codex 400 tool-history mismatch responses to the TUI autoheal path and observes the real recovery decision.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-FIXTURES-GIT-WORKTREE-ACCEL-LINUX-JSON",
-      "path": "src/ux-sim/fixtures/git-worktree-accel-linux.json",
-      "boundary": "Deterministic Linux fixture for same-cut cold/warm checkout route comparisons, with candidate measurements and explicit unavailable metrics; not host performance claims.",
-      "deviceIds": [
-        "git-worktree-accel-measure"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GATE-SHARD-HOST-REROUTE-TS",
-      "path": "src/ux-sim/gate-shard-host-reroute.ts",
-      "boundary": "gate shard host reroute: S1 device for a release gate's shard dispatch. It replaces host execution, not planning or reduction.",
-      "deviceIds": [
-        "fault-injection"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GOAL-DEVICE-TS",
-      "path": "src/ux-sim/goal-device.ts",
-      "boundary": "Feeds work intervals and load samples to the production goal-progress classifier, including its minimum evidence sample.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GOAL-INTERIM-TRACE-TS",
-      "path": "src/ux-sim/goal-interim-trace.ts",
-      "boundary": "Defines one fixed user/tool trace consumed by classic and next goal-interim renderers so both are checked against identical events.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GRAPH-ENGINE-SIM-TS",
-      "path": "src/ux-sim/graph-engine-sim.ts",
-      "boundary": "Selects graph components from synthetic component results and renders the graph observation; it executes no nodes or external effects.",
-      "deviceIds": [
-        "graph-engine-selector"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-WORKER-TS",
-      "path": "src/ux-sim/graph-runtime-overlay-event-path-worker.ts",
-      "boundary": "Isolated child runs the real self-implement graph overlay, persists observer events to the selected test log DB and can inject a dropped-event fault.",
-      "deviceIds": [
-        "sim-event-log-path"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-TS",
-      "path": "src/ux-sim/graph-runtime-overlay-event-path.ts",
-      "boundary": "graph runtime overlay event path: Run the real graph runtime in an isolated process, then relay its production observer event.",
-      "deviceIds": [
-        "sim-event-log-path"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GRID-CHAOS-DRIVER-TS",
-      "path": "src/ux-sim/grid-chaos-driver.ts",
-      "boundary": "Builds seeded fault attacks and applies them through the production in-memory grid-ledger decision seam, including whole-grid lease loss.",
-      "deviceIds": [
-        "grid-chaos-driver"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GRID-LEDGER-TS",
-      "path": "src/ux-sim/grid-ledger.ts",
-      "boundary": "Defines grid host/lane capacity and lease state transitions, then reports admission, occupancy and lease-loss decisions for simulated work.",
-      "deviceIds": [
-        "grid-chaos-driver",
-        "grid-ledger"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-GRID-READY-TIERS-TS",
-      "path": "src/ux-sim/grid-ready-tiers.ts",
-      "boundary": "Chooses how many additional work slots a grid needs and which cold/warm provisioning tier satisfies demand from the supplied readiness snapshot.",
-      "deviceIds": [
-        "fake-cloud-vm"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-HEADLESS-TUI-TS",
-      "path": "src/ux-sim/headless-tui.ts",
-      "boundary": "Runs the production dashboard frame renderer serially in a headless process and captures snapshots while isolating its process-global frame cache.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-HEAL-REAUTHOR-MATERIALIZED-TS",
-      "path": "src/ux-sim/heal-reauthor-materialized.ts",
-      "boundary": "heal reauthor materialized: 진짜 heal-loop와 role 스크립트를 돌린다. 재작성 뒤 dispatch만 가짜로 받아 외부 구현 런은 만들지 않는다.",
-      "deviceIds": [
-        "heal-reauthor-materialized"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-IN-PROCESS-CLI-TS",
-      "path": "src/ux-sim/in-process-cli.ts",
-      "boundary": "Invokes an allow-listed registered Commander action inside this process with isolated config/state roots, captures stdout/stderr and exit code, then restores CLI and process singletons.",
-      "deviceIds": [
-        "support-fakes"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-INPUT-HISTORY-TS",
-      "path": "src/ux-sim/input-history.ts",
-      "boundary": "Creates and inspects isolated temporary input-history state to verify queued records and temp-directory containment.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-INTERACTION-TS",
-      "path": "src/ux-sim/interaction.ts",
-      "boundary": "Exercises the real Escape abort gate and agent-registry typeahead against a simulated mounted-modal stack in mount order.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-LINEAR-SECRETARY-TS",
-      "path": "src/ux-sim/linear-secretary.ts",
-      "boundary": "Runs the production Linear secretary flow with deterministic issue/comment responses; observes its next-action summary without contacting Linear.",
-      "deviceIds": [
-        "linear-secretary"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-AUTHORING-FIRST-RUN-CHILD-TS",
-      "path": "src/ux-sim/mock-authoring-first-run-child.ts",
-      "boundary": "Child-process probe for production first-run onboarding: consumes a fixture, runs provider/config selection in isolation and emits a structured receipt.",
-      "deviceIds": [
-        "first-run-and-seminar"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-AUTHORING-FIRST-RUN-TS",
-      "path": "src/ux-sim/mock-authoring-first-run.ts",
-      "boundary": "Creates an isolated HOME/PATH, launches the real first-run child probe, checks its config/root/provider receipt and hashes, and returns timing plus reproducible evidence.",
-      "deviceIds": [
-        "first-run-and-seminar"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-DEVICE-REQUESTS-TS",
-      "path": "src/ux-sim/mock-device-requests.ts",
-      "boundary": "Validates, stores and lists typed requests for registered mock devices; records discovery requests without executing a simulator.",
-      "deviceIds": [
-        "scenario-runner"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-SCENARIO-CATALOG-JSON",
-      "path": "src/ux-sim/mock-scenario-catalog.json",
-      "boundary": "Declarative registry of simulator devices, file-level MD inventory, scenarios, candidate audit, world events and run-evidence metadata; loading it runs no simulation.",
-      "deviceIds": [
-        "scenario-runner"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-SCENARIO-CATALOG-TS",
-      "path": "src/ux-sim/mock-scenario-catalog.ts",
-      "boundary": "Parses and validates the declarative simulator catalog, resolves devices/scenarios, and renders read-only list/show/device and generated-manual views.",
-      "deviceIds": [
-        "scenario-runner",
-        "sim-universe-world-yaml-schema"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-SEAT-PTY-FRAME-CHILD-TS",
-      "path": "src/ux-sim/mock-seat-pty-frame-child.ts",
-      "boundary": "Real-PTY child probe that initializes the production TUI, renders a first frame, reads one key and emits run-correlated lifecycle markers.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-SEAT-PTY-FRAME-TS",
-      "path": "src/ux-sim/mock-seat-pty-frame.ts",
-      "boundary": "Drives the real first-run TUI through a PTY with injected clock, host, HOME, size and key input; captures frames and lifecycle markers.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-SEAT-PTY-SEQUENCE-CHILD-TS",
-      "path": "src/ux-sim/mock-seat-pty-sequence-child.ts",
-      "boundary": "Real-PTY child probe that initializes the production TUI, renders after each key and exits on Ctrl+Q for parent-driven sequence tests.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-MOCK-SEAT-PTY-SEQUENCE-TS",
-      "path": "src/ux-sim/mock-seat-pty-sequence.ts",
-      "boundary": "Drives a real TUI child through PTY keys and frame-text predicates, capturing frames until the declared terminal condition.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-NEXT-TUI-SEAT-SCENARIOS-TS",
-      "path": "src/ux-sim/next-tui-seat-scenarios.ts",
-      "boundary": "Runs next-TUI session, resume, queue, tool, goal and subagent scenarios through a real PTY child in an isolated state root, then checks rendered frames and logs.",
-      "deviceIds": [
-        "first-run-and-seminar"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-ONBOARDING-FIRST-RUN-DEVICE-TS",
-      "path": "src/ux-sim/onboarding-first-run-device.ts",
-      "boundary": "Counts and checks English and Korean first-run provider chooser frames from the production onboarding renderer.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-PTY-KEY-MODIFIERS-DEVICE-TS",
-      "path": "src/ux-sim/pty-key-modifiers-device.ts",
-      "boundary": "Sends modifier-key sequences through a real PTY to the production TUI parser and records parsed key events and rendered output.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-RELEASE-SIM-RIG-TS",
-      "path": "src/ux-sim/release-sim-rig.ts",
-      "boundary": "Parses release rehearsal cases and runs production release-decision stages against injected records without publishing a release.",
-      "deviceIds": [
-        "release-graph-rig"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-RENDER-FRAME-TS",
-      "path": "src/ux-sim/render-frame.ts",
-      "boundary": "Builds dashboard log frames from supplied widget state and optional UX fields so tests can inspect the real renderer output.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-RESEARCH-DECISION-CHAIN-TS",
-      "path": "src/ux-sim/research-decision-chain.ts",
-      "boundary": "Runs the production Think Lens decision chain in a worker with captured event/log evidence, then checks stage output and evidence ancestry markers.",
-      "deviceIds": [
-        "research-decision-chain"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-RESUME-PICKER-DEVICE-TS",
-      "path": "src/ux-sim/resume-picker-device.ts",
-      "boundary": "resume picker device: `picker` (default): the list → pick flow. `boot-resume`: start with `--resume <id>` on a synthetic 379-row session.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SAFE-PUBLIC-COPY-PUBLISH-TS",
-      "path": "src/ux-sim/safe-public-copy-publish.ts",
-      "boundary": "Runs production redaction, publish handlers, rendering and artifact storage with an upload seam that records and refuses external writes.",
-      "deviceIds": [
-        "support-fakes"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SCENARIO-TS",
-      "path": "src/ux-sim/scenario.ts",
-      "boundary": "Parses and validates ScenarioV0 YAML, executes its registered trigger through the production path with isolated injected boundaries, checks screen/log expectations and persists run evidence.",
-      "deviceIds": [
-        "scenario-runner",
-        "draft-inventory",
-        "sim-event-log-path",
-        "author-reviewer-precheck"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SEMINAR-REHEARSAL-TS",
-      "path": "src/ux-sim/seminar-rehearsal.ts",
-      "boundary": "Runs the seven-scene rehearsal state machine with injected timing/evidence records, checking fallback and disclosure guards without claiming live rehearsal.",
-      "deviceIds": [
-        "first-run-and-seminar"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SERVICE-KEY-SETUP-TS",
-      "path": "src/ux-sim/service-key-setup.ts",
-      "boundary": "Routes production Codex login fetch requests through fake OpenAI and device-OAuth endpoints; unknown URLs fail closed and no external request is sent.",
-      "deviceIds": [
-        "support-fakes"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SESSION-ID-SEED-TS",
-      "path": "src/ux-sim/session-id-seed.ts",
-      "boundary": "Seeds a session transcript and index row under a chosen ID for long-session and resume-picker fixtures.",
-      "deviceIds": [
-        "first-run-and-seminar"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SKILLS-TOOLS-SHELL-DEVICE-TS",
-      "path": "src/ux-sim/skills-tools-shell-device.ts",
-      "boundary": "Exercises the RunShell policy: rejects HQ heavy-gate commands before spawn with a remote alternative and isolated log event, while recording safe fake-spawn outcomes.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SLASH-MENU-FRAMES-TS",
-      "path": "src/ux-sim/slash-menu-frames.ts",
-      "boundary": "Drives production slash-command textInput and DisplayCoordinator with scripted keys, capturing each real TUI frame and counting full-screen clears and rewritten rows.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-SUBAGENT-TOOLS-DEVICE-TS",
-      "path": "src/ux-sim/subagent-tools-device.ts",
-      "boundary": "Runs production subagent-tool validation against scripted requests and reports accepted, refused and malformed outcomes without spawning agents.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TASK-AGENT-PARENT-HOST-DEVICE-TS",
-      "path": "src/ux-sim/task-agent-parent-host-device.ts",
-      "boundary": "Injects host inventory, preflight gaps and launch responses at resolveParentHosts/preflightParentHost/launchRemoteParent; no SSH connection is opened.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TASK-AGENT-REJUDGE-ON-HEAD-DEVICE-TS",
-      "path": "src/ux-sim/task-agent-rejudge-on-head-device.ts",
-      "boundary": "Feeds stored review rounds and changing head SHAs to production rejudge-on-head decisions and records whether the round cap permits review.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TASK-ORCHESTRATOR-SURFACES-SELF-IMPLEMENT-POD-DEVICE-TS",
-      "path": "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.ts",
-      "boundary": "Scripts Kubernetes Job termination, OOM, deadline, premature-result and post-GC lookup faults at the production pod-result reader; no cluster is contacted.",
-      "deviceIds": [
-        "product-devices"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TEMP-GIT-REMOTE-TS",
-      "path": "src/ux-sim/temp-git-remote.ts",
-      "boundary": "Creates a disposable local Git remote for child-process tests and returns the pinned environment needed to access that fixture.",
-      "deviceIds": [
-        "temp-git-remote"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TERM-SLASH-DEVICE-TS",
-      "path": "src/ux-sim/term-slash-device.ts",
-      "boundary": "term slash device: Run the fast command matrix through the same production handler used by TUI.",
-      "deviceIds": [
-        "support-fakes"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TTY-FOREGROUND-STEAL-CHILD-TS",
-      "path": "src/ux-sim/tty-foreground-steal-child.ts",
-      "boundary": "Real-PTY reproducer for login-shell foreground-process-group theft; runs legacy/current shell capture and reports terminal group IDs.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TURN-STATES-TS",
-      "path": "src/ux-sim/turn-states.ts",
-      "boundary": "Models observed TUI turn phases and runs the production footer, line-rendering and typeahead transitions for each simulated phase.",
-      "deviceIds": [
-        "tui-interaction"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-TURN-THROW-SIM-TS",
-      "path": "src/ux-sim/turn-throw-sim.ts",
-      "boundary": "Injects configured exceptions into the production turn path and captures the resulting throw/recovery behavior; without the explicit simulation setting it is inert.",
-      "deviceIds": [
-        "turn-throw-sim"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-WARM-POOL-REUSE-SIM-TS",
-      "path": "src/ux-sim/warm-pool-reuse-sim.ts",
-      "boundary": "Runs production warm-provider reconcile and gate selection against isolated fake Kubernetes and token-authorized lease-control boundaries.",
-      "deviceIds": [
-        "warm-pool-reuse-sim"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-WORLD-SCHEMA-TS",
-      "path": "src/ux-sim/world-schema.ts",
-      "boundary": "Parses the RFC A2 world declaration, validates device references/settings and reports errors at the offending field without creating a world.",
-      "deviceIds": [
-        "sim-universe-world-yaml-schema"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-WORLD-STORE-TS",
-      "path": "src/ux-sim/world-store.ts",
-      "boundary": "Creates private test-root worlds with one catalog-derived metadata file per MD source module; verifies the complete assembly and ownership before listing or deleting.",
-      "deviceIds": [
-        "sim-universe-world-lifecycle"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    },
-    {
-      "id": "MD-UX-SIM-WORLD-TS",
-      "path": "src/ux-sim/world.ts",
-      "boundary": "Parses world YAML, resolves catalog devices and assembles their fakes; creates/lists/loads/destroys worlds under the explicit test root, executes declared scenarios and blocks real network egress.",
-      "deviceIds": [
-        "world-runtime",
-        "sim-mailbox"
-      ],
-      "integrityCertificatePresent": false,
-      "integrityCertificatePath": null
-    }
-  ],
+  "discovery": {
+    "trackedRoot": "src/ux-sim/*.ts runtime modules",
+    "candidateRoots": [
+      "scripts/*sim*.ts",
+      "scripts/release-loop/*sim*.ts",
+      "scripts/lib/pwa-scenarios/*.ts",
+      "test/**/*fake*",
+      "test/**/*stub*",
+      "test/scenarios/**/*",
+      "scenarios/**/*.yaml",
+      "src/playground-scenario/*.ts",
+      "src/showroom/outbound/channels/stubs.ts"
+    ],
+    "limits": "File-level sourceModules recursively covers src/ux-sim/**/*.ts except *.test.ts plus *.json fixtures; other extensions are outside this catalog contract."
+  },
+  "runEvidence": {
+    "scope": "ScenarioV0 YAML runs only; catalog entries reference reusable devices/tests, and list/show/devices do not execute them",
+    "runId": "uuid per execution",
+    "event": {
+      "category": "ux.sim.scenario",
+      "name": "completed"
+    },
+    "persistence": "ScenarioV0 and device logsRecorded=yes refer to rows persisted in the isolated test instance logs/logs.db (not production ~/.elanous/logs.db); eventNames lists persisted category/event pairs only, while debug-spy-only observations do not count.",
+    "artifact": "<test-state>/ux-sim/evidence/<scenario>-seed-<seed>-run-<runId>.json"
+  },
   "scenarios": [
     {
       "id": "UX-MS-01",
@@ -2580,385 +2645,1254 @@
         "a matching owner approval records the next build and starts its pass count"
       ],
       "expected": "The third consecutive same-build pass freezes the rehearsal state; a changed build is refused until a matching owner approval receipt is supplied."
+    },
+    {
+      "id": "SIM-HQ-MOVE",
+      "name": "Move HQ from mbp to Studio with safe host fencing",
+      "kind": "hq-move",
+      "device": "world-runtime",
+      "implementation": [
+        "src/ux-sim/hq-move-sim.ts",
+        "src/hq/transfer.ts",
+        "src/hq/hq.ts",
+        "src/hq/promote.ts",
+        "src/resource-ledger/machine-pool-inventory.ts",
+        "scenarios/ux-sim/sim-hq-move.yaml"
+      ],
+      "tests": [
+        "src/ux-sim/hq-move-sim.test.ts",
+        "src/ux-sim/world.test.ts"
+      ],
+      "trigger": "The real HQ transfer runbook promotes MacStudioB1 under injected remote host, arbiter, standby-volume, and clock boundaries.",
+      "observe": [
+        "lease generation advances from mbp to Studio",
+        "old HQ is fenced and new HQ is allowed",
+        "promotion copy completes or an injected failure remains visible",
+        "gate/simulation capacity belongs to the new host"
+      ],
+      "expected": "transfer converges with old-host fencing; injected faults are observed without unsafe dual ownership"
+    },
+    {
+      "id": "SIM-CHAIN-LAND",
+      "name": "Enqueue through multi-host train disposition",
+      "kind": "chain-land",
+      "device": "fake-land-queue",
+      "implementation": [
+        "src/ux-sim/chain-land.ts",
+        "src/ux-sim/fake-gh.ts",
+        "src/ux-sim/fake-bin.ts",
+        "src/self-implement/l8-merge-queue.ts",
+        "src/self-implement/merge-train.ts"
+      ],
+      "tests": [
+        "src/ux-sim/chain-land.test.ts"
+      ],
+      "trigger": "Enqueue multiple PRs, inject integrated remote-gate outcomes, or place a real stale lock directory in the temporary Git common dir.",
+      "observe": [
+        "production runL8ShadowQueue result and ledger",
+        "actual git merge-tree/commit-tree calls",
+        "GitHub CLI requests through fake-gh and fake-bin",
+        "per-host gate outcome and attribution",
+        "stale lock leaves pending entries unchanged"
+      ],
+      "expected": "the production queue performs enqueue, integration, gate attribution and verdict disposition; stale lock refuses before integration; no simulated copy of queue/train/disposition logic is used"
     }
   ],
-  "candidateAudit": {
-    "source": "~/elanous-hq/seat-state/OP/MOCK-DEVICES-INVENTORY-1031.md §3 + targeted fake-Telegram consumer scan",
-    "baseCommit": "533845484cf2c901cfee902a3586354278e7cae8",
-    "sourceRows": 36,
-    "existingPaths": 35,
-    "catalogAdditions": [
-      {
-        "path": "src/ux-sim/safe-public-copy-publish.ts",
-        "reason": "Post-inventory registration for SW-PUBLIC-COPY-LIVE-FU; the source snapshot and base commit remain unchanged."
-      },
-      {
-        "path": "src/ux-sim/seminar-rehearsal.test.ts",
-        "reason": "Post-inventory catalog addition for backlog SW-FREEZE; it extends the existing first-run-and-seminar device and records the repeated-run freeze scenario."
-      },
-      {
-        "path": "src/ux-sim/aside-feedback-loop.ts",
-        "reason": "DEMO1104-ASIDE-FEEDBACK-LOOP mock regression for the live feedback-cycle trial."
-      }
-    ],
-    "excludedPaths": 27,
-    "sourceExclusions": [
-      {
-        "path": "scenarios/ux-sim/MK-MS-01.yaml",
-        "reason": "Separately registered by open PR #34039 (MK-MS-01 E4 sequence); keep it outside this 33-candidate registration to avoid duplicate catalog ownership."
-      }
-    ],
-    "omissionCheck": {
-      "requiredPaths": [
-        "test/ux-sim/aimock-local.ts",
-        "test/telegram-surface-hitl.test.ts",
-        "src/ux-sim/safe-public-copy-publish.ts"
+  "sourceModules": [
+    {
+      "id": "MD-UX-SIM-ASIDE-FEEDBACK-LOOP-TS",
+      "path": "src/ux-sim/aside-feedback-loop.ts",
+      "boundary": "Runs the deterministic aside feedback loop through the production Linear secretary and topic-subscription paths, with research, capture, network and schedule edges injected.",
+      "deviceIds": [
+        "aside-feedback-loop"
       ],
-      "missingPaths": []
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
     },
-    "candidates": [
-      {
-        "path": "scripts/tui-sim-bench.ts",
-        "disposition": "excluded",
-        "entryCommand": "not-applicable: benchmark requires an explicitly selected goal and provider",
-        "logsRecorded": "no",
-        "logsDetail": "Benchmark is not run by catalog discovery.",
-        "excludeReason": "Measurement/benchmark tool, not a mock device."
-      },
-      {
-        "path": "scripts/tui-sim.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun scripts/tui-sim.ts start --id mock-catalog-example --test",
-        "logsRecorded": "conditional",
-        "logsDetail": "Writes its own simulation artifacts, not ScenarioV0 logs.",
-        "excludeReason": "Standalone TUI driver; separate artifact contract."
-      },
-      {
-        "path": "scripts/ux-sim.ts",
-        "disposition": "already-indexed",
-        "entryCommand": "bun scripts/ux-sim.ts list",
-        "logsRecorded": "conditional",
-        "logsDetail": "ScenarioV0 runs log completion; list/show are read-only.",
-        "deviceId": "scenario-runner"
-      },
-      {
-        "path": "scripts/voice-dogfood-sim.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun run scripts/voice-dogfood-sim.ts",
-        "logsRecorded": "no",
-        "logsDetail": "No ScenarioV0 logs.db contract.",
-        "excludeReason": "Product dogfood script, not a reusable fake-device contract."
-      },
-      {
-        "path": "scripts/voice-pwa-sim.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun run scripts/voice-pwa-sim.ts",
-        "logsRecorded": "no",
-        "logsDetail": "No ScenarioV0 logs.db contract.",
-        "excludeReason": "PWA voice dogfood script, not an isolated reusable device."
-      },
-      {
-        "path": "scripts/release-loop/gate-autoheal-sim-evidence.ts",
-        "disposition": "device",
-        "entryCommand": "bun scripts/release-loop/gate-autoheal-sim-evidence.ts",
-        "logsRecorded": "yes",
-        "logsDetail": "Writes release-loop events to isolated logs.db with runId.",
-        "deviceId": "release-graph-rig",
-        "scenarioIds": [
-          "UX-MS-02"
-        ]
-      },
-      {
-        "path": "scripts/release-loop/gate-node-sim.ts",
-        "disposition": "device",
-        "entryCommand": "bun test scripts/release-loop/gate-node-sim.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "Pure decision result asserted by test; no persistent event.",
-        "deviceId": "release-graph-rig",
-        "scenarioIds": [
-          "UX-MS-02"
-        ]
-      },
-      {
-        "path": "scripts/release-loop/tui-sim-node.ts",
-        "disposition": "excluded",
-        "entryCommand": "called by release-loop tui-sim graph node; no standalone CLI",
-        "logsRecorded": "no",
-        "logsDetail": "Node result/artifact only.",
-        "excludeReason": "Graph-node adapter for TUI measurements, not an independent mock device."
-      },
-      {
-        "path": "scripts/lib/pwa-scenarios/acp-replay.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test scripts/lib/pwa-scenarios/acp-replay.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "Browser/E2E cell result, not ScenarioV0 logs.",
-        "excludeReason": "Live-browser PWA runner support; not a mock device."
-      },
-      {
-        "path": "scripts/lib/pwa-scenarios/cdp-driver.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun scripts/pwa-scenarios.ts --base-url http://127.0.0.1:31455 --shots ./shots",
-        "logsRecorded": "no",
-        "logsDetail": "Writes optional screenshots and cell output through the PWA runner; no logs.db row.",
-        "excludeReason": "Live-browser PWA runner support; not a mock device."
-      },
-      {
-        "path": "scripts/lib/pwa-scenarios/runner.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test scripts/lib/pwa-scenarios/runner.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "Browser/E2E cell result, not ScenarioV0 logs.",
-        "excludeReason": "Live-browser PWA runner support; not a mock device."
-      },
-      {
-        "path": "scripts/lib/pwa-scenarios/scenarios.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test scripts/lib/pwa-scenarios/scenarios.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "Browser/E2E cell result, not ScenarioV0 logs.",
-        "excludeReason": "Live-browser PWA runner support; not a mock device."
-      },
-      {
-        "path": "test/fixtures/acp-initialize-stub.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test test/acp-client-observability.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "The consuming ACP test asserts protocol behavior; fixture emits no app logs.db row.",
-        "excludeReason": "Protocol fixture only; no independent scenario entry."
-      },
-      {
-        "path": "test/fixtures/mock-lsp-server.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test test/lsp-client.test.ts test/lsp-operations-dispatch.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "The consuming LSP tests assert protocol behavior; fixture emits no app logs.db row.",
-        "excludeReason": "Protocol fixture only; no independent scenario entry."
-      },
-      {
-        "path": "test/helpers/intake-fake-repo.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test test/intake-plane-check-common-name.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "The consumer test asserts temporary-repository behavior.",
-        "excludeReason": "Test helper, not a simulation device."
-      },
-      {
-        "path": "test/ux-sim/aimock-local.ts",
-        "disposition": "already-indexed",
-        "entryCommand": "bun test src/ux-sim/aimock-local.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "Test server interactions are asserted by tests, not app logs.db.",
-        "deviceId": "support-fakes"
-      },
-      {
-        "path": "scenarios/dashboard-default.yaml",
-        "disposition": "excluded",
-        "entryCommand": "not-applicable: consumed by the Playground renderer; no direct scenario CLI",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
-        "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
-      },
-      {
-        "path": "scenarios/heap-graph.yaml",
-        "disposition": "excluded",
-        "entryCommand": "not-applicable: consumed by the Playground renderer; no direct scenario CLI",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
-        "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
-      },
-      {
-        "path": "scenarios/iul-timeline-viewer.yaml",
-        "disposition": "excluded",
-        "entryCommand": "not-applicable: consumed by the IUL timeline viewer; no direct scenario CLI",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
-        "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
-      },
-      {
-        "path": "scenarios/ux-sim/provider-4xx-no-provider.yaml",
-        "disposition": "scenario",
-        "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/provider-4xx-no-provider.yaml",
-        "logsRecorded": "yes",
-        "logsDetail": "ux.sim.scenario/completed in test logs.db; expects llm.codex/request-rejected-shape.",
-        "deviceId": "scenario-runner",
-        "scenarioIds": [
-          "UX-MS-11"
-        ]
-      },
-      {
-        "path": "scenarios/ux-sim/release-sim-rig.yaml",
-        "disposition": "already-indexed",
-        "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/release-sim-rig.yaml",
-        "logsRecorded": "yes",
-        "logsDetail": "ScenarioV0 completion row is stored in isolated test logs.db; the evidence artifact is a separate JSON file.",
-        "deviceId": "release-graph-rig",
-        "scenarioIds": [
-          "UX-MS-02",
-          "RELEASE-GRAPH-PREPUB-FANOUT"
-        ]
-      },
-      {
-        "path": "tests/scenarios/4provider-feature-impl.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/4provider-feature-impl.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/capability-level-11.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/capability-level-11.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/codex-baseline.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/codex-baseline.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/codex-opus-2way.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/codex-opus-2way.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/codex-variance-w5f.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/codex-variance-w5f.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/multi-turn-cache-rate.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/multi-turn-cache-rate.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/repl-rotation-chain.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/repl-rotation-chain.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/repl-self-debug-arc.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/repl-self-debug-arc.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "tests/scenarios/repl-tool-doom-recovery.yaml",
-        "disposition": "excluded",
-        "entryCommand": "eln repl --new --json --scenario tests/scenarios/repl-tool-doom-recovery.yaml",
-        "logsRecorded": "runner-dependent",
-        "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
-        "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
-      },
-      {
-        "path": "src/playground-scenario/default-scenarios.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test src/playground-scenario/",
-        "logsRecorded": "no",
-        "logsDetail": "Scenario constants consumed by Playground tests.",
-        "excludeReason": "Product demo inputs, not mock-device implementation."
-      },
-      {
-        "path": "src/playground-scenario/fake-harness.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test src/playground-scenario/",
-        "logsRecorded": "no",
-        "logsDetail": "In-memory test harness consumed by Playground tests.",
-        "excludeReason": "Test helper, no independent reusable mock interface."
-      },
-      {
-        "path": "src/showroom/outbound/channels/stubs.ts",
-        "disposition": "excluded",
-        "entryCommand": "bun test src/showroom/outbound/channels/",
-        "logsRecorded": "no",
-        "logsDetail": "Stub results asserted by channel tests.",
-        "excludeReason": "Outbound channel stub, not a UX simulation device."
-      },
-      {
-        "path": "test/telegram-surface-hitl.test.ts",
-        "disposition": "already-indexed",
-        "entryCommand": "bun test test/telegram-surface-hitl.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "The test drives an in-memory fake TelegramBot and asserts captured interactions; it does not write app logs.db.",
-        "deviceId": "support-fakes"
-      },
-      {
-        "path": "src/ux-sim/author-reviewer-precheck-device.ts",
-        "disposition": "device",
-        "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/author-reviewer-precheck-applied.yaml",
-        "logsRecorded": "yes",
-        "logsDetail": "Production validator events are persisted in isolated test logs.db with CLI-minted runId; ScenarioV0 evidence is separate.",
-        "deviceId": "author-reviewer-precheck",
-        "scenarioIds": [
-          "AUTHOR-PRECHECK-APPLIED",
-          "AUTHOR-PRECHECK-REJECTED-UNPROVABLE"
-        ]
-      },
-      {
-        "path": "src/ux-sim/safe-public-copy-publish.ts",
-        "disposition": "scenario",
-        "entryCommand": "bun test src/ux-sim/safe-public-copy-publish.test.ts test/nexus/api/markdown-publish.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "The test captures the production handler receipt and temporary artifact; fake S3 returns unavailable, with no logs.db or external writes.",
-        "deviceId": "support-fakes",
-        "scenarioIds": [
-          "SAFE-PUBLIC-COPY-PUBLISH-REDACTION"
-        ]
-      },
-      {
-        "path": "src/ux-sim/seminar-rehearsal.test.ts",
-        "disposition": "scenario",
-        "entryCommand": "bun test src/ux-sim/seminar-rehearsal.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "The test drives simSeminarRehearsal and createSimWorld in a fake-clock scope; persisted state is inspected under an isolated --test root.",
-        "deviceId": "first-run-and-seminar",
-        "scenarioIds": [
-          "SW-FREEZE"
-        ]
-      },
-      {
-        "path": "src/ux-sim/aside-feedback-loop.ts",
-        "disposition": "already-indexed",
-        "entryCommand": "bun test src/ux-sim/aside-feedback-loop.test.ts",
-        "logsRecorded": "no",
-        "logsDetail": "No runtime logs; real secretary runtime and topic subscription functions run with injected external edges.",
-        "deviceId": "aside-feedback-loop"
-      }
-    ]
-  },
-  "discovery": {
-    "trackedRoot": "src/ux-sim/*.ts runtime modules",
-    "candidateRoots": [
-      "scripts/*sim*.ts",
-      "scripts/release-loop/*sim*.ts",
-      "scripts/lib/pwa-scenarios/*.ts",
-      "test/**/*fake*",
-      "test/**/*stub*",
-      "test/scenarios/**/*",
-      "scenarios/**/*.yaml",
-      "src/playground-scenario/*.ts",
-      "src/showroom/outbound/channels/stubs.ts"
-    ],
-    "limits": "File-level sourceModules recursively covers src/ux-sim/**/*.ts except *.test.ts plus *.json fixtures; other extensions are outside this catalog contract."
-  }
+    {
+      "id": "MD-UX-SIM-AUTHOR-REVIEWER-PRECHECK-DEVICE-TS",
+      "path": "src/ux-sim/author-reviewer-precheck-device.ts",
+      "boundary": "author reviewer precheck device: Uses the real reviewer parser/validator and its real event writer, with the only model boundary faked.",
+      "deviceIds": [
+        "author-reviewer-precheck"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-BACKEND-TIER-DEVICE-TS",
+      "path": "src/ux-sim/backend-tier-device.ts",
+      "boundary": "Fake host profiles drive backend tier advice without probing or changing the machine (simulation boundary).",
+      "deviceIds": [
+        "backend-tier-device"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-BOOT-DAEMON-TOOLS-PTY-SHELL-DEVICE-TS",
+      "path": "src/ux-sim/boot-daemon-tools-pty-shell-device.ts",
+      "boundary": "Stages and inspects production PTY-shell startup, including argv validation and launch outcomes.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-BROWSER-HAND-TS",
+      "path": "src/ux-sim/browser-hand.ts",
+      "boundary": "browser hand: Run the real BrowserHand coordinator and performBrowserAction with only browser and Linear I/O faked.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-BURST-READY-LADDER-SIM-TS",
+      "path": "src/ux-sim/burst-ready-ladder-sim.ts",
+      "boundary": "Runs the purpose-specific burst warm-up and TTL scenario through the production fake-cloud-vm state machine and fake clock without provider calls.",
+      "deviceIds": [
+        "fake-cloud-vm"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-CHAIN-LAND-TS",
+      "path": "src/ux-sim/chain-land.ts",
+      "boundary": "Runs the production merge-train planning, integration and failure attribution; remote gate, queue lock, park and merge effects are injected boundaries.",
+      "deviceIds": [
+        "fake-land-queue"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-CLASSIC-TUI-SEAT-SCENARIOS-TS",
+      "path": "src/ux-sim/classic-tui-seat-scenarios.ts",
+      "boundary": "Runs the classic TUI first-run, authoring and scripted interaction scenarios against the real CLI in a pinned isolated universe, then captures screen and persisted-state evidence.",
+      "deviceIds": [
+        "first-run-and-seminar"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-CLI-CONFIG-AUDIT-DEVICE-TS",
+      "path": "src/ux-sim/cli-config-audit-device.ts",
+      "boundary": "Runs the real CLI config-audit command with controlled config fixtures and records its warnings, proposed edits and command result.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-CODEX-WIRE-CAPTURE-TS",
+      "path": "src/ux-sim/codex-wire-capture.ts",
+      "boundary": "codex wire capture: Fetch-boundary mock for Codex Responses wire-contract tests.",
+      "deviceIds": [
+        "codex-wire-capture"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-COMPUTER-USE-TS",
+      "path": "src/ux-sim/computer-use.ts",
+      "boundary": "Feeds declared click trajectories into the production computer-use dispatcher and records action attribution and observations without inventing coordinates.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-DASHBOARD-EVENT-LOOP-STALL-MONITOR-DEVICE-TS",
+      "path": "src/ux-sim/dashboard-event-loop-stall-monitor-device.ts",
+      "boundary": "Advances a staged clock through due monitor tasks and streamed keypress samples, recording event-loop lag and task ordering from the production monitor path.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-DEVICE-FIDELITY-TS",
+      "path": "src/ux-sim/device-fidelity.ts",
+      "boundary": "Replays recorded real GitHub API request/response pairs through the production fake-github adapter and records hashed fidelity verdicts; test-universe state only.",
+      "deviceIds": [
+        "device-fidelity"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-DRAFT-INVENTORY-BUILDER-TS",
+      "path": "src/ux-sim/draft-inventory-builder.ts",
+      "boundary": "draft inventory builder: Deterministic synthetic inventory; both production draft triage functions run for every case.",
+      "deviceIds": [
+        "draft-inventory"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-EVENT-MONKEY-TS",
+      "path": "src/ux-sim/event-monkey.ts",
+      "boundary": "Declares the run-ledger fault-event catalog and seeded monkey/gorilla/kong attack kinds consumed by the grid chaos simulator.",
+      "deviceIds": [
+        "product-devices",
+        "author-reviewer-precheck"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-APP-AUTH-TS",
+      "path": "src/ux-sim/fake-app-auth.ts",
+      "boundary": "Signed app-scoped invitation acceptance and temporary-token-backed host-only sessions (simulation boundary).",
+      "deviceIds": [
+        "fake-app-auth"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-APP-HOST-TS",
+      "path": "src/ux-sim/fake-app-host.ts",
+      "boundary": "Serves declared in-memory app versions through the simulated app-host fetch boundary, including deploy, rollback, content type and content digest behavior.",
+      "deviceIds": [
+        "sim-universe-world-yaml-schema",
+        "world-runtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-APP-REALTIME-TS",
+      "path": "src/ux-sim/fake-app-realtime.ts",
+      "boundary": "App-slug-scoped row-change SSE contract matrix run on the real NexusEventBus reference port (createNexusEventBusAppRealtimePortFactory) and injected port factories (simulation boundary).",
+      "deviceIds": [
+        "fake-app-realtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-APP-STORAGE-TS",
+      "path": "src/ux-sim/fake-app-storage.ts",
+      "boundary": "Runs app-scoped storage decisions through the production ObjectStore local provider or an injected provider RunFn; uses temporary storage, injected time, and no external network.",
+      "deviceIds": [
+        "fake-app-storage"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-APP-TRAFFIC-TS",
+      "path": "src/ux-sim/fake-app-traffic.ts",
+      "boundary": "Per-app request and response byte accounting with warning, throttle, block, window reset, and immediate admin stream termination (simulation boundary).",
+      "deviceIds": [
+        "fake-app-traffic"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-BIN-TS",
+      "path": "src/ux-sim/fake-bin.ts",
+      "boundary": "Creates a temporary PATH shim for declared executables and records argv, output, exit status, signals and cleanup.",
+      "deviceIds": [
+        "fake-executable"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-BROWSER-PAGE-TS",
+      "path": "src/ux-sim/fake-browser-page.ts",
+      "boundary": "CDP page navigation: inject fake page lifecycle, evaluate, click, and screenshot at BrowserActionDeps while production browser actions run.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-CLOCK-TS",
+      "path": "src/ux-sim/fake-clock.ts",
+      "boundary": "Replaces process-local Date and timers with an explicitly advanced clock for deterministic scheduled-callback and elapsed-time behavior.",
+      "deviceIds": [
+        "fake-clock",
+        "fake-cloud-vm",
+        "grid-chaos-driver"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-CLOUD-VM-TS",
+      "path": "src/ux-sim/fake-cloud-vm.ts",
+      "boundary": "Models image-based VM create/resume/stop, lease draining, powered-on cost and capacity-tier choice using deterministic state transitions; it never calls a cloud provider.",
+      "deviceIds": [
+        "fake-cloud-vm"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-DNS-CERT-TS",
+      "path": "src/ux-sim/fake-dns-cert.ts",
+      "boundary": "Isolated wildcard DNS zone and DNS-01 certificate issuance, failure, and renewal contracts (simulation boundary).",
+      "deviceIds": [
+        "fake-dns-cert"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-ELEVENLABS-TS",
+      "path": "src/ux-sim/fake-elevenlabs.ts",
+      "boundary": "Loopback-only ElevenLabs-compatible TTS responses with deterministic audio, authentication, rate limiting, delay, and reusable contract cases.",
+      "deviceIds": [
+        "SIM-FAKE-PROVIDERS-AV"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-FETCH-TS",
+      "path": "src/ux-sim/fake-fetch.ts",
+      "boundary": "Installs an exact method and URL/path fetch response table, records request metadata and response status, rejects unmatched requests without network fallback, and restores the original global fetch.",
+      "deviceIds": [
+        "fake-fetch"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-FLEET-TS",
+      "path": "src/ux-sim/fake-fleet.ts",
+      "boundary": "Composes independent host SSH scripts and per-context Kubernetes fixtures, recording ordered calls, latency and failures for multi-host release-gate tests.",
+      "deviceIds": [
+        "fake-fleet"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-GH-TS",
+      "path": "src/ux-sim/fake-gh.ts",
+      "boundary": "fake gh: GitHub data at the CLI boundary; sweep decisions remain in the production callers.",
+      "deviceIds": [
+        "fake-github"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-HERDR-TS",
+      "path": "src/ux-sim/fake-herdr.ts",
+      "boundary": "Models herdr pane lifecycle, agent reports, missing-report faults and handoff timeouts without starting panes.",
+      "deviceIds": [
+        "fake-herdr"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-HIGGSFIELD-TS",
+      "path": "src/ux-sim/fake-higgsfield.ts",
+      "boundary": "Higgsfield generation calls answered by a local fake so media pipelines run without the real service (simulation boundary).",
+      "deviceIds": [
+        "fake-higgsfield"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-KUBECTL-TS",
+      "path": "src/ux-sim/fake-kubectl.ts",
+      "boundary": "Provides a mutable in-memory Kubernetes API for production pool-admission and warm-provider callers, including per-node readiness and reversible API outages; unknown kubectl operations fail closed.",
+      "deviceIds": [
+        "fake-kubectl",
+        "warm-pool-reuse-sim",
+        "fake-fleet"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-LAND-QUEUE-TS",
+      "path": "src/ux-sim/fake-land-queue.ts",
+      "boundary": "fake land queue: In-process LAND-QUEUE simulator. Scheduling and verdict logic use the production train functions; only git's merge-tree/commit-tree and the remote gate are replaced.",
+      "deviceIds": [
+        "fake-land-queue"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-LINEAR-DEVICE-TS",
+      "path": "src/ux-sim/fake-linear-device.ts",
+      "boundary": "Implements the Linear API response boundary used by the production browser-hand coordinator, capturing requests without network access.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-LLM-TS",
+      "path": "src/ux-sim/fake-llm.ts",
+      "boundary": "fake llm: Deterministic, network-free LLM for gate tests without provider credentials. The opt-in is deliberately explicit; production never selects this provider.",
+      "deviceIds": [
+        "fake-llm"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-PAYMENT-TS",
+      "path": "src/ux-sim/fake-payment.ts",
+      "boundary": "In-process payment gateway simulator: validates integer minor-unit amounts, signs and verifies idempotent webhooks, advances subscription retry/grace states from an injected clock, and bounds refunds without external payment or network access.",
+      "deviceIds": [
+        "fake-payment"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-PS-TS",
+      "path": "src/ux-sim/fake-ps.ts",
+      "boundary": "Mutable fake ps process inventory shared by monkey kills, host-wide gorilla failure, and process re-registration.",
+      "deviceIds": [
+        "fake-ps"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-SSH-TS",
+      "path": "src/ux-sim/fake-ssh.ts",
+      "boundary": "Implements GateTools.ssh with scripted host responses, latency, timeout and SCP disconnect outcomes; it opens no SSH connection.",
+      "deviceIds": [
+        "fake-ssh"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-STT-TS",
+      "path": "src/ux-sim/fake-stt.ts",
+      "boundary": "Deterministic SHA-256 recording-to-transcript fixture with language, failure, delay, empty-result, and reusable contract cases.",
+      "deviceIds": [
+        "SIM-FAKE-PROVIDERS-AV"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-TELEGRAM-VIDEO-TS",
+      "path": "src/ux-sim/fake-telegram-video.ts",
+      "boundary": "Implements an in-memory Telegram sendVideo endpoint that records multipart requests and returns scripted delivery receipts or rejection responses.",
+      "deviceIds": [
+        "telegram-video-receipt"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-CRED-EXPIRY-TS",
+      "path": "src/ux-sim/fault-cred-expiry.ts",
+      "boundary": "Grok subscription expiry: temporary HOME credentials, fake-clock refresh outcomes, and production grokLaunchReadiness/podGrokSubscriptionUsable decisions.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-GLM-NO-CREDENTIAL-TS",
+      "path": "src/ux-sim/fault-glm-no-credential.ts",
+      "boundary": "Runs the production Z.ai provider-selection and launch-readiness path with the credential absent, then records whether the real caller refuses launch and why.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-NEEDS-HUMAN-REASON-REPAIR-TS",
+      "path": "src/ux-sim/fault-needs-human-reason-repair.ts",
+      "boundary": "fault needs human reason repair: Runs the production supervisor with one injected failure per repair reason.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-NEXTMOVE-DISPATCH-TS",
+      "path": "src/ux-sim/fault-nextmove-dispatch.ts",
+      "boundary": "Injects nextmove-dispatch fixtures into the production decision path and renders the observed classification with its evidence command.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-NEXUS-STALL-TS",
+      "path": "src/ux-sim/fault-nexus-stall.ts",
+      "boundary": "Production Nexus grid consumer with synchronous kubectl delay and unreachable faults (simulation boundary).",
+      "deviceIds": [
+        "fault-nexus-stall"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-POD-CHILD-RESULT-TS",
+      "path": "src/ux-sim/fault-pod-child-result.ts",
+      "boundary": "fault pod child result: Replays a successful Kubernetes Job carrying a failed/partial child result.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-POD-CODEX-503-TS",
+      "path": "src/ux-sim/fault-pod-codex-503.ts",
+      "boundary": "Injects a child-endpoint Codex HTTP 503 and competing Z.ai response to verify production fallback and surfaced result.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-POD-DEATH-TS",
+      "path": "src/ux-sim/fault-pod-death.ts",
+      "boundary": "Replays pod termination and partial-output variants, then observes production classification of final, partial, missing and unparsable child results.",
+      "deviceIds": [
+        "fault-injection",
+        "grid-chaos-driver"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-POD-REUSE-RESIDUE-TS",
+      "path": "src/ux-sim/fault-pod-reuse-residue.ts",
+      "boundary": "Seeds repeatable local Git and credential residue, with fake-ps process inventory consumed by production POD cleanup; the clean-state integration test adds a live child process.",
+      "deviceIds": [
+        "pod-reuse-residue-fault"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-POOL-CAP-TS",
+      "path": "src/ux-sim/fault-pool-cap.ts",
+      "boundary": "Pod pool capacity: compare omitted :N default capacity with explicit caps through production parsePodPool and recommendConcurrency.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-SCOPE-ESCAPE-LIFT-TS",
+      "path": "src/ux-sim/fault-scope-escape-lift.ts",
+      "boundary": "Builds child-result fixtures for abandoned, scope-stop and implementation-deficit classifications to test production result lifting.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-SQLITE-BUSY-TS",
+      "path": "src/ux-sim/fault-sqlite-busy.ts",
+      "boundary": "SQLite write lock: hold a real local BEGIN IMMEDIATE lock across LogStore.insertBatch, then observe buffered-row recovery.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAULT-TUI-400-AUTOHEAL-TS",
+      "path": "src/ux-sim/fault-tui-400-autoheal.ts",
+      "boundary": "Supplies captured Codex 400 tool-history mismatch responses to the TUI autoheal path and observes the real recovery decision.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FIXTURES-GIT-WORKTREE-ACCEL-LINUX-JSON",
+      "path": "src/ux-sim/fixtures/git-worktree-accel-linux.json",
+      "boundary": "Deterministic Linux fixture for same-cut cold/warm checkout route comparisons, with candidate measurements and explicit unavailable metrics; not host performance claims.",
+      "deviceIds": [
+        "git-worktree-accel-measure"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GATE-SHARD-HOST-REROUTE-TS",
+      "path": "src/ux-sim/gate-shard-host-reroute.ts",
+      "boundary": "gate shard host reroute: S1 device for a release gate's shard dispatch. It replaces host execution, not planning or reduction.",
+      "deviceIds": [
+        "fault-injection"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GOAL-DEVICE-TS",
+      "path": "src/ux-sim/goal-device.ts",
+      "boundary": "Feeds work intervals and load samples to the production goal-progress classifier, including its minimum evidence sample.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GOAL-INTERIM-TRACE-TS",
+      "path": "src/ux-sim/goal-interim-trace.ts",
+      "boundary": "Defines one fixed user/tool trace consumed by classic and next goal-interim renderers so both are checked against identical events.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GRAPH-ENGINE-SIM-TS",
+      "path": "src/ux-sim/graph-engine-sim.ts",
+      "boundary": "Selects graph components from synthetic component results and renders the graph observation; it executes no nodes or external effects.",
+      "deviceIds": [
+        "graph-engine-selector"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-WORKER-TS",
+      "path": "src/ux-sim/graph-runtime-overlay-event-path-worker.ts",
+      "boundary": "Isolated child runs the real self-implement graph overlay, persists observer events to the selected test log DB and can inject a dropped-event fault.",
+      "deviceIds": [
+        "sim-event-log-path"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-TS",
+      "path": "src/ux-sim/graph-runtime-overlay-event-path.ts",
+      "boundary": "graph runtime overlay event path: Run the real graph runtime in an isolated process, then relay its production observer event.",
+      "deviceIds": [
+        "sim-event-log-path"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GRID-CHAOS-DRIVER-TS",
+      "path": "src/ux-sim/grid-chaos-driver.ts",
+      "boundary": "Builds seeded fault attacks and applies them through the production in-memory grid-ledger decision seam, including whole-grid lease loss.",
+      "deviceIds": [
+        "grid-chaos-driver"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GRID-LEDGER-TS",
+      "path": "src/ux-sim/grid-ledger.ts",
+      "boundary": "Defines grid host/lane capacity and lease state transitions, then reports admission, occupancy and lease-loss decisions for simulated work.",
+      "deviceIds": [
+        "grid-chaos-driver",
+        "grid-ledger"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-GRID-READY-TIERS-TS",
+      "path": "src/ux-sim/grid-ready-tiers.ts",
+      "boundary": "Chooses how many additional work slots a grid needs and which cold/warm provisioning tier satisfies demand from the supplied readiness snapshot.",
+      "deviceIds": [
+        "fake-cloud-vm"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-HEADLESS-TUI-TS",
+      "path": "src/ux-sim/headless-tui.ts",
+      "boundary": "Runs the production dashboard frame renderer serially in a headless process and captures snapshots while isolating its process-global frame cache.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-HEAL-REAUTHOR-MATERIALIZED-TS",
+      "path": "src/ux-sim/heal-reauthor-materialized.ts",
+      "boundary": "heal reauthor materialized: 진짜 heal-loop와 role 스크립트를 돌린다. 재작성 뒤 dispatch만 가짜로 받아 외부 구현 런은 만들지 않는다.",
+      "deviceIds": [
+        "heal-reauthor-materialized"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-HQ-MOVE-SIM-TS",
+      "path": "src/ux-sim/hq-move-sim.ts",
+      "boundary": "Calls the production HQ move-plan, lease/CAS, transfer, fence, promote, and machine-pool capacity paths; only remote host, standby volume, and clock edges are simulated.",
+      "deviceIds": [
+        "world-runtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-IN-PROCESS-CLI-TS",
+      "path": "src/ux-sim/in-process-cli.ts",
+      "boundary": "Invokes an allow-listed registered Commander action inside this process with isolated config/state roots, captures stdout/stderr and exit code, then restores CLI and process singletons.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-INPUT-HISTORY-TS",
+      "path": "src/ux-sim/input-history.ts",
+      "boundary": "Creates and inspects isolated temporary input-history state to verify queued records and temp-directory containment.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-INSTALL-CONSENT-DEVICE-TS",
+      "path": "src/ux-sim/install-consent-device.ts",
+      "boundary": "Runs the real release installer consent refusal and release verify installer invocation through fake command runners; no network or installation.",
+      "deviceIds": [
+        "install-consent"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-INTERACTION-TS",
+      "path": "src/ux-sim/interaction.ts",
+      "boundary": "Exercises the real Escape abort gate and agent-registry typeahead against a simulated mounted-modal stack in mount order.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-LINEAR-SECRETARY-TS",
+      "path": "src/ux-sim/linear-secretary.ts",
+      "boundary": "Runs the production Linear secretary flow with deterministic issue/comment responses; observes its next-action summary without contacting Linear.",
+      "deviceIds": [
+        "linear-secretary"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-AUTHORING-FIRST-RUN-CHILD-TS",
+      "path": "src/ux-sim/mock-authoring-first-run-child.ts",
+      "boundary": "Child-process probe for production first-run onboarding: consumes a fixture, runs provider/config selection in isolation and emits a structured receipt.",
+      "deviceIds": [
+        "first-run-and-seminar"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-AUTHORING-FIRST-RUN-TS",
+      "path": "src/ux-sim/mock-authoring-first-run.ts",
+      "boundary": "Creates an isolated HOME/PATH, launches the real first-run child probe, checks its config/root/provider receipt and hashes, and returns timing plus reproducible evidence.",
+      "deviceIds": [
+        "first-run-and-seminar"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-DEVICE-REQUESTS-TS",
+      "path": "src/ux-sim/mock-device-requests.ts",
+      "boundary": "Validates, stores and lists typed requests for registered mock devices; records discovery requests without executing a simulator.",
+      "deviceIds": [
+        "scenario-runner"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-SCENARIO-CATALOG-JSON",
+      "path": "src/ux-sim/mock-scenario-catalog.json",
+      "boundary": "Declarative registry of simulator devices, file-level MD inventory, scenarios, candidate audit, world events and run-evidence metadata; loading it runs no simulation.",
+      "deviceIds": [
+        "scenario-runner"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-SCENARIO-CATALOG-TS",
+      "path": "src/ux-sim/mock-scenario-catalog.ts",
+      "boundary": "Parses and validates the declarative simulator catalog, resolves devices/scenarios, and renders read-only list/show/device and generated-manual views.",
+      "deviceIds": [
+        "scenario-runner",
+        "sim-universe-world-yaml-schema"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-SEAT-PTY-FRAME-CHILD-TS",
+      "path": "src/ux-sim/mock-seat-pty-frame-child.ts",
+      "boundary": "Real-PTY child probe that initializes the production TUI, renders a first frame, reads one key and emits run-correlated lifecycle markers.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-SEAT-PTY-FRAME-TS",
+      "path": "src/ux-sim/mock-seat-pty-frame.ts",
+      "boundary": "Drives the real first-run TUI through a PTY with injected clock, host, HOME, size and key input; captures frames and lifecycle markers.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-SEAT-PTY-SEQUENCE-CHILD-TS",
+      "path": "src/ux-sim/mock-seat-pty-sequence-child.ts",
+      "boundary": "Real-PTY child probe that initializes the production TUI, renders after each key and exits on Ctrl+Q for parent-driven sequence tests.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MOCK-SEAT-PTY-SEQUENCE-TS",
+      "path": "src/ux-sim/mock-seat-pty-sequence.ts",
+      "boundary": "Drives a real TUI child through PTY keys and frame-text predicates, capturing frames until the declared terminal condition.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-NEXT-TUI-SEAT-SCENARIOS-TS",
+      "path": "src/ux-sim/next-tui-seat-scenarios.ts",
+      "boundary": "Runs next-TUI session, resume, queue, tool, goal and subagent scenarios through a real PTY child in an isolated state root, then checks rendered frames and logs.",
+      "deviceIds": [
+        "first-run-and-seminar"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-ONBOARDING-FIRST-RUN-DEVICE-TS",
+      "path": "src/ux-sim/onboarding-first-run-device.ts",
+      "boundary": "Counts and checks English and Korean first-run provider chooser frames from the production onboarding renderer.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-PTY-KEY-MODIFIERS-DEVICE-TS",
+      "path": "src/ux-sim/pty-key-modifiers-device.ts",
+      "boundary": "Sends modifier-key sequences through a real PTY to the production TUI parser and records parsed key events and rendered output.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-RELEASE-SIM-RIG-TS",
+      "path": "src/ux-sim/release-sim-rig.ts",
+      "boundary": "Parses release rehearsal cases and runs production release-decision stages against injected records without publishing a release.",
+      "deviceIds": [
+        "release-graph-rig"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-RENDER-FRAME-TS",
+      "path": "src/ux-sim/render-frame.ts",
+      "boundary": "Builds dashboard log frames from supplied widget state and optional UX fields so tests can inspect the real renderer output.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-RESEARCH-DECISION-CHAIN-TS",
+      "path": "src/ux-sim/research-decision-chain.ts",
+      "boundary": "Runs the production Think Lens decision chain in a worker with captured event/log evidence, then checks stage output and evidence ancestry markers.",
+      "deviceIds": [
+        "research-decision-chain"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-RESUME-PICKER-DEVICE-TS",
+      "path": "src/ux-sim/resume-picker-device.ts",
+      "boundary": "resume picker device: `picker` (default): the list → pick flow. `boot-resume`: start with `--resume <id>` on a synthetic 379-row session.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SAFE-PUBLIC-COPY-PUBLISH-TS",
+      "path": "src/ux-sim/safe-public-copy-publish.ts",
+      "boundary": "Runs production redaction, publish handlers, rendering and artifact storage with an upload seam that records and refuses external writes.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SCENARIO-TS",
+      "path": "src/ux-sim/scenario.ts",
+      "boundary": "Parses and validates ScenarioV0 YAML, executes its registered trigger through the production path with isolated injected boundaries, checks screen/log expectations and persists run evidence.",
+      "deviceIds": [
+        "scenario-runner",
+        "draft-inventory",
+        "sim-event-log-path",
+        "author-reviewer-precheck"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SECRET-CANARY-TS",
+      "path": "src/ux-sim/secret-canary.ts",
+      "boundary": "Provider-shaped fake canary minting and raw/base64/URL leak scanning across public artifacts; excludes only explicit secret backend storage.",
+      "deviceIds": [
+        "secret-canary"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SEMINAR-REHEARSAL-TS",
+      "path": "src/ux-sim/seminar-rehearsal.ts",
+      "boundary": "Runs the seven-scene rehearsal state machine with injected timing/evidence records, checking fallback and disclosure guards without claiming live rehearsal.",
+      "deviceIds": [
+        "first-run-and-seminar"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SERVICE-KEY-SETUP-TS",
+      "path": "src/ux-sim/service-key-setup.ts",
+      "boundary": "Routes production Codex login fetch requests through fake OpenAI and device-OAuth endpoints; unknown URLs fail closed and no external request is sent.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SESSION-ID-SEED-TS",
+      "path": "src/ux-sim/session-id-seed.ts",
+      "boundary": "Seeds a session transcript and index row under a chosen ID for long-session and resume-picker fixtures.",
+      "deviceIds": [
+        "first-run-and-seminar"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SIM-COVERAGE-TS",
+      "path": "src/ux-sim/sim-coverage.ts",
+      "boundary": "Records code paths, observed event kinds and device implementation fingerprints for successful world runs; reports uncovered catalog paths and requests missing devices inside the explicit test universe.",
+      "deviceIds": [
+        "world-runtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SKILLS-TOOLS-SHELL-DEVICE-TS",
+      "path": "src/ux-sim/skills-tools-shell-device.ts",
+      "boundary": "Exercises the RunShell policy: rejects HQ heavy-gate commands before spawn with a remote alternative and isolated log event, while recording safe fake-spawn outcomes.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SLASH-MENU-FRAMES-TS",
+      "path": "src/ux-sim/slash-menu-frames.ts",
+      "boundary": "Drives production slash-command textInput and DisplayCoordinator with scripted keys, capturing each real TUI frame and counting full-screen clears and rewritten rows.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-SUBAGENT-TOOLS-DEVICE-TS",
+      "path": "src/ux-sim/subagent-tools-device.ts",
+      "boundary": "Runs production subagent-tool validation against scripted requests and reports accepted, refused and malformed outcomes without spawning agents.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TASK-AGENT-PARENT-HOST-DEVICE-TS",
+      "path": "src/ux-sim/task-agent-parent-host-device.ts",
+      "boundary": "Injects host inventory, preflight gaps and launch responses at resolveParentHosts/preflightParentHost/launchRemoteParent; no SSH connection is opened.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TASK-AGENT-REJUDGE-ON-HEAD-DEVICE-TS",
+      "path": "src/ux-sim/task-agent-rejudge-on-head-device.ts",
+      "boundary": "Feeds stored review rounds and changing head SHAs to production rejudge-on-head decisions and records whether the round cap permits review.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TASK-ORCHESTRATOR-SURFACES-SELF-IMPLEMENT-POD-DEVICE-TS",
+      "path": "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.ts",
+      "boundary": "Scripts Kubernetes Job termination, OOM, deadline, premature-result and post-GC lookup faults at the production pod-result reader; no cluster is contacted.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TEMP-GIT-REMOTE-TS",
+      "path": "src/ux-sim/temp-git-remote.ts",
+      "boundary": "Creates a disposable local Git remote for child-process tests and returns the pinned environment needed to access that fixture.",
+      "deviceIds": [
+        "temp-git-remote"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TEMP-GIT-REPO-TS",
+      "path": "src/ux-sim/temp-git-repo.ts",
+      "boundary": "Throwaway Git repositories with real commits for simulation tests that need history (simulation boundary).",
+      "deviceIds": [
+        "temp-git-repo"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TERM-SLASH-DEVICE-TS",
+      "path": "src/ux-sim/term-slash-device.ts",
+      "boundary": "term slash device: Run the fast command matrix through the same production handler used by TUI.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TOOL-ASYNC-FAIL-LOOP-TS",
+      "path": "src/ux-sim/tool-async-fail-loop.ts",
+      "boundary": "Replays the declared SelfImplement retry incident through the production model tool loop and daemon adapter, with scenario state isolated in a temporary repository.",
+      "deviceIds": [
+        "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TTY-FOREGROUND-STEAL-CHILD-TS",
+      "path": "src/ux-sim/tty-foreground-steal-child.ts",
+      "boundary": "Real-PTY reproducer for login-shell foreground-process-group theft; runs legacy/current shell capture and reports terminal group IDs.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TURN-STATES-TS",
+      "path": "src/ux-sim/turn-states.ts",
+      "boundary": "Models observed TUI turn phases and runs the production footer, line-rendering and typeahead transitions for each simulated phase.",
+      "deviceIds": [
+        "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-TURN-THROW-SIM-TS",
+      "path": "src/ux-sim/turn-throw-sim.ts",
+      "boundary": "Injects configured exceptions into the production turn path and captures the resulting throw/recovery behavior; without the explicit simulation setting it is inert.",
+      "deviceIds": [
+        "turn-throw-sim"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WARM-POOL-REUSE-SIM-TS",
+      "path": "src/ux-sim/warm-pool-reuse-sim.ts",
+      "boundary": "Runs production warm-provider reconcile and gate selection against isolated fake Kubernetes and token-authorized lease-control boundaries.",
+      "deviceIds": [
+        "warm-pool-reuse-sim"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WARM-POOL-REUSE-SWITCH-SIM-TS",
+      "path": "src/ux-sim/warm-pool-reuse-switch-sim.ts",
+      "boundary": "Exercises a real warm-pod provider lease, fresh-versus-warm comparison and evidence journal through isolated fake Kubernetes and primary-control boundaries.",
+      "deviceIds": [
+        "warm-pool-reuse-sim",
+        "warm-si-reuse-sim"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WARM-SI-REUSE-SIM-TS",
+      "path": "src/ux-sim/warm-si-reuse-sim.ts",
+      "boundary": "Runs the production SI warm provider and child cleanup/return chain against an isolated primary lease API, fake Kubernetes and a simulated fixed-runner boundary.",
+      "deviceIds": [
+        "warm-si-reuse-sim"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WORLD-CHAOS-RUNTIME-TS",
+      "path": "src/ux-sim/world-chaos-runtime.ts",
+      "boundary": "Runs declared monkey faults and world injections on one shared fake-time timeline; measures production readiness recovery and persisted injected ledger rows.",
+      "deviceIds": [
+        "world-runtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WORLD-HOST-CHAOS-TS",
+      "path": "src/ux-sim/world-host-chaos.ts",
+      "boundary": "Runs gorilla host failure through measured placement and the shared fake ps inventory.",
+      "deviceIds": [
+        "world-runtime",
+        "fake-kubectl",
+        "fake-ps"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WORLD-SCHEMA-TS",
+      "path": "src/ux-sim/world-schema.ts",
+      "boundary": "Parses RFC A2 world declarations, declared process targets, arbitrary ledger/log injection rows and scheduled monkey/recovery budgets, validating references and field errors without writing.",
+      "deviceIds": [
+        "sim-universe-world-yaml-schema"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WORLD-SNAPSHOT-TS",
+      "path": "src/ux-sim/world-snapshot.ts",
+      "boundary": "Creates, verifies, restores, and forks isolated simulation world snapshots inside the explicit test universe; world-runtime exercises migration boundaries and sim-universe-world-lifecycle owns snapshot lifecycle behavior.",
+      "deviceIds": [
+        "world-runtime",
+        "sim-universe-world-lifecycle"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WORLD-STORE-TS",
+      "path": "src/ux-sim/world-store.ts",
+      "boundary": "Creates private test-root worlds with one catalog-derived metadata file per MD source module; verifies the complete assembly and ownership before listing or deleting.",
+      "deviceIds": [
+        "sim-universe-world-lifecycle"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WORLD-TS",
+      "path": "src/ux-sim/world.ts",
+      "boundary": "Parses world YAML, resolves catalog devices, assembles their fakes, and runs scheduled injections through the production event writer under the isolated test root.",
+      "deviceIds": [
+        "world-runtime",
+        "sim-mailbox"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    }
+  ],
+  "version": 2,
+  "worldEvents": [
+    {
+      "id": "EV-0042",
+      "name": "Dead process lock",
+      "description": "Inject a stale process lock into a simulated world."
+    },
+    {
+      "id": "EV-0107",
+      "name": "Host reboot",
+      "description": "Inject a host reboot into a simulated world."
+    },
+    {
+      "id": "hq-move",
+      "name": "HQ host move",
+      "description": "Run the real HQ lease, promotion, fence, and pool-capacity paths against isolated host boundaries."
+    }
+  ]
 }

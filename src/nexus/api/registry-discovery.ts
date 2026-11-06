@@ -11,7 +11,7 @@
 
 import { debug } from '../../debug/log.js';
 import { setEventLoopActivity } from '../../debug/event-loop-watchdog.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   BUILTIN_SOURCES,
   buildDiscoverySnapshot,

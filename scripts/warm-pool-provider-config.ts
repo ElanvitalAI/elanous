@@ -18,6 +18,7 @@ type JsonObject = Record<string, unknown>;
 export interface WarmPoolProviderConfig {
   candidates: WarmWorkerCandidate[];
   expandPoolTemplatesToQuota: boolean;
+  drainingHosts: string[];
   poolTemplates: Array<{
     host: string;
     tier: 'lite' | 'standard';
@@ -33,6 +34,7 @@ export interface WarmPoolProviderConfig {
       nodeName: string;
       cutSha: string;
       key: { context: string; imageDigest: string; lockHash: string; architecture: string };
+      runtimeContract?: { bunVersion: string; os: 'linux'; architecture: string; requiredTools: string[] };
       memoryLimit: '2Gi' | '16Gi';
       hostProbeUrl: string;
       prodProbeUrl: string;
@@ -145,9 +147,16 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   const expandPoolTemplatesToQuota = pool.expandPoolTemplatesToQuota;
   if (expandPoolTemplatesToQuota !== undefined && typeof expandPoolTemplatesToQuota !== 'boolean')
     throw new Error('pod.warmPool.expandPoolTemplatesToQuota must be a boolean');
+  const drainingHostsValue = pool.drainingHosts ?? [];
+  if (!Array.isArray(drainingHostsValue) || drainingHostsValue.some(host => typeof host !== 'string' || !host.trim())
+    || new Set(drainingHostsValue).size !== drainingHostsValue.length)
+    throw new Error('pod.warmPool.drainingHosts must be a unique list of host names');
+  const drainingHosts = drainingHostsValue as string[];
   const lockHash = text(pool.lockHash, 'pod.warmPool.lockHash');
   if (!LOCK_HASH.test(lockHash)) throw new Error('pod.warmPool.lockHash must be a 64-character SHA-256');
   const architecture = text(pool.architecture, 'pod.warmPool.architecture');
+  const bunVersion = readFileSync(fileURLToPath(new URL('../.bun-version', import.meta.url)), 'utf8').trim();
+  if (!/^\d+\.\d+\.\d+$/.test(bunVersion)) throw new Error('.bun-version must be a semantic version');
   const hostProbeUrl = httpUrl(pool.hostProbeUrl, 'pod.warmPool.hostProbeUrl', 'host.orb.internal');
   const prodProbeUrl = httpUrl(pool.prodProbeUrl, 'pod.warmPool.prodProbeUrl', 'core.elanous-prod');
   const source = privateSource(pool);
@@ -201,12 +210,13 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
         workerId: `warm-${host}-${cutSha.slice(0, 12)}`, image: `${imageRepository}@${imageDigest}`,
         ...source, nodeName, cutSha,
         key: { context: kubectlContext, imageDigest, lockHash, architecture },
+        runtimeContract: { bunVersion, os: 'linux' as const, architecture, requiredTools: ['bun', 'git'] },
         memoryLimit: tier === 'lite' ? '2Gi' as const : '16Gi' as const,
         hostProbeUrl, prodProbeUrl,
       },
     };
   });
-  return { candidates: [], expandPoolTemplatesToQuota: expandPoolTemplatesToQuota === true,
+  return { candidates: [], expandPoolTemplatesToQuota: expandPoolTemplatesToQuota === true, drainingHosts,
     poolTemplates, profileConfig: { pod: { warmPoolProfile: profile } },
     controlUrl: controlUrl(input.controlUrl), memberToken: token(input.memberToken, 'member token'), machineTokens, ...(input.machinePools ? { machinePools: input.machinePools } : {}) };
 }

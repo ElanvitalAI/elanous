@@ -85,6 +85,22 @@ describe('si-v1 warm transport boundary', () => {
     expect(result.reason).toBe('match');
   });
 
+  test('late deadline-killed result retains only hash-verified terminal bytes for reconciliation', async () => {
+    const timedOutTerminal = new TextEncoder().encode('{"ok":false,"stage":"error"}');
+    const timedOutReply = { ...reply, startedAt: 19_000, finishedAt: command.deadlineAt,
+      exitCode: 124, terminalSha256: siWarmSha256(timedOutTerminal) };
+    const timedOutBytes = { ...bytes, terminal: timedOutTerminal };
+    let quarantined = '';
+    const runner: SiWarmFixedRunner = { inspect: async () => pod,
+      execute: async () => ({ reply: timedOutReply, bytes: timedOutBytes, cleanup: 'failed' }),
+      quarantine: async (_command, reason) => { quarantined = reason; return true; } };
+    const result = await executeSiWarmTransport({ ...input, runner });
+    expect(result).toMatchObject({ boundary: 'exec-attempted', measured: false,
+      quarantineWorker: true, quarantineRecorded: true, validationReason: 'expired',
+      verifiedBytesForReconcile: timedOutBytes, reply: null, bytes: null });
+    expect(quarantined).toBe('exec-uncertain');
+  });
+
   test('lost response, wrong artifact hash and uncertain cleanup require quarantine', async () => {
     for (const receipt of [
       { reply: null, bytes: null, cleanup: 'unknown' as const },

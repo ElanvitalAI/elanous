@@ -25,6 +25,68 @@ describe('raw terminal control keys', () => {
 });
 
 describe('modal-preserving terminal row updates', () => {
+  test('NEXT-TUI-TERM-IO-SPLIT: public key API delegates to the extracted production module', async () => {
+    const { code, stdout } = await runChild(`
+      const { mock } = await import('bun:test');
+      const calls = [];
+      mock.module(${JSON.stringify(join(import.meta.dir, 'tui-key.js'))}, () => ({
+        KeyStreamParser: class { push() { return []; } reset() {} flushEscape() { return []; } },
+        splitKeys: (input) => { calls.push(input); return [{ name: 'mock-key', ctrl: false, shift: false }]; },
+        __resetDoubleClickState: () => {},
+      }));
+      const { splitKeys } = await import(${JSON.stringify(TUI_PATH)});
+      const result = splitKeys('production-key-input');
+      console.log(JSON.stringify({ calls, result }));
+    `);
+
+    expect(code).toBe(0);
+    const result = JSON.parse(stdout.trim()) as {
+      calls: string[];
+      result: Array<{ name: string; ctrl: boolean; shift: boolean }>;
+    };
+    expect(result.calls).toEqual(['production-key-input']);
+    expect(result.result).toEqual([{ name: 'mock-key', ctrl: false, shift: false }]);
+  }, 10_000);
+
+  test('NEXT-TUI-TERM-IO-SPLIT: production key input and wide text reach the mocked terminal renderer', async () => {
+    const { code, stdout } = await runChild(`
+      const { splitKeys, render, resetRenderCache, visibleWidth } = await import(${JSON.stringify(TUI_PATH)});
+      const { renderCacheRowIs: moduleCacheRowIs } = await import(${JSON.stringify(RENDER_CACHE_PATH)});
+      const chunks = [];
+      const write = process.stdout.write.bind(process.stdout);
+      process.stdout.rows = 2;
+      process.stdout.columns = 12;
+      process.stdout.write = (chunk) => { chunks.push(String(chunk)); return true; };
+      resetRenderCache();
+      const keys = splitKeys('\\x1b[27;5;106~');
+      render(['界面 ready'], { force: true });
+      const firstRowCached = moduleCacheRowIs(0, '界面 ready');
+      const firstFrame = chunks.at(-1);
+      render(['界面 ready']);
+      const cachedRowStillMatches = moduleCacheRowIs(0, '界面 ready');
+      const cachedFrame = chunks.at(-1);
+      const width = visibleWidth('界面');
+      process.stdout.write = write;
+      console.log(JSON.stringify({ keys, width, frame: firstFrame, cachedFrame, firstRowCached, cachedRowStillMatches }));
+    `);
+
+    expect(code).toBe(0);
+    const result = JSON.parse(stdout.trim()) as {
+      keys: Array<{ name: string; ctrl: boolean; shift: boolean; alt: boolean; raw: string }>;
+      width: number;
+      frame: string;
+      cachedFrame: string;
+      firstRowCached: boolean;
+      cachedRowStillMatches: boolean;
+    };
+    expect(result.keys).toEqual([{ name: 'j', ctrl: true, shift: false, alt: false, raw: '\u001b[27;5;106~' }]);
+    expect(result.width).toBe(4);
+    expect(result.frame).toContain('界面 ready');
+    expect(result.cachedFrame).toBe('\x1b[?25l');
+    expect(result.firstRowCached).toBe(true);
+    expect(result.cachedRowStillMatches).toBe(true);
+  }, 10_000);
+
   test('slices ANSI rows by visible columns and protects wide glyph edges', () => {
     expect(sliceAnsiByColumns('\x1b[31mAB界CD\x1b[0m', 1, 4)).toBe('\x1b[31mB界\x1b[0m');
     expect(sliceAnsiByColumns('A界B', 0, 2)).toBe('A ');
@@ -64,6 +126,7 @@ describe('modal-preserving terminal row updates', () => {
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const TUI_PATH = join(REPO_ROOT, 'src/tui.ts');
+const RENDER_CACHE_PATH = join(REPO_ROOT, 'src/tui-render-cache.ts');
 const CHAT_PATH = join(REPO_ROOT, 'src/chat/index.ts');
 
 function runChild(source: string, opts?: {

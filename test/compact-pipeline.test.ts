@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCompactPipeline } from '../src/compact/pipeline';
 import { truncateProportional } from '../src/compact/truncate-proportional';
-import { archivePath } from '../src/compact/archive';
+import { archivePath, archiveReferencePath } from '../src/compact/archive';
 import type { LLMMessage } from '../src/llm';
 
 function archDir(): string {
@@ -50,6 +50,7 @@ describe('Wave 2 · pipeline orchestrator', () => {
 
   test('archive jsonl written when archive enabled', async () => {
     const dir = archDir();
+    const toolOutputCharBudget = archiveReferencePath('test-session-x', dir).length + 512;
     const messages: LLMMessage[] = [
       { role: 'user', content: 'pad' },
       {
@@ -66,7 +67,7 @@ describe('Wave 2 · pipeline orchestrator', () => {
     await runCompactPipeline(messages, {
       sessionId: 'test-session-x',
       policy: {
-        toolOutputCharBudget: 100,
+        toolOutputCharBudget,
         archiveDir: dir,
         preserveLastN: 3,
       },
@@ -104,7 +105,8 @@ describe('Wave 2 · pipeline orchestrator', () => {
       },
     });
     expect(r.diagnostics.archived).toBe(0);
-    expect(r.diagnostics.layer1ResponsesTrimmed).toBeGreaterThan(0);
+    expect(r.diagnostics.layer1ResponsesTrimmed).toBe(0);
+    expect(r.diagnostics.layer2MicrocompactCleared).toBeGreaterThan(0);
   });
 
   test('does not mutate input messages array', async () => {

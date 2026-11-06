@@ -675,6 +675,7 @@ edges:
       gate-host-busy: next-move
       gate-merge-conflict: main-sync
       gate-touch-clean: next-move
+      typecheck-drift: main-sync
       pr-base-unreadable: next-move
       public-export-leak: next-move
       other: next-move

@@ -1,7 +1,7 @@
 /** Adopt only transport-verified si-v1 bytes into the existing host collectors. */
 import { gzipSync } from 'node:zlib';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { collectPodLedgers } from './pod-ledger-collect.js';
@@ -23,6 +23,9 @@ import type { SiWarmChildAttempt } from './self-implement-pod.js';
 import type { SiWarmRunnerPayload, SiWarmCredentialBundle } from './pod-si-warm-runner.js';
 
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
+const SOURCE_SHA_CACHE_MS = 1_000;
+const SOURCE_SHA_CACHE_MAX_ENTRIES = 128;
+const SOURCE_SHA = /^[a-f0-9]{40}$/;
 const strictBase64 = (value: unknown): Buffer => {
   if (typeof value !== 'string' || value.length > MAX_LEDGER_BYTES * 2
     || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))
@@ -31,6 +34,67 @@ const strictBase64 = (value: unknown): Buffer => {
   if (bytes.toString('base64') !== value) throw new Error('si-v1 ledger base64 noncanonical');
   return bytes;
 };
+
+export interface SiWarmSourceShaResolution {
+  sha: string;
+  cache: 'hit' | 'miss' | 'in-flight';
+  durationMs: number;
+}
+
+/** Resolve a source ref without blocking the host event loop; coalesce concurrent lookups and cache only briefly. */
+export function createSiWarmSourceShaResolver(options: {
+  execute?: (cwd: string, revision: string) => Promise<string>;
+  now?: () => number;
+  cacheMs?: number;
+  maxEntries?: number;
+} = {}): (base: string | undefined, cwd: string) => Promise<SiWarmSourceShaResolution> {
+  const now = options.now ?? Date.now;
+  const cacheMs = options.cacheMs ?? SOURCE_SHA_CACHE_MS;
+  const maxEntries = options.maxEntries ?? SOURCE_SHA_CACHE_MAX_ENTRIES;
+  if (!Number.isSafeInteger(cacheMs) || cacheMs < 0) throw new Error('warm source SHA cache TTL is invalid');
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) throw new Error('warm source SHA cache limit is invalid');
+  const execute = options.execute ?? ((cwd: string, revision: string) => new Promise<string>((resolve, reject) => {
+    execFile('git', ['rev-parse', '--verify', '--end-of-options', revision], { cwd, encoding: 'utf8' },
+      (error, stdout) => error ? reject(error) : resolve(stdout));
+  }));
+  const cache = new Map<string, { sha: string; expiresAt: number }>();
+  const inFlight = new Map<string, Promise<string>>();
+
+  return async (base, cwd) => {
+    const revision = `${base ?? 'origin/HEAD'}^{commit}`;
+    const key = JSON.stringify([cwd, revision]);
+    const startedAt = now();
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > startedAt) {
+      cache.delete(key);
+      cache.set(key, cached);
+      return { sha: cached.sha, cache: 'hit', durationMs: Math.max(0, now() - startedAt) };
+    }
+    if (cached) cache.delete(key);
+
+    const pending = inFlight.get(key);
+    if (pending) {
+      const sha = await pending;
+      return { sha, cache: 'in-flight', durationMs: Math.max(0, now() - startedAt) };
+    }
+
+    const lookup = execute(cwd, revision).then(output => {
+      const sha = output.trim();
+      if (!SOURCE_SHA.test(sha)) throw new Error('warm source SHA is invalid');
+      const expiresAt = now() + cacheMs;
+      for (const [entryKey, entry] of cache) if (entry.expiresAt <= now()) cache.delete(entryKey);
+      cache.delete(key);
+      cache.set(key, { sha, expiresAt });
+      while (cache.size > maxEntries) cache.delete(cache.keys().next().value!);
+      return sha;
+    }).finally(() => inFlight.delete(key));
+    inFlight.set(key, lookup);
+    const sha = await lookup;
+    return { sha, cache: 'miss', durationMs: Math.max(0, now() - startedAt) };
+  };
+}
+
+const resolveSiWarmSourceSha = createSiWarmSourceShaResolver();
 
 function chunks(kind: 'ledger' | 'artifact', id: string, bytes: Uint8Array): string[] {
   const encoded = gzipSync(bytes).toString('base64');
@@ -187,9 +251,9 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
   try {
     const config = (options.fallbackConfig ?? getUserConfig)();
     if (!siWarmEligible(input, options, config.llm.provider)) return { status: 'no-entry', reason: 'invalid-input' };
-    const sourceSha = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${input.base ?? 'origin/HEAD'}^{commit}`],
-      { cwd: process.cwd(), encoding: 'utf8' }).trim();
-    if (!/^[a-f0-9]{40}$/.test(sourceSha)) return { status: 'no-entry', reason: 'invalid-input' };
+    const source = await resolveSiWarmSourceSha(input.base, process.cwd());
+    const sourceSha = source.sha;
+    debug.log('pod.reuse', 'source-sha-resolved', { cache: source.cache, durationMs: source.durationMs });
     const runId = `run-${randomUUID()}`;
     const attemptId = `attempt-${randomUUID()}`;
     const executionKey = siWarmExecutionKey(input, runId);

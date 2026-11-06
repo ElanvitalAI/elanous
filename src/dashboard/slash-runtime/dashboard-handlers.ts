@@ -382,15 +382,13 @@ import {
 import { resolveLocalEndpoints, runLocalLLMCompat } from '../../local-llm-test.js';
 // TUI-SLASH-SPLIT-TERM(D4b) — /term·/terminal 은 src/tui/slash/term.ts 로 이사(그 구현의 정적 import 도 함께 갔다).
 import { registerTermSlash, type TermSlashHost } from '../../tui/slash/term.js';
-// 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5 · /mission 과 같은 꼴).
+// 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5).
 import { SlashCommandRegistry } from './registry.js';
 export { readDashboardAskClarification } from './ask-clarification.js';
 import { createLoopScheduler, type LoopScheduler } from '../loop-scheduler.js';
 import { registerShellSlash } from './shell-slash.js';
 import { registerClassicSideSlash } from '../side-basic-runtime.js';
 export { registerShellSlash } from './shell-slash.js';
-import { registerMissionSlash } from '../../tui/slash/mission.js';
-// TUI-SLASH-SPLIT-MISSION(D4b) — /mission 은 src/tui/slash/mission.ts 로 이사. 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5).
 import { cronSecondDueAt, filterLoopRows, formatLoopsTable, localLoopRows, type LoopsTableRow } from './loops-table.js';
 import { loopCronVerdict } from '../../loops/verdict.js';
 import { checklistBoardSlash } from '../../release-loop/checklist-board.js';
@@ -621,14 +619,6 @@ export interface DashboardSlashContext {
   sessionFork: {
     openPicker(): void;
     timetravel(n: number): Promise<{ forkedId: string; turn: number; removedUserText: string } | null>;
-  };
-  /** TUI 부활 C-b-2 PR① — /mission new 준비(ready) 워처. dashboard 가
-   *  mission-tui-watch 폴링 + 준비완료 시 페이즈 보드 인라인 + HITL 픽커를
-   *  배선(startMissionReadyWatch). revise 재분해 후 재시작에도 쓰인다. */
-  missionTui: {
-    startReadyWatch(missionId: string): void;
-    /** PR ② — approve 후 실행 워처(페이즈 전이 chat line + footer 진행바 + 종결 리포트). */
-    startRunWatch(missionId: string): void;
   };
 
   // B-1.i additions
@@ -1218,7 +1208,7 @@ export const DASHBOARD_SLASH_CATALOG_BASELINE = {
     'board', 'capture', 'chat', 'claude', 'codex', 'control', 'conv',
     'dash', 'dashboard', 'debug', 'default', 'delta', 'design', 'design-check', 'diffs',
     'directive', 'export', 'fork', 'gemini', 'handoff', 'hist', 'history', 'inject', 'inputs',
-    'lane', 'll', 'local', 'log', 'loops', 'mission', 'p', 'paste', 'persona', 'plan', 'plugin',
+    'lane', 'll', 'local', 'log', 'loops', 'p', 'paste', 'persona', 'plan', 'plugin',
     'plugins', 'prompt', 'prompts', 'provider', 'qc', 'r', 'reasoning', 'rebind', 'relay',
     'reply', 'research', 'resume-turn', 'rewind', 'rs', 'run', 'run-skill', 's', 'showroom',
     'surface', 'sync', 'tablet', 'telegram', 'term', 'terminal', 'tg', 'theme', 'think', 'tts',
@@ -2226,10 +2216,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     ctx.sessionResume.openPicker();
   });
 
-  // /mission — TUI 부활 C-a: autopilot 미션 레지스트리의 TUI 표면.
-  // `elanous autopilot` CLI 와 동일한 단일 창구(dispatchAutopilotMissions)
-  // 소비 — 엔진/레지스트리 무변. 스코프 = 읽기(list/trace) + 승인(arm).
-  // materialize/cancel 같은 무거운 변경은 CLI/skill 로 안내(오조작 방지).
   registry.register('harness', async (args, ctx) => {
     const sub = args[0]?.toLowerCase();
     const usage = (line: string): void => {
@@ -2439,8 +2425,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       })();
     }
   });
-
-  registerMissionSlash(registry);
 
   // ── B-1.i ─────────────────────────────────────────────────────────
 

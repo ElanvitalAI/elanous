@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { runGoalLoop, type CoreTurnContext, type CoreTurnDispatchTool, type GoalLoopOptions, type GoalLoopResult } from '../../core-turn/index.js';
+import { runGoalLoop } from '../../core-turn/run-goal-loop.js';
+import type { CoreTurnContext, CoreTurnDispatchTool } from '../../core-turn/types.js';
+import type { GoalLoopOptions, GoalLoopResult } from '../../core-turn/run-goal-loop.js';
 import { debug } from '../../debug/log.js';
 import { selectPlanningLlm } from '../../prompt-enhance/enhance.js';
 import type { LLMMessage, LLMToolSpec } from '../../llm.js';

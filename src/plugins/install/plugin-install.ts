@@ -728,8 +728,10 @@ export function listInstalledPlugins(root = elanousStateRoot()): InstalledPlugin
         if (!version.isDirectory() || !VERSION.test(version.name)) continue;
         const path = join(base, market.name, name.name, version.name);
         try {
-          const manifest = loadPluginManifestFromDir(path, { id: name.name }).manifest;
-          if (manifest.id === name.name && manifest.version === version.name) {
+          const loaded = loadPluginManifestFromDir(path, { id: name.name, version: version.name, allowClaudeManifest: true });
+          const isClaudeManifest = loaded.path === join(path, '.claude-plugin', 'plugin.json');
+          const manifest = loaded.manifest;
+          if (manifest.id === name.name && manifest.version === version.name && (!isClaudeManifest || manifest.name === name.name)) {
             const recorded = ledger.find(entry => entry.name === name.name && entry.version === version.name && entry.market === market.name);
             result.push({ name: name.name, version: version.name, market: market.name, path,
               sha256: recorded?.sha256 ?? null,

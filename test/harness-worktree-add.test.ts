@@ -13,6 +13,7 @@ import {
   renderHarnessWorktreeAdd,
 } from '../src/harness/harness-worktree-add.js';
 import { defaultSeams } from '../src/self-implement/seams.js';
+import { clearLaunchRoleLlmOverrides, setLaunchRoleLlmOverrides } from '../src/user-config.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -45,7 +46,7 @@ describe('harness worktree add', () => {
     git(repo, 'commit', '-qm', 'initial');
   });
 
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => { clearLaunchRoleLlmOverrides(); rmSync(root, { recursive: true, force: true }); });
 
   test('creates through the gateway and records default provenance when no owner is supplied', () => {
     const result = addHarnessWorktree({ repoRoot: repo, worktreeRoot: join(root, 'worktrees'), branch: 'feature/fresh' });
@@ -139,6 +140,7 @@ describe('harness worktree add', () => {
   });
 
   test('판정 신호: goal context records a leading H1 goal title instead of structural H2 headings', async () => {
+    setLaunchRoleLlmOverrides({ classify: { provider: 'openai-codex', model: 'gpt-5.1' } });
     const goalFile = join(root, 'leading-h1-goal.md');
     writeFileSync(goalFile, [
       '# Record human-readable worktree purpose',
@@ -194,6 +196,7 @@ describe('harness worktree add', () => {
   });
 
   test('판정 신호: goal synthesis truncates generated output at 250 characters and falls back to title on empty or thrown model output', async () => {
+    setLaunchRoleLlmOverrides({ classify: { provider: 'openai-codex', model: 'gpt-5.1' } });
     const goalFile = join(root, 'goal.md');
     writeFileSync(goalFile, '# Durable worktree purpose\n\nDescribe worktree metadata.\n');
     const long = defaultSeams({ summarizeGoal: async () => 'x'.repeat(300) });

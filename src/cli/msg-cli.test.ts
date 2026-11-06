@@ -240,6 +240,12 @@ test('list pages by recipient and cursor; unread and watch are read-only until e
   expect(JSON.parse(f.stdout.pop()!).map((row: { id: number }) => row.id)).toEqual([3]);
   await f.run('ack', '3', '--to', 'MK');
   expect(f.stdout.pop()).toBe('MK acknowledged through #3');
+  const storeForPerMessageAck = f.store();
+  let individualId: number;
+  try { individualId = storeForPerMessageAck.post({ from: 'OP', to: 'MK', body: 'individual ack' }).id; }
+  finally { storeForPerMessageAck.close(); }
+  await f.run('ack', '--id', String(individualId!), '--to', 'MK', '--json');
+  expect(JSON.parse(f.stdout.pop()!)).toEqual({ recipient: 'MK', id: individualId!, status: 'acked' });
   await f.run('unread', '--to', 't');
   expect(f.stdout.pop()).toBe('No unread messages.');
   await f.run('unread');

@@ -14,7 +14,8 @@
 //   - multi-iter: 2회 호출 시 history 누적
 //
 // mock.module 은 test file boot 시 1회 호출 — runtime swap. Barrel의 다른
-// runtime export를 보존해야 같은 suite의 runGoalLoop import가 깨지지 않는다. dynamic
+// barrel mock은 실제 runner import 경로와 달라 stub이 적용되지 않는다.
+// 원본 run-core-turn export를 보존한다. dynamic
 // behavior (per-test 다른 onText/onToolCall 의 시퀀스) 는 mock state
 // (`__mockRunCoreTurn`) 통해 inject.
 
@@ -26,7 +27,7 @@ import type {
 } from '../core-turn/types.js';
 import type { LLMMessage } from '../llm.js';
 import type { ContentBlock, SessionUpdate, StopReason } from '@agentclientprotocol/sdk';
-import * as goalLoop from '../core-turn/run-goal-loop.js';
+import * as realRunCoreTurn from '../core-turn/run-core-turn.js';
 
 // ── Mock state ──────────────────────────────────────────────────
 //
@@ -70,8 +71,8 @@ function resetMockState(): void {
 // Mock runCoreTurn — stub 이 mockState.events 를 ctx.callbacks 로 forward
 // 후 mockState.stopReason / finalText 반환. signal.aborted 이미 set 시
 // pre-flight abort. 각 event 사이 microtask yield — cancel() race 가능.
-mock.module('../core-turn/index.js', () => ({
-  ...goalLoop,
+mock.module('../core-turn/run-core-turn.js', () => ({
+  ...realRunCoreTurn,
   runCoreTurn: async (ctx: CoreTurnContext): Promise<CoreTurnResult> => {
     mockState.callCount += 1;
     mockState.lastCtx = ctx;

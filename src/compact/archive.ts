@@ -25,6 +25,12 @@ export function archivePath(sessionId: string, dir?: string): string {
   return join(root, `${sanitiseSessionId(sessionId)}.jsonl`);
 }
 
+/** Keep ordinary paths readable and quote paths containing stub delimiters or escapes. */
+export function archiveReferencePath(sessionId: string, dir?: string): string {
+  const path = archivePath(sessionId, dir);
+  return /[\]\\"\x00-\x1f]/.test(path) ? JSON.stringify(path) : path;
+}
+
 function sanitiseSessionId(id: string): string {
   return id.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) || 'default';
 }

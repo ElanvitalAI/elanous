@@ -18,6 +18,32 @@ test('standalone exact-head remote gate can be reused on the same content or an 
   expect(decidePrGateCache(input({ mainChangedFiles: ['docs/guide.md'] }))).toMatchObject({ decision: 'reuse', reason: 'main-doc-only-outside-radius' });
 });
 
+test('a complete zero-test skip receipt is green while incomplete no-tests evidence stays full', () => {
+  const noTestsSummary = { ...summary, verdict: 'skipped', artifactsUnavailable: 'no-tests', shards: 0, cohort: [], shardsDetail: [] };
+  expect(decidePrGateCache(input({ summary: noTestsSummary })))
+    .toMatchObject({ decision: 'reuse', reason: 'same-content-base', files: [], head, base });
+  expect(decidePrGateCache(input({ summary: noTestsSummary, mainChangedFiles: ['src/a.ts'], sourceDependencyOverlap: false })))
+    .toMatchObject({ decision: 'full', reason: 'author-no-tests-main-code-change', files: [] });
+  const incomplete: unknown[] = [
+    { ...noTestsSummary, exitCode: 1 },
+    { ...noTestsSummary, artifactsUnavailable: 'unsharded' },
+    { ...noTestsSummary, shards: 1 },
+    { ...noTestsSummary, shardsDetail: [{ shardId: 'shard-1' }] },
+    { ...noTestsSummary, introduced: 1 },
+    { ...noTestsSummary, unknown: 1 },
+    { ...noTestsSummary, preconditionUnmet: 1 },
+    { ...noTestsSummary, unrunImporters: 1 },
+    { ...noTestsSummary, cohort: ['src/a.test.ts'] },
+    { ...noTestsSummary, shards: undefined },
+    { ...noTestsSummary, shardsDetail: undefined },
+    { ...noTestsSummary, remoteHost: 'localhost' },
+  ];
+  for (const invalidSummary of incomplete) {
+    expect(decidePrGateCache(input({ summary: invalidSummary })))
+      .toMatchObject({ decision: 'full', reason: 'author-gate-unmeasured-or-incomplete', files: [] });
+  }
+});
+
 test('main movement outside the author cohort reuses; one reached test requests only that file', () => {
   expect(decidePrGateCache(input({ mainChangedFiles: ['src/other.ts'], affectedTests: [] }))).toMatchObject({ decision: 'reuse', reason: 'main-change-outside-pr-radius' });
   expect(decidePrGateCache(input({ mainChangedFiles: ['src/a.ts'], affectedTests: ['src/a.test.ts'] })))

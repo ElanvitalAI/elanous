@@ -77,7 +77,7 @@ describe('PWA /run-skill', () => {
       await dispatchMeta('/rs skill private task', ctx);
       expect(seen[1]).toEqual({ skill: 'skill', kind: 'rejected' });
       expect(JSON.stringify(seen)).not.toContain('private');
-      expect((await dispatchMeta('/mission', ctx))?.text).toContain('PWA 채팅에서 아직 안 됩니다');
+      expect((await dispatchMeta('/mission', ctx))?.text).toContain('모르는 명령입니다: /mission');
       expect((await dispatchMeta('/remaining', { ...ctx, daemon: undefined }))?.text).toBe('남은 양을 읽지 못했습니다');
       expect((await dispatchMeta(':session', ctx))?.text).toBe('session = test');
       expect((await dispatchMeta('/fork invalid', ctx))?.text).toBe('쓰는 법: /fork');

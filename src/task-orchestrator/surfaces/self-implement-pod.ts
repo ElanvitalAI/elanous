@@ -134,6 +134,7 @@ export function podJobFinishedTiming(input: { jobCreatedAt: string | null; jobCo
 // Node allocatable ≈ 343Gi ≫ 25 × 6Gi. One-minute samples can miss the true peak (lower bound).
 import { POD_LAUNCH_FINISHED_EVENT, POD_LAUNCH_STARTED_EVENT, provenanceRowFromAnnotations, siTaskPodProvenance } from './pod-launch-history.js';
 import { podProvenanceMetadata, type PodProvenanceMetadata } from './pod-provenance.js';
+import { recordWarmReuseComparison } from './warm-reuse-evidence.js';
 import { packageVersion } from '../../version/code-revision.js';
 import { minihLocationFrom, podWorkLabels, type PodWorkIdentity, type PodPlacement, type PodPlacementKind, type PodPoolMember, type PodPoolScheduler } from './pod-pool.js';
 import { acquirePodPoolSlot, POD_DISTRIBUTOR_ENTRY_ENV, type PodDistributorAdapter } from './pod-distributor.js';
@@ -187,7 +188,7 @@ import { resolveBedrockRegion, validBedrockRegion } from '../../llm/bedrock.js';
 import { ZAI_POD_EGRESS_LABEL, checkZaiPodSecret, countActiveZaiJobs, decideZaiPodSlot, zaiOverflowChildArgs, zaiPodEnv, type ZaiPodSpec } from './pod-zai-child.js';
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_OPENROUTER_FALLBACK_MODEL, zaiSettingsFromConfig, type ZaiCodingPlanSettings } from '../../llm/zai-coding-plan.js';
 import { normalizePlanningFallbackReason, selectEnhanceLlm } from '../../prompt-enhance/enhance.js';
-import { inferProviderFromModel } from '../../llm.js';
+import { inferProviderFromModel, NoLlmProviderAvailableError } from '../../llm.js';
 import { classifyPodExit, extractPodFailureReason, podChildEvidenceLedgerRow, podChildFailureAttribution, podChildProviderFailureFact, podDeadlineResultMarker, podJobConditionReason, podTerminalRow, POD_TERMINATION_JOB_JSONPATH, POD_TERMINATION_PODS_JSONPATH, readPodTermination, type PodExitClass, type PodTermination } from './pod-failure-reason.js';
 import { kubectlTransientReason, retryKubectlTransient } from './kubectl-transient-retry.js';
 import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
@@ -276,6 +277,10 @@ export interface PodSpawnOptions {
   /** TA warm-reuse shadow evidence/config seams. Missing evidence must stay off; no warm candidate is consumed here. */
   warmReuseConfig?: () => WarmReuseSwitchConfig | undefined;
   warmReuseEvidence?: () => WarmReuseEvidenceByConsumer | undefined;
+  /** Exact source/main pair used by TA admission; writes evidence only after a verified warm attempt. */
+  warmReuseIdentity?: (sourceSha: string) => { head: string; main: string } | undefined;
+  /** Test seam for the durable consumer evidence journal. */
+  warmReuseEvidenceFile?: string;
   /** Optional warm-pool observation/preparation hook. It never replaces the feature implementation Job. */
   warmPodRequest?: WarmPodRequestHook;
   /** SI-SEED-DEFAULT — resolves a default source's branch tip for the mirror seed (test seam · default
@@ -1653,6 +1658,24 @@ export function parsePodRepairExportEvidence(output: string): { exportExitCode: 
     podExitCode: podRc === undefined ? null : Number(podRc), exported, reasonCode };
 }
 
+/** 리뷰 역할 provider 는 «OpenRouter 자격을 같이 실을지»만 가른다 — 발사 조건이 아니다(아래 호출부 주석).
+ *  호스트에 전역 provider 가 하나도 없으면(`NoLlmProviderAvailableError`) 리뷰 provider 를 «모름»으로 두고
+ *  발사를 막지 않는다 — 자식은 자기 provider·자격으로 돈다. 그 판정은 관측으로 남긴다. */
+export function podReviewProvider(
+  config: UserConfig,
+  env: NodeJS.ProcessEnv,
+  spaceId?: string,
+  resolve: typeof resolveRoleLlm = resolveRoleLlm,
+): string | undefined {
+  try {
+    return resolve('review', { config, env }).provider;
+  } catch (error) {
+    if (!(error instanceof NoLlmProviderAvailableError)) throw error;
+    debug.log('self-implement.pod', 'review-provider-unresolved', { spaceId, reason: 'no-host-llm-provider' });
+    return undefined;
+  }
+}
+
 export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplementJobSpawn {
   if (options.repairCommitOnly && (options.source?.kind !== 'pr' || options.source.number !== options.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(options.repairCommitOnly.baseHead))) {
     throw new Error('repair commit-only requires a matching PR source and exact head');
@@ -1954,12 +1977,26 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           catch (error) { debug.log('pod.reuse', 'quarantine-failed', { spaceId: input.spaceId,
             reason: error instanceof Error ? error.message : String(error) }, { level: 'error' });
             quarantineError = error instanceof Error ? error.message : String(error); }
-          return { exitCode: 1, output: '',
+          const reconcileResult: SelfImplementJobDone = { exitCode: 1, output: '',
             ...(hostDisposition ? { disposition: hostDisposition } : {}),
             error: { code: quarantineError
             || (transport.quarantineWorker && !transport.quarantineRecorded)
             ? 'si-warm-worker-state-unknown' : 'si-warm-reconcile-only',
             message: `si-v1 exec may have run; reconcile before retry (${transport.reason})${transport.quarantineError ? `; transport quarantine: ${transport.quarantineError}` : ''}${quarantineError ? `; worker-state-unknown: ${quarantineError}` : ''}` } };
+          // A late response is never adopted, but its identity and all returned hashes were
+          // verified. Preserve the cold Job's terminal-classification side effect before
+          // returning the reconcile-only error; the worker remains quarantined above.
+          if (hostDisposition && transport.validationReason === 'expired'
+            && transport.verifiedBytesForReconcile) {
+            try { return await options.siWarmHostPostprocess!(reconcileResult, attempt, input); }
+            catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              debug.log('pod.reuse', 'host-postprocess-failed', { spaceId: input.spaceId,
+                reason: message }, { level: 'error' });
+              return { ...reconcileResult, error: { code: 'si-warm-host-postprocess-failed', message } };
+            }
+          }
+          return reconcileResult;
         }
         const terminal = new TextDecoder().decode(transport.bytes.terminal);
         const disposition = parseSelfImplementJson(terminal);
@@ -2034,11 +2071,36 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           error: { code: 'si-warm-worker-state-unknown', message: workerStateUnknown } };
         debug.log('pod.reuse', 'child-result', { spaceId: input.spaceId, workerId: command.workerId,
           leaseId: command.leaseId, returnOutcome, stage: disposition.stage ?? null });
+        const recordTaEvidence = (warmResultPassed: boolean, reason: string) => {
+          try {
+            const identity = options.warmReuseIdentity?.(command.sourceSha);
+            if (!identity || identity.head !== command.sourceSha) throw new Error('source-main-identity-unavailable');
+            const leaseValid = returnOutcome === 'returned' && !workerStateUnknown;
+            // A successful TA warm run is only a lease/result observation. Unlike gate and land,
+            // this path does not execute a fresh reference, so it cannot qualify as a match sample.
+            const comparisonReason = warmResultPassed ? 'ta-fresh-reference-unavailable' : reason;
+            recordWarmReuseComparison({ consumer: 'ta', ...identity, lease: {
+              workerId: command.workerId, leaseId: command.leaseId, generation: command.generation,
+              expectedLockHash: command.key.lockHash, workerLockHash: transport.reply!.key.lockHash,
+              leaseValid, canaryPassed: false, agree: false,
+            }, comparison: { reason: comparisonReason },
+            finalized: leaseValid, reason: comparisonReason }, options.warmReuseEvidenceFile);
+            debug.log('pod.warm', 'ta-evidence-recorded', { measured: false, observed: true,
+              reason: comparisonReason, leaseValid });
+          } catch (error) {
+            debug.log('pod.warm', 'ta-evidence-recorded', { measured: false,
+              reason: error instanceof Error ? error.message : 'evidence-write-failed' }, { level: 'warn' });
+          }
+        };
         try {
-          return await options.siWarmHostPostprocess!({ exitCode: transport.reply.exitCode,
+          const result = await options.siWarmHostPostprocess!({ exitCode: transport.reply.exitCode,
             output: log.slice(-4096), disposition: hostDisposition }, attempt, input);
+          recordTaEvidence(result.exitCode === 0 && result.disposition?.ok !== false,
+            result.exitCode === 0 && result.disposition?.ok !== false ? 'warm-ta-observed' : 'warm-ta-result-failed');
+          return result;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          recordTaEvidence(false, 'warm-ta-host-postprocess-failed');
           debug.log('pod.reuse', 'host-postprocess-failed', { spaceId: input.spaceId,
             reason: message }, { level: 'error' });
           return { exitCode: 1, output: log.slice(-4096), disposition: hostDisposition,
@@ -2530,7 +2592,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         /** ZAI 로 입장한 자식도 플랜 한도 오류 뒤 OpenRouter 로 전환할 수 있다. 실행 중 폴백 자격을 발사 전에 확보한다. */
         const openrouterCredentialRequired = openrouter || (zaiChild && zaiLaunchOverage !== 'stop');
         const hostConfig = (options.fallbackConfig ?? getUserConfig)();
-        const reviewProvider = resolveRoleLlm('review', { config: hostConfig, env: { ...env, ...options.armEnv } }).provider;
+        const reviewProvider = podReviewProvider(hostConfig, { ...env, ...options.armEnv }, input.spaceId);
         // A non-OpenRouter child can still run a review role pinned to OpenRouter. Pass that
         // credential through the same Secret path, but don't make it a launch requirement.
         const openrouterCredentialNeeded = openrouterCredentialRequired || reviewProvider === 'openrouter';
@@ -3331,7 +3393,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const waitStartedAt = Date.now();
         let consecutiveJobNotFound = 0;
         let podVanished = false;
-        let stopCapture: { trigger: 'abort-signal' | 'job-not-found'; outcome: string; reason: string; lastStage: string | null; logLines: number; logBytes: number } | null = null;
+        let stopCapture: { trigger: 'abort-signal' | 'job-not-found'; outcome: string; reason: string; lastStage: string | null; logLines: number; logBytes: number; signalReason?: ReturnType<typeof podAbortSignalReasonCode> } | null = null;
         let unmeasurableSince: number | null = null;
         let unmeasurableIncidentRecorded = false;
         for (;;) {
@@ -3357,7 +3419,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
                 return typeof row.stage === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/u.test(row.stage) ? row.stage : null;
               } catch { return null; }
             }).filter((stage): stage is string => stage !== null).at(-1) ?? null;
-            stopCapture = { trigger: 'abort-signal', ...capture, lastStage,
+            stopCapture = { trigger: 'abort-signal', ...capture, lastStage, signalReason: podAbortSignalReasonCode(input.signal),
               logLines: abortSummaryLogs ? abortSummaryLogs.split(/\r?\n/u).filter(Boolean).length : 0,
               logBytes: Buffer.byteLength(abortSummaryLogs) };
             kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=false']);
@@ -4331,6 +4393,15 @@ export function podRunResultLine(logs: string, branches: readonly string[]): str
   if (!branches.length) return result;
   const note = branches.map((branch) => `수확할 브랜치: ${branch}`).join('\n');
   return result ? `${result}\n${note}` : note;
+}
+
+/** Keep cancellation attribution useful without persisting arbitrary AbortSignal.reason text. */
+export function podAbortSignalReasonCode(signal: AbortSignal | undefined): 'not-aborted' | 'user' | 'cascade' | 'timeout' | 'signal:SIGTERM' | 'unspecified' {
+  if (!signal?.aborted) return 'not-aborted';
+  const reason: unknown = signal.reason;
+  if (reason === 'user' || reason === 'cascade' || reason === 'timeout') return reason;
+  if (reason === 'SIGTERM') return 'signal:SIGTERM';
+  return 'unspecified';
 }
 
 export function parseMemSamples(logs: string): Array<{ at: number; cgroupBytes: number | null; top: Array<{ rssKb: number; name: string; cmd?: string }> }> {

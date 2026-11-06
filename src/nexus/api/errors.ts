@@ -6,7 +6,7 @@
 // both consume the JSON the writer dropped under
 // `~/.elanous/nexus/errors/<tabId>/<ts>.json`.
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   deleteErrorSnapshot,
   listErrorSnapshots,

@@ -196,7 +196,7 @@ describe('tree sync decision', () => {
       throw new Error(`unexpected command ${args.join(' ')}`);
     };
     await expect(observeTreeSync(readableTarget, git)).resolves.toEqual({ action: 'pull', reason: 'clean-behind', behind: 1, path: readableTarget, untracked: 0 });
-    expect(calls).toContainEqual(['fetch', '--quiet', 'origin', 'refs/heads/main:refs/remotes/origin/main']);
+    expect(calls).toContainEqual(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
     expect(calls).toContainEqual(['rev-list', '--left-right', '--count', 'HEAD...refs/remotes/origin/main']);
   });
 

@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { preflightParentHost, resolveParentHosts } from '../task-agent/parent-host.js';
 import {
@@ -49,6 +50,42 @@ describe('parent-host production functions over the fake ssh device (HARNESS-PAR
       'version-mismatch: remote 0.2.19 ≠ HQ 0.2.20-dev.0',
       'remote-config-missing', 'remote-pod-pool-unset', 'remote-repo-missing', 'remote-kubectl-missing', 'hq-launch-freeze-active',
     ]);
+  });
+
+  test('계약이 같으면 판 차이는 경고만 하고, 계약 불일치는 어느 축인지 막으며, 계약 없는 옛 원격은 x.y.z 규칙으로 판정한다', () => {
+    const contractFacts = 'ledgerSchema=run-ledger-line/v1\nparentProtocol=parent-host-facts/v1\n';
+    const baseFacts = 'config=1\npodPool=1\nrepo=1\nkubectl=1\n';
+    const run = (remoteVersion: string, extraFacts: string) => {
+      const fixture = { kind: 'preflight-gap-clear' as const, host: 'node-c', cwd: '/srv/elanous', localVersion: '0.2.20-dev.0',
+        facts: `version=${remoteVersion}\n${baseFacts}${extraFacts}` };
+      return preflightParentHost({ target: { host: fixture.host, cwd: fixture.cwd }, localVersion: fixture.localVersion,
+        launchHoldActive: false, ssh: makeScriptedSshDevice([fixture]).ssh });
+    };
+    const driftEvents: unknown[] = [];
+    const off = debug.registerSink({ name: 'parent-host-compat-version-drift-test', emit: (record) => {
+      if (record.category === 'task-agent.parent-host' && record.event === 'version-drift') driftEvents.push(record.data);
+    } });
+    try {
+      const compatible = run('0.2.19', contractFacts);
+      expect(compatible).toMatchObject({ ok: true, gaps: [] });
+      expect(driftEvents).toContainEqual(expect.objectContaining({ remote: '0.2.19', hq: '0.2.20-dev.0' }));
+
+      const incompatible = run('0.2.20', contractFacts.replace('ledgerSchema=run-ledger-line/v1', 'ledgerSchema=run-ledger-line/v2'));
+      expect(incompatible.ok).toBe(false);
+      expect(incompatible.gaps).toContain('compatibility-contract-mismatch: ledger-schema remote run-ledger-line/v2 ≠ HQ run-ledger-line/v1');
+
+      const partialMismatch = run('0.2.20', 'ledgerSchema=run-ledger-line/v2\n');
+      expect(partialMismatch.ok).toBe(false);
+      expect(partialMismatch.gaps).toContain('compatibility-contract-mismatch: ledger-schema remote run-ledger-line/v2 ≠ HQ run-ledger-line/v1');
+      const protocolMismatch = run('0.2.20', 'parentProtocol=parent-host-facts/v2\n');
+      expect(protocolMismatch.ok).toBe(false);
+      expect(protocolMismatch.gaps).toContain('compatibility-contract-mismatch: parent-HQ-protocol remote parent-host-facts/v2 ≠ HQ parent-host-facts/v1');
+      expect(run('0.2.19', 'ledgerSchema=run-ledger-line/v1\n').gaps)
+        .toContain('version-mismatch: remote 0.2.19 ≠ HQ 0.2.20-dev.0');
+
+      expect(run('0.2.20', '').gaps).toEqual([]);
+      expect(run('0.2.19', '').gaps).toContain('version-mismatch: remote 0.2.19 ≠ HQ 0.2.20-dev.0');
+    } finally { off(); }
   });
 
   test('E4: 네 고정 사건이 실제 운영 경로를 돈다 → parent-host-run ⊕ parent-host-evidence · 사건마다 incident row 정확히 1건', async () => {

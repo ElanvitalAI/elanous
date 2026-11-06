@@ -1,4 +1,5 @@
 import { appendRunLedgerEntry } from '../../self-implement/run-ledger.js';
+import { GRAPH_TEMPLATES, pipelineNodeEntryPayload } from '../../self-implement/graph-templates.js';
 import { publishInsideEvent } from './inside-events.js';
 
 export const RESEARCH_GRAPH_ID = 'natural-language-research';
@@ -38,7 +39,12 @@ export function registerResearchRun(runId: string, deps: {
       if (finished) return;
       switch (event.type) {
         case 'enter':
-          emit('pipeline-node-entry', { node: event.node, visit: 1, round: 0 });
+          emit('pipeline-node-entry', {
+            ...pipelineNodeEntryPayload(GRAPH_TEMPLATES[RESEARCH_GRAPH_ID]!, event.node),
+            node: event.node,
+            visit: 1,
+            round: 0,
+          });
           break;
         case 'exit':
           emit('pipeline-node-exit', { node: event.node, outcome: event.outcome });

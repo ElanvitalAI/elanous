@@ -15,12 +15,14 @@ import {
   currentBackend,
   currentBackendId,
 } from './registry.js';
+import { importSecretsFileRaw } from './file-backend.js';
 
 export * from './types.js';
 export * from './registry.js';
 export {
   readSecretsFileRaw as readSecrets,
   writeSecretsFileRaw as writeSecrets,
+  importSecretsFileRaw,
 } from './file-backend.js';
 
 // ---------------------------------------------------------------------------
@@ -41,6 +43,16 @@ export async function deleteSecretAsync(id: string): Promise<boolean> {
 
 export async function listSecretIdsAsync(): Promise<string[]> {
   return currentBackend().list();
+}
+
+/** Imports need a storage-level lock so confirmed name conflicts cannot race with another writer. */
+export async function importSecretBatchAsync(
+  secrets: Readonly<Record<string, string>>,
+  overwrite: boolean,
+  expectedConflicts?: readonly string[],
+): Promise<{ imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean }> {
+  if (currentBackendId() !== 'file') throw new Error('ELANOUS_IMPORT_BACKEND_UNSUPPORTED');
+  return importSecretsFileRaw(secrets, overwrite, expectedConflicts);
 }
 
 // ---------------------------------------------------------------------------

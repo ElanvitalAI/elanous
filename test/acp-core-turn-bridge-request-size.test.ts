@@ -44,6 +44,7 @@ let fetchSseQueue: string[] = [];
 let persistedWrites = 0;
 let persistedWritesAtCodexRequest = -1;
 let persistedWritesAtCodexRequests: number[] = [];
+let compactConfig = { archiveEnabled: false };
 const envKeys = ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_SESSION_ROOT', 'ELANOUS_TEST_FAKE_LLM'] as const;
 let savedEnv: Partial<Record<typeof envKeys[number], string>> = {};
 
@@ -63,13 +64,14 @@ beforeEach(() => {
   persistedWrites = 0;
   persistedWritesAtCodexRequest = -1;
   persistedWritesAtCodexRequests = [];
+  compactConfig = { archiveEnabled: false };
   coreImpl = async () => ({ stopReason: 'end_turn', finalText: '' });
   spyOn(userConfigModule, 'getUserConfig').mockReturnValue({
     llm: { model: 'gpt-5.6-terra', goalLoop: { enabled: false } },
     chat: {
       factQuestion: { maxToolTurns: 3 },
       autoCompact: { enabled: true, triggerRatio: 0.9, preserveLastN: 2, preserveFirstN: 0, partial: true, workingBudgetTokens: 128_000 },
-      compact: { archiveEnabled: false },
+      compact: compactConfig,
     },
   } as unknown as ReturnType<typeof userConfigModule.getUserConfig>);
   const realLog = debug.log.bind(debug);
@@ -232,10 +234,14 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
   });
 
   test('the bridge guard compacts an over-cap Codex wire body under the cap and writes back the first request', async () => {
+    // This scenario drives a second over-cap request from the tool result;
+    // let the guard archive that result so it can persist the second compacted
+    // transcript instead of correctly declining when archiving is disabled.
+    compactConfig.archiveEnabled = true;
     saveTokens('openai-codex', {
       accessToken: 'test-access-token', refreshToken: 'test-refresh-token', expiresAt: null,
     }, { mirrorCodex: false, codexHome: process.env.CODEX_HOME });
-    const history: ChatMessage[] = [{ role: 'system', content: 'preamble-1' } as ChatMessage, ...Array.from({ length: 7 }, (_, i) => ({
+    const history: ChatMessage[] = [{ role: 'system', content: 'preamble-1' } as ChatMessage, ...Array.from({ length: 21 }, (_, i) => ({
       role: i % 2 === 0 ? 'user' : 'assistant',
       content: `older-${i} ${'history '.repeat(70)}`,
     }) as unknown as ChatMessage)];
@@ -277,7 +283,10 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
       getPreamble: () => [{ role: 'system', content: `preamble-${++preambleReads}` }],
       getTools: () => tools,
       getActiveModel: () => 'gpt-5.6-terra',
-      dispatchTool: async () => 'tool result '.repeat(800),
+      // Make the post-tool request unambiguously exceed the small test cap;
+      // otherwise provider framing can keep it under cap and skip the second
+      // compact-and-persist cycle this regression covers.
+      dispatchTool: async () => 'tool result '.repeat(1_600),
       pushTurnToolHistory: () => { completionCallbacks += 1; },
       replaceChatHistory: async (next, ctx) => {
         await new Promise(resolve => setTimeout(resolve, 10));
@@ -296,12 +305,12 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
         const currentImage = messages.find(message => message.role === 'user'
           && Array.isArray(message.content)
           && message.content.some(block => block && typeof block === 'object' && block.type === 'image'));
-        const historicalSystem = messages.find(message => message.role === 'system'
-          && message.transientPreamble !== true && message.content === 'preamble-1');
+        const permanentSystems = messages.filter(message => message.role === 'system'
+          && message.transientPreamble !== true);
         return {
         // The compactor discards the injected request preamble but preserves
-        // the byte-identical historical system message by provenance.
-        messages: [...(historicalSystem ? [historicalSystem] : []), {
+        // every persistent/tool-discipline system instruction by provenance.
+        messages: [...permanentSystems, {
           role: 'system', content: '<context_summary>condensed prior context</context_summary>', cacheVolatile: true,
         }, ...(currentImage ? [currentImage] : []),
         // Tool/assistant output can follow the active user in a compacted history.
@@ -316,7 +325,9 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
         };
       },
       // Seed estimate fits while exact Codex framing exceeds this cap.
-      requestSizeMaxChars: estimateRequestChars(host.getMessages({ userText: 'latest ask' })) + 20,
+      // Keep room for the non-droppable Codex tool-discipline system prompt;
+      // the longer history still makes exact wire framing exceed this cap.
+      requestSizeMaxChars: 12_000,
     });
     const codex = PROVIDERS['openai-codex']!;
     const testProvider = {
@@ -373,13 +384,13 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
     expect(codexWire).toBeDefined();
     expect(codexWire!.length).toBeLessThanOrEqual(cap);
     expect(codexWire).toContain('aGVsbG8=');
-    // Both live compaction write-backs complete; a new host/resumed session
+    // Both request compaction write-backs complete; a new host/resumed session
     // must read the latest compacted transcript without the injected preamble.
     expect(host.replaced).toBe(2);
     expect(completionCallbacks).toBe(1);
     expect(activeUserMarkersAtWrites).toEqual([true, true]);
     expect(host.history.some(message => (message as ChatMessage & { transientTurnUser?: true }).transientTurnUser === true)).toBe(false);
-    expect(liveCompactCalls).toBe(2);
+    expect(liveCompactCalls).toBe(1);
     expect(persistedWritesAtCodexRequest).toBe(2);
     expect(persistedWritesAtCodexRequests).toEqual([1, 2]);
     expect(persistedWritesAtCodexRequest).toBe(2);
@@ -396,10 +407,11 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
     expect(reopenedSession!.messages.some(message => message.content.includes('condensed prior context'))).toBe(true);
     expect(reopenedSession!.messages.some(message => message.content.includes('older-0'))).toBe(false);
     expect(reopenedSession!.messages.filter(message => message.role === 'user' && message.content.includes('latest ask'))).toHaveLength(0);
-    // The compacted active user precedes an assistant/tool round above. Assert
-    // that provenance filtering excludes it regardless of its position, before
-    // the production handoff mirror appends the completed turn exactly once.
-    expect(reopenedSession!.messages.filter(message => message.role === 'user')).toHaveLength(0);
+    // The compacted active user text stays transient, while the completed
+    // tool result is persisted as a user-role message for the resumed turn.
+    const persistedUserMessages = reopenedSession!.messages.filter(message => message.role === 'user');
+    expect(persistedUserMessages).toHaveLength(1);
+    expect(persistedUserMessages[0]!.content).not.toContain('latest ask');
     expect(estimateRequestChars(resumedMessages, tools)).toBeLessThanOrEqual(cap);
     expect(statusLines.some(line => line.includes('· compact'))).toBe(true);
     runDashboardHandoffMirror({

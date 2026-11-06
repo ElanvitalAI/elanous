@@ -16,8 +16,7 @@ import { createInputLagProbe } from './input-lag-probe.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { countInterimDisplay, internalTurnOriginOfText, planInterimDisplay } from './chat/goal-interim.js';
 import { createNextLoopCommand, type NextLoopCommand } from '../tui-client/next-loop-command.js';
-import { handleMissionSlash, type MissionSlashContext } from './slash/mission.js';
-import { handleSignalsSlash } from './slash/signals.js';
+import { handleSignalsSlash, type SignalsSlashContext } from './slash/signals.js';
 import { updatePtyManifestSession } from '../pty-shell/pty-manifest.js';
 
 /** Status-line count of what waits for the running turn — empty when nothing waits. */
@@ -207,99 +206,24 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     });
     observedSessionId = sessionId;
   };
-  const slashHandlers = new Map<string, (args: string[], context: MissionSlashContext) => Promise<void>>();
-  slashHandlers.set('mission', handleMissionSlash);
+  // MISSION-FABRIC-REMOVAL(대표 11-05) — /mission 은 지웠다. 미션 패브릭(autopilot 미션 스토어)은 시뮬레이션 장치로 새로 짓는다.
+  const slashHandlers = new Map<string, (args: string[], context: SignalsSlashContext) => Promise<void>>();
   slashHandlers.set('signals', handleSignalsSlash);
-  const dispatchSlash = async (name: string, args: string[], context: MissionSlashContext): Promise<boolean> => {
+  const dispatchSlash = async (name: string, args: string[], context: SignalsSlashContext): Promise<boolean> => {
     const handler = slashHandlers.get(name);
     if (!handler) return false;
     await handler(args, context);
     return true;
   };
-  const missionWatchTimers = new Set<ReturnType<typeof setInterval>>();
-  let missionWatchesClosed = false;
-  const readyWatchIds = new Set<string>();
-  const runWatchIds = new Set<string>();
-  const startMissionReadyWatch = (missionId: string): void => {
-    if (readyWatchIds.has(missionId)) return;
-    readyWatchIds.add(missionId);
-    pushNotice(`미션 준비 관찰 시작: ${missionId}`);
-    void import('../autopilot/mission-tui-watch.js').then((watch) => {
-      if (missionWatchesClosed) { readyWatchIds.delete(missionId); return; }
-      const baseline = watch.takeMissionReadySnapshot(missionId);
-      let state = watch.createMissionWatchState(baseline, Date.now());
-      const timer = setInterval(() => {
-        const current = watch.takeMissionReadySnapshot(missionId);
-        const result = watch.advanceMissionWatch(state, current, Date.now());
-        state = result.state;
-        for (const event of result.events) {
-          if (event.kind === 'phases') activity.push(`미션 분해 진행 — ${event.count} 페이즈 (${missionId})`);
-          else if (event.kind === 'ready') {
-            activity.push(`미션 준비 완료 — ${event.snapshot.goal}`);
-            activity.push(...watch.missionDescriptionDigest(event.snapshot.description));
-            activity.push(...watch.renderMissionPhaseBoardLines(event.snapshot.phases, { goal: event.snapshot.goal }));
-            activity.push(`검토 후 /mission approve|hold ${missionId}`);
-          } else if (event.kind === 'resolved-elsewhere') activity.push(`미션 ${missionId} 은 다른 서피스에서 해소됨 (status=${event.status})`);
-          else if (event.kind === 'gone') activity.push(`미션 ${missionId} 삭제됨 · 준비 관찰 종료`);
-          else if (event.kind === 'timeout') activity.push(`미션 준비 관찰 타임아웃 · /mission trace ${missionId}`);
-        }
-        if (result.events.length > 0) { activity = activity.slice(-80); render(); }
-        if (result.done) { clearInterval(timer); missionWatchTimers.delete(timer); readyWatchIds.delete(missionId); }
-      }, watch.MISSION_WATCH_INTERVAL_MS);
-      missionWatchTimers.add(timer);
-    }).catch((error: unknown) => {
-      readyWatchIds.delete(missionId);
-      pushNotice(`미션 준비 관찰 실패: ${safeStatusText(error instanceof Error ? error.message : String(error))}`);
-      render();
-    });
-    render();
-  };
-  const startMissionRunWatch = (missionId: string): void => {
-    if (runWatchIds.has(missionId)) return;
-    runWatchIds.add(missionId);
-    pushNotice(`미션 실행 관찰 시작: ${missionId}`);
-    void import('../autopilot/mission-tui-watch.js').then((watch) => {
-      if (missionWatchesClosed) { runWatchIds.delete(missionId); return; }
-      const baseline = watch.takeMissionRunSnapshot(missionId);
-      let state = watch.createMissionRunWatchState(baseline, Date.now());
-      const timer = setInterval(() => {
-        const current = watch.takeMissionRunSnapshot(missionId);
-        const result = watch.advanceMissionRunWatch(state, current, Date.now());
-        state = result.state;
-        for (const event of result.events) {
-          if (event.kind === 'phase') activity.push(watch.renderMissionRunPhaseLine(event));
-          else if (event.kind === 'progress') activity.push(`미션 진행 ${event.phase.index + 1}/${event.total}: ${event.note}`);
-          else if (event.kind === 'finished') activity.push('미션 종결', ...watch.renderMissionRunReportLines(event.snapshot));
-          else if (event.kind === 'gone') activity.push(`미션 ${missionId} 삭제됨 · 실행 관찰 종료`);
-          else if (event.kind === 'timeout') activity.push(`미션 실행 관찰 타임아웃 · /mission trace ${missionId}`);
-        }
-        if (result.events.length > 0) { activity = activity.slice(-80); render(); }
-        if (result.done) { clearInterval(timer); missionWatchTimers.delete(timer); runWatchIds.delete(missionId); }
-      }, watch.MISSION_RUN_WATCH_INTERVAL_MS);
-      missionWatchTimers.add(timer);
-      if (baseline) { activity.push(watch.renderMissionRunFooter(baseline)); render(); }
-    }).catch((error: unknown) => {
-      runWatchIds.delete(missionId);
-      pushNotice(`미션 실행 관찰 실패: ${safeStatusText(error instanceof Error ? error.message : String(error))}`);
-      render();
-    });
-    render();
-  };
-  const missionContext: MissionSlashContext = {
+  const slashContext: SignalsSlashContext = {
     chatLines: activity,
     setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
     muted: (text) => text,
     accent: (text) => text,
     text: (text) => text,
     error: (text) => text,
-    success: (text) => text,
     warning: (text) => text,
     info: (text) => text,
-    subtext: (text) => text,
-    missionTui: {
-      startReadyWatch: startMissionReadyWatch,
-      startRunWatch: startMissionRunWatch,
-    },
   };
 
   // TURN-START-BLOCK-REST — 턴 경계 recorder: showNextTui → runLocalChatTurn 위임 턴의
@@ -1506,13 +1430,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
-        if (
-          submitted === '/mission' || submitted.startsWith('/mission ')
-          || submitted === '/signals' || submitted.startsWith('/signals ')
-        ) {
-          missionContext.chatLines = activity;
+        if (submitted === '/signals' || submitted.startsWith('/signals ')) {
+          slashContext.chatLines = activity;
           const [command = '', ...args] = submitted.slice('/'.length).trim().split(/\s+/);
-          const dispatched = await dispatchSlash(command, args, missionContext);
+          const dispatched = await dispatchSlash(command, args, slashContext);
           if (!dispatched) activity.push('알 수 없는 슬래시 명령');
           status = 'Enter 전송';
           render();
@@ -1536,11 +1457,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     restoreTuiStderrOwner = null;
     if (residueTimer !== null) clearTimeout(residueTimer);
     loopCommand?.dispose();
-    missionWatchesClosed = true;
-    for (const timer of missionWatchTimers) clearInterval(timer);
-    missionWatchTimers.clear();
-    readyWatchIds.clear();
-    runWatchIds.clear();
     wakeup?.dispose();
     if (wakeup) {
       const { setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');

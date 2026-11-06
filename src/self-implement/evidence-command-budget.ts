@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, resolve, sep } from 'node:path';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import { siblingTestPath } from '../self-dev/launch-preflight-text.js';
 
 // A generated evidence check is a smoke test. Large integration files belong in the
@@ -13,20 +14,20 @@ export function resolveEvidenceHeadCommit(seamHead: string | undefined, readHead
 }
 
 function directlyImportsTarget(path: string, source: string, targetSpecifiers: ReadonlySet<string>): boolean {
-  const ast = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, false);
+  const ast = tsApi.createSourceFile(path, source, tsApi.ScriptTarget.Latest, false);
   let found = false;
-  const visit = (node: ts.Node): void => {
+  const visit = (node: TS.Node): void => {
     if (found) return;
-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)
+    if (tsApi.isImportDeclaration(node) && tsApi.isStringLiteral(node.moduleSpecifier)
       && !node.importClause?.isTypeOnly
-      && !(node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings)
+      && !(node.importClause?.namedBindings && tsApi.isNamedImports(node.importClause.namedBindings)
         && !node.importClause.name && node.importClause.namedBindings.elements.every((element) => element.isTypeOnly))) {
       found = targetSpecifiers.has(node.moduleSpecifier.text);
-    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
-      && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0])) {
+    } else if (tsApi.isCallExpression(node) && node.expression.kind === tsApi.SyntaxKind.ImportKeyword
+      && node.arguments.length === 1 && tsApi.isStringLiteral(node.arguments[0])) {
       found = targetSpecifiers.has(node.arguments[0].text);
     }
-    if (!found) ts.forEachChild(node, visit);
+    if (!found) tsApi.forEachChild(node, visit);
   };
   visit(ast);
   return found;

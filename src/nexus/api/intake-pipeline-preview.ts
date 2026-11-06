@@ -31,7 +31,7 @@ import {
 } from '../../intake-plane/pipeline-metrics.js';
 
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 function badRequest(reason: string): Response {
   return jsonResponse({ error: 'bad_request', reason }, 400);

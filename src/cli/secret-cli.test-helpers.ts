@@ -15,6 +15,15 @@ export function createEmptySecretCliMock() {
     getSecret: async (id) => values.get(id),
     listSecrets: async () => [...values.keys()].sort(),
     removeSecret: async (id) => values.delete(id),
+    importSecrets: async (secrets, overwrite, expectedConflicts) => {
+      const conflicts = Object.keys(secrets).filter((id) => values.has(id)).sort();
+      if (expectedConflicts && (conflicts.length !== expectedConflicts.length || conflicts.some((id, index) => id !== [...expectedConflicts].sort()[index]))) {
+        return { imported: false, conflicts, changedSinceConfirmation: true };
+      }
+      if (conflicts.length && !overwrite) return { imported: false, conflicts, changedSinceConfirmation: false };
+      for (const [id, value] of Object.entries(secrets)) values.set(id, value);
+      return { imported: true, conflicts, changedSinceConfirmation: false };
+    },
     verifySecret: async (serviceId) => { verified.push(serviceId); return { result: 'verified', httpStatus: 200 }; },
     storageBackend: () => 'mock-empty',
     initializeBackend: () => {},

@@ -9,6 +9,7 @@
 //
 // 미션 무접촉: 미션 plan/build 코드와 무결합인 재사용 seam 만 호출(세션-드라이브 흐름).
 
+import { observeSelfImplementSoftStopSpace } from './soft-stop-observer.js';
 import type { LLMToolSpec } from '../llm.js';
 import type { ToolRuntime, ToolRuntimeContext } from '../tool-runtime/types.js';
 import type { SelfImplementProgressStage, SelfImplementResult, SelfImplementSeams } from './orchestrator.js';
@@ -58,10 +59,7 @@ let runtimeDeps: SelfImplementRuntimeDeps = {};
 
 // TUI-only observer. The tool call id is furnished by the actual dispatcher;
 // other surfaces and calls without an id cannot register a stop target.
-let softStopSpaceObserver: ((toolCallId: string, spaceId: string) => void) | null = null;
-export function setSelfImplementSoftStopSpaceObserver(observer: typeof softStopSpaceObserver): void {
-  softStopSpaceObserver = observer;
-}
+export { setSelfImplementSoftStopSpaceObserver } from './soft-stop-observer.js';
 
 /** 자식 헤드리스 elanous 의 config/state 격리 + 구현 대기 상한을 주입. */
 export function setSelfImplementRuntimeDeps(d: SelfImplementRuntimeDeps | null): void {
@@ -806,9 +804,9 @@ export const selfImplementRuntime: ToolRuntime<SelfImplementRuntimeRequest, Self
       ...(runtimeDeps.implementMaxWaitSec ? { implementMaxWaitSec: runtimeDeps.implementMaxWaitSec } : {}),
       ...(approvePr ? { approvePr } : {}),
       onProgress: resolveHarnessProgressSink(ctx),
-      ...(ctx.surface === 'tui' && ctx.toolCallId && softStopSpaceObserver ? {
+      ...(ctx.surface === 'tui' && ctx.toolCallId ? {
         onSoftStopSpaceReady: (spaceId: string) => {
-          try { softStopSpaceObserver?.(ctx.toolCallId!, spaceId); } catch { /* UI observer cannot break harness */ }
+          try { observeSelfImplementSoftStopSpace(ctx.toolCallId!, spaceId); } catch { /* UI observer cannot break harness */ }
         },
       } : {}),
     });

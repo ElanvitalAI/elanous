@@ -599,16 +599,18 @@ class DebugLog {
   log(
     category: string,
     event: string,
-    data?: unknown,
+    data?: unknown | (() => unknown),
     opts?: { level?: LogLevel; compact?: CompactOpts },
   ): void {
-    if (!this.isAnySinkEnabled()) return;
+    const lazy = typeof data === 'function';
+    if (!this.isAnySinkEnabled() || (lazy && !this.enabled)) return;
     // OH9 — render-log mute (orthogonal to the level gates). Single
     // short-circuit here covers all sinks (file/chatFile/ring/mirror/
     // extra) so `elanous logs`, log/debug-*.log and log/chat-*.log are
     // cleaned in lock-step. Non-render categories are unaffected — diag
     // stays fully alive.
     if (this._renderSuppressed && isRenderCategory(category)) return;
+    if (typeof data === 'function') data = (data as () => unknown)();
     perf.bumpDebugCall(category);
     const payload = data === undefined
       ? undefined

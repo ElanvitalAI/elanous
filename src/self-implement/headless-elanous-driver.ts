@@ -931,6 +931,8 @@ export interface HeadlessGoalLoopPtyOptions {
   /** Original goal document before the execution prompt is decorated. */
   goalDocument?: string;
   configDir?: string;
+  /** Explicit isolated-child environment overrides (e.g. fake provider devices in SIM worlds). */
+  childEnv?: Readonly<Record<string, string>>;
   /** ★ K run-identity — 이 실행이 속한 per-run join anchor. 미지정 시 상속(env) → 없으면 canonical mint
    *  (`perCallRunId`). 호출자(runSelfImplement)가 지정하면 **리워크 라운드가 하나의 runId 를 공유**해
    *  `elanous self run <runId>` 가 그 self-implement 전체를 조인한다. */
@@ -1339,6 +1341,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
     cols: opts.cols ?? 200, rows: opts.rows ?? 55,
     workdir: opts.cwd,
     env: {
+      ...(opts.childEnv ?? {}),
       ...(opts.stateDir ? { ELANOUS_STATE_DIR: opts.stateDir } : {}),
       ...(process.env.XDG_DATA_HOME?.trim() ? { XDG_DATA_HOME: process.env.XDG_DATA_HOME } : {}),
       [CHILD_LIVENESS_HEARTBEAT_ENV]: resolveChildLivenessHeartbeatPath(opts.cwd),

@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import type { Command } from 'commander';
 import { getUserConfig } from '../user-config.js';
 import { parsePodPool, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
-import { activeResourceLeases, parseResourceLedgerEvents, readResourceLedger, reconcileResourceLeases, resourceLedgerPath, resourceMatrix,
+import { activeResourceLeases, parseResourceLedgerEvents, readResourceLedger, reconcileResourceLeases, reassignResourcePools, resourceLedgerPath, resourceMatrix,
   RESOURCE_LANES, type ResourceLane, type ResourceMeasurement } from '../resource-ledger/resource-ledger.js';
 
 export interface ResourceCommandRunner { (command: string, args: string[], host?: string): { status: number | null; stdout: string; stderr: string } }
@@ -204,6 +204,15 @@ export function buildResourceLedgerSnapshot(deps: Required<Pick<ResourceLedgerCl
 export function registerResourceLedgerCommands(resources: Command, overrides: ResourceLedgerCliDeps = {}): void {
   const deps = { events: overrides.events ?? readResourceLedger, hosts: overrides.hosts ?? defaultResourceHosts,
     run: overrides.run ?? defaultResourceRun, now: overrides.now ?? (() => new Date()) };
+  resources.command('reassign-pools').description('현재 호스트의 활성 풀 선언을 이전 대상 호스트로 원장에 재지정')
+    .requiredOption('--from-host <host>', '이전 호스트').requiredOption('--to-host <host>', '대상 호스트').option('--json', 'JSON 출력')
+    .action((opts: { fromHost: string; toHost: string; json?: boolean }) => {
+      try {
+        const reassigned = reassignResourcePools(opts.fromHost, opts.toHost, deps.now());
+        if (opts.json) console.log(JSON.stringify({ ok: true, reassigned }));
+        else console.log(`resource pools reassigned=${reassigned} ${opts.fromHost}→${opts.toHost}`);
+      } catch (error) { console.error(`resource pool reassignment failed: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+    });
   resources.command('ledger').description('실행 자원 임대 원장 호스트×차선 조회 (읽기 전용)')
     .option('--host <host>', '호스트 필터')
     .option('--lane <lane>', '차선 필터').option('--mission <mission>', '칸·골 id·PR 필터')

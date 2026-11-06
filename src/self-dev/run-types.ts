@@ -125,9 +125,14 @@ export interface SelfDevJobResult {
   providerErrors?: { count: number; provider: string; category: 'quota' | 'credential' | 'request' | 'other' };
   /** Stable child run identity used to join its run-ledger proposal. */
   runId?: string;
+  /** Pod child identity, distinct from this self-implement result's run id. */
+  childRunId?: string;
   /** Self review verdict bound to the PR head observed by the child; absent if either observation is missing. */
   /** TA-LAND-MUSTFIX-ZERO — `mustFixCount` is the review's must-fix list length; absent = unknown (the land gate fails closed). */
   selfReview?: { verdict: 'pass' | 'fail'; head: string; mustFixCount?: number };
+  /** Last observed review verdict and must-fix count; omitted when the review did not run or was not parsed. */
+  reviewVerdict?: 'pass' | 'warn' | 'fail';
+  reviewMustFixCount?: number;
   /** Measured child review history; absence means not observed, not a negative oscillation result. */
   rework?: ReviewRework;
   /** taskId whose review-oscillation repair produced this result (explicit lineage across a new taskId). */

@@ -22,7 +22,7 @@
 import { listPipelineRuns } from '../../intake-plane/pipeline-metrics.js';
 
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 1000;

@@ -19,11 +19,116 @@ function content(chunks: unknown[], kind: string): string[] {
   });
 }
 
+test('DEBUG-GATE-INSIDE-LOG: lazy payload evaluation waits for logger gates', () => {
+  const previousLevel = debug.level();
+  const previousDiagEnabled = debug.isDiagEnabled();
+  const previousRenderSuppressed = debug.isRenderSuppressed();
+  const records: { category: string; event: string }[] = [];
+  const unregister = debug.registerSink({ emit: ({ category, event }) => { records.push({ category, event }); } } as Parameters<typeof debug.registerSink>[0]);
+  let evaluated = 0;
+  try {
+    debug.setLevel('off');
+    debug.log('acp.test', 'lazy-off', () => { evaluated += 1; return { value: 'unused' }; });
+    expect(evaluated).toBe(0);
+
+    debug.setDiagEnabled(true);
+    debug.setRenderSuppressed(true);
+    debug.log('render.frame', 'lazy-muted', () => { evaluated += 1; return { value: 'muted' }; });
+    expect(evaluated).toBe(0);
+
+    debug.setRenderSuppressed(false);
+    debug.log('acp.test', 'lazy-on', () => { evaluated += 1; return { value: 'used' }; });
+    expect(evaluated).toBe(1);
+
+    debug.setLevel('trail');
+    debug.log('acp.test', 'eager-trail', { value: 'preserved' });
+    expect(records.some(({ category, event }) => category === 'acp.test' && event === 'eager-trail')).toBe(true);
+  } finally {
+    unregister();
+    debug.setRenderSuppressed(previousRenderSuppressed);
+    debug.setDiagEnabled(previousDiagEnabled);
+    debug.setLevel(previousLevel);
+  }
+});
+
+test('runAcpServer routes filtered and enabled terminal attachment diagnostics through debug.log', async () => {
+  const bridge = createInProcessAcpBridge();
+  const abort = new AbortController();
+  const previousLevel = debug.level();
+  const previousDiagEnabled = debug.isDiagEnabled();
+  const records: { category: string; event: string; data?: unknown }[] = [];
+  let lazyPayloadEvaluations = 0;
+  const originalLog = debug.log.bind(debug);
+  const logSpy = spyOn(debug, 'log').mockImplementation((category, event, data, opts) => {
+    if (category === 'webterm.acp' && event === 'repl.attachments.dropped' && typeof data === 'function') {
+      const lazyPayload = data as () => unknown;
+      originalLog(category, event, () => {
+        lazyPayloadEvaluations += 1;
+        return lazyPayload();
+      }, opts);
+      return;
+    }
+    originalLog(category, event, data, opts);
+  });
+  const unregister = debug.registerSink({ emit: (record) => { records.push(record); } } as Parameters<typeof debug.registerSink>[0]);
+  debug.setLevel('off');
+  debug.setDiagEnabled(false);
+  const server = runAcpServer({
+    shutdownSignal: abort.signal,
+    transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
+      void onConnection({
+        readable: bridge.a.readable,
+        writable: bridge.a.writable,
+        peerId: 'lazy-log-test',
+        close: async () => { try { await bridge.a.writable.close(); } catch { /* closed */ } },
+      });
+      return {
+        kind: 'in-process', address: 'test://lazy-log',
+        close: async () => { try { await bridge.a.writable.close(); } catch { /* closed */ } },
+      };
+    },
+    runTurn: async () => {},
+  });
+  const client = new ClientSideConnection(() => ({
+    async sessionUpdate() {},
+    async requestPermission() { return { outcome: { outcome: 'cancelled' as const } }; },
+  }), ndJsonStream(bridge.b.writable, bridge.b.readable));
+  try {
+    await client.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const { sessionId } = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await client.extMethod('terminal/repl/exec', {
+      sessionId, line: ':help', attachments: [{}],
+    });
+    expect(logSpy.mock.calls.some(([category, event]) => category === 'webterm.acp' && event === 'repl.attachments.dropped')).toBe(true);
+    expect(records.some(({ category, event }) => category === 'webterm.acp' && event === 'repl.attachments.dropped')).toBe(false);
+    expect(lazyPayloadEvaluations).toBe(0);
+
+    debug.setDiagEnabled(true);
+    await client.extMethod('terminal/repl/exec', {
+      sessionId, line: ':help', attachments: [{}],
+    });
+    expect(lazyPayloadEvaluations).toBe(1);
+    const dropped = records.find(({ category, event }) => category === 'webterm.acp' && event === 'repl.attachments.dropped');
+    expect(dropped?.data).toMatchObject({
+      sessionId, requestedCount: 1, acceptedCount: 0, droppedCount: 1,
+    });
+  } finally {
+    abort.abort();
+    await server;
+    unregister();
+    logSpy.mockRestore();
+    debug.setDiagEnabled(previousDiagEnabled);
+    debug.setLevel(previousLevel);
+  }
+});
+
 test('plain initialize sees model text and real thought, never feedback; aware peer alone receives per-session and HUD envelopes', async () => {
   const bridges = [createInProcessAcpBridge(), createInProcessAcpBridge()];
   const updates: unknown[][] = [[], []];
   const abort = new AbortController();
-  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  const log = spyOn(debug, 'log');
+  const previousLevel = debug.level();
+  debug.setLevel('off');
   const server = runAcpServer({
     shutdownSignal: abort.signal,
     transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
@@ -86,6 +191,7 @@ test('plain initialize sees model text and real thought, never feedback; aware p
     }
     expect(content(updates[0]!, 'agent_thought_chunk')).toContain(bypass.content.text);
     expect(content(updates[1]!, 'agent_thought_chunk').join('')).not.toContain('elanous/feedback/emit');
+    expect(log.mock.calls.some(([category]) => category === 'acp.peer.register')).toBe(true);
     expect(log.mock.calls.filter(([category, event]) => category === 'acp.envelope' && event === 'skipped-plain-client')).toEqual([
       ['acp.envelope', 'skipped-plain-client', { sessionId, kind: 'feedback' }],
       ['acp.envelope', 'skipped-plain-client', { sessionId: plainSession, kind: 'feedback' }],
@@ -93,6 +199,7 @@ test('plain initialize sees model text and real thought, never feedback; aware p
   } finally {
     abort.abort();
     await server;
+    debug.setLevel(previousLevel);
     log.mockRestore();
   }
 });

@@ -15,6 +15,7 @@ import { debug } from '../debug/log.js';
 import { buildUserConfig, resetUserConfig } from '../user-config.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { reviewScopeDiff } from '../self-implement/seams.js';
+import { createTempGitRepo, type TempGitRepo } from '../ux-sim/temp-git-repo.js';
 
 function git(repo: string, ...args: string[]): void {
   const r = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
@@ -23,15 +24,13 @@ function git(repo: string, ...args: string[]): void {
 
 describe('createWorktree — add timeout and stderr diagnostics', () => {
   let tmp: string, repo: string;
+  let fixture: TempGitRepo;
   beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), 'wt-add-timeout-'));
-    repo = join(tmp, 'repo');
-    git(tmp, 'init', '-q', 'repo');
-    git(repo, 'config', 'user.email', 't@t.t');
-    git(repo, 'config', 'user.name', 't');
-    git(repo, 'commit', '--allow-empty', '-qm', 'init');
+    fixture = createTempGitRepo();
+    tmp = fixture.root;
+    repo = fixture.repo;
   });
-  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+  afterEach(() => { fixture.cleanup(); });
 
   const failed = (stderr: string, extra: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> => ({
     pid: 0, output: [], stdout: '', stderr, status: 128, signal: null, ...extra,

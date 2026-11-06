@@ -1,5 +1,6 @@
 // HQ seat folders are disposable views of one bare repository. No scheduler or human checkout is modified here.
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
 import { runGhCliWithResult, type GhCliResult } from '../git-fs/gh-cli.js';
@@ -10,6 +11,7 @@ type HqSeatRole = 'OP' | 'MK' | 'TC' | 'UX';
 const ROLES: readonly string[] = ['OP', 'MK', 'TC', 'UX'];
 interface HouseLedger {
   home: { kind: 'home'; path: string; source: 'cli-resolved' };
+  remoteSeats?: Partial<Record<HqSeatRole, { host: string; path: string }>>;
   // `reclaiming` records the original work branch tip; checkoutTip is needed if done detached a different branch.
   sandboxes: Record<string, { kind: 'sandbox'; path: string; owner: HqSeatRole; reclaiming?: string; checkoutTip?: string; checkoutBranch?: string }>;
 }
@@ -30,6 +32,15 @@ function repository(root: string): string {
   const repo = join(root, 'repo.git');
   if (git(repo, 'rev-parse', '--is-bare-repository') !== 'true') throw new Error(`not a bare repository: ${repo}`);
   return repo;
+}
+
+const MAIN_FETCH_REFSPEC = '+refs/heads/main:refs/remotes/origin/main';
+
+/** Keep the shared mirror's remote-tracking namespace bounded to main, including mirrors created by older versions. */
+function configureMainOnlyFetch(repo: string): void {
+  git(repo, 'config', '--replace-all', 'remote.origin.fetch', MAIN_FETCH_REFSPEC);
+  const refs = git(repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin').split('\n').filter(Boolean);
+  for (const ref of refs) if (ref !== 'refs/remotes/origin/main') git(repo, 'update-ref', '--no-deref', '-d', ref);
 }
 
 function ledgerPath(root: string): string { return join(root, 'house.json'); }
@@ -223,6 +234,163 @@ function removeStaleWorktreeAdmin(repo: string, path: string): void {
 }
 function quoteShell(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
+type RemoteSeatOutcome = 'created' | 'unchanged' | 'refreshed' | 'dirty' | 'removed';
+type RemoteSeatRunner = (host: string, script: string) => { status: number | null; stdout: string; stderr: string; error?: string };
+
+function remoteSeatRunner(host: string, script: string): { status: number | null; stdout: string; stderr: string; error?: string } {
+  const command = `bash -c ${quoteShell(script)}`;
+  const result = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', host, command], {
+    encoding: 'utf8', timeout: 1_800_000,
+  });
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', ...(result.error ? { error: result.error.message } : {}) };
+}
+
+function remoteSeatScript(role: HqSeatRole, action: 'create' | 'refresh' | 'delete', origin: string): string {
+  const common = String.raw`set -euo pipefail
+root="$HOME/elanous-hq"
+repo="$root/repo.git"
+path="$root/seats/${role}"
+`;
+  const registered = String.raw`if [ -L "$path" ]; then echo "seat path is a symlink: $path" >&2; exit 1; fi
+worktrees="$(git --git-dir="$repo" worktree list --porcelain)"
+if ! printf '%s\n' "$worktrees" | grep -Fqx "worktree $path"; then
+  echo "not a registered HQ seat worktree: $path" >&2; exit 1
+fi
+`;
+  const clone = action === 'delete'
+    ? 'echo "remote seat repository is missing: $repo" >&2; exit 1'
+    : `git clone --bare --filter=blob:none --single-branch --branch main ${quoteShell(origin)} "$repo"`;
+  const repositoryCheck = String.raw`if [ -L "$root" ]; then echo "HQ root is a symlink: $root" >&2; exit 1; fi
+if [ ! -d "$root" ]; then echo "HQ root is missing: $root" >&2; exit 1; fi
+if [ -L "$repo" ]; then echo "HQ bare repository is a symlink: $repo" >&2; exit 1; fi
+if [ ! -e "$repo" ]; then echo "remote seat repository is missing: $repo" >&2; exit 1; fi
+if [ "$(git --git-dir="$repo" rev-parse --is-bare-repository)" != true ]; then
+  echo "not a bare repository: $repo" >&2; exit 1
+fi
+remote_origin="$(git --git-dir="$repo" remote get-url origin)"
+if [ "$remote_origin" != ${quoteShell(origin)} ]; then
+  echo "remote origin mismatch; refusing to reuse repository" >&2; exit 1
+fi
+`;
+  const setup = String.raw`if [ -L "$root" ]; then echo "HQ root is a symlink: $root" >&2; exit 1; fi
+mkdir -p "$root"
+if [ -L "$repo" ]; then echo "HQ bare repository is a symlink: $repo" >&2; exit 1; fi
+gh auth setup-git
+if [ ! -e "$repo" ]; then
+  ${clone}
+fi
+if [ "$(git --git-dir="$repo" rev-parse --is-bare-repository)" != true ]; then
+  echo "not a bare repository: $repo" >&2; exit 1
+fi
+remote_origin="$(git --git-dir="$repo" remote get-url origin)"
+if [ "$remote_origin" != ${quoteShell(origin)} ]; then
+  echo "remote origin mismatch; refusing to reuse repository" >&2; exit 1
+fi
+git --git-dir="$repo" config --replace-all remote.origin.fetch ${quoteShell(MAIN_FETCH_REFSPEC)}
+refs="$(git --git-dir="$repo" for-each-ref --format='%(refname)' refs/remotes/origin)"
+while IFS= read -r ref; do
+  [ -z "$ref" ] || [ "$ref" = refs/remotes/origin/main ] || git --git-dir="$repo" update-ref --no-deref -d "$ref"
+done <<< "$refs"
+git --git-dir="$repo" fetch --prune -q origin
+mkdir -p "$root/seats" "$root/work"
+touch "$root/.metadata_never_index" "$root/seats/.metadata_never_index" "$root/work/.metadata_never_index"
+`;
+  if (action === 'delete') {
+    return `${common}if [ ! -e "$path" ] && [ ! -L "$path" ]; then echo HQ_SEAT_RESULT=removed; exit 0; fi
+${repositoryCheck}${registered}if [ -n "$(git -C "$path" status --porcelain --ignored=matching)" ]; then
+  echo "seat has tracked, untracked, or ignored data; refusing to remove: $path" >&2; exit 1
+fi
+if git -C "$path" symbolic-ref --quiet HEAD >/dev/null; then
+  echo "seat HEAD is attached to a branch; refusing to remove: $path" >&2; exit 1
+else
+  rc=$?
+  if [ "$rc" -ne 1 ]; then echo "cannot verify detached seat HEAD: $path" >&2; exit "$rc"; fi
+fi
+head="$(git -C "$path" rev-parse HEAD)"
+if git --git-dir="$repo" merge-base --is-ancestor "$head" refs/remotes/origin/main; then
+  :
+else
+  rc=$?
+  if [ "$rc" -eq 1 ]; then echo "seat has an unmerged commit; refusing to remove: $head" >&2; else echo "cannot verify remote seat HEAD: $head" >&2; fi
+  exit "$rc"
+fi
+git --git-dir="$repo" worktree remove "$path"
+echo HQ_SEAT_RESULT=removed
+`;
+  }
+  const actionBody = action === 'create'
+    ? String.raw`if [ -e "$path" ]; then
+${registered}  echo HQ_SEAT_RESULT=unchanged
+else
+  git --git-dir="$repo" worktree add --detach "$path" refs/remotes/origin/main
+  echo HQ_SEAT_RESULT=created
+fi`
+    : String.raw`if [ ! -e "$path" ]; then echo "remote seat does not exist: $path" >&2; exit 1; fi
+${registered}if [ -n "$(git -C "$path" status --porcelain)" ]; then echo HQ_SEAT_RESULT=dirty; exit 0; fi
+if git -C "$path" symbolic-ref --quiet HEAD >/dev/null; then
+  echo "seat HEAD is attached to a branch; refusing to refresh: $path" >&2; exit 1
+else
+  rc=$?
+  if [ "$rc" -ne 1 ]; then echo "cannot verify detached seat HEAD: $path" >&2; exit "$rc"; fi
+fi
+head="$(git -C "$path" rev-parse HEAD)"
+if git --git-dir="$repo" merge-base --is-ancestor "$head" refs/remotes/origin/main; then
+  git -C "$path" checkout --detach refs/remotes/origin/main
+  echo HQ_SEAT_RESULT=refreshed
+else
+  rc=$?
+  if [ "$rc" -eq 1 ]; then echo HQ_SEAT_RESULT=dirty; else echo "cannot verify remote seat HEAD: $head" >&2; exit "$rc"; fi
+fi`;
+  return `${common}${setup}${actionBody}\n`;
+}
+
+function ensureRemoteSeatLedger(root: string, home?: string): HouseLedger {
+  if (existsSync(ledgerPath(root))) return readLedger(root);
+  if (!home) throw new Error('remote HQ seat requires a resolved home for house.json');
+  mkdirSync(home, { recursive: true });
+  const resolvedHome = realpathSync(home);
+  mkdirSync(root, { recursive: true });
+  return withLedgerLock(root, () => {
+    if (!existsSync(ledgerPath(root))) saveLedger(root, { home: { kind: 'home', path: resolvedHome, source: 'cli-resolved' }, sandboxes: {}, remoteSeats: {} });
+    return readLedger(root);
+  });
+}
+
+function hqRemoteSeat(role: HqSeatRole, root: string, options: { host?: string; refresh?: boolean; delete?: boolean; home?: string; ssh?: RemoteSeatRunner }): { path: string; outcome: RemoteSeatOutcome } {
+  if (options.delete && options.refresh) throw new Error('--delete and --refresh cannot be combined');
+  ensureRemoteSeatLedger(root, options.home);
+  return withLedgerLock(root, () => {
+    const ledger = readLedger(root);
+    const registered = ledger.remoteSeats?.[role];
+    const host = options.host ?? registered?.host;
+    if (!host || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(host)) throw new Error('remote HQ seat requires a valid --host SSH alias');
+    if (registered && registered.host !== host) throw new Error(`remote seat ${role} is registered on ${registered.host}; remove it there before moving to ${host}`);
+    const action = options.delete ? 'delete' : options.refresh ? 'refresh' : 'create';
+    if (action !== 'create' && !registered) throw new Error(`remote seat ${role} is not registered in house.json`);
+    const origin = callerOrigin();
+    const result = (options.ssh ?? remoteSeatRunner)(host, remoteSeatScript(role, action, origin));
+    if (result.status !== 0) {
+      const details = [
+        result.stderr.length > 0 ? `stderr:\n${result.stderr}` : '',
+        result.stdout.length > 0 ? `stdout:\n${result.stdout}` : '',
+        result.error ? `spawn error:\n${result.error}` : '',
+      ].filter(Boolean).join('\n');
+      const reason = details || 'remote command returned no output';
+      try { debug.log('hq.seat', 'remote-operation-failed', { role, host, action, status: result.status, reason }); } catch { /* observation must not change the verdict */ }
+      throw new Error(`remote hq seat ${role} on ${host} (exit ${result.status})\n${reason}`);
+    }
+    const marker = /^HQ_SEAT_RESULT=(created|unchanged|refreshed|dirty|removed)$/m.exec(result.stdout)?.[1] as RemoteSeatOutcome | undefined;
+    if (!marker) throw new Error(`remote hq seat ${role} on ${host}: missing operation result marker\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    updateLedgerLocked(root, current => {
+      current.remoteSeats ??= {};
+      if (marker === 'removed') delete current.remoteSeats[role];
+      else current.remoteSeats[role] = { host, path: `~/elanous-hq/seats/${role}` };
+    });
+    try { debug.log('hq.seat', 'remote-operation', { role, host, action, outcome: marker }); } catch { /* observation must not change the verdict */ }
+    return { path: `${host}:~/elanous-hq/seats/${role}`, outcome: marker };
+  }, 1_830_000);
+}
+
 /** Origin is read from the calling checkout; nothing in that checkout is moved or reconfigured. */
 export function hqInit(options: { root?: string; home?: string } = {}): { root: string; created: boolean; cron: string } {
   const root = resolve(options.root ?? hqRoot());
@@ -260,8 +428,8 @@ export function hqInit(options: { root?: string; home?: string } = {}): { root: 
       git(repo, 'remote', 'add', 'origin', source);
     }
     const main = runGitCommand(repo, ['rev-parse', '--verify', 'refs/remotes/origin/main'], { encoding: 'utf8' });
+    configureMainOnlyFetch(repo);
     if (fresh || remote.status !== 0 || main.status !== 0) {
-      git(repo, 'config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*');
       git(repo, 'fetch', 'origin');
     }
     git(repo, 'rev-parse', '--verify', 'refs/remotes/origin/main');
@@ -273,7 +441,7 @@ export function hqInit(options: { root?: string; home?: string } = {}): { root: 
   // Print only: OP installs the line. Only existing role views can be refreshed; init never creates seats.
   // cron runs with a minimal PATH, so the line names this runtime and CLI entry by absolute path.
   const cli = [process.execPath, process.argv[1]].filter((part): part is string => Boolean(part)).map(part => quoteShell(resolve(part))).join(' ');
-  const script = `git --git-dir=${quoteShell(repo)} fetch origin && ${ROLES.map(role => `( [ ! -d ${quoteShell(join(root, 'seats', role))} ] || ${cli} hq seat ${role} --refresh --root ${quoteShell(root)} )`).join(' && ')}`;
+  const script = `${ROLES.map(role => `( [ ! -d ${quoteShell(join(root, 'seats', role))} ] || ${cli} hq seat ${role} --refresh --root ${quoteShell(root)} )`).join(' && ')}`;
   const cron = `*/5 * * * * ${script}`;
   return { root, created, cron };
 }
@@ -290,9 +458,11 @@ function observeRefreshSkipped(path: string, role: HqSeatRole, reason: 'dirty' |
   } catch { /* observation must not change the verdict */ }
 }
 
-export function hqSeat(value: string, options: { root?: string; refresh?: boolean } = {}): { path: string; outcome: 'created' | 'unchanged' | 'refreshed' | 'dirty' } {
+export function hqSeat(value: string, options: { root?: string; refresh?: boolean; host?: string; delete?: boolean; home?: string; ssh?: RemoteSeatRunner } = {}): { path: string; outcome: RemoteSeatOutcome } {
   const role = roleOf(value);
   const root = resolve(options.root ?? hqRoot());
+  const remoteRegistration = existsSync(ledgerPath(root)) ? readLedger(root).remoteSeats?.[role] : undefined;
+  if (options.host || options.delete || remoteRegistration) return hqRemoteSeat(role, root, options);
   const repo = repository(root);
   readLedger(root);
   const path = join(root, 'seats', role);

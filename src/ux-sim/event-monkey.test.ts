@@ -14,6 +14,7 @@ import {
   EVENT_MONKEY_KINDS,
   EventMonkeyRefusedError,
   emitInjectedEvent,
+  injectAnyEvent,
   renderEventMonkeyKinds,
   resolveEventMonkeyKind,
   type EventMonkeyDebugRow,
@@ -43,6 +44,15 @@ function dbRows(root: string): EventMonkeyDebugRow[] {
 }
 
 describe('event monkey (SIM-EVENT-MONKEY · L0) — real ledger writer into an isolated universe', () => {
+  test('SIM-INJECT-ANY writes arbitrary ledger and log events through production writers and locks injected identity', () => {
+    const root = tempRoot();
+    const result = injectAnyEvent({ stateRoot: root, runId: 'run-sim-inject-any', injectionId: 'inj-contract',
+      ledger: [{ event: 'custom-ledger-event', data: { injected: false, level: 'L9', keep: 7 } }],
+      logs: [{ category: 'custom.category', event: 'custom-log-event', data: { injected: false, level: 'L9', keep: 8 } }] });
+    expect(loadRunLedger(result.runId, runLedgerDir(root))).toEqual([...result.ledgerRows]);
+    expect(result.ledgerRows[0]?.data).toMatchObject({ injected: true, injectionId: 'inj-contract', level: 'L0', runId: result.runId, keep: 7 });
+    expect(dbRows(root)[0]).toMatchObject({ category: 'custom.category', event: 'custom-log-event', data: { injected: true, injectionId: 'inj-contract', level: 'L0', runId: result.runId, keep: 8 } });
+  });
   test('catalog names the six first kinds and each carries consumers', () => {
     expect([...EVENT_MONKEY_KINDS]).toEqual([
       'child-error-long', 'same-cell-reuse-push', 'scope-escape-held', 'no-result-line', 'pr-terminal-null', 'land-slot-wait', 'author-reviewer-precheck',

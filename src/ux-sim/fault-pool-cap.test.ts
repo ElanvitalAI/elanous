@@ -20,7 +20,9 @@ describe('simPoolCap — 결함 주입 «풀 상한 없음»', () => {
     const obs = simPoolCap({ spec: 'pool-node-b@node-b:20,pool-node-c@node-c', running: { 'pool-node-b': 20, 'pool-node-c': 2 } });
     expect(obs.members.map((m) => m.capacityDefaulted)).toEqual([false, true]);
     expect(obs.recommendation).toMatchObject({ recommended: 0, limitedBy: 'pool-cap' });
-    expect(simPoolCap({ spec: 'pool-node-b@node-b:20,pool-node-c@node-c', running: { 'pool-node-b': 20, 'pool-node-c': 0 } }).recommendation.recommended).toBe(2);
+    const admitted = simPoolCap({ spec: 'pool-node-b@node-b:20,pool-node-c@node-c', running: { 'pool-node-b': 20, 'pool-node-c': 0 } }).recommendation;
+    if (!admitted) throw new Error('a pool with available capacity should return a recommendation');
+    expect(admitted.recommended).toBe(2);
   });
 
   test('a member without a Running count is refused, never read as zero', () => {

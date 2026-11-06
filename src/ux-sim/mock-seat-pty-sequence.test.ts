@@ -110,6 +110,19 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 150_000);
 
+  test('next-clear-session: /clear is the same new-session action as /new', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'n03-next-clear-'));
+    try {
+      const r = await runNextTuiScenario({ scenario: 'next-clear-session', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+      expect(r.checks).toEqual({
+        screenClearedWithNewTitle: true, statusNamesPrevious: true, sessionNewObservedOnce: true,
+        nextTurnInNewSession: true, oldSessionKept: true, busyNewRejected: true, busyKeptSession: true,
+        onlyFakeProvider: true, exitedClean: true,
+      });
+      expect(r.logs.rc).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 150_000);
+
   test('next-compact: a seeded long session compacts once before the turn, then /compact once more', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-next-compact-'));
     try {

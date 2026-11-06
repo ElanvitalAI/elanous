@@ -50,7 +50,7 @@ import { DEFAULT_CONTROL_PORT } from '../../src/control-plane/server.js';
 import { createRunScopedWarmControlForward, startWarmControlPortForward } from './warm-control-forward.js';
 import { resolveWarmPoolProfile } from '../../src/self-implement/pod-warm-pool-profile.js';
 import { decideWarmReuse, type WarmReuseSwitchConfig, type WarmReuseEvidence } from '../../src/task-orchestrator/surfaces/pod-warm-switch.js';
-import { invalidateWarmReuseEvidence, recordWarmGateEvidence, type ActualWarmLeaseEvidence } from '../../src/task-orchestrator/surfaces/warm-reuse-evidence.js';
+import { invalidateWarmReuseEvidence, recordWarmReuseComparison, type ActualWarmLeaseEvidence } from '../../src/task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { getUserConfig, userConfigPath } from '../../src/user-config.js';
 import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateJobTerminal, type GateShard } from '../../src/release-loop/gate-shards.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
@@ -395,7 +395,9 @@ export function withWarmGateHooks(opts: GateOptions, config: unknown, injectedRu
     try { await lifecycle.ensure(); }
     catch (error) {
       const reason = safeWarmControlFailureReason(error);
-      debug.log('pod.warm.control-forward', 'unavailable', { reason, fallback: 'fresh-job' }, { level: 'error' });
+      debug.log('pod.warm.control-forward', 'unavailable', { reason, fallback: 'fresh-job',
+        ...(reason === 'provider-config-unavailable' ? { expectedFile: 'warm-pod-provider.json',
+          setup: 'generate this host-local file with scripts/warm-pool-provider-config.ts' } : {}) }, { level: 'error' });
       return { command: null, transport: { status: 'fallback', reason: 'control-unavailable', reply: null } };
     }
     return (controlDependencies.requestReplay ?? requestWarmPodReplay)(input);
@@ -420,7 +422,8 @@ export function resolveWarmProviderConfig(config: unknown): { path: string; sour
   if (configuredPath) return { path: configuredPath, source: 'config' };
 
   const defaultPath = join(dirname(userConfigPath()), 'warm-pod-provider.json');
-  return existsSync(defaultPath) ? { path: defaultPath, source: 'default' } : undefined;
+  // A missing private config is an actionable deployment error, not an ambiguous "no provider" result.
+  return { path: defaultPath, source: 'default' };
 }
 
 export function warmProviderTarget(path: string): { context: string; namespace: string } {
@@ -465,6 +468,8 @@ export interface GateResult {
   commit: string;
   /** Formal receipt fallback decision observed by the real graph-scoped gate. */
   formalReceiptDecision?: string;
+  /** Human-readable decision for a rehearsal receipt considered by this cut. */
+  rehearsalReceiptDecision?: { action: 'reuse-zero' | 'partial-rerun' | 'full-sweep' | 'not-selected'; reason: string };
   introduced: string[];
   preexisting: number;
   /** null = not counted (GATE-SPEED A4: the swept baseline ran only the cut's failing files). */
@@ -523,6 +528,16 @@ const versionPattern = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
 const failureFile = (root: string, version: string) => join(root, 'release', version, 'gate-failures.json');
 /** Judged identities live beside the machine release ledger; gate-failures.json keeps its raw baseline schema. */
 const verdictFile = (root: string, version: string) => join(root, 'release', version, 'gate-verdict.json');
+/** Persist the judged gate record atomically. Shared by gate production and storage-boundary tests. */
+export function writeGateVerdictRecord(path: string, value: Record<string, unknown>): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = join(dirname(path), `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+    chmodSync(temp, 0o600);
+    renameSync(temp, path);
+  } finally { if (existsSync(temp)) rmSync(temp); }
+}
 const WARM_VERDICT_HISTORY_LIMIT = 5;
 const WARM_REPLAY_BUDGET = 3;
 interface WarmVerdictSample { version: string; commit: string; baselineCommit: string; warmShadow: WarmShadowObservation[] }
@@ -698,10 +713,14 @@ async function journalWarmGateShadow(shadow: WarmShadowObservation, commit: stri
   const accepted = head === main && shadow.status === 'observed' && shadow.reason === 'match'
     && shadow.finalized === true && shadow.quarantined === 'no' && !!shadow.leaseEvidence;
   try {
-    recordWarmGateEvidence({ head, main, evidence: shadow.leaseEvidence
-      ? { ...shadow.leaseEvidence, leaseValid: accepted && shadow.leaseEvidence.leaseValid,
-        canaryPassed: accepted && shadow.leaseEvidence.canaryPassed, agree: accepted && shadow.leaseEvidence.agree }
-      : undefined, reason: head === main ? (shadow.reason || shadow.status) : 'head-main-mismatch' });
+    recordWarmReuseComparison({ consumer: 'gate-recheck', head, main,
+      ...(shadow.leaseEvidence ? { lease: { workerId: shadow.leaseEvidence.workerId,
+        leaseId: shadow.leaseEvidence.leaseId, generation: shadow.leaseEvidence.generation,
+        expectedLockHash: shadow.leaseEvidence.expectedLockHash, workerLockHash: shadow.leaseEvidence.workerLockHash,
+        leaseValid: shadow.leaseEvidence.leaseValid, canaryPassed: shadow.leaseEvidence.canaryPassed,
+        agree: shadow.leaseEvidence.agree } } : {}),
+      comparison: { reason: shadow.reason }, finalized: accepted,
+      reason: head === main ? (shadow.reason || shadow.status) : 'head-main-mismatch' });
   } catch (error) {
     debug.log('pod.warm', 'evidence-journal-write-failed', { consumer: 'gate-recheck', reason: String(error) }, { level: 'warn' });
   }
@@ -4015,6 +4034,12 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     if (radius) debug.log('release-loop.gate', 'radius-live-plan', { version: opts.version, reason: radius.reason,
       files: radius.plan?.files.length ?? null, rehearsalRunId: radius.rehearsalRunId ?? null });
     let partial = opts.full ? null : explicitPartial ?? radius?.plan ?? null;
+    if (radius) {
+      const rehearsalPlanSelected = radius.plan !== null && partial === radius.plan;
+      result.rehearsalReceiptDecision = rehearsalPlanSelected
+        ? { action: radius.plan!.kind === 'carry' ? 'reuse-zero' : 'partial-rerun', reason: radius.reason }
+        : { action: opts.full ? 'full-sweep' : 'not-selected', reason: opts.full ? 'explicit full-sweep option' : explicitPartial ? 'explicit partial plan takes precedence' : radius.reason };
+    }
     let trainReceiptPlan: ReturnType<typeof planGateTrainReceiptCarry> = null;
     if (!opts.full && !partial && opts.graphRunId && opts.pod) {
       const receiptPath = gateReceiptRegistryPath(repo);
@@ -4141,7 +4166,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         && typeof partial.preservedShardCount === 'number' ? partial.preservedShardCount : 0,
       fallbackReason: partial ? undefined : partialRead.fallbackReason,
     });
-    if (partial?.kind === 'carry') {
+    const sameHeadRehearsalCarry = partial?.kind === 'carry' && radius?.plan === partial;
+    if (partial?.kind === 'carry' && !sameHeadRehearsalCarry) {
       const carryPriorCommit = partial.priorCommit;
       // The plan alone is not evidence: the old cut and its verdict must still be complete and clean at this SHA.
       if (!verifyDocsOnlyCarry(repo, carryPriorCommit, opts.commit))
@@ -4212,7 +4238,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     let cutRun = await runCut(partial);
     const radiusSelectionMatched = partial?.files && cutRun?.podSweep?.files
       && JSON.stringify([...partial.files].sort()) === JSON.stringify([...cutRun.podSweep.files].sort());
-    if (radius?.plan && (!radiusSelectionMatched
+    if (radius?.plan && radius.plan.kind !== 'carry' && (!radiusSelectionMatched
       || !partialGateImagesMatch(root, opts.version, currentImage!, opts.commit, cutRun?.podSweep))) {
       debug.log('release-loop.gate', 'radius-live-image-drift', { version: opts.version,
         rehearsalRunId: radius.rehearsalRunId, action: 'full-sweep' }, { level: 'warn' });
@@ -4366,7 +4392,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           host: opts.pod ? `pod:${opts.pod.pool}` : opts.remote ?? 'local', retry: 'same-pod-standalone' }) + '\n').join(''), { mode: 0o600 });
       } catch (error) { debug.log('release-loop.gate', 'load-flaky-census-write-failed', { ids: samePodFlaky, error: String(error) }); }
     }
-    if (partial) result.partial = { priorCommit: partial.priorCommit, files: partial.files.length };
+    if (partial && !sameHeadRehearsalCarry) result.partial = { priorCommit: partial.priorCommit, files: partial.files.length };
     cutFailures = cut;
     const baseSha = opts.baselineCommit ?? baselineReleaseCommit(baselineVersion);
     baselineCommitForVerdict = baseSha;
@@ -4742,7 +4768,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       graphPins: gateGraphPins(root, opts.graphRunId) ?? (opts.rehearsalBaseline ? gateSourcePins(repo, opts.commit) : null),
       envFingerprint: gateEnvFingerprint(process.env),
       ...(result.attributionRecheck ? { attributionRecheck: result.attributionRecheck } : {}),
-      fullSweep: result.outcome === 'ok' && cutSweepUsable && !result.partial && !!cutFailures
+      // 대표 11-06: a regression must not void the receipt — passed shards stay reusable; failed files are re-measured from gate-failures.json.
+      fullSweep: result.outcome !== 'error' && cutSweepUsable && !result.partial && !!cutFailures
         && !result.rcNonzeroNoFailures.length && !result.stalledShards?.length && !result.stalledEnv.length
         && !result.unmeasuredRecheckFiles?.length && !result.unmeasuredErrors?.length });
     try {
@@ -4752,32 +4779,20 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       }
       for (const location of roots) {
         const path = verdictFile(location, opts.version);
-        mkdirSync(dirname(path), { recursive: true });
-        const temp = join(dirname(path), `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
-        try {
-          const warmHistory = readWarmVerdictHistory(path) ?? [];
-          writeFileSync(temp, JSON.stringify({ version: opts.version, commit: opts.commit,
-            outcome: result.outcome, ...ids, ...observed, baselineReceipt,
-            ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) }, null, 2) + '\n', { mode: 0o600 });
-          chmodSync(temp, 0o600);
-          renameSync(temp, path);
-        } finally { if (existsSync(temp)) rmSync(temp); }
+        const warmHistory = readWarmVerdictHistory(path) ?? [];
+        writeGateVerdictRecord(path, { version: opts.version, commit: opts.commit,
+          outcome: result.outcome, ...ids, ...observed, baselineReceipt,
+          ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) });
       }
     } catch (error) {
       result.outcome = 'error';
       result.error = `verdict persistence: ${String(error)}`;
       const path = verdictFile(ledger, opts.version);
       try {
-        mkdirSync(dirname(path), { recursive: true });
-        const temp = join(dirname(path), `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
-        try {
-          const warmHistory = readWarmVerdictHistory(path) ?? [];
-          writeFileSync(temp, JSON.stringify({ version: opts.version, commit: opts.commit,
-            outcome: result.outcome, ...ids, ...observed, baselineReceipt,
-            ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) }, null, 2) + '\n', { mode: 0o600 });
-          chmodSync(temp, 0o600);
-          renameSync(temp, path);
-        } finally { if (existsSync(temp)) rmSync(temp); }
+        const warmHistory = readWarmVerdictHistory(path) ?? [];
+        writeGateVerdictRecord(path, { version: opts.version, commit: opts.commit,
+          outcome: result.outcome, ...ids, ...observed, baselineReceipt,
+          ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) });
       } catch (persistenceError) {
         result.error += `; error verdict persistence: ${String(persistenceError)}`;
       }
@@ -4822,6 +4837,7 @@ export function graphGateResult(result: GateResult, graph: boolean) {
     unmeasuredErrors: result.unmeasuredErrors ?? [], abortedShards: result.abortedShards ?? 0,
     verdict: result.outcome === 'ok' ? 'pass' as const : 'fail' as const,
     summary: (result.partial ? `부분 재검 ${result.partial.files}파일(앞 게이트 ${result.partial.priorCommit.slice(0, 9)} 결과 이음) · ` : '')
+      + (result.rehearsalReceiptDecision ? `예행 영수증 ${result.rehearsalReceiptDecision.action} · ${result.rehearsalReceiptDecision.reason} · ` : '')
       + (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed ?? '못 셈(기준선 미루기)'}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}`
       + (result.rcNonzeroNoFailures.length ? ` · ⚠ 종료코드만 비영 ${result.rcNonzeroNoFailures.length}` : '')
       + (result.loadFlaky?.length ? ` · ⚠ 부하 흔들림 ${result.loadFlaky.length}(독립 재실행 통과 · 막지 않음)` : '')

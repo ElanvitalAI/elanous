@@ -4,10 +4,10 @@ devices:
   - fake-clock
 events:
   - at: +5m
-    id: dead-pid-lock
+    id: EV-0042
 steps:
   - inject:
-      id: dead-pid-lock
+      id: EV-0042
       version: 0.2.45
   - observe: release-readiness
 expect:

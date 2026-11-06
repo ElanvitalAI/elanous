@@ -13,6 +13,7 @@ MAIN_ACCEPTANCE_UNMEASURED = '⚪ main 수용 못 쟀다'
 MAIN_ACCEPTANCE_MISSING_BRANCH = '브랜치 없음'
 MAIN_ACCEPTANCE_AMBIGUOUS_MAPPING = '대응 모호'
 MAIN_ACCEPTANCE_COMMAND_FAILURE = '명령 실패'
+MAIN_ACCEPTANCE_STALE_REF = '로컬 ref 낡음'
 
 
 def gh(args, timeout=30):
@@ -229,9 +230,39 @@ def measurement_ref(branch, pr_number=None):
     return branch
 
 
-def measure_main_acceptance(branch, pr_number=None, run=git):
-    """Measure local git only and name why an unmeasured branch cannot be assessed."""
-    revision = measurement_ref(branch, pr_number) if run is git else branch
+def pinned_head_revision(branch, pr_number, head_sha):
+    """PR-HEAD-FETCH-STATELESS: measure the PR's pinned head SHA itself, not a named local ref.
+
+    A named ref (local branch · refs/remotes/origin/pr/N) can lag a rebased PR. When the pinned
+    commit object is local, the SHA is the revision; otherwise an existing named ref is «stale»
+    (it cannot equal a commit we do not have), and no ref at all is «missing».
+    """
+    if git(['cat-file', '-e', f'{head_sha}^{{commit}}']) is not None:
+        return head_sha, None
+    named = [branch] + ([f'refs/remotes/origin/pr/{pr_number}'] if pr_number is not None else [])
+    if any(git(['rev-parse', '--verify', '--quiet', ref]) is not None for ref in named):
+        return None, MAIN_ACCEPTANCE_STALE_REF
+    return None, MAIN_ACCEPTANCE_MISSING_BRANCH
+
+
+_UNPINNED = object()
+
+
+def measure_main_acceptance(branch, pr_number=None, run=git, head_sha=_UNPINNED):
+    """Measure local git only and name why an unmeasured branch cannot be assessed.
+
+    `head_sha` omitted keeps the legacy named-ref lookup for direct callers. Once a caller pins it
+    (main() always does, from gh headRefOid), an absent or malformed SHA is a command failure — never a
+    silent fallback to a named ref that may be stale.
+    """
+    if head_sha is not _UNPINNED and not (isinstance(head_sha, str) and re.fullmatch(r'[0-9a-f]{40}', head_sha)):
+        return MAIN_ACCEPTANCE_UNMEASURED, MAIN_ACCEPTANCE_COMMAND_FAILURE
+    if run is git and head_sha is not _UNPINNED:
+        revision, reason = pinned_head_revision(branch, pr_number, head_sha)
+        if revision is None:
+            return MAIN_ACCEPTANCE_UNMEASURED, reason
+    else:
+        revision = measurement_ref(branch, pr_number) if run is git else branch
     if run is git:
         verified = git_result(['rev-parse', '--verify', '--quiet', revision])
         if verified is None:
@@ -288,7 +319,7 @@ def measure_main_acceptance(branch, pr_number=None, run=git):
 
 
 def main(run=git):
-    raw = gh(['pr', 'list', '--state', 'open', '--limit', '100', '--json', 'number,title,isDraft,headRefName,updatedAt'])
+    raw = gh(['pr', 'list', '--state', 'open', '--limit', '100', '--json', 'number,title,isDraft,headRefName,headRefOid,updatedAt'])
     if not raw.strip():
         print('⛔ PR 목록을 못 얻었다 — 「0건」이 아니라 «못 셌음»이다', file=sys.stderr); return 2
     prs = [p for p in json.loads(raw) if p['isDraft'] and p['headRefName'].startswith('self-impl/')]
@@ -302,7 +333,7 @@ def main(run=git):
         m = re.search(r'(?ms)^## 마지막 리뷰 must-fix\s*$(.*?)(?=^## |\Z)', b)
         n = len([line for line in m.group(1).strip().split('\n') if line.strip().startswith('-')]) if m else 0
         key = classify_draft_body(b); buckets.setdefault(key, []).append(p['number'])
-        acceptance = measure_main_acceptance(p['headRefName'], p['number'], run)
+        acceptance = measure_main_acceptance(p['headRefName'], p['number'], run, head_sha=p.get('headRefOid'))
         acceptance_buckets.setdefault(main_acceptance_bucket(acceptance), []).append(p['number'])
         reason = main_acceptance_reason(acceptance)
         if reason: acceptance_reasons.setdefault(reason, []).append(p['number'])
@@ -313,12 +344,14 @@ def main(run=git):
     for key in (MAIN_ACCEPTED_ALL, MAIN_ACCEPTED_NONE, MAIN_ACCEPTED_PARTIAL, MAIN_ACCEPTANCE_UNMEASURED):
         numbers = acceptance_buckets.get(key, [])
         print(f"  {key:<28} {len(numbers)}건  {' '.join('#'+str(number) for number in numbers)}")
-    for reason in (MAIN_ACCEPTANCE_MISSING_BRANCH, MAIN_ACCEPTANCE_AMBIGUOUS_MAPPING, MAIN_ACCEPTANCE_COMMAND_FAILURE):
+    for reason in (MAIN_ACCEPTANCE_MISSING_BRANCH, MAIN_ACCEPTANCE_STALE_REF, MAIN_ACCEPTANCE_AMBIGUOUS_MAPPING, MAIN_ACCEPTANCE_COMMAND_FAILURE):
         numbers = acceptance_reasons.get(reason, [])
         print(f"    {reason:<24} {len(numbers)}건  {' '.join('#'+str(number) for number in numbers)}")
-    missing_numbers = acceptance_reasons.get(MAIN_ACCEPTANCE_MISSING_BRANCH, [])
+    # PR-HEAD-FETCH-STATELESS: fetch objects only (FETCH_HEAD) — no named destination ref, so a rebased
+    # PR head can never be refused as non-fast-forward; the next run measures the pinned headRefOid itself.
+    missing_numbers = sorted(acceptance_reasons.get(MAIN_ACCEPTANCE_MISSING_BRANCH, []) + acceptance_reasons.get(MAIN_ACCEPTANCE_STALE_REF, []))
     if missing_numbers:
-        refs = ' '.join(f'refs/pull/{number}/head:refs/remotes/origin/pr/{number}' for number in missing_numbers)
+        refs = ' '.join(f'refs/pull/{number}/head' for number in missing_numbers)
         print(f"    가져오기 안내 (실행 안 함): git fetch origin {refs}")
     print("\n  ⛔ ①이라고 「병합 가능」이 아니다 — 브랜치를 돌리고 «반증»까지 하고 판단한다(R-REV3·R-CLM13).")
     print("  ⛔ 오래된 것은 리베이스 비용이 붙는다 — 나이를 같이 본다.")

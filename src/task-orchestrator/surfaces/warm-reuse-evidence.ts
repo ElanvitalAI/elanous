@@ -28,6 +28,8 @@ export interface WarmReuseEvidenceRow {
   leaseValid?: boolean;
   canaryPassed?: boolean;
   agree?: boolean;
+  /** False when the row is an observation without a fresh comparison reference. */
+  comparisonMeasured?: boolean;
   reason?: string;
 }
 
@@ -42,6 +44,38 @@ export interface ActualWarmLeaseEvidence {
   leaseValid: boolean;
   canaryPassed: boolean;
   agree: boolean;
+}
+
+/** Lease evidence measured by the production warm-vs-fresh comparator after worker finalization. */
+export function recordWarmReuseComparison(input: {
+  consumer: WarmReuseEvidenceConsumer; head: string; main: string; pr?: number;
+  lease?: ActualWarmLeaseEvidence;
+  comparison: { reason: string }; finalized: boolean; reason?: string; recordedAt?: string;
+}, path = warmReuseEvidencePath()): void {
+  const matched = input.comparison.reason === 'match';
+  const identityValid = !!input.lease?.workerId && !!input.lease.leaseId
+    && Number.isSafeInteger(input.lease.generation) && !!input.lease.expectedLockHash
+    && !!input.lease.workerLockHash;
+  const evidence: ActualWarmLeaseEvidence | undefined = input.lease ? {
+    ...input.lease,
+    leaseValid: input.finalized && identityValid && input.lease.leaseValid,
+    canaryPassed: matched && input.finalized && input.lease.canaryPassed,
+    agree: matched && input.finalized && input.lease.agree,
+  } : undefined;
+  if (input.consumer === 'gate-recheck') {
+    recordWarmGateEvidence({ head: input.head, main: input.main, evidence,
+      reason: input.reason ?? input.comparison.reason, recordedAt: input.recordedAt }, path);
+    return;
+  }
+  recordWarmReuseEvidence(path, { schema: 1, consumer: input.consumer, ...(input.pr ? { pr: input.pr } : {}),
+    head: input.head, main: input.main, recordedAt: input.recordedAt ?? new Date().toISOString(),
+    // Only a finalized fresh-reference comparison counts as measured. Current production TA
+    // observations use ta-fresh-reference-unavailable; the SIM's paired comparator can still
+    // record a measured TA match/mismatch through this same production writer.
+    comparisonMeasured: input.finalized && (input.comparison.reason === 'match' || input.comparison.reason === 'mismatch'),
+    ...(evidence
+      ? { ...evidence, ...(!matched ? { reason: input.reason ?? input.comparison.reason } : {}) }
+      : { reason: input.reason ?? input.comparison.reason }) });
 }
 
 /** Persist a gate-recheck sample; an unmeasured/mismatched sample supersedes older success. */
@@ -61,7 +95,7 @@ export function recordWarmGateEvidence(
   try {
     write(path, { schema: 1, consumer: 'gate-recheck', head: input.head, main: input.main,
       recordedAt: input.recordedAt ?? new Date().toISOString(),
-      ...(evidence ? evidence : { reason: input.reason ?? (identityMatches ? 'warm-shadow-unmeasured' : 'head-main-mismatch') }) });
+      ...(evidence ?? { reason: input.reason ?? (identityMatches ? 'warm-shadow-unmeasured' : 'head-main-mismatch') }) });
   } catch (error) {
     try { invalidateWarmReuseEvidence(path); }
     catch (invalidateError) {
@@ -124,6 +158,7 @@ function validRow(value: unknown): value is WarmReuseEvidenceRow {
     && (row.leaseValid === undefined || typeof row.leaseValid === 'boolean')
     && (row.canaryPassed === undefined || typeof row.canaryPassed === 'boolean')
     && (row.agree === undefined || typeof row.agree === 'boolean')
+    && (row.comparisonMeasured === undefined || typeof row.comparisonMeasured === 'boolean')
     && (row.reason === undefined || typeof row.reason === 'string');
 }
 
@@ -212,7 +247,7 @@ export function loadWarmReuseEvidenceByConsumer(
     }
     const evidence: WarmReuseEvidence = {
       consecutiveMatchSamples,
-      recentMismatchCount: rows.filter((row) => row.agree === false).length,
+      recentMismatchCount: rows.filter((row) => row.comparisonMeasured !== false && row.agree === false).length,
       ...(typeof latest.leaseValid === 'boolean'
         ? { leaseValid: latest.leaseValid && !!latest.leaseId && !!latest.workerId && Number.isSafeInteger(latest.generation) }
         : {}),
@@ -223,7 +258,8 @@ export function loadWarmReuseEvidenceByConsumer(
     result[consumer as WarmReuseConsumer] = evidence;
     const measured = typeof latest.leaseValid === 'boolean' && !!latest.leaseId && !!latest.workerId
       && Number.isSafeInteger(latest.generation) && typeof latest.canaryPassed === 'boolean'
-      && !!latest.expectedLockHash && !!latest.workerLockHash && typeof latest.agree === 'boolean';
+      && !!latest.expectedLockHash && !!latest.workerLockHash && typeof latest.agree === 'boolean'
+      && latest.comparisonMeasured !== false;
     try { debug.log('pod.warm', 'evidence-supplied', { consumer, measured }); } catch { /* observation only */ }
   }
   return Object.keys(result).length ? result : undefined;

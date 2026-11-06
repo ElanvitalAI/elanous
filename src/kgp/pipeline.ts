@@ -17,7 +17,7 @@
 // src/image-preview.ts (chafa/viu). isKgpTerminal() is the guard.
 
 import { statSync } from 'node:fs';
-import sharp from 'sharp';
+// IMPORT-DIET-LAZY-SDK (2026-11-05): sharp(네이티브)는 실제로 그릴 때만 싣는다.
 import { cellsToPixels, cellSize } from './cell-size.js';
 import {
   uploadSequence,
@@ -110,6 +110,7 @@ async function encodeFromFile(
   //   1. auto-orient (honor EXIF so phone photos aren't sideways)
   //   2. resize to fit max box; preserve aspect; no enlargement
   //   3. emit raw RGBA for the encoder
+  const { default: sharp } = await import('sharp');
   const pipeline = sharp(absPath).rotate(); // rotate() w/o args applies EXIF orientation
   const resized = pipeline.resize({
     width: pxW,

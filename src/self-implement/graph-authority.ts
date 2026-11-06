@@ -2,7 +2,8 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, normalize } from 'node:path/posix';
 import type { GoalType } from './goal-author.js';
 import type { UserConfig } from '../user-config.js';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import {
   GRAPH_SPECS,
   GRAPH_TEMPLATES,
@@ -101,13 +102,13 @@ export interface TestDocumentCoverageAudit {
   readonly violationCount: number;
 }
 
-function isReadFileCall(node: ts.CallExpression): boolean {
-  return ts.isIdentifier(node.expression) && /^readFile(?:Sync)?$/.test(node.expression.text);
+function isReadFileCall(node: TS.CallExpression): boolean {
+  return tsApi.isIdentifier(node.expression) && /^readFile(?:Sync)?$/.test(node.expression.text);
 }
 
-function staticString(node: ts.Expression, bindings: ReadonlyMap<string, string>): string | undefined {
-  if (ts.isStringLiteralLike(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
-  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && /^(?:join|resolve)$/.test(node.expression.text)) {
+function staticString(node: TS.Expression, bindings: ReadonlyMap<string, string>): string | undefined {
+  if (tsApi.isStringLiteralLike(node) || tsApi.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  if (tsApi.isCallExpression(node) && tsApi.isIdentifier(node.expression) && /^(?:join|resolve)$/.test(node.expression.text)) {
     const parts = node.arguments.map((argument) => staticString(argument, bindings));
     const firstKnown = parts.findIndex((part) => part !== undefined);
     if (firstKnown < 0 || parts.slice(firstKnown).some((part) => part === undefined)) return undefined;
@@ -115,42 +116,42 @@ function staticString(node: ts.Expression, bindings: ReadonlyMap<string, string>
     const repositoryPath = value.match(/(?:^|\/)(docs\/.*|\.rules\/.*|DESIGN\.md)$/)?.[1];
     return repositoryPath ?? value;
   }
-  return ts.isIdentifier(node) ? bindings.get(node.text) : undefined;
+  return tsApi.isIdentifier(node) ? bindings.get(node.text) : undefined;
 }
 
 function documentReads(source: string, path: string): string[] {
-  const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+  const file = tsApi.createSourceFile(path, source, tsApi.ScriptTarget.Latest, true);
   const paths = new Set<string>();
-  const visit = (node: ts.Node, bindings: ReadonlyMap<string, string>): void => {
-    if (ts.isSourceFile(node) || ts.isBlock(node)) {
+  const visit = (node: TS.Node, bindings: ReadonlyMap<string, string>): void => {
+    if (tsApi.isSourceFile(node) || tsApi.isBlock(node)) {
       const scope = new Map(bindings);
       for (const statement of node.statements) visit(statement, scope);
       return;
     }
-    if (ts.isVariableStatement(node)) {
-      const isConst = (node.declarationList.flags & ts.NodeFlags.Const) !== 0;
+    if (tsApi.isVariableStatement(node)) {
+      const isConst = (node.declarationList.flags & tsApi.NodeFlags.Const) !== 0;
       for (const declaration of node.declarationList.declarations) {
         if (declaration.initializer !== undefined) visit(declaration.initializer, bindings);
-        if (isConst && ts.isIdentifier(declaration.name) && declaration.initializer !== undefined) {
+        if (isConst && tsApi.isIdentifier(declaration.name) && declaration.initializer !== undefined) {
           const value = staticString(declaration.initializer, bindings);
           if (value !== undefined && bindings instanceof Map) bindings.set(declaration.name.text, value);
         }
       }
       return;
     }
-    if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+    if (tsApi.isFunctionDeclaration(node) || tsApi.isFunctionExpression(node) || tsApi.isArrowFunction(node)) {
       const scope = new Map(bindings);
       for (const parameter of node.parameters) {
-        if (ts.isIdentifier(parameter.name)) scope.delete(parameter.name.text);
+        if (tsApi.isIdentifier(parameter.name)) scope.delete(parameter.name.text);
       }
       if (node.body !== undefined) visit(node.body, scope);
       return;
     }
-    if (ts.isCallExpression(node) && isReadFileCall(node) && node.arguments[0] !== undefined) {
+    if (tsApi.isCallExpression(node) && isReadFileCall(node) && node.arguments[0] !== undefined) {
       const value = staticString(node.arguments[0], bindings);
       if (value !== undefined && /\.(?:md|markdown|txt|rst)$/i.test(value)) paths.add(value);
     }
-    ts.forEachChild(node, (child) => visit(child, bindings));
+    tsApi.forEachChild(node, (child) => visit(child, bindings));
   };
   visit(file, new Map());
   return [...paths];

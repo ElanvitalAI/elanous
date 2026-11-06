@@ -1,0 +1,40 @@
+version: 1
+kind: release-graph
+id: release-introduced-repair
+isolation: test
+input:
+  version: '0.3.1'
+  previousVersion: '0.3.0'
+cases:
+  - id: introduced-three-gate-regressions-hitl
+    fault:
+      node: gate
+      outcome: fail
+      evidence:
+        realGateTriage: true
+        introduced:
+          - 'src/auth/session.test.ts > rejects expired sessions'
+          - 'src/graph/runner.test.ts > preserves failed edge attribution'
+          - 'src/ux-sim/release.test.ts > blocks publish after a gate regression'
+    expect:
+      status: failed
+      mustVisit: [gate, gate-triage, traffic-failed-restore, failed]
+      mustNotVisit: [publish, npm-publish]
+  - id: missing-introduced-identity-stays-unmeasured
+    fault:
+      node: gate
+      outcome: fail
+      evidence: { realGateTriage: true, introduced: [] }
+    expect:
+      status: failed
+      mustVisit: [gate, gate-triage, traffic-failed-restore, failed]
+      mustNotVisit: [publish, npm-publish]
+  - id: absent-introduced-identity-stays-unmeasured
+    fault:
+      node: gate
+      outcome: fail
+      evidence: { realGateTriage: true }
+    expect:
+      status: failed
+      mustVisit: [gate, gate-triage, traffic-failed-restore, failed]
+      mustNotVisit: [publish, npm-publish]

@@ -15,7 +15,8 @@ payload = json.loads(sys.stdin.read())
 if sys.argv[2] == 'classify':
     print(json.dumps(module.classify_draft_body(payload)))
 elif sys.argv[2] == 'measure':
-    print(json.dumps(module.measure_main_acceptance(payload['branch'], payload.get('pr_number'))))
+    kwargs = {'head_sha': payload['head_sha']} if 'head_sha' in payload else {}
+    print(json.dumps(module.measure_main_acceptance(payload['branch'], payload.get('pr_number'), **kwargs)))
 elif sys.argv[2] == 'classify-acceptance':
     print(json.dumps(module.classify_main_acceptance(payload)))
 elif sys.argv[2] == 'measure-metadata-failure':
@@ -25,7 +26,7 @@ elif sys.argv[2] == 'main':
     gh_responses = iter(payload['gh'])
     acceptance = iter(payload.get('acceptance', []))
     module.gh = lambda args: next(gh_responses)
-    module.measure_main_acceptance = lambda branch, pr_number=None, run=module.git: next(acceptance, module.MAIN_ACCEPTANCE_UNMEASURED)
+    module.measure_main_acceptance = lambda branch, pr_number=None, run=module.git, head_sha=None: next(acceptance, module.MAIN_ACCEPTANCE_UNMEASURED)
     sys.exit(module.main())
 elif sys.argv[2] == 'main-real':
     gh_responses = iter(payload['gh'])
@@ -81,8 +82,8 @@ function createRepository() {
 function commit(cwd: string, message: string) { git(cwd, 'add', '.'); git(cwd, 'commit', '-m', message); }
 function syncOriginMain(cwd: string) { git(cwd, 'fetch', 'origin', 'main:refs/remotes/origin/main'); }
 type Acceptance = [string, string | null];
-function measureAcceptance(cwd: string, branch = 'self-impl/topic', pr_number?: number): Acceptance {
-  const result = runPython('measure', { branch, pr_number }, cwd);
+function measureAcceptance(cwd: string, branch = 'self-impl/topic', pr_number?: number, head_sha?: string | null): Acceptance {
+  const result = runPython('measure', head_sha === undefined ? { branch, pr_number } : { branch, pr_number, head_sha }, cwd);
   if (result.exitCode !== 0) throw new Error(result.stderr);
   return JSON.parse(result.stdout) as Acceptance;
 }
@@ -538,31 +539,23 @@ describe('triage-open-drafts main acceptance measurement', () => {
     expect(result.stdout).not.toContain(`${all}                         1건`);
   });
 
-  test('main prints a pull-ref fetch command without executing it, then measures its fetched ref', () => {
+  test('an absent or malformed headRefOid is a command failure, never a fallback to a stale named ref', () => {
     const dir = createRepository();
     git(dir, 'checkout', '-b', 'self-impl/topic');
     writeFileSync(join(dir, 'source.txt'), 'branch-zero\nkeep-a\nkeep-b\nkeep-c\nkeep-d\nkeep-e\nkeep-f\ntwo\n');
-    commit(dir, 'branch source change');
-    const branchCommit = git(dir, 'rev-parse', 'self-impl/topic');
-    git(dir, 'update-ref', 'refs/pull/91/head', branchCommit);
+    commit(dir, 'stale named ref');
+    git(dir, 'update-ref', 'refs/remotes/origin/pr/91', git(dir, 'rev-parse', 'self-impl/topic'));
     git(dir, 'checkout', 'main');
-    writeFileSync(join(dir, 'unrelated-main-noise.txt'), 'always unrelated main line\n');
-    commit(dir, 'main unrelated change');
-    syncOriginMain(dir);
-    git(dir, 'branch', '-D', 'self-impl/topic');
-    const list = JSON.stringify([{ number: 91, title: 'missing branch', isDraft: true, headRefName: 'self-impl/topic', updatedAt: '2026-08-23T00:00:00Z' }]);
-    const first = runPython('main-real', { gh: [list, ''] }, dir);
-    expect(first.exitCode).toBe(0);
-    const firstTrace = JSON.parse(first.stdout.slice(first.stdout.lastIndexOf('{')));
-    expect(firstTrace.exitCode).toBe(0);
-    expect(first.stdout).toMatch(new RegExp(`${unmeasured}\\s+1건\\s+#91`));
-    expect(first.stdout).toContain('git fetch origin refs/pull/91/head:refs/remotes/origin/pr/91');
-    expect(firstTrace.gitCalls).not.toContainEqual(['git', 'fetch', 'origin', 'refs/pull/91/head:refs/remotes/origin/pr/91']);
-    git(dir, 'fetch', 'origin', 'refs/pull/91/head:refs/remotes/origin/pr/91');
-    const second = runPython('main-real', { gh: [list, ''] }, dir);
-    expect(second.exitCode).toBe(0);
-    expect(second.stdout).not.toMatch(new RegExp(`${unmeasured}\\s+1건\\s+#91`));
-    expect(second.stdout).toMatch(new RegExp(`${none}\\s+1건\\s+#91`));
+    for (const head_sha of [null, '', 'not-a-sha', 'ABCDEF']) expect(measureAcceptance(dir, 'self-impl/topic', 91, head_sha)).toEqual([unmeasured, '명령 실패']);
+    for (const headRefOid of [undefined, 'not-a-sha']) {
+      const list = JSON.stringify([{ number: 91, title: 'no pin', isDraft: true, headRefName: 'self-impl/topic', ...(headRefOid === undefined ? {} : { headRefOid }), updatedAt: '2026-11-05T00:00:00Z' }]);
+      const result = runPython('main-real', { gh: [list, ''] }, dir);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toMatch(/명령 실패\s+1건\s+#91/);
+      expect(result.stdout).not.toMatch(new RegExp(`${none}\\s+1건\\s+#91`));
+      const trace = JSON.parse(result.stdout.slice(result.stdout.lastIndexOf('{')));
+      expect(trace.gitCalls).toEqual([]);
+    }
   });
 
   test('main aggregates unmeasured reasons and prints but does not run the pull-ref fetch command', () => {
@@ -574,7 +567,7 @@ describe('triage-open-drafts main acceptance measurement', () => {
     const result = runPython('main', { gh: [list, '', '', ''], acceptance: [[unmeasured, '브랜치 없음'], [unmeasured, '대응 모호'], [unmeasured, '명령 실패']] });
     expect(result.exitCode).toBe(0);
     for (const reason of ['브랜치 없음', '대응 모호', '명령 실패']) expect(result.stdout).toMatch(new RegExp(`${reason}\\s+1건`));
-    expect(result.stdout).toContain('가져오기 안내 (실행 안 함): git fetch origin refs/pull/12/head:refs/remotes/origin/pr/12');
+    expect(result.stdout).toContain('가져오기 안내 (실행 안 함): git fetch origin refs/pull/12/head\n');
   });
 
   test('main calls the measurement while preserving four buckets, population, failure warning, and final warnings', () => {
@@ -590,6 +583,80 @@ describe('triage-open-drafts main acceptance measurement', () => {
     expect(result.stdout).toContain('self-impl draft 4건');
     for (const line of ['① gate PASS · must-fix 0     1건  #1', '② gate PASS · must-fix 있음    1건  #2', '③ gate FAIL                  1건  #3', '④ gate 판정 없음(예산 등)           1건  #4', '⛔ ①이라고 「병합 가능」이 아니다', '⛔ 오래된 것은 리베이스 비용이 붙는다 — 나이를 같이 본다.']) expect(result.stdout).toContain(line);
     expect(result.stdout).toMatch(new RegExp(`${unmeasured}\\s+4건\\s+#1 #2 #3 #4`));
+  });
+
+  // PR-HEAD-FETCH-STATELESS (11-05 열차 관리자 602회 «unmeasured» 사건): a named, non-forced
+  // destination ref is refused as non-fast-forward once the PR is rebased. The printed fetch is
+  // stateless (FETCH_HEAD only) and the measurement pins the gh headRefOid, so a rebase is just a new SHA.
+  function createPullRemote() {
+    const root = mkdtempSync(join(tmpdir(), 'triage-open-drafts-pull-'));
+    tempDirs.push(root);
+    const seed = join(root, 'seed');
+    const remote = join(root, 'remote.git');
+    const local = join(root, 'local');
+    mkdirSync(seed);
+    git(seed, 'init', '--initial-branch=main');
+    git(seed, 'config', 'user.email', 'test@example.com');
+    git(seed, 'config', 'user.name', 'Test');
+    writeFileSync(join(seed, 'source.txt'), 'zero\nkeep-a\nkeep-b\nkeep-c\nkeep-d\nkeep-e\nkeep-f\ntwo\n');
+    commit(seed, 'base');
+    git(root, 'init', '--bare', '--initial-branch=main', remote);
+    git(seed, 'push', '-q', remote, 'main:refs/heads/main');
+    git(root, 'clone', '-q', remote, local);
+    return { root, seed, remote, local };
+  }
+  function pushPullHead(seed: string, remote: string, content: string, message: string) {
+    git(seed, 'checkout', '-q', '--detach', 'main');
+    writeFileSync(join(seed, 'source.txt'), content);
+    commit(seed, message);
+    const sha = git(seed, 'rev-parse', 'HEAD');
+    git(seed, 'push', '-q', '--force', remote, `${sha}:refs/pull/93/head`);
+    return sha;
+  }
+  function runPrintedFetch(cwd: string, stdout: string) {
+    const line = stdout.split('\n').find((entry) => entry.includes('가져오기 안내 (실행 안 함): '));
+    expect(line).toBeDefined();
+    const args = line!.split('가져오기 안내 (실행 안 함): ')[1]!.trim().split(/\s+/);
+    expect(args.slice(0, 3)).toEqual(['git', 'fetch', 'origin']);
+    git(cwd, ...args.slice(1));
+  }
+
+  test('a rebased (force-updated) PR head is re-fetched successfully and its new SHA is measured', () => {
+    const { seed, remote, local } = createPullRemote();
+    const v1 = pushPullHead(seed, remote, 'v1-zero\nkeep-a\nkeep-b\nkeep-c\nkeep-d\nkeep-e\nkeep-f\ntwo\n', 'pr v1');
+    const listFor = (sha: string) => JSON.stringify([{ number: 93, title: 'rebased', isDraft: true, headRefName: 'self-impl/rebased', headRefOid: sha, updatedAt: '2026-11-05T00:00:00Z' }]);
+    const first = runPython('main-real', { gh: [listFor(v1), ''] }, local);
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toMatch(/브랜치 없음\s+1건\s+#93/);
+    runPrintedFetch(local, first.stdout);
+    expect(measureAcceptance(local, 'self-impl/rebased', 93, v1)).toEqual([none, null]);
+    // The incident's refspec: a named ref taken without «+» before the rebase …
+    git(local, 'fetch', 'origin', 'refs/pull/93/head:refs/remotes/origin/pr/93');
+    // … main moves (it accepts v1's hunk), and the PR is rebased onto it: refs/pull/93/head is
+    // force-updated to a commit that does not descend from v1.
+    git(seed, 'checkout', '-q', 'main');
+    writeFileSync(join(seed, 'source.txt'), 'v1-zero\nkeep-a\nkeep-b\nkeep-c\nkeep-d\nkeep-e\nkeep-f\ntwo\n');
+    commit(seed, 'main accepts v1');
+    git(seed, 'push', '-q', remote, 'main:refs/heads/main');
+    git(local, 'fetch', '-q', 'origin');
+    const v2 = pushPullHead(seed, remote, 'v1-zero\nkeep-a\nkeep-b\nkeep-c\nkeep-d\nkeep-e\nkeep-f\nv2-two\n', 'pr v2 rebased');
+    expect(Bun.spawnSync({ cmd: ['git', 'merge-base', '--is-ancestor', v1, v2], cwd: seed }).exitCode).toBe(1);
+    // The stale named ref is reported by name, not measured as if it were the PR head.
+    const stale = runPython('main-real', { gh: [listFor(v2), ''] }, local);
+    expect(stale.exitCode).toBe(0);
+    expect(stale.stdout).toMatch(/로컬 ref 낡음\s+1건\s+#93/);
+    expect(stale.stdout).not.toMatch(new RegExp(`${none}\\s+1건\\s+#93`));
+    // The incident: re-taking the same named ref without «+» is refused as non-fast-forward.
+    const refused = Bun.spawnSync({ cmd: ['git', 'fetch', 'origin', 'refs/pull/93/head:refs/remotes/origin/pr/93'], cwd: local, stdout: 'pipe', stderr: 'pipe' });
+    expect(refused.exitCode).not.toBe(0);
+    expect(new TextDecoder().decode(refused.stderr)).toContain('non-fast-forward');
+    // The printed stateless fetch succeeds after the rebase and the next run measures v2.
+    runPrintedFetch(local, stale.stdout);
+    expect(measureAcceptance(local, 'self-impl/rebased', 93, v2)).toEqual([none, null]);
+    expect(measureAcceptance(local, 'self-impl/rebased', 93, v1)).toEqual([all, null]);
+    const second = runPython('main-real', { gh: [listFor(v2), ''] }, local);
+    expect(second.stdout).toMatch(new RegExp(`${none}\\s+1건\\s+#93`));
+    expect(second.stdout).not.toContain('가져오기 안내');
   });
 
   test('main returns exit code 2 when the PR list cannot be obtained', () => {

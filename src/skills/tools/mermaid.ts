@@ -73,7 +73,10 @@ export function buildMermaidRenderTool(): LLMToolSpec {
   };
 }
 
-export async function dispatchMermaidRender(rawArgs: Record<string, unknown>): Promise<MermaidRenderResult> {
+export async function dispatchMermaidRender(
+  rawArgs: Record<string, unknown>,
+  rendererOverride?: RendererFn,
+): Promise<MermaidRenderResult> {
   const args = validate(rawArgs);
 
   // Strip ``` mermaid fences defensively — even though we say "no
@@ -84,7 +87,7 @@ export async function dispatchMermaidRender(rawArgs: Record<string, unknown>): P
     .replace(/\n```\s*$/, '')
     .trim();
 
-  const renderer = await loadRenderer();
+  const renderer = rendererOverride ?? await loadRenderer();
   if (!renderer) {
     // Probe should have hidden this tool via catalog.onFail='hide',
     // but if the user calls it anyway, return a structured error.

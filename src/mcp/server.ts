@@ -20,7 +20,6 @@
 // point that pipes to process.stdin / process.stdout.
 
 import type { ToolRuntime, ToolSurface, ToolRunResult } from '../tool-runtime/types.js';
-import { registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
 import { dispatchToolByName, listToolRuntimes, getToolRuntime } from '../tool-runtime/registry.js';
 import { findNativeTool } from '../native-tool-catalog.js';
 import { debug } from '../debug/log.js';
@@ -187,7 +186,7 @@ export async function handleMcpRequest(
 
       case 'tools/list': {
         await preloadCoreTools();
-        ensureDefaultMcpToolRuntimes();
+        await ensureDefaultMcpToolRuntimes();
         const surface = ctx.surface ?? 'mcp';
         const runtimes = listToolRuntimes(surface);
         logMcpToolsList(runtimes, surface, ctx.origin);
@@ -197,7 +196,7 @@ export async function handleMcpRequest(
 
       case 'tools/call': {
         await preloadCoreTools();
-        ensureDefaultMcpToolRuntimes();
+        await ensureDefaultMcpToolRuntimes();
         const name = typeof req.params?.name === 'string' ? req.params.name : '';
         if (ctx.tokenScope && !isToolAllowedForScope(name, ctx.tokenScope)) {
           emitProxyCallIntent(name, ctx.origin, false, 'unknown_tool');
@@ -305,8 +304,9 @@ async function preloadCoreTools(): Promise<void> {
 /** Ensure direct MCP transports expose elanous-owned runtimes even before
  * the daemon's broader boot sequence has registered them. Registration is
  * idempotent, so externally registered proxy runtimes remain untouched. */
-function ensureDefaultMcpToolRuntimes(): void {
+async function ensureDefaultMcpToolRuntimes(): Promise<void> {
   if (!getToolRuntime('elanous_autopilot_launch')) {
+    const { registerAllDefaultToolRuntimes } = await import('../tool-runtime/index.js');
     registerAllDefaultToolRuntimes();
   }
 }

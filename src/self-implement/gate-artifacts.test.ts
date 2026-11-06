@@ -245,7 +245,10 @@ describe('self gate --artifact-dir (R2 입력 재료)', () => {
       changedFiles: () => ({ files: ['docs/x.md'], baseRef: 'HEAD' }), exists: () => false, ...quietGates, ...artifactDeps,
     });
     const summary = JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8'));
-    expect(summary).toMatchObject({ head40: HEAD, base40: HEAD, verdict: 'skipped', artifactsUnavailable: 'no-tests', cohort: [], shardsDetail: [] });
+    expect(summary).toMatchObject({
+      head40: HEAD, base40: HEAD, verdict: 'skipped', artifactsUnavailable: 'no-tests', exitCode: 0,
+      shards: 0, cohort: [], shardsDetail: [], introduced: 0, unknown: 0, preconditionUnmet: 0, unrunImporters: 0,
+    });
   });
 
   test('a write failure is one warning line — the verdict and exit code stay', () => {

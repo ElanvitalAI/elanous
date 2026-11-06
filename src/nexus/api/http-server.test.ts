@@ -138,6 +138,64 @@ test('GET /v1/grid is bearer-gated, combines HQ and pool data without writes, an
   } finally { server.stop(); }
 });
 
+test('GRID cache belongs to the server lifetime when the same options and dependencies are reused', async () => {
+  let generation = 1;
+  let poolReads = 0;
+  const grid = {
+    readHq: () => ({ record: { holder: 'mbp', generation, acquiredAt: 1, renewedAt: 2, ttlSeconds: 1500 }, ageSeconds: 3, expired: false }),
+    poolSpec: () => 'node-b:4',
+    measure: () => {
+      poolReads++;
+      return { members: [{ context: 'node-b', capacity: 4, running: generation, pending: 0, reason: null }] as ReturnType<typeof import('../../task-orchestrator/surfaces/pod-lease.js').measurePoolLease>['members'] };
+    },
+  };
+  const options = { ...serverFixture(), startPort: uniquePort(), metaApi: { bearerToken: 'auth', noAuth: false }, grid };
+  let server = startNexusHttpServer(options);
+  const headers = { authorization: 'Bearer auth' };
+  try {
+    const first = await fetch(`${server.url}/v1/grid`, { headers });
+    expect((await first.json() as { hq: { record: { generation: number } }; members: Array<{ running: number }> }))
+      .toMatchObject({ hq: { record: { generation: 1 } }, members: [{ running: 1 }] });
+    expect(poolReads).toBe(1);
+    server.stop();
+    generation = 2;
+    server = startNexusHttpServer(options);
+    const second = await fetch(`${server.url}/v1/grid`, { headers });
+    expect((await second.json() as { hq: { record: { generation: number } }; members: Array<{ running: number }> }))
+      .toMatchObject({ hq: { record: { generation: 2 } }, members: [{ running: 2 }] });
+    expect(poolReads).toBe(2);
+  } finally { server.stop(); }
+});
+
+test('GET /v1/grid preserves the injected kubectl boundary through async measurement', async () => {
+  const calls: string[][] = [];
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'auth', noAuth: false },
+    grid: {
+      readHq: () => ({ record: null, ageSeconds: null, expired: null }),
+      poolSpec: () => 'injected-http:2',
+      kubectl: args => {
+        calls.push([...args]);
+        return { status: 0, stdout: args.includes('nodes')
+          ? JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '64Gi', cpu: '32' }, conditions: [{ type: 'Ready', status: 'True' }] } }] })
+          : JSON.stringify({ items: [] }), stderr: '' };
+      },
+    },
+  });
+  try {
+    const headers = { authorization: 'Bearer auth' };
+    const cold = await fetch(`${server.url}/v1/grid`, { headers });
+    expect(cold.status).toBe(200);
+    expect((await cold.json() as { members: Array<{ reason: string | null }> }).members)
+      .toMatchObject([{ reason: '측정 불가' }]);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const measured = await fetch(`${server.url}/v1/grid`, { headers });
+    expect((await measured.json() as { members: Array<{ context: string; capacity: number; running: number; pending: number }> }).members)
+      .toMatchObject([{ context: 'injected-http', capacity: 2, running: 0, pending: 0 }]);
+    expect(calls).toHaveLength(3);
+  } finally { server.stop(); }
+});
+
 function uniquePort(): number {
   return 43000 + Math.floor(Math.random() * 2000);
 }

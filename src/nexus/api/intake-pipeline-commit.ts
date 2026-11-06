@@ -44,7 +44,7 @@ import {
 import { saveWorkflow as saveWorkflowToDisk } from '../../workflow-runtime/storage.js';
 
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { resolveRealIntakeCallables } from './intake-pipeline-preview.js';
 
 function badRequest(reason: string): Response {

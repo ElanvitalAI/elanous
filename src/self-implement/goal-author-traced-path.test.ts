@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
-import { lintGoalFile, tracedPathReferences } from './goal-author.js';
+import { lintGoalFile, tracedPathReferences, verbatimOriginalAsk } from './goal-author.js';
+import { tracedPathReferences as tracedPathReferencesFromText, verbatimOriginalAsk as verbatimOriginalAskFromText } from './goal-author-text.js';
 
 const goalWithTracedPaths = (paths: string) => `## PROBLEM
 problem
@@ -31,6 +32,29 @@ signals
 `;
 
 describe('lintGoalFile traced paths', () => {
+  test('ignores fenced examples inside the traced-path section and retains surrounding entries', () => {
+    const document = goalWithTracedPaths('```md\n## TRACED PATHS\n- src/in-fenced-example.ts\n```\n- src/actual-target.ts');
+    expect(tracedPathReferencesFromText(document)).toEqual([
+      { path: 'src/actual-target.ts', line: null, endLine: null },
+    ]);
+  });
+
+  test('does not parse a traced-path heading outside the selected section from a fenced example', () => {
+    const document = `\`\`\`md\n## TRACED PATHS\n- src/not-a-real-target.ts\n\`\`\`\n`;
+    expect(tracedPathReferencesFromText(document)).toEqual([]);
+  });
+  test('goal-author re-exports the extracted helper functions unchanged', () => {
+    expect(tracedPathReferences).toBe(tracedPathReferencesFromText);
+    expect(verbatimOriginalAsk).toBe(verbatimOriginalAskFromText);
+  });
+
+  test('extracted helper preserves exclusions and path locators', () => {
+    const document = goalWithTracedPaths('- src/dashboard/input — contains related modules, but searches showed the implementation is elsewhere\n- `src/self-implement/goal-author.ts:2365-2401` — implementation');
+    expect(tracedPathReferencesFromText(document)).toEqual([
+      { path: 'src/self-implement/goal-author.ts', line: 2365, endLine: 2401 },
+    ]);
+  });
+
   test('excludes a related-but-not-here description from traced paths and records its classification', () => {
     const document = goalWithTracedPaths('- src/dashboard/input — contains related modules, but searches showed the implementation is elsewhere');
     const findings = lintGoalFile(document, 'main', { readReferencedFile: () => ({ kind: 'directory' }) });

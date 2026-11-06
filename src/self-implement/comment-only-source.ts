@@ -1,23 +1,24 @@
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 
 /** Exclude importer expansion only when non-comment bytes and comment boundaries
  * are identical. The TypeScript parser finds comments within JSDoc that a bare
  * scanner can misread because their prose contains backticks. */
 export function isCommentOnlySourceChange(before: string, after: string, path: string): boolean {
   if (before === after || !/\.(?:[cm]?[jt]sx?)$/.test(path)) return false;
-  const kind = /\.(?:[cm]?[jt]sx)$/.test(path) ? ts.ScriptKind.TSX
-    : /\.(?:[cm]?js)$/.test(path) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+  const kind = /\.(?:[cm]?[jt]sx)$/.test(path) ? tsApi.ScriptKind.TSX
+    : /\.(?:[cm]?js)$/.test(path) ? tsApi.ScriptKind.JS : tsApi.ScriptKind.TS;
   const collect = (source: string): { masked: string; comments: string[] } | null => {
-    const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, kind);
+    const file = tsApi.createSourceFile(path, source, tsApi.ScriptTarget.Latest, true, kind);
     if (file.parseDiagnostics.length) return null;
-    const ranges = new Map<number, ts.CommentRange>();
-    const add = (found: ts.CommentRange[] | undefined) => {
+    const ranges = new Map<number, TS.CommentRange>();
+    const add = (found: TS.CommentRange[] | undefined) => {
       for (const range of found ?? []) ranges.set(range.pos, range);
     };
-    const visit = (node: ts.Node) => {
-      add(ts.getLeadingCommentRanges(source, node.getFullStart()));
-      add(ts.getTrailingCommentRanges(source, node.getEnd()));
-      ts.forEachChild(node, visit);
+    const visit = (node: TS.Node) => {
+      add(tsApi.getLeadingCommentRanges(source, node.getFullStart()));
+      add(tsApi.getTrailingCommentRanges(source, node.getEnd()));
+      tsApi.forEachChild(node, visit);
     };
     visit(file);
     const comments: string[] = [];

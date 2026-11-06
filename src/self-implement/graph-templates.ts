@@ -2,7 +2,8 @@ import { inspectPipelineGraph, PIPELINE_EDGES_BY_NODE, pipelineGraphVersion, PIP
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import { GOAL_TYPES, type GoalType } from './goal-author.js';
 import type { GraphRunContractSpec } from './graph-run-contract.js';
 import { edgeMapOf, loadGraphTemplates, type GraphEdgeSpec, type GraphNodeContract, type GraphNodeKind, type GraphNodeSpec, type GraphTemplateSpec } from './graph-yaml.js';
@@ -406,19 +407,19 @@ export function pipelineNodeEntryPayload(
   };
 }
 
-function stringLiteralValue(node: ts.Expression): string | undefined {
-  return ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : undefined;
+function stringLiteralValue(node: TS.Expression): string | undefined {
+  return tsApi.isStringLiteral(node) || tsApi.isNoSubstitutionTemplateLiteral(node) ? node.text : undefined;
 }
 
-function isPipelineNodeEntryArguments(args: readonly ts.Expression[]): boolean {
+function isPipelineNodeEntryArguments(args: readonly TS.Expression[]): boolean {
   return args.some((argument) => stringLiteralValue(argument) === 'pipeline-node-entry');
 }
 
-function callUsesPipelineNodeEntryPayload(call: ts.CallExpression): boolean {
+function callUsesPipelineNodeEntryPayload(call: TS.CallExpression): boolean {
   let found = false;
-  const visit = (node: ts.Node): void => {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'pipelineNodeEntryPayload') found = true;
-    ts.forEachChild(node, visit);
+  const visit = (node: TS.Node): void => {
+    if (tsApi.isCallExpression(node) && tsApi.isIdentifier(node.expression) && node.expression.text === 'pipelineNodeEntryPayload') found = true;
+    tsApi.forEachChild(node, visit);
   };
   call.arguments.forEach(visit);
   return found;
@@ -429,14 +430,14 @@ export function directPipelineNodeEntryConstructionViolations(
   sources: Readonly<Record<string, string>>,
 ): readonly string[] {
   return Object.entries(sources).flatMap(([path, source]) => {
-    const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+    const file = tsApi.createSourceFile(path, source, tsApi.ScriptTarget.Latest, true);
     const violations: string[] = [];
-    const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && isPipelineNodeEntryArguments(node.arguments) && !callUsesPipelineNodeEntryPayload(node)) {
+    const visit = (node: TS.Node): void => {
+      if (tsApi.isCallExpression(node) && isPipelineNodeEntryArguments(node.arguments) && !callUsesPipelineNodeEntryPayload(node)) {
         const { line } = file.getLineAndCharacterOfPosition(node.getStart(file));
         violations.push(`${path}:${line + 1}`);
       }
-      ts.forEachChild(node, visit);
+      tsApi.forEachChild(node, visit);
     };
     visit(file);
     return violations;

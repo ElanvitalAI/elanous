@@ -1,6 +1,6 @@
 import { classifyShortQuestion } from '../chat/short-question.js';
 import { getUserConfig } from '../user-config.js';
-import { runCoreTurn } from '../core-turn/index.js';
+import { runCoreTurn } from '../core-turn/run-core-turn.js';
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
 import { maybeImageBearingResult } from '../llm.js';
 import { notifyAgentTurnEnd } from '../web-push/notify-turn-end.js';

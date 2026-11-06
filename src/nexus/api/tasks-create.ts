@@ -6,7 +6,7 @@ import { TaskStore } from '../../task-orchestrator/store.js';
 import { isExternalProvider } from '../../task-orchestrator/external-policy.js';
 import { externalTaskFingerprint } from '../../task-orchestrator/external-fingerprint.js';
 import { isTaskSurface, TASK_DEFAULTS, type TaskPriority } from '../../task-orchestrator/types.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { matchIngestAuthorization } from './ingest-token.js';
 

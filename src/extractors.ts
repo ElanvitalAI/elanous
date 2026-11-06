@@ -8,8 +8,8 @@
 // not the v1 default-function export. Verified at Phase 0 smoke test.
 
 import { readFile } from 'fs/promises';
-import mammoth from 'mammoth';
-import * as XLSX from 'xlsx';
+// IMPORT-DIET-LAZY-SDK (2026-11-05): mammoth·xlsx 는 첨부를 실제로 풀 때만 싣는다 —
+// TUI·CLI 진입이 이 파일을 정적으로 끌어 두 SDK(각 ≈70ms)를 기동마다 적재했다.
 
 import type { Attachment, ContextRegistry } from './context';
 import { loadImageAsAttachment } from './image/utils';
@@ -81,6 +81,7 @@ export async function extractPdf(path: string): Promise<ExtractResult> {
 }
 
 export async function extractDocx(path: string): Promise<ExtractResult> {
+  const { default: mammoth } = await import('mammoth');
   const result = await mammoth.extractRawText({ path });
   return finalize(result.value, { mammothMessages: result.messages.length });
 }
@@ -90,6 +91,7 @@ export async function extractDocx(path: string): Promise<ExtractResult> {
  * Sheets are joined with a `# Sheet: <name>` header for LLM legibility.
  */
 export async function extractXlsx(path: string): Promise<ExtractResult> {
+  const XLSX = await import('xlsx');
   const wb = XLSX.readFile(path);
   const parts: string[] = [];
 

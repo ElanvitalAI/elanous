@@ -54,6 +54,18 @@ cases:
       status: failed
       mustVisit: [cutoff, traffic-failed-restore, failed]
       mustNotVisit: [checklist-gate, gate, publish]
+  - id: cutoff-notes-empty-real-cli
+    mode: cutoff-cli-notes-empty
+    expect:
+      status: failed
+      mustVisit: [cutoff, traffic-failed-restore, failed]
+      mustNotVisit: [export-check, gate, publish]
+  - id: docs-node-real-cli-in-sim
+    mode: docs-node-cli-in-sim
+    expect:
+      status: done
+      mustVisit: [docs, docs-land, verify, done]
+      mustNotVisit: [failed]
   - id: public-export-leak
     fault:
       node: export-check

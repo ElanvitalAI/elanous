@@ -533,26 +533,23 @@ START_SETUP=$INTERACTIVE
 # A fresh installation starts first-run even from a headless SSH session; `--no-setup` remains the opt-out.
 if [ -z "$INSTALLED_VERSION" ] && [ "$RUN_SETUP" -eq 1 ]; then START_SETUP=1; fi
 
-# Run the installed copy with the same consent; never implicitly enable sudo or restart.
-if ELANOUS_INSTALL_PREFIX="$PREFIX" PATH="$PREFIX/bin:$PATH" "$PREFIX/bin/elanous" doctor --fix --yes --setup-tools --json >"$TMP/doctor-setup.json" 2>"$TMP/doctor-setup.err"; then
+# Bootstrap selects only non-sudo tools and PATH; sudo items are printed as a short plan.
+if ELANOUS_INSTALL_PREFIX="$PREFIX" PATH="$PREFIX/bin:$PATH" "$PREFIX/bin/elanous" bootstrap >"$TMP/bootstrap.out" 2>"$TMP/bootstrap.err"; then
+  cat "$TMP/bootstrap.out"
+  cat "$TMP/bootstrap.err" >&2
   echo "$(t 'Setup: prerequisite repairs completed.' '설정: 필수 환경 복구를 완료했습니다.')"
 else
+  cat "$TMP/bootstrap.out"
+  cat "$TMP/bootstrap.err" >&2
   RETRY_BIN=""
   RETRY_ENV_PREFIX=""
   RETRY_ENV_PATH=""
   printf -v RETRY_BIN '%q' "$PREFIX/bin/elanous"
   printf -v RETRY_ENV_PREFIX 'ELANOUS_INSTALL_PREFIX=%q' "$PREFIX"
   printf -v RETRY_ENV_PATH 'PATH=%q' "$PREFIX/bin:$PATH"
-  RETRY_COMMAND="$RETRY_ENV_PREFIX $RETRY_ENV_PATH $RETRY_BIN doctor --fix --yes --setup-tools"
-  # Only the known unprivileged git-install case is non-blocking: doctor must report an
-  # otherwise healthy setup, and the failed repair must specifically be git installation.
-  DOCTOR_RESULT_HELPER="$PREFIX/current/node_modules/elanous/scripts/install-doctor-result.ts"
-  if [ "$SUDO" != '' ] && bun "$DOCTOR_RESULT_HELPER" "$TMP/doctor-setup.json" >/dev/null 2>&1; then
-    echo "$(t "Git could not be installed without sudo; continue setup and retry later: $RETRY_COMMAND" "sudo 권한이 없어 git 자동 설치를 건너뜁니다. 설정을 계속한 뒤 나중에 다시 실행하세요: $RETRY_COMMAND")" >&2
-  else
-    echo "$(t "Setup failed; retry: $RETRY_COMMAND" "설정 실패; 다시 시도: $RETRY_COMMAND")" >&2
-    exit 1
-  fi
+  RETRY_COMMAND="$RETRY_ENV_PREFIX $RETRY_ENV_PATH $RETRY_BIN bootstrap"
+  echo "Bootstrap failed; retry: $RETRY_COMMAND" >&2
+  exit 1
 fi
 
 # Keep the remaining next steps that automatic prerequisite repair does not perform.

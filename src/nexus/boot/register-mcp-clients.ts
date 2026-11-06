@@ -27,7 +27,8 @@
 //     child processes get SIGTERM (+ SIGKILL fallback) before
 //     daemon exit.
 
-import type { McpServerSpec } from '../../user-config.js';
+import type { AsideConfig, McpServerSpec } from '../../user-config.js';
+import { asideTargetSshCommand, beginAsideRemoteTargetsConfiguration, createAsideRemoteRouter, sanitizeAsideObservabilityValue, sanitizeAsideObservabilityText, setAsideRemoteRouter, setAsideRemoteTargetsConfigured, type AsideTargetHealth } from '../../aside/remote-targets.js';
 import { McpClient, McpConnectionError, type McpCallMeta, type McpTool, type McpToolCallResult } from '../../mcp/client.js';
 import {
   createMcpProxyRuntime,
@@ -52,6 +53,8 @@ export interface McpClientsHandle {
   registered: number;
   /** Per-server diagnostic. Indexed by `spec.id`. */
   perServer: Record<string, McpServerBootResult>;
+  /** Target-aware Aside dispatcher, installed for the lifetime of this handle. */
+  asideRouter?: ReturnType<typeof createAsideRemoteRouter>;
   // ⛔ 초판은 여기에 `authorizer` 를 노출했다. ***테스트 밖 읽는 자가 «하나도» 없었다*** —
   //    리뷰가 4라운드 연속 그것을 DEAD 표면으로 지적했고 그것이 이 골이 죽은 직접 원인이다.
   //    ⇒ 노출하지 않는다. 허가 상태는 「등록된 런타임이 거부하나」로 «행동»으로 관측한다.
@@ -109,6 +112,7 @@ export function classifyMcpConnectFailure(err: unknown): McpConnectFailureClass 
 
 export interface RegisterMcpClientsOpts {
   servers: McpServerSpec[];
+  aside?: AsideConfig;
   /** Defaults to `console.warn` for failures + `console.info` for the
    *  one-line success summary. Tests inject a recorder. */
   logger?: McpBootLogger;
@@ -324,6 +328,9 @@ export interface McpBootLogger {
 export async function registerMcpClients(
   opts: RegisterMcpClientsOpts,
 ): Promise<McpClientsHandle> {
+  const asideTargetsConfigured = (opts.aside?.targets.length ?? 0) > 0;
+  const asideOwner = {};
+  beginAsideRemoteTargetsConfiguration(asideTargetsConfigured, asideOwner);
   const logger = opts.logger ?? defaultLogger();
   const register = opts.registerRuntime ?? registerToolRuntime;
   const unregister = opts.unregisterRuntime ?? unregisterToolRuntime;
@@ -353,8 +360,11 @@ export async function registerMcpClients(
   };
   const bootLogger = (id: string) => (event: string, data?: Record<string, unknown>) => {
     try {
-      const safe = data ? Object.fromEntries(Object.entries(data).map(([key, value]) =>
+      const pluginSafe = data ? Object.fromEntries(Object.entries(data).map(([key, value]) =>
         [key, typeof value === 'string' ? redactPluginValues(value) : value])) : {};
+      const safe = id.startsWith('aside-target-')
+        ? sanitizeAsideObservabilityValue(pluginSafe) as Record<string, unknown>
+        : pluginSafe;
       debug.log('mcp.client.boot', event, { id, ...safe });
     } catch { /* logger must never throw the boot */ }
   };
@@ -421,6 +431,8 @@ export async function registerMcpClients(
   const clients: McpClient[] = [];
   const perServer: Record<string, McpServerBootResult> = {};
   let registered = 0;
+  let asideRouter: ReturnType<typeof createAsideRemoteRouter> | undefined;
+  const asideRemoteTools = new Map<string, McpTool>();
 
   // ── CLASSIC-IDLE-MCP-LAZY ────────────────────────────────────────────────
   // classic TUI 는 MCP 서버 둘(xcodebuildmcp · aside mcp)을 «기동 때» 띄워
@@ -488,6 +500,12 @@ export async function registerMcpClients(
   }
 
   for (const spec of opts.servers) {
+    // A configured remote target set owns the stable Aside surface. Never
+    // expose a local Aside proxy beside it or let calls silently fall back.
+    if (asideTargetsConfigured && spec.id === 'aside') {
+      perServer[spec.id] = { status: 'disabled', toolCount: 0 };
+      continue;
+    }
     const serverHandshakeTimeoutMs = spec.handshakeTimeoutMs ?? handshakeTimeoutMs;
     if (spec.enabled === false) {
       perServer[spec.id] = { status: 'disabled', toolCount: 0 };
@@ -499,11 +517,21 @@ export async function registerMcpClients(
       if (spec.transport === 'stdio' && (!opts.createClient || spec.id === 'aside')) {
         const originalCallTool = client.callTool.bind(client);
         client.callTool = async (name: string, args: Record<string, unknown>, meta?: McpCallMeta): Promise<McpToolCallResult> => {
+          if (spec.id === 'aside' && name === 'exec' && (opts.aside?.targets.length ?? 0) > 0) {
+            if (!asideRouter) throw new Error('Aside targets are initializing');
+            const { target_id: targetId, context, ...remoteArgs } = args;
+            return await asideRouter.call('aside.repl', remoteArgs, {
+              ...(typeof targetId === 'string' ? { targetId } : {}),
+              ...(typeof context === 'string' ? { context } : {}),
+              capability: 'repl',
+            }) as McpToolCallResult;
+          }
           // Aside test clients use this same invocation boundary but bypass production credential injection.
           const values = opts.createClient ? [] : injectedValuesByServer.get(spec.id) ?? [];
           const isAsideExec = spec.id === 'aside' && name === 'exec';
           const runId = isAsideExec ? (meta?.elanousRunId ?? getHarnessRunId()).trim() : '';
           const reason = isAsideExec ? asideReason(args) : null;
+          const observedReason = reason ? sanitizeAsideObservabilityText(reason).slice(0, 240) : null;
           const ledger = isAsideExec && runId ? asideLedgerFor() : undefined;
           const now = () => new Date().toISOString();
           const appendReceipt = (entry: AsideRoundtripEntry) => {
@@ -512,9 +540,9 @@ export async function registerMcpClients(
           };
           const callArgs = isAsideExec && runId ? asidePrompt(args, runId, reason) : args;
           if (isAsideExec && runId) {
-            try { debug.log('mcp-client.aside', 'exec-request', { runId, reason, toolName: name }); }
+            try { debug.log('mcp-client.aside', 'exec-request', { runId, reason: observedReason, toolName: name }); }
             catch { /* observability is best-effort */ }
-            appendReceipt({ runId, phase: 'call', toolName: name, reason, at: now() });
+            appendReceipt({ runId, phase: 'call', toolName: name, reason: observedReason, at: now() });
           }
           try {
             const result = await originalCallTool(name, callArgs, meta);
@@ -522,20 +550,24 @@ export async function registerMcpClients(
               const isError = result.isError === true;
               const classification = isError ? 'mcp-server-error' : undefined;
               const outputLength = asideTextLength(result);
-              appendReceipt({ runId, phase: 'result', toolName: name, reason, at: now(), ok: !isError, ...(classification ? { classification } : {}), outputLength });
-              try { debug.log('mcp-client.aside', 'exec-result', { runId, reason, toolName: name, ok: !isError, ...(classification ? { classification } : {}), isError, outputLength }); }
+              appendReceipt({ runId, phase: 'result', toolName: name, reason: observedReason, at: now(), ok: !isError, ...(classification ? { classification } : {}), outputLength });
+              try { debug.log('mcp-client.aside', 'exec-result', { runId, reason: observedReason, toolName: name, ok: !isError, ...(classification ? { classification } : {}), isError, outputLength }); }
               catch { /* observability is best-effort */ }
             }
             return maskInjectedValues(result, values) as McpToolCallResult;
           } catch (err) {
             if (isAsideExec && runId) {
               const errorClass = err instanceof Error ? err.name : 'unknown';
-              appendReceipt({ runId, phase: 'result', toolName: name, reason, at: now(), ok: false, classification: 'mcp-transport-error', errorClass });
-              try { debug.log('mcp-client.aside', 'exec-error', { runId, reason, toolName: name, callToolRejected: true, errorClass }); }
+              appendReceipt({ runId, phase: 'result', toolName: name, reason: observedReason, at: now(), ok: false, classification: 'mcp-transport-error', errorClass });
+              try { debug.log('mcp-client.aside', 'exec-error', { runId, reason: observedReason, toolName: name, callToolRejected: true, errorClass }); }
               catch { /* observability is best-effort */ }
             }
-            if (err instanceof Error) err.message = redactValues(err.message, values);
-            else throw new Error(redactValues(String(err), values));
+            if (err instanceof Error) err.message = isAsideExec
+              ? sanitizeAsideObservabilityText(redactValues(err.message, values))
+              : redactValues(err.message, values);
+            else throw new Error(isAsideExec
+              ? sanitizeAsideObservabilityText(redactValues(String(err), values))
+              : redactValues(String(err), values));
             throw err;
           }
         };
@@ -650,10 +682,97 @@ export async function registerMcpClients(
     }
   }
 
+  const asideTargets = opts.aside?.targets ?? [];
+  if (asideTargets.length > 0) {
+    const health = new Map<string, AsideTargetHealth>();
+    const targetClients = new Map<string, Pick<McpClient, 'callTool'>>();
+    for (const target of asideTargets) {
+      const serverId = `aside-target-${target.id}`;
+      if (target.enabled === false) {
+        perServer[serverId] = { status: 'disabled', toolCount: 0 };
+        health.set(target.id, { online: true, authenticated: false });
+        continue;
+      }
+      let client: McpClient | undefined;
+      try {
+        const spec: McpServerSpec = { id: serverId, transport: 'stdio', command: asideTargetSshCommand(target) };
+        client = createClient(spec) as McpClient;
+        await withTimeout(`mcp.${serverId}.start`, () => client!.start(), handshakeTimeoutMs, setTimeoutFn, clearTimeoutFn);
+        const tools = await withTimeout(`mcp.${serverId}.listTools`, () => client!.listTools(), handshakeTimeoutMs, setTimeoutFn, clearTimeoutFn);
+        if (!tools.some(tool => tool.name === 'exec')) throw new Error('aside-tool-missing');
+        for (const tool of tools) if (!asideRemoteTools.has(tool.name)) asideRemoteTools.set(tool.name, tool);
+        clients.push(client);
+        targetClients.set(target.id, client);
+        health.set(target.id, { online: true, authenticated: true });
+        perServer[serverId] = { status: 'ready', toolCount: tools.length };
+      } catch (error) {
+        const failure = classifyMcpConnectFailure(error);
+        health.set(target.id, { online: failure === 'auth-required' || failure === 'invalid-token', authenticated: false });
+        perServer[serverId] = { status: 'failed', toolCount: 0, reasonClass: failure, reason: `Aside target connection ${failure}` };
+        try { debug.log('aside.remote-target', 'connect-failed', { targetId: target.id, reason: failure }); } catch { /* diagnostics never block boot */ }
+        if (client) try { await client.dispose(); } catch { /* best-effort */ }
+      }
+    }
+    asideRouter = createAsideRemoteRouter({
+      targets: asideTargets,
+      preferences: { defaultTargetId: opts.aside?.defaultTargetId, contextDefaults: opts.aside?.contextDefaults },
+      strictRedactMode: opts.aside?.strictRedactMode,
+      health: () => health,
+      clients: targetClients,
+    });
+    setAsideRemoteRouter(asideRouter, undefined, asideOwner);
+    // One stable proxy per remote tool name, independent of target count.
+    // The request carries target selection metadata; the adapter strips it
+    // before forwarding arguments to the selected MCP server.
+    for (const [toolName, tool] of asideRemoteTools) {
+      authorizer.grant({ serverId: 'aside', toolName });
+      const schema = tool.inputSchema && typeof tool.inputSchema === 'object' && !Array.isArray(tool.inputSchema)
+        ? tool.inputSchema as Record<string, unknown>
+        : { type: 'object', properties: {} };
+      const properties = schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+        ? schema.properties as Record<string, unknown> : {};
+      const routeKey = '__elanous_aside_route';
+      const routeKeyConflicts = routeKey in properties;
+      const routedTool: McpTool = {
+        ...tool,
+        inputSchema: {
+          ...schema,
+          properties: {
+            ...properties,
+            ...(!routeKeyConflicts ? { [routeKey]: {
+              type: 'object',
+              description: 'Elanous target-routing metadata; omit unless selecting an Aside target.',
+              properties: { target_id: { type: 'string' }, context: { type: 'string' } },
+              additionalProperties: false,
+            } } : {}),
+          },
+        },
+      };
+      const routedClient = {
+        callTool: async (name: string, args: Record<string, unknown>) => {
+          const { [routeKey]: routeValue, ...withoutRouteValue } = args;
+          const remoteArgs = routeKeyConflicts ? args : withoutRouteValue;
+          const route = !routeKeyConflicts && routeValue && typeof routeValue === 'object' && !Array.isArray(routeValue)
+            ? routeValue as Record<string, unknown> : {};
+          return asideRouter!.call(name, remoteArgs, {
+            ...(typeof route.target_id === 'string' ? { targetId: route.target_id } : {}),
+            ...(typeof route.context === 'string' ? { context: route.context } : {}),
+            ...(name === 'exec' ? { capability: 'repl' as const } : {}),
+          }) as Promise<McpToolCallResult>;
+        },
+      };
+      const runtime = createMcpProxyRuntime({ serverId: 'aside', mcpTool: routedTool, client: routedClient, authorizer });
+      register(runtime);
+      registeredIds.push(runtime.id);
+      registered += 1;
+    }
+  }
+
   return {
     clients,
     registered,
     perServer,
+    ...(asideRouter ? { asideRouter } : {}),
     async shutdown() {
       // Snapshot + clear so a re-entrant call (e.g. SIGTERM races) is a no-op.
       const snapshot = clients.splice(0);
@@ -671,6 +790,9 @@ export async function registerMcpClients(
         ...pendingDeferred.map((d) => d.dispose().catch(() => { /* 아직 안 뜬 클라이언트 */ })),
       ];
       for (const spec of opts.servers) authorizer.revokeServer(spec.id);
+      authorizer.revokeServer('aside');
+      setAsideRemoteTargetsConfigured(false, asideOwner);
+      if (asideRouter) setAsideRemoteRouter(undefined, asideRouter, asideOwner);
       // ⭐ 등록도 «되돌린다». 데몬 종료 때는 어차피 프로세스가 죽으니 무해하고,
       //    재장전 때는 ***이 줄이 없으면 다음 등록이 전부 id 충돌로 죽는다***.
       //    ⛔ 「shutdown 이 클라이언트만 내린다」는 이름과 어긋난 계약이었다.

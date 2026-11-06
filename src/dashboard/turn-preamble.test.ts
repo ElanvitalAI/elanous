@@ -26,23 +26,30 @@ import { createInternalTurnGate, type StartTurnIfIdleOptions } from './input/int
 
 const fakeConfig = { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>;
 
-test('TUI preamble directs capability discovery through ToolSearch before StartPluginWizard', () => {
+function configWithoutNativeStructureProviderLookup(): ReturnType<typeof getUserConfig> {
+  const config = getUserConfig();
+  const tools = { ...config.tools };
+  Reflect.deleteProperty(tools, 'nativeStructure');
+  return { ...config, tools };
+}
+
+test('TUI preamble directs capability discovery through ToolSearch without a removed wizard entrypoint', () => {
   const messages = buildDashboardTurnPreamble({
     userText: '리니어에 등록해 줘 — HBM 투자 비중 늘릴지 이번 주 안에 판단',
     cwd: process.cwd(),
-    userConfig: getUserConfig(),
+    userConfig: fakeConfig,
     memory: false,
   });
   const prompt = messages.map(message => String(message.content)).join('\n');
   expect(prompt).toContain('For one explicit action in an external service, choose the narrow direct-action integration tool over any secretary or multi-step workflow tool.');
   expect(prompt).toContain('Use a secretary or workflow tool only when the user asks for its multi-step workflow.');
   expect(prompt).toContain('If no matching integration tool is active, use `ToolSearch` before inspecting local plugin, config, or CLI files.');
-  expect(prompt).toContain('Start `StartPluginWizard` only after ToolSearch finds no matching tool');
+  expect(prompt).not.toContain('StartPluginWizard');
   expect(prompt).not.toContain('Linear');
 });
 
 test('research surface carries the current date and allows a full sourced report', () => {
-  const baseConfig = getUserConfig();
+  const baseConfig = configWithoutNativeStructureProviderLookup();
   const config = { ...baseConfig, chat: { ...baseConfig.chat, conciseness: {
     enabled: true, finalMessageMaxLines: 10, preambleMaxWords: 12, flatBullets: true,
   } } };
@@ -111,7 +118,7 @@ test('classic turn prompt runtime recognizes the CEO challenge and restores its 
   const preamble = buildDashboardTurnPreamble({
     userText: challenge,
     cwd: process.cwd(),
-    userConfig: getUserConfig(),
+    userConfig: configWithoutNativeStructureProviderLookup(),
     memory: false,
     turnProfile: turnRuntime.turnProfile,
   });
@@ -126,7 +133,7 @@ test('installed skill summaries lead the stable system preamble and respect the 
   const preamble = buildDashboardTurnPreamble({
     userText: 'omni crawl',
     cwd: process.cwd(),
-    userConfig: getUserConfig(),
+    userConfig: fakeConfig,
     memory: false,
     skillCatalogContextWindow: 128_000,
     skillCatalog: [

@@ -1309,8 +1309,10 @@ describe('harness ask production entry wiring', () => {
         '/tmp/GOAL-ask.md',
         '/tmp/say-goal.md',
       ]);
-      for (const decision of decisions) {
+      for (const [index, decision] of decisions.entries()) {
         expect(decision.options).toEqual(expect.objectContaining({
+          entryPoint: index === 0 ? 'cli-harness-ask' : 'cli-harness-say',
+          observedRunId: expect.any(String),
           executePiece: expect.any(Function),
         }));
       }

@@ -19,7 +19,7 @@
 // Default `lines` is 50 (matches Showroom RFC v4 D14 default · `frozen
 // snapshot · last 50 lines`).
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { getPty, listPty, onPtyEvent, type PtyEvent, type PtyHandle } from '../../pty-shell/registry.js';
 import { listAllPreviewTerminals } from '../../web-terminal/preview-tap-registry.js';

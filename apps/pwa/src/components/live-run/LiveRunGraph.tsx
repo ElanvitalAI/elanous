@@ -53,6 +53,12 @@ export function replayOverviewMinZoom(narrow: boolean): number | null {
   return narrow ? null : 0.5;
 }
 
+function recordedResource(value: string | readonly string[] | undefined): string {
+  if (typeof value === 'string') return value.trim() || '기록 없음';
+  const listed = value?.filter((item) => item.trim()).map((item) => item.trim()).join(', ');
+  return listed || '기록 없음';
+}
+
 interface LiveNodeData extends RunGraphNodeData {
   state: LiveNodeState;
   /** The run is over and never entered this node — «기록 없음», not «대기». */
@@ -84,7 +90,7 @@ function LiveNode({ data }: NodeProps) {
       <div className="overflow-x-auto whitespace-nowrap font-mono text-sm font-semibold text-text-primary" title={node.label}>{isGroupNodeId(node.label) ? `▣ ${node.label.slice(GROUP_NODE_PREFIX.length)}` : node.label}</div>
       {node.stageMode && (
         <div data-testid={`live-node-resources-${node.label}`} title={node.resourceBadges?.join(' · ')} className="flex h-4 items-center gap-1 overflow-hidden whitespace-nowrap">
-          {(node.resourceBadges ?? ['호스트 미계측', '모델 미계측']).slice(0, 3).map((badge) => <span key={badge} className="shrink-0 rounded-full border border-cyan-400/40 bg-cyan-400/10 px-1 text-[8px] leading-3 text-cyan-700 dark:text-cyan-200">{badge}</span>)}
+          {(node.resourceBadges ?? ['호스트 기록 없음', '모델 기록 없음']).slice(0, 3).map((badge) => <span key={badge} className="shrink-0 rounded-full border border-cyan-400/40 bg-cyan-400/10 px-1 text-[8px] leading-3 text-cyan-700 dark:text-cyan-200">{badge}</span>)}
         </div>
       )}
       {node.provenance?.type === 'scenario-injection' ? (
@@ -220,9 +226,12 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
   // 장면은 «그려진» 노드 위에서 돈다 — 접힌 묶음 안의 방문은 묶음 노드의 방문이다.
   const viewSteps: TraversalStep[] = useMemo(() => view ? steps.map((step) => ({ ...step, node: view.resolve(step.node) })) : steps, [view, steps]);
   const visibleViewSteps: TraversalStep[] = useMemo(() => view ? visible.steps.map((step) => ({ ...step, node: view.resolve(step.node) })) : visible.steps, [view, visible.steps]);
-  const resourceBadgesByNode = useMemo(() => stageNodeResourceBadges(
-    visibleViewSteps, (node) => node, run?.substrate, view?.graph.nodes.map((node) => node.node_id),
-  ), [visibleViewSteps, run?.substrate, view]);
+  const resourceBadgesByNode = useMemo(() => {
+    const resources = stageNodeResourceBadges(
+      visibleViewSteps, (node) => node, run?.substrate, view?.graph.nodes.map((node) => node.node_id),
+    );
+    return new Map([...resources].map(([node, badges]) => [node, badges.map((badge) => badge.replace(/미계측/g, '기록 없음'))] as const));
+  }, [visibleViewSteps, run?.substrate, view]);
   const flow = useMemo(() => view ? runGraphToFlow(view.graph) : null, [view]);
   const sceneEdges: SceneEdge[] = useMemo(() => flow?.edges.map((edge) => ({
     id: edge.id, from: edge.source, to: edge.target, outcomes: (edge.data as unknown as TidyEdgeData).route.outcomes,
@@ -560,10 +569,10 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
                       <span className={step.outcome === 'fail' ? 'text-error' : step.outcome === null ? 'text-amber-500' : 'text-success'}>{step.outcome ?? '도는 중'}</span>{' '}
                       <span className="text-text-tertiary">소요 {durationLabel(step.durationMs)}</span>
                       {stageMode && <span className="mt-0.5 flex flex-wrap gap-x-2 text-[10px] text-cyan-700 dark:text-cyan-200" data-testid={`visit-resources-${step.node}-${step.visit}`}>
-                        <span>호스트 {step.resources?.host ?? '미계측'}</span>
-                        <span>Pod {step.resources?.pod ?? '미계측'}</span>
-                        <span>모델 {step.resources?.models?.join(', ') ?? '미계측'}</span>
-                        <span>플러그인 {step.resources?.plugins?.join(', ') ?? '미계측'}</span>
+                        <span>호스트 {recordedResource(step.resources?.host)}</span>
+                        <span>Pod {recordedResource(step.resources?.pod)}</span>
+                        <span>모델 {recordedResource(step.resources?.models)}</span>
+                        <span>도구·플러그인 {recordedResource(step.resources?.plugins)}</span>
                       </span>}
                       {step.detail && <span className="block text-text-secondary">{step.detail}</span>}
                     </button>
@@ -574,8 +583,8 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
           )}
         </section>
 
-        <aside aria-label="실행 타임라인" className={`overflow-y-auto rounded-lg border border-border bg-surface ${stageMode ? 'stage-timeline' : `${narrow ? 'max-h-[300px]' : 'max-h-[420px]'} lg:max-h-[calc(100dvh-230px)] lg:w-[340px] lg:shrink-0`}`}>
-          <h3 className="sticky top-0 border-b border-border bg-surface px-3 py-2 text-xs font-semibold">타임라인 (KST)</h3>
+        <aside aria-label={stageMode ? '노드별 자원 패널' : '실행 타임라인'} className={`overflow-y-auto rounded-lg border border-border bg-surface ${stageMode ? 'stage-timeline' : `${narrow ? 'max-h-[300px]' : 'max-h-[420px]'} lg:max-h-[calc(100dvh-230px)] lg:w-[340px] lg:shrink-0`}`}>
+          <h3 className="sticky top-0 border-b border-border bg-surface px-3 py-2 text-xs font-semibold">{stageMode ? '자원 지도 · 방문별 원장 기록' : '타임라인 (KST)'}</h3>
           <ol>
             {steps.map((step, index) => {
               const future = index > cursor;
@@ -591,6 +600,12 @@ export function LiveRunGraph({ runId, initialFolded = false, clearFocusVersion =
                     </span>
                     <span className="text-[11px] text-text-tertiary">{durationLabel(step.durationMs)}</span>
                     <span className="col-span-2 truncate text-[11px] text-text-secondary" title={step.detail ?? undefined}>{step.detail ?? ''}</span>
+                    {stageMode && <span data-testid={`resource-visit-${step.node}-${step.visit}`} className="col-span-3 grid grid-cols-2 gap-x-2 text-[10px] text-cyan-700 dark:text-cyan-200">
+                      <span>호스트 {recordedResource(step.resources?.host)}</span>
+                      <span>Pod {recordedResource(step.resources?.pod)}</span>
+                      <span>모델 {recordedResource(step.resources?.models)}</span>
+                      <span>도구·플러그인 {recordedResource(step.resources?.plugins)}</span>
+                    </span>}
                   </button>
                 </li>
               );

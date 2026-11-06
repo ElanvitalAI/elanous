@@ -12,7 +12,7 @@
 // handlers call the singleton `getPushcutClient()` / read the
 // default audit log path. Tests inject a custom client + path.
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { getPushcutClient, type PushcutClient } from '../../pushcut/client.js';
 import {
   readAuditLog,

@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
+import type { Writable } from 'node:stream';
 
 import { createFakeBins, createFakeExecutableDevice, withFakeBins, withFakeExecutableDevice } from './fake-bin.js';
 
@@ -247,6 +248,147 @@ describe('fake executable result receipts', () => {
       expect(device.calls()).toEqual([]);
     } finally {
       device.cleanup();
+    }
+  });
+
+  test('declared package artifacts are written only to the exact install prefix', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'ux-sim-install-prefix-')));
+    const prefix = join(root, 'prefix');
+    const outside = join(root, 'outside');
+    mkdirSync(outside);
+    const args = ['install', '-g', '@openai/codex@latest'];
+    const specs = { npm: { stdout: 'installer stdout\n', stderr: 'installer stderr\n', installArtifacts: { prefixEnv: 'NPM_CONFIG_PREFIX', prefix, argv: args, files: [{ path: 'bin/codex', contents: '#!/bin/sh\necho Codex 9.8.7\n' }] } } };
+    const device = createFakeExecutableDevice(specs);
+    try {
+      const wrongArgs = device.run('npm', ['view', '@openai/codex'], { env: { NPM_CONFIG_PREFIX: prefix } });
+      expect(wrongArgs.status).toBe(64);
+      const refused = device.run('npm', args, { env: { NPM_CONFIG_PREFIX: outside } });
+      expect(refused.status).toBe(78);
+      expect(existsSync(join(outside, 'bin/codex'))).toBe(false);
+
+      const linkedPrefix = join(root, 'linked-prefix');
+      const linkedPrefixDevice = createFakeExecutableDevice({ npm: { ...specs.npm, installArtifacts: { ...specs.npm.installArtifacts, prefix: linkedPrefix } } });
+      try {
+        symlinkSync(outside, linkedPrefix, 'dir');
+        expect(linkedPrefixDevice.run('npm', args, { env: { NPM_CONFIG_PREFIX: linkedPrefix } }).status).toBe(73);
+        expect(existsSync(join(outside, 'bin/codex'))).toBe(false);
+      } finally { linkedPrefixDevice.cleanup(); }
+
+      const runtimeParent = join(root, 'runtime-parent');
+      mkdirSync(runtimeParent);
+      const runtimePrefix = join(runtimeParent, 'prefix');
+      const runtimeSymlinkDevice = createFakeExecutableDevice({ npm: { ...specs.npm, installArtifacts: { ...specs.npm.installArtifacts, prefix: runtimePrefix } } });
+      try {
+        renameSync(runtimeParent, join(root, 'moved-runtime-parent'));
+        symlinkSync(outside, runtimeParent, 'dir');
+        expect(runtimeSymlinkDevice.run('npm', args, { env: { NPM_CONFIG_PREFIX: runtimePrefix } }).status).toBe(73);
+        expect(existsSync(join(outside, 'prefix/bin/codex'))).toBe(false);
+      } finally { runtimeSymlinkDevice.cleanup(); }
+
+      mkdirSync(prefix);
+      symlinkSync(outside, join(prefix, 'bin'), 'dir');
+      expect(device.run('npm', args, { env: { NPM_CONFIG_PREFIX: prefix } }).status).toBe(73);
+      expect(existsSync(join(outside, 'codex'))).toBe(false);
+      unlinkSync(join(prefix, 'bin'));
+
+      mkdirSync(join(prefix, 'bin'));
+      symlinkSync(join(outside, 'codex'), join(prefix, 'bin/codex'));
+      expect(device.run('npm', args, { env: { NPM_CONFIG_PREFIX: prefix } }).status).toBe(73);
+      expect(existsSync(join(outside, 'codex'))).toBe(false);
+      unlinkSync(join(prefix, 'bin/codex'));
+
+      const failedInstall = createFakeExecutableDevice({ npm: { exitCode: 1, installArtifacts: specs.npm.installArtifacts } });
+      try {
+        expect(failedInstall.run('npm', args, { env: { NPM_CONFIG_PREFIX: prefix } }).status).toBe(1);
+        expect(existsSync(join(prefix, 'bin/codex'))).toBe(false);
+      } finally { failedInstall.cleanup(); }
+
+      const blockedPrefix = join(root, 'blocked-prefix');
+      writeFileSync(blockedPrefix, 'not a directory');
+      const blockedInstall = createFakeExecutableDevice({ npm: { installArtifacts: { ...specs.npm.installArtifacts, prefix: blockedPrefix } } });
+      try {
+        expect(blockedInstall.run('npm', args, { env: { NPM_CONFIG_PREFIX: blockedPrefix } }).status).toBe(74);
+        expect(existsSync(join(blockedPrefix, 'bin/codex'))).toBe(false);
+      } finally { blockedInstall.cleanup(); }
+
+      const manyArgPrefix = join(root, 'many-arg-prefix');
+      const manyArgs = ['install', '-g', 'fixture', '--scope', 'private', '--registry', 'https://registry.invalid', '--offline', '--audit=false', '--fund=false'];
+      const manyArgDevice = createFakeExecutableDevice({ npm: { installArtifacts: { prefixEnv: 'NPM_CONFIG_PREFIX', prefix: manyArgPrefix, argv: manyArgs, files: [{ path: 'bin/tool', contents: '#!/bin/sh\nexit 0\n' }] } } });
+      try {
+        expect(manyArgDevice.run('npm', manyArgs, { env: { NPM_CONFIG_PREFIX: manyArgPrefix } }).status).toBe(0);
+        expect(existsSync(join(manyArgPrefix, 'bin/tool'))).toBe(true);
+      } finally { manyArgDevice.cleanup(); }
+
+      const installed = device.run('npm', args, { env: { NPM_CONFIG_PREFIX: prefix } });
+      expect(installed.status).toBe(0);
+      expect(installed.stdout).toBe('installer stdout\n');
+      expect(installed.stderr).toBe('installer stderr\n');
+      expect(existsSync(join(prefix, 'bin/codex'))).toBe(true);
+      expect(device.calls()).toHaveLength(5);
+    } finally {
+      device.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('install prefixes and artifact paths reject NUL before native path truncation', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'ux-sim-install-nul-')));
+    const outside = join(root, 'outside');
+    const files = [{ path: 'bin/codex', contents: 'must not be written' }];
+    try {
+      expect(() => createFakeExecutableDevice({
+        npm: { installArtifacts: { prefixEnv: 'NPM_CONFIG_PREFIX', prefix: join(root, 'prefix'), argv: ['install'], files: [{ path: '..\0x/outside', contents: 'escape' }] } },
+      })).toThrow(/install artifact path must stay relative/);
+      expect(() => createFakeExecutableDevice({
+        npm: { installArtifacts: { prefixEnv: 'NPM_CONFIG_PREFIX', prefix: join(root, 'prefix\0truncated'), argv: ['install'], files } },
+      })).toThrow(/install prefix must not contain NUL/);
+      expect(existsSync(outside)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a prefix-parent symlink swap after descriptor pinning cannot redirect an artifact write', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'ux-sim-install-race-')));
+    const parent = join(root, 'runtime-parent');
+    const movedParent = join(root, 'moved-runtime-parent');
+    const outside = join(root, 'outside');
+    mkdirSync(parent);
+    mkdirSync(outside);
+    const prefix = join(parent, 'prefix');
+    const argv = ['install', '-g', 'fixture'];
+    const device = createFakeExecutableDevice({ npm: { installArtifacts: {
+      prefixEnv: 'NPM_CONFIG_PREFIX', prefix, argv,
+      files: [{ path: 'bin/codex', contents: '#!/bin/sh\nexit 0\n' }],
+      testBarrier: true,
+    } } });
+    const child = spawn(device.bin('npm'), argv, {
+      env: { ...process.env, PATH: device.path(), NPM_CONFIG_PREFIX: prefix },
+      stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'],
+    });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+    try {
+      const ready = await new Promise<boolean>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('installer did not reach prefix barrier')), 5_000);
+        child.stdio[3]?.once('data', () => { clearTimeout(timer); resolve(true); });
+        child.once('error', (error) => { clearTimeout(timer); reject(error); });
+      });
+      expect(ready).toBe(true);
+      renameSync(parent, movedParent);
+      symlinkSync(outside, parent, 'dir');
+      (child.stdio[4] as Writable | null)?.write('continue\n');
+      expect(await exited).toEqual({ code: 0, signal: null });
+      expect(existsSync(join(outside, 'prefix/bin/codex'))).toBe(false);
+      expect(existsSync(join(movedParent, 'prefix/bin/codex'))).toBe(true);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+        await exited;
+      }
+      device.cleanup();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

@@ -15,7 +15,7 @@
 
 import { createHash } from 'node:crypto';
 import { tierModel } from '../../llm/model-defaults.js';
-import { dispatchTask, type DispatchTaskDeps } from '../../execution-loop/dispatch-task.js';
+import type { DispatchTaskDeps } from '../../execution-loop/dispatch-task.js';
 import type { LLMToolSpec } from '../../llm.js';
 import type { DaemonToolDispatchCtx } from '../../boot/daemon-tools/types.js';
 import type { SelfImplementSeams } from '../../self-implement/orchestrator.js';
@@ -101,7 +101,7 @@ export interface DevHarnessDeps {
   /** 하니스 구동(기본 runStagedHarnessOnSurface). */
   runHarness?: (opts: RunHarnessOnSurfaceOptions) => Promise<HarnessResult>;
   /** In-process 실행 직전의 관측 전용 디스패치 seam. */
-  dispatchTask?: typeof dispatchTask;
+  dispatchTask?: (typeof import('../../execution-loop/dispatch-task.js'))['dispatchTask'];
   dispatchTaskDeps?: DispatchTaskDeps;
   /** seam 팩토리(기본 defaultSeams). */
   seamsFactory?: (o: DefaultSeamsOptions) => SelfImplementSeams;
@@ -490,14 +490,17 @@ export async function dispatchRunDevHarness(
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
-          Promise.resolve().then(() => (deps?.dispatchTask ?? dispatchTask)({
+          Promise.resolve().then(async () => {
+            const dispatchTask = deps?.dispatchTask ?? (await import('../../execution-loop/dispatch-task.js')).dispatchTask;
+            return dispatchTask({
             goalId: `request-${createHash('sha256').update(objective).digest('hex').slice(0, 32)}`,
             title: objective.split(/\r?\n/, 1)[0]?.trim() || 'Untitled request',
             goalText: objective,
             targetPaths: [],
             spec,
             runKey: runId,
-          }, { ...deps?.dispatchTaskDeps, signal: observer.signal })),
+          }, { ...deps?.dispatchTaskDeps, signal: observer.signal });
+          }),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
               observer.abort();

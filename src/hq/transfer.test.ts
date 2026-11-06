@@ -70,6 +70,7 @@ process.exit(hqFenceRun('cron', process.argv.slice(7), {
   let promotions = 0;
   const deps: TransferDeps = {
     store, run, journalDir: join(dir, 'journal'),
+    reallocatePools: () => 0,
     confirm: () => { confirmations++; return true; },
     promote: (host) => { promotions++; return { ok: true, host, apply: true, lines: [{ step: '⑤ nexus health', status: 'done', measurement: 'health=200', command: 'nexus' }] }; },
   };

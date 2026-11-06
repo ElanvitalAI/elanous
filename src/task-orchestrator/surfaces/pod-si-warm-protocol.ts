@@ -10,6 +10,27 @@ const MAX_ARTIFACTS = 256;
 const MAX_RESULT_BYTES = 64 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACT_TOTAL_BYTES = 20 * 1024 * 1024;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** Preflight every artifact's base64 size before decoding any artifact buffer. */
+export function decodeSiWarmArtifacts(raw: unknown,
+  decode: (encoded: string) => Uint8Array | null = value => Buffer.from(value, 'base64')):
+  Array<{ path: string; bytes: Uint8Array }> | null {
+  if (!Array.isArray(raw) || raw.length > MAX_ARTIFACTS) return null;
+  const rows: Array<{ path: string; encoded: string }> = [];
+  let total = 0;
+  for (const part of raw) {
+    const item = own(part);
+    if (!item || !safePath(item.path) || typeof item.bytes !== 'string' || !BASE64.test(item.bytes)) return null;
+    const encoded = item.bytes;
+    const padding = encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0;
+    const size = encoded.length / 4 * 3 - padding;
+    if (size > MAX_ARTIFACT_BYTES || (total += size) > MAX_ARTIFACT_TOTAL_BYTES) return null;
+    rows.push({ path: item.path, encoded });
+  }
+  const decoded = rows.map(({ path, encoded }) => ({ path, bytes: decode(encoded) }));
+  return decoded.some(row => !row.bytes) ? null : decoded as Array<{ path: string; bytes: Uint8Array }>;
+}
 
 /** The secret bundle travels on a separate private stdin channel, never in this command or its reply. */
 export interface SiWarmCommand {
@@ -67,6 +88,8 @@ export interface SiWarmValidation {
   /** A matching failed child is still a measured result, never a reason to run a second Job. */
   measured: boolean;
   quarantineWorker: boolean;
+  /** Late but identity/hash-verified terminal bytes may be classified; they must never be adopted. */
+  terminalVerifiedForReconcile?: boolean;
 }
 
 const own = (value: unknown): Record<string, unknown> | null =>
@@ -152,7 +175,7 @@ export function assessSiWarmReply(commandRaw: unknown, replyRaw: unknown, return
     || reply.workerId !== command.workerId || reply.podUid !== command.podUid
     || reply.envProfile !== command.envProfile || reply.payloadSha256 !== command.payloadSha256
     || keyFields.some(field => reply.key[field] !== command.key[field])) return fail('identity');
-  if (reply.startedAt > reply.finishedAt || reply.finishedAt >= command.deadlineAt) return fail('expired');
+  if (reply.startedAt > reply.finishedAt) return fail('invalid-reply');
   if (!returned || !(returned.terminal instanceof Uint8Array)
     || !(returned.ledger instanceof Uint8Array) || !(returned.log instanceof Uint8Array)
     || !Array.isArray(returned.artifacts) || returned.artifacts.length !== reply.artifacts.length
@@ -180,6 +203,8 @@ export function assessSiWarmReply(commandRaw: unknown, replyRaw: unknown, return
     const row = own(terminal);
     if (!row || typeof row.ok !== 'boolean' || !str(row.stage) || !row.stage) return fail('terminal');
   } catch { return fail('terminal'); }
+  if (reply.finishedAt >= command.deadlineAt)
+    return { reason: 'expired', measured: false, quarantineWorker: true, terminalVerifiedForReconcile: true };
   return { reason: 'match', measured: true, quarantineWorker: false };
 }
 

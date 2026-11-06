@@ -32,7 +32,7 @@ import { isAbsolute } from 'node:path';
 import { getUserConfig } from '../../user-config.js';
 import { type GitRunner } from '../../git-fs/retry.js';
 import { runGitCommand } from '../../git-fs/runner.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import {
   clearWorktreeSession,
   isPidAlive,

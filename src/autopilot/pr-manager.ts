@@ -444,7 +444,7 @@ export function configuredHunkOverlapMode(raw: Record<string, unknown> | undefin
 export const defaultCensusParallelRunner: PrToolParallelCommand = (calls, concurrency) =>
   spawnParallelCommands(calls, { concurrency, env: ghAutomationEnv(process.env) });
 
-function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; seat: Seat | null; body: string }, run: CmdRunner): GuardVerdict {
+export function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; seat: Seat | null; body: string }, run: CmdRunner): GuardVerdict {
   if (!input.base) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: '비교 base 없음' });
   const diff = run('git', ['-C', input.cwd, 'diff', '--name-only', '-z', `${input.base}...HEAD`]);
   const files = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
@@ -452,11 +452,23 @@ function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; se
   if (!patch.ok) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: `후보 수정 줄 조회 실패: ${patch.err || patch.out}` });
   const boundRaw = process.env.ELANOUS_TASK_BOUND_PR;
   const boundPrNumber = boundRaw && /^[1-9]\d*$/.test(boundRaw) ? Number(boundRaw) : undefined;
+  const censusStarted = Date.now();
+  debug.log('pr.land', 'open-pr-census-start', { candidateFileCount: files?.length ?? null });
+  let inventory: ReturnType<typeof readOpenPrs>;
+  try {
+    inventory = readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}),
+      runParallel: defaultCensusParallelRunner, diffCache: sharedCensusDiffCache });
+  } catch (error) {
+    debug.log('pr.land', 'open-pr-census-end', { elapsedMs: Date.now() - censusStarted, ok: false,
+      errorName: error instanceof Error ? error.name : 'unknown' });
+    throw error;
+  }
+  debug.log('pr.land', 'open-pr-census-end', { elapsedMs: Date.now() - censusStarted, ok: inventory.status === 'checked',
+    openPrs: inventory.status === 'checked' ? inventory.prs.length : null, status: inventory.status });
   return guardNewPr({ files, seat: input.seat, cellId: cellIdFromBody(input.body), cardId: cardIdFromBody(input.body),
     slice: sliceMarkerFromBody(input.body),
     ...(boundPrNumber && Number.isSafeInteger(boundPrNumber) ? { boundPrNumber } : {}),
-    hunks: parseDiffHunks(patch.out), hunkOverlap: configuredHunkOverlapMode() }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}),
-      runParallel: defaultCensusParallelRunner, diffCache: sharedCensusDiffCache }));
+    hunks: parseDiffHunks(patch.out), hunkOverlap: configuredHunkOverlapMode() }, inventory);
 }
 
 function editExistingPr(run: CmdRunner, input: UpsertPrInput, url: string): UpsertPrOutcome {
@@ -795,8 +807,15 @@ export function makePrManager(
       if (selfBase) {
         const upstream = run('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', `${input.branch}@{upstream}`], opts);
         const trackingRef = upstream.ok ? upstream.out.trim() : '';
-        comparisonBase = /^(?:origin\/|refs\/remotes\/origin\/)/.test(trackingRef) ? trackingRef : undefined;
         prBaseRef = resolveDeliverableBase(run, cwd);
+        // Harness-created branches often have no upstream until their first push. If the caller
+        // inherited the branch itself as `base`, using only @{upstream} leaves the PR guard with
+        // no candidate comparison ref even though the PR's default base is available. Keep a
+        // real remote upstream when present; otherwise compare against the same default ref used
+        // to open the PR so changed files remain observable before draft creation.
+        comparisonBase = /^(?:origin\/|refs\/remotes\/origin\/)/.test(trackingRef)
+          ? trackingRef
+          : prBaseRef && !isBranchSelfRef(prBaseRef, input.branch) ? prBaseRef : undefined;
       }
       const prBase = prBaseRef && !isBranchSelfRef(prBaseRef, input.branch)
         ? prBaseFromComparison(prBaseRef)

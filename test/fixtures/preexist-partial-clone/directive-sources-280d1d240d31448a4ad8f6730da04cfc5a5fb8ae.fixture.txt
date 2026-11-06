@@ -1,0 +1,211 @@
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
+import { Database } from 'bun:sqlite';
+import { surfaceEventsDbPath } from '../domains/surface-events.js';
+
+export type DirectiveAgent = 'claude-code' | 'codex' | 'elanous' | 'grok';
+export interface DirectiveTurn {
+  agent: DirectiveAgent;
+  ts: string;
+  sessionId: string;
+  cwd?: string;
+  text: string;
+  sourceFile: string;
+  lineNo: number;
+  role: 'user' | 'assistant';
+}
+export interface SourceOptions {
+  claudeRoot?: string;
+  codexRoot?: string;
+  grokRoot?: string;
+  surfaceDb?: string;
+  projectNames?: string[];
+  offsets?: Record<string, number>;
+  contexts?: Record<string, FileContext>;
+}
+export interface FileContext {
+  lineNo: number; sessionId: string; cwd?: string; automatedCodex: boolean;
+  sessionCwds: Record<string, string>; sessionAllowed: Record<string, boolean>;
+  assistantCounts: Record<string, Record<string, number>>;
+  firstCwd?: string; accepted?: boolean;
+}
+export interface SourceFile { path: string; agent: DirectiveAgent; end: number; turns: DirectiveTurn[]; context?: FileContext; truncated?: boolean }
+export interface SourceScan { files: SourceFile[]; missingSources: DirectiveAgent[]; perSource: Record<DirectiveAgent, { files: number; directives: number }> }
+
+function object(v: unknown): Record<string, any> { return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, any> : {}; }
+function textOf(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.filter(x => object(x).type === 'text' || object(x).type === 'input_text' || object(x).type === 'output_text').map(x => object(x).text).filter((x): x is string => typeof x === 'string').join('\n');
+  return '';
+}
+export function cleanDirectiveText(text: string): string {
+  return text.replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/gi, '')
+    .replace(/<pasted_content\b[^>]*>/gi, '').replace(/<\/pasted_content>/gi, '').trim();
+}
+function human(text: string): boolean {
+  return !!text && !/^(<task-notification\b|<system-reminder\b|This session is being continued from a previous conversation|<environment_context\b|You are the FINAL MERGE JUDGE\b|You are an AI assistant accessed via an API\b)/i.test(text);
+}
+/** A path segment must equal the project name — `/tmp/not-monad-agent-project` is not the project. */
+export function allowed(cwd: string | undefined, names: string[]): boolean {
+  if (!cwd) return false;
+  const segments = cwd.toLowerCase().split(/[\\/]+/).filter(Boolean);
+  return names.some(n => segments.includes(n.toLowerCase()));
+}
+function filesUnder(root: string, accept: (path: string) => boolean): string[] {
+  if (!existsSync(root)) return [];
+  const result: string[] = [];
+  const visit = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile() && accept(path)) result.push(path);
+    }
+  };
+  visit(root);
+  return result.sort();
+}
+function parseLines(path: string, agent: 'claude-code' | 'codex' | 'grok', offset: number, names: string[], previous?: FileContext): SourceFile {
+  let lineNo = previous?.lineNo ?? 0;
+  let sessionId = previous?.sessionId ?? '';
+  let cwd: string | undefined = previous?.cwd;
+  let automatedCodex = previous?.automatedCodex ?? false;
+  const sessionCwds = new Map(Object.entries(previous?.sessionCwds ?? {}));
+  const sessionAllowed = new Map(Object.entries(previous?.sessionAllowed ?? {}));
+  let firstCwd: string | undefined = previous?.firstCwd;
+  let accepted: boolean | undefined = previous?.accepted;
+  const assistantCounts: Record<string, Record<string, number>> = previous?.assistantCounts ?? {};
+  const turns: DirectiveTurn[] = [];
+  const parse = (chunk: string) => {
+    lineNo++;
+    if (!chunk) return;
+    let row: Record<string, any>;
+    try { row = object(JSON.parse(chunk)); } catch { return; }
+    const payload = object(row.payload);
+    if (agent === 'codex') {
+      if (row.type === 'session_meta') {
+        sessionId = payload.id ?? sessionId; cwd = payload.cwd ?? cwd;
+        automatedCodex = typeof payload.originator === 'string' && payload.originator !== 'codex-tui' && payload.originator !== 'codex-cli'
+          && payload.source !== 'vscode' && payload.source !== 'cli' && payload.source !== 'interactive';
+      }
+      if (row.type === 'turn_context') cwd = payload.cwd ?? cwd;
+    } else {
+      sessionId = row.sessionId ?? row.session_id ?? sessionId;
+      cwd = agent === 'grok' ? decodeURIComponent(basename(dirname(path))) : row.cwd ?? cwd;
+    }
+    const role: 'user' | 'assistant' | null = agent === 'codex'
+      ? row.type === 'event_msg' && payload.type === 'user_message' ? 'user'
+        : row.type === 'response_item' && payload.role === 'assistant' ? 'assistant' : null
+      : agent === 'grok'
+        ? typeof row.prompt === 'string' ? 'user' : null
+        : row.type === 'user' && !row.isMeta && !row.isSidechain && !object(row.message).isMeta ? 'user'
+        : row.type === 'assistant' && !row.isSidechain ? 'assistant' : null;
+    if (!role || (agent === 'codex' && automatedCodex)) return;
+    const raw = agent === 'codex' ? role === 'user' ? payload.message : textOf(payload.content)
+      : agent === 'grok' ? row.prompt : textOf(object(row.message).content ?? row.content);
+    const text = cleanDirectiveText(typeof raw === 'string' ? raw : '');
+    if (!text || (role === 'user' && !human(text))) return;
+    if (agent === 'claude-code') {
+      if (role === 'user' && !sessionAllowed.has(sessionId)) {
+        sessionCwds.set(sessionId, cwd ?? '');
+        sessionAllowed.set(sessionId, allowed(cwd, names));
+      }
+      firstCwd = sessionCwds.get(sessionId);
+      accepted = sessionAllowed.get(sessionId);
+    } else if (role === 'user' && accepted === undefined) {
+      firstCwd = cwd;
+      accepted = agent === 'grok' || allowed(firstCwd, names);
+    }
+    if (!accepted) return;
+    if (role === 'assistant') {
+      const match = /^\*\*\[([STFO])\]\*\*/.exec(text);
+      if (match) {
+        const tally = assistantCounts[sessionId] ?? {};
+        tally[match[1]!] = (tally[match[1]!] ?? 0) + 1;
+        assistantCounts[sessionId] = tally;
+      }
+    }
+    turns.push({ agent, ts: row.timestamp ?? row.ts ?? '', sessionId: sessionId || path, cwd: firstCwd ?? cwd, text, sourceFile: path, lineNo, role });
+  };
+  const fd = openSync(path, 'r');
+  let end = offset;
+  let pending = Buffer.alloc(0);
+  const block = Buffer.allocUnsafe(64 * 1024);
+  try {
+    let cursor = offset;
+    while (true) {
+      const count = readSync(fd, block, 0, block.length, cursor);
+      if (!count) break;
+      cursor += count;
+      const data = pending.length ? Buffer.concat([pending, block.subarray(0, count)]) : block.subarray(0, count);
+      let start = 0;
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] !== 10) continue;
+        parse(data.subarray(start, i).toString('utf8'));
+        end += i - start + 1;
+        start = i + 1;
+      }
+      pending = Buffer.from(data.subarray(start));
+    }
+  } finally { closeSync(fd); }
+  return { path, agent, end, turns, context: {
+    lineNo, sessionId, cwd, automatedCodex, sessionCwds: Object.fromEntries(sessionCwds),
+    sessionAllowed: Object.fromEntries(sessionAllowed), assistantCounts, firstCwd, accepted,
+  } };
+}
+
+/** Reads existing sources only; never initializes or migrates the surface-events database. */
+export function scanDirectiveSources(opts: SourceOptions = {}): SourceScan {
+  const roots = {
+    'claude-code': opts.claudeRoot ?? join(homedir(), '.claude', 'projects'),
+    codex: opts.codexRoot ?? join(homedir(), '.codex', 'sessions'),
+    grok: opts.grokRoot ?? join(homedir(), '.grok'),
+  };
+  const dbPath = opts.surfaceDb ?? surfaceEventsDbPath();
+  const perSource: SourceScan['perSource'] = {
+    'claude-code': { files: 0, directives: 0 }, codex: { files: 0, directives: 0 },
+    elanous: { files: 0, directives: 0 }, grok: { files: 0, directives: 0 },
+  };
+  const files: SourceFile[] = [];
+  const missingSources: DirectiveAgent[] = [];
+  for (const agent of ['claude-code', 'codex', 'grok'] as const) {
+    if (!existsSync(roots[agent])) { missingSources.push(agent); continue; }
+    const acceptedFile = (path: string) => agent === 'grok'
+      ? basename(path) === 'prompt_history.jsonl' && path.includes(`${join(roots.grok, 'sessions')}/`)
+      : agent === 'codex' ? basename(path).startsWith('rollout-') && path.endsWith('.jsonl')
+      : path.endsWith('.jsonl') && !path.includes('/subagents/');
+    const candidates = filesUnder(roots[agent], acceptedFile);
+    if (agent === 'grok' && candidates.length === 0) { missingSources.push('grok'); continue; }
+    for (const path of candidates) {
+      const previous = opts.offsets?.[path] ?? 0;
+      const truncated = previous > statSync(path).size || (previous > 0 && !opts.contexts?.[path]);
+      const offset = truncated ? 0 : previous;
+      const file = parseLines(path, agent, offset, opts.projectNames ?? ['monad-agent', 'elanous'], offset ? opts.contexts?.[path] : undefined);
+      file.truncated = truncated;
+      files.push(file);
+      perSource[agent].files++;
+      perSource[agent].directives += file.turns.filter(t => t.role === 'user').length;
+    }
+  }
+  if (!existsSync(dbPath)) missingSources.push('elanous');
+  else {
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const offset = opts.offsets?.[dbPath] ?? 0;
+      const rows = db.prepare("SELECT rowid, id, ts, session_id, text, refs, kind FROM events WHERE rowid > ? AND direction = 'inbound' AND kind IN ('utterance', 'qna') ORDER BY rowid").all(offset) as Array<{ rowid: number; id: string; ts: string; session_id: string | null; text: string; refs: string | null; kind: string }>;
+      const turns: DirectiveTurn[] = [];
+      for (const row of rows) {
+        let refs: Record<string, any> = {};
+        try { refs = object(JSON.parse(row.refs ?? '{}')); } catch { /* invalid provenance is not user text */ }
+        if (refs.origin && refs.origin !== 'elanous-self') continue;
+        const userPart = row.kind === 'qna' && row.text.startsWith('Q: ') ? row.text.slice(3).split('\nA:')[0]! : row.text;
+        const text = cleanDirectiveText(userPart);
+        if (human(text)) turns.push({ agent: 'elanous', ts: row.ts, sessionId: row.session_id ?? row.id, cwd: refs.cwd, text, sourceFile: dbPath, lineNo: row.rowid, role: 'user' });
+      }
+      files.push({ path: dbPath, agent: 'elanous', end: rows.at(-1)?.rowid ?? offset, turns });
+      perSource.elanous.files = 1;
+      perSource.elanous.directives = turns.length;
+    } finally { db.close(); }
+  }
+  return { files, missingSources, perSource };
+}

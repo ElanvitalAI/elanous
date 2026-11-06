@@ -6,6 +6,7 @@
 // ⛔ 토큰 «값»은 어디에도 출력하지 않는다 — accountId 앞 8자만(R-LLM2).
 
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, statSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { consumeCodexResetCredits, listCodexResetCredits } from '../budget/codex-reset-credits.js';
@@ -32,7 +33,7 @@ import {
   decideFallback, fallbackChainForProvider, normalizeFallbackChain, grokQuotaFromUsageSnapshot,
   type FallbackDecision, type FallbackInput, type FallbackStep, type RotationOutcome,
 } from './fallback-chain.js';
-import { collectClaudePtyMaturitySample, judgeClaudePtyMaturity, type ClaudePtyMaturity } from './claude-pty-maturity.js';
+import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
 import type { UsageOutcomesDeps } from '../budget/usage-outcomes.js';
 import { resolveGrokCredential } from '../grok/credential.js';
 import { getOpenRouterApiKey } from '../config.js';
@@ -41,6 +42,8 @@ import { lookupOpenRouterModelSpec } from '../model-tier/llm-tier-map.js';
 import { sendOutbound } from '../domains/outbound-alert.js';
 
 type CodexAccountOutboundSender = (text: string, kind?: string) => boolean;
+
+const requireFromHere = createRequire(import.meta.url);
 
 function defaultCodexAccountOutboundSender(text: string, kind?: string): boolean {
   return sendOutbound(text, kind);
@@ -1105,12 +1108,15 @@ function claudePtyMaturityForChain(
 ): ClaudePtyMaturity | undefined {
   if (!chain.includes('claude-pty')) return undefined;
   try {
+    // This ledger-backed collector is only needed for the claude-pty fallback step.
+    // Keep the synchronous fallback API while deferring the large run-ledger subtree.
+    const { collectClaudePtyMaturitySample, judgeClaudePtyMaturity } = requireFromHere('./claude-pty-maturity.js') as typeof import('./claude-pty-maturity.js');
     return judgeClaudePtyMaturity(collectClaudePtyMaturitySample(ledger ?? {}));
   } catch (error) {
     debug.log('oauth.claude-pty', 'maturity-read-failed', {
       reason: error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120),
     }, { level: 'warn' });
-    return judgeClaudePtyMaturity(null);
+    return { mature: false, why: 'sample-unreadable' };
   }
 }
 

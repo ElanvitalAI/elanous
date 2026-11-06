@@ -23,6 +23,31 @@ export interface SubagentToolsResult {
 
 type Row = { category?: string; event?: string; data?: string };
 
+export function observedArrayCount(value: unknown): number {
+  if (!Array.isArray(value)) return -1;
+  let count = 0;
+  let summarized = false;
+  for (const [index, item] of value.entries()) {
+    if (typeof item === 'string') {
+      if (summarized) return -1;
+      count += 1;
+      if (!Number.isSafeInteger(count)) return -1;
+      continue;
+    }
+    if (typeof item === 'object' && item !== null && !Array.isArray(item)
+      && Object.keys(item).length === 1 && '_more' in item
+      && Number.isSafeInteger((item as { _more?: unknown })._more)
+      && (item as { _more: number })._more > 0 && index === value.length - 1 && !summarized) {
+      count += (item as { _more: number })._more;
+      if (!Number.isSafeInteger(count)) return -1;
+      summarized = true;
+      continue;
+    }
+    return -1;
+  }
+  return count;
+}
+
 export async function runSubagentToolsDevice(spec: SubagentToolsSpec): Promise<SubagentToolsResult> {
   const root = resolve(spec.root);
   mkdirSync(root, { recursive: true });
@@ -46,7 +71,11 @@ export async function runSubagentToolsDevice(spec: SubagentToolsSpec): Promise<S
       ...(spec.scenario === 'zero-refused' ? { ELANOUS_SUBAGENT_HONOR_ALLOW: '1' } : {}),
       [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '서브에이전트로', name: 'Agent', args: { description: '도구 확인', prompt: '파일 하나 읽어라', tool_filter: toolFilter } }),
     },
-    ready: { label: 'boot', until: (s: string) => s.includes('elanous | daemon') && s.includes('❯'), timeoutMs: 90_000 },
+    ready: {
+      label: 'boot',
+      until: (s: string) => (s.includes('elanous | daemon') || s.includes('Opening web setup…') || s.includes('웹 화면을 여는 중…')) && s.includes('❯'),
+      timeoutMs: 90_000,
+    },
     quitKeys: '/exit\r',
     exitTimeoutMs: 20_000,
     steps: [{ label: 'delegated', text: '서브에이전트로 확인해줘', until: (s) => /✔ 완료|✘ 실패/.test(s), timeoutMs: 60_000 }],
@@ -58,7 +87,7 @@ export async function runSubagentToolsDevice(spec: SubagentToolsSpec): Promise<S
   const dispatch = ev('dispatch');
   const refused = ev('no-tools-refused');
   const f0 = filterRows[0] ?? {};
-  const dispatchedTools = Array.isArray(dispatch[0]?.tools) ? (dispatch[0]!.tools as unknown[]).length : -1;
+  const dispatchedTools = observedArrayCount(dispatch[0]?.tools);
   const checks: Record<string, boolean> = spec.scenario === 'mismatch'
     ? {
         filterObserved: filterRows.length === 1,

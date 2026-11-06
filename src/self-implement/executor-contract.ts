@@ -1,18 +1,18 @@
 // ── executor 통일 계약 (G9 P3a · 2026-07-25) ──────────────────────────────────
 //
 // canonical = [[DESIGN-executor-pty-ref-contract-2026-07-25]] §3 (양 세션 §8 6항 합의 완료).
-// 목적: PTY-spawn executor(backend = elanous-chat/codex/claude/gemini/grok/aside 한 가족)가 pty 산출 순간
+// 목적: PTY-spawn executor(backend = elanous-chat/codex/claude/gemini/grok/aside/openclaw/hermes 한 가족)가 pty 산출 순간
 //   **식별자만 표면화**하면 K(run-identity join)·G5(제어루프 관측)가 **별도 bolt-on 없이** 그 seam 을 소비.
 // 원칙: 전부 기존 값의 co-location — 신규 개념 없음. 이 모듈은 순수(타입+상수+순수 헬퍼).
 
 import type { AgentBackend } from '../agent-mission/driver.js';
 
 /**
- * PTY-spawn executor backend SSOT (계약 §8 Q5). `AgentBackend{codex|claude|gemini|grok|aside}`(외부 에이전틱
+ * PTY-spawn executor backend SSOT (계약 §8 Q5). `AgentBackend`(외부 에이전틱
  * CLI) superset 에 `elanous-chat`(elanous 자체 goal-loop 을 PTY 로 spawn)만 얹는다. `ExecutorPtyRef.backend`
  * 를 이 타입으로 못박아 문자열 drift 를 차단한다.
  */
-export const EXECUTOR_BACKENDS = ['elanous-chat', 'codex', 'claude', 'gemini', 'grok', 'aside'] as const;
+export const EXECUTOR_BACKENDS = ['elanous-chat', 'codex', 'claude', 'gemini', 'grok', 'aside', 'openclaw', 'hermes'] as const;
 export type ExecutorBackend = typeof EXECUTOR_BACKENDS[number];
 
 // 컴파일 drift 가드(Q5·실 drift 방지의 SSOT) — `ExecutorBackend` 는 `EXECUTOR_BACKENDS` 배열에서 파생하므로

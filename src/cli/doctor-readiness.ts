@@ -2,6 +2,7 @@ import { remediesFor, type DistroFamily } from './doctor-distro.js';
 import type { UsableLlm } from '../llm/usable-llm.js';
 import { providerSecretNames } from '../nexus/install/launchd.js';
 import { win32 } from 'node:path';
+import type { BackendEngine, BackendTier } from '../nexus/apps/backend-tier.js';
 /**
  * F1 readiness — read-only detection for the four places a new user actually falls.
  * Every external lookup is an injected dependency. This module never writes and
@@ -116,6 +117,8 @@ export interface ReadinessDeps {
   kubernetes?: KubernetesProbe | null;
   /** 시스템 RAM(바이트). 없으면(undefined/null) 못 쟀다. */
   memory?: MemoryProbe | null;
+  /** L0 시스템 측정으로 만든 백엔드 단 권고(읽기 전용). */
+  backendTier?: { tier: BackendTier; reasons: string[]; engines: BackendEngine[]; estimatedThresholds: true };
   /** 서비스 파일(launchd plist · systemd unit) 경로와 본문. `null` = 서비스 파일 없음 · 없으면(undefined) 못 쟀다. ⛔ 본문은 보고에 싣지 않는다(평문 키가 있을 수 있다). */
   serviceFile?: { path: string; text: string } | null;
 }

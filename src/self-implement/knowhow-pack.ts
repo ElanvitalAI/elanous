@@ -293,15 +293,68 @@ function mentionedPaths(text: string): Set<string> {
   return paths;
 }
 
+function safeRepositoryPath(path: string): boolean {
+  return path.length > 0 && path.length <= 512 && !path.startsWith('/') && !path.includes('\\')
+    && !/^[A-Za-z]:/.test(path) && !path.split('/').some((part) => !part || part === '.' || part === '..');
+}
+
+function segmentPatternMatches(pattern: string, value: string): boolean {
+  let expression = '^';
+  for (const character of pattern) {
+    if (character === '*') expression += '[^/]*';
+    else expression += character.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+  }
+  return new RegExp(`${expression}$`).test(value);
+}
+
+/** Match only safe repository-relative globs; `**` spans zero or more path segments. */
+function repositoryPathPatternMatches(pattern: string, value: string): boolean {
+  if (!safeRepositoryPath(pattern) || !safeRepositoryPath(value) || !pattern.includes('*')) return false;
+  const patternParts = pattern.split('/');
+  const valueParts = value.split('/');
+  const memo = new Map<string, boolean>();
+  const visit = (patternIndex: number, valueIndex: number): boolean => {
+    const key = `${patternIndex}:${valueIndex}`;
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+    let matched: boolean;
+    if (patternIndex === patternParts.length) matched = valueIndex === valueParts.length;
+    else if (patternParts[patternIndex] === '**') {
+      matched = visit(patternIndex + 1, valueIndex)
+        || (valueIndex < valueParts.length && visit(patternIndex, valueIndex + 1));
+    } else {
+      matched = valueIndex < valueParts.length
+        && segmentPatternMatches(patternParts[patternIndex]!, valueParts[valueIndex]!)
+        && visit(patternIndex + 1, valueIndex + 1);
+    }
+    memo.set(key, matched);
+    return matched;
+  };
+  return visit(0, 0);
+}
+
+function samePathKind(a: string, b: string): boolean {
+  if (!safeRepositoryPath(a) || !safeRepositoryPath(b)) return false;
+  const aTestFile = /(?:^|\/)[^/]+\.test\.ts$/i.test(a);
+  const bTestFile = /(?:^|\/)[^/]+\.test\.ts$/i.test(b);
+  const aRulesFile = a === '.rules' || a.startsWith('.rules/');
+  const bRulesFile = b === '.rules' || b.startsWith('.rules/');
+  return (aTestFile && bTestFile) || (aRulesFile && bRulesFile);
+}
+
 function relevance(goal: string, section: string, targetPaths?: readonly string[]): number {
   const paths = targetPaths === undefined ? mentionedPaths(goal) : new Set(targetPaths);
   const sourcePaths = mentionedPaths(section);
   let score = 0;
   for (const path of paths) {
-    if (sourcePaths.has(path)) score += 20;
+    const bestMatch = Math.max(0, ...[...sourcePaths].map((sourcePath) => {
+      if (sourcePath === path) return 20;
+      if (repositoryPathPatternMatches(path, sourcePath) || repositoryPathPatternMatches(sourcePath, path)) return 14;
+      return samePathKind(path, sourcePath) ? 10 : 0;
+    }));
+    score += bestMatch;
   }
-  // A path-scoped remedy must not be selected solely because an unrelated goal shares its failure label.
-  // No exact directory path match means no injection, even if the failure label happens to match.
+  // Path patterns and file kinds broaden only path-scoped matches; a shared failure label alone is insufficient.
   if (score === 0) return 0;
   for (const signature of SIGNATURES) {
     if (goal.includes(signature) && section.includes(signature)) score += 6;
@@ -358,6 +411,8 @@ function selectKnowhowOnly(repo: string, goal: string, targetPaths: readonly str
     if (!inside(realpathSync(repo), realRoles)) return empty('source-unreadable');
   } catch { return empty('source-unreadable'); }
   const candidates: Array<{ id: string; text: string; score: number }> = [];
+  const goalPaths = targetPaths === undefined ? mentionedPaths(goal) : new Set(targetPaths);
+  const hasTestFileGoal = [...goalPaths].some((path) => safeRepositoryPath(path) && /(?:^|\/)[^/]+\.test\.ts$/i.test(path));
   let seatDirs: string[];
   try { seatDirs = readdirSync(rolesDir).sort(); } catch { return empty('source-unreadable'); }
   let readableFiles = 0;
@@ -381,10 +436,16 @@ function selectKnowhowOnly(repo: string, goal: string, targetPaths: readonly str
   if (readableFiles === 0) return empty('source-unreadable');
   if (promotedCount === 0) return empty('no-promoted-section');
   if (candidates.length === 0) return empty('no-path-overlap');
+  const tcTestHygieneIds = ['K-TC-58', 'K-TC-59', 'K-TC-60', 'K-TC-61'];
+  const selectTcTestHygiene = hasTestFileGoal && tcTestHygieneIds.every((id) => candidates.some((candidate) => candidate.id === id));
+  const maxSelected = selectTcTestHygiene ? 4 : 3;
   candidates.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  const selectionOrder = selectTcTestHygiene
+    ? [...candidates.filter((candidate) => tcTestHygieneIds.includes(candidate.id)), ...candidates.filter((candidate) => !tcTestHygieneIds.includes(candidate.id))]
+    : candidates;
   const selected: typeof candidates = [];
-  for (const candidate of candidates) {
-    if (selected.length === 3) break;
+  for (const candidate of selectionOrder) {
+    if (selected.length === maxSelected) break;
     const next = [...selected, candidate];
     const ids = next.map((item) => item.id);
     const body = next.map((item) => item.text).join('\n\n');

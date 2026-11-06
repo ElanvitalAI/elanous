@@ -182,9 +182,9 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
     stamps.sort((a, b) => b.ended - a.ended);
     if (stamps.length > 1 && stamps[0]!.ended === stamps[1]!.ended) return full('hard rehearsal order ambiguous');
     for (const { step, stamp } of stamps.slice(0, 1)) {
-      if (stamp.version !== input.version || stamp.step !== step || stamp.outcome !== 'ok' || !stamp.sha || !SHA.test(stamp.sha)
-        || stamp.hardGate?.outcome !== 'ok' || stamp.hardGate.commit !== stamp.sha || stamp.hardGate.executor !== 'pod'
-        || !Array.isArray(stamp.hardGate.introduced) || stamp.hardGate.introduced.length)
+      if (stamp.version !== input.version || stamp.step !== step || !(stamp.outcome === 'ok' || stamp.outcome === 'regression') || !stamp.sha || !SHA.test(stamp.sha)
+        || !(stamp.hardGate?.outcome === 'ok' || stamp.hardGate?.outcome === 'fail' || stamp.hardGate?.outcome === 'regression') || stamp.hardGate.commit !== stamp.sha || stamp.hardGate.executor !== 'pod'
+        || !Array.isArray(stamp.hardGate.introduced))
         return full('latest hard rehearsal is not clean');
       let gateVersion: string;
       try { gateVersion = hardRehearsalGateVersion(input.version, stamp.hardGateRunId ?? ''); }
@@ -195,8 +195,8 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
       const failures = JSON.parse(readFileSync(join(dir, 'gate-failures.json'), 'utf8')) as {
         commit?: string; failures?: string[]; errors?: string[] };
       const receipt = verdict.baselineReceipt;
-      if (verdict.commit !== stamp.sha || verdict.outcome !== 'ok' || failures.commit !== stamp.sha
-        || !Array.isArray(failures.failures) || failures.failures.length !== 0
+      if (verdict.commit !== stamp.sha || !(verdict.outcome === 'ok' || verdict.outcome === 'regression' || verdict.outcome === 'fail') || failures.commit !== stamp.sha
+        || !Array.isArray(failures.failures)
         || !Array.isArray(failures.errors) || failures.errors.length !== 0
         || !receipt || receipt.schema !== 2 || !receipt.valid || receipt.version !== gateVersion || receipt.commit !== stamp.sha
         || receipt.graphSha !== input.graphPins.graphSha || receipt.recipeSha !== input.graphPins.recipeSha
@@ -223,6 +223,20 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
       if (!expectedFiles || JSON.stringify(measuredFiles.sort()) !== JSON.stringify(expectedFiles)
         || measuredFiles.length !== receipt.files)
         return full('hard rehearsal file inventory differs from receipt');
+      // A validated clean full-sweep receipt for the exact cut SHA already measures every test at that SHA.
+      // Keep an explicit empty carry plan so the caller skips the cut sweep instead of treating an empty radius
+      // as missing evidence and silently running the entire suite again.
+      if (stamp.sha === input.forCommit && failures.failures.length) {
+        let failedFiles: string[];
+        try { failedFiles = [...new Set(failures.failures.map(testFileOfId))].sort(); }
+        catch { return full('hard rehearsal failure ids unreadable'); }
+        return { plan: { version: input.version, priorCommit: stamp.sha, forCommit: input.forCommit, files: failedFiles,
+          priorFailures: failures.failures, priorErrors: failures.errors ?? [] },
+          reason: `same-head rehearsal receipt verified; re-measure ${failedFiles.length} failed file(s) only`, rehearsalRunId: stamp.hardGateRunId };
+      }
+      if (stamp.sha === input.forCommit) return { plan: { kind: 'carry', version: input.version, priorCommit: stamp.sha,
+        forCommit: input.forCommit, files: [], priorFailures: [], priorErrors: [] },
+        reason: 'same-head clean rehearsal receipt verified; zero tests rerun', rehearsalRunId: stamp.hardGateRunId };
       const tree = gitClosureTree(input.repo, input.forCommit);
       const tests = tree.files.filter((file) => TEST.test(file));
       const changed = changedFilesBetween(input.repo, stamp.sha, input.forCommit);

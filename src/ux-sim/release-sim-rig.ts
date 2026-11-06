@@ -1,10 +1,10 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { delimiter, dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { listGraphRuns, runGraph, type GraphRunState } from '../graph-runner/runner.js';
 import { releaseResumeWaiver } from '../../scripts/release-loop/resume.js';
 import { runKnownIssues } from '../../scripts/release-loop/known-issues-node.js';
@@ -22,6 +22,23 @@ import { gateEnvFingerprint, gateSourcePins } from '../../scripts/release-loop/g
 const REPOSITORY_ROOT = join(import.meta.dir, '../..');
 const RELEASE_GRAPH = join(REPOSITORY_ROOT, 'graphs/release/release-loop.yaml');
 const RECEIPT_SIM_NODE_IDS = ['cut', 'gate-cut', 'append-a', 'resume-a', 'gate-a', 'append-b', 'resume-b', 'gate-b', 'publish', 'done', 'failed'];
+
+function releaseCutWorldEnv(base: NodeJS.ProcessEnv, home: string, tmp: string, emptyGitConfig: string): NodeJS.ProcessEnv {
+  const gitExecutable = Bun.which('git');
+  const bunExecutable = Bun.which('bun');
+  if (!gitExecutable || !bunExecutable) throw new Error('release cut sim requires git and bun executables');
+  const safePath = [...new Set([dirname(gitExecutable), dirname(bunExecutable), '/usr/bin', '/bin', '/usr/sbin', '/sbin'])].join(delimiter);
+  return {
+    ...Object.fromEntries(Object.entries(base).filter(([key]) => !key.startsWith('GIT_') && key !== 'HOME' && key !== 'PATH' && key !== 'SSH_AUTH_SOCK')),
+    HOME: home, PATH: safePath, TMPDIR: tmp, NODE_ENV: base.NODE_ENV ?? 'test',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: emptyGitConfig,
+    GIT_CONFIG_SYSTEM: emptyGitConfig, GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'file',
+    GIT_AUTHOR_NAME: 'Release sim', GIT_AUTHOR_EMAIL: 'release-sim@example.invalid',
+    GIT_COMMITTER_NAME: 'Release sim', GIT_COMMITTER_EMAIL: 'release-sim@example.invalid',
+    GIT_AUTHOR_DATE: '2026-11-05T00:00:00Z', GIT_COMMITTER_DATE: '2026-11-05T00:00:00Z',
+  };
+}
+
 let cachedCutTip: string | undefined;
 function cutTip(): string {
   // The sim command is registered for root help. Resolve Git only when a
@@ -33,7 +50,7 @@ function cutTip(): string {
 
 export interface ReleaseSimRigCase {
   id: string;
-  mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'gate-waive-introduced-regression' | 'owner-waive-missing-schema' | 'owner-waive-0246-fixture' | 'append-receipt-continuity';
+  mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'cutoff-cli-notes-empty' | 'docs-node-cli-in-sim' | 'gate-waive-introduced-regression' | 'owner-waive-missing-schema' | 'owner-waive-0246-fixture' | 'append-receipt-continuity';
   fault?: { node: string; outcome: 'fail' | 'error' | 'timeout'; evidence?: Record<string, unknown> };
   nodeOutcomes?: Record<string, { outcome: 'ok' | 'fail' | 'error'; delayMs?: number }>;
   expect: { status: 'done' | 'failed' | 'resume-refused'; mustVisit: string[]; mustNotVisit: string[]; overlap?: [string, string]; refusalIncludes?: string };
@@ -391,7 +408,7 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
     ids.add(row.id);
     let mode: ReleaseSimRigCase['mode'];
     if (row.mode !== undefined) {
-      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume' && row.mode !== 'gate-waive-introduced-regression' && row.mode !== 'owner-waive-missing-schema' && row.mode !== 'owner-waive-0246-fixture' && row.mode !== 'append-receipt-continuity') throw new Error(`scenario.cases[${index}].mode is unregistered`);
+      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume' && row.mode !== 'cutoff-cli-notes-empty' && row.mode !== 'docs-node-cli-in-sim' && row.mode !== 'gate-waive-introduced-regression' && row.mode !== 'owner-waive-missing-schema' && row.mode !== 'owner-waive-0246-fixture' && row.mode !== 'append-receipt-continuity') throw new Error(`scenario.cases[${index}].mode is unregistered`);
       mode = row.mode;
     }
     let fault: ReleaseSimRigCase['fault'];
@@ -451,7 +468,15 @@ function resultForNode(nodeId: string, fault: ReleaseSimRigCase['fault'], versio
   const outcome = triggeredFault ? triggeredFault.outcome === 'timeout' ? 'error' : triggeredFault.outcome : 'ok';
   const evidence = triggeredFault?.evidence ?? {};
   const commit = nodeId === 'version-release' ? { commit: cutTip(), tag: `v${version}` } : {};
-  const payload = { outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: triggeredFault ? `simulated ${triggeredFault.outcome}` : `simulated ${nodeId} success`, ...commit,
+  const introduced = Array.isArray(evidence.introduced) && evidence.introduced.every((id) => typeof id === 'string')
+    ? evidence.introduced as string[] : [];
+  // Only a named, nonempty introduced set can stand in for a measured remote regression verdict.
+  const gateOutput = nodeId === 'gate' && triggeredFault && evidence.realGateTriage === true && introduced.length > 0 ? {
+    commit: cutTip(), introduced, preexisting: 0, fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [],
+    durationMs: 1, ...(outcome === 'fail' ? { outcome: 'fail', autoheal: { action: 'hitl', cause: 'true-regression',
+      shardKey: 'gate', reason: 'measured regression requires a human decision', shardElapsedMs: 1, overallElapsedMs: 1 } } : {}),
+  } : {};
+  const payload = { outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: triggeredFault ? `simulated ${triggeredFault.outcome}` : `simulated ${nodeId} success`, ...commit, ...gateOutput,
     simulation: { injected: triggeredFault !== undefined, node: nodeId, evidence } };
   return { exitCode: !triggeredFault ? 0 : triggeredFault.outcome === 'fail' ? 1 : triggeredFault.outcome === 'timeout' ? 124 : 2,
     stdout: `${JSON.stringify(payload)}\n`, stderr: triggeredFault ? `SIMULATED_${triggeredFault.outcome.toUpperCase()}` : '', evidence };
@@ -737,12 +762,185 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
   const ledgerEvents: Array<Record<string, unknown>> = [];
   const dispatchedNodes: string[] = [];
   const nodeTimings: NonNullable<ReleaseSimRigCaseResult['nodeTimings']> = {};
+  let versionReleaseCliStdout = '';
+  let cutoffCliStdout = '';
+  let docsNodeCliStdout = '';
+  let docsNodeEvidence: Record<string, unknown> = {};
+  let cutoffWorld: { world: string; repo: string; stateRoot: string; home: string; tmp: string; emptyGitConfig: string } | undefined;
   const runBash = async (command: string, options: { env?: NodeJS.ProcessEnv }) => {
     const { nodeId } = parseContext(options.env ?? process.env);
     if (!command.trim()) throw new Error(`empty command at simulated node ${nodeId}`);
     dispatchedNodes.push(nodeId);
     const startedAtMs = performance.now();
+    if (item.mode === 'cutoff-cli-notes-empty' && nodeId === 'version-release') {
+      if (command.trim() !== 'bun scripts/release-loop/version-node.ts release --json') throw new Error(`version-release recipe changed: ${command}`);
+      const world = join(root, `${runId}-cutoff-world`);
+      const seed = join(world, 'seed');
+      const origin = join(world, 'origin.git');
+      const repo = join(world, 'repo');
+      const stateRoot = join(world, 'state');
+      const home = join(world, 'home');
+      const tmp = join(world, 'tmp');
+      const emptyHooks = join(world, 'empty-hooks');
+      const emptyTemplate = join(world, 'empty-template');
+      const emptyGitConfig = join(world, 'empty.gitconfig');
+      rmSync(world, { recursive: true, force: true });
+      mkdirSync(join(seed, 'release/public/docs'), { recursive: true });
+      mkdirSync(join(seed, 'src/cli'), { recursive: true });
+      for (const directory of [stateRoot, home, tmp, emptyHooks, emptyTemplate]) mkdirSync(directory, { recursive: true });
+      writeFileSync(emptyGitConfig, '');
+      writeFileSync(join(seed, 'package.json'), `${JSON.stringify({ name: 'release-sim-cut', version: scenario.input.version })}\n`);
+      writeFileSync(join(seed, 'release/public/docs/cli.md'), '## `elanous sim`\n');
+      const gitExecutable = Bun.which('git');
+      if (!gitExecutable) throw new Error('release cut sim requires git executable');
+      const worldEnv = (base: NodeJS.ProcessEnv) => releaseCutWorldEnv(base, home, tmp, emptyGitConfig);
+      const git = (cwd: string, ...args: string[]) => execFileSync(gitExecutable, args, { cwd, env: worldEnv(process.env), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      git(world, 'init', '--bare', `--template=${emptyTemplate}`, '-q', origin);
+      git(origin, 'config', 'core.hooksPath', emptyHooks);
+      git(seed, 'init', `--template=${emptyTemplate}`, '-q'); git(seed, 'config', 'core.hooksPath', emptyHooks);
+      git(seed, 'config', 'user.name', 'Release sim'); git(seed, 'config', 'user.email', 'release-sim@example.invalid');
+      git(seed, 'add', '.'); git(seed, 'commit', '-qm', 'release simulation baseline');
+      git(seed, 'tag', `v${scenario.input.previousVersion}`);
+      git(seed, 'remote', 'add', 'origin', origin); git(seed, 'push', '-q', '-u', 'origin', 'HEAD:main');
+      git(seed, 'push', '-q', 'origin', `refs/tags/v${scenario.input.previousVersion}`);
+      git(origin, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+      writeFileSync(join(seed, 'src/cli/simulated-cut.ts'), 'export const simulatedCut = true;\n');
+      git(seed, 'add', '.'); git(seed, 'commit', '-qm', 'feat: simulated release cut');
+      git(seed, 'push', '-q', 'origin', 'HEAD:main');
+      execFileSync(gitExecutable, ['clone', '-q', `--template=${emptyTemplate}`, origin, repo], {
+        cwd: world, env: worldEnv(process.env), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      git(repo, 'config', 'core.hooksPath', emptyHooks);
+      git(repo, 'config', 'user.name', 'Release sim'); git(repo, 'config', 'user.email', 'release-sim@example.invalid');
+      if (git(repo, 'remote', 'get-url', 'origin') !== origin) throw new Error('release cut sim origin is not the isolated local bare repository');
+      symlinkSync(join(REPOSITORY_ROOT, 'scripts'), join(repo, 'scripts'), 'dir');
+      cutoffWorld = { world, repo, stateRoot, home, tmp, emptyGitConfig };
+      const contextValue = options.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextValue) throw new Error('release graph context missing for version-release CLI');
+      const context = JSON.parse(contextValue.trimStart().startsWith('{') ? contextValue : readFileSync(contextValue, 'utf8')) as {
+        input: Record<string, unknown> };
+      context.input = { ...context.input, branchCut: true };
+      const cli = spawnSync('bun', ['scripts/release-loop/version-node.ts', 'release', '--json'], {
+        cwd: repo, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+        env: { ...worldEnv({ ...process.env, ...options.env }), ELANOUS_STATE_DIR: stateRoot, ELANOUS_STATE_DIR_SOURCE: 'explicit',
+          ELANOUS_NEXUS_DIR: stateRoot, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context) },
+      });
+      versionReleaseCliStdout = cli.stdout ?? '';
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      if (cli.error) throw cli.error;
+      return { exitCode: cli.status ?? 2, stdout: cli.stdout ?? '', stderr: cli.stderr ?? '' };
+    }
+    if (item.mode === 'cutoff-cli-notes-empty' && nodeId === 'cutoff') {
+      if (command.trim() !== 'bun scripts/release-loop/node-verdict.ts cutoff') throw new Error(`cutoff recipe changed: ${command}`);
+      if (!cutoffWorld) throw new Error('version-release CLI did not create an isolated cutoff world');
+      const cli = spawnSync('bun', ['scripts/release-loop/node-verdict.ts', 'cutoff'], {
+        cwd: cutoffWorld.repo, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+        env: { ...releaseCutWorldEnv({ ...process.env, ...options.env }, cutoffWorld.home, cutoffWorld.tmp, cutoffWorld.emptyGitConfig), ELANOUS_STATE_DIR: cutoffWorld.stateRoot, ELANOUS_STATE_DIR_SOURCE: 'explicit',
+          ELANOUS_NEXUS_DIR: cutoffWorld.stateRoot },
+      });
+      cutoffCliStdout = cli.stdout ?? '';
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      if (cli.error) throw cli.error;
+      return { exitCode: cli.status ?? 2, stdout: cli.stdout ?? '', stderr: cli.stderr ?? '' };
+    }
+    if (item.mode === 'docs-node-cli-in-sim' && nodeId === 'docs') {
+      if (command.trim() !== 'bun scripts/release-loop/docs-node.ts --json') throw new Error(`docs recipe changed: ${command}`);
+      const world = join(root, `${runId}-docs-world`);
+      const seed = join(world, 'seed');
+      const origin = join(world, 'origin.git');
+      const repo = join(world, 'repo');
+      const stateRoot = join(world, 'state');
+      const home = join(world, 'home');
+      const tmp = join(world, 'tmp');
+      const emptyHooks = join(world, 'empty-hooks');
+      const emptyTemplate = join(world, 'empty-template');
+      const emptyGitConfig = join(world, 'empty.gitconfig');
+      const fakeBin = join(world, 'fake-bin');
+      rmSync(world, { recursive: true, force: true });
+      for (const directory of [stateRoot, home, tmp, emptyHooks, emptyTemplate, fakeBin]) mkdirSync(directory, { recursive: true });
+      writeFileSync(emptyGitConfig, '');
+      const gitExecutable = Bun.which('git');
+      const bunExecutable = Bun.which('bun');
+      if (!gitExecutable || !bunExecutable) throw new Error('docs node sim requires git and bun executables');
+      const isolatedEnv = releaseCutWorldEnv(process.env, home, tmp, emptyGitConfig);
+      const git = (cwd: string, ...args: string[]) => execFileSync(gitExecutable, args, { cwd, env: isolatedEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      mkdirSync(join(seed, 'release/public/docs'), { recursive: true });
+      mkdirSync(join(seed, 'release/public/docs/releases'), { recursive: true });
+      mkdirSync(join(seed, 'website'), { recursive: true });
+      mkdirSync(join(seed, 'scripts/release-loop'), { recursive: true });
+      writeFileSync(join(seed, 'package.json'), '{"name":"release-docs-sim","version":"0.0.0","private":true}\n');
+      writeFileSync(join(seed, 'release/public/docs/cli.md'), '## CLI\n\n🟡 on main — next release\n');
+      writeFileSync(join(seed, 'release/public/docs/releases/index.md'), '# Releases\n');
+      writeFileSync(join(seed, 'website/pages.json'), '{"pages":[]}\n');
+      symlinkSync(join(REPOSITORY_ROOT, 'scripts/release-loop/docs-node.ts'), join(seed, 'scripts/release-loop/docs-node.ts'));
+      git(seed, 'init', '-b', 'main', `--template=${emptyTemplate}`, '-q');
+      git(seed, 'config', 'core.hooksPath', emptyHooks);
+      git(seed, 'config', 'user.name', 'Release sim'); git(seed, 'config', 'user.email', 'release-sim@example.invalid');
+      git(seed, 'add', '.'); git(seed, 'commit', '-qm', 'release docs simulation baseline');
+      git(world, 'clone', '-q', '--bare', `--template=${emptyTemplate}`, seed, origin);
+      git(origin, 'config', 'core.hooksPath', emptyHooks);
+      git(origin, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+      execFileSync(gitExecutable, ['clone', '-q', `--template=${emptyTemplate}`, origin, repo], {
+        cwd: world, env: isolatedEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      git(repo, 'config', 'core.hooksPath', emptyHooks);
+      git(repo, 'config', 'user.name', 'Release sim'); git(repo, 'config', 'user.email', 'release-sim@example.invalid');
+      if (git(repo, 'remote', 'get-url', 'origin') !== origin) throw new Error('docs sim origin is not the isolated local bare repository');
+      const fakeBun = join(fakeBin, 'bun');
+      writeFileSync(fakeBun, '#!/bin/sh\nif [ "$1" = install ] && [ "$2" = --frozen-lockfile ]; then\n  ln -s "$ELANOUS_SIM_NODE_MODULES" "$PWD/node_modules"\n  exit 0\nfi\necho "unexpected bun boundary: $*" >&2\nexit 97\n');
+      chmodSync(fakeBun, 0o755);
+      const contextValue = options.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextValue) throw new Error('release graph context missing for docs node CLI');
+      const context = JSON.parse(contextValue.trimStart().startsWith('{') ? contextValue : readFileSync(contextValue, 'utf8')) as {
+        input: { version: string }; outputs: Record<string, { outcome?: string; commit?: string }> };
+      const version = context.input.version;
+      const versionCommit = context.outputs['version-release']?.commit;
+      if (!versionCommit || !/^[0-9a-f]{40}$/i.test(versionCommit)) throw new Error('docs sim release commit missing from graph context');
+      mkdirSync(join(stateRoot, 'release', version), { recursive: true });
+      writeFileSync(join(stateRoot, 'release', version, 'manifest.json'), `${JSON.stringify({
+        version, baseline: { ref: `v${scenario.input.previousVersion}`, sha: cutTip() }, cutoff: { sha: versionCommit },
+        in: [{ sha: versionCommit, title: 'feat: simulated docs node', docs: 'present', kind: 'feat', line: 'Simulation publishes release documentation.' }],
+        deferred: [], escalate: [],
+      }, null, 2)}\n`);
+      const cli = spawnSync(bunExecutable, ['scripts/release-loop/docs-node.ts', '--json'], {
+        cwd: repo, encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
+        env: { ...isolatedEnv, PATH: [fakeBin, isolatedEnv.PATH].join(delimiter),
+          ELANOUS_SIM_NODE_MODULES: join(REPOSITORY_ROOT, 'node_modules'), ELANOUS_GRAPH_CONTEXT: contextValue,
+          ELANOUS_STATE_DIR: stateRoot, ELANOUS_STATE_DIR_SOURCE: 'explicit', ELANOUS_NEXUS_DIR: stateRoot },
+      });
+      docsNodeCliStdout = cli.stdout ?? '';
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      if (cli.error) throw cli.error;
+      if (cli.status !== 0) {
+        docsNodeEvidence = { actualCli: 'bun scripts/release-loop/docs-node.ts --json', cliStatus: cli.status,
+          cliOutput: docsNodeCliStdout, cliStderr: cli.stderr ?? '', remote: 'local-bare-only' };
+        return { exitCode: cli.status ?? 2, stdout: cli.stdout ?? '', stderr: cli.stderr ?? '' };
+      }
+      const branch = `release-docs/${version}`;
+      const remoteHead = git(origin, 'rev-parse', `refs/heads/${branch}`);
+      const remoteNotes = git(origin, 'show', `${branch}:release/public/docs/releases/${version}.md`);
+      const remotePages = git(origin, 'show', `${branch}:website/pages.json`);
+      const remoteMarker = git(origin, 'show', `${branch}:release/public/docs/cli.md`);
+      const cliPayload = JSON.parse(docsNodeCliStdout.trim().split('\n').at(-1) ?? 'null') as { outcome?: unknown; branch?: unknown };
+      docsNodeEvidence = { actualCli: 'bun scripts/release-loop/docs-node.ts --json', cliStatus: cli.status,
+        cliOutput: docsNodeCliStdout, remote: 'local-bare-only', branch, remoteHead,
+        cliOutcome: cliPayload.outcome, cliBranch: cliPayload.branch,
+        notesRegistered: remoteNotes.includes('Simulation publishes release documentation.'),
+        pagesRegistered: remotePages.includes(`"id": "releases/${version}"`),
+        markerFlipped: remoteMarker.includes(`✅ in v${version}`) && !remoteMarker.includes('🟡 on main') };
+      if (cliPayload.outcome !== 'ok' || cliPayload.branch !== branch || !docsNodeEvidence.notesRegistered
+        || !docsNodeEvidence.pagesRegistered || !docsNodeEvidence.markerFlipped)
+        throw new Error(`actual docs node CLI did not publish complete docs evidence: ${JSON.stringify(docsNodeEvidence)}`);
+      return { exitCode: cli.status ?? 2, stdout: cli.stdout ?? '', stderr: cli.stderr ?? '' };
+    }
     const injection = item.nodeOutcomes?.[nodeId];
+    if (item.fault?.evidence?.realGateTriage === true && nodeId === 'gate-triage') {
+      const child = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
+        cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
+      });
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
+    }
     const result = injection ? resultForNode(nodeId, injection.outcome === 'ok' ? undefined : {
       node: nodeId, outcome: injection.outcome, evidence: {},
     }, scenario.input.version) : resultForNode(nodeId, item.fault, scenario.input.version);
@@ -805,7 +1003,10 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
     nodeTimings[overlapPair[1]]!.startedAtMs < nodeTimings[overlapPair[0]]!.endedAtMs);
   const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
     && ledgerEvents.filter((row) => row.event === 'edge-observed').length === Math.max(0, path.length - 1);
-  const injectedEvidence = item.fault ? item.fault.evidence ?? {} : {};
+  const injectedEvidence = { ...(item.fault ? item.fault.evidence ?? {} : {}),
+    ...(item.mode === 'cutoff-cli-notes-empty' ? { actualCli: 'version-node.ts release → node-verdict.ts cutoff → cutoff.ts',
+      actualVersionReleaseCliOutput: versionReleaseCliStdout, actualCutoffCliOutput: cutoffCliStdout } : {}),
+    ...(item.mode === 'docs-node-cli-in-sim' ? docsNodeEvidence : {}) };
   return { id: item.id, pass: statusOk && visitOk && notVisitOk && overlapOk && ledgerOk && edgeIssues.length === 0, status: state.status, path, dispatchedNodes, unexpectedEdges: edgeIssues,
     checks: { status: statusOk, mustVisit: visitOk, mustNotVisit: notVisitOk, overlap: overlapOk, ledgerEvents: ledgerOk }, injectedEvidence,
     fanOuts: state.fanOuts, nodeTimings, ledgerEvents, statePath: state.statePath };

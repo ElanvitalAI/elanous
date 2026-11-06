@@ -43,7 +43,9 @@ import {
 // ⭐ substrate 통합(PLAN-unified-autonomous-agent-substrate-2026-07-20) — goal-loop 아밍 시
 // chat 툴루프를 canonical 엔진(runGoalLoop→runCoreTurn→streamLLMWithTools)으로 라우팅.
 // ACP bridge(core-turn-bridge.ts)·dashboard(runGoalLoopHook)와 동일 엔진 재사용(재발명 제거).
-import { runCoreTurn, runGoalLoop, type CoreTurnContext, type CoreTurnDispatchTool } from '../core-turn/index.js';
+import { runCoreTurn } from '../core-turn/run-core-turn.js';
+import { runGoalLoop } from '../core-turn/run-goal-loop.js';
+import type { CoreTurnContext, CoreTurnDispatchTool } from '../core-turn/types.js';
 import { resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
@@ -419,8 +421,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // 2) Assemble, trim, call. When images are attached for THIS turn,
   //    swap the string content of the latest user message for
   //    ContentBlock[] so the provider adapter sends them multimodally.
-  const assembleTurnMessages = (systemPrompt?: string): { kept: LLMMessage[]; dropped: number; used: number } => {
-    const wire = toLLM([...messages, userMsg], systemPrompt);
+  const assembleTurnMessages = (systemPrompt?: string, history = messages): { kept: LLMMessage[]; dropped: number; used: number } => {
+    const wire = toLLM([...history, userMsg], systemPrompt);
     if (opts.userImages && opts.userImages.length > 0) {
       const last = wire[wire.length - 1];
       if (last && last.role === 'user') {
@@ -447,23 +449,27 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           // user turn, so use the shared session compactor and rebuild from
           // the rewritten history. Later tool rounds compact their live
           // message list (shared guard) so no just-produced tool context is lost.
-          compactFirstRequest: async () => {
+          compactFirstRequest: async (currentMessages) => {
             const { compactSessionHistory } = await import('./compact-session.js');
             const result = await compactSessionHistory(opts.sessionId, {
               config: opts.userConfig.chat.autoCompact,
               force: true,
+              prepareOnly: true,
               modelId: llmOpts?.model ?? provider.defaultModel,
             });
-            if (!result.fired) return null;
-            const refreshed = loadSession(opts.sessionId);
-            if (!refreshed) return null;
-            // The persisted compacted session includes this turn's
-            // user message. Drop that final persisted row here, then
-            // assembleTurnMessages re-adds the canonical userMsg and
-            // any image blocks from opts.userImages exactly once.
-            messages = refreshed.messages.slice(0, -1);
-            const rebuilt = assembleTurnMessages(effectiveSystemPrompt).kept;
-            return { messages: rebuilt, reason: `session-${result.reason}` };
+            if (!result.fired || !result.preparedMessages || !result.commit) return null;
+            // The prepared session includes this turn's user message. Re-add
+            // the canonical message and images while constructing the candidate.
+            const preparedHistory = result.preparedMessages.slice(0, -1);
+            const rebuilt = assembleTurnMessages(effectiveSystemPrompt, preparedHistory).kept;
+            const originalSystems = currentMessages.filter(message => message.role === 'system');
+            const missingSystems = originalSystems.filter(message => !rebuilt.some(candidate => JSON.stringify(candidate) === JSON.stringify(message)));
+            rebuilt.unshift(...missingSystems);
+            return {
+              messages: rebuilt,
+              reason: `session-${result.reason}`,
+              commit: () => { result.commit!(); messages = preparedHistory; },
+            };
           },
           onMeasured: (measurement) => {
             opts.onStatusLine?.(formatRequestSizeStatus(measurement));

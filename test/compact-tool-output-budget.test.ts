@@ -1,17 +1,86 @@
 // ── Wave 2 · Layer 1 · tool-output budget ──
 
-import { describe, expect, test } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyToolOutputBudget } from '../src/compact/tool-output-budget';
+import { archiveReferencePath } from '../src/compact/archive';
 import type { LLMMessage } from '../src/llm';
+import { dispatchRead } from '../src/code-edit/tools';
 
+const archiveDirs: string[] = [];
 function archDir(): string {
-  return mkdtempSync(join(tmpdir(), 'compact-tob-'));
+  const dir = mkdtempSync(join(tmpdir(), 'compact-tob-'));
+  archiveDirs.push(dir);
+  return dir;
 }
+afterEach(() => {
+  for (const dir of archiveDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 describe('Wave 2 · Layer 1 · tool-output budget', () => {
+  test('quotes delimiter characters in archive paths for Read', async () => {
+    const dir = join(archDir(), 'a]b"c\\d');
+    const original = 'original\n'.repeat(1000);
+    const messages: LLMMessage[] = [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'quoted', content: original }] }];
+    const result = applyToolOutputBudget(messages, { sessionId: 'quoted', policy: { archiveDir: dir, preserveLastN: 0, toolOutputCharBudget: 512, toolOutputTailLines: 1 } });
+    const block = (result.messages[0]!.content as Array<{ content: string }>)[0]!;
+    const path = JSON.parse(block.content.match(/saved to: ("(?:\\.|[^"\\])*")\]/)![1]!) as string;
+    expect(path).toBe(join(dir, 'quoted.jsonl'));
+    const read = await dispatchRead({ file_path: path });
+    const record = JSON.parse(read.output.split('\n').find(line => line.startsWith('{'))!);
+    expect(record.origin.tool_use_id).toBe('quoted');
+    expect(record.content).toBe(original);
+  });
+  test('does not truncate a recovery reference or required tail to fit a tiny budget', () => {
+    const original = `${'head\n'.repeat(1000)}last line`;
+    const messages: LLMMessage[] = [{ role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'tiny-budget', content: original },
+    ] }];
+    const result = applyToolOutputBudget(messages, {
+      sessionId: 'tiny', policy: { archiveDir: archDir(), preserveLastN: 0, toolOutputCharBudget: 10, toolOutputTailLines: 1 },
+    });
+    expect(result.responsesTrimmed).toBe(0);
+    expect(result.messages).toEqual(messages);
+  });
+
+  test('reserves the recovery reference and selected tail within the budget', () => {
+    const original = `${'head\n'.repeat(1000)}tail-1\ntail-2`;
+    const messages: LLMMessage[] = [{ role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'budget-tail', content: original },
+    ] }];
+    const dir = archDir();
+    const result = applyToolOutputBudget(messages, {
+      sessionId: 'budget', policy: { archiveDir: dir, preserveLastN: 0, toolOutputCharBudget: 256, toolOutputTailLines: 2 },
+    });
+    expect(result.responsesTrimmed).toBe(1);
+    const block = (result.messages[0]!.content as Array<{ content: string }>)[0]!;
+    expect(block.content.length).toBeLessThanOrEqual(256);
+    expect(block.content).toContain(join(dir, 'budget.jsonl'));
+    expect(block.content).toContain('tail-1\ntail-2');
+  });
+
+  test('long archive path remains readable through the production Read tool', async () => {
+    const dir = join(archDir(), ...Array.from({ length: 3 }, () => 'long-segment-'.repeat(15)));
+    const original = `${'original\n'.repeat(1_000)}last line`;
+    const messages: LLMMessage[] = [{ role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'long-path', content: original },
+    ] }];
+    const result = applyToolOutputBudget(messages, {
+      sessionId: 'long-session', policy: { archiveDir: dir, preserveLastN: 0, toolOutputCharBudget: 1_200, toolOutputTailLines: 1 },
+    });
+    expect(result.responsesTrimmed).toBe(1);
+    const block = (result.messages[0]!.content as Array<{ tool_use_id: string; content: string }>)[0]!;
+    const path = block.content.match(/saved to: ([^\]]+)\]/)?.[1];
+    expect(path).toBe(join(dir, 'long-session.jsonl'));
+    expect(block.content.length).toBeLessThanOrEqual(1_200);
+    const read = await dispatchRead({ file_path: path });
+    const record = JSON.parse(read.output.split('\n').find(line => line.startsWith('{'))!);
+    expect(record.origin.tool_use_id).toBe(block.tool_use_id);
+    expect(record.content).toBe(original);
+  });
+
   test('small tool result passes through untouched', () => {
     const messages: LLMMessage[] = [
       { role: 'user', content: 'go' },
@@ -44,8 +113,12 @@ describe('Wave 2 · Layer 1 · tool-output budget', () => {
       { role: 'user', content: 'pad-6' },
       { role: 'assistant', content: 'pad-7' },
     ];
+    const archiveDir = join(archDir(), 'a]b"c\\d');
+    const recoveryReference = archiveReferencePath('default', archiveDir);
     const r = applyToolOutputBudget(messages, {
-      policy: { toolOutputCharBudget: 100, toolOutputTailLines: 30, archiveDir: archDir(), preserveLastN: 3 },
+      // Derive the budget from the escaped recovery reference, so temp paths
+      // and JSON escaping cannot push the pointer over the budget.
+      policy: { toolOutputCharBudget: recoveryReference.length + 512, toolOutputTailLines: 30, archiveDir, preserveLastN: 3 },
     });
     expect(r.responsesTrimmed).toBe(1);
     expect(r.savedChars).toBeGreaterThan(0);
@@ -95,7 +168,7 @@ describe('Wave 2 · Layer 1 · tool-output budget', () => {
     expect(r.responsesTrimmed).toBe(0);
   });
 
-  test('archive disabled = no file pointer hint references archive path', () => {
+  test('archive disabled preserves the original without a false recovery pointer', () => {
     const huge = 'y'.repeat(80_000);
     const messages: LLMMessage[] = [
       { role: 'user', content: 'pad' },
@@ -110,11 +183,13 @@ describe('Wave 2 · Layer 1 · tool-output budget', () => {
       { role: 'user', content: 'tail-5' },
       { role: 'assistant', content: 'tail-6' },
     ];
+    const dir = archDir();
     const r = applyToolOutputBudget(messages, {
-      policy: { toolOutputCharBudget: 100, archiveDir: archDir(), archiveEnabled: false, preserveLastN: 3 },
+      policy: { toolOutputCharBudget: 100, archiveDir: dir, archiveEnabled: false, preserveLastN: 3 },
     });
-    expect(r.responsesTrimmed).toBe(1);
-    const block = (r.messages[1]?.content as any)[0];
-    expect(block.content).toContain('<archive disabled>');
+    expect(readdirSync(dir)).toEqual([]);
+    expect(r.responsesTrimmed).toBe(0);
+    expect(r.savedChars).toBe(0);
+    expect(r.messages).toEqual(messages);
   });
 });

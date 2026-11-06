@@ -29,6 +29,18 @@ const sweep = (gh: ReturnType<typeof createFakeGh>, apply = false) => runDraftSw
 const item = { id: 'CELL', title: 'CELL', status: 'yellow' as const, evidence: `PR #123 merged ${SHA}\n판정: green`,
   updatedAt: '2026-10-22T00:00:00Z', updatedBy: 'test' };
 
+test('fake gh pr view --json returns pinned queue fields for the production shadow queue', () => {
+  const gh = fakeGh({ prs: [{ ...merged, mergedAt: undefined, head: SHA, files: ['src/feature.ts'] }] });
+  const result = gh.run('gh', ['pr', 'view', '123', '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository,files']);
+  expect(JSON.parse(result.stdout)).toEqual({
+    headRefOid: SHA, baseRefName: 'main', state: 'OPEN', isDraft: false, isCrossRepository: false,
+    files: [{ path: 'src/feature.ts' }],
+  });
+  gh.api(['pr', 'merge', '123']);
+  const mergedView = JSON.parse(gh.api(['pr', 'view', '123', '--json', 'state,mergeCommit'])) as { state: string; mergeCommit: { oid: string } };
+  expect(mergedView).toEqual({ state: 'MERGED', mergeCommit: { oid: gh.prs[0]!.mergeSha! } });
+});
+
 async function greenSweep(gh: ReturnType<typeof createFakeGh>, mergeSha = SHA) {
   const root = mkdtempSync(join(tmpdir(), 'fake-gh-green-'));
   const lines: string[] = [];
@@ -146,6 +158,29 @@ test('fake REST honors per_page boundaries and paginates slurped issue comments'
   const comments = JSON.parse(gh.api(['api', '--paginate', '--slurp', 'repos/example/repo/issues/10/comments?per_page=2'])) as Array<Array<{ body: string }>>;
   expect(comments.map((page) => page.length)).toEqual([2, 2, 1]);
   expect(comments.flat().map((comment) => comment.body)).toEqual(['one', 'two', 'three', 'four', 'five']);
+});
+
+test('fake gh lists a pre-existing open PR by head branch', () => {
+  const gh = fakeGh({ prs: [{ ...draft, branch: 'sim-chain-existing' }] });
+  expect(gh.run('gh', ['pr', 'list', '--head', 'sim-chain-existing', '--state', 'open', '--json', 'url', '--jq', '.[0].url // \"\"']))
+    .toMatchObject({ status: 0, stdout: 'https://github.com/example/repo/pull/10' });
+  expect(gh.run('gh', ['pr', 'list', '--head', 'missing', '--state', 'open', '--json', 'url', '--jq', '.[0].url // \"\"']))
+    .toMatchObject({ status: 0, stdout: '' });
+});
+
+test('fake gh creates a PR through the CLI boundary and initializes editable collections', () => {
+  const gh = fakeGh({ prs: [] });
+  const created = gh.run('gh', ['pr', 'create', '--title', 'SIM-CHAIN-IMPL', '--head', 'sim-chain', '--body', 'scenario']);
+  expect(created).toMatchObject({ status: 0, stdout: 'https://github.com/example/repo/pull/1' });
+  expect(gh.prs[0]).toMatchObject({ number: 1, title: 'SIM-CHAIN-IMPL', branch: 'sim-chain', body: 'scenario', labels: [], files: [], comments: [] });
+  expect(gh.run('gh', ['pr', 'list', '--head', 'sim-chain', '--state', 'open', '--json', 'url', '--jq', '.[0].url // ""']))
+    .toMatchObject({ status: 0, stdout: 'https://github.com/example/repo/pull/1' });
+  expect(gh.run('gh', ['pr', 'list', '--head', 'other-branch', '--state', 'open', '--json', 'url', '--jq', '.[0].url // ""']))
+    .toMatchObject({ status: 0, stdout: '' });
+  expect(gh.run('gh', ['pr', 'edit', '1', '--add-label', 'simulation'])).toMatchObject({ status: 0 });
+  expect(gh.prs[0]?.labels).toEqual(['simulation']);
+  expect(gh.run('gh', ['pr', 'create', '--title', '--head', 'sim-chain', '--body', 'scenario']))
+    .toMatchObject({ status: 1, stderr: 'fake-gh: missing --title' });
 });
 
 test('rate-limit process results use gh exit code 1 and retain the API message in stderr', () => {

@@ -320,6 +320,12 @@ export function remoteParentAlive(parentHost: { host: string; pid?: number; runI
 /** 발사 전 점검 결과 — `gaps` 가 비어야 원격으로 띄운다. */
 export interface ParentHostPreflight { ok: boolean; gaps: string[]; warnings: string[]; facts: Record<string, string> }
 
+/** Explicit compatibility identity for the two parent/HQ contracts; bump only for breaking changes. */
+export const PARENT_HOST_COMPATIBILITY_CONTRACT = {
+  ledgerSchema: 'run-ledger-line/v1',
+  parentProtocol: 'parent-host-facts/v1',
+} as const;
+
 /** 원격 사실 한 번에 — key=value 줄. LLM 자격은 «존재·개수»만 센다(값을 읽지도 찍지도 않는다). */
 export function preflightScript(target: ParentHostConfig): string {
   const elanous = remotePath(target.elanous ?? DEFAULT_REMOTE_ELANOUS);
@@ -328,6 +334,7 @@ export function preflightScript(target: ParentHostConfig): string {
   const grokCredentialFloorSeconds = Math.ceil(PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS / 1_000);
   return [
     `echo "version=$(${elanous} --version 2>/dev/null | tail -1 | cut -d' ' -f1)"`,
+    `${elanous} tasks parent-host-contract 2>/dev/null || true`,
     `test -f ${configDir}/config.json && echo config=1`,
     `grep -Eq '"podPool"[[:space:]]*:[[:space:]]*"[^"[:space:]]+' ${configDir}/config.json 2>/dev/null && echo podPool=1`,
     `(cd ${shellQuote(target.cwd)} 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1) && echo repo=1`,
@@ -371,8 +378,28 @@ export function judgeParentHostFacts(facts: Record<string, string>, input: Omit<
   if (facts.unreachable) gaps.push(`unreachable: ${facts.unreachable}`);
   else {
     if (!facts.version) gaps.push('remote-elanous-missing');
-    else if (facts.version !== input.localVersion) {
-      // 레일은 HQ 를 30분마다 올리고 원격은 한 주기 늦을 수 있다 — 기준판(x.y.z)이 같으면 막지 않고 경고만 남긴다(OP 10-09 13:17).
+    const hasLedgerSchema = Boolean(facts.ledgerSchema?.trim());
+    const hasParentProtocol = Boolean(facts.parentProtocol?.trim());
+    const hasAnyCompatibilityContract = hasLedgerSchema || hasParentProtocol;
+    const mismatches: string[] = [];
+    if (hasLedgerSchema && facts.ledgerSchema !== PARENT_HOST_COMPATIBILITY_CONTRACT.ledgerSchema) {
+      mismatches.push(`ledger-schema remote ${facts.ledgerSchema} ≠ HQ ${PARENT_HOST_COMPATIBILITY_CONTRACT.ledgerSchema}`);
+    }
+    if (hasParentProtocol && facts.parentProtocol !== PARENT_HOST_COMPATIBILITY_CONTRACT.parentProtocol) {
+      mismatches.push(`parent-HQ-protocol remote ${facts.parentProtocol} ≠ HQ ${PARENT_HOST_COMPATIBILITY_CONTRACT.parentProtocol}`);
+    }
+    for (const mismatch of mismatches) gaps.push(`compatibility-contract-mismatch: ${mismatch}`);
+    if (hasLedgerSchema && hasParentProtocol && mismatches.length === 0) {
+      if (facts.version && facts.version !== input.localVersion) {
+        debug.log('task-agent.parent-host', 'version-drift', {
+          remote: facts.version,
+          hq: input.localVersion,
+          ledgerSchema: facts.ledgerSchema,
+          parentProtocol: facts.parentProtocol,
+        });
+      }
+    } else if ((!hasAnyCompatibilityContract || mismatches.length === 0) && facts.version && facts.version !== input.localVersion) {
+      // A legacy remote cannot report the contract identities, so preserve the prior release-core check.
       if (releaseCore(facts.version) !== releaseCore(input.localVersion)) gaps.push(`version-mismatch: remote ${facts.version} ≠ HQ ${input.localVersion}`);
       else debug.log('task-agent.parent-host', 'version-drift', { remote: facts.version, hq: input.localVersion });
     }

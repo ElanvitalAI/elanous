@@ -22,7 +22,7 @@ import {
   type McpServerBootResult,
   type RegisterMcpClientsOpts,
 } from '../nexus/boot/register-mcp-clients.js';
-import { getUserConfig, type McpServerSpec, type UserConfig } from '../user-config.js';
+import { getUserConfig, type AsideConfig, type McpServerSpec, type UserConfig } from '../user-config.js';
 import { registerToolRuntime } from './registry.js';
 
 export type McpProxyBootstrapStatus = 'idle' | 'pending' | 'ready' | 'skipped' | 'failed';
@@ -44,8 +44,9 @@ export interface McpProxyBootstrapHandle {
 
 export interface BootstrapMcpProxyRuntimesOpts {
   servers?: McpServerSpec[];
+  aside?: AsideConfig;
   enabled?: boolean;
-  getConfig?: () => Pick<UserConfig, 'mcp'>;
+  getConfig?: () => Pick<UserConfig, 'mcp' | 'aside'>;
   registerClients?: (opts: RegisterMcpClientsOpts) => Promise<McpClientsHandle>;
   createClient?: RegisterMcpClientsOpts['createClient'];
   registerRuntime?: typeof registerToolRuntime;
@@ -171,7 +172,8 @@ export function bootstrapMcpProxyRuntimes(
   if (enabled === false) return skippedHandle('disabled');
 
   const servers = resolved.servers ?? cfg.mcp?.servers ?? [];
-  if (servers.length === 0) return skippedHandle('no-servers');
+  const aside = resolved.aside ?? cfg.aside;
+  if (servers.length === 0 && (aside?.targets.length ?? 0) === 0) return skippedHandle('no-servers');
 
   // bun test must not spawn real MCP children unless a test injected the client.
   if (!resolved.createClient && process.env.BUN_TEST) {
@@ -198,6 +200,7 @@ export function bootstrapMcpProxyRuntimes(
       const registerClients = resolved.registerClients ?? registerMcpClients;
       const result = await registerClients({
         servers,
+        ...(aside ? { aside } : {}),
         // The registrar's default logger writes to console.info/console.warn.
         // In the TUI process that output lands on top of the already-painted
         // frame (status line / prompt) seconds after boot, because the

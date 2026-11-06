@@ -29,7 +29,7 @@
 // "Unknown candidate" hint when the LLM picked a nonexistent name or
 // when the LLM call itself threw.
 
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { getSkillIndex, type SkillIndexEntry } from '../../skills/index.js';
 import {

@@ -497,6 +497,7 @@ describe('agent-mission handoff commit and PR', () => {
           git(cwd, 'commit', '-qm', message);
           return { ok: true, out: 'committed' };
         },
+        pushWorktree: (cwd, branch) => git(bare, 'fetch', cwd, `HEAD:refs/heads/${branch}`),
         dispatchOpenPullRequest: () => {
           expect(git(bare, 'rev-parse', 'refs/heads/fixture')).toBe(git(repo, 'rev-parse', 'HEAD'));
           prCalls++;
@@ -809,7 +810,7 @@ describe('createMissionControlBrain', () => {
     const user = messages.find((message) => message.role === 'user')!.content;
     expect(system).toContain(backend.name);
     expect(user).toContain(`=== ${backend.name} 화면 ===`);
-    for (const name of ['codex', 'claude', 'gemini', 'grok', 'aside']) {
+    for (const name of ['codex', 'claude', 'gemini', 'grok', 'aside', 'openclaw', 'hermes']) {
       if (name !== backend.name) {
         expect(system).not.toContain(name);
         expect(user).not.toContain(name);

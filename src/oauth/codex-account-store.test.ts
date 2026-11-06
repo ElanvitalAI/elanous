@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeAvailabilityState, writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
@@ -789,4 +789,26 @@ describe('CLAUDE-FAILOVER-FU — resolveRunFallback 이 원장 성숙도를 판�
       .toEqual({ action: 'switch-backend', backend: 'grok' });
     expect(calls.count).toBe(0);
   });
+});
+
+test('codex-account-store defers the claude-pty maturity loader until that chain is selected', () => {
+  const entry = new URL('./codex-account-store.ts', import.meta.url).href;
+  const probe = `
+    import { createRequire } from 'node:module';
+    const { _setRotationConfigReaderForTesting, resolveRunFallback } = await import(${JSON.stringify(entry)});
+    const require = createRequire(import.meta.url);
+    const loaded = () => Object.keys(require.cache).some((path) => path.endsWith('/claude-pty-maturity.ts'));
+    const chain = process.argv[1] === 'claude' ? ['codex-rotate', 'claude-pty'] : ['codex-rotate'];
+    _setRotationConfigReaderForTesting(() => ({ llm: { fallbackChain: chain } }));
+    resolveRunFallback({ HOME: '/tmp', CODEX_HOME: '/tmp/imp1-lazy-codex-home' }, {
+      storePath: '/tmp/imp1-lazy-auth.json', grokAvailable: false,
+      claudePtyLedger: { nowMs: Date.now(), dir: '/tmp/imp1-lazy-ledger', list: () => [], load: () => null },
+    });
+    process.stdout.write(loaded() ? 'loaded' : 'not-loaded');
+  `;
+  for (const [step, expected] of [['codex', 'not-loaded'], ['claude', 'loaded']] as const) {
+    const result = spawnSync(process.execPath, ['-e', probe, step], { encoding: 'utf8', timeout: 15_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(expected);
+  }
 });

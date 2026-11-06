@@ -265,6 +265,27 @@ export const realGateRemoteRunner: GateRemoteRunner = {
 };
 
 const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+
+/** Stable repo identity passed into remote checkouts whose origin URL is only the host-local mirror path. */
+function normalizeRepositoryIdentity(raw: string): string | undefined {
+  const value = raw.trim();
+  if (!value) return undefined;
+  if (!value.includes('://')) {
+    const scp = /^(?:[^@]+@)?([^:]+):(.+)$/.exec(value);
+    if (scp) {
+      const path = scp[2]!.split(/[?#]/, 1)[0]!;
+      return `${scp[1]!.toLowerCase()}/${path}`.replace(/\.git$/i, '').replace(/\/$/, '');
+    }
+  }
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return `${url.protocol.toLowerCase()}//${url.host.toLowerCase()}${url.pathname}`.replace(/\.git$/i, '').replace(/\/$/, '');
+  } catch { return undefined; }
+}
 const INFRA = '__GATE_REMOTE_INFRA=';
 const RC = '__GATE_REMOTE_RC=';
 export const PUSH_TIMEOUT_MS = 10 * 60_000;
@@ -301,7 +322,7 @@ export interface PayloadFile { env: string; content: string }
 export type RemoteArgv = string[] | ((sha: (ref: string) => string) => string[]);
 
 /** Build the remote shell script (exported for tests). Every setup failure ends in an INFRA marker, the tool's rc in an RC marker. */
-export function remoteScript(input: { mirror: string; commit: string; fetchShas: string[]; mainSha?: string; argv: string[]; installPwa: boolean; stableCheckout?: boolean; payloadFiles?: PayloadFile[]; hostCap?: number; slotDir?: string; runLimitSeconds?: number }): string {
+export function remoteScript(input: { mirror: string; commit: string; fetchShas: string[]; mainSha?: string; argv: string[]; installPwa: boolean; stableCheckout?: boolean; payloadFiles?: PayloadFile[]; repositoryIdentity?: string; hostCap?: number; slotDir?: string; runLimitSeconds?: number }): string {
   const mirror = input.mirror.startsWith('~/') ? `"$HOME"/${quote(input.mirror.slice(2))}` : quote(input.mirror);
   const fetches = input.fetchShas.map((sha) => `refs/elanous/gate/${sha}:refs/elanous/gate/${sha}`).join(' ');
   const payloads = (input.payloadFiles ?? []).filter((file) => /^[A-Z_][A-Z0-9_]*$/.test(file.env));
@@ -311,6 +332,7 @@ export function remoteScript(input: { mirror: string; commit: string; fetchShas:
     return [`cat > "$W/payload-${i}" <<'${delimiter}' || infra payload`, file.content.replace(/\n$/, ''), delimiter];
   });
   const payloadEnv = payloads.map((file, i) => `${file.env}="$W/payload-${i}" `).join('');
+  const repositoryIdentityEnv = input.repositoryIdentity ? `ELANOUS_GATE_REPOSITORY_IDENTITY=${quote(input.repositoryIdentity)} ` : '';
   // One brace group: sh parses the whole script off stdin before running anything, so no child can swallow the rest of it.
   // The work itself is written to "$W/run.sh" and runs under a host slot lock.
   const RUN = '__GATE_REMOTE_RUN__';
@@ -343,7 +365,7 @@ export function remoteScript(input: { mirror: string; commit: string; fetchShas:
     ...(input.installPwa ? ['(cd apps/pwa && bun install) >>"$W/setup.log" 2>&1 || infra bun-install-pwa'] : []),
     // A scratch universe: the remote run never touches the host's operational ~/.elanous state.
     'mkdir -p "$W/state" || infra scratch',
-    `${payloadEnv}ELANOUS_STATE_DIR="$W/state" ELANOUS_GATE_REMOTE_CHILD=1 ${input.argv.map(quote).join(' ')} </dev/null`,
+    `${payloadEnv}${repositoryIdentityEnv}ELANOUS_STATE_DIR="$W/state" ELANOUS_GATE_REMOTE_CHILD=1 ${input.argv.map(quote).join(' ')} </dev/null`,
     // The marker always starts on its own line, whatever the tool's stderr ended with; the parser strips that newline.
     `rc=$?; printf '\\n%s%s\\n' '${RC}' "$rc" >&2`,
     'exit 0',
@@ -413,6 +435,8 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
     resolved.set(ref, sha);
   }
   const extra = [...resolved.values()];
+  const origin = runner.local('git', ['config', '--get', 'remote.origin.url'], opts.repo);
+  const repositoryIdentity = origin.rc === 0 ? normalizeRepositoryIdentity(origin.stdout) : undefined;
   let argv: string[];
   try {
     argv = typeof opts.argv === 'function' ? opts.argv((ref) => {
@@ -430,7 +454,7 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
   });
   if (push.rc !== 0 || push.error) return { kind: 'infra', stage: 'push', rc: push.rc, stderr: push.stderr || push.error || '', reason: `push-failed rc=${push.rc}: ${(push.stderr || push.error || '').trim().split('\n').slice(-2).join(' | ')}` };
   const sshTimeoutMs = opts.timeoutMs ?? 120 * 60_000;
-  const script = remoteScript({ mirror: opts.mirror, commit, fetchShas: shas, mainSha, argv, installPwa: opts.installPwa ?? false, stableCheckout: opts.stableCheckout, payloadFiles: opts.payloadFiles, hostCap: opts.hostCap, slotDir: opts.slotDir,
+  const script = remoteScript({ mirror: opts.mirror, commit, fetchShas: shas, mainSha, argv, installPwa: opts.installPwa ?? false, stableCheckout: opts.stableCheckout, payloadFiles: opts.payloadFiles, repositoryIdentity, hostCap: opts.hostCap, slotDir: opts.slotDir,
     runLimitSeconds: Math.min(REMOTE_RUN_LIMIT_SECONDS, Math.max(1, Math.floor((sshTimeoutMs - 30_000) / 1000))) });
   const run = runner.ssh(opts.host, script, sshTimeoutMs);
   // The script prints "\n<marker><rc>\n": everything before that leading newline is the tool's own stderr, byte for byte.

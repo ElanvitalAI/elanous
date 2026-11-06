@@ -150,8 +150,11 @@ test('MOCK-FAKE-KUBECTL: vanished Job leaves its Pod occupied; reuse and isolati
   const scheduler = new PodPoolScheduler([member], { kubectl: device.kubectl, dns: () => 'ready' });
   expect(await scheduler.tryAcquire()).toBeNull();
   expect(scheduler.snapshot()[member.context]).toBe(0);
-  const lease: ChildPodLease = { workerId: command.workerId, podUid: command.podUid, leaseId: command.leaseId,
-    generation: command.generation, key: command.key, sourceSha: command.cutSha };
+  const sourceSha = command.cutSha;
+  const podUid = command.podUid;
+  if (!sourceSha || !podUid) throw new Error('fixture command must include the child Pod UID and source SHA');
+  const lease: ChildPodLease = { workerId: command.workerId, podUid, leaseId: command.leaseId,
+    generation: command.generation, key: command.key, sourceSha };
   let returns = 0;
   let quarantines = 0;
   const cleaned = await cleanAndReturnChildPod(lease, {

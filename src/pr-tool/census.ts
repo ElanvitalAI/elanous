@@ -73,10 +73,14 @@ const DEFAULT_SEAT_CAP = 30;
 const DRAFT_STALE_MS = 2 * 24 * 60 * 60 * 1000;
 const MAX_PAGES = 100;
 const MAX_FILES = 3000; // GitHub does not expose more than 3000 PR files.
+/** Keep the nested GraphQL `files` projection bounded; older open PRs use the bounded REST pool below. */
+export const PR_FILE_PROJECTION_LIMIT = 100;
 const UNMEASURED_WINDOW_MS = 60 * 60 * 1000;
 const UNMEASURED_ALLOW_COUNT = 3;
 
 export const DEFAULT_DIFF_CONCURRENCY = 6;
+/** REST file-list fallback calls are small; keep their pool separately bounded from patch fetches. */
+export const DEFAULT_FILE_CENSUS_CONCURRENCY = 16;
 const DIFF_CACHE_MAX = 2000;
 const DIFF_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const DIFF_CACHE_ENTRY_MAX_BYTES = 4 * 1024 * 1024;
@@ -329,16 +333,23 @@ interface FileProjection {
   failure?: string;
   /** Rows the projection could not vouch for (malformed · file list shorter than changedFiles, e.g. >100 files). */
   skipped: number;
+  elapsedMs: number;
+  limit: number;
+  rows: number;
 }
 
 /** Fast file projection; the REST page census below remains the authority for which PRs exist. A failed or partial
  *  projection is never silent: the reason and skipped row count go to the `diff-scan` observation. */
 function projectedFiles(run: PrToolCommand, count: number, cwd?: string): FileProjection {
-  const result = run('gh', ['pr', 'list', '--state', 'open', '--limit', String(Math.max(count, 1)), '--json', 'number,changedFiles,files'], cwd ? { cwd } : undefined);
-  if (!result.ok) return { files: new Map(), skipped: 0, failure: `gh pr list 실패: ${(result.err || result.out || 'rc≠0').trim().slice(0, 200)}` };
+  const started = Date.now();
+  const limit = Math.min(Math.max(count, 1), PR_FILE_PROJECTION_LIMIT);
+  const result = run('gh', ['pr', 'list', '--state', 'open', '--limit', String(limit), '--json', 'number,changedFiles,files'], cwd ? { cwd } : undefined);
+  if (!result.ok) return { files: new Map(), skipped: 0, elapsedMs: Date.now() - started, limit, rows: 0,
+    failure: `gh pr list 실패: ${(result.err || result.out || 'rc≠0').trim().slice(0, 200)}` };
   let rows: unknown;
-  try { rows = JSON.parse(result.out); } catch { return { files: new Map(), skipped: 0, failure: `gh pr list JSON 오류 (${result.out.length}자)` }; }
-  if (!Array.isArray(rows)) return { files: new Map(), skipped: 0, failure: 'gh pr list 응답이 배열 아님' };
+  try { rows = JSON.parse(result.out); } catch { return { files: new Map(), skipped: 0, elapsedMs: Date.now() - started, limit, rows: 0,
+    failure: `gh pr list JSON 오류 (${result.out.length}자)` }; }
+  if (!Array.isArray(rows)) return { files: new Map(), skipped: 0, elapsedMs: Date.now() - started, limit, rows: 0, failure: 'gh pr list 응답이 배열 아님' };
   const projection = new Map<number, string[]>();
   let skipped = 0;
   for (const value of rows) {
@@ -350,8 +361,9 @@ function projectedFiles(run: PrToolCommand, count: number, cwd?: string): FilePr
       else skipped += 1;
     } catch { skipped += 1; /* malformed projection: REST file endpoint below decides this PR */ }
   }
-  if (rows.length > 0 && projection.size === 0) return { files: projection, skipped, failure: `gh pr list ${rows.length}행 모두 사용 불가` };
-  return { files: projection, skipped };
+  if (rows.length > 0 && projection.size === 0) return { files: projection, skipped, elapsedMs: Date.now() - started, limit, rows: rows.length,
+    failure: `gh pr list ${rows.length}행 모두 사용 불가` };
+  return { files: projection, skipped, elapsedMs: Date.now() - started, limit, rows: rows.length };
 }
 
 /** Run `calls` through the bounded pool when given, else one by one with the injected runner, stopping at the first
@@ -380,21 +392,28 @@ export function readOpenPrs(run: PrToolCommand, options: {
   runParallel?: PrToolParallelCommand;
   /** Operations default {@link DEFAULT_DIFF_CONCURRENCY} (6) — production callers do not pass it; for test injection. */
   diffConcurrency?: number;
+  /** Bounded REST file-list fallback pool; production default is {@link DEFAULT_FILE_CENSUS_CONCURRENCY}. */
+  fileConcurrency?: number;
   /** Absent ⇒ no cache. Production callers pass {@link sharedCensusDiffCache}. */
   diffCache?: CensusDiffCache;
 } = {}): Inventory {
   const started = Date.now();
   const callOpts = options.cwd ? { opts: { cwd: options.cwd } } : {};
   const concurrency = options.runParallel ? Math.max(1, Math.floor(options.diffConcurrency ?? DEFAULT_DIFF_CONCURRENCY)) : 1;
+  const fileConcurrency = options.runParallel ? Math.max(1, Math.floor(options.fileConcurrency ?? DEFAULT_FILE_CENSUS_CONCURRENCY)) : 1;
   const scan = { openPrs: 0, projected: 0, restFallback: 0, projectionFailed: false, projectionReason: undefined as string | undefined,
+    projectionLimit: 0, projectionRows: 0, projectionElapsedMs: 0, fileFallbackElapsedMs: 0,
     projectionSkipped: 0, fileOverlap: 0, patchFetched: 0, cacheHits: 0 };
   let status: 'checked' | 'inventory-unknown' | 'files-failed' | 'diff-failed' | 'commit-date-failed' = 'inventory-unknown';
   const logDiffScan = () => {
-    debug.log('pr-tool.census', 'diff-scan', { ...scan, concurrency, elapsedMs: Date.now() - started, status });
+    debug.log('pr-tool.census', 'diff-scan', { ...scan, concurrency, fileConcurrency, elapsedMs: Date.now() - started, status });
   };
   try {
     const rows = pages(run, 'repos/{owner}/{repo}/pulls?state=open&per_page=100', options.cwd);
     const projection = projectedFiles(run, rows.length, options.cwd);
+    scan.projectionLimit = projection.limit;
+    scan.projectionRows = projection.rows;
+    scan.projectionElapsedMs = projection.elapsedMs;
     scan.projectionFailed = projection.failure !== undefined;
     scan.projectionReason = projection.failure;
     scan.projectionSkipped = projection.skipped;
@@ -429,7 +448,9 @@ export function readOpenPrs(run: PrToolCommand, options: {
     scan.restFallback = restPrs.length;
     if (restPrs.length) {
       status = 'files-failed';
-      const results = runCalls(run, restPrs.map(pr => ({ command: 'gh', args: pagesArgs(filesEndpoint(pr.number)), ...callOpts })), options.runParallel, concurrency, 'PR 파일 조회');
+      const filesStarted = Date.now();
+      const results = runCalls(run, restPrs.map(pr => ({ command: 'gh', args: pagesArgs(filesEndpoint(pr.number)), ...callOpts })), options.runParallel, fileConcurrency, 'PR 파일 조회');
+      scan.fileFallbackElapsedMs = Date.now() - filesStarted;
       // The first failure in input order decides the reason; one failure keeps the whole inventory unknown.
       // Invariant: a result is missing only after an earlier failure (sequential stop), which throws first. Still,
       // a missing result is a failure (unknown), never an empty file list.

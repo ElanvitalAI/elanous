@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { MsgStore, canonicalSeatId, defaultMsgStorePath, openMsgStore, readUnreadSummary, validateMessageEnvelope } from './msg-store.js';
+import { MsgStore, canonicalSeatId, defaultMsgStorePath, openMsgStore, readUnreadCount, readUnreadSummary, validateMessageEnvelope } from './msg-store.js';
 
 const dirs: string[] = [];
 function diskPath(): string {
@@ -15,6 +15,55 @@ function diskPath(): string {
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('message identity and envelope', () => {
+  test('acknowledges one message by ID and excludes expired messages from unread', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const first = store.post({ from: 'OP', to: 'MK', body: 'one', priority: 1 });
+      const middle = store.post({ from: 'OP', to: 'MK', body: 'two', supersedes: first.id });
+      const third = store.post({ from: 'OP', to: 'MK', body: 'three' });
+      expect(store.messageStatus('MK', first.id)).toBe('delivered');
+      store.ackMessage('MK', middle.id);
+      expect(store.list('MK').map(message => message.id)).toEqual([first.id, third.id]);
+      expect(store.messageStatus('MK', middle.id)).toBe('acked');
+      store.ackMessage('MK', third.id, 'done');
+      expect(store.messageStatus('MK', third.id)).toBe('done');
+      expect(store.messageStatus('OP', middle.id)).toBeNull();
+      expect(store.unreadCount('MK')).toBe(1);
+      expect(() => store.post({ from: 'OP', to: 'MK', body: 'out of range', expiresAt: '+010000-01-01T00:00:00.000Z' })).toThrow('within years');
+      const expired = store.post({ from: 'OP', to: 'MK', body: 'expired', expiresAt: '2000-01-01T00:00:00.000Z' });
+      expect(store.messageStatus('MK', expired.id)).toBe('delivered');
+      expect(store.unreadCount('MK')).toBe(1);
+    } finally { store.close(); }
+  });
+  test('group message status follows the active membership interval', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const group = store.createGroup('status-check', 'OP');
+      store.joinGroup(group, 'TC');
+      const message = store.post({ from: 'OP', to: group, body: 'member delivery' });
+      expect(store.messageStatus('TC', message.id)).toBe('delivered');
+      store.leaveGroup(group, 'TC');
+      const afterLeave = store.post({ from: 'OP', to: group, body: 'after leave' });
+      expect(store.messageStatus('TC', afterLeave.id)).toBeNull();
+    } finally { store.close(); }
+  });
+  test('aggregate unread excludes expiry and per-ID ack; through ack updates message status', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const first = store.post({ from: 'OP', to: 'MK', body: 'first' });
+      const middle = store.post({ from: 'OP', to: 'MK', body: 'middle' });
+      const third = store.post({ from: 'OP', to: 'MK', body: 'third' });
+      store.post({ from: 'OP', to: 'MK', body: 'expired', expiresAt: '2000-01-01T00:00:00Z' });
+      store.ackMessage('MK', middle.id);
+      expect(store.unreadRecipients().find(row => row.recipient === 'MK')?.count).toBe(2);
+      store.ack('MK', first.id);
+      expect(store.messageStatus('MK', first.id)).toBe('acked');
+      expect(store.messageStatus('MK', middle.id)).toBe('acked');
+      expect(store.unreadRecipients().find(row => row.recipient === 'MK')?.count).toBe(1);
+      store.ack('MK', third.id);
+      expect(store.unreadRecipients().find(row => row.recipient === 'MK')).toBeUndefined();
+    } finally { store.close(); }
+  });
   test('old seats and role aliases resolve to a single stable canonical seat', () => {
     for (const [alias, seat] of Object.entries({ S: 'OP', COO: 'OP', T: 'MK', CMO: 'MK', O: 'TC', CTO: 'TC', F: 'UX', CXO: 'UX' })) {
       expect(canonicalSeatId(` ${alias.toLowerCase()} `)).toBe(seat);
@@ -498,6 +547,18 @@ describe('durable message log and cursor', () => {
 });
 
 describe('readUnreadSummary (TUI-H3 턴 끝 자동 재개의 «같은 오더» 지문)', () => {
+  test('legacy read-only ledger without metadata, ack or group tables uses cursor-only unread queries', () => {
+    const path = diskPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const db = new Database(path);
+    db.exec(`CREATE TABLE msg_messages(id INTEGER PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE msg_cursors(recipient TEXT PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0);
+      INSERT INTO msg_messages VALUES (1,'OP','MK','legacy unread','2026-10-01T00:00:00.000Z');`);
+    db.close();
+    expect(readUnreadCount('MK', path)).toBe(1);
+    expect(readUnreadSummary('MK', path)).toEqual({ count: 1, maxId: 1 });
+  });
+
   test('unread count ⊕ newest unread ID · ack moves both · ALL topic from others counts · absent ledger = null', () => {
     const path = diskPath();
     expect(readUnreadSummary('OPT', path)).toBeNull();

@@ -10,13 +10,13 @@
 // to such calls. Code that passes its own `env` must receive `fakeBins.env` (or a
 // PATH built from `fakeBins.path()`).
 //
-// ⛔ This is not a simulator of the real tool: a spec only fixes stdout · stderr ·
-// exit code · lifetime, and records argv. Behaviour of the real tool stays with
-// tests that run where the tool exists.
+// ⛔ This is not a simulator of the real tool: a spec fixes process responses and records argv.
+// The one opt-in package-install fixture mode writes only declared files under an exact canonical
+// prefix; it does not emulate package resolution, scripts, or network behavior.
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
 export interface FakeBinSpec {
   readonly stdout?: string;
@@ -46,6 +46,18 @@ export interface FakeBinSpec {
    * (`utilLinuxScript()`); incompatible with the output-faking fields below.
    */
   readonly pty?: boolean;
+  /**
+   * Simulate package-manager outputs under one exact, caller-selected install prefix.
+   * The fake refuses a different prefix and writes only the declared relative files.
+   */
+  readonly installArtifacts?: {
+    readonly prefixEnv: string;
+    readonly prefix: string;
+    readonly argv: readonly string[];
+    readonly files: readonly { readonly path: string; readonly contents: string; readonly mode?: number }[];
+    /** Deterministic race injection: helper signals after pinning prefix directories and waits before writing. */
+    readonly testBarrier?: true;
+  };
 }
 
 export interface FakeBinCall {
@@ -108,6 +120,11 @@ function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: strin
   // for recorder and payload reads so a fake of one of those names cannot recursively call itself.
   lines.push(`rec=$(command -p mktemp ${shellQuote(join(dataDir, 'rec.XXXXXX'))})`);
   lines.push(`{ printf '%s\\0' ${shellQuote(name)} "$@"; printf '\\036'; } > "$rec"; command -p cat "$rec" >> ${shellQuote(logPath)}; command -p rm -f "$rec"`);
+  if (spec.installArtifacts !== undefined) {
+      lines.push(`${shellQuote(process.execPath)} ${shellQuote(join(dataDir, 'install-artifacts.mjs'))} ${shellQuote(join(dataDir, `${name}.install-artifacts.json`))} "$@"`);
+      lines.push('installer_status=$?');
+      lines.push('[ "$installer_status" -eq 0 ] || exit "$installer_status"');
+  }
   if (spec.pty === true) {
     // Recorded already: exec the real util-linux script so the caller gets a genuine TTY.
     lines.push(`exec ${shellQuote(utilLinuxScript()!)} "$@"`);
@@ -158,10 +175,30 @@ export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): Fa
     if (spec.pty === true) {
       if (spec.stdout !== undefined || spec.stderr !== undefined || spec.exitCode !== undefined
         || spec.sleepSeconds !== undefined || spec.killSignal !== undefined
-        || spec.whenArgsStartWith !== undefined || spec.otherwise !== undefined) {
+        || spec.whenArgsStartWith !== undefined || spec.otherwise !== undefined || spec.installArtifacts !== undefined) {
         throw new Error(`fake-bin: ${name}: pty is a pass-through PTY allocator and takes no output/fake fields`);
       }
       if (utilLinuxScript() === null) throw new Error(`fake-bin: ${name}: pty needs the util-linux \`script\` on PATH (this host has none)`);
+    }
+    if (spec.installArtifacts !== undefined) {
+      const { prefixEnv, prefix, argv, files } = spec.installArtifacts;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(prefixEnv)) throw new Error(`fake-bin: ${name}: invalid install prefix environment name`);
+      if (prefix.includes('\0')) throw new Error(`fake-bin: ${name}: install prefix must not contain NUL`);
+      if (!isAbsolute(prefix)) throw new Error(`fake-bin: ${name}: install prefix must be absolute`);
+      if (resolve(prefix) !== prefix) throw new Error(`fake-bin: ${name}: install prefix must be normalized`);
+      if (argv.length === 0 || argv.some((word) => typeof word !== 'string')) throw new Error(`fake-bin: ${name}: installArtifacts needs exact argv`);
+      if (files.length === 0) throw new Error(`fake-bin: ${name}: installArtifacts needs at least one file`);
+      const paths = new Set<string>();
+      for (const artifact of files) {
+        if (artifact.path.includes('\0') || isAbsolute(artifact.path) || artifact.path.split(/[\\/]/).some((part) => part === '..' || part === '')) {
+          throw new Error(`fake-bin: ${name}: install artifact path must stay relative to its prefix`);
+        }
+        if (paths.has(artifact.path)) throw new Error(`fake-bin: ${name}: duplicate install artifact path ${artifact.path}`);
+        paths.add(artifact.path);
+        if (artifact.mode !== undefined && (!Number.isInteger(artifact.mode) || artifact.mode < 0 || artifact.mode > 0o777)) {
+          throw new Error(`fake-bin: ${name}: invalid install artifact mode`);
+        }
+      }
     }
   }
   const root = mkdtempSync(join(tmpdir(), 'ux-sim-fake-bin-'));
@@ -172,7 +209,14 @@ export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): Fa
     mkdirSync(dir);
     mkdirSync(dataDir);
     writeFileSync(logPath, '');
+    const hasInstallArtifacts = Object.values(specs).some((spec) => spec.installArtifacts !== undefined);
+    if (hasInstallArtifacts) {
+      writeFileSync(join(dataDir, 'install-artifacts.mjs'), readFileSync(new URL('./fake-bin-install-helper.mjs', import.meta.url)));
+    }
     for (const [name, spec] of Object.entries(specs)) {
+      if (spec.installArtifacts !== undefined) {
+        writeFileSync(join(dataDir, `${name}.install-artifacts.json`), JSON.stringify({ ...spec.installArtifacts, exitCode: spec.exitCode ?? 0 }));
+      }
       const file = join(dir, name);
       writeFileSync(file, script(name, spec, dataDir, logPath));
       chmodSync(file, 0o755);

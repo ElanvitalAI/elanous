@@ -26,16 +26,25 @@ import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podJobFinishedTiming, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, recordPodSourceIoSummary, parsePodSourceAttemptOutcome, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podJobFinishedTiming, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, recordPodSourceIoSummary, parsePodSourceAttemptOutcome, parseMemSamples, podRunResultLine, podAbortSignalReasonCode, type Kubectl } from './self-implement-pod.js';
 import type { SiWarmChildAttempt } from './self-implement-pod.js';
 import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
 import { stablePodRunGuard } from './pod-manifest-test-normalize.js';
 import { POD_PROVENANCE_ENV_NAMES } from './pod-provenance.js';
 import { makeScriptedKubectlDevice, type PodDeviceEvent } from '../../ux-sim/task-orchestrator-surfaces-self-implement-pod-device.js';
+import { createFakeKubectl } from '../../ux-sim/fake-kubectl.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { buildPodConfigSnapshot } from './pod-config-snapshot.js';
 import { podSpawnWithSiWarm } from './pod-si-warm-entry.js';
+import { loadWarmReuseEvidenceByConsumer, readWarmReuseEvidence } from './warm-reuse-evidence.js';
+import { postprocessSiWarmChild } from './pod-si-warm-host.js';
+import { classifyPodTerminal } from '../../self-dev/draft-residue.js';
+import { TaskDispatcher } from '../dispatcher.js';
+import { TaskGraph } from '../graph.js';
+import { SurfaceRegistry } from '../surface-registry.js';
+import { createTask } from '../types.js';
+import { createSelfImplementAdapter } from './self-implement.js';
 
 import { buildUserConfig, resetUserConfig, userConfigPath, type UserConfig } from '../../user-config.js';
 import { worktreeAddTimeoutForRepo } from '../../git-fs/worktree.js';
@@ -267,7 +276,9 @@ test('Pod Job records the selected image without attributing a different local c
   const localImage = 'registry.example/harness:local';
   const selectedImage = 'registry.example/harness:remote';
   const imageCommit = 'a'.repeat(40);
-  const { k } = fakeKubectl(['Complete'], '{"ok":true,"stage":"complete"}\n');
+  const device = createFakeKubectl({ context: 'test-context', node: 'test-node' });
+  expect(device.kubectl(['config', 'current-context']).stdout).toBe('test-context\n');
+  const k = device.kubectl;
   const pool = { tryAcquire: () => ({ context: 'test-context', imageRef: selectedImage, capacity: 2 }), release: () => {}, snapshot: () => ({}) };
   try {
     await podSelfImplementSpawn({ kubectl: k, pool: pool as never, sleep: async () => {}, credentials: CREDS,
@@ -1690,6 +1701,8 @@ test('sync throw, async rejection, and pending warm hooks cannot prevent the fre
 // 그 임대를 다시 얻어 처리한다(잔여 0). 생산 진입점 podSelfImplementSpawn 을 그대로 지나며, 클러스터는
 // ux-sim 스크립트 kubectl 장치가 대신한다 — 어느 단계에서도 새 Job 이 만들어지지 않아야 한다.
 test('POD-REUSE-REQUEST-CLEAN-FU: two warm commands clean and return one Pod lease twice with zero residue', async () => {
+  const evidenceRoot = mkdtempSync(join(tmpdir(), 'pod-ta-warm-evidence-'));
+  const evidenceFile = join(evidenceRoot, 'warm-reuse-evidence.jsonl');
   const encoder = new TextEncoder();
   const payload = encoder.encode('{"feature":"a"}');
   const credentialBundle = encoder.encode('private fixture');
@@ -1767,6 +1780,8 @@ test('POD-REUSE-REQUEST-CLEAN-FU: two warm commands clean and return one Pod lea
   };
   const spawn = podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {}, pollMs: 1, sleep: async () => {},
     siWarmAttempt: acquire,
+    warmReuseIdentity: (sourceSha) => ({ head: sourceSha, main: 'f'.repeat(40) }),
+    warmReuseEvidenceFile: evidenceFile,
     siWarmHostPostprocess: async (result) => result,
     siWarmLedger: (entry) => { ledgerRows.push({ event: entry.event, runId: entry.runId, data: entry.data }); } });
 
@@ -1800,6 +1815,17 @@ test('POD-REUSE-REQUEST-CLEAN-FU: two warm commands clean and return one Pod lea
       data: { spaceId: 'request-round-2', correlationId: 'request-round-2', runIdSource: 'warm-child-run',
         outcome: 'warm-path-selected', workerId: 'worker-1', leaseId: 'lease-2', generation: 2, podUid: command.podUid } },
   ]);
+  expect(readWarmReuseEvidence(evidenceFile, { consumer: 'ta', head: command.sourceSha, main: 'f'.repeat(40) }))
+    .toMatchObject([expect.objectContaining({ leaseId: 'lease-1', workerId: 'worker-1', generation: 1,
+      leaseValid: true, canaryPassed: false, agree: false, reason: 'ta-fresh-reference-unavailable',
+      comparisonMeasured: false,
+      expectedLockHash: command.key.lockHash, workerLockHash: command.key.lockHash })]);
+  expect(readWarmReuseEvidence(evidenceFile, { consumer: 'ta', head: 'e'.repeat(40), main: 'f'.repeat(40) }))
+    .toMatchObject([expect.objectContaining({ leaseId: 'lease-2', generation: 2, leaseValid: true,
+      canaryPassed: false, agree: false, reason: 'ta-fresh-reference-unavailable' })]);
+  expect(loadWarmReuseEvidenceByConsumer({ head: command.sourceSha, main: 'f'.repeat(40) }, evidenceFile)?.ta)
+    .toMatchObject({ consecutiveMatchSamples: 0, leaseValid: true, canaryPassed: false });
+  rmSync(evidenceRoot, { recursive: true, force: true });
 });
 
 test('POD-REUSE-REQUEST-CLEAN-FU: cold-job and acquire-failed requests are ledgered and never touch a warm lease', async () => {
@@ -2009,6 +2035,25 @@ describe('pod memory evidence', () => {
     expect(podRunResultLine(withSamples, [])).toBe(withoutSamples);
     expect(podRunResultLine(withoutSamples, [])).toBe(withoutSamples);
     expect(podRunResultLine(withSamples, ['salvage/j/w'])).toBe(`${withoutSamples}\n수확할 브랜치: salvage/j/w`);
+  });
+
+  test('abort observation distinguishes dispatcher causes and redacts arbitrary signal reasons', () => {
+    const signalFor = (reason: unknown) => {
+      const controller = new AbortController();
+      controller.abort(reason);
+      return controller.signal;
+    };
+    expect(podAbortSignalReasonCode(signalFor('user'))).toBe('user');
+    expect(podAbortSignalReasonCode(signalFor('cascade'))).toBe('cascade');
+    expect(podAbortSignalReasonCode(signalFor('timeout'))).toBe('timeout');
+    expect(podAbortSignalReasonCode(signalFor('SIGTERM'))).toBe('signal:SIGTERM');
+    expect(podAbortSignalReasonCode(signalFor('secret-bearing reason'))).toBe('unspecified');
+    expect(podAbortSignalReasonCode(signalFor(new Error('secret-bearing error')))).toBe('unspecified');
+    expect(podAbortSignalReasonCode(signalFor({ source: 'secret-bearing object' }))).toBe('unspecified');
+    const defaultController = new AbortController();
+    defaultController.abort();
+    expect(podAbortSignalReasonCode(defaultController.signal)).toBe('unspecified');
+    expect(podAbortSignalReasonCode(new AbortController().signal)).toBe('not-aborted');
   });
 
   test('a 4000-character result tail cut inside a sample never leaks its fragment', async () => {
@@ -3206,7 +3251,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       const path = join(dir, 'si.out');
       const command = `${process.execPath} --preload ${preload} bin/elanous.mjs --test=${join(dir, 'state')} self implement 'overlap' --json --open-pr > ${path} 2>&1; rc=$?; ${POD_RESULT_FLATTEN.replace('/tmp/si.out', path)}; exit $rc`;
       const { ELANOUS_CONFIG_DIR: _ignoredConfigDir, ...isolatedEnv } = process.env;
-      const emitted = spawnSync('bash', ['-c', command], { cwd: root, env: { ...isolatedEnv, NODE_ENV: 'test', ELANOUS_HARNESS_ENTRANCE: 'self-implement' }, encoding: 'utf8', timeout: 45_000 });
+      const emitted = spawnSync('bash', ['-c', command], { cwd: root, env: { ...isolatedEnv, NODE_ENV: 'test', ELANOUS_HARNESS_ENTRANCE: 'self-implement', ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' }, encoding: 'utf8', timeout: 45_000 });
       expect(emitted.error).toBeUndefined();
       expect(emitted.status).toBe(1);
       const cliOutput = readFileSync(path, 'utf8');
@@ -4144,7 +4189,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
         throw new Error('terminal stopCapture summary missing');
       }
       const stopCapture = rawStopCapture as Record<string, unknown>;
-      expect(stopCapture).toMatchObject({ trigger: 'abort-signal', outcome: 'collected',
+      expect(stopCapture).toMatchObject({ trigger: 'abort-signal', outcome: 'collected', signalReason: 'signal:SIGTERM',
         lastStage: 'implement' });
       const logBytes = stopCapture.logBytes;
       if (typeof logBytes !== 'number') throw new Error('terminal stopCapture.logBytes must be numeric');
@@ -4196,6 +4241,50 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(String(capture?.data.jobEventEvidence)).toStartWith(join(root, 'pod-artifacts'));
       expect(entries.find(entry => entry.event === POD_LAUNCH_FINISHED_EVENT)?.data.stopCapture)
         .toMatchObject({ trigger: 'job-not-found', outcome: 'vanished', reason: 'job-not-found' });
+    } finally {
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('dispatcher timeout reason reaches the Pod stopCapture ledger field', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-dispatcher-abort-reason-'));
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    const parentRunId = 'run-dispatcher-abort-reason';
+    const base = fakeKubectl([''], '');
+    let resolveJobApplied!: () => void;
+    const jobApplied = new Promise<void>((resolve) => { resolveJobApplied = resolve; });
+    let jobWasApplied = false;
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input) {
+        const manifest = JSON.parse(input) as { kind?: string };
+        if (manifest.kind === 'Job' && !jobWasApplied) {
+          jobWasApplied = true;
+          resolveJobApplied();
+        }
+      }
+      return base.k(args, input);
+    };
+    const task = createTask({ title: 'dispatcher abort cause', surface: { kind: 'self-implement', feature: 'dispatcher abort cause' } }, { id: 'task:dispatcher-abort-cause' });
+    const graph = new TaskGraph();
+    graph.addTask(task);
+    graph.promoteReady();
+    const registry = new SurfaceRegistry();
+    registry.register('self-implement', createSelfImplementAdapter({
+      spawn: (options) => podSelfImplementSpawn({ kubectl, sleep: async () => {}, credentials: CREDS,
+        env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })(options),
+    }));
+    const dispatcher = new TaskDispatcher({ graph, registry, recordOpsEvent: () => {} });
+    try {
+      const dispatch = dispatcher.tickTask(task.id);
+      expect(dispatch.dispatched).toHaveLength(1);
+      await jobApplied;
+      dispatcher.kill(task.id, 'timeout');
+      await dispatch.dispatched[0]!.promise;
+      const finished = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? []).find(entry => entry.event === POD_LAUNCH_FINISHED_EVENT);
+      expect(finished?.data.stopCapture).toMatchObject({ trigger: 'abort-signal', signalReason: 'timeout' });
     } finally {
       if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previousStateDir;

@@ -1,7 +1,8 @@
 // ── diff 밖 이행 증거 파싱 (S3 · 2026-07-29) ──────────────────────────────────
 
 import { requirePosixShellCommand } from '../platform/default-shell.js';
-import ts from 'typescript';
+import type * as TS from 'typescript';
+import tsApi from './lazy-typescript.js';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -808,12 +809,12 @@ function missingExportDiagnostic(output: string): MissingExportDiagnostic | unde
 }
 
 function moduleCandidates(cwd: string, containingFile: string, specifier: string): string[] {
-  const resolution = ts.resolveModuleName(specifier, containingFile, {
+  const resolution = tsApi.resolveModuleName(specifier, containingFile, {
     allowJs: true,
-    module: ts.ModuleKind.ESNext,
-    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    module: tsApi.ModuleKind.ESNext,
+    moduleResolution: tsApi.ModuleResolutionKind.Bundler,
     resolveJsonModule: true,
-  }, ts.sys).resolvedModule?.resolvedFileName;
+  }, tsApi.sys).resolvedModule?.resolvedFileName;
   if (resolution) return resolve(resolution).startsWith(`${resolve(cwd)}${sep}`) ? [resolve(resolution)] : [];
   const stem = resolve(dirname(containingFile), specifier);
   const substitutions: Record<string, string[]> = {
@@ -840,13 +841,13 @@ function reachableNamedImports(input: { root: string; testFile: string; name: st
     if (visited.has(filePath) || !existsSync(filePath)) continue;
     visited.add(filePath);
     const source = readFileSync(filePath, 'utf8');
-    const file = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const file = tsApi.createSourceFile(filePath, source, tsApi.ScriptTarget.Latest, true, tsApi.ScriptKind.TS);
     for (const statement of file.statements) {
-      let moduleSpecifier: ts.StringLiteral | undefined;
-      if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+      let moduleSpecifier: TS.StringLiteral | undefined;
+      if (tsApi.isImportDeclaration(statement) && tsApi.isStringLiteral(statement.moduleSpecifier)) {
         moduleSpecifier = statement.moduleSpecifier;
         const bindings = statement.importClause?.namedBindings;
-        if (statement.importClause && !statement.importClause.isTypeOnly && bindings && ts.isNamedImports(bindings)) {
+        if (statement.importClause && !statement.importClause.isTypeOnly && bindings && tsApi.isNamedImports(bindings)) {
           const matching = bindings.elements.some((element) => !element.isTypeOnly && (element.propertyName?.text ?? element.name.text) === input.name);
           for (const resolvedPath of moduleCandidates(input.root, filePath, statement.moduleSpecifier.text)) {
             if (existsSync(resolvedPath)) {
@@ -855,9 +856,9 @@ function reachableNamedImports(input: { root: string; testFile: string; name: st
             }
           }
         }
-      } else if (ts.isExportDeclaration(statement) && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+      } else if (tsApi.isExportDeclaration(statement) && statement.moduleSpecifier && tsApi.isStringLiteral(statement.moduleSpecifier)) {
         moduleSpecifier = statement.moduleSpecifier;
-        if (!statement.isTypeOnly && statement.exportClause && ts.isNamedExports(statement.exportClause)
+        if (!statement.isTypeOnly && statement.exportClause && tsApi.isNamedExports(statement.exportClause)
           && statement.exportClause.elements.some((element) => !element.isTypeOnly && (element.propertyName?.text ?? element.name.text) === input.name)) {
           for (const resolvedPath of moduleCandidates(input.root, filePath, statement.moduleSpecifier.text)) {
             if (existsSync(resolvedPath)) imports.push({ importer: filePath, specifier: statement.moduleSpecifier.text, candidate: resolvedPath });
@@ -893,27 +894,27 @@ function hasRuntimeNamedExport(input: { cwd: string; source: string; filePath: s
   const filePath = resolve(input.filePath);
   if (seen.has(filePath)) return false;
   seen.add(filePath);
-  const file = ts.createSourceFile(filePath, input.source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const hasExport = (node: ts.Node) => {
-    const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
-    return Boolean(modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
-      && !modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword || modifier.kind === ts.SyntaxKind.DeclareKeyword));
+  const file = tsApi.createSourceFile(filePath, input.source, tsApi.ScriptTarget.Latest, true, tsApi.ScriptKind.TS);
+  const hasExport = (node: TS.Node) => {
+    const modifiers = tsApi.canHaveModifiers(node) ? tsApi.getModifiers(node) : undefined;
+    return Boolean(modifiers?.some((modifier) => modifier.kind === tsApi.SyntaxKind.ExportKeyword)
+      && !modifiers.some((modifier) => modifier.kind === tsApi.SyntaxKind.DefaultKeyword || modifier.kind === tsApi.SyntaxKind.DeclareKeyword));
   };
-  const bindingHasName = (binding: ts.BindingName, targetName: string): boolean => ts.isIdentifier(binding)
+  const bindingHasName = (binding: TS.BindingName, targetName: string): boolean => tsApi.isIdentifier(binding)
     ? binding.text === targetName
-    : binding.elements.some((element) => ts.isBindingElement(element) && bindingHasName(element.name, targetName));
+    : binding.elements.some((element) => tsApi.isBindingElement(element) && bindingHasName(element.name, targetName));
   const hasLocalRuntimeBinding = (name: string, seenBindings = new Set<string>()): boolean => {
     if (seenBindings.has(name)) return false;
     seenBindings.add(name);
     for (const statement of file.statements) {
-      if (ts.isImportDeclaration(statement) && statement.importClause && !statement.importClause.isTypeOnly
-        && ts.isStringLiteral(statement.moduleSpecifier)) {
+      if (tsApi.isImportDeclaration(statement) && statement.importClause && !statement.importClause.isTypeOnly
+        && tsApi.isStringLiteral(statement.moduleSpecifier)) {
         const clause = statement.importClause;
         const specifier = statement.moduleSpecifier.text;
         let requested: string | undefined;
         if (clause.name?.text === name) requested = 'default';
-        else if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings) && clause.namedBindings.name.text === name) requested = '*';
-        else if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+        else if (clause.namedBindings && tsApi.isNamespaceImport(clause.namedBindings) && clause.namedBindings.name.text === name) requested = '*';
+        else if (clause.namedBindings && tsApi.isNamedImports(clause.namedBindings)) {
           const element = clause.namedBindings.elements.find((item) => !item.isTypeOnly && item.name.text === name);
           if (element) requested = element.propertyName?.text ?? element.name.text;
         }
@@ -926,50 +927,50 @@ function hasRuntimeNamedExport(input: { cwd: string; source: string; filePath: s
           if (nested && hasRuntimeNamedExport({ ...input, source: nested, filePath: candidate, name: requested }, new Set(seen))) return true;
         }
       }
-      const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) : undefined;
-      if (modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword)) continue;
-      if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some((declaration) => bindingHasName(declaration.name, name))) return true;
-      if (ts.isFunctionDeclaration(statement) && statement.body && statement.name?.text === name) return true;
-      if ((ts.isClassDeclaration(statement) || ts.isModuleDeclaration(statement))
-        && statement.name && ts.isIdentifier(statement.name) && statement.name.text === name) return true;
-      if (ts.isEnumDeclaration(statement) && statement.name.text === name
-        && !ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.ConstKeyword)) return true;
+      const modifiers = tsApi.canHaveModifiers(statement) ? tsApi.getModifiers(statement) : undefined;
+      if (modifiers?.some((modifier) => modifier.kind === tsApi.SyntaxKind.DeclareKeyword)) continue;
+      if (tsApi.isVariableStatement(statement) && statement.declarationList.declarations.some((declaration) => bindingHasName(declaration.name, name))) return true;
+      if (tsApi.isFunctionDeclaration(statement) && statement.body && statement.name?.text === name) return true;
+      if ((tsApi.isClassDeclaration(statement) || tsApi.isModuleDeclaration(statement))
+        && statement.name && tsApi.isIdentifier(statement.name) && statement.name.text === name) return true;
+      if (tsApi.isEnumDeclaration(statement) && statement.name.text === name
+        && !tsApi.getModifiers(statement)?.some((modifier) => modifier.kind === tsApi.SyntaxKind.ConstKeyword)) return true;
     }
     return false;
   };
-  const readReexport = (statement: ts.ExportDeclaration, sourceName: string): boolean => {
-    if (!statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) return hasLocalRuntimeBinding(sourceName);
+  const readReexport = (statement: TS.ExportDeclaration, sourceName: string): boolean => {
+    if (!statement.moduleSpecifier || !tsApi.isStringLiteral(statement.moduleSpecifier)) return hasLocalRuntimeBinding(sourceName);
     return moduleCandidates(input.cwd, filePath, statement.moduleSpecifier.text).some((candidate) => {
       const nested = input.readModule(candidate);
       return nested !== undefined && hasRuntimeNamedExport({ ...input, source: nested, filePath: candidate, name: sourceName }, seen);
     });
   };
   for (const statement of file.statements) {
-    if (ts.isExportDeclaration(statement)) {
+    if (tsApi.isExportDeclaration(statement)) {
       if (statement.isTypeOnly) continue;
-      if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      if (statement.exportClause && tsApi.isNamedExports(statement.exportClause)) {
         const match = statement.exportClause.elements.find((element) => !element.isTypeOnly && element.name.text === input.name);
         if (match && readReexport(statement, match.propertyName?.text ?? match.name.text)) return true;
-      } else if (statement.exportClause && ts.isNamespaceExport(statement.exportClause)) {
+      } else if (statement.exportClause && tsApi.isNamespaceExport(statement.exportClause)) {
         if (statement.exportClause.name.text === input.name) return true;
-      } else if (!statement.exportClause && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+      } else if (!statement.exportClause && statement.moduleSpecifier && tsApi.isStringLiteral(statement.moduleSpecifier)) {
         if (readReexport(statement, input.name)) return true;
       }
       continue;
     }
-    const modifiers = ts.canHaveModifiers(statement) ? ts.getModifiers(statement) : undefined;
-    const isExported = Boolean(modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword));
-    const isDefault = Boolean(modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword));
-    if (input.name === 'default' && ts.isExportAssignment(statement) && !statement.isExportEquals) return true;
+    const modifiers = tsApi.canHaveModifiers(statement) ? tsApi.getModifiers(statement) : undefined;
+    const isExported = Boolean(modifiers?.some((modifier) => modifier.kind === tsApi.SyntaxKind.ExportKeyword));
+    const isDefault = Boolean(modifiers?.some((modifier) => modifier.kind === tsApi.SyntaxKind.DefaultKeyword));
+    if (input.name === 'default' && tsApi.isExportAssignment(statement) && !statement.isExportEquals) return true;
     if (input.name === 'default' && isExported && isDefault
-      && ((ts.isFunctionDeclaration(statement) && Boolean(statement.body)) || ts.isClassDeclaration(statement))) return true;
+      && ((tsApi.isFunctionDeclaration(statement) && Boolean(statement.body)) || tsApi.isClassDeclaration(statement))) return true;
     if (!hasExport(statement)) continue;
-    if (ts.isVariableStatement(statement) && statement.declarationList.declarations.some((declaration) => bindingHasName(declaration.name, input.name))) return true;
-    if (ts.isFunctionDeclaration(statement) && statement.body && statement.name?.text === input.name) return true;
-    if ((ts.isClassDeclaration(statement) || ts.isModuleDeclaration(statement))
-      && statement.name && ts.isIdentifier(statement.name) && statement.name.text === input.name) return true;
-    if (ts.isEnumDeclaration(statement) && statement.name.text === input.name
-      && !ts.getModifiers(statement)?.some((modifier) => modifier.kind === ts.SyntaxKind.ConstKeyword)) return true;
+    if (tsApi.isVariableStatement(statement) && statement.declarationList.declarations.some((declaration) => bindingHasName(declaration.name, input.name))) return true;
+    if (tsApi.isFunctionDeclaration(statement) && statement.body && statement.name?.text === input.name) return true;
+    if ((tsApi.isClassDeclaration(statement) || tsApi.isModuleDeclaration(statement))
+      && statement.name && tsApi.isIdentifier(statement.name) && statement.name.text === input.name) return true;
+    if (tsApi.isEnumDeclaration(statement) && statement.name.text === input.name
+      && !tsApi.getModifiers(statement)?.some((modifier) => modifier.kind === tsApi.SyntaxKind.ConstKeyword)) return true;
   }
   return false;
 }

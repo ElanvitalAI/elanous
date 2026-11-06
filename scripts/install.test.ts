@@ -150,12 +150,11 @@ describe('scripts/install.sh', () => {
     expect(isUnprivilegedGitRepairOnlyFailure({ report: { ok: true }, gitInstall: { ran: true, ok: false } })).toBe(false);
   });
 
-  test('release tarball contains the doctor result helper at the installed path used by install.sh', () => {
+  test('release installer uses the first-run bootstrap command', () => {
     const packed = pack(fixture());
     const listing = spawnSync('tar', ['-tzf', packed], { encoding: 'utf8' });
     expect(listing.status, listing.stderr).toBe(0);
-    expect(listing.stdout).toContain('package/scripts/install-doctor-result.ts');
-    expect(readFileSync(installer, 'utf8')).toContain('$PREFIX/current/node_modules/elanous/scripts/install-doctor-result.ts');
+    expect(readFileSync(installer, 'utf8')).toContain('"$PREFIX/bin/elanous" bootstrap');
   }, 120_000);
 
   test('package bin exposes elanous and eln through the same entrypoint, without mda', () => {
@@ -345,7 +344,7 @@ describe('scripts/install.sh', () => {
     const env = setup();
     const first = run([], env);
     const second = run([], env);
-    expect(first.result.status).toBe(0);
+    expect(first.result.status, `${first.result.stderr}\n${first.result.stdout}`).toBe(0);
     expect(second.result.status).toBe(0);
     const startup = readFileSync(env.startup, 'utf8');
     expect(startup.match(/^# >>> elanous installer PATH >>>$/gm)).toHaveLength(1);

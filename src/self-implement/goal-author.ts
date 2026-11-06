@@ -1,3 +1,5 @@
+import { canonicalTracedPathToken, classifyTracedPathToken, extractVerbatimOriginalAsk, isTracedPathExclusionDescription, isTracedPathsEvidenceUnavailable, ORIGINAL_ASK_MARKER, stripInlineCode, tracedPathListItem, tracedPathReferences, verbatimOriginalAsk, type TracedPathReference, type TracedPathTokenClassification, type TracedPathTokenKind, type VerbatimOriginalAsk, TRACED_PATH_DESCRIPTION_DELIMITER, TRACED_PATH_LEADING_LIST_MARKERS, TRACED_PATH_LINE, TRACED_PATH_READ_ANNOTATION, TRACED_PATHS_EVIDENCE_UNAVAILABLE, TRACED_PATHS_PERSISTENT_CHANNEL_UNAVAILABLE } from './goal-author-text.js';
+export { canonicalTracedPathToken, classifyTracedPathToken, extractVerbatimOriginalAsk, ORIGINAL_ASK_MARKER, tracedPathReferences, verbatimOriginalAsk, type TracedPathReference, type TracedPathTokenClassification, type TracedPathTokenKind, type VerbatimOriginalAsk } from './goal-author-text.js';
 import { classifyObservation } from '../design/behaviour-signal.js';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, type Dirent } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
@@ -2090,80 +2092,6 @@ function canonicalBlocks(document: string): string[] {
     .map((line) => line.text.trim());
 }
 
-interface TracedPathReference {
-  path: string;
-  line: number | null;
-  /** End of a `:start-end` range, or null when the reference names a single line or none. */
-  endLine: number | null;
-}
-
-/** Every TRACED PATHS declaration token is one of these kinds. Nested repository paths are `path`. */
-export type TracedPathTokenKind = 'path' | 'bare' | 'residual' | 'repository-root' | 'empty-cover';
-
-export interface TracedPathTokenClassification {
-  readonly token: string;
-  readonly kind: TracedPathTokenKind;
-  /** Inspectable path when the token names one; null for an empty cover. */
-  readonly path: string | null;
-  /** Attached residual characters when `kind` is `residual` (for example `???` in `src/a.ts???`). */
-  readonly residual: string | null;
-}
-
-const EMPTY_COVER_TOKEN = '(빈 대상 경로)';
-/** Leftover punctuation after a complete file token (`src/a.ts???`). Must not steal extension letters. */
-const TRACED_PATH_RESIDUAL_TOKEN = /^((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)([^A-Za-z0-9./\\:\s,;]+)$/;
-
-function isEmptyCoverToken(token: string): boolean {
-  const trimmed = token.trim();
-  return trimmed === '' || trimmed === EMPTY_COVER_TOKEN;
-}
-
-function repositoryRootFileExists(path: string, repositoryRoot: string): boolean {
-  if (path.includes('/') || path.includes('\\') || isAbsolute(path)) return false;
-  try {
-    const realRoot = realpathSync(resolve(repositoryRoot));
-    const absolutePath = resolve(realRoot, path);
-    if (dirname(absolutePath) !== realRoot || !isSameOrNestedPath(absolutePath, realRoot)) return false;
-    return lstatSync(absolutePath).isFile();
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Classify one TRACED PATHS / 대상 경로 declaration token.
- * Residual characters stay attached until this plate splits them; locators (`file.ts:line`) stay locators.
- */
-export function classifyTracedPathToken(token: string, repositoryRoot?: string): TracedPathTokenClassification {
-  const trimmed = token.trim();
-  if (isEmptyCoverToken(trimmed)) {
-    return { token: trimmed, kind: 'empty-cover', path: null, residual: null };
-  }
-  const unwrapped = stripInlineCode(trimmed).replace(TRACED_PATH_LEADING_LIST_MARKERS, '').trim();
-  if (isEmptyCoverToken(unwrapped)) {
-    return { token: trimmed, kind: 'empty-cover', path: null, residual: null };
-  }
-  const residualMatch = TRACED_PATH_RESIDUAL_TOKEN.exec(unwrapped);
-  if (residualMatch?.[1] && residualMatch[2]) {
-    return { token: trimmed, kind: 'residual', path: residualMatch[1], residual: residualMatch[2] };
-  }
-  const normalized = unwrapped.replaceAll('\\', '/');
-  if (!normalized.includes('/')) {
-    if (repositoryRoot && repositoryRootFileExists(normalized, repositoryRoot)) {
-      return { token: trimmed, kind: 'repository-root', path: normalized, residual: null };
-    }
-    return { token: trimmed, kind: 'bare', path: normalized, residual: null };
-  }
-  return { token: trimmed, kind: 'path', path: normalized, residual: null };
-}
-
-/** Inspectable traced path: nested or repository-root files only. Residual, bare-only, and empty covers are not injected. */
-export function canonicalTracedPathToken(token: string, repositoryRoot?: string): string | null {
-  const classification = classifyTracedPathToken(token, repositoryRoot);
-  if (classification.kind === 'path' || classification.kind === 'repository-root') return classification.path;
-  return null;
-}
-
 /**
  * Count lines an editor would address. A file's terminating newline closes the last line rather
  * than opening a new one, so `"one\n"` is one addressable line — counting the split remainder
@@ -2175,39 +2103,6 @@ function countAddressableLines(contents: string): number {
   const body = contents.replace(/\r?\n$/, '');
   return body === '' ? 1 : body.split(/\r?\n/).length;
 }
-
-const TRACED_PATH_LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+(.+)$/;
-const TRACED_PATH_LEADING_LIST_MARKERS = /^(?:\s*(?:[-*+]|\d+[.)])\s+)+/;
-const TRACED_PATH_EVIDENCE_TAG = /^\[(?:code|skill|memory|doc|pty|unknown)\]\s+/;
-// 2026-10-11 — 저작기가 «목록 기호 두 겹»(`- - src/x.ts` · `- 1. src/x.ts` · `- [code] - src/x.ts`)을 쓰면
-//   한 겹만 벗긴 남은 «- src/…» 를 경로로 읽어 `traced path does not exist: - src/…` ERROR 를 냈다
-//   (Pod 저작에서 자식이 결과 줄 없이 죽음 · 오늘 no-result-line 18건의 공용 원인). 기호·태그를 반복해서 벗긴다.
-function tracedPathListItem(line: string): string | undefined {
-  const item = TRACED_PATH_LIST_ITEM.exec(line)?.[1];
-  if (item === undefined) return undefined;
-  let evidence = item;
-  for (;;) {
-    const next = evidence.replace(TRACED_PATH_LEADING_LIST_MARKERS, '').replace(TRACED_PATH_EVIDENCE_TAG, '');
-    if (next === evidence) return evidence;
-    evidence = next;
-  }
-}
-// ⛔⭐⭐⭐ 2026-08-11 — 이 문면은 «통하지 않는 처방»을 첫 번째로 권하고 있었다.
-//   옛 문면: *"Re-authoring the same input may produce different evidence; **retry before changing the ask**."*
-//   📏 실측(두 트랙 합산): 그 말대로 «재저작»만 반복했더니 ***0/4***. ask 에 «식별자 앵커»를 넣자 ***2/2***.
-//   ⛔ 즉 정답(ask 를 고치는 것)을 «하지 말라»고 안내했고, 저작 한 번이 100초 넘으니 시간 비용이었다.
-//   ⚠️ 그리고 같은 상황의 «되묻기»(`implementation_anchor`)는 이미 앵커를 요구한다 —
-//      ***문장과 되묻기가 서로 다른 말을 하고 있었다.***
-//   ⭐ 앵커는 «그 파일이 내보내는 이름»이어야 한다 — 파일 «안»의 비공개 상수를 앵커로 준 시도는 실패했다.
-//   ⛔⭐⭐ 그리고 «앵커만으로는 부족하다»(같은 날 🅣 실측 0/3): 서술 → 줄번호+지역변수 → export 식별자를
-//     차례로 줘도 «셋 다» 같은 실패였다. 이 문면이 처음부터 그 이유를 말하고 있었다 —
-//     *"identifies locations and exported facts, but does not establish behavior, causation, or call path"*.
-//     ⇒ ***요구는 「식별자」가 아니라 「지금 무엇을 하고 그게 왜 문제인가」다.***
-//     📌 그래서 ***「필드를 하나 더 실어라」 같은 «순수 추가» 골은 인과가 «없어» 여기서 자주 막힌다.***
-//     (🅢 골 셋이 통과한 이유도 앵커가 아니라 「지금 이렇게 도는데 그게 문제다」를 적었기 때문이다.)
-//   📚 그리고 방법론 문서에 답이 이미 있었는데 이 문장이 그것을 «한 글자도» 안 가리켰다.
-const TRACED_PATHS_EVIDENCE_UNAVAILABLE = 'Evidence unavailable — grounding found no persistent evidence and the cause remains undifferentiated. Grounding needs behavior and causation, not only locations: state what the target code does today and why that is a problem, and name a function, constant, or type that the target file exports. A pure-addition ask ("also record field X") often fails here because it names no current behavior to ground. Re-authoring the same input may also produce different evidence, but try that first. See docs/manual/MANUAL-goal-authoring-method-2026-08-03.md';
-const TRACED_PATHS_PERSISTENT_CHANNEL_UNAVAILABLE = /^Evidence unavailable — grounding found \d+ categorized evidence items, but no persistent evidence; only the persistent channel is empty\. Strengthening the ask's prose may not resolve this channel gap; inspect or restore persistent grounding evidence instead\. See docs\/manual\/MANUAL-goal-authoring-method-2026-08-03\.md$/;
 
 function tracedPathsEvidenceUnavailable(evidenceCount: number, groundedCount: number): string {
   return evidenceCount > 0 && groundedCount === 0
@@ -2312,37 +2207,6 @@ export function classifyEmptyPersistentEvidence(
   };
 }
 
-function isTracedPathsEvidenceUnavailable(entry: string): boolean {
-  return entry === TRACED_PATHS_EVIDENCE_UNAVAILABLE || TRACED_PATHS_PERSISTENT_CHANNEL_UNAVAILABLE.test(entry);
-}
-// ⭐ 행 **범위**(`:736-737`)까지 받는다 — 안 받으면 범위가 경로에 붙어 실재 파일을 missing 으로 읽는다.
-//   `[T]` 원장 `GOAL-T10` 실측: *"정확히 쓸수록 벌받는다"*(표기를 흐리게 해야 통과했다).
-const TRACED_PATH_LINE = /^(.*?)(?::(\d+)(?:-(\d+))?)?$/;
-const INLINE_CODE_WRAPPED = /^(`+)([^`]*)\1$/;
-const TRACED_PATH_DESCRIPTION_DELIMITER = /\s+(?:—|-)\s+|:\s+/;
-/** Read tool output annotations are prose, never part of a repository path. */
-const TRACED_PATH_READ_ANNOTATION = /\s+\(Read,\s*\d+\s+lines?\)\s*$/i;
-/** 저작기가 「관련 있어 보이지만 여기가 아니다」를 말하려고 적은 항목 — 추적 경로가 아니다.
- *  ⚠️ 지금은 영어 문면만 문다(저작기 산출이 영어다). 한국어 배제 문장은 아직 안 잡는다. */
-const TRACED_PATH_EXCLUSION_DESCRIPTION = /\b(?:related|relevant)\b.*\b(?:but|however)\b.*\b(?:not here|elsewhere|another (?:location|place|path))\b|\b(?:not here|elsewhere|another (?:location|place|path))\b.*\b(?:related|relevant)\b/i;
-
-function isTracedPathExclusionDescription(item: string): boolean {
-  const description = item.split(TRACED_PATH_DESCRIPTION_DELIMITER).slice(1).join(' — ').trim();
-  return description.length > 0 && TRACED_PATH_EXCLUSION_DESCRIPTION.test(description);
-}
-
-/**
- * Strip a matched pair of markdown inline-code backticks that wraps the whole field, if present.
- *
- * ⛔ 벗긴 결과가 비면 **벗지 않는다**. 빈 인라인 코드(`` `` ``)를 빈 경로로 만들면 호출부의
- * `if (!path) continue` 에 걸려 **검사 자체가 건너뛰어진다** — 벗기기 도입 전에는 missing ERROR 였다.
- * 관대한 파싱이 검사를 무르게 하면 안 된다(리뷰 must-fix · 2026-08-02).
- */
-function stripInlineCode(field: string): string {
-  const inner = INLINE_CODE_WRAPPED.exec(field)?.[2].trim();
-  return inner ? inner : field;
-}
-
 function outOfTargetRequirementPaths(document: string): string[] {
   const [firstLine] = document.split(METADATA_LINE_BOUNDARY);
   const targetPaths = TARGET_PATH_LABEL.exec(firstLine ?? '')?.[1]
@@ -2360,44 +2224,6 @@ function outOfTargetRequirementPaths(document: string): string[] {
     }
   }
   return [...paths];
-}
-
-export function tracedPathReferences(document: string): TracedPathReference[] {
-  const section = markdownSection(document, 'TRACED PATHS');
-  if (!section) return [];
-  const references: TracedPathReference[] = [];
-  let normalizedAnnotationCount = 0;
-  for (const line of section.split(/\r?\n/)) {
-    const evidence = tracedPathListItem(line);
-    if (!evidence) continue;
-    if (isTracedPathsEvidenceUnavailable(evidence) || evidence.startsWith('미해석:') || isTracedPathExclusionDescription(evidence)) continue;
-    // 설명 구분자는 **공백으로 둘러싼** em dash 또는 hyphen 뿐이다 — 파일명 안의 dash 를 설명 구분자로 오인하지 않는다.
-    // 경로 칸 안의 복수 경로는 **공백으로 둘러싼** 가운뎃점만 본다 — 파일명 안의 `·` 를 가르지 않는다.
-    // ⭐ 인라인 코드 표기(`path`)를 벗긴다 — 저작기는 맨 경로를 쓰지만 사람이 쓴 골과 이 레포의 다른 문서는
-    //   백틱을 쓴다. 안 벗기면 실재하는 파일을 "does not exist" 로 판정해 **자가 거짓 ERROR 를 낸다**(실측 2026-08-02).
-    const pathField = evidence.split(TRACED_PATH_DESCRIPTION_DELIMITER, 1)[0].trim();
-    for (const fragment of pathField.split(' · ')) {
-      const trimmed = fragment.trim();
-      if (!trimmed) continue;
-      // 10-11 재발 — 저작기가 «`- src/…`» 처럼 목록 기호를 백틱 «안»에 쓰면 바깥 기호만 벗긴 뒤 백틱을 벗겨
-      //   «- src/…» 가 경로로 남았다(AUTHOR-DECOMPOSE-KNOB · MODEL-BENCH-SCORES 부검). 백틱을 벗긴 뒤 한 번 더 벗긴다.
-      const withoutAnnotation = trimmed.replace(TRACED_PATH_READ_ANNOTATION, '').trim();
-      if (withoutAnnotation !== trimmed) normalizedAnnotationCount += 1;
-      const unwrapped = stripInlineCode(withoutAnnotation).replace(TRACED_PATH_LEADING_LIST_MARKERS, '');
-      const match = TRACED_PATH_LINE.exec(unwrapped);
-      // 두 번 벗긴다 — 줄번호가 백틱 **안**(`p:42`)일 수도 **밖**(`p`:42)일 수도 있다.
-      const path = match ? stripInlineCode(match[1].trim()).replace(TRACED_PATH_LEADING_LIST_MARKERS, '') : undefined;
-      if (!path) continue;
-      const classification = classifyTracedPathToken(path);
-      if (classification.kind === 'residual' || classification.kind === 'empty-cover') continue;
-      references.push({ path, line: match?.[2] ? Number(match[2]) : null, endLine: match?.[3] ? Number(match[3]) : null });
-    }
-  }
-  if (normalizedAnnotationCount > 0) {
-    try { debug.log('goal-author', 'traced-path-annotation-normalized', { count: normalizedAnnotationCount }); }
-    catch { /* observation must not prevent path validation */ }
-  }
-  return references;
 }
 
 /**
@@ -4756,7 +4582,6 @@ function genericSearchScopeNotice(facts: CodebaseGrounding | null, groundingErro
   return ['- Search-scope notice: the ask contains no repository-specific identifier, so grounding used general search terms. An empty or omitted result means the repository scope is unknown, not that the behavior is absent.'];
 }
 
-export const ORIGINAL_ASK_MARKER = 'Original ask (verbatim, unmodified):';
 
 /** Attach the authoring evidence contract unless the document already has it as an independent requirement. */
 export function appendEvidenceLocationRequirement(document: string): string {
@@ -5417,47 +5242,6 @@ function describeFormatMatchingAskCount(label: string, askCount: number, phraseC
     return `${formatted} (the phrase "${label}" appears ${phraseCount} time(s) but not in marker form)`;
   }
   return `${formatted} (the phrase "${label}" appears ${phraseCount} time(s))`;
-}
-
-/** ⭐ 골 문서에서 ***사람이 쓴 ask 원문만*** 떼어 낸다(없으면 `null` — 던지지 않는다).
- *
- *  ⛔⭐ **왜 export 하나**(2026-08-11 73차): 골 문서는 세 종류의 텍스트가 «다른 절»에 있다 —
- *  ⓐ 사람의 ask · ⓑ 저작기가 넣은 정책·기준 · ⓒ 접지가 쓴 근거 프로즈.
- *  그런데 소비자들이 그것을 ***평평하게*** 읽어 ⓑⓒ 의 낱말이 ⓐ 의 «의도»로 오인된다.
- *  📏 실측: 무인 리뷰 위험 판정의 riskHits ***643 중 442(68.7%)***가 ⓑⓒ 에서 왔다
- *    (`production` 220 = 접지 프로즈 · `rewrite` 184 = 저작기 정책 한 줄 · `wire` 38 = 배선 기준).
- *  ⇒ 📌 그 판정이 ***이 함수를 써서 ⓐ 만 보면*** 그 442 가 사라진다.
- *  ⚠️ 같은 추출이 `goal-author-cli.ts:extractOriginalAsk` 에도 «따로» 있다(그쪽은 던진다).
- *    ⛔ 이 창에서는 «합치지 않았다» — 오류 계약이 달라 합치는 것은 별개 착지다. */
-export interface VerbatimOriginalAsk {
-  ask: string;
-  /** Omitted when normalization means the document substring cannot equal `ask` exactly. */
-  range?: { start: number; end: number };
-}
-
-/** Extract the original ask and its already-known offsets in the goal document. */
-export function extractVerbatimOriginalAsk(document: string): VerbatimOriginalAsk | null {
-  const lines = [...document.matchAll(/([^\r\n]*)(\r\n|\r|\n|$)/g)]
-    .filter((match) => match[0] !== '')
-    .map((match) => ({ text: match[1], start: match.index!, end: match.index! + match[0].length, contentEnd: match.index! + match[1].length }));
-  // ⛔ 문자열을 다시 쓰지 않는다 — 같은 파일이 export 하는 상수 하나에서 파생한다(2026-08-11: 하드코딩이었다).
-  const heading = lines.findIndex(({ text }) => text === ORIGINAL_ASK_MARKER);
-  if (heading < 0) return null;
-  const opening = /^(\s*)(`{3,})[^`]*\s*$/.exec(lines[heading + 1]?.text ?? '');
-  if (!opening) return null;
-  const [, indentation, fence] = opening;
-  const closing = new RegExp(`^${escapeRegularExpression(indentation)}${escapeRegularExpression(fence)}\\s*$`);
-  const end = lines.findIndex(({ text }, index) => index > heading + 1 && closing.test(text));
-  if (end < 0) return null;
-
-  const start = lines[heading + 1].end;
-  const range = { start, end: end === heading + 2 ? lines[end].start : lines[end - 1].contentEnd };
-  return { ask: document.slice(range.start, range.end), range };
-}
-
-/** Backward-compatible string-only view of extractVerbatimOriginalAsk. */
-export function verbatimOriginalAsk(document: string): string | null {
-  return extractVerbatimOriginalAsk(document)?.ask ?? null;
 }
 
 /** One header under which a fragment copies its parent document's `경계:` lines verbatim.

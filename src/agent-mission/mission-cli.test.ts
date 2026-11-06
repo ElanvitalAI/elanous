@@ -455,6 +455,18 @@ describe('runAgentMissionCliCommand — 에러경로', () => {
     })).toThrow('--headless');
   });
 
+  it.each(['openclaw', 'hermes'] as const)('%s backend stays on the agent-mission PTY route', async (name) => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: name }), {
+      resolveBackend: () => ({ ...BACKEND, name }), runDevPipeline: cap.fn,
+    });
+    expect(out.ok).toBe(true);
+    const plan = planDevPipeline(cap.last().spec!);
+    expect(plan.dispatch).toBe('agent-mission-pty');
+    expect(plan.executor).toEqual({ kind: 'external', backend: name, transport: 'pty' });
+    expect(toAgentMissionSpec('M', plan, () => ({ ...BACKEND, name })).agent?.name).toBe(name);
+  });
+
   it('bad backend → exit 1(재라우팅 전)', async () => {
     const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: 'bogus' }), {
       resolveBackend: () => { throw new Error("알 수 없는 agent backend 'bogus'"); },

@@ -37,13 +37,12 @@ describe('PWA slash-command boundary', () => {
   it('answers TUI commands and aliases locally, without calling an LLM', async () => {
     const cap = captureMetaLog();
     try {
-      for (const name of ['/resume-turn', '/mission']) {
+      for (const name of ['/resume-turn']) {
         expect(isMetaCommand(name)).toBe(true);
         expect((await dispatchMeta(name, ctx))?.text).toBe(`${name.split(' ')[0]} 은 PWA 채팅에서 아직 안 됩니다 — 지금 되는 명령: /help /session /fork /budget /history /clear`);
       }
       expect(cap.seen).toEqual([
         { cmd: ':resume-turn', outcome: 'unsupported-tui' },
-        { cmd: ':mission', outcome: 'unsupported-tui' },
       ]);
     } finally { cap.restore(); }
   });
@@ -51,9 +50,9 @@ describe('PWA slash-command boundary', () => {
   it('answers unknown slash commands locally and observes the outcome', async () => {
     const cap = captureMetaLog();
     try {
-      expect(isMetaCommand('/zzz')).toBe(true);
-      expect(await dispatchMeta('/zzz extra', ctx)).toEqual({ text: '모르는 명령입니다: /zzz — /help 로 목록 보기' });
-      expect(cap.seen).toEqual([{ cmd: ':zzz', outcome: 'unknown' }]);
+      expect(isMetaCommand('/mission')).toBe(true);
+      expect(await dispatchMeta('/mission extra', ctx)).toEqual({ text: '모르는 명령입니다: /mission — /help 로 목록 보기' });
+      expect(cap.seen).toEqual([{ cmd: ':mission', outcome: 'unknown' }]);
     } finally { cap.restore(); }
   });
 

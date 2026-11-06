@@ -24,7 +24,7 @@ export const HELP_GROUP_ORDER: readonly string[] = [HELP_START_GROUP, ...HELP_VE
 
 const GROUP_MEMBERS: Readonly<Record<string, readonly string[]>> = {
   [HELP_START_GROUP]: ['help', 'status', 'model', 'clear', 'new', 'resume'],
-  지켜보기: ['now', 'loops', 'mission', 'log', 'term', 'surface', 'conv', 'capture', 'telegram', 'remaining', 'debug'],
+  지켜보기: ['now', 'loops', 'log', 'term', 'surface', 'conv', 'capture', 'telegram', 'remaining', 'debug'],
   조사하기: ['research', 'prompt', 'context'],
   판단하기: ['decide', 'plan', 'wish', 'directive'],
   만들기: ['harness', 'ad', 'export'],

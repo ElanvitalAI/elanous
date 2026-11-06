@@ -14,7 +14,7 @@
 import type { ContentBlock, LLMMessage } from '../llm.js';
 import {
   appendArchiveEntry,
-  archivePath,
+  archiveReferencePath,
   getDefaultArchiveDir,
 } from './archive.js';
 import { DEFAULT_COMPACT_POLICY, type CompactPolicy } from './types.js';
@@ -37,6 +37,7 @@ export function applyToolOutputBudget(
   opts: ToolOutputBudgetOpts = {},
 ): ToolOutputBudgetResult {
   const policy = { ...DEFAULT_COMPACT_POLICY, ...opts.policy };
+  if (!policy.archiveEnabled) return { messages, responsesTrimmed: 0, savedChars: 0 };
   const sessionId = opts.sessionId ?? 'default';
   const now = opts.now ?? Date.now;
   const archiveDir = policy.archiveDir ?? getDefaultArchiveDir();
@@ -60,31 +61,39 @@ export function applyToolOutputBudget(
         newBlocks.push(block);
         continue;
       }
-      // Trim — keep tail N lines + emit file pointer.
-      const tailLines = block.content
-        .split('\n')
-        .slice(-policy.toolOutputTailLines)
-        .join('\n');
-      const replacementPath = policy.archiveEnabled
-        ? archivePath(sessionId, archiveDir)
-        : '<archive disabled>';
-      const replacement =
+      const tailLines = policy.toolOutputTailLines > 0
+        ? block.content.split('\n').slice(-policy.toolOutputTailLines).join('\n')
+        : '';
+      const replacementPath = archiveReferencePath(sessionId, archiveDir);
+      const prefix =
         `[Full output (${block.content.length} chars) saved to: ${replacementPath}]\n` +
-        `[Last ${policy.toolOutputTailLines} lines preserved below]\n` +
-        tailLines;
+        `[Up to last ${policy.toolOutputTailLines} lines preserved below]\n`;
+      // Never cut the recovery pointer. A long final line may itself exceed
+      // the budget; in that case retain the newest suffix that fits.
+      const available = Math.floor(policy.toolOutputCharBudget) - prefix.length;
+      if (available < 0 || (tailLines.length > 0 && available === 0)) {
+        newBlocks.push(block);
+        continue;
+      }
+      const replacement = prefix + (tailLines.length > available ? tailLines.slice(-available) : tailLines);
+      if (replacement.length >= block.content.length) {
+        newBlocks.push(block);
+        continue;
+      }
 
-      if (policy.archiveEnabled) {
-        appendArchiveEntry(
-          {
-            ts: now(),
-            layer: 'tool-output-budget',
-            sessionId,
-            origin: { kind: 'tool_result', tool_use_id: block.tool_use_id },
-            content: block.content,
-            replacement,
-          },
-          archiveDir,
-        );
+      if (!appendArchiveEntry(
+        {
+          ts: now(),
+          layer: 'tool-output-budget',
+          sessionId,
+          origin: { kind: 'tool_result', tool_use_id: block.tool_use_id },
+          content: block.content,
+          replacement,
+        },
+        archiveDir,
+      )) {
+        newBlocks.push(block);
+        continue;
       }
       savedChars += block.content.length - replacement.length;
       responsesTrimmed += 1;

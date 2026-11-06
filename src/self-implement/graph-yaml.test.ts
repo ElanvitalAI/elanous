@@ -301,7 +301,7 @@ describe('RFC §5 0단계 — 로더 (⛔ 뿌리를 «인자»로)', () => {
     expect({ errors: result.errors, scanned: result.scannedFiles > 0 }).toEqual({ errors: [], scanned: true });
     // ⛔ 키는 «파일명»이 아니라 `graph_id` 다 — implement-loop.yaml 의 조인 키는 'self-implement' 다
     //   (원장에 그 이름으로 이미 쌓였다 · 바꾸면 옛 표본과 비교 불가).
-    expect(Object.keys(result.templates).sort()).toEqual(['ad-loop', 'default-loop', 'document-loop', 'operate-loop', 'plan-loop', 'research-loop', 'self-implement']);
+    expect(Object.keys(result.templates).sort()).toEqual(['ad-loop', 'default-loop', 'document-loop', 'natural-language-research', 'operate-loop', 'plan-loop', 'research-loop', 'self-implement']);
   });
 
   test('four goal loops route the shared journey through real YAML and ARG-UNIT-LIB calls', () => {
@@ -464,7 +464,7 @@ describe('RFC §5 1단계 — YAML 이 «코드 상수»와 같은가', () => {
     expect(refusalEdges[0]?.map).toEqual({
       draft: 'ready', 'gate-host-busy': 'next-move', 'gate-merge-conflict': 'main-sync',
       'gate-touch-clean': 'next-move', 'head-branch': 'pr-head-checkout',
-      'not-ancestor': 'main-sync', 'pr-base-unreadable': 'next-move',
+      'not-ancestor': 'main-sync', 'pr-base-unreadable': 'next-move', 'typecheck-drift': 'main-sync',
       'public-export-leak': 'next-move', 'review-missing': 'review', other: 'next-move',
     });
     const yamlTargets = new Map<string, Set<string>>();

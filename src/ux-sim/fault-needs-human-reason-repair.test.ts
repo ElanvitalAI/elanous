@@ -35,13 +35,13 @@ describe('simNeedsHumanReasonRepair — production supervisor repair boundary', 
     await superviseRun({
       initial: [candidate],
       repairGoalExecution: true,
-      // needsHumanReasonRepairExecution is intentionally omitted: the separate kill switch defaults off.
+      // The runtime's separate kill switch is omitted, so the reason stays unknown rather than implying it was explicitly disabled.
       rerun: async (previous) => { reruns++; return previous; },
       sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
       taskAgentShadow: false,
       observe: (event, data) => { if (event === 'supervisor.reason-repair-skipped') skipped.push(data); },
     });
     expect(reruns).toBe(0);
-    expect(skipped).toEqual([{ taskId: 'default-off-piece', reason: 'disabled' }]);
+    expect(skipped).toEqual([{ taskId: 'default-off-piece', reason: 'unknown' }]);
   });
 });

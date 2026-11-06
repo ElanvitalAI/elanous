@@ -109,6 +109,25 @@ export interface EmitInjectedEventOptions {
   now?: () => Date;
 }
 
+/** 범용 운영 사건 입력. 운영 쓰기 API는 유지하고 주입 꼬리표는 입력값보다 우선한다. */
+export interface InjectAnyEventOptions {
+  runId?: string;
+  stateRoot?: string;
+  injectionId?: string;
+  ledger?: readonly { event: string; data?: Record<string, unknown> }[];
+  logs?: readonly { category: string; event: string; data?: Record<string, unknown> }[];
+  now?: () => Date;
+}
+
+export interface InjectAnyEventResult {
+  injectionId: string;
+  runId: string;
+  stateRoot: string;
+  ledgerPath: string;
+  ledgerRows: readonly RunLedgerEntry[];
+  debugRows: readonly EventMonkeyDebugRow[];
+}
+
 export interface EmitInjectedEventResult {
   readonly kind: EventMonkeyKind;
   readonly level: typeof EVENT_MONKEY_LEVEL;
@@ -210,6 +229,35 @@ function makeWriter(runId: string, dir: string, tag: Record<string, unknown>, no
       rows.push(entry);
     },
   };
+}
+
+/** 임의 category/event 및 원장 사건을 실제 운영 writer로 격리 우주에 쓴다. */
+export function injectAnyEvent(options: InjectAnyEventOptions): InjectAnyEventResult {
+  const ledgerInput = options.ledger ?? [];
+  const logInput = options.logs ?? [];
+  if (!ledgerInput.length && !logInput.length) throw new Error('injection requires at least one ledger or log row');
+  for (const row of ledgerInput) if (!row.event?.trim()) throw new Error('ledger event must be non-empty');
+  for (const row of logInput) if (!row.category?.trim() || !row.event?.trim()) throw new Error('log category and event must be non-empty');
+  const runId = options.runId ?? `run-${randomUUID()}`;
+  const requestedRoot = resolve(options.stateRoot ?? resolveEventMonkeyRoot());
+  const ledgerPath = runLedgerPath(runId, runLedgerDir(requestedRoot));
+  const stateRoot = assertIsolatedEventRoot(requestedRoot, runId);
+  const injectionId = options.injectionId ?? `inj-${randomUUID()}`;
+  const tag = { injected: true, injectionId, level: EVENT_MONKEY_LEVEL };
+  const now = options.now ?? (() => new Date());
+  const writer = makeWriter(runId, runLedgerDir(stateRoot), tag, now);
+  for (const [index, row] of ledgerInput.entries()) writer.write(row.event, {
+    ...(row.data ?? {}), runId, injectionRowId: `${injectionId}:${index}`,
+  });
+  const debugRows = logInput.map((row) => ({ category: row.category, event: row.event,
+    data: { ...(row.data ?? {}), ...tag, runId } }));
+  if (debugRows.length) {
+    const store = new LogStore(join(stateRoot, 'logs', 'logs.db'));
+    try {
+      store.insertBatch(debugRows.map((row) => ({ rec: { ts: now().toISOString(), category: row.category, event: row.event, data: row.data, level: 'info' as const }, surface: 'ux-sim' })));
+    } finally { store.close(); }
+  }
+  return { injectionId, runId, stateRoot, ledgerPath, ledgerRows: writer.rows, debugRows };
 }
 
 export function emitInjectedEvent(options: EmitInjectedEventOptions): EmitInjectedEventResult {

@@ -33,6 +33,18 @@ const checks: Array<[string, string]> = [
   ['MCP list', `set -o pipefail; codex mcp list --json | python3 -c 'import json,sys; data=json.load(sys.stdin); print("MCP entries="+str(len(data)))'`],
   ['installed hq', `${cli} hq promote --help >/dev/null && python3 -c 'import json,pathlib; p=pathlib.Path.home()/".elanous-hqcfg/config.json"; print("host="+json.loads(p.read_text())["hq"]["hostName"])'`],
 ];
+
+/** Accept only Python bodies embedded in this production promotion runbook. */
+export function isTrustedPromotionPythonBody(source: string): boolean {
+  const marker = "python3 - <<'PY'\n";
+  return [...checks, ...stages].some(([, command]) => {
+    const markerAt = command.indexOf(marker);
+    if (markerAt < 0) return false;
+    const bodyStart = markerAt + marker.length;
+    const bodyEnd = command.lastIndexOf('\nPY');
+    return bodyEnd >= bodyStart && command.slice(bodyStart, bodyEnd) === source;
+  });
+}
 const stages: Array<[string, string]> = [
   ['standby checksums', `cd ${install} && bun -e 'import("node:fs/promises").then(async ({ readlink }) => { const root = process.env.HOME + "/.elanous-standby"; const generations = { core: await readlink(root + "/core/latest"), big: await readlink(root + "/big/latest") }; const { verifyStandby } = await import("./scripts/hq/standby-verify.ts"); const result = await verifyStandby({ root, tiers: ["core", "big"], generations }); console.log(JSON.stringify(result)); if (!result.ok) process.exitCode = 1 }).catch(error => { console.error(error); process.exitCode = 1 })'`],
   ['copy to promotion universe', `python3 - <<'PY'

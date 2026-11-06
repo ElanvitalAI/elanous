@@ -11,6 +11,9 @@ export interface MessageEnvelope {
   body: string;
   kind?: string;
   replyTo?: number;
+  expiresAt?: string;
+  priority?: number;
+  supersedes?: number;
 }
 
 export interface Message extends MessageEnvelope {
@@ -73,12 +76,24 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (replyTo !== undefined && (typeof replyTo !== 'number' || !Number.isSafeInteger(replyTo) || replyTo < 1)) {
     throw new Error('replyTo must be a positive integer message ID');
   }
-  if (Object.keys(record).some(key => !['from', 'to', 'body', 'kind', 'replyTo'].includes(key))) throw new Error('unknown message field');
+  if (record.expiresAt !== undefined && (typeof record.expiresAt !== 'string' || !Number.isFinite(Date.parse(record.expiresAt)))) throw new Error('expiresAt must be an ISO timestamp');
+  if (record.priority !== undefined && (typeof record.priority !== 'number' || !Number.isFinite(record.priority))) throw new Error('priority must be a finite number');
+  if (record.supersedes !== undefined && (typeof record.supersedes !== 'number' || !Number.isSafeInteger(record.supersedes) || record.supersedes < 1)) throw new Error('supersedes must be a positive message ID');
+  if (Object.keys(record).some(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes'].includes(key))) throw new Error('unknown message field');
   return {
     from, to, body: record.body,
     ...(record.kind === undefined ? {} : { kind: record.kind as string }),
     ...(replyTo === undefined ? {} : { replyTo }),
+    ...(record.expiresAt === undefined ? {} : { expiresAt: normalizeExpiry(record.expiresAt as string) }),
+    ...(record.priority === undefined ? {} : { priority: record.priority as number }),
+    ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes as number }),
   };
+}
+
+function normalizeExpiry(value: string): string {
+  const normalized = new Date(value).toISOString();
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(normalized)) throw new Error('expiresAt must be within years 0000 through 9999');
+  return normalized;
 }
 
 function validCursor(cursor: number): number {
@@ -90,29 +105,44 @@ function hasGroupMembershipTable(db: Database): boolean {
   return (db.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'msg_group_memberships'")
     .get() as { count: number }).count > 0;
 }
+function hasMessageAckTable(db: Database): boolean {
+  return (db.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'msg_message_acks'").get() as { count: number }).count > 0;
+}
+function hasEnvelopeMetadata(db: Database): boolean {
+  return (db.query("SELECT COUNT(*) AS count FROM pragma_table_info('msg_messages') WHERE name = 'expires_at'").get() as { count: number }).count > 0;
+}
 
 /** Unread count ⊕ newest unread ID for one recipient (same predicate as `unreadCountOn`). */
 function unreadSummaryOn(db: Database, to: string): { count: number; maxId: number | null } {
+  const hasAcks = hasMessageAckTable(db);
+  const hasMetadata = hasEnvelopeMetadata(db);
+  const ackClause = hasAcks ? 'AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id=m.id AND a.recipient=?)' : '';
+  const expiryClause = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
   const groupClause = hasGroupMembershipTable(db) ? ` OR EXISTS (
         SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = ?
           AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
       )` : '';
-  const params = hasGroupMembershipTable(db) ? [to, to, to, to] : [to, to, to];
   const row = db.query(`SELECT COUNT(*) AS count, MAX(m.id) AS max_id FROM msg_messages m
     WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
+      ${expiryClause} ${ackClause}
       AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause})`)
-    .get(...params) as { count: number; max_id: number | null };
+    .get(...[to, ...(hasAcks ? [to] : []), to, to, ...(hasGroupMembershipTable(db) ? [to] : [])]) as { count: number; max_id: number | null };
   return { count: row.count, maxId: row.max_id ?? null };
 }
 
 function unreadCountOn(db: Database, to: string): number {
+  const hasAcks = hasMessageAckTable(db);
+  const hasMetadata = hasEnvelopeMetadata(db);
+  const ackClause = hasAcks ? 'AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id=m.id AND a.recipient=?)' : '';
+  const expiryClause = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
   const groupClause = hasGroupMembershipTable(db) ? ` OR EXISTS (
         SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = ?
           AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
       )` : '';
-  const params = hasGroupMembershipTable(db) ? [to, to, to, to] : [to, to, to];
+  const params = [to, ...(hasAcks ? [to] : []), to, to, ...(hasGroupMembershipTable(db) ? [to] : [])];
   return (db.query(`SELECT COUNT(*) AS count FROM msg_messages m
     WHERE m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
+      ${expiryClause} ${ackClause}
       AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause})`)
     .get(...params) as { count: number }).count;
 }
@@ -125,12 +155,18 @@ interface MessageRow {
   kind: string | null;
   reply_to: number | null;
   created_at: string;
+  expires_at?: string | null;
+  priority?: number | null;
+  supersedes?: number | null;
 }
 
 function fromRow(row: MessageRow): Message {
   return { id: row.id, from: row.sender, to: row.recipient, body: row.body,
     ...(row.kind === null ? {} : { kind: row.kind }),
     ...(row.reply_to == null ? {} : { replyTo: row.reply_to }),
+    ...(row.expires_at == null ? {} : { expiresAt: row.expires_at }),
+    ...(row.priority == null ? {} : { priority: row.priority }),
+    ...(row.supersedes == null ? {} : { supersedes: row.supersedes }),
     createdAt: row.created_at };
 }
 
@@ -177,6 +213,7 @@ export class MsgStore {
       recipient TEXT PRIMARY KEY,
       last_id INTEGER NOT NULL DEFAULT 0 CHECK(last_id >= 0)
     );
+    CREATE TABLE IF NOT EXISTS msg_message_acks (message_id INTEGER NOT NULL REFERENCES msg_messages(id), recipient TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('acked','done')), PRIMARY KEY(message_id, recipient));
     CREATE TABLE IF NOT EXISTS msg_provenance (
       provenance_key TEXT PRIMARY KEY,
       message_id INTEGER NOT NULL REFERENCES msg_messages(id)
@@ -212,6 +249,10 @@ export class MsgStore {
       const replyToColumn = (this.db.query(`SELECT COUNT(*) AS count FROM pragma_table_info('msg_messages') WHERE name = 'reply_to'`)
         .get() as { count: number }).count;
       if (replyToColumn === 0) this.db.exec('ALTER TABLE msg_messages ADD COLUMN reply_to INTEGER');
+      const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
+      if (!columns.has('expires_at')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN expires_at TEXT');
+      if (!columns.has('priority')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN priority REAL');
+      if (!columns.has('supersedes')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN supersedes INTEGER');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
     }).immediate();
   }
@@ -253,8 +294,9 @@ export class MsgStore {
       throw new Error(`reply target not found: #${msg.replyTo}`);
     }
     const createdAt = new Date().toISOString();
-    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt);
+    if (msg.supersedes !== undefined && !this.db.query('SELECT 1 FROM msg_messages WHERE id = ?').get(msg.supersedes)) throw new Error(`superseded message not found: #${msg.supersedes}`);
+    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null);
     return { id: Number(result.lastInsertRowid), ...msg, createdAt };
   }
 
@@ -401,13 +443,19 @@ export class MsgStore {
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
     return this.readWithSchema((hasReplyTo, hasGroupMemberships) => {
+      const hasAcks = hasMessageAckTable(this.db);
+      const hasMetadata = hasEnvelopeMetadata(this.db);
       const groupClause = hasGroupMemberships ? ` OR EXISTS (
-        SELECT 1 FROM msg_group_memberships gm WHERE gm.address = msg_messages.recipient AND gm.seat = ?
-          AND msg_messages.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR msg_messages.id <= gm.left_after_id)
+        SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = ?
+          AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
       )` : '';
-      const params = hasGroupMemberships ? [after, to, to, to, limit] : [after, to, to, limit];
-      return (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
-        WHERE id > ? AND (recipient = ? OR (recipient = 'ALL' AND sender <> ?)${groupClause}) ORDER BY id ASC LIMIT ?`)
+      const acksJoin = hasAcks ? 'LEFT JOIN msg_message_acks a ON a.message_id=m.id AND a.recipient=?' : '';
+      const ackFilter = hasAcks ? 'AND a.message_id IS NULL' : '';
+      const expiryFilter = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
+      const metadata = hasMetadata ? 'm.expires_at, m.priority, m.supersedes' : 'NULL AS expires_at, NULL AS priority, NULL AS supersedes';
+      const params = [...(hasAcks ? [to] : []), after, to, to, ...(hasGroupMemberships ? [to] : []), limit];
+      return (this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, ${hasReplyTo ? 'm.reply_to' : 'NULL AS reply_to'}, m.created_at, ${metadata} FROM msg_messages m ${acksJoin}
+        WHERE m.id > ? ${expiryFilter} ${ackFilter} AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause}) ORDER BY m.id ASC LIMIT ?`)
         .all(...params) as MessageRow[]).map(fromRow);
     });
   }
@@ -416,10 +464,27 @@ export class MsgStore {
   getMessage(messageId: number): Message | null {
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     return this.readWithSchema(hasReplyTo => {
-      const row = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+      const metadata = hasEnvelopeMetadata(this.db) ? 'expires_at, priority, supersedes' : 'NULL AS expires_at, NULL AS priority, NULL AS supersedes';
+      const row = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${metadata} FROM msg_messages
         WHERE id = ?`).get(messageId) as MessageRow | null;
       return row === null ? null : fromRow(row);
     });
+  }
+
+  messageStatus(recipient: string, messageId: number): 'delivered' | 'acked' | 'done' | null {
+    const to = canonicalSeatId(recipient);
+    if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
+    const hasAcks = hasMessageAckTable(this.db);
+    const hasGroups = hasGroupMembershipTable(this.db);
+    const ackProjection = hasAcks ? '(SELECT status FROM msg_message_acks WHERE message_id=m.id AND recipient=?)' : 'NULL';
+    const groupEligibility = hasGroups ? ` OR EXISTS (SELECT 1 FROM msg_group_memberships gm WHERE gm.address=m.recipient AND gm.seat=?
+      AND m.id>gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id<=gm.left_after_id))` : '';
+    const row = this.db.query(`SELECT m.recipient, m.sender, ${ackProjection} AS explicit_status, COALESCE(c.last_id,0) AS cursor_id FROM msg_messages m
+      LEFT JOIN msg_cursors c ON c.recipient=? WHERE m.id=?
+      AND (m.recipient=? OR (m.recipient='ALL' AND m.sender<>?)${groupEligibility})`)
+      .get(...[...(hasAcks ? [to] : []), to, messageId, to, to, ...(hasGroups ? [to] : [])]) as { recipient: string; sender: string; explicit_status: 'acked' | 'done' | null; cursor_id: number } | null;
+    if (!row) return null;
+    return row.explicit_status ?? (messageId <= row.cursor_id ? 'acked' : 'delivered');
   }
 
   /** Replies pointing at the supplied message, ordered by durable insertion ID. */
@@ -497,6 +562,22 @@ export class MsgStore {
 
   ack(recipient: string, cursor: number): number { return this.advanceCursor(recipient, cursor); }
 
+  /** Acknowledge exactly one delivered message for its recipient without moving past siblings. */
+  ackMessage(recipient: string, messageId: number, status: 'acked' | 'done' = 'acked'): boolean {
+    const to = canonicalSeatId(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+    if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
+    if (status !== 'acked' && status !== 'done') throw new Error('status must be acked or done');
+    const result = this.db.query(`INSERT INTO msg_message_acks(message_id, recipient, status)
+      SELECT id, ?, ? FROM msg_messages WHERE id=? AND (recipient=? OR (recipient='ALL' AND sender<>?) OR EXISTS (
+        SELECT 1 FROM msg_group_memberships gm WHERE gm.address=msg_messages.recipient AND gm.seat=?
+          AND msg_messages.id>gm.joined_after_id AND (gm.left_after_id IS NULL OR msg_messages.id<=gm.left_after_id)))
+      ON CONFLICT(message_id,recipient) DO UPDATE SET status=excluded.status`)
+      .run(to, status, messageId, to, to, to);
+    if (!result.changes) throw new Error(`message not found for ${to}: #${messageId}`);
+    return true;
+  }
+
   unreadCount(recipient: string): number {
     const to = canonicalSeatId(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
@@ -505,7 +586,11 @@ export class MsgStore {
 
   unreadRecipients(): UnreadRecipient[] {
     const hasGroups = this.hasGroupMemberships;
+    const hasAcks = hasMessageAckTable(this.db);
+    const hasMetadata = hasEnvelopeMetadata(this.db);
     const membershipRecipients = hasGroups ? ' UNION SELECT seat FROM msg_group_memberships' : '';
+    const ackFilter = hasAcks ? 'AND NOT EXISTS (SELECT 1 FROM msg_message_acks a WHERE a.message_id=m.id AND a.recipient=r.recipient)' : '';
+    const expiryFilter = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at)>julianday('now'))" : '';
     const groupClause = hasGroups ? ` OR EXISTS (
           SELECT 1 FROM msg_group_memberships gm WHERE gm.address = m.recipient AND gm.seat = r.recipient
             AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
@@ -520,6 +605,7 @@ export class MsgStore {
       FROM recipients r
       LEFT JOIN msg_cursors c ON c.recipient = r.recipient
       JOIN msg_messages m ON m.id > COALESCE(c.last_id, 0)
+        ${expiryFilter} ${ackFilter}
         AND (m.recipient = r.recipient OR (m.recipient = 'ALL' AND m.sender <> r.recipient)${groupClause})
       GROUP BY r.recipient ORDER BY r.recipient ASC`).all() as UnreadRecipient[];
   }

@@ -15,7 +15,7 @@ import { compareVersions } from '../directives/version-at.js';
 import type { BoardNode } from '../task-agent/board.js';
 import { boundPrTerminal, cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, defaultDraftClaimGhPorts, handDraftClaim, HAND_MOVE_HISTORY_EVENT, updateTaskCard, resolveHandText, readTaskAgentState, readTaskCard, runTagChange, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_SEATS, type CompletionKind, type DraftClaimGhPorts, type TaskCard, type TaskCardEvent, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { recordWiringLiveVerified, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
-import { remoteLedgerMirrorDir, remoteLedgerMirrorDirs } from '../task-agent/parent-host.js';
+import { PARENT_HOST_COMPATIBILITY_CONTRACT, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs } from '../task-agent/parent-host.js';
 import { buildWorkOrder } from '../task-agent/work-order-build.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
 import { ambiguousGreenSweepPrs, applyGreenSweepDecisions, decideGreenSweep, greenSweepCandidates, greenSweepEvidenceTestArgs, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
@@ -244,7 +244,7 @@ export function podParentLaunchSelectors(contextEnv: Record<string, string>, inh
  * 막히면 null — 호출부가 종전 로컬 발사로 간다(관측: task-agent parent-host-fallback).
  */
 async function tryRemoteParent(args: string[], cwd: string | undefined, context: TaskLaunchContext, deps: DefaultTaskLauncherDeps,
-  attached = false): Promise<(TaskLaunchReceipt & { exitCode?: number }) | { blocked: true; reason: string } | null> {
+  attached = false): Promise<(TaskLaunchReceipt & { exitCode?: number }) | { blocked: true; reason: string } | { localFallback: true } | null> {
   const parentHostModule = await import('../task-agent/parent-host.js');
   let configured: import('../task-agent/parent-host.js').ParentHostSetting | null | undefined = deps.parentHost;
   if (configured === undefined) {
@@ -528,7 +528,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   }
   recordHostRanking(null);
   if (provisionRequests.size > 0) throw new Error(`parent-host-provision-pending: ${[...provisionRequests].join(', ')}; no child provider host launched`);
-  return gateExclusive ? { blocked: true, reason: 'all-non-gate-parent-hosts-unavailable' } : null;
+  return gateExclusive ? { blocked: true, reason: 'all-non-gate-parent-hosts-unavailable' } : { localFallback: true };
 }
 
 /** Run an orchestrator parent through task hand's host selection, preflight, and credential policy. */
@@ -536,7 +536,7 @@ export async function runRemoteTaskParent(args: string[], context: TaskLaunchCon
   deps: DefaultTaskLauncherDeps = {}): Promise<{ dispatched: false } | { dispatched: true; exitCode: number; host: string } | { dispatched: false; blocked: true; reason: string }> {
   const receipt = await tryRemoteParent(args, undefined, context, deps, true);
   if (receipt && 'blocked' in receipt) return { dispatched: false, blocked: true, reason: receipt.reason };
-  if (!receipt) return { dispatched: false };
+  if (!receipt || 'localFallback' in receipt) return { dispatched: false };
   return { dispatched: true, exitCode: receipt.exitCode ?? 0, host: receipt.parentHost?.host ?? 'unknown' };
 }
 
@@ -555,22 +555,31 @@ function actionableStderrLine(path: string): string {
 
 export async function defaultTaskLauncher(args: string[], cwd?: string, context?: TaskLaunchContext, deps: DefaultTaskLauncherDeps = {}): Promise<void | TaskLaunchReceipt> {
   if (context) context = (await import('../harness/launch-utterance-ledger.js')).withHandLaunchPairContext(args, context); // LAUNCH-UTTERANCE-LEDGER hand→say pair env
+  let remoteRejected = false;
   if (context) {
     const remote = await tryRemoteParent(args, cwd, context, deps);
     if (remote && 'blocked' in remote) throw new Error(`release gate parent-host dispatch blocked: ${remote.reason}`);
-    if (remote) return remote;
+    if (remote && 'localFallback' in remote) remoteRejected = true;
+    else if (remote) return remote;
   }
+  // TA's local fallback keeps the same HQ-owned landing path as a remote parent.
+  // Otherwise a rejected remote host leaves --merge-by-host intact and can merge on mbp.
+  const isTaskAgentCard = remoteRejected && context?.env.ELANOUS_TASK_CARD_ID !== undefined;
+  const localContext = context && isTaskAgentCard
+    ? { ...context, env: { ...context.env, ELANOUS_TA_LAND: '1' } }
+    : context;
+  const localArgs = isTaskAgentCard ? remoteParentArgs(args) : args;
   // ⛔ R7(2026-10-16): 시험 안에서 실 `elanous harness say` 를 띄우는 것은 명시 허용 없이 거부한다(가짜 spawn 주입은 통과).
   if (!deps.spawn) (await import('../task-agent/real-launch-guard.js')).refuseRealLaunchUnderTest('local-harness-spawn', args.slice(0, 2).join(' '));
   const spawn = deps.spawn ?? ((await import('node:child_process')).spawn as unknown as DetachedSpawn);
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { prodInstanceRoot } = await import('../instance/resolve.js');
   const configDir = getElanousConfigDirOverride() ?? prodInstanceRoot();
-  const argv = taskLauncherArgv(configDir, args);
+  const argv = taskLauncherArgv(configDir, localArgs);
   const window = context ? deps.earlyExitWindowMs ?? LAUNCH_EARLY_EXIT_WINDOW_MS : 0;
   if (!context || window <= 0) {
     // TA-CARD-RUN-LINK: 런 id 를 자식 환경에 얹는다 — `harness say` 의 런(호스트 orchestrate)이 그 id 를 상속한다.
-    await spawnDetachedConfirmed(spawn, process.execPath, argv, SPAWN_CONFIRM_TIMEOUT_MS, cwd, context?.env);
+    await spawnDetachedConfirmed(spawn, process.execPath, argv, SPAWN_CONFIRM_TIMEOUT_MS, cwd, localContext?.env);
     return context ? { runId: context.runId } : undefined;
   }
   // STOP-RECORD launch-failed: stdio 를 버리면 자식이 exit 2 로 죽어도 흔적이 0 이고 카드는 «launched» 로 남는다
@@ -588,7 +597,7 @@ export async function defaultTaskLauncher(args: string[], cwd?: string, context?
     return child;
   };
   try {
-    await spawnDetachedConfirmed(watched, process.execPath, argv, SPAWN_CONFIRM_TIMEOUT_MS, cwd, context.env);
+    await spawnDetachedConfirmed(watched, process.execPath, argv, SPAWN_CONFIRM_TIMEOUT_MS, cwd, localContext!.env);
   } finally {
     try { closeSync(fd); } catch { /* the child keeps its own copy */ }
   }
@@ -1807,6 +1816,12 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
   const ctx = createTasksCliContext(deps);
   const { out, authenticate } = ctx;
   const tasks = registerTasksRoot(program);
+
+  tasks.command('parent-host-contract', { hidden: true })
+    .action(() => {
+      out(`ledgerSchema=${PARENT_HOST_COMPATIBILITY_CONTRACT.ledgerSchema}`);
+      out(`parentProtocol=${PARENT_HOST_COMPATIBILITY_CONTRACT.parentProtocol}`);
+    });
 
   tasks.command('work-order').description('TASK-AGENT 작업 지시서')
     .command('build')

@@ -572,7 +572,7 @@ describe('harness API handlers', () => {
     const shared = { entries: [], counts: { running: 0 }, total: 0 };
     const response = await handleHarnessRunsGet(new Request('http://nexus.test/v1/harness/runs'), {}, {
       queryRunningRuns: ((options: unknown) => {
-        expect(options).toEqual({ includeTest: false, timeBudgetMs: 3_000 });
+        expect(options).toEqual({ includeTest: false });
         return shared;
       }) as never,
     });
@@ -619,15 +619,15 @@ describe('harness API handlers', () => {
         { caller: null, cacheHits: 0, cacheMisses: 1 },
       ]);
       expect(warm).toEqual(cold);
-      expect(options).toEqual([{ includeTest: false, timeBudgetMs: 3_000 }]);
+      expect(options).toEqual([{ includeTest: false }]);
 
       writeFileSync(file, entry('start', { feature: 'now running' }));
       utimesSync(file, new Date('2026-10-09T00:00:02.000Z'), new Date('2026-10-09T00:00:02.000Z'));
-      now += 120_001;
+      now += 3_001;
       const changed = await (await handleHarnessRunsGet(request, {}, { queryRunningRuns: query, now: () => now })).json() as { entries: Array<{ runId: string }> };
       expect(changed.entries.map((row) => row.runId)).toEqual([runId]);
       expect(observations[1]).toMatchObject({ caller: null, cacheHits: 0, cacheMisses: 1 });
-      expect(options).toEqual([{ includeTest: false, timeBudgetMs: 3_000 }, { includeTest: false, timeBudgetMs: 3_000 }]);
+      expect(options).toEqual([{ includeTest: false }, { includeTest: false }]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

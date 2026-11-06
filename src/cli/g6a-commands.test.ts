@@ -19,6 +19,7 @@ const expectedCommandTree = [
     ],
     children: [
       { name: 'federate', flags: [] },
+      { name: 'warm-reuse-stats', flags: ['--test', '--instance <name>', '--all', '--include-test', '--json'] },
       { name: 'instances', flags: ['--json'] },
       { name: 'level', flags: ['--json', '--render <on|off>'] },
       { name: 'timeline', flags: ['--session <id>', '--since <t>', '--until <t>', '--out <path>', '--test', '--instance <name>'] },

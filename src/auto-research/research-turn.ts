@@ -935,6 +935,7 @@ export async function runResearchQuestionLadder(
     };
   }
 
+  emitGraphEvent(options, { type: 'enter', node: 'synthesis' });
   try {
     const applied = applySecondOrderLens({
       question: request,
@@ -1073,6 +1074,7 @@ export async function runResearchQuestionLadder(
       }, { level: 'warn' });
     }
   }
+  emitGraphEvent(options, { type: 'exit', node: 'synthesis', outcome: allOk && !signal.aborted && !entityStatusTableFailed ? 'ok' : 'incomplete' });
   saveRetroRecord(request, ladder, ladder.evidence);
   return {
     ok: allOk && !signal.aborted && !entityStatusTableFailed,

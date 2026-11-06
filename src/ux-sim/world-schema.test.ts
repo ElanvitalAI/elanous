@@ -14,6 +14,10 @@ const validWorld = {
   seats: ['OP', 'TC', 'OPT'],
   clock: { start: '2026-11-01T18:00:00+09:00', speed: 600 },
   events: [{ at: '+5m', id: 'EV-0042' }, { at: '+20m', id: 'EV-0107' }],
+  injections: [{ at: '+1m', ledger: [{ event: 'sim-probe.started', data: { source: 'world-yaml' } }] }],
+  processes: [{ id: 'train-auto-loop', host: 'gcp2', releaseVersion: '0.2.45' }],
+  chaos: [{ at: '+10m', monkey: { kill: 'train-auto-loop host=gcp2', signal: 'KILL' as const } }],
+  expect: { recovers: { within: '+15m', hitl: 0, lostLedger: 0 } },
 };
 
 const VALID_WORLD_YAML = `
@@ -28,6 +32,8 @@ hosts:
     arch: amd64
     cpu: 8
     egress: false
+processes:
+  - { id: train-auto-loop, host: gcp2, releaseVersion: '0.2.45' }
 providers:
   codex:
     accounts: [default:61%, team:1%]
@@ -39,6 +45,17 @@ clock: { start: '2026-11-01T18:00:00+09:00', speed: 600 }
 events:
   - { at: '+5m', id: EV-0042 }
   - { at: '+20m', id: EV-0107 }
+injections:
+  - at: '+1m'
+    ledger:
+      - event: sim-probe.started
+        data: { source: world-yaml }
+    logs:
+      - { category: sim-probe, event: started, data: { source: world-yaml } }
+chaos:
+  - { at: '+10m', monkey: { kill: "train-auto-loop host=gcp2", signal: KILL } }
+expect:
+  recovers: { within: '+15m', hitl: 0, lostLedger: 0 }
 `;
 
 function source(value: unknown): string {
@@ -50,7 +67,7 @@ describe('SIM world YAML schema', () => {
     const parsed = parseSimWorld(VALID_WORLD_YAML);
     expect(parsed.world).toBe(validWorld.world);
     expect(parsed.seed).toBe(validWorld.seed);
-    expect(parsed.devices).toEqual(['fake-kubectl', 'fake-llm', 'fake-github', 'fake-clock', 'fake-herdr']);
+    expect(parsed.devices).toEqual(['fake-kubectl', 'fake-llm', 'fake-github', 'fake-clock', 'fake-herdr', 'fake-ps']);
     expect(parsed.hosts?.map(({ name, arch, cpu, pools, egress }) => ({ name, arch, cpu, pools, egress }))).toEqual([
       { name: 'node-b', arch: 'arm64', cpu: 32, pools: ['gate', 'train'], egress: false },
       { name: 'gcp2', arch: 'amd64', cpu: 8, pools: [], egress: false },
@@ -60,6 +77,10 @@ describe('SIM world YAML schema', () => {
     expect(parsed.seats).toEqual(validWorld.seats);
     expect(parsed.clock).toEqual(validWorld.clock);
     expect(parsed.events).toEqual(validWorld.events);
+    expect(parsed.injections).toEqual([{ at: '+1m', ledger: [{ event: 'sim-probe.started', data: { source: 'world-yaml' } }], logs: [{ category: 'sim-probe', event: 'started', data: { source: 'world-yaml' } }] }]);
+    expect(parsed.processes).toEqual([{ id: 'train-auto-loop', host: 'gcp2', releaseVersion: '0.2.45' }]);
+    expect(parsed.chaos).toEqual([{ at: '+10m', monkey: { kill: 'train-auto-loop host=gcp2', signal: 'KILL' } }]);
+    expect(parsed.expect).toEqual({ recovers: { within: '+15m', hitl: 0, lostLedger: 0 } });
     const catalog = loadMockScenarioCatalog();
     expect(parsed.devices.every((id) => catalog.devices.some((device) => device.id === id))).toBe(true);
     expect(catalog.worldEvents.map((event) => event.id)).toContain('EV-0042');
@@ -139,5 +160,41 @@ describe('SIM world YAML schema', () => {
 
   test('rejects declarations without a device or device-backed setting', () => {
     expect(() => parseSimWorld(source({ world: 'empty-world' }))).toThrow('at least one mock device');
+  });
+
+  test('monkey targets a declared process and recovery budgets are measured nonnegative values', () => {
+    expect(() => parseSimWorld(source({ ...validWorld, processes: undefined })))
+      .toThrow('world.chaos[0].monkey.kill must name a declared world process');
+    expect(() => parseSimWorld(source({ ...validWorld, processes: [{ id: 'train-auto-loop', host: 'missing', releaseVersion: '0.2.45' }] })))
+      .toThrow('world.processes[0].host');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', monkey: { kill: 'other host=gcp2', signal: 'KILL' } }] })))
+      .toThrow('world.chaos[0].monkey.kill');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', monkey: { kill: 'worker', signal: 'SIGSTOP' } }] })))
+      .toThrow('world.chaos[0].monkey.kill');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', monkey: { kill: 'train-auto-loop host=gcp2', signal: 'SIGSTOP' } }] })))
+      .toThrow('world.chaos[0].monkey.signal');
+    expect(() => parseSimWorld(source({ ...validWorld, expect: { recovers: { within: '+5m', hitl: -1, lostLedger: 0 } } })))
+      .toThrow('world.expect.recovers.hitl');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: undefined })))
+      .toThrow('world.expect.recovers requires world.chaos');
+    expect(() => parseSimWorld(source({ ...validWorld, injections: undefined })))
+      .toThrow('world.expect.recovers requires injected ledger rows to measure losses');
+    expect(() => parseSimWorld(source({ ...validWorld, injections: [{ at: '+1m', ledger: [{ event: '' }] }] })))
+      .toThrow('world.injections[0].ledger[0].event');
+  });
+
+  test('gorilla faults target one declared host and carry measurable recovery inputs', () => {
+    const gorilla = { ...validWorld, chaos: [{ at: '+5m', gorilla: { host: 'gcp2', egress: false, cpu: 2, for: '+20m' } }] };
+    expect(parseSimWorld(source(gorilla)).chaos).toEqual([{ at: '+5m', gorilla: { host: 'gcp2', egress: false, cpu: 2, for: '+20m' } }]);
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', gorilla: { host: 'unknown', egress: false, cpu: 2, for: '+1m' } }] })))
+      .toThrow('gorilla.host must name exactly one declared world host');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', gorilla: { host: 'gcp2', egress: false, cpu: 8, for: '+1m' } }] })))
+      .toThrow('gorilla.cpu must reduce');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [
+      { at: '+1m', gorilla: { host: 'node-b', egress: false, cpu: 2, for: '+5m' } },
+      { at: '+6m', gorilla: { host: 'node-b', egress: false, cpu: 2, for: '+1m' } },
+    ] }))).toThrow('overlaps another host fault for node-b');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', disaster: { host: 'node-b', down: true } }] })))
+      .toThrow('exactly one supported fault: monkey, gorilla');
   });
 });

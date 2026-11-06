@@ -17,7 +17,7 @@
 // per existing same-origin enforcement layer).
 
 import { botCommandCatalog } from '../../bots/command-surface.js';
-import { jsonResponse } from './http-server.js';
+import { jsonResponse } from './json-response.js';
 
 /** GET /v1/bots/commands — see top-of-file wire shape. Returns the
  *  catalog array from `botCommandCatalog()` unchanged. Does not run

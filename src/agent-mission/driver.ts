@@ -173,7 +173,7 @@ export type EvidenceMode =
 //   elanous 이 PTY 로 모는 코딩 에이전트를 교체 가능하게 추상화. 지금은 codex, 이후 claude/gemini/grok 확장.
 //   (폴더/개념이 codex-mission 이던 것을 agent-mission 으로 일반화 — driver 는 backend 만 바꾸면 된다.)
 export interface AgentBackend {
-  name: 'codex' | 'claude' | 'gemini' | 'grok' | 'aside';
+  name: 'codex' | 'claude' | 'gemini' | 'grok' | 'aside' | 'openclaw' | 'hermes';
   /** PTY 실행 커맨드/인자. */
   cmd: string;
   args: string[];
@@ -316,6 +316,20 @@ export const grokBackend: AgentBackend = {
   },
 };
 
+const openclawBackend: AgentBackend = {
+  name: 'openclaw',
+  cmd: 'openclaw',
+  args: ['chat'],
+  scrubEnv: ['OPENCLAW_API_KEY', 'HERMES_API_KEY'],
+};
+
+const hermesBackend: AgentBackend = {
+  name: 'hermes',
+  cmd: 'hermes',
+  args: [],
+  scrubEnv: ['HERMES_API_KEY', 'OPENCLAW_API_KEY'],
+};
+
 /** Aside Browser agent backend — `aside exec --help` confirms `--effort low`; `ultrabrowse` enables the highest thinking level and proactive mode. */
 export const asideBackend: AgentBackend = {
   name: 'aside',
@@ -331,6 +345,8 @@ const AGENT_BACKENDS: Record<string, AgentBackend> = {
   gemini: geminiBackend,
   grok: grokBackend,
   aside: asideBackend,
+  openclaw: openclawBackend,
+  hermes: hermesBackend,
 };
 
 const FORCED_ENV_BY_BACKEND: Readonly<Record<string, Readonly<Record<string, string>>>> = {
@@ -348,6 +364,7 @@ const FORCED_ENV_BY_BACKEND: Readonly<Record<string, Readonly<Record<string, str
 export function resolveBackendSpawn(
   backend: AgentBackend,
   baseEnv: Record<string, string | undefined>,
+  missionWorktree?: string,
 ): { cmd: string; args: string[]; env: Record<string, string>; unsetEnv: string[]; nestedEnvRemovedCount: number; forcedEnv: string[] } {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(baseEnv)) if (v != null) env[k] = v;
@@ -360,6 +377,10 @@ export function resolveBackendSpawn(
     }
   }
   for (const [key, value] of Object.entries(backend.env ?? {})) env[key] = value;
+  // OpenClaw's `chat` alias runs its embedded local agent. Bind that runtime's
+  // documented default workspace to the mission worktree so its file tools and
+  // the evidence/handoff checks address the same tree.
+  if (backend.name === 'openclaw' && missionWorktree) env.OPENCLAW_WORKSPACE_DIR = resolve(missionWorktree);
   let nestedEnvRemovedCount = 0;
   for (const key of NESTED_AGENT_ENV_BLOCKLIST) {
     if (key in env) {
@@ -702,6 +723,7 @@ export interface AgentMissionDeps {
   runCodexExec?: typeof runCodexExec;
   checkEvidence?: typeof checkEvidence;
   commitWorktree?: typeof commitWorktree;
+  pushWorktree?: (worktree: string, branch: string) => void;
   dispatchOpenPullRequest?: typeof dispatchOpenPullRequest;
   /** Optional context-journal sink for isolated missions. */
   emitContextEvent?: (input: SessionEventInput) => void;
@@ -1705,7 +1727,6 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   });
   // 구독 모드 — backend 지정 env 키 스크럽 후 강제 env까지 적용해 cmd·args·env를 순수 seam으로 구성한다.
   // forcedEnv 이름의 후속 로깅은 이 착지의 의도적 경계이며, spawn에는 같은 seam의 env가 그대로 흐른다.
-  const spawnParams = resolveBackendSpawn(backend, process.env);
   const nestedRefusal = refuseNestedElanousOnBackend({
     backendName: backend.name,
     nestedLaunchRequested: spec.nestedElanousLaunch === true,
@@ -1721,9 +1742,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       detail: `nested elanous refused (${nestedRefusal.reason})`,
     };
   }
-  const env = spawnParams.env;
   if (backend.name === 'claude') {
-    const status = (deps.checkClaudeSubscription ?? checkClaudeSubscription)({ env });
+    const status = (deps.checkClaudeSubscription ?? checkClaudeSubscription)({ env: resolveBackendSpawn(backend, process.env).env });
     debug.log('agent-mission.claude-subscription', 'status', {
       ok: status.ok, authMethod: status.authMethod, apiProvider: status.apiProvider, reason: status.reason,
     });
@@ -1751,6 +1771,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     if (!deps.handoffWorktree) recordMissionWorktreeProvenance(wt.path, buildMissionWorktreeProvenance(spec.branch!), recordWorktreeProvenance);
     debug.log('agent-mission', 'worktree', { path: wt.path, branch: wt.branch, base: wt.base });
   }
+  const spawnParams = resolveBackendSpawn(backend, process.env, wt.path);
+  const env = spawnParams.env;
   const baselineTsc = spec.evidence.kind === 'tsc' ? (deps.initialTsc ?? collectTscDiagnostics(wt.path)) : null;
   const evidenceCheck: typeof checkEvidence = (worktree, evidence) => evidence.kind === 'tsc' && baselineTsc
     ? checkEvidence(worktree, evidence, { baseline: baselineTsc.diagnostics, executeTsc: baselineTsc.ran ? collectTscDiagnostics : () => baselineTsc })
@@ -2248,7 +2270,11 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       }
       const commit = (deps.commitWorktree ?? commitWorktree)(worktree, `chore(agent-mission): ${spec.branch} handoff`);
       if (!commit.ok) throw new Error(`handoff commit failed: ${commit.out}`);
-      execFileSync('git', ['push', '-u', 'origin', `HEAD:${spec.branch}`], { cwd: worktree, encoding: 'utf8', timeout: 120_000 });
+      const pushBranch = spec.branch ?? wt.branch;
+      if (!pushBranch) throw new Error('handoff push requires a branch');
+      (deps.pushWorktree ?? ((cwd, branch) => {
+        execFileSync('git', ['push', '-u', 'origin', `HEAD:${branch}`], { cwd, encoding: 'utf8', timeout: 120_000 });
+      }))(worktree, pushBranch);
       const pushUrls = execFileSync('git', ['remote', 'get-url', '--push', '--all', 'origin'], { cwd: worktree, encoding: 'utf8' }).trim().split('\n');
       if (!pushUrls.length || !pushUrls.every((url) => /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)[^/]+\/[^/]+\/?$/i.test(url))) {
         handoffPrSkipped = true;

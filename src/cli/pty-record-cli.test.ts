@@ -1,14 +1,14 @@
 import { setDefaultTimeout, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { PreviewTerminal } from '../preview/terminal.js';
 import type { AcpServerHandle } from '../acp/server.js';
 import { registerPtyRecordCommand, runPtyRecord, type PtyRecordDeps } from './pty-record-cli.js';
+import { simInProcessCli } from '../ux-sim/in-process-cli.js';
 
-// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+// CLI and web-terminal integration paths can exceed Bun's 5 s default under gate-pod load.
 setDefaultTimeout(60_000);
 
 function deps(): PtyRecordDeps & { calls: string[] } {
@@ -142,11 +142,9 @@ test('default web terminal exposes owner control, preserves ACP output, and reco
   }
 });
 
-test('real CLI entry exposes pty record below pty', () => {
-  const result = spawnSync(process.execPath, ['bin/elanous.mjs', '--test', 'pty', 'record', '--help'], {
-    cwd: join(import.meta.dir, '../..'), env: { ...process.env, NODE_ENV: 'test' }, encoding: 'utf8', timeout: 30_000,
-  });
-  expect(result.status).toBe(0);
+test('registered pty record help is captured through the isolated in-process CLI', async () => {
+  const result = await simInProcessCli(['pty', 'record', '--help'], { allowPaths: [['pty', 'record']] });
+  expect(result.exitCode).toBe(0);
   expect(result.stdout).toContain('--stop');
   expect(result.stdout).toContain('--json');
 });

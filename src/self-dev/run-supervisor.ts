@@ -1338,6 +1338,7 @@ export interface SuperviseRunOptions {
   /** True only when rerun consumes `invocation.repairGoals`; omitted or false → a review oscillation stops for a human. */
   repairGoalExecution?: boolean;
   needsHumanReasonRepairExecution?: boolean;
+  needsHumanReasonRepairSkipReason?: 'disabled' | 'missing-executor' | 'unknown';
   /**
    * TASK-AGENT-SHADOW — 멈춤이 확정되면 판단부를 그림자로 부른다(기본 `recordTaskAgentShadowMove`).
    * `false` 면 끈다. 던져도 런의 결말은 바뀌지 않는다(fail-soft).
@@ -1522,8 +1523,9 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       if (!decision.classifications.some((classification) => classification.taskId === result.taskId && classification.kind === 'unclassified')) return [];
       const repairReason = needsHumanRepairReason(result)!;
       if (needsHumanRepairSpent(history, repairReason, result.feature)) return [];
-      const reason = opts.repairGoalExecution !== true || opts.needsHumanReasonRepairExecution !== true
-        ? 'disabled' : 'no-target-paths';
+      const reason = opts.needsHumanReasonRepairSkipReason
+        ?? (opts.repairGoalExecution !== true ? 'missing-executor'
+          : opts.needsHumanReasonRepairExecution !== true ? 'unknown' : 'no-target-paths');
       if (reason === 'no-target-paths' && (result.targetPaths?.length ?? 0) > 0) return [];
       return [{ taskId: result.taskId, reason }];
     });

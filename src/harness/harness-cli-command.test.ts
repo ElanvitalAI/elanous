@@ -17,6 +17,7 @@ import { debug } from '../debug/log.js';
 import { DISPATCH_SHADOW_COMPARE_ENV } from './dispatch-shadow-compare.js';
 import { addHarnessQueue, listHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
 import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
+import type { UserConfig } from '../user-config.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';
@@ -87,6 +88,11 @@ import {
 } from './harness-cli-command.js';
 
 const harnessTestCwd = process.cwd();
+const podFixtureConfig: UserConfig = {
+  ...getUserConfig(),
+  llm: { provider: 'openai-codex' },
+  roleLlm: { review: { provider: 'openai-codex' } },
+};
 afterEach(() => { process.chdir(harnessTestCwd); });
 
 const MEASURED_LAUNCHCTL_LIST = [
@@ -121,7 +127,7 @@ const MEASURED_PS_EWW_OWNERSHIP = {
   stateDir: '/Users/example/source/axon/monad-agent/.elanous-test',
 };
 
-describe('harness CLI command', () => {
+describe.serial('harness CLI command', () => {
   // 정지·발사 환경(자식 프로세스)이 물려주는 저작 등급 seam — 시험은 «자기가 세운» 값만 본다.
   const AUTHOR_GRADE_SEAM_ENV = ['ELANOUS_AUTHOR_GRADE', 'ELANOUS_POD_AUTHOR_ON_POD', 'ELANOUS_POD_AUTHOR_GRADE', 'ELANOUS_POD_AUTHOR_GRADE_SOURCE'] as const;
   let ambientAuthorGradeSeam: Array<string | undefined> = [];
@@ -2656,7 +2662,7 @@ describe('harness CLI command', () => {
       }
       return { status: 0, stdout: '', stderr: '' };
     };
-    const spawn = podSelfImplementSpawn({ pool, kubectl, env: {}, repoUrl: 'not-a-github-repository',
+    const spawn = podSelfImplementSpawn({ pool, kubectl, env: {}, provider: 'openai-codex', childProviderExplicit: true, fallbackConfig: () => podFixtureConfig, repoUrl: 'not-a-github-repository',
       credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }), pollMs: 2 });
     const controllers = [new AbortController(), new AbortController(), new AbortController()];
     const jobs: ReturnType<typeof spawn>[] = [];
@@ -3021,7 +3027,7 @@ describe('harness CLI command', () => {
         };
         // Real producer: src/task-orchestrator/surfaces/self-implement-pod.ts emits pod-child-failed with the Pod reason.
         const produced = await podSelfImplementSpawn({
-          kubectl, credentials: () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' }),
+          kubectl, provider: 'openai-codex', childProviderExplicit: true, fallbackConfig: () => podFixtureConfig, credentials: () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' }),
           ...(stage === 'host-regate-failed' ? { hostRegate: async () => ({ passed: false, failures: [{ step: 'test-interference', detail: 'combined fail' }], os: process.platform }) } : {}),
         })({ feature: 'x', spaceId: `cli-pod-${stage}-${entrance}`, autoMerge: true }).done;
         expect(produced.exitCode).toBe(1);

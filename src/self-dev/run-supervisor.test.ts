@@ -319,19 +319,24 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
   test('NEEDS-HUMAN-REASON-REPAIR: disabled·zero-path skip 사건만 내고 rerun은 호출하지 않는다', async () => {
     const candidate = { taskId: 'reason-skip', feature: 'reason skip', status: 'failed' as const, stage: 'error' as const,
       error: { code: 'BOOM', message: 'unclassified failure' } } as unknown as SupervisorJobResult;
-    const runCase = async (needsHumanReasonRepairExecution: boolean, result: SupervisorJobResult | SupervisorJobResult[] = candidate) => {
+    const runCase = async (needsHumanReasonRepairExecution: boolean, result: SupervisorJobResult | SupervisorJobResult[] = candidate,
+      needsHumanReasonRepairSkipReason?: 'disabled' | 'missing-executor') => {
       const events: Array<{ event: string; data: Record<string, unknown> }> = [];
       let reruns = 0;
       await superviseRun({ initial: Array.isArray(result) ? result : [result], repairGoalExecution: true, needsHumanReasonRepairExecution,
+        ...(needsHumanReasonRepairSkipReason === undefined ? {} : { needsHumanReasonRepairSkipReason }),
         rerun: async (previous) => { reruns++; return previous; }, taskAgentShadow: false,
         sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
         observe: (event, data) => { if (event === 'supervisor.reason-repair-skipped') events.push({ event, data }); },
       });
       return { events, reruns };
     };
-    expect(await runCase(false)).toMatchObject({ reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'disabled' } }] });
+    expect(await runCase(false)).toMatchObject({ reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'unknown' } }] });
+    expect(await runCase(false, candidate, 'missing-executor')).toMatchObject({
+      reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'missing-executor' } }],
+    });
     expect(await runCase(false, [candidate, { ...candidate, taskId: 'reason-skip-2' }])).toMatchObject({
-      reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'disabled' } }, { data: { taskId: 'reason-skip-2', reason: 'disabled' } }],
+      reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'unknown' } }, { data: { taskId: 'reason-skip-2', reason: 'unknown' } }],
     });
     expect(await runCase(true, { ...candidate, targetPaths: [] })).toMatchObject({
       reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'no-target-paths' } }],
