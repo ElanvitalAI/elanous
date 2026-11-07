@@ -8,8 +8,10 @@ import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { NexusEventBus } from './event-bus.js';
-import { handleFieldUploads } from './field-uploads.js';
+import { handleAppUploads, handleFieldUploads } from './field-uploads.js';
 import { routeRequest } from './http-server.js';
+import { createAppUpload } from '../apps/app-upload.js';
+import { createObjectStore } from '../../storage/object-store.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -140,6 +142,13 @@ describe('handleFieldUploads (direct)', () => {
     expect(await res.json()).toEqual({ ok: true, event: 'ev', count: 1, saved: [{ name: '20261015T090000Z-pixel-p.webp', bytes: 5 }] });
     expect(readFileSync(join(rootDir, 'field', 'ev', '20261015T090000Z-pixel-p.webp'), 'utf8')).toBe('hello');
 
+    const invalidBase64 = await handleFieldUploads(new Request(`${URL_BASE}?event=ev&device=pixel`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ files: [{ name: 'invalid.webp', dataBase64: '%%%' }] }),
+    }), { authorize: () => true, rootDir: () => rootDir, now: NOW });
+    expect(invalidBase64.status).toBe(400);
+    expect(await invalidBase64.json()).toMatchObject({ ok: false, error: 'bad-request' });
+
     const list = await handleFieldUploads(new Request(`${URL_BASE}?event=ev`), { authorize: () => true, rootDir: () => rootDir });
     expect(await list.json()).toEqual({ event: 'ev', count: 1, files: [{ name: '20261015T090000Z-pixel-p.webp', bytes: 5 }],
       reel: { status: 'waiting', updatedAt: expect.any(String) } });
@@ -192,13 +201,50 @@ describe('handleFieldUploads (direct)', () => {
   });
 });
 
+test('handleAppUploads gates requests and returns storage list failures as 503', async () => {
+  const rootDir = root();
+  const appUpload = createAppUpload({
+    store: createObjectStore({ provider: 'local', localDir: rootDir, bucket: 'private', publicBucket: '', prefix: 'apps' }),
+    maxUploadBytes: 5,
+  });
+  const url = 'http://localhost/v1/apps/notes/uploads';
+  expect((await handleAppUploads(new Request(url), { appUpload, authorize: () => false })).status).toBe(401);
+  const post = await handleAppUploads(new Request(url, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: 'audio/note.wav', contentType: 'audio/wav', dataBase64: 'AQID' }),
+  }), { appUpload, authorize: () => true });
+  expect(post.status).toBe(201);
+  expect(await post.json()).toEqual({ ok: true, bytes: 3 });
+  const listed = await handleAppUploads(new Request(url), { appUpload, authorize: () => true });
+  expect(await listed.json()).toEqual({ app: 'notes', files: ['audio/note.wav'] });
+
+  const malformed = await handleAppUploads(new Request(url, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: 'audio/invalid.wav', contentType: 'audio/wav', dataBase64: '%%%' }),
+  }), { appUpload, authorize: () => true });
+  expect(malformed.status).toBe(400);
+  expect(await malformed.json()).toMatchObject({ error: 'bad-request' });
+  const tooLarge = await handleAppUploads(new Request(url, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: 'audio/large.wav', contentType: 'audio/wav', dataBase64: Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64') }),
+  }), { appUpload: createAppUpload({ store: createObjectStore({ provider: 'local', localDir: rootDir, bucket: 'private', publicBucket: '', prefix: 'apps' }) }), authorize: () => true });
+  expect(tooLarge.status).toBe(413);
+
+  const unavailable = createAppUpload({
+    store: {
+      provider: 'local', put() {}, get() {}, head() { return { exists: false }; }, list() { throw new Error('offline'); }, publicUrl() { return null; },
+    },
+  });
+  expect((await handleAppUploads(new Request(url), { appUpload: unavailable, authorize: () => true })).status).toBe(503);
+});
+
 describe('routeRequest wiring', () => {
-  function call(path: string, init: RequestInit, bearer: boolean) {
+  function call(path: string, init: RequestInit, bearer: boolean, site = 'cross-site') {
     const bus = new NexusEventBus();
     const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
     state.bus = bus;
     const headers = new Headers(init.headers);
-    headers.set('sec-fetch-site', 'cross-site');
+    headers.set('sec-fetch-site', site);
     if (bearer) headers.set('authorization', 'Bearer owner-secret');
     return routeRequest(new Request(`http://localhost${path}`, { ...init, headers }),
       { state, registry: new TabRegistry(state), eventBus: bus, metaApi: { bearerToken: 'owner-secret', noAuth: false } },
@@ -230,6 +276,26 @@ describe('routeRequest wiring', () => {
     const invalid = await call('/v1/field/reel?event=ev', { method: 'GET' }, true);
     expect((await invalid!.json() as { url?: string }).url).toBeUndefined();
     expect((await call('/v1/field/reel/file?event=ev', { method: 'GET' }, true))?.status).toBe(404);
+  });
+
+  test('app upload route enforces bearer auth and isolates files under the app namespace', async () => {
+    const rootDir = root();
+    const priorState = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = join(rootDir, 'state');
+    setElanousConfigDir(rootDir);
+    try {
+      const unauthorized = await call('/v1/apps/notes/uploads', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'audio/a.wav', contentType: 'audio/wav', dataBase64: 'AQID' }) }, false);
+      expect(unauthorized?.status).toBe(401);
+      const upload = await call('/v1/apps/notes/uploads', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'audio/note.wav', contentType: 'audio/wav', dataBase64: 'AQID' }) }, true);
+      expect(upload?.status).toBe(201);
+      const listed = await call('/v1/apps/notes/uploads', { method: 'GET' }, true);
+      expect(await listed!.json()).toEqual({ app: 'notes', files: ['audio/note.wav'] });
+    } finally {
+      if (priorState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorState;
+    }
   });
 });
 

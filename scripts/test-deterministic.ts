@@ -326,7 +326,7 @@ const defaultSpawn: SpawnDirectChild = (opts) => {
   });
   if (!opts.captureNoMatch) return child;
   const stderrEvidence = scanNamePatternStderr(
-    child.stderr as ReadableStream<Uint8Array>, opts.namePatterns ?? [],
+    child.stderr as unknown as AsyncIterable<Uint8Array>, opts.namePatterns ?? [],
     (chunk) => process.stderr.write(chunk),
   );
   return { pid: child.pid, exited: child.exited, kill: (signal) => child.kill(signal), stderrEvidence };

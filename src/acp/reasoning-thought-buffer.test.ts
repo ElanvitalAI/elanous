@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
-import * as core from '../core-turn/index.js';
+import * as core from '../core-turn/run-core-turn.js';
 import * as config from '../user-config.js';
 import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp } from './core-turn-bridge.js';

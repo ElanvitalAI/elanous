@@ -1,11 +1,11 @@
 // ACP 브리지의 «턴 마감» 표면 — #22 401 조용한 완료 · #25 최종 답 2회 렌더 ⊕ goal loop 내부 판정 노출.
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
-import * as core from '../core-turn/index.js';
+import * as core from '../core-turn/run-core-turn.js';
 import * as llm from '../llm.js';
 import type { LLMMessage, LLMProvider, LLMStreamEvent } from '../llm.js';
 import * as config from '../user-config.js';
 import { debug } from '../debug/log.js';
-import type { CoreTurnContext } from '../core-turn/index.js';
+import type { CoreTurnContext } from '../core-turn/types.js';
 import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp, extractLastAssistantText } from './core-turn-bridge.js';
 import { AUTH_REJECTED_NOTICE, CoreTurnAuthRejectedError } from '../core-turn/auth-rejected-notice.js';

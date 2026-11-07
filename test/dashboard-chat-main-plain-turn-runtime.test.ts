@@ -131,16 +131,6 @@ function buildDeps(overrides: Partial<DashboardChatMainPlainTurnRuntimeDeps> = {
         onUsage({ tokens: 3 });
       },
     },
-    autoTts: {
-      pushChunk: (_chunk) => { calls.push('tts:push'); },
-      commit: async () => { calls.push('tts:commit'); },
-      cancel: async () => { calls.push('tts:cancel'); },
-    },
-    voiceChat: {
-      getPhase: () => 'processing',
-      transitionToSpeaking: () => { calls.push('voice:speaking'); },
-      notifyResponseDone: () => { calls.push('voice:done'); },
-    },
     finalizeStreamLifecycle: (cleanupEsc, _aborted, status) => {
       cleanupEsc();
       calls.push(`finalize-stream:${status}`);

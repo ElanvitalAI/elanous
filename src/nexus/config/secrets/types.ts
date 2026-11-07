@@ -20,6 +20,14 @@ export type SecretBackendId =
   | 'gcp'
   | '1password';
 
+export function isAppSecretId(id: string): boolean {
+  return id.startsWith('app/');
+}
+
+export function assertSharedSecretId(id: string): void {
+  if (isAppSecretId(id)) throw new Error('ELANOUS_APP_SECRET_LEDGER_REQUIRED');
+}
+
 export class SecretBackendError extends Error {
   constructor(public readonly backend: SecretBackendId, public readonly secretId: string, message: string) {
     super(`[${backend}:${secretId}] ${message}`);

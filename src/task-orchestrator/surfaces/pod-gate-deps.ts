@@ -18,12 +18,13 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 /** Baked dependency root inside the full harness image (mirrors the repo layout). */
 export const GATE_DEPS_DIR = '/opt/elanous-gate-deps';
 /** The install trees, relative to the repo root, in install order (same as the old `bun install && (cd apps/pwa && bun install)`). */
 export const GATE_DEPS_TREES = ['.', 'apps/pwa'] as const;
+const ROOT_POSTINSTALL = 'scripts/npm-postinstall.cjs';
 
 /**
  * The part of a package.json that decides what `bun install` produces: dependency maps, overrides, trusted/patched
@@ -53,7 +54,8 @@ export function projectDepsManifest(manifest: Record<string, unknown>): Record<s
 
 /**
  * build.sh staging: `<dest>/<tree>/bun.lock` (verbatim) ⊕ `<dest>/<tree>/package.json` (the projection) for every install
- * tree. The digest (sha256 of the staged bytes, 12 hex) becomes the image label `elanous.gate-deps`.
+ * tree, plus the root package's local postinstall script when projected. The digest (sha256 of staged bytes, 12 hex)
+ * becomes the image label `elanous.gate-deps`.
  */
 export function stageGateDeps(root: string, dest: string): { digest: string; trees: string[] } {
   const hash = createHash('sha256');
@@ -70,6 +72,15 @@ export function stageGateDeps(root: string, dest: string): { digest: string; tre
     writeFileSync(join(out, 'bun.lock'), lockBytes, { mode: 0o644 });
     writeFileSync(join(out, 'package.json'), projected, { mode: 0o644 });
     hash.update(`${tree}\0`).update(lockBytes).update('\0').update(projected).update('\0');
+    if (tree === '.' && JSON.parse(projected).scripts?.postinstall === `node ${ROOT_POSTINSTALL}`) {
+      const source = join(root, ROOT_POSTINSTALL);
+      if (!existsSync(source)) throw new Error(`gate deps lifecycle input missing: ${ROOT_POSTINSTALL}`);
+      const scriptBytes = readFileSync(source);
+      const stagedScript = join(out, ROOT_POSTINSTALL);
+      mkdirSync(dirname(stagedScript), { recursive: true });
+      writeFileSync(stagedScript, scriptBytes, { mode: 0o644 });
+      hash.update(`${ROOT_POSTINSTALL}\0`).update(scriptBytes).update('\0');
+    }
     trees.push(tree);
   }
   return { digest: hash.digest('hex').slice(0, 12), trees };
@@ -95,6 +106,10 @@ export function gateDepsInstallScript(o: { log: string; installSlots: number; de
     '  if ! cmp -s "$t/bun.lock" "$d/bun.lock"; then echo "[gate] deps $t miss (bun.lock differs)"; return 1; fi',
     `  want=$(bun -e ${sq(GATE_DEPS_PROJECTION_JS)} "$t/package.json" 2>/dev/null) || { echo "[gate] deps $t miss (package.json unreadable)"; return 1; }`,
     '  if [ "$want" != "$(cat "$d/package.json" 2>/dev/null)" ]; then echo "[gate] deps $t miss (package.json differs)"; return 1; fi',
+    `  if [ "$t" = . ] && [[ "$want" == *'"postinstall": "node ${ROOT_POSTINSTALL}"'* ]]; then`,
+    `    if [ ! -f "$t/${ROOT_POSTINSTALL}" ] || [ ! -f "$d/${ROOT_POSTINSTALL}" ]; then echo "[gate] deps $t miss (lifecycle input missing)"; return 1; fi`,
+    `    if ! cmp -s "$t/${ROOT_POSTINSTALL}" "$d/${ROOT_POSTINSTALL}"; then echo "[gate] deps $t miss (lifecycle input differs)"; return 1; fi`,
+    '  fi',
     '  if ! ln -s "$d/node_modules" "$t/node_modules"; then echo "[gate] deps $t miss (link failed)"; return 1; fi',
     '  echo "[gate] deps $t baked"',
     '}',

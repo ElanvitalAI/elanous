@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { isUnprivilegedGitRepairOnlyFailure } from './install-doctor-result';
+import { runReleaseInstaller, type Runner } from '../src/cli/release-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -1153,6 +1154,29 @@ describe('INST2 — finish in the same window', () => {
     const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(record, 'utf8')).toBe(`${join(realpathSync(prefix), 'bin', 'elanous')}|1|unset`);
+  }, 180_000);
+
+  test('release prepare installer helper runs the real installer with no setup in an interactive session', () => {
+    const packed = pack(fixture());
+    const env = setup();
+    const { exec, record } = fakeSetup(env.dir);
+    const path = hostPathWithoutEln();
+    const doctorBin = isolatedDoctorBin(env);
+    const installEnv: NodeJS.ProcessEnv = {
+      ...process.env, NODE_ENV: 'test', HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'),
+      XDG_CACHE_HOME: join(env.home, '.cache'), BUN_INSTALL: join(env.home, '.bun'), BUN_INSTALL_CACHE_DIR: hostBunCache,
+      ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_INSTALL_SOURCE: packed, ELANOUS_SHELL_STARTUP: env.startup,
+      ELANOUS_INSTALL_LANG: 'en', ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec,
+      ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin, PATH: path, CI: '',
+    };
+    const runner: Runner = (command, args, cwd, options) => {
+      const result = spawnSync(command, [...args], { cwd, encoding: 'utf8', env: options?.env ?? installEnv, input: options?.input });
+      return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+    };
+    const result = runReleaseInstaller(readFileSync(installer, 'utf8'), env.home, installEnv, runner);
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(record)).toBe(false);
+    expect(result.stdout).not.toContain('Starting first-time setup');
   }, 180_000);
 
   test('--no-setup: an interactive terminal still does not start setup', () => {

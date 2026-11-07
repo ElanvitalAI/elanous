@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 
 import { DaemonSessionHistory } from './daemon-runtime.js';
 import { runDaemonPromptTurn } from './daemon-prompt-turn.js';
-import * as coreTurnModule from '../core-turn/index.js';
+import * as coreTurnModule from '../core-turn/run-core-turn.js';
 import { debug } from '../debug/log.js';
 import { surfaceUxFromDispatchCtx } from '../agent/surface-ux/build.js';
 import type { ConfirmChannel } from '../hitl/confirm.js';

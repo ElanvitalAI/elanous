@@ -10,10 +10,10 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { listLoops } from '../loops/registry.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
 import { runGraph } from '../graph-runner/runner.js';
-import type { LightRcResult } from './light-rc.js';
+import { LIGHT_RC_DEFAULT_SHARDS, type LightRcResult } from './light-rc.js';
 import { setSchedule, type ReleaseSchedule } from './release-schedule.js';
 import { spawnHardRehearsalGate, planRehearsal as livePlanRehearsal, rehearsalLeakFailureDetail, runRehearsalLeakCheck, runRehearsalTick, sanitizeRehearsalLeakDetail, type HardGateResult, type RehearsalDeps, type StepId } from './rehearsal.js';
-import { planRehearsalShards } from './rehearsal-shard-plan.js';
+import { planRehearsalShards, type RehearsalShardPlan } from './rehearsal-shard-plan.js';
 import { writeGateVerdictRecord } from '../../scripts/release-loop/gate-node.js';
 import { hardRehearsalGateVersion, planHardRehearsalRadius } from '../../scripts/release-loop/gate-radius-live.js';
 
@@ -737,6 +737,86 @@ test('missing gate shard plan releases claim regardless of diagnostic wording', 
   expect(h.calls).toEqual([schedule.version]);
 });
 
+test('REHEARSAL-HARD-2H-MANDATORY: rc-150m falls back to a complete remote shard run when planning inputs are incomplete', async () => {
+  const scenario = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/rehearsal-hard-2h-mandatory.yaml'), 'utf8')) as {
+    kind: string; cases: Array<{ id: string; plan: RehearsalShardPlan }>;
+  };
+  expect(scenario.kind).toBe('rehearsal-hard-2h-mandatory');
+  for (const item of scenario.cases) {
+    const root = newRoot();
+    const dir = join(root, 'release', schedule.version, 'rehearsal');
+    mkdirSync(dir, { recursive: true });
+    for (const step of ['rc-7h', 'hard-5h'] as const) writeFileSync(join(dir, `${step}.json`), JSON.stringify({
+      version: schedule.version, step, cutAt: cut, outcome: 'ok', startedAt: at(720).toISOString(), endedAt: at(720).toISOString(), notifiedAt: at(720).toISOString(),
+    }));
+    const h = harness(at(150));
+    const selection: Array<{ shards?: number; remote?: string; fullFallback?: { reason: string; plannedShards?: number } }> = [];
+    h.deps.shardPlan = () => item.plan;
+    h.deps.lightRc = async (_version, _checkout, picked) => {
+      selection.push(picked);
+      return rc({ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'minim5', introduced: 0, preexisting: 0, unclassified: 0,
+        gateExitCode: 0, ok: true, unmeasured: null });
+    };
+    const result = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, remote: 'minim5' }, h.deps);
+    expect(result).toMatchObject({ status: 'due', run: 'rc-150m', stamps: [{ outcome: 'ok' }] });
+    expect(selection).toHaveLength(1);
+    expect(selection[0]).toMatchObject({ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'minim5' });
+    const fallbackExpected = item.plan.planningGaps?.length || item.plan.testFiles === null
+      || item.plan.testFiles === 0 || item.plan.gatePlanShards === null || item.plan.rssRevisionPending
+      || item.plan.shards !== LIGHT_RC_DEFAULT_SHARDS;
+    expect(Boolean(selection[0]?.fullFallback)).toBe(Boolean(fallbackExpected));
+    expect(stamp(root, 'rc-150m')).toMatchObject({ selection: { shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'minim5' }, outcome: 'ok' });
+    expect(stamp(root, 'rc-150m').summary).toContain(fallbackExpected ? 'full-shards fallback' : 'gate rc 0');
+    expect(stamp(root, 'rc-150m').summary).not.toContain('unmeasured: remote gate host resources unmeasured before RC');
+  }
+});
+
+test('REHEARSAL-HARD-2H-MANDATORY: planner exposes missing file memory, shard board, and inventory', () => {
+  const base = {
+    remoteGate: true,
+    resources: () => ({ cpus: 8, freeBytes: 16 * 1024 ** 3, totalBytes: 32 * 1024 ** 3 }),
+    readAlways: () => 'test/example.test.ts',
+    resolveBase: () => 'a'.repeat(40),
+    select: () => ({ testFiles: ['test/example.test.ts'], unrunImporterTotal: 0 }),
+  };
+  const board = { v: 1 as const, version: schedule.version, updatedAt: at(150).toISOString(), shards: [{ id: 'pod-1', state: 'pending' as const }] };
+  const missingMemory = planRehearsalShards(schedule.version, '/ledger', '/checkout', {
+    ...base, board: () => board, fileMemory: () => new Map(),
+  });
+  expect(missingMemory.planningGaps).toContain('selected file memory not measured: 1/1');
+
+  const missingBoard = planRehearsalShards(schedule.version, '/ledger', '/checkout', {
+    ...base, board: () => null,
+    fileMemory: () => new Map([['test/example.test.ts', 1000]]),
+  });
+  expect(missingBoard.gatePlanShards).toBeNull();
+  expect(missingBoard.planningGaps).toContain('persisted gate shard plan unavailable');
+
+  const unknownInventory = planRehearsalShards(schedule.version, '/ledger', '/checkout', {
+    ...base, board: () => board, select: () => { throw new Error('inventory unavailable'); },
+    fileMemory: () => new Map(),
+  });
+  expect(unknownInventory.testFiles).toBeNull();
+  expect(unknownInventory.planningGaps?.some((gap) => gap.includes('test selection unavailable'))).toBe(true);
+});
+
+test('REHEARSAL-HARD-2H-MANDATORY: failed rc-150m run retains provisional capacity warning', async () => {
+  const root = newRoot(), dir = join(root, 'release', schedule.version, 'rehearsal');
+  mkdirSync(dir, { recursive: true });
+  for (const step of ['rc-7h', 'hard-5h'] as const) writeFileSync(join(dir, `${step}.json`), JSON.stringify({
+    version: schedule.version, step, cutAt: cut, outcome: 'ok', startedAt: at(720).toISOString(), endedAt: at(720).toISOString(), notifiedAt: at(720).toISOString(),
+  }));
+  const h = harness(at(150));
+  h.deps.shardPlan = () => ({ shards: 4, testFiles: 18, gatePlanShards: 4,
+    resources: { cpus: 8, freeBytes: 16 * 1024 ** 3, totalBytes: 32 * 1024 ** 3 },
+    remoteCapacityPending: true, planningGaps: [], unmeasured: 'remote gate host resources unmeasured before RC' });
+  h.deps.lightRc = async () => rc({ shards: 4, remote: 'minim5', introduced: 0, preexisting: 0, unclassified: 0,
+    gateExitCode: 1, ok: false, unmeasured: null });
+  await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, remote: 'minim5' }, h.deps);
+  expect(stamp(root, 'rc-150m')).toMatchObject({ outcome: 'error' });
+  expect(stamp(root, 'rc-150m').summary).toContain('unmeasured: remote gate host resources unmeasured before RC');
+});
+
 test('leak-check failure stays recorded even when the gate shard plan is missing', async () => {
   const root = newRoot(), h = harness(at(420));
   h.deps.leakCheck = () => ({ status: 1 });
@@ -929,30 +1009,59 @@ test('two concurrent tick processes on a dead-owner stamp (with and without a de
   const root = newRoot(), dir = join(root, 'release', schedule.version, 'rehearsal');
   mkdirSync(dir, { recursive: true });
   const sent = join(root, 'sent.log');
-  const script = join(root, 'tick.ts');
-  writeFileSync(script, `import { appendFileSync } from 'node:fs';
+  const script = join(root, 'tick.ts'), ready = join(root, 'ready.log'), roundReady = join(root, 'round-ready.log');
+  const done = join(root, 'round-done.log'), roundFile = join(root, 'round.txt');
+  writeFileSync(script, `import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { runRehearsalTick } from ${JSON.stringify(resolve(import.meta.dir, 'rehearsal.ts'))};
-const [root, sent, go] = process.argv.slice(2);
-while (Date.now() < Number(go)) { /* align both ticks */ }
-await runRehearsalTick({ ledgerRoot: root, apply: true }, { now: () => new Date(${JSON.stringify(new Date(Date.parse(cut) + 60_000).toISOString())}), schedules: () => [],
-  notify: (text) => { appendFileSync(sent, text + '\\n'); } });
+const [root, sent, ready, roundReady, done, roundFile] = process.argv.slice(2);
+const lines = (path) => existsSync(path) ? readFileSync(path, 'utf8').trim().split('\\n').filter(Boolean) : [];
+const waitFor = async (path, prefix, count) => {
+  while (lines(path).filter(line => line.startsWith(prefix)).length < count) await new Promise(resolve => setTimeout(resolve, 2));
+};
+appendFileSync(ready, process.pid + '\\n');
+await waitFor(ready, '', 2);
+let last = -1;
+while (true) {
+  const signal = readFileSync(roundFile, 'utf8').trim();
+  if (signal === 'done') break;
+  const round = Number(signal);
+  if (!Number.isSafeInteger(round) || round <= last) { await new Promise(resolve => setTimeout(resolve, 2)); continue; }
+  last = round;
+  appendFileSync(roundReady, round + ':' + process.pid + '\\n');
+  await waitFor(roundReady, round + ':', 2);
+  await runRehearsalTick({ ledgerRoot: root, apply: true }, { now: () => new Date(${JSON.stringify(new Date(Date.parse(cut) + 60_000).toISOString())}), schedules: () => [],
+    notify: text => { appendFileSync(sent, text + '\\n'); } });
+  appendFileSync(done, round + ':' + process.pid + '\\n');
+}
 `);
+  writeFileSync(roundFile, '-1');
+  const procs = [0, 1].map(() => Bun.spawn(['bun', script, root, sent, ready, roundReady, done, roundFile],
+    { stdout: 'ignore', stderr: 'pipe' }));
+  const readLines = (path: string) => existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').filter(Boolean) : [];
+  const waitForLines = async (path: string, prefix: string, count: number) => {
+    const deadline = Date.now() + 10_000;
+    while (readLines(path).filter(line => line.startsWith(prefix)).length < count) {
+      if (Date.now() >= deadline) throw new Error(`concurrent tick barrier timed out: ${prefix}`);
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+  };
+  await waitForLines(ready, '', 2);
   for (let round = 0; round < 6; round++) {
     rmSync(join(dir, 'rc-7h.json.interrupt.lock'), { force: true });
     // Odd rounds: both processes must also recover the same dead transition lock.
     if (round % 2) writeFileSync(join(dir, 'rc-7h.json.interrupt.lock'), JSON.stringify({ pid: 2147483647, token: 'dead' }));
     writeFileSync(join(dir, 'rc-7h.json'), JSON.stringify({ version: schedule.version, cutAt: cut, step: 'rc-7h', outcome: 'running', startedAt: at(420).toISOString(), ownerPid: 2147483647 }));
     rmSync(sent, { force: true });
-    const go = String(Date.now() + 1500);
-    const procs = [0, 1].map(() => Bun.spawn(['bun', script, root, sent, go], { stdout: 'pipe', stderr: 'pipe' }));
-    const codes = await Promise.all(procs.map(proc => proc.exited));
-    expect(codes).toEqual([0, 0]);
+    writeFileSync(roundFile, String(round));
+    await waitForLines(done, `${round}:`, 2);
     const lines = readFileSync(sent, 'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('interrupted');
     expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'interrupted' });
     expect(stamp(root, 'rc-7h').notifiedAt).toBeDefined();
   }
+  writeFileSync(roundFile, 'done');
+  expect(await Promise.all(procs.map(proc => proc.exited))).toEqual([0, 0]);
 }, 60_000);
 
 test('a corrupt stamp left by a crash neither blocks other stages and notifications nor re-runs its stage', async () => {

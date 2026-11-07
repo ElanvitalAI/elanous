@@ -1,4 +1,13 @@
 /** Pure, fail-closed planning for a release gate measured across hosts. No host command runs here. */
+import { runtimeIdentityKey } from '../../src/runtime-identity.js';
+
+export function gateShardRuntimeIdentityKey(identity: { bunVersion: string; platform: string;
+  architecture: string; baseImageDigest?: string } | null | undefined, lockHash: string | null | undefined): string | null {
+  if (!identity) return null;
+  return runtimeIdentityKey({ baseImageDigest: identity.baseImageDigest ?? '', lockHash: lockHash ?? '',
+    os: identity.platform, architecture: identity.architecture, bunVersion: identity.bunVersion });
+}
+
 export interface GateShardIdentity {
   id: string;
   files: string[];
@@ -34,6 +43,12 @@ export interface GateShardReceipt extends GateShardIdentity {
   imageDigest?: string;
   /** Bun/platform/architecture fingerprint observed inside the executed Pod. */
   runtimeIdentity?: { bunVersion: string; platform: string; architecture: string; envFingerprint: string; baseImageDigest?: string };
+  /** Source-derived runtime/dependency identity at the measured commit, carried with each shard receipt. */
+  runtimeSourceFingerprint?: string;
+  /** Named lockfile component of the runtime reuse tuple. */
+  lockfileHash?: string;
+  /** SHA-256 of the exact test-file blobs this shard actually measured. */
+  testedFileHashes?: Record<string, string>;
   /** Every Pod attempt that contributed to this logical shard; summary identity is valid only when these agree. */
   executions?: GateShardExecutionEvidence[];
   status: 'complete' | 'unmeasured';
@@ -62,9 +77,20 @@ export type GateProgressState = 'pending' | 'running' | 'done' | 'failed' | 'tim
 export interface GateProgressGroup {
   id: string;
   state: GateProgressState;
+  /** Original shard-board state before retry is normalized to running for summaries. */
+  rawState?: string;
+  /** Current Pod attempt identity; absent while a retry is being scheduled. */
+  attemptId?: string;
   host?: string;
+  /** Exact failure and error case count when shard output is complete; unknown otherwise. */
+  failureCount?: number | null;
   startedAtMs?: number;
   endedAtMs?: number;
+}
+
+/** Deduplicate repeated observations while preserving raw retry and attempt transitions. */
+export function gateProgressTransitionKey(group: GateProgressGroup): string {
+  return JSON.stringify([group.rawState ?? group.state, group.attemptId ?? null, group.failureCount ?? null]);
 }
 
 export interface GateProgressSummary {
@@ -117,6 +143,8 @@ export interface GateShardDispatchInput {
   recipeCommand?: string;
   recipeTimeoutMs?: number;
   environmentIdentity?: { baseImageDigest?: string; imageDigest?: string; bunVersion: string; platform: string; architecture: string; envFingerprint: string };
+  lockfileHash?: string;
+  testedFileHashesByShard?: Readonly<Record<string, Readonly<Record<string, string>>>>;
 }
 
 /** Preserve the producer shard assignment while applying a changed-test import radius. Missing or incomplete inventory fails closed. */
@@ -124,9 +152,13 @@ export function planGateReceiptRadius(input: { receipts: readonly GateShardRecei
   selectedFiles: readonly string[]; priorCommit: string }): { shards: GateShardIdentity[]; invalidatedShardIds: string[]; unchangedShardIds: string[] } | null {
   if (!input.receipts.length || !input.tests.length || !/^[a-f0-9]{40}$/i.test(input.priorCommit)) return null;
   const receipts = [...input.receipts].sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
-  if (receipts.some((receipt, index) => receipt.id !== `pod-${index}` || receipt.status !== 'complete' || receipt.head40 !== input.priorCommit)
-    || new Set(receipts.flatMap((receipt) => receipt.files)).size !== input.tests.length
-    || JSON.stringify(receipts.flatMap((receipt) => receipt.files).sort()) !== JSON.stringify([...input.tests].sort())
+  const measuredFiles = receipts.flatMap((receipt) => receipt.files);
+  const measuredFileSet = new Set(measuredFiles);
+  // A test-file append is monotonic: retain the complete prior inventory and put each new file
+  // in its own new shard. Removed files, duplicate ownership, or gaps still invalidate the proof.
+  if (receipts.some((receipt, index) => receipt.id !== `pod-${index}` || receipt.status !== 'complete' || receipt.head40 !== input.priorCommit || !receipt.files.length)
+    || measuredFileSet.size !== measuredFiles.length
+    || measuredFiles.some((file) => !input.tests.includes(file))
     || input.selectedFiles.some((file) => !input.tests.includes(file))) return null;
   const invalidatedShardIds: string[] = [];
   const unchangedShardIds: string[] = [];
@@ -135,6 +167,12 @@ export function planGateReceiptRadius(input: { receipts: readonly GateShardRecei
     (changed ? invalidatedShardIds : unchangedShardIds).push(receipt.id);
     return { id: receipt.id, files: [...receipt.files] };
   });
+  const appendedFiles = input.tests.filter((file) => !measuredFileSet.has(file)).sort();
+  for (const file of appendedFiles) {
+    const id = `pod-${shards.length}`;
+    shards.push({ id, files: [file] });
+    invalidatedShardIds.push(id);
+  }
   return { shards, invalidatedShardIds, unchangedShardIds };
 }
 
@@ -183,7 +221,9 @@ export function eligibleGateShardReceipt(
       && /^[a-f0-9]{64}$/i.test(receipt.runtimeIdentity.envFingerprint)
       && typeof receipt.runtimeIdentity.baseImageDigest === 'string' && /^sha256:[a-f0-9]{64}$/i.test(receipt.runtimeIdentity.baseImageDigest)
       && receipt.envFingerprint === receipt.runtimeIdentity.envFingerprint
-      && receipt.envKey === `${receipt.envFingerprint}:${receipt.imageDigest}`
+      && receipt.envKey === gateShardRuntimeIdentityKey(receipt.runtimeIdentity, receipt.lockfileHash)
+      && typeof receipt.lockfileHash === 'string' && /^[a-f0-9]{64}$/i.test(receipt.lockfileHash)
+      && validTestedFileHashesForFiles(receipt.testedFileHashes, receipt.files)
       && Array.isArray(receipt.executions) && receipt.executions.length > 0
       && receipt.executions.every((execution) => typeof execution.branch === 'string'
         && typeof execution.attemptId === 'string' && execution.attemptId.trim().length > 0
@@ -208,20 +248,26 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
   const radiusUnchanged = new Set(input.radiusUnchangedShardIds ?? []);
   return input.shards.map((shard) => {
     const prior = [...input.receipts].reverse().find((r) => r.id === shard.id && r.base40 === input.base40 && sameFiles(r.files, shard.files));
-    const envFields = ['baseImageDigest', 'bunVersion', 'platform', 'architecture', 'envFingerprint'] as const;
+    const currentFileHashes = input.testedFileHashesByShard?.[shard.id];
+    const currentLockfileValid = typeof input.lockfileHash === 'string' && /^[a-f0-9]{64}$/i.test(input.lockfileHash);
+    const currentFileHashesValid = validTestedFileHashesForFiles(currentFileHashes, shard.files);
+    const envFields = ['baseImageDigest', 'bunVersion', 'platform', 'architecture'] as const;
     const storedEnv = prior?.runtimeIdentity && prior.imageDigest && prior.envFingerprint
       ? { ...prior.runtimeIdentity, envFingerprint: prior.envFingerprint } : undefined;
     const environmentMismatch = storedEnv && input.environmentIdentity
-      ? (prior?.imageDigest !== input.environmentIdentity.imageDigest ? 'imageDigest' : envFields.find((field) => storedEnv[field] !== input.environmentIdentity![field]))
+      ? envFields.find((field) => storedEnv[field] !== input.environmentIdentity![field])
       : (!input.environmentIdentity ? 'environment-unmeasured' as const : undefined);
     const recipeMismatch = prior && input.graphEntry && input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
       ? (prior.graphEntry !== input.graphEntry ? 'graph-entry-mismatch' : prior.recipeCommand !== input.recipeCommand ? 'recipe-command-mismatch'
         : prior.recipeTimeoutMs !== input.recipeTimeoutMs ? 'recipe-timeout-mismatch' : undefined)
       : prior ? 'shard-recipe-unmeasured' : undefined;
     const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40, radiusUnchanged.has(shard.id))
+      && r.failureIds.length === 0 && r.errorIds.length === 0
+      && currentLockfileValid && r.lockfileHash === input.lockfileHash
+      && currentFileHashesValid && sameTestedFileHashes(r.testedFileHashes, currentFileHashes)
       && !!input.graphEntry && !!input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
       && r.graphEntry === input.graphEntry && r.recipeCommand === input.recipeCommand && r.recipeTimeoutMs === input.recipeTimeoutMs
-      && !!input.environmentIdentity?.imageDigest && r.imageDigest === input.environmentIdentity.imageDigest
+      && !!input.environmentIdentity?.imageDigest && /^sha256:[a-f0-9]{64}$/i.test(input.environmentIdentity.imageDigest)
       && envFields.every((field) => ({ ...r.runtimeIdentity })[field] === input.environmentIdentity![field]));
     const invalidated = new Set(input.invalidatedShardIds ?? []).has(shard.id);
     const forced = input.rerouteShard === shard.id || invalidated;
@@ -230,7 +276,12 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const receiptHost = hosts.find((host) => host.id === receipt?.host);
     if (receipt && (receipt.head40 === input.head40 || radiusUnchanged.has(shard.id)) && !forced && !auto && !invalidated && (!shard.requiredOs || receiptHost?.platform === shard.requiredOs))
       return { shardId: shard.id, files: [...shard.files], kind: 'reuse', receipt, reason: 'unchanged-radius-from-' + receipt.head40.slice(0, 12) };
-    const rerunReason = invalidated ? 'radius-invalidated' : (prior && prior.head40 !== input.head40 && !radiusUnchanged.has(shard.id)) ? 'radius-proof-missing' : environmentMismatch ? 'environment-' + environmentMismatch + '-mismatch'
+    const testedContentMismatch = input.testedFileHashesByShard !== undefined
+      && !sameTestedFileHashes(prior?.testedFileHashes, input.testedFileHashesByShard[shard.id]);
+    const lockfileMismatch = input.lockfileHash !== undefined && prior?.lockfileHash !== input.lockfileHash;
+    const rerunReason = invalidated ? 'radius-invalidated' : !currentLockfileValid ? 'runtime-lockfile-unmeasured'
+      : !currentFileHashesValid ? 'tested-file-identity-unmeasured' : testedContentMismatch ? 'tested-file-content-mismatch'
+      : lockfileMismatch ? 'runtime-lockfile-mismatch' : (prior && prior.head40 !== input.head40 && !radiusUnchanged.has(shard.id)) ? 'radius-proof-missing' : environmentMismatch ? 'environment-' + environmentMismatch + '-mismatch'
       : recipeMismatch ?? (forced ? 'reroute-requested' : receipt ? 'receipt-ineligible' : 'receipt-unavailable');
     let candidates = hosts.filter((host) => !shard.requiredOs || host.platform === shard.requiredOs);
     if (input.shardHost && (forced || auto)) candidates = candidates.filter((host) => host.id === input.shardHost);
@@ -240,6 +291,19 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const host = candidates[nextHost++ % candidates.length]!;
     return { shardId: shard.id, files: [...shard.files], kind: 'run', host: host.id, reason: rerunReason, ...(prior ? { replacing: prior } : {}) };
   });
+}
+
+function sameTestedFileHashes(a: Readonly<Record<string, string>> | undefined, b: Readonly<Record<string, string>> | undefined): boolean {
+  if (!a || !b) return false;
+  const ak = Object.keys(a).sort(), bk = Object.keys(b).sort();
+  return JSON.stringify(ak) === JSON.stringify(bk) && ak.every((file) => /^[a-f0-9]{64}$/i.test(a[file] ?? '') && a[file] === b[file]);
+}
+
+function validTestedFileHashesForFiles(hashes: Readonly<Record<string, string>> | undefined, files: readonly string[]): boolean {
+  if (!hashes) return false;
+  const keys = Object.keys(hashes).sort();
+  return JSON.stringify(keys) === JSON.stringify([...files].sort())
+    && Object.values(hashes).every((hash) => /^[a-f0-9]{64}$/i.test(hash));
 }
 
 export type GateShardReduction =

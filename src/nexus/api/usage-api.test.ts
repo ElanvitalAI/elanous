@@ -118,6 +118,35 @@ test('concurrent GETs share one in-flight collection', async () => {
   expect((await second)?.status).toBe(200);
 });
 
+test('usage fan-in stays synchronous past app-host routing and skips app routes', async () => {
+  let calls = 0;
+  let appRouteCalls = 0;
+  let release!: (value: UnifiedUsageReport) => void;
+  const handler = createUsageHandler(() => {
+    calls++;
+    return new Promise<UnifiedUsageReport>((resolve) => { release = resolve; });
+  });
+  const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
+  const send = () => routeRequest(new Request('http://localhost/v1/usage', {
+    headers: { authorization: 'Bearer owner-token', 'sec-fetch-site': 'cross-site' },
+  }), {
+    state, registry: new TabRegistry(state), eventBus: new NexusEventBus(),
+    metaApi: { bearerToken: 'owner-token', noAuth: false }, usageHandler: handler,
+    appHost: { handle: () => undefined } as never,
+    appRoutes: [() => { appRouteCalls++; return undefined; }],
+  }, { requestIP: () => ({ address: '203.0.113.1' }) } as never,
+  null, createDevProxyRuntimeRef());
+
+  const first = send();
+  const second = send();
+  await Promise.resolve();
+  expect(calls).toBe(1);
+  expect(appRouteCalls).toBe(0);
+  release(report);
+  expect((await first)?.status).toBe(200);
+  expect((await second)?.status).toBe(200);
+});
+
 test('collection failure returns a safe reason at HTTP 200 and retries next time', async () => {
   let calls = 0;
   const handler = createUsageHandler(async () => {

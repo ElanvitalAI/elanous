@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { expectMalformedJson400 } from './helpers/http-error-contract';
 
 import { handleImageGenerate } from '../src/nexus/api/image-generate.js';
 import type { ObsidianVault } from '../src/auto-research/obsidian-bridge.js';
@@ -134,7 +135,7 @@ describe('handleImageGenerate · validation', () => {
       body: '{ not json',
     });
     const res = await handleImageGenerate(req, opts());
-    expect(res.status).toBe(400);
+    await expectMalformedJson400(res);
   });
 });
 

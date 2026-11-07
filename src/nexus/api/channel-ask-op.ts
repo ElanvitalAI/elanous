@@ -1,11 +1,8 @@
 import type { Message, MessageEnvelope } from '../../msg/msg-store.js';
-import type { TgSlashCommand } from '../../telegram-commands.js';
-import { ASK_OP_COMMAND, formatAskOpQuestionEnvelope } from '../../session/channel-ask-op-envelope.js';
+import { ASK_OP_COMMAND } from '../../session/channel-ask-op-envelope.js';
+import { createAskOpTelegramSlashCommand, type AskOpTelegramOptions } from '../../telegram-commands.js';
 
-export interface AskOpTelegramOptions {
-  allowedUserIds: readonly number[];
-  append: (message: MessageEnvelope, provenanceKey: string) => Message;
-}
+export { createAskOpTelegramSlashCommand, type AskOpTelegramOptions } from '../../telegram-commands.js';
 
 export interface AskOpDiscordOptions {
   allowedUserIds: readonly string[];
@@ -31,38 +28,6 @@ function appendAskOpQuestion(
     kind: 'question',
     body: [`${input.surface} /${ASK_OP_COMMAND}`, ...input.correlation, `question: ${input.question}`].join('\n'),
   }, input.provenanceKey);
-}
-
-function extractQuestion(text: string): string | null {
-  const match = new RegExp(`^/(?:${ASK_OP_COMMAND}|ask-op)(?:@[-_a-z0-9]+)?(?:\\s+([\\s\\S]*))?$`, 'i').exec(text.trim());
-  const question = match?.[1]?.trim();
-  return question || null;
-}
-
-export function createAskOpTelegramSlashCommand(options: AskOpTelegramOptions): TgSlashCommand {
-  return {
-    name: ASK_OP_COMMAND,
-    description: '운영 책임자에게 질문을 보냅니다',
-    handler: async (_args, ctx) => {
-      if (!options.allowedUserIds.includes(ctx.userId)) return '허용된 사용자만 OP에게 질문할 수 있습니다.';
-      const question = extractQuestion(ctx.text);
-      if (!question) return `사용법: /${ASK_OP_COMMAND} <질문>`;
-      if (!Number.isSafeInteger(ctx.updateId) || ctx.updateId < 0) return 'Telegram update 식별값을 확인할 수 없어 질문을 저장하지 못했습니다.';
-
-      const botId = (ctx.botId ?? 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
-      const message = options.append({
-        from: 'TELEGRAM',
-        to: 'COORDINATOR',
-        kind: 'question',
-        body: formatAskOpQuestionEnvelope({
-          surface: 'telegram', botId, chatId: ctx.chatId, threadId: ctx.threadId,
-          messageId: ctx.messageId, updateId: ctx.updateId, question,
-        }),
-      }, `coord:tg-${botId}-${ctx.updateId}:COORDINATOR`);
-
-      return `OP에게 질문 #${message.id}로 접수했습니다.`;
-    },
-  };
 }
 
 /** Handle a Discord text command from an already-routed message. Returning

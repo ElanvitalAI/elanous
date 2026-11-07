@@ -13,6 +13,8 @@ import {
 import type { BigIntStats } from 'node:fs';
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parseAppManifest, type AppManifest } from './app-contract.js';
+import { createAppAuth, type AppAuthOptions, type IssuedAppInvitation } from './app-auth.js';
+import { createAppDatabase, type AppDatabase } from './app-db.js';
 
 const APP_HOST_SUFFIX = '.app.localhost';
 const MIME_BY_EXT: Readonly<Record<string, string>> = {
@@ -30,13 +32,20 @@ export interface NexusAppHostIssue {
 
 export interface NexusAppHost {
   /** Reserves app-host origins before API routing, even when no app bundle mounted. */
-  handle(req: Request): Response | undefined;
+  handle(req: Request): Response | undefined | Promise<Response | undefined>;
+  /** Trusted server-side invitation issuance. Public app-host requests cannot call this operation. */
+  issueInvitation(appSlug: string, invitedBy: string, ttlMs?: number, role?: string): IssuedAppInvitation;
   readonly slugs: readonly string[];
+  /** Parsed, validated manifest snapshot for app-scoped route registration. */
+  getManifest(appSlug: string): AppManifest | undefined;
   close(): void;
 }
 
+export type NexusAppHostAuthOptions = Pick<AppAuthOptions, 'dir' | 'key' | 'now' | 'invitationTtlMs' | 'sessionTtlMs'> & { readonly databaseDirectory?: string };
+
 interface MountedApp {
   readonly slug: string;
+  readonly manifest: AppManifest;
   readonly files: ReadonlyMap<string, Buffer>;
 }
 
@@ -75,6 +84,42 @@ function requestAuthority(req: Request, hostname: string): string {
 
 function notFound(): Response {
   return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+}
+
+async function readJsonBody(req: Request, limit: number): Promise<{ readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly tooLarge: boolean }> {
+  if (!req.body) return { ok: false, tooLarge: false };
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      size += part.value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        return { ok: false, tooLarge: true };
+      }
+      chunks.push(part.value);
+    }
+  } catch {
+    return { ok: false, tooLarge: false };
+  } finally {
+    reader.releaseLock();
+  }
+  try {
+    return { ok: true, value: JSON.parse(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString('utf8')) };
+  } catch { return { ok: false, tooLarge: false }; }
+}
+
+function sameRequestOrigin(req: Request, hostname: string): boolean {
+  const origin = req.headers.get('origin');
+  if (!origin) return false;
+  try {
+    const supplied = new URL(origin);
+    const request = new URL(req.url);
+    return supplied.origin === origin && supplied.origin === `${request.protocol}//${requestAuthority(req, hostname)}`;
+  } catch { return false; }
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -234,7 +279,7 @@ function mountApp(appsRoot: string, entryName: string, simulation?: NexusAppHost
   if (!files.has('index.html')) throw new Error('frontend.out has no index.html');
   verifySnapshot(outputRoot, outputRoot, files, identities);
   stableDirectory(appsRoot, appPath, appIdentity);
-  return { slug: manifest.slug, files };
+  return { slug: manifest.slug, files, manifest };
 }
 
 function normalizeRequestPath(pathname: string): string | undefined {
@@ -246,20 +291,91 @@ function normalizeRequestPath(pathname: string): string | undefined {
   return pieces.join('/') || 'index.html';
 }
 
-function createNexusAppHost(mounts: ReadonlyMap<string, MountedApp>): NexusAppHost {
+function createNexusAppHost(mounts: ReadonlyMap<string, MountedApp>, authBySlug: ReadonlyMap<string, ReturnType<typeof createAppAuth>>, appDb?: AppDatabase): NexusAppHost {
   return {
     slugs: [...mounts.keys()],
-    close() {},
+    getManifest(appSlug) { return mounts.get(appSlug)?.manifest; },
+    close() { appDb?.close(); },
+    issueInvitation(appSlug, invitedBy, ttlMs, role) {
+      const auth = authBySlug.get(appSlug);
+      const mounted = mounts.get(appSlug);
+      if (!mounted || !auth) throw new Error('app is not mounted or app authentication is unavailable');
+      const roles = mounted.manifest.roles as Record<string, unknown> | undefined;
+      const hasDbContract = Object.hasOwn(mounted.manifest, 'tables') || Object.hasOwn(mounted.manifest, 'rpc');
+      // Old static-only manifests may have no viewer role declaration. Keep their invitation flow;
+      // the fallback role has no RPC authority unless a declaration explicitly grants it.
+      const effectiveRole = role ?? 'viewer';
+      const roleDeclaration = roles?.[effectiveRole];
+      if (role !== undefined && (!roles || !Object.hasOwn(roles, role))) throw new Error('app role is not declared');
+      if (role === undefined && hasDbContract && (!roles || !Object.hasOwn(roles, effectiveRole))) throw new Error('app role is not declared');
+      if (roles && Object.hasOwn(roles, effectiveRole)) {
+        const via = typeof roleDeclaration === 'object' && roleDeclaration !== null && !Array.isArray(roleDeclaration)
+          ? (roleDeclaration as Record<string, unknown>).via : undefined;
+        if (via !== 'share-link') throw new Error('app role is not available through a share-link invitation');
+      }
+      return auth.issueInvitation({ appSlug, invitedBy, role: effectiveRole, ...(ttlMs !== undefined ? { ttlMs } : {}) });
+    },
     handle(req) {
       const hostname = requestHostname(req);
       if (!hostname?.endsWith(APP_HOST_SUFFIX)) return undefined;
       const slug = hostname.slice(0, -APP_HOST_SUFFIX.length);
       const mounted = mounts.get(slug);
       if (!mounted) return notFound();
+      const auth = authBySlug.get(slug);
+      if (!auth) return new Response('App authentication unavailable', { status: 503 });
+      const url = new URL(req.url);
+      if (url.pathname === '/__auth/accept') {
+        if (req.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET' } });
+        const token = url.searchParams.get('token') ?? '';
+        const accepted = auth.acceptInvitation({ appSlug: slug, token });
+        if (accepted.status !== 200 || !accepted.cookie) return new Response('Unauthorized', { status: 401 });
+        return new Response(null, { status: 303, headers: {
+          location: '/', 'set-cookie': accepted.cookie, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer',
+        } });
+      }
+      const rpcMatch = /^\/__rpc\/([a-zA-Z][a-zA-Z0-9_-]{0,63})$/.exec(url.pathname);
+      if (rpcMatch) {
+        return (async () => {
+        if (req.method !== 'POST') return new Response(JSON.stringify({ error: 'method-not-allowed' }), { status: 405, headers: { allow: 'POST', 'content-type': 'application/json' } });
+        if (!sameRequestOrigin(req, hostname)) return new Response(JSON.stringify({ error: 'origin-not-allowed' }), { status: 403, headers: { 'content-type': 'application/json' } });
+        if (!/^application\/json(?:\s*;|\s*$)/i.test(req.headers.get('content-type') ?? '')) return new Response(JSON.stringify({ error: 'json-required' }), { status: 415, headers: { 'content-type': 'application/json' } });
+        const sessionCookie = req.headers.get('cookie') ?? '';
+        let session = auth.getSessionRecord(sessionCookie);
+        if (!session || session.appSlug !== slug) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+        if (!appDb) return new Response(JSON.stringify({ error: 'app-db-not-wired' }), { status: 503, headers: { 'content-type': 'application/json' } });
+        const contentLength = req.headers.get('content-length');
+        if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > 64 * 1024) return new Response(JSON.stringify({ error: 'request-too-large' }), { status: 413, headers: { 'content-type': 'application/json' } });
+        const parsed = await readJsonBody(req, 64 * 1024);
+        if (!parsed.ok) return new Response(JSON.stringify({ error: parsed.tooLarge ? 'request-too-large' : 'invalid-json' }), { status: parsed.tooLarge ? 413 : 400, headers: { 'content-type': 'application/json' } });
+        const input = parsed.value;
+        const rpcInput = input as { params?: unknown };
+        if (!input || typeof input !== 'object' || Array.isArray(input)
+          || Object.keys(input).some(key => key !== 'params')
+          || (Object.hasOwn(input, 'params') && (!rpcInput.params || typeof rpcInput.params !== 'object' || Array.isArray(rpcInput.params)))) {
+          return new Response(JSON.stringify({ error: 'invalid-rpc-request' }), { status: 400, headers: { 'content-type': 'application/json' } });
+        }
+        try {
+          // The request body may have taken long enough for the session to expire or be revoked.
+          session = auth.getSessionRecord(sessionCookie);
+          if (!session || session.appSlug !== slug) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+          const roles = mounted.manifest.roles as Record<string, unknown> | undefined;
+          if (roles && !Object.hasOwn(roles, session.role)) return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403, headers: { 'content-type': 'application/json' } });
+          const rows = appDb.rpc(slug, rpcMatch[1]!, (rpcInput.params ?? {}) as Record<string, unknown>, session.role);
+          return new Response(JSON.stringify({ rows }), { status: 200, headers: { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' } });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : '';
+          const status = message === 'app role is not allowed' ? 403 : message.startsWith('rpc not found:') ? 404 : 400;
+          return new Response(JSON.stringify({ error: status === 403 ? 'forbidden' : status === 404 ? 'rpc-not-found' : 'invalid-rpc-request' }), { status, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+        }
+        })();
+      }
+      if (auth.verifySession({ appSlug: slug, token: req.headers.get('cookie') ?? '' }).status !== 200) {
+        return new Response('Unauthorized', { status: 401, headers: { 'cache-control': 'no-store' } });
+      }
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
       }
-      const pathname = normalizeRequestPath(new URL(req.url).pathname);
+      const pathname = normalizeRequestPath(url.pathname);
       if (!pathname) return notFound();
       const filePath = mounted.files.has(pathname) ? pathname : `${pathname.replace(/\/$/, '')}/index.html`;
       const body = mounted.files.get(filePath);
@@ -284,10 +400,12 @@ function createNexusAppHost(mounts: ReadonlyMap<string, MountedApp>): NexusAppHo
 export function loadNexusAppHost(
   appsDir: string,
   simulation?: NexusAppHostFsSimulation,
+  authOptions?: NexusAppHostAuthOptions,
 ): { appHost: NexusAppHost; issues: readonly NexusAppHostIssue[] } {
   const mounts = new Map<string, MountedApp>();
+  const authBySlug = new Map<string, ReturnType<typeof createAppAuth>>();
   const issues: NexusAppHostIssue[] = [];
-  if (!existsSync(appsDir)) return { appHost: createNexusAppHost(mounts), issues };
+  if (!existsSync(appsDir)) return { appHost: createNexusAppHost(mounts, authBySlug), issues };
 
   const appsRoot = realpathSync(appsDir);
   const rootIdentity = stableDirectory(appsRoot, appsRoot);
@@ -300,10 +418,38 @@ export function loadNexusAppHost(
       const mounted = mountApp(appsRoot, entry.name, simulation);
       if (mounts.has(mounted.slug)) throw new Error('duplicate app slug');
       mounts.set(mounted.slug, mounted);
+      if (authOptions) {
+        authBySlug.set(mounted.slug, createAppAuth({ ...authOptions, dir: join(authOptions.dir ?? join(appsRoot, '..', 'app-session-tokens'), mounted.slug) }));
+      }
     } catch (error) {
       issues.push({ appDir: basename(appDir), reason: error instanceof Error ? error.message : String(error) });
     }
   }
   stableDirectory(appsRoot, appsRoot, rootIdentity);
-  return { appHost: createNexusAppHost(mounts), issues };
+  let appDb: AppDatabase | undefined;
+  if (authOptions && mounts.size > 0) {
+    const databases = new Map<string, AppDatabase>();
+    for (const [slug, mounted] of mounts) {
+      const hasDbContract = Object.hasOwn(mounted.manifest, 'tables') || Object.hasOwn(mounted.manifest, 'rpc');
+      if (!hasDbContract) continue;
+      try {
+        databases.set(slug, createAppDatabase([mounted.manifest], authOptions.databaseDirectory ? { directory: authOptions.databaseDirectory } : {}));
+      } catch (error) {
+        issues.push({ appDir: slug, reason: error instanceof Error ? error.message : String(error) });
+        mounts.delete(slug);
+        authBySlug.delete(slug);
+      }
+    }
+    if (databases.size > 0) {
+      appDb = {
+        rpc(slug, name, params, role) {
+          const database = databases.get(slug);
+          if (!database) throw new Error(`app not found: ${slug}`);
+          return database.rpc(slug, name, params, role);
+        },
+        close() { for (const database of databases.values()) database.close(); databases.clear(); },
+      };
+    }
+  }
+  return { appHost: createNexusAppHost(mounts, authBySlug, appDb), issues };
 }

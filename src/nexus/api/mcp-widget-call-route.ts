@@ -45,7 +45,12 @@ export interface McpWidgetCallRouteOpts {
    *  한 파일이 수 분씩 걸리고, 상한을 실측에 맞춰 올릴 때마다 시험이 «같이» 느려진다.
    *  🩸 실제로 그렇게 됐다 — 상한을 10초→180초로 올리자 시험 넷이 그 값을 기다리다 깨졌다.
    *  ⇒ ***상한은 「실물의 값」이고 시험은 「그 규칙」을 잰다*** — 둘을 분리한다. */
-  _pollLimitsForTest?: { maxElapsedMs?: number };
+  _pollLimitsForTest?: {
+    maxElapsedMs?: number;
+    now?: () => number;
+    setTimeout?: (callback: () => void, ms: number) => unknown;
+    clearTimeout?: (timer: unknown) => void;
+  };
   /** 위젯 턴을 on-disk 세션 저장소에 남긴다(주입 가능 — 시험은 목으로 받는다).
    *
    *  ⛔⭐ 이 자리가 «없어서» 안드로이드에서 슬래시 명령으로 «시작한» 세션이
@@ -188,19 +193,15 @@ function sessionIdOf(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : undefined;
 }
 
-function elapsedMsSince(startedAt: number): number {
-  return Date.now() - startedAt;
-}
-
-async function withTimeout<T>(operation: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+async function withTimeout<T>(operation: Promise<T>, ms: number, setTimer: (callback: () => void, ms: number) => unknown, clearTimer: (timer: unknown) => void): Promise<T> {
+  let timer: unknown;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('mcp-widget-job-poll-timed-out')), ms);
+    timer = setTimer(() => reject(new Error('mcp-widget-job-poll-timed-out')), ms);
   });
   try {
     return await Promise.race([operation, timeout]);
   } finally {
-    if (timer) clearTimeout(timer);
+    if (timer !== undefined) clearTimer(timer);
   }
 }
 
@@ -210,7 +211,7 @@ function scheduleAfterResponse(task: () => void): void {
 
 export function pollMaxElapsedMsFor(
   pendingJobs: Array<{ job: MediaJob; index: number }>,
-  limits?: { maxElapsedMs?: number },
+  limits?: NonNullable<McpWidgetCallRouteOpts['_pollLimitsForTest']>,
 ): number {
   if (limits?.maxElapsedMs !== undefined) return limits.maxElapsedMs;
   return pendingJobs.some(({ job }) => job.kind === 'video')
@@ -243,10 +244,13 @@ async function pollMcpMediaJobs(
   pendingJobs: Array<{ job: MediaJob; index: number }>,
   dispatch: NonNullable<McpWidgetCallRouteOpts['dispatch']>,
   context: ToolRuntimeContext,
-  limits?: { maxElapsedMs?: number },
+  limits?: NonNullable<McpWidgetCallRouteOpts['_pollLimitsForTest']>,
   persistTurn?: McpWidgetCallRouteOpts['persistTurn'],
 ): Promise<void> {
   const maxElapsedMs = pollMaxElapsedMsFor(pendingJobs, limits);
+  const now = limits?.now ?? Date.now;
+  const setTimer = limits?.setTimeout ?? ((callback, ms) => setTimeout(callback, ms));
+  const clearTimer = limits?.clearTimeout ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
   // ⭐ 폴링은 «자기 emitter» 로 돈다 — 상한에 닿으면 그것만 해지한다(원래 턴의 emitter 는 안 건드린다).
   let nextEnvelopeSeq = 0;
   const gate = revocableEmitter(context.emitFeedback);
@@ -258,12 +262,13 @@ async function pollMcpMediaJobs(
     ...context,
     ...(gate.emit ? { emitFeedback: emitPollingFeedback } : {}),
   };
-  const startedAt = Date.now();
+  const startedAt = now();
   let pending = pendingJobs;
   let attempts = 0;
 
   while (pending.length > 0) {
-    const remainingMs = maxElapsedMs - elapsedMsSince(startedAt);
+    const elapsedMs = now() - startedAt;
+    const remainingMs = maxElapsedMs - elapsedMs;
     if (remainingMs <= 0) break;
     attempts += 1;
     try {
@@ -271,7 +276,7 @@ async function pollMcpMediaJobs(
         dispatch(`${serverId}.jobs_wait`, {
           jobs: pending.map(({ index, job }) => ({ index, job_id: job.jobId })),
         }, pollContext),
-        remainingMs,
+        remainingMs, setTimer, clearTimer,
       );
       const nextJobs = new Map(mcpMediaJobs(result).map((job) => [job.jobId, job]));
       for (const { job } of pending) {
@@ -281,7 +286,7 @@ async function pollMcpMediaJobs(
             jobId: job.jobId,
             status: next.status,
             attempts,
-            elapsedMs: elapsedMsSince(startedAt),
+            elapsedMs: now() - startedAt,
           });
           // ⭐ 「끝났다」를 저장소에도 남긴다 — 이것이 없으면 앱을 다시 열었을 때
           //   말풍선만 돌아오고 그림·영상은 안 돌아온다.
@@ -318,7 +323,7 @@ async function pollMcpMediaJobs(
   }
 
   if (pending.length > 0) {
-    const elapsedMs = elapsedMsSince(startedAt);
+    const elapsedMs = now() - startedAt;
     try {
       for (const { job } of pending) {
         try {

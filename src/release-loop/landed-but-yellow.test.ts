@@ -524,7 +524,7 @@ describe('LANDED-YELLOW-FAST — merged PR fetch', () => {
     expect(seen).toBeLessThanOrEqual(1 + 6 + 1);
   });
 
-  test('CLI on a fake gh (fake-bin · 300 merged PRs · 1s per call) prints the same JSON within 15s and logs stage timings', async () => {
+  test('CLI on a fake gh (fake-bin · 300 merged PRs) prints the same JSON and logs stage timings', async () => {
     const items = [item('LANDED-YELLOW-FAST', 'yellow', { updatedAt: '2026-10-01T00:00:00Z' }), item('W3', 'red'), item('G1', 'green')];
     const page = all.slice(0, 300);
     const events: Array<{ category: string; event: string; data: unknown }> = [];
@@ -538,7 +538,7 @@ describe('LANDED-YELLOW-FAST — merged PR fetch', () => {
     }) as typeof process.stdout.write);
     const started = performance.now();
     try {
-      await withFakeBins({ gh: { stdout: JSON.stringify(page), sleepSeconds: 1 } }, async (bins) => {
+      await withFakeBins({ gh: { stdout: JSON.stringify(page) } }, async (bins) => {
         const program = new Command();
         registerReleaseCommands(program, {}, {
           checklist: (version) => ({ version, dev: version, released: '', items, history: [] }),

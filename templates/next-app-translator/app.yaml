@@ -1,0 +1,67 @@
+apiVersion: elanous.app/v0
+slug: translator
+title: 나만의 음성 번역기
+template: next-app-translator
+
+frontend:
+  kind: static-export
+  out: out/
+
+tables:
+  translations:
+    columns:
+      id: { type: text, primary: true }
+      source_text: { type: text }
+      translated_text: { type: text }
+      source_language: { type: text }
+      target_language: { type: text }
+      source_audio: { type: object-ref }
+      created_at: { type: timestamp, default: now }
+    realtime: true
+
+roles:
+  owner: { via: nexus-session }
+
+rpc:
+  listTranslations:
+    sql: SELECT id, source_text, translated_text, source_language, target_language, created_at FROM translations ORDER BY created_at DESC LIMIT :limit
+    params:
+      limit: { type: int, max: 200, default: 50 }
+    allow: [owner]
+  addTranslation:
+    sql: INSERT INTO translations (id, source_text, translated_text, source_language, target_language, source_audio, created_at) VALUES (:id, :source_text, :translated_text, :source_language, :target_language, :source_audio, :created_at)
+    params:
+      id: { type: text }
+      source_text: { type: text }
+      translated_text: { type: text }
+      source_language: { type: text }
+      target_language: { type: text }
+      source_audio: { type: object-ref }
+      created_at: { type: timestamp }
+    allow: [owner]
+
+actions:
+  transcribe:
+    builtin: stt
+    input: { audio: object-ref }
+    uses: [cred:openai.api_key]
+  translate:
+    builtin: translate
+    input: { text: text, sourceLanguage: text, targetLanguage: text }
+    output: { text: text }
+    uses: [cred:openai.api_key]
+  readAloud:
+    builtin: tts
+    input: { text: text }
+    uses: [cred:elevenlabs.api_key]
+    optional: true
+
+storage:
+  prefix: apps/translator/
+  upload:
+    allow: [owner]
+    types: [audio/webm, audio/wav]
+
+credentials:
+  - cred:openai.api_key
+  - cred:elevenlabs.api_key

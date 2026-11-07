@@ -26,8 +26,8 @@ test('임시 cli/ 의 변수 부모·설명·시험 제외·추가 명령과 생
     const input = { cliRoot, repoRoot: root, commit: 'abc123', generatedAt: '2026-10-06T00:00:00.000Z' };
     const first = renderCliAnatomy(input);
     expect(first).toContain('| 명령 | 설명 | 정의 파일 |');
-    expect(first).toContain('- generatedAt: 2026-10-06T00:00:00.000Z');
-    expect(first).toContain('- commit: abc123');
+    expect(first).not.toContain('- generatedAt:');
+    expect(first).not.toContain('- commit:');
     expect(rows(first)).toEqual([
       ['brief', '브리핑', 'cli/brief-cli.ts'],
       ['brief add', '추가', 'cli/brief-cli.ts'],
@@ -36,8 +36,8 @@ test('임시 cli/ 의 변수 부모·설명·시험 제외·추가 명령과 생
     expect(first).not.toContain('zzz');
 
     const second = renderCliAnatomy({ ...input, generatedAt: '2026-10-07T00:00:00.000Z' });
-    const withoutTime = (markdown: string) => markdown.split('\n').filter((line) => !line.startsWith('- generatedAt:')).join('\n');
-    expect(Buffer.from(withoutTime(first)).equals(Buffer.from(withoutTime(second)))).toBe(true);
+    expect(Buffer.from(first).equals(Buffer.from(second))).toBe(true);
+    expect(Buffer.from(first).equals(Buffer.from(renderCliAnatomy({ ...input, commit: 'def456' })))).toBe(true);
 
     writeFileSync(brief, `${BRIEF}brief.command('compose').description('한 장');\n`);
     const changed = renderCliAnatomy(input);
@@ -110,8 +110,8 @@ test('main 은 옵션 없이 격리된 저장소의 docs/generated/cli-anatomy.m
     expect(result.stdout).toBe(`${out}\n`);
     const markdown = readFileSync(out, 'utf8');
     expect(markdown).toContain('| 명령 | 설명 | 정의 파일 |');
-    expect(markdown).toContain('- commit: (설치본 v0.0.1)');
-    expect(markdown).toMatch(/- generatedAt: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/);
+    expect(markdown).not.toContain('- commit:');
+    expect(markdown).not.toContain('- generatedAt:');
     expect(rows(markdown)).toEqual([
       ['brief', '브리핑', 'src/cli/brief-cli.ts'],
       ['brief add', '추가', 'src/cli/brief-cli.ts'],
@@ -132,8 +132,7 @@ test('main --out 은 지정된 마크다운에 쓴다', () => {
     expect(result.stdout.trim()).toBe(out);
     const markdown = readFileSync(out, 'utf8');
     expect(markdown).toContain('| 명령 | 설명 | 정의 파일 |');
-    expect(markdown).toContain('- commit: ');
-    expect(markdown).toContain('- generatedAt: ');
+    expect(markdown).not.toContain('- generatedAt: ');
     expect(rows(markdown)).toContainEqual([
       'a2a serve', 'A2A JSON-RPC 서버를 포그라운드에서 실행', 'src/cli/a2a-cli.ts',
     ]);

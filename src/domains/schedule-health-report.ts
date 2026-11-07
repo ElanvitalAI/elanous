@@ -7,7 +7,7 @@
 // 포맷은 순수 함수(테스트 가능) · 발송은 scripts/schedule-health-report.ts.
 
 import type { ScheduleHealth, JobHealth } from './schedule-registry.js';
-import { formatDateTime } from '../time/format.js';
+import { formatDateTime } from '../time/calendar.js';
 
 /** 독립 프로세스 로그 싱크 커버리지 — 스케줄 헬스(밀림/실패/정규형)와 다른 축. */
 export interface StandaloneSinkTarget {

@@ -1,6 +1,7 @@
 // TUI-SEAT-TURN-CAP — 브리지가 «자리 판정으로 goal loop 에 온 턴» 에만 seatTurnCap 을 넘기는가(사람 TUI·하니스 자식 0).
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
-import * as core from '../core-turn/index.js';
+import * as coreTurn from '../core-turn/run-core-turn.js';
+import * as coreGoalLoop from '../core-turn/run-goal-loop.js';
 import * as config from '../user-config.js';
 import type { GoalLoopOptions } from '../core-turn/run-goal-loop.js';
 import type { AcpTurnContext } from './server.js';
@@ -15,11 +16,11 @@ const specs = ['Read', 'RunShell'].map((name) => ({ name, description: '', param
 
 async function run(seat: string | null, seatTurnCap?: Record<string, unknown>) {
   const seen: GoalLoopOptions[] = [];
-  spyOn(core, 'runGoalLoop').mockImplementation(async (_ctx, opts) => {
+  spyOn(coreGoalLoop, 'runGoalLoop').mockImplementation(async (_ctx, opts) => {
     seen.push(opts ?? {});
     return { finalText: '', iterations: 1, stopReason: 'goal_complete', goalComplete: true };
   });
-  spyOn(core, 'runCoreTurn').mockImplementation(async () => ({ stopReason: 'end_turn', finalText: '' }));
+  spyOn(coreTurn, 'runCoreTurn').mockImplementation(async () => ({ stopReason: 'end_turn', finalText: '' }));
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
     ...base,

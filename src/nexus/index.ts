@@ -16,6 +16,7 @@
 // the legacy dashboard.
 
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { createHmac, randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
 import { request as httpRequest } from 'node:http';
 import { isIP } from 'node:net';
@@ -71,8 +72,10 @@ import { buildPatcherSubstrate, stopPatcherSubstrate, type PatcherSubstrate } fr
 import { resolvePatcherLlmCallables } from '../background-reasoning/patcher-llm-resolver.js';
 import { buildDevicesSubstrate, stopDevicesSubstrate, type DevicesSubstrate } from '../mission-templates/devices-boot.js';
 import { migrateLegacyEnvToConfig } from './config/env-migrate.js';
-import { selectBackendFromConfig } from './config/secrets/index.js';
+import { getSecretAsync, selectBackendFromConfig, setSecretAsync } from './config/secrets/index.js';
+import { appSecretId } from './config/secrets/app-secret-ledger.js';
 import { registerAllCloudBackends } from './config/secrets/register-cloud.js';
+import { SERVICE_KEY_CATALOG } from '../setup/service-key-catalog.js';
 // PLAN-tui-redundancy-cleanup T4 (2026-05-16) — NEXUS TUI shell 정리.
 // PLAN-nexus-shell-followup U1+U2 (2026-05-16) — mini-terminal{,-backend}
 // → nexus/webterm/pty.ts 통합. `MiniTerminal` class + `createMiniTermSpawn`
@@ -115,6 +118,11 @@ import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-run
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
 import { loadNexusAppHost } from './apps/app-host.js';
+import { createAppActions, handleAppActionRequest, type AppActionDeclaration, type AppActionDeps } from './apps/app-actions.js';
+import { createAppStorage, type AppStorage } from './apps/app-storage.js';
+import { createAppStorageRoute } from './apps/app-storage-route.js';
+import { resolveStorageConfig } from '../storage/object-store.js';
+import { checkAuth } from './api/meta-api.js';
 import { startControlServer } from '../control-plane/server.js';
 import { nexusMemberMachine, startMemberHeartbeat } from '../control-plane/member.js';
 import { resolvePrimary } from '../control-plane/primary.js';
@@ -214,7 +222,6 @@ import { createDaemonMultiLlmRunTurn } from '../boot/daemon-multi-llm-runtime.js
 import { toolSurface } from '../boot/daemon-tools/index.js';
 import type { DaemonToolSurfaceKind } from '../boot/daemon-tools/types.js';
 import {
-  getActiveAcpFeedbackBroadcaster,
   runAcpServer,
   type AcpServerOptions,
 } from '../acp/server.js';
@@ -665,6 +672,8 @@ export interface RunNexusOptions {
   mcpEnabled?: boolean;
   /** Test seams for observing the MCP reload callback through the real NEXUS server wiring. */
   startNexusHttpServerFn?: typeof startNexusHttpServer;
+  /** Test-only fake app action providers and credentials; production never supplies this. */
+  appActionDepsForTesting?: Omit<Partial<AppActionDeps>, 'secrets'>;
   registerMcpClientsFn?: typeof registerMcpClients;
   getMcpUserConfigForTesting?: typeof getUserConfig;
   reloadUserConfigForTesting?: typeof import('../user-config.js').reloadUserConfig;
@@ -1306,6 +1315,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
 
   const skipHttp = opts.skipHttpServer ?? !!opts.detachForTesting;
   let httpServer: NexusHttpServer | undefined;
+  let appStorageService: AppStorage | undefined;
+  let appAuthSigningKey: string | undefined;
   let stopMemberHeartbeat: (() => void) | undefined;
   // ⛔ 관제부는 운영 넥서스와 «별도 프로세스»다(RFC 관제 평면 A2 · P0 골 경계) — 넥서스는 기본으로 띄우지 않는다.
   //   🩸 2026-09-27: 넥서스 부팅이 31413 을 늘 잡고 실패하면 throw 해서, 운영이 31413 을 쥔 뒤엔 모든 격리 데몬(`nexus run --test`)이
@@ -2252,9 +2263,45 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     // NEXUS-APP-HOST-S1 — app installs live beside Nexus runtime state as
     // `~/.elanous/nexus/apps/<slug>/{app.yaml,out/}`. Invalid apps stay
     // unmounted without preventing the owner's Nexus API from starting.
-    const { appHost, issues: appHostIssues } = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'));
+    let appHostLoad: ReturnType<typeof loadNexusAppHost>;
+    try {
+      const keyId = 'nexus.app-auth-signing-key';
+      let key = await getSecretAsync(keyId);
+      if (!key) {
+        key = randomBytes(32).toString('base64url');
+        await setSecretAsync(keyId, key);
+      }
+      appAuthSigningKey = key;
+      appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'), undefined, {
+        dir: joinPath(nexusRootDir(), 'app-session-tokens'), key,
+      });
+    } catch (error) {
+      debug.log('nexus.app-auth', 'signing-key-unavailable', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+      // App hosts stay mounted as a reserved origin but fail closed with 503 until auth storage works.
+      appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'));
+    }
+    const { appHost, issues: appHostIssues } = appHostLoad;
     for (const issue of appHostIssues) {
       debug.log('nexus.app-host', 'app-mount-rejected', issue, { level: 'warn' });
+    }
+    const storageManifests = appHost.slugs.flatMap(slug => {
+      const manifest = appHost.getManifest(slug);
+      return manifest?.storage ? [manifest] : [];
+    });
+    if (storageManifests.length > 0) {
+      try {
+        if (!appAuthSigningKey) throw new Error('app auth signing key is unavailable');
+        const signingKey = createHmac('sha256', appAuthSigningKey)
+          .update('elanous-nexus-app-storage-signed-url-v1').digest('base64url');
+        appStorageService = createAppStorage(storageManifests, {
+          config: resolveStorageConfig(getUserConfig() as Parameters<typeof resolveStorageConfig>[0]), signingKey,
+        });
+      } catch (error) {
+        debug.log('nexus.app-storage', 'storage-unavailable', {
+          reason: error instanceof Error ? error.message : String(error),
+          apps: storageManifests.map(manifest => manifest.slug),
+        }, { level: 'warn' });
+      }
     }
 
     // P-2D.2 — dev-proxy upstream is no longer persisted in UserConfig.
@@ -3045,6 +3092,66 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     }
 
     const startHttpServer = opts.startNexusHttpServerFn ?? startNexusHttpServer;
+    const appActionExecutor = createAppActions({
+      readAudioObject: async ({ appSlug, reference }) => {
+        const result = appStorageService?.read({ appSlug, key: reference });
+        if (!result || result.status !== 200 || result.body === undefined) return undefined;
+        return {
+          bytes: result.body,
+          mimeType: result.contentType ?? 'application/octet-stream',
+          filename: result.filename ?? 'download',
+        };
+      },
+      ...opts.appActionDepsForTesting,
+      secrets: {
+        async resolve({ appSlug, reference }) {
+          try {
+            const credentialService = /^cred:([a-z0-9][a-z0-9-]*)\.[a-zA-Z][a-zA-Z0-9_-]*$/.exec(reference)?.[1];
+            const serviceId = credentialService === 'openai' ? 'openai-api' : credentialService;
+            const service = serviceId ? SERVICE_KEY_CATALOG.find(item => item.id === serviceId && item.appAttachable === true) : undefined;
+            const name = service?.envNames[0];
+            if (!name) {
+              debug.log('nexus.app-actions', 'credential-unavailable', {
+                appSlug, reference, reason: 'credential reference is not app-attachable',
+              }, { level: 'warn' });
+              return undefined;
+            }
+            const value = await getSecretAsync(appSecretId(appSlug, name));
+            if (!value?.trim()) {
+              debug.log('nexus.app-actions', 'credential-unavailable', {
+                appSlug, reference, reason: 'app-scoped credential is absent',
+              }, { level: 'warn' });
+              return undefined;
+            }
+            return value;
+          } catch {
+            debug.log('nexus.app-actions', 'credential-unavailable', {
+              appSlug, reference, reason: 'app-scoped credential lookup failed',
+            }, { level: 'warn' });
+            return undefined;
+          }
+        },
+      },
+    });
+    const appActionRoute = async (request: Request) => handleAppActionRequest(request, {
+      authorize: candidate => !!metaApiOpts && checkAuth(candidate, metaApiOpts),
+      getDeclaration(appSlug, actionName): AppActionDeclaration | undefined {
+        const actions = appHost.getManifest(appSlug)?.actions;
+        if (typeof actions !== 'object' || actions === null || Array.isArray(actions)) return undefined;
+        const raw = (actions as Record<string, unknown>)[actionName];
+        if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+        const value = raw as Record<string, unknown>;
+        if ((value.builtin !== 'stt' && value.builtin !== 'summarize' && value.builtin !== 'tts')
+          || !Array.isArray(value.uses) || !value.uses.every(item => typeof item === 'string')) return undefined;
+        return { builtin: value.builtin, uses: value.uses as string[] };
+      },
+      run: input => appActionExecutor.run(input),
+    });
+    const appStorageRoute = createAppStorageRoute({
+      storage: appStorageService,
+      getManifest: appSlug => appHost.getManifest(appSlug),
+      authorize: candidate => !!metaApiOpts && checkAuth(candidate, metaApiOpts),
+    });
     const mcpUserConfig = (opts.getMcpUserConfigForTesting ?? getUserConfig)();
     const configuredWidgetServerId = mcpUserConfig.mcp?.widgetServerId;
     const knownMcpServerIds = new Set((mcpUserConfig.mcp?.servers ?? []).map((server) => server.id));
@@ -3099,6 +3206,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       ...(getMcpWidgetServerId ? { getMcpWidgetServerId } : {}),
       ...(pwaStaticDir ? { staticDir: pwaStaticDir } : {}),
       appHost,
+      appRoutes: [appActionRoute, appStorageRoute],
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
       // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.
@@ -3150,17 +3258,6 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       // envelope. Cron-disabled boot (`cronEnabled: false`) still
       // populates `source` so the http endpoints stay live.
       ...(devicesSubstrateHandle ? { devices: { fleetSource: devicesSubstrateHandle.source } } : {}),
-      // cascade-zyu W8-A 옵션 A (2026-05-14) — POST /v1/missions/test
-      // mock emitter for the iOS Companion shell "Test Mission" button.
-      // Broadcaster is resolved lazily per-request via
-      // `getActiveAcpFeedbackBroadcaster()` so the wire reflects the
-      // currently-active ACP peer (multi-connection daemon). Returns 503
-      // when no ACP peer is up (broadcaster=null).
-      missionsTest: {
-        get broadcastToSession() {
-          return getActiveAcpFeedbackBroadcaster();
-        },
-      },
       // R5.0 — share the same `history` instance the rest of the
       // session API consumes. When skipRuntime is true (no metaApi)
       // the field stays undefined and the endpoint returns 503.
@@ -3582,6 +3679,10 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     }
     controlServer?.stop();
     httpServer?.stop();
+    if (appStorageService) {
+      try { appStorageService.close(); } catch { /* best-effort shutdown */ }
+      appStorageService = undefined;
+    }
     try { deleteNexusRuntime(); } catch { /* best-effort */ }
     release();
   };

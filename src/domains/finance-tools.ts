@@ -38,7 +38,7 @@ import { getUserConfig } from '../user-config.js';
 import { loadFullPanel, backtest as conatusBacktest, factorResearch as conatusFactorResearch } from './conatus-backtest.js';
 import { runScreens, reportMd as conatusScreenReportMd } from './conatus-screen.js';
 import { computeTrend, render as conatusTrendRender } from './conatus-trend.js';
-import { dateKey } from '../time/format.js';
+import { dateKey } from '../time/calendar.js';
 import { conatusDataDir } from './conatus-data-dir.js';
 
 const HOME = homedir();

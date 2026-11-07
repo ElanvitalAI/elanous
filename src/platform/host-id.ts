@@ -1,4 +1,4 @@
-import { getOrCreateElanousId } from '../mss/identity.js';
+import { getOrCreateElanousId } from '../mss/identity-store.js';
 
 /** The supervisor's inherited installation identity wins over this process's local identity. */
 export function resolveHostId(env: NodeJS.ProcessEnv = process.env): string {

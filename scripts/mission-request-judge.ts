@@ -14,6 +14,8 @@ import { debug } from '../src/debug/log.js';
 
 export type CreateHarnessGoal = (goal: HarnessGoal) => Promise<void> | void;
 
+const JUDGE_ONLY_SCHEDULE_ID = 'e27030c5f0be';
+
 function logJudge(event: string, data: Record<string, unknown>): void {
   try { debug.log('mission-fabric.judge', event, data); } catch { /* observation must not change a judgment */ }
 }
@@ -111,6 +113,10 @@ export async function runMissionRequestJudge(argv: readonly string[], dependenci
     else lines.push(`✅ ${judgment.file} ⇒ 스키마 통과 · 능력 ${judgment.capabilityCount}개`, '   🟢 블루프린트 «후보» 있음 → 검증 ⑴~⑷');
   }
   lines.push(`📏 훑은 ${result.requestsScanned} · invalid ${result.invalidCount}`);
+  if (argv.includes('--tick') && process.env.CRON_RUN_SCHEDULE_ID === JUDGE_ONLY_SCHEDULE_ID) {
+    logJudge('skipped', { reason: 'scheduled-composite-cycle-disabled', scheduleId: process.env.CRON_RUN_SCHEDULE_ID });
+    return lines;
+  }
   if (!argv.includes('--tick')) {
     logJudge('skipped', { reason: 'tick-not-requested' });
     return lines;

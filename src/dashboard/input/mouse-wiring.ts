@@ -85,7 +85,6 @@ import {
   STATUS_SEGMENT_SEPARATOR,
   tmuxSegment,
   vwSegment,
-  voiceSegment,
   type GitSegmentState,
   type RunningBuildState,
   type ShellRollupSummary,
@@ -187,11 +186,6 @@ export interface DashboardStatusInput {
    *  between workingDir and model. Omit → treated as 'general'. */
   mode?: 'general' | 'sync' | 'control';
   conversationPopups?: ConversationPopupSummary | null;
-  /** PR-S1V.4-wiring (2026-04-29) — voice mode indicator label. The
-   *  dashboard subscribes to `voiceInputHost.onIndicatorChange` and
-   *  passes the latest label through here; null/empty means the voice
-   *  segment is hidden (idle). */
-  voiceLabel?: string | null;
   /** The code this TUI process booted with. Present → a `▶ 실행` pill
    *  follows the git pill, which is then labelled `트리`. Omit to hide. */
   runningBuild?: RunningBuildState | null;
@@ -1000,14 +994,7 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
         segments.push({ name: 'conversationPopup', render });
       }
     }
-    // PR-S1V.4-wiring — voice indicator. Sits at the right edge of the
-    // pill row so it never displaces session identity (cwd/git/model)
-    // when the user toggles voice mode mid-session. voiceSegment hides
-    // itself when label is null/empty.
-    const voiceRender = voiceSegment(input.voiceLabel, opts);
-    if (voiceRender) {
-      segments.push({ name: null, render: voiceRender });
-    }
+
 
     // Compute column positions as segments concatenate with the same
     // separator string the renderer uses. `visibleWidth` counts cells

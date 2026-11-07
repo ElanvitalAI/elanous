@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import type { DaemonClient } from '@/lib/daemon-client';
-import { DecisionCard } from '@/components/missions/DecisionCard';
+import { DecisionCard } from '@/components/decisions/DecisionCard';
 import { ChatPendingDecision } from './ChatPendingDecision';
 import { ChatHistory } from './ChatHistory';
 

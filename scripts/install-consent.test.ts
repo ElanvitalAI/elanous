@@ -62,3 +62,36 @@ test('consent runs the installed bootstrap once, reports failure and permits ret
     rmSync(home, { recursive: true, force: true });
   }
 }, 240_000);
+
+test('an unattended run over an existing installation is its own update (self-update) — a fresh unattended install still needs --yes', () => {
+  const home = mkdtempSync(join(tmpdir(), 'elanous-selfupdate-consent-'));
+  try {
+    const pkg = join(home, 'package');
+    const prefix = join(home, 'install');
+    const archive = join(home, 'fixture.tgz');
+    mkdirSync(join(pkg, 'bin'), { recursive: true });
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'elanous', version: '1.0.0' }));
+    writeFileSync(join(pkg, 'bin', 'elanous.mjs'), 'process.exit(0);\n');
+    const packed = spawnSync('tar', ['-czf', archive, '-C', home, 'package'], { encoding: 'utf8' });
+    expect(packed.status, packed.stderr).toBe(0);
+    const args = [installer, '--source', archive, '--prefix', prefix, '--no-modify-path', '--no-setup'];
+    const base = { ...process.env, HOME: home, ELANOUS_INSTALL_LANG: 'en', CI: '' } as Record<string, string | undefined>;
+    delete base.ELANOUS_INSTALL_INTERACTIVE;
+    delete base.ELANOUS_INSTALL_ANSWER;
+    // fresh + unattended + no --yes → refused, nothing written
+    const fresh = spawnSync('/bin/bash', args, { encoding: 'utf8', env: base, timeout: 120_000 });
+    expect(fresh.status).toBe(1);
+    expect(fresh.stderr).toContain('consent required');
+    expect(existsSync(join(prefix, 'install.json'))).toBe(false);
+    // first install with consent
+    const first = spawnSync('/bin/bash', [...args, '--yes'], { encoding: 'utf8', env: base, timeout: 120_000 });
+    expect(first.status, first.stderr).toBe(0);
+    expect(existsSync(join(prefix, 'install.json'))).toBe(true);
+    // unattended re-run over the installation (what `elanous self-update` does) → proceeds without --yes
+    const update = spawnSync('/bin/bash', args, { encoding: 'utf8', env: base, timeout: 120_000 });
+    expect(update.status, update.stderr).toBe(0);
+    expect(update.stderr).not.toContain('consent required');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 300_000);

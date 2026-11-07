@@ -142,16 +142,6 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
       meta?: Record<string, unknown>;
     }): Promise<unknown>;
   };
-  autoTts: {
-    pushChunk: (chunk: string) => void;
-    commit: () => void | Promise<void>;
-    cancel: () => void | Promise<void>;
-  };
-  voiceChat: {
-    getPhase: () => string;
-    transitionToSpeaking: () => void;
-    notifyResponseDone: () => void;
-  };
   finalizeStreamLifecycle: (
     cleanupEsc: () => void,
     aborted: boolean,
@@ -641,9 +631,6 @@ ${summary}` }] : []),
         deps.pushChatLine(`  · ${line}`);
         deps.draw();
       },
-      autoTts: deps.autoTts,
-      voiceChat: deps.voiceChat,
-      drainCooldownMs: userConfig.voice.tts.drainCooldownMs,
       resetTurnRef: deps.resetAcpTurnRef,
     });
     const fullResponse = streamResult.fullResponse;
@@ -653,7 +640,6 @@ ${summary}` }] : []),
         fullResponseChars: fullResponse.length,
         chatLinesLen: deps.chatLines.length,
         assistantStart,
-        settled: streamResult.settled,
       });
     }
 

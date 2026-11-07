@@ -105,7 +105,6 @@ export interface NonMenuSidebarRoute {
 
 export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/share', category: 'system-share-target', reason: '운영체제가 공유 동작으로 호출하는 Share Target 진입점.' },
-  { href: '/missions', category: 'dynamic-route-parent', reason: '`[id]`를 받는 동적 주소이며 부모 경로 자체는 없다.' },
   { href: '/setup', category: 'provider-onboarding', reason: 'LLM provider 온보딩 진입점.' },
   { href: '/setup/done', category: 'provider-onboarding-complete', reason: 'LLM provider 온보딩 완료 화면.' },
   { href: '/settings/devices', category: 'settings-subpage', reason: 'Settings 아래 Device fleet 하위 화면.' },
@@ -130,7 +129,6 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'today', href: '/intake', label: '넣기', hint: '넣으면 흡수 · 작업 · 그래프로 (URL · 미션 · 메모)', icon: Inbox, kind: null },
   { group: 'talk', href: '/chat', label: '채팅', hint: '채팅 (스트리밍 · multimodal · mic)', icon: MessageSquare, kind: 'chat' },
   { group: 'talk', href: '/exec', label: 'COO 에게 맡기기', hint: 'COO 에게 맡기기 · 맡긴 일', icon: Bot, kind: null },
-  { group: 'work', href: '/autopilot', label: '미션', hint: '미션 · 작업 (미션 계보·골 던지기·작업 보드·자율행동)', icon: Compass, kind: null, activeAlso: ['/tasks', '/missions'] },
   { group: 'work', href: '/outputs', label: '산출물', hint: '엘라누스가 만든 문서 · 슬라이드 · 보고서 · 영상', icon: Layers, kind: null },
   { group: 'work', href: '/scheduler', label: '예약', hint: '예약 잡 종합 현황 (크론·데몬·launchd)', icon: CalendarClock, kind: null },
   { group: 'work', href: '/live', label: 'Live', hint: '런이 판단·기획하는 신호 (진짜 수 · 쇼 모드)', icon: Activity, kind: null },
@@ -139,6 +137,7 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'make', href: '/term', label: '터미널', hint: '터미널 + agent dock', icon: TerminalSquare, kind: 'term' },
   { group: 'make', href: '/editor', label: '그래프', hint: '그래프 작성·편집 — 작업 노드 · 실행 단계 노드', icon: GitBranch, kind: null, activeAlso: ['/workflows'] },
   { group: 'make', href: '/design-check', label: '디자인', hint: '디자인 시스템 고르기 · 시안 · URL 로 내 시스템', icon: Palette, kind: null },
+  { group: 'make', href: '/apps', label: '앱', hint: '시뮬레이션과 정식 앱 관리', icon: LayoutGrid, kind: null },
   { group: 'make', href: '/workspace', label: '여러 탭', hint: '여러 탭 동시 보기', icon: Layers, kind: null, visibility: 'labs' },
   { group: 'files', href: '/vault', label: 'Obsidian 노트', hint: 'Vault — Obsidian 노트 (브라우저·에디터·검색·그래프)', icon: BookOpen, kind: null },
   { group: 'files', href: '/field', label: '현장 올리기', hint: '현장 올리기 · 사진과 메모', icon: Inbox, kind: null },

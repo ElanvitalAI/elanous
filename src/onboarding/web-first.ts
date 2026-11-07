@@ -20,6 +20,8 @@ export interface WebFirstSetupDeps {
   /** Set true when this entry owns first-run launch and may start a missing daemon without a TTY. */
   startIfMissing?: boolean;
   startedAt?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   /** Locale for user-facing wording; defaults to the shared ambient decision (detectLocale). */
   locale?: Locale;
   showNexus?: () => Promise<NexusShowResult>;
@@ -39,6 +41,7 @@ export interface WebFirstSetupDeps {
   print?: (line: string) => void;
 }
 
+// The onboarding flow waits at most twelve seconds for a daemon before falling back to terminal setup.
 const STARTUP_TIMEOUT_MS = 12_000;
 const require = createRequire(import.meta.url);
 
@@ -107,7 +110,9 @@ function setupUrl(pwa: string, token: string): string {
 }
 
 export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-shown' | 'fallback'> {
-  const startedAt = deps.startedAt ?? Date.now();
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? Bun.sleep;
+  const startedAt = deps.startedAt ?? now();
   const print = deps.print ?? console.log;
   const text = WEB_FIRST_TEXT[(deps.locale ?? detectLocale()) === 'en' ? 'en' : 'ko'];
   const observe = (event: 'link-shown' | 'fallback', reason?: string, qr = false, browserOpened = false, remote: 'loopback' | 'tailnet' = 'loopback', ms?: number, lan?: 'shown' | 'loopback-bind' | 'no-address' | 'unknown', ssh?: boolean) => {
@@ -142,7 +147,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
       ? await (deps.probeHealth ?? probeHealth)(joinRestHealthUrl(rest), 500) : false;
     if (!up) { observe('fallback', 'non-tty'); return 'fallback'; }
   }
-  const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+  const deadline = now() + STARTUP_TIMEOUT_MS;
   if (!running || !shown?.urls?.pwa.loopback || !shown?.urls?.rest.loopback) {
     if (deps.startIfMissing === false) {
       const reason = !running ? 'daemon-not-running' : 'daemon-endpoint-unavailable';
@@ -159,7 +164,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   }
 
   let healthy = false;
-  while (Date.now() < deadline) {
+  while (now() < deadline) {
     try {
       shown = await show();
       inspectionFailed = false;
@@ -169,7 +174,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     if (!inspectionFailed && shown) {
       const live = shown.status === 'unregistered' || (shown.status === 'registered' && shown.instance?.alive === true);
       if (live && shown.urls?.pwa.loopback && shown.urls.rest.loopback) {
-        const remaining = deadline - Date.now();
+        const remaining = deadline - now();
         if (remaining > 0) {
           try {
             healthy = await (deps.probeHealth ?? probeHealth)(joinRestHealthUrl(shown.urls.rest.loopback), Math.min(remaining, 500));
@@ -181,8 +186,8 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
       }
     }
     if (deps.startIfMissing === false) break;
-    const remaining = deadline - Date.now();
-    if (remaining > 0) await Bun.sleep(Math.min(200, remaining));
+    const remaining = deadline - now();
+    if (remaining > 0) await sleep(Math.min(200, remaining));
   }
   if (!healthy && deps.startIfMissing === false) {
     const stillRunning = shown?.status === 'unregistered' || (shown?.status === 'registered' && shown.instance?.alive === true);
@@ -273,7 +278,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     print(text.sameWifiRestart);
   }
   if (tailnetLink) print(text.tailnetLink(tailnetLink));
-  const linkShownMs = Date.now() - startedAt;
+  const linkShownMs = now() - startedAt;
   let qr = false;
   if (qrLink) {
     try {

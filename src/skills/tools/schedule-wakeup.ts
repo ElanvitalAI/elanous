@@ -456,17 +456,16 @@ export function createDashboardWakeupScheduler(
   const acceleratedTestClock = process.env.ELANOUS_TEST_FAKE_LLM === '1'
     && process.env.ELANOUS_TEST_FAST_WAKEUP_CLOCK === '1';
   let testNow = Date.now();
-  let testTimerCount = 0;
   const schedulerDeps: Omit<WakeupSchedulerDeps, 'startTurnIfIdle' | 'isTurnActive'> = acceleratedTestClock
     ? {
       ...deps,
       now: () => testNow,
       setTimer: (callback, logicalDelayMs) => {
-        const realDelayMs = testTimerCount++ === 0 ? 3_000 : 8_000;
+        // Keep one busy deferral, then let the idle retry fire without spending 11 wall-clock seconds.
         return setTimeout(() => {
           testNow += logicalDelayMs;
           callback();
-        }, realDelayMs);
+        }, 2_000);
       },
       clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
     }

@@ -131,9 +131,8 @@ export function renderCliAnatomy(input: RenderCliAnatomyInput): string {
     '',
     '> 이 문서는 생성물이다 — 손으로 고치지 마라',
     '',
-    `- generatedAt: ${input.generatedAt}`,
-    `- commit: ${input.commit}`,
-    '',
+    // Deterministic on purpose: a commit or timestamp line made every regeneration differ, so each PR branch the
+    // train refreshed added a different copy and every landing turned the rest into add/add conflicts (11-06).
     '| 명령 | 설명 | 정의 파일 |',
     '| --- | --- | --- |',
     ...rows.map((row) => `| ${cell(row.name)} | ${cell(row.description)} | ${cell(row.file)} |`),

@@ -55,7 +55,7 @@ describe('mss category-infer — 8-track prefix mapping', () => {
   });
 
   test('mss — src/mss/**', () => {
-    expect(inferCategoryFromPath('src/mss/identity.ts', 'getOrCreateElanousId')).toBe('mss.get-or-create-elanous-id');
+    expect(inferCategoryFromPath('src/mss/identity-store.ts', 'getOrCreateElanousId')).toBe('mss.get-or-create-elanous-id');
   });
 
   test('plugin — plugins/**', () => {

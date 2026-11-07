@@ -19,17 +19,24 @@ import { createSecretPrompt } from '../onboarding/secret-prompt.js';
 import { decryptSecretBundle, encryptSecretBundle } from '../nexus/config/secrets/transfer.js';
 import { SECRETS_VERSION } from '../nexus/config/types.js';
 import { parseSecretEnvFile, renderSecretEnvExports } from '../nexus/config/secrets/env-import.js';
+import { registerCredCommands } from './cred-cli.js';
+import { appSecretId, appSecretIdForExistingApp } from '../nexus/config/secrets/app-secret-ledger.js';
+import type { SecretBackendId } from '../nexus/config/secrets/types.js';
+import { revokeAppSecretValues, setAppSecretValue, type AppSecretRevokeResult } from '../nexus/config/secrets/file-backend.js';
 
 export interface SecretCliDeps {
   isInteractive?: () => boolean;
   promptSecret?: (message: string) => Promise<string | undefined>;
   saveSecret?: (id: string, value: string) => Promise<void>;
+  saveAppSecret?: (id: string, value: string) => Promise<void>;
+  revokeAppSecrets?: (app: string, name?: string) => Promise<AppSecretRevokeResult>;
   getSecret?: (id: string) => Promise<string | undefined>;
   listSecrets?: () => Promise<string[]>;
   removeSecret?: (id: string) => Promise<boolean>;
   verifySecret?: (serviceId: string, value: string) => Promise<{ result: ServiceKeyVerification; httpStatus?: number }>;
   storageBackend?: () => string;
   initializeBackend?: () => void;
+  environment?: Readonly<Record<string, string | undefined>>;
   output?: { log: (line: string) => void; error: (line: string) => void };
   setExitCode?: (code: number) => void;
   readBundleFile?: (path: string) => Promise<string>;
@@ -43,6 +50,16 @@ const SECRET_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 function validId(id: string): boolean {
   return SECRET_ID_PATTERN.test(id);
+}
+
+function validRemovalId(id: string): boolean {
+  return validId(id) || (id.startsWith('app/') && id.length <= 512 && !/[\u0000-\u001f\u007f]/.test(id));
+}
+
+function appSecretBackendSupported(backend: string): backend is SecretBackendId {
+  // Only the local file backend has synchronous, process-cancelled mutations;
+  // remote providers need conditional/idempotent writes before crash recovery is safe.
+  return backend === 'file';
 }
 
 function redactParserErrors(command: Command): void {
@@ -93,15 +110,19 @@ export async function syncEncryptedBundleOverSsh(
 const defaultSyncBundle = syncEncryptedBundleOverSsh;
 
 function resolveDeps(deps: SecretCliDeps) {
+  const storageBackend = deps.storageBackend ?? currentBackendId;
+  const getSecret = deps.getSecret ?? getSecretAsync;
   return {
     isInteractive: deps.isInteractive ?? (() => process.stdin.isTTY === true && process.stdout.isTTY === true),
     promptSecret: deps.promptSecret ?? createSecretPrompt(),
     saveSecret: deps.saveSecret ?? setSecretAsync,
-    getSecret: deps.getSecret ?? getSecretAsync,
+    saveAppSecret: deps.saveAppSecret ?? deps.saveSecret ?? setAppSecretValue,
+    revokeAppSecrets: deps.revokeAppSecrets ?? revokeAppSecretValues,
+    getSecret,
     listSecrets: deps.listSecrets ?? listSecretIdsAsync,
     removeSecret: deps.removeSecret ?? deleteSecretAsync,
     verifySecret: deps.verifySecret ?? (async (serviceId: string, value: string) => verifyServiceKey(serviceId, value)),
-    storageBackend: deps.storageBackend ?? currentBackendId,
+    storageBackend,
     initializeBackend: deps.initializeBackend ?? (() => { selectBackendFromConfig(); }),
     output: deps.output ?? console,
     setExitCode: deps.setExitCode ?? ((code: number) => { process.exitCode = code; }),
@@ -127,6 +148,16 @@ function resolveDeps(deps: SecretCliDeps) {
 
 export function registerSecretCommands(program: Command, deps: SecretCliDeps = {}): Command {
   const cli = resolveDeps(deps);
+  const cred = registerCredCommands(program, {
+    listSecrets: cli.listSecrets,
+    getSecret: cli.getSecret,
+    verifySecret: cli.verifySecret,
+    storageBackend: cli.storageBackend,
+    initializeBackend: cli.initializeBackend,
+    environment: deps.environment,
+    output: cli.output,
+    setExitCode: cli.setExitCode,
+  });
   const exportableSecretIds = new Set(SERVICE_KEY_CATALOG
     .filter((entry) => entry.kind === 'api-key')
     .flatMap((entry) => [entry.id, ...entry.envNames, ...(entry.storeIds ?? [])]));
@@ -137,6 +168,162 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
   // Commander shares output configuration across parent/child commands. Override
   // error handling on this command tree instead so sibling commands keep theirs.
   redactParserErrors(secret);
+
+  const appSecret = secret.command('app').description('Manage app-scoped secrets; values remain in the secret backend.');
+  appSecret.command('set <slug> <name>')
+    .description('Issue one app secret using hidden input; revoke an existing name before issuing it again.')
+    .allowExcessArguments(false)
+    .action(async (slug: string, name: string) => {
+      let id: string;
+      try { id = appSecretId(slug, name); }
+      catch { cli.output.error('invalid app secret name'); cli.setExitCode(1); return; }
+      if (!cli.isInteractive()) { cli.output.error('secret app set requires an interactive terminal'); cli.setExitCode(1); return; }
+      try {
+        cli.initializeBackend();
+        const backend = cli.storageBackend();
+        if (!appSecretBackendSupported(backend)) {
+          cli.output.error('app secret operations require the file backend');
+          cli.setExitCode(1);
+          return;
+        }
+        const value = await cli.promptSecret('Secret value: ');
+        if (value === undefined || !value.trim() || value.includes('\0')) {
+          cli.output.error('secret input cancelled or invalid'); cli.setExitCode(1); return;
+        }
+        await cli.saveAppSecret(id, value);
+        cli.output.log(`issued ${slug}/${name} · ${cli.storageBackend()}`);
+        cli.setExitCode(0);
+      } catch { cli.output.error('app secret could not be issued'); cli.setExitCode(1); }
+    });
+  appSecret.command('revoke <slug> [name]')
+    .description('Revoke one app secret or every secret for the app; values are never shown.')
+    .allowExcessArguments(false)
+    .action(async (slug: string, name?: string) => {
+      try { appSecretIdForExistingApp(slug, name ?? 'PLACEHOLDER'); }
+      catch { cli.output.error('invalid app secret name'); cli.setExitCode(1); return; }
+      try {
+        cli.initializeBackend();
+        const backend = cli.storageBackend();
+        if (!appSecretBackendSupported(backend)) {
+          cli.output.error('app secret operations require the file backend');
+          cli.setExitCode(1);
+          return;
+        }
+        const result = await cli.revokeAppSecrets(slug, name);
+        cli.output.log(result.alreadyAbsent
+          ? `already absent ${name === undefined ? slug : `${slug}/${name}`}`
+          : `revoked ${slug} · ${result.revoked} secret(s)`);
+        cli.setExitCode(0);
+      } catch { cli.output.error('app secret could not be revoked'); cli.setExitCode(1); }
+    });
+
+  const registerEncryptedExport = (parent: Command, label: 'secret' | 'credential'): void => {
+    const command = parent.command('export')
+      .description(`Write an encrypted bundle of static ${label} values; passphrase is entered without echo.`)
+      .requiredOption('--to <file>', 'Destination file (must not already exist)')
+      .allowExcessArguments(false)
+      .action(async (options: { to: string }) => {
+        if (!cli.isInteractive()) {
+          cli.output.error(`${label} export requires an interactive terminal`);
+          cli.setExitCode(1);
+          return;
+        }
+        try {
+          cli.initializeBackend();
+          const first = await cli.promptSecret('Bundle passphrase (12+ characters): ');
+          const second = await cli.promptSecret('Repeat bundle passphrase: ');
+          if (first === undefined || second === undefined || first !== second || first.length < 12) {
+            cli.output.error('bundle passphrase was not accepted');
+            cli.setExitCode(1);
+            return;
+          }
+          const secrets: Record<string, string> = {};
+          for (const id of await cli.listSecrets()) {
+            // Only catalogued static API keys transfer. OAuth/session stores and unknown names fail closed.
+            if (!exportableSecretIds.has(id)) continue;
+            const value = await cli.getSecret(id);
+            if (value !== undefined) secrets[id] = value;
+          }
+          const contents = await encryptSecretBundle({ version: SECRETS_VERSION, secrets }, first);
+          await cli.writeBundleFile(options.to, contents);
+          cli.output.log(label === 'credential'
+            ? `exported ${Object.keys(secrets).length} static credentials · encrypted · rotating login credentials excluded; sign in on destination`
+            : `exported ${Object.keys(secrets).length} secrets · encrypted · non-catalog names and rotating login credentials excluded; sign in on destination`);
+          cli.setExitCode(0);
+        } catch {
+          cli.output.error(`${label} export failed`);
+          cli.setExitCode(1);
+        }
+      });
+    redactParserErrors(command);
+  };
+
+  const registerEncryptedImport = (parent: Command, label: 'secret' | 'credential'): void => {
+    const command = parent.command('import <file>')
+      .description(`Import an encrypted static ${label} bundle; existing names require explicit confirmation.`)
+      .option('--overwrite', 'Allow replacing names already in the secret store after confirmation')
+      .allowExcessArguments(false)
+      .action(async (file: string, options: { overwrite?: boolean }) => {
+        if (!cli.isInteractive()) {
+          cli.output.error(`${label} import requires an interactive terminal`);
+          cli.setExitCode(1);
+          return;
+        }
+        try {
+          cli.initializeBackend();
+          const passphrase = await cli.promptSecret('Bundle passphrase: ');
+          if (passphrase === undefined) {
+            cli.output.error(`${label} import cancelled`);
+            cli.setExitCode(1);
+            return;
+          }
+          const bundle = await decryptSecretBundle(await cli.readBundleFile(file), passphrase);
+          const unsupportedIds = Object.keys(bundle.secrets).filter((id) => !exportableSecretIds.has(id));
+          if (unsupportedIds.length) {
+            cli.output.error(`bundle contains unsupported secret names: ${unsupportedIds.join(', ')}`);
+            cli.setExitCode(1);
+            return;
+          }
+          const firstImport = await cli.importSecrets(bundle.secrets, false);
+          const collisions = firstImport.conflicts;
+          if (collisions.length && !options.overwrite) {
+            cli.output.error(`name conflicts: ${collisions.join(', ')} · rerun with --overwrite to confirm`);
+            cli.setExitCode(1);
+            return;
+          }
+          if (collisions.length) {
+            cli.output.log(`replace names: ${collisions.join(', ')}`);
+            const confirmation = await cli.promptSecret(`Type exactly: REPLACE ${collisions.join(',')}`);
+            if (confirmation !== `REPLACE ${collisions.join(',')}`) {
+              cli.output.error(`${label} import cancelled`);
+              cli.setExitCode(1);
+              return;
+            }
+          }
+          const result = collisions.length
+            ? await cli.importSecrets(bundle.secrets, true, collisions)
+            : firstImport;
+          if (!result.imported) {
+            cli.output.error(result.changedSinceConfirmation ? 'secret names changed during import confirmation' : `${label} import was not applied`);
+            cli.setExitCode(1);
+            return;
+          }
+          cli.output.log(label === 'credential'
+            ? `imported ${Object.keys(bundle.secrets).length} static credentials · values hidden`
+            : `imported ${Object.keys(bundle.secrets).length} secrets · values hidden`);
+          cli.setExitCode(0);
+        } catch (error) {
+          cli.output.error(error instanceof Error && error.message === 'ELANOUS_IMPORT_BACKEND_UNSUPPORTED'
+            ? 'atomic secret import currently requires the file backend'
+            : `${label} import failed`);
+          cli.setExitCode(1);
+        }
+      });
+    redactParserErrors(command);
+  };
+
+  registerEncryptedExport(cred, 'credential');
+  registerEncryptedImport(cred, 'credential');
 
   const setCommand = secret.command('set <id>')
     .description('Prompt for a secret without echo; the value is never accepted as an argument.')
@@ -194,10 +381,10 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
     });
 
   const removeCommand = secret.command('rm <id>')
-    .description('Remove a stored secret by name.')
+    .description('Remove a stored secret by name; legacy app-prefixed IDs remain removable unless their lifecycle ledger owns them.')
     .allowExcessArguments(false)
     .action(async (id: string) => {
-      if (!validId(id)) {
+      if (!validRemovalId(id)) {
         cli.output.error('invalid secret identifier');
         cli.setExitCode(1);
         return;
@@ -246,100 +433,8 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
       }
     });
 
-  const exportCommand = secret.command('export')
-    .description('Write an encrypted secret bundle; the passphrase is entered without echo.')
-    .requiredOption('--to <file>', 'Destination file (must not already exist)')
-    .allowExcessArguments(false)
-    .action(async (options: { to: string }) => {
-      if (!cli.isInteractive()) {
-        cli.output.error('secret export requires an interactive terminal');
-        cli.setExitCode(1);
-        return;
-      }
-      try {
-        cli.initializeBackend();
-        const first = await cli.promptSecret('Bundle passphrase (12+ characters): ');
-        const second = await cli.promptSecret('Repeat bundle passphrase: ');
-        if (first === undefined || second === undefined || first !== second || first.length < 12) {
-          cli.output.error('bundle passphrase was not accepted');
-          cli.setExitCode(1);
-          return;
-        }
-        const secrets: Record<string, string> = {};
-        for (const id of await cli.listSecrets()) {
-          // Unknown names and non-key catalog entries fail closed; auth stores are never exported.
-          if (!exportableSecretIds.has(id)) continue;
-          const value = await cli.getSecret(id);
-          if (value !== undefined) secrets[id] = value;
-        }
-        const contents = await encryptSecretBundle({ version: SECRETS_VERSION, secrets }, first);
-        await cli.writeBundleFile(options.to, contents);
-        cli.output.log(`exported ${Object.keys(secrets).length} secrets · encrypted · non-catalog names and rotating login credentials excluded; sign in on destination`);
-        cli.setExitCode(0);
-      } catch {
-        cli.output.error('secret export failed');
-        cli.setExitCode(1);
-      }
-    });
-
-  const importCommand = secret.command('import <file>')
-    .description('Import an encrypted secret bundle; existing names require explicit confirmation.')
-    .option('--overwrite', 'Allow replacing names already in the secret store after confirmation')
-    .allowExcessArguments(false)
-    .action(async (file: string, options: { overwrite?: boolean }) => {
-      if (!cli.isInteractive()) {
-        cli.output.error('secret import requires an interactive terminal');
-        cli.setExitCode(1);
-        return;
-      }
-      try {
-        cli.initializeBackend();
-        const passphrase = await cli.promptSecret('Bundle passphrase: ');
-        if (passphrase === undefined) {
-          cli.output.error('secret import cancelled');
-          cli.setExitCode(1);
-          return;
-        }
-        const bundle = await decryptSecretBundle(await cli.readBundleFile(file), passphrase);
-        const unsupportedIds = Object.keys(bundle.secrets).filter((id) => !exportableSecretIds.has(id));
-        if (unsupportedIds.length) {
-          cli.output.error(`bundle contains unsupported secret names: ${unsupportedIds.join(', ')}`);
-          cli.setExitCode(1);
-          return;
-        }
-        const firstImport = await cli.importSecrets(bundle.secrets, false);
-        const collisions = firstImport.conflicts;
-        if (collisions.length && !options.overwrite) {
-          cli.output.error(`name conflicts: ${collisions.join(', ')} · rerun with --overwrite to confirm`);
-          cli.setExitCode(1);
-          return;
-        }
-        if (collisions.length) {
-          cli.output.log(`replace names: ${collisions.join(', ')}`);
-          const confirmation = await cli.promptSecret(`Type exactly: REPLACE ${collisions.join(',')}`);
-          if (confirmation !== `REPLACE ${collisions.join(',')}`) {
-            cli.output.error('secret import cancelled');
-            cli.setExitCode(1);
-            return;
-          }
-        }
-        const result = collisions.length
-          ? await cli.importSecrets(bundle.secrets, true, collisions)
-          : firstImport;
-        if (!result.imported) {
-          cli.output.error(result.changedSinceConfirmation ? 'secret names changed during import confirmation' : 'secret import was not applied');
-          cli.setExitCode(1);
-          return;
-        }
-        cli.output.log(`imported ${Object.keys(bundle.secrets).length} secrets · values hidden`);
-        cli.setExitCode(0);
-      } catch (error) {
-        cli.output.error(error instanceof Error && error.message === 'ELANOUS_IMPORT_BACKEND_UNSUPPORTED'
-          ? 'atomic secret import currently requires the file backend'
-          : 'secret import failed');
-        cli.setExitCode(1);
-      }
-    });
+  registerEncryptedExport(secret, 'secret');
+  registerEncryptedImport(secret, 'secret');
 
   const syncCommand = secret.command('sync <host>')
     .description('Send an encrypted bundle over SSH; the destination prompts for its passphrase.')
@@ -460,6 +555,6 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
       }
     });
 
-  for (const command of [setCommand, listCommand, removeCommand, testCommand, exportCommand, importCommand, syncCommand, importEnvCommand, envCommand]) redactParserErrors(command);
+  for (const command of [setCommand, listCommand, removeCommand, testCommand, syncCommand, importEnvCommand, envCommand]) redactParserErrors(command);
   return secret;
 }

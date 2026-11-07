@@ -19,7 +19,7 @@
 //
 // canonical: 내부 문서 `FEATURE-unified-log-fabric-2026-07-13` §0-LF5.
 
-import { debug } from '../../debug/log.js';
+import { flushDiagnostics, logDiagnostic } from './diagnostic-sink.js';
 
 /** console args → 한 줄 요약(캡 500자). 객체는 JSON 시도 후 String 폴백. */
 export function formatConsoleArgs(args: unknown[]): string {
@@ -64,7 +64,7 @@ export function installLogSafetyNet(opts: LogSafetyNetOpts = {}): LogSafetyNetIn
   const root = opts.componentRoot ?? 'nexus';
   if (installed) {
     const existingRoot = installedComponentRoot ?? 'nexus';
-    debug.log('mss.logging.log-safety-net.duplicate.warn', 'duplicate install refused', {
+    logDiagnostic('mss.logging.log-safety-net.duplicate.warn', 'duplicate install refused', {
       requestedComponentRoot: root,
       installedComponentRoot: existingRoot,
     }, { level: 'warn' });
@@ -91,7 +91,7 @@ export function installLogSafetyNet(opts: LogSafetyNetOpts = {}): LogSafetyNetIn
       orig(...args);
       if (inBridge) return;
       inBridge = true;
-      try { debug.log(`${root}.console.${kind}`, formatConsoleArgs(args), undefined, { level: kind }); }
+      try { logDiagnostic(`${root}.console.${kind}`, formatConsoleArgs(args), undefined, { level: kind }); }
       catch { /* 안전망이 앱을 못 죽인다 */ }
       finally { inBridge = false; }
     };
@@ -102,20 +102,20 @@ export function installLogSafetyNet(opts: LogSafetyNetOpts = {}): LogSafetyNetIn
   // 의미론(죽음) 보존, unhandledRejection 은 기록만(런타임 기본 비치명).
   const onUncaught = (err: unknown): void => {
     try {
-      debug.log(`${root}.crash.uncaught.error`, err instanceof Error ? `${err.name}: ${err.message}` : String(err), {
+      logDiagnostic(`${root}.crash.uncaught.error`, err instanceof Error ? `${err.name}: ${err.message}` : String(err), {
         stack: err instanceof Error ? err.stack?.slice(0, 2000) : undefined,
       }, { level: 'error' });
-      debug.flush();
+      flushDiagnostics();
     } catch { /* noop */ }
     origError('[log-safety-net] uncaughtException:', err);
     if (exitOnUncaught) exit(1);
   };
   const onRejection = (reason: unknown): void => {
     try {
-      debug.log(`${root}.crash.unhandled-rejection.error`, reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason), {
+      logDiagnostic(`${root}.crash.unhandled-rejection.error`, reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason), {
         stack: reason instanceof Error ? reason.stack?.slice(0, 2000) : undefined,
       }, { level: 'error' });
-      debug.flush();
+      flushDiagnostics();
     } catch { /* noop */ }
     origError('[log-safety-net] unhandledRejection:', reason);
   };

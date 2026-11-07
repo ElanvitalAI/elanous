@@ -1,10 +1,16 @@
+import type { GraphEvent } from './graph-events.js';
+
 /** A run-scoped registry keeps in-process graph effects out of YAML and shell recipes. */
 export interface InProcessHandlerContext {
   readonly graphId: string;
   readonly runId: string;
   readonly nodeId: string;
   readonly input: unknown;
+  /** Optional node-scoped payload used by dynamically appended repair steps. */
+  readonly nodeInput?: unknown;
   readonly outputs: Readonly<Record<string, unknown>>;
+  /** A code node may publish only the event kinds declared in its YAML `emits` allowlist. */
+  readonly emitEvent?: (type: string, data?: Readonly<Record<string, unknown>>) => Promise<GraphEvent>;
 }
 
 export interface InProcessHandlerResult {

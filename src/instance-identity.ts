@@ -25,6 +25,7 @@
 //   env(2층)는 리졸버 안에 이미 층으로 들어있어 종전 동작(명시 stateDir)은 그대로 보존된다.
 
 import { basename, dirname } from 'node:path';
+import { logDiagnostic } from './mss/logging/diagnostic-sink.js';
 
 let instanceNameOverride: string | undefined;
 /** 리졸버 폴백 관측을 프로세스당 1회로 묶는 래치(핫패스 소음·자기재귀 방지). */
@@ -106,8 +107,7 @@ export function resolveInstanceName(): string {
     if (!fallbackObserved) {
       fallbackObserved = true;
       try {
-        const { debug } = require('./debug/log.js') as typeof import('./debug/log.js');
-        debug.log('instance.identity', 'name-resolver-failed', {
+        logDiagnostic('instance.identity', 'name-resolver-failed', {
           error: e instanceof Error ? e.message : String(e),
           envStateDir: process.env.ELANOUS_STATE_DIR?.trim() ?? null,
           why: '리졸버 실패 — env 유도로 폴백. 경로(리졸버)와 이름(env)이 갈릴 수 있으니 조사 필요',

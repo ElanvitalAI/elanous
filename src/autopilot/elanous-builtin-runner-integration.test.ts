@@ -20,11 +20,7 @@
 // (`__mockRunCoreTurn`) 통해 inject.
 
 import { describe, test, expect, beforeEach, mock } from 'bun:test';
-import type {
-  CoreTurnContext,
-  CoreTurnResult,
-  CoreTurnStopReason,
-} from '../core-turn/types.js';
+import type { CoreTurnContext, CoreTurnResult, CoreTurnStopReason } from '../core-turn/types.js';
 import type { LLMMessage } from '../llm.js';
 import type { ContentBlock, SessionUpdate, StopReason } from '@agentclientprotocol/sdk';
 import * as realRunCoreTurn from '../core-turn/run-core-turn.js';
@@ -119,7 +115,7 @@ mock.module('../core-turn/run-core-turn.js', () => ({
 }));
 
 // Imported AFTER mock.module — picks up the stub.
-const coreTurn = await import('../core-turn/index.js');
+const coreTurn = await import('../core-turn/run-goal-loop.js');
 const { ElanousBuiltinTurnRunner } = await import('./elanous-builtin-runner.js');
 
 function noopDispatch() {

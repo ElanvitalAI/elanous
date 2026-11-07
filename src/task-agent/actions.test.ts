@@ -1,10 +1,8 @@
 import { expect, test } from 'bun:test';
-import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { registerAutopilotCommands } from '../cli/autopilot-cli.js';
 import * as actions from './actions.js';
 import { buildEntranceRefusalDenominator, executeEntranceTick, executeNextAction, failureKey, readDeliveryEvidence, type ActionDeps, type GreenSweepProbe, type NextAction } from './actions.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
@@ -81,28 +79,6 @@ function fake(review = { verdict: 'pass', mustFix: [] as string[], reviewed: tru
   };
   return { calls, events, deps };
 }
-test('registered autopilot action entry invokes executor in default shadow mode', async () => {
-  // 격리된 설정 폴더 — 사용자 설정(taskAgent.mode=live)이 이 시험을 실물 실행으로 바꾸지 않게.
-  const { mkdtempSync } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { setElanousConfigDir, resetElanousConfigDir } = await import('../elanous-config-dir.js');
-  const isolated = mkdtempSync(join(tmpdir(), 'task-agent-cli-'));
-  setElanousConfigDir(isolated);
-  process.env.ELANOUS_STATE_DIR = isolated;
-  const program = new Command();
-  const surfaces: string[] = [];
-  registerAutopilotCommands(program, { registerSink: async (surface) => { surfaces.push(surface); return true; } });
-  const output: string[] = [];
-  const original = process.stdout.write;
-  process.stdout.write = ((text: string) => { output.push(text); return true; }) as typeof process.stdout.write;
-  try {
-    await program.parseAsync(['autopilot', 'task-agent-action', JSON.stringify(action)], { from: 'user' });
-    expect(output).toContain('shadow\n');
-    // 독립 프로세스 관측 — task-agent 싱크를 실행 전에 등록한다(실 logs.db 대신 주입).
-    expect(surfaces).toEqual(['task-agent']);
-  } finally { process.stdout.write = original; resetElanousConfigDir(); delete process.env.ELANOUS_STATE_DIR; }
-});
 test('TA-REVIEW-SKIP-HARVEST: absent or mismatched signal preserves review', async () => {
   for (const harvestState of [
     undefined,

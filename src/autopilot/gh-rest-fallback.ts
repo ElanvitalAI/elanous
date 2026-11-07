@@ -72,13 +72,17 @@ function restCall(run: CmdRunner, args: string[], opts?: { cwd?: string }): CmdR
   return run('gh', ['api', ...args], opts);
 }
 
-/** Retry exactly once via REST after the secondary GraphQL limit; unsupported shapes fail closed. */
+function isRestFallbackGraphqlFailure(result: CmdResult): boolean {
+  const detail = `${result.out}\n${result.err ?? ''}`;
+  if (!/GraphQL/i.test(detail)) return false;
+  return /API rate limit/i.test(detail) || /Projects \(classic\) is being deprecated/i.test(detail);
+}
+
+/** Retry exactly once via REST after known GraphQL API failures; unsupported shapes fail closed. */
 export function withGhRestFallback(run: CmdRunner): CmdRunner {
   return (cmd, args, opts) => {
     const original = run(cmd, args, opts);
-    if (cmd !== 'gh' || args[0] !== 'pr' || original.ok ||
-        !/GraphQL/i.test(`${original.out}\n${original.err ?? ''}`) ||
-        !/API rate limit/i.test(`${original.out}\n${original.err ?? ''}`)) return original;
+    if (cmd !== 'gh' || args[0] !== 'pr' || original.ok || !isRestFallbackGraphqlFailure(original)) return original;
     const sub = args[1];
     if (!['list', 'view', 'create', 'edit', 'merge', 'comment'].includes(sub ?? '')) return original;
     if (sub === 'list' && !args.includes('--json')) return original;

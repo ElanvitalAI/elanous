@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { debug, redactSecrets } from '../../debug/log.js';
+import { logDiagnostic } from './diagnostic-sink.js';
+import { redactSecrets } from '../../debug/secret-redaction.js';
 import { getDefaultLogStore, logsDbPath, type LogStoreRow } from './log-store.js';
 import { readLogInstances } from './instance-registry.js';
 import { redactLogRecord } from './redaction.js';
@@ -189,7 +190,7 @@ export function registerLogFederationWorker(opts: { fetcher?: typeof fetch; poll
       store = (opts.store ?? getDefaultLogStore)();
       if (!store) return;
     } catch (error) {
-      debug.log('logs.federate', 'configuration-error', { reason: error instanceof Error ? error.message : String(error) });
+      logDiagnostic('logs.federate', 'configuration-error', { reason: error instanceof Error ? error.message : String(error) });
       return;
     }
     running = true;
@@ -213,7 +214,7 @@ export function registerLogFederationWorker(opts: { fetcher?: typeof fetch; poll
         // A single oversized log stays in the local logs.db and is explicitly skipped for federation
         // so it cannot poison the spool and block later, smaller rows forever.
         skippedThrough = row.id;
-        debug.log('logs.federate', 'oversized-row-skipped', { instance: config.instance, rowId: row.id, bytes: singleBytes, maxBytes: MAX_BATCH_BYTES });
+        logDiagnostic('logs.federate', 'oversized-row-skipped', { instance: config.instance, rowId: row.id, bytes: singleBytes, maxBytes: MAX_BATCH_BYTES });
       }
       if (payload.length === 0 && skippedThrough === config.afterId) return;
       if (payload.length === 0) latest = skippedThrough;
@@ -239,11 +240,11 @@ export function registerLogFederationWorker(opts: { fetcher?: typeof fetch; poll
         writePrivate(configPath(), JSON.stringify({ ...current, afterId: Math.max(current.afterId, through) }, null, 2) + '\n');
       });
       failures = 0;
-      debug.log('logs.federate', 'batch-sent', { instance: config.instance, count: payload.length, afterId: latest, skippedThrough });
+      logDiagnostic('logs.federate', 'batch-sent', { instance: config.instance, count: payload.length, afterId: latest, skippedThrough });
     } catch (error) {
       failures += 1;
       retryAt = Date.now() + Math.min(MAX_BACKOFF_MS, (opts.retryBaseMs ?? POLL_MS) * (2 ** Math.min(failures, 4)));
-      debug.log('logs.federate', 'batch-retry', { reason: error instanceof Error ? error.message : String(error), retryMs: retryAt - Date.now() });
+      logDiagnostic('logs.federate', 'batch-retry', { reason: error instanceof Error ? error.message : String(error), retryMs: retryAt - Date.now() });
     } finally { running = false; }
   };
   const timer = setInterval(() => { void pump(); }, opts.pollMs ?? POLL_MS);

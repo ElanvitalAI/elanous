@@ -16,22 +16,49 @@ title: Voice notes
 frontend:
   kind: static-export
   out: out
+tables:
+  notes:
+    columns:
+      id: { type: text, primary: true }
+      title: { type: text }
+roles:
+  owner: { via: nexus-session }
+  viewer: { via: share-link }
+rpc:
+  list:
+    sql: SELECT id, title FROM notes ORDER BY id
+    params: {}
+    allow: [owner, viewer]
+  add:
+    sql: INSERT INTO notes (id, title) VALUES (:id, :title)
+    params: { id: { type: text }, title: { type: text } }
+    allow: [owner]
+actions:
+  transcribe:
+    builtin: stt
+    uses: [cred:openai.api_key]
 `;
 
-function writeApp(appsDir: string, body: string): string {
+function writeApp(appsDir: string, body: string, appManifest = manifest): string {
   const appDir = join(appsDir, 'voice-note');
   const outDir = join(appDir, 'out');
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(appDir, 'app.yaml'), manifest);
+  writeFileSync(join(appDir, 'app.yaml'), appManifest);
   writeFileSync(join(outDir, 'index.html'), body);
   return outDir;
 }
 
-function appRequest(appHost: ReturnType<typeof loadNexusAppHost>['appHost'], path = '/', method = 'GET'): Response {
-  return appHost.handle(new Request(`http://nexus.invalid${path}`, {
+const APP_AUTH_KEY = 'nexus-app-host-test-signing-key-with-at-least-256-bits';
+
+async function appRequest(appHost: ReturnType<typeof loadNexusAppHost>['appHost'], path = '/', method = 'GET', cookie?: string): Promise<Response> {
+  return (await appHost.handle(new Request(`http://nexus.invalid${path}`, {
     method,
-    headers: { host: 'voice-note.app.localhost' },
-  }))!;
+    headers: { host: 'voice-note.app.localhost', ...(cookie ? { cookie } : {}) },
+  })))!;
+}
+
+function appAuthOptions(root: string, now = () => Date.UTC(2026, 0, 1)) {
+  return { dir: join(root, 'auth-tokens'), databaseDirectory: join(root, 'databases'), key: APP_AUTH_KEY, now };
 }
 
 test('NEXUS-APP-HOST-FS-HARDEN mounts an immutable snapshot on an isolated app origin', async () => {
@@ -44,23 +71,103 @@ test('NEXUS-APP-HOST-FS-HARDEN mounts an immutable snapshot on an isolated app o
     ],
   }]);
 
-  const first = loadNexusAppHost(root);
+  const first = loadNexusAppHost(root, undefined, appAuthOptions(root));
+  let second: ReturnType<typeof loadNexusAppHost> | undefined;
   expect(first.issues).toEqual([]);
   expect(first.appHost.slugs).toEqual(['voice-note']);
+  expect((await appRequest(first.appHost)).status).toBe(401);
+  expect(first.appHost.getManifest('voice-note')?.actions).toEqual({
+    transcribe: { builtin: 'stt', uses: ['cred:openai.api_key'] },
+  });
   const state = createNexusState({ nexusVersion: 'test', phase: 'app-host-fs-harden' });
   const eventBus = new NexusEventBus();
   state.bus = eventBus;
   const server = startNexusHttpServer({
     state, eventBus, registry: new TabRegistry(state), startPort: 45000 + Math.floor(Math.random() * 1000),
-    portRange: 20, appHost: first.appHost,
+    portRange: 20, appHost: first.appHost, metaApi: { bearerToken: 'owner-auth', noAuth: false },
   });
   try {
-    const app = await fetch(`${server.url}/`, { headers: { host: `voice-note.app.localhost:${server.port}` } });
+    const deniedIssue = await fetch(`${server.url}/v1/nexus/apps/voice-note/invitations`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ invitedBy: 'owner-1' }),
+    });
+    expect(deniedIssue.status).toBe(401);
+    const issue = await fetch(`${server.url}/v1/nexus/apps/voice-note/invitations`, {
+      method: 'POST', headers: { authorization: 'Bearer owner-auth', 'content-type': 'application/json' },
+      body: JSON.stringify({ invitedBy: 'owner-1' }),
+    });
+    expect(issue.status).toBe(201);
+    const issueBody = await issue.json() as { invitation: { token: string } };
+    const accepted = await fetch(`${server.url}/__auth/accept?token=${encodeURIComponent(issueBody.invitation.token)}`, {
+      headers: { host: `voice-note.app.localhost:${server.port}` }, redirect: 'manual',
+    });
+    expect(accepted.status).toBe(303);
+    const cookie = accepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+    const app = await fetch(`${server.url}/`, { headers: { host: `voice-note.app.localhost:${server.port}`, cookie: `theme=dark; ${cookie}` } });
     expect(app.status).toBe(200);
     expect(await app.text()).toContain('version one');
     expect(app.headers.get('x-nexus-app-origin')).toBe(`http://voice-note.app.localhost:${server.port}`);
 
-    const appApi = await fetch(`${server.url}/v1/health`, { headers: { host: `voice-note.app.localhost:${server.port}` } });
+    const list = await fetch(`${server.url}/__rpc/list`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, cookie, 'content-type': 'application/json' }, body: JSON.stringify({ params: {} }),
+    });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toEqual({ rows: [] });
+    const forbidden = await fetch(`${server.url}/__rpc/add`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ params: { id: '1', title: 'no' }, role: 'owner' }),
+    });
+    expect(forbidden.status).toBe(400); // A client cannot override the authenticated share-link role.
+    const ownerOnly = await fetch(`${server.url}/__rpc/add`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ params: { id: '1', title: 'no' } }),
+    });
+    expect(ownerOnly.status).toBe(403);
+    const unauthenticatedRpc = await fetch(`${server.url}/__rpc/list`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, 'content-type': 'application/json' }, body: JSON.stringify({ params: {} }),
+    });
+    expect(unauthenticatedRpc.status).toBe(401);
+    const crossOrigin = await fetch(`${server.url}/__rpc/list`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: 'http://attacker.invalid', cookie, 'content-type': 'application/json' }, body: JSON.stringify({ params: {} }),
+    });
+    expect(crossOrigin.status).toBe(403);
+    const nonJson = await fetch(`${server.url}/__rpc/list`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, cookie, 'content-type': 'text/plain' }, body: '{"params":{}}',
+    });
+    expect(nonJson.status).toBe(415);
+    const tooLarge = await fetch(`${server.url}/__rpc/list`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ params: { title: 'x'.repeat(65 * 1024) } }),
+    });
+    expect(tooLarge.status).toBe(413);
+    const oversizedBytes = new TextEncoder().encode(JSON.stringify({ params: { title: 'x'.repeat(65 * 1024) } }));
+    const streamingRequest = new Request('http://nexus.invalid/__rpc/list', {
+      method: 'POST',
+      headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, cookie, 'content-type': 'application/json' },
+      body: new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(oversizedBytes.slice(0, 32 * 1024)); controller.enqueue(oversizedBytes.slice(32 * 1024)); controller.close(); },
+      }),
+    });
+    expect(streamingRequest.headers.get('content-length')).toBeNull();
+    expect((await first.appHost.handle(streamingRequest))?.status).toBe(413);
+    const undeclaredRole = await fetch(`${server.url}/v1/nexus/apps/voice-note/invitations`, {
+      method: 'POST', headers: { authorization: 'Bearer owner-auth', 'content-type': 'application/json' },
+      body: JSON.stringify({ invitedBy: 'owner-1', role: 'admin' }),
+    });
+    expect(undeclaredRole.status).toBe(400);
+
+    const ownerInviteResponse = await fetch(`${server.url}/v1/nexus/apps/voice-note/invitations`, {
+      method: 'POST', headers: { authorization: 'Bearer owner-auth', 'content-type': 'application/json' },
+      body: JSON.stringify({ invitedBy: 'owner-1', role: 'owner' }),
+    });
+    expect(ownerInviteResponse.status).toBe(400);
+    expect(() => first.appHost.issueInvitation('voice-note', 'owner-1', undefined, 'owner'))
+      .toThrow('app role is not available through a share-link invitation');
+    const viewerList = await fetch(`${server.url}/__rpc/list`, {
+      method: 'POST', headers: { host: `voice-note.app.localhost:${server.port}`, origin: `http://voice-note.app.localhost:${server.port}`, cookie, 'content-type': 'application/json' }, body: JSON.stringify({ params: {} }),
+    });
+    expect(await viewerList.json()).toEqual({ rows: [] });
+
+    const appApi = await fetch(`${server.url}/v1/health`, { headers: { host: `voice-note.app.localhost:${server.port}`, cookie } });
     expect(appApi.status).toBe(404);
     const pwaRoot = await fetch(`${server.url}/`, { redirect: 'manual' });
     expect(pwaRoot.status).toBe(302);
@@ -72,14 +179,77 @@ test('NEXUS-APP-HOST-FS-HARDEN mounts an immutable snapshot on an isolated app o
     const simulatedV2 = simulatedApps.fetch('voice-note.app.sim.invalid', '/index.html');
     expect(simulatedV2.status).toBe(200);
     writeFileSync(join(outDir, 'index.html'), simulatedV2.body);
-    expect(await (await fetch(`${server.url}/`, { headers: { host: `voice-note.app.localhost:${server.port}` } })).text())
+    expect(await (await fetch(`${server.url}/`, { headers: { host: `voice-note.app.localhost:${server.port}`, cookie } })).text())
       .toContain('version one');
-    const second = loadNexusAppHost(root);
+    second = loadNexusAppHost(root, undefined, appAuthOptions(root));
     expect(second.issues).toEqual([]);
-    expect(await appRequest(second.appHost).text()).toContain('version two');
+    expect(await (await appRequest(second.appHost, '/', 'GET', `theme=dark; ${cookie}`)).text()).toContain('version two');
   } finally {
     server.stop();
     first.appHost.close();
+    second?.appHost.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('NEXUS-APP-DB-RPC-WIRE preserves invitations for legacy manifests without viewer roles', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-legacy-role-'));
+  const appDir = join(root, 'legacy');
+  mkdirSync(join(appDir, 'out'), { recursive: true });
+  writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: legacy\ntitle: Legacy\nfrontend: { kind: static-export, out: out }\nroles: { owner: { via: nexus-session } }\n`);
+  writeFileSync(join(appDir, 'out', 'index.html'), '<main>legacy</main>');
+  const blockedDbPath = join(root, 'blocked-db-path');
+  writeFileSync(blockedDbPath, 'static app must not initialize SQLite');
+  const { appHost, issues } = loadNexusAppHost(root, undefined, { ...appAuthOptions(root), databaseDirectory: blockedDbPath });
+  try {
+    expect(issues).toEqual([]);
+    const invite = appHost.issueInvitation('legacy', 'owner-1');
+    expect(invite.role).toBe('viewer');
+    expect(() => appHost.issueInvitation('legacy', 'owner-1', undefined, 'admin')).toThrow('app role is not declared');
+    const accepted = await appHost.handle(new Request(`http://nexus.invalid/__auth/accept?token=${encodeURIComponent(invite.token)}`, {
+      headers: { host: 'legacy.app.localhost' },
+    }));
+    expect(accepted?.status).toBe(303);
+  } finally {
+    appHost.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('NEXUS-APP-DB-RPC-WIRE rechecks session expiry after a slow RPC body', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-rpc-expiry-'));
+  writeApp(root, '<main>notes</main>', manifest.replace('allow: [owner]', 'allow: [viewer]'));
+  let now = Date.UTC(2026, 0, 1);
+  const { appHost } = loadNexusAppHost(root, undefined, appAuthOptions(root, () => now));
+  try {
+    const invitation = appHost.issueInvitation('voice-note', 'owner-1');
+    const accepted = await appHost.handle(new Request(`http://nexus.invalid/__auth/accept?token=${encodeURIComponent(invitation.token)}`, {
+      headers: { host: 'voice-note.app.localhost' },
+    }));
+    const cookie = accepted!.headers.get('set-cookie')!.split(';', 1)[0]!;
+    const bytes = new TextEncoder().encode(JSON.stringify({ params: { id: 'slow', title: 'must not execute' } }));
+    const slowBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, 12));
+        setTimeout(() => { now += 60 * 60_000 + 1; controller.enqueue(bytes.slice(12)); controller.close(); }, 10);
+      },
+    });
+    const response = await appHost.handle(new Request('http://nexus.invalid/__rpc/add', {
+      method: 'POST', headers: { host: 'voice-note.app.localhost', origin: 'http://voice-note.app.localhost', cookie, 'content-type': 'application/json' }, body: slowBody,
+    }));
+    expect(response?.status).toBe(401);
+
+    const freshInvitation = appHost.issueInvitation('voice-note', 'owner-1');
+    const freshAccepted = await appHost.handle(new Request(`http://nexus.invalid/__auth/accept?token=${encodeURIComponent(freshInvitation.token)}`, {
+      headers: { host: 'voice-note.app.localhost' },
+    }));
+    const freshCookie = freshAccepted!.headers.get('set-cookie')!.split(';', 1)[0]!;
+    const rows = await appHost.handle(new Request('http://nexus.invalid/__rpc/list', {
+      method: 'POST', headers: { host: 'voice-note.app.localhost', origin: 'http://voice-note.app.localhost', cookie: freshCookie, 'content-type': 'application/json' }, body: JSON.stringify({ params: {} }),
+    }));
+    expect(await rows!.json()).toEqual({ rows: [] });
+  } finally {
+    appHost.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -131,12 +301,15 @@ test('NEXUS-APP-HOST-FS-HARDEN keeps same-event-loop mounts complete and rejects
   writeApp(root, '<main>stable</main>');
   try {
     const results = await Promise.all([
-      Promise.resolve().then(() => loadNexusAppHost(root)),
-      Promise.resolve().then(() => loadNexusAppHost(root)),
+      Promise.resolve().then(() => loadNexusAppHost(root, undefined, appAuthOptions(root))),
+      Promise.resolve().then(() => loadNexusAppHost(root, undefined, appAuthOptions(root))),
     ]);
     expect(results.map(result => result.appHost.slugs)).toEqual([['voice-note'], ['voice-note']]);
-    expect(await appRequest(results[0]!.appHost, '/%252e%252e/private.html').text()).toBe('Not Found');
-    expect(appRequest(results[1]!.appHost, '/', 'POST').status).toBe(405);
+    const invite = results[0]!.appHost.issueInvitation('voice-note', 'owner-1');
+    const accepted = await appRequest(results[0]!.appHost, `/__auth/accept?token=${encodeURIComponent(invite.token)}`);
+    const cookie = accepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+    expect(await (await appRequest(results[0]!.appHost, '/%252e%252e/private.html', 'GET', cookie)).text()).toBe('Not Found');
+    expect((await appRequest(results[1]!.appHost, '/', 'POST', cookie)).status).toBe(405);
     results.forEach(result => result.appHost.close());
   } finally {
     rmSync(root, { recursive: true, force: true });

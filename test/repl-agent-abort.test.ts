@@ -24,7 +24,7 @@ import {
 } from '../src/repl/agent-turn';
 import { DaemonSessionHistory } from '../src/boot/daemon-runtime';
 import * as promptTurnModule from '../src/boot/daemon-prompt-turn';
-import * as coreTurnModule from '../src/core-turn/index';
+import * as coreTurnModule from '../src/core-turn/run-core-turn';
 
 describe('agent-turn abort registry', () => {
   test('register on enter / deregister on success', async () => {

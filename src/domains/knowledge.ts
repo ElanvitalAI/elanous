@@ -638,10 +638,15 @@ export interface QueryOptions {
   sector?: string;
   domain?: string; // GEN
   embed?: EmbedFn;
+  /** Restrict vector ranking to a candidate pool (e.g. lexical candidates before reranking). */
+  candidateIds?: readonly string[];
+  /** Omit a query document when searching for its neighbors. */
+  excludeId?: string;
 }
 
 /** 유사국면 질의 — 질의 임베딩과 같은 embed_model 공간의 문서만 대상. */
 export async function queryKnowledge(db: Database, query: string, opts: QueryOptions = {}): Promise<KnowledgeMatch[]> {
+  if (opts.candidateIds?.length === 0) return [];
   const embed = opts.embed ?? defaultEmbed;
   const k = Math.min(Math.max(opts.k ?? 5, 1), 20);
   const { vector: qv, model } = await embed(query);
@@ -651,6 +656,11 @@ export async function queryKnowledge(db: Database, query: string, opts: QueryOpt
   if (opts.kind) { conds.push('kind = ?'); params.push(opts.kind); }
   if (opts.sector) { conds.push("COALESCE(sector_tags,'') LIKE ?"); params.push(`%${opts.sector}%`); }
   if (opts.domain) { conds.push("COALESCE(domain,'finance') = ?"); params.push(opts.domain); }
+  if (opts.excludeId) { conds.push('id <> ?'); params.push(opts.excludeId); }
+  if (opts.candidateIds) {
+    conds.push(`id IN (${opts.candidateIds.map(() => '?').join(', ')})`);
+    params.push(...opts.candidateIds);
+  }
 
   const rows = db.prepare(
     `SELECT id, ts, kind, sector_tags, text, source_ref, embed_model, embedding, domain FROM docs WHERE ${conds.join(' AND ')}`

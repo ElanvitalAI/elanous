@@ -35,7 +35,7 @@ import {
 import { LOG_LEVEL_ORDER, type LogLevel } from '../mss/logging/record.js';
 import { isRenderCategory, RENDER_ORIENTED_PREFIXES } from '../mss/logging/render-categories.js';
 import { readScopedRenderLogs } from '../mss/logging/scoped-level.js';
-import { formatClock } from '../time/format.js';
+import { formatClock } from '../time/clock.js';
 import '../user-config.js'; // Register the saved timezone for standalone logs CLI formatting.
 import { HARNESS_SPACE_KINDS } from '../harness/harness-space.js';
 import { LOG_RETENTION_DEFAULTS, LogCursorNotFoundError, STORE_SAFETY_MAX } from '../mss/logging/log-store.js';

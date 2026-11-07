@@ -11,7 +11,7 @@ import { isValidGateHost } from '../self-implement/gate-remote.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { latestPublishedPreviousVersion, releaseLoopConfig } from '../../scripts/release-loop/unattended-release.js';
 import { LEAK_MARKERS, loadExportConfig, selectExportFiles } from '../../scripts/public-export.js';
-import { LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcResult } from './light-rc.js';
+import { LIGHT_RC_DEFAULT_SHARDS, LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcResult } from './light-rc.js';
 import { planRehearsalShards, type RehearsalShardPlan, type RehearsalShardPlanDeps } from './rehearsal-shard-plan.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
@@ -98,7 +98,7 @@ export interface RehearsalStamp {
   measurementGap?: { cause: string; runId: string; evidence: string };
   shardPlan?: RehearsalShardPlan;
   leakCheck?: { outcome: 'ok' | 'fail'; sha: string; exitCode: number | null; detail?: string };
-  selection?: { shards?: number; remote?: string };
+  selection?: { shards?: number; remote?: string; fullFallback?: { reason: string; plannedShards?: number } };
   notifiedAt?: string;
   ownerPid?: number;
 }
@@ -607,9 +607,24 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
             } else {
             const shardPlan = opts.shards === undefined ? (deps.shardPlan ?? planRehearsalShards)(plan.version, root, checkout, { ...deps.shardPlanDeps, remoteGate: true }) : undefined;
             if (shardPlan) stamp.shardPlan = shardPlan;
-            const selection = { shards: opts.shards ?? shardPlan?.shards, remote: opts.remote };
+            const fullFallbackReasons = [
+              ...(shardPlan?.planningGaps ?? []),
+              ...(shardPlan?.rssRevisionPending ? ['selected-file memory revision is not verified'] : []),
+              ...(shardPlan?.testFiles === null ? ['selected test inventory unavailable'] : []),
+              ...(shardPlan?.testFiles === 0 ? ['selected test inventory empty'] : []),
+              ...(shardPlan?.gatePlanShards === null ? ['persisted gate shard plan unavailable'] : []),
+              ...(opts.shards !== undefined && opts.shards !== LIGHT_RC_DEFAULT_SHARDS ? [`requested shard count ${opts.shards} does not match the full host gate`] : []),
+              ...(shardPlan && shardPlan.shards !== LIGHT_RC_DEFAULT_SHARDS ? [`planned shard count ${shardPlan.shards} does not match the full host gate`] : []),
+            ];
+            const fullFallback = plan.run === 'rc-150m' && fullFallbackReasons.length > 0;
+            const selection = {
+              shards: fullFallback ? LIGHT_RC_DEFAULT_SHARDS : opts.shards ?? shardPlan?.shards,
+              remote: opts.remote,
+              ...(fullFallback ? { fullFallback: { reason: [...new Set(fullFallbackReasons)].join('; '),
+                ...(shardPlan ? { plannedShards: shardPlan.shards } : {}) } } : {}),
+            };
             stamp.selection = selection;
-            if (shardPlan && (shardPlan.testFiles === 0 || shardPlan.gatePlanShards === null)) {
+            if (plan.run !== 'rc-150m' && shardPlan && (shardPlan.testFiles === 0 || shardPlan.gatePlanShards === null)) {
               stamp.outcome = 'unmeasured';
               stamp.summary = oneLine(`${shardPlan.testFiles === 0 ? 'no runnable rehearsal shards' : 'rehearsal shard plan unavailable'} · ${shardPlan.unmeasured ?? 'selected test files empty'}`);
               stamp.endedAt = clock().toISOString();
@@ -658,14 +673,20 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
                 remoteCapacityVerifiedBy: result.remote,
                 unmeasured: shardPlan.planningGaps?.length ? shardPlan.planningGaps.join('; ') : null };
             }
-            const planningGap = stamp.shardPlan?.unmeasured || shardMismatch || remoteMismatch;
+            const remoteCapacityVerified = plan.run === 'rc-150m' && stamp.shardPlan?.remoteCapacityPending === true
+              && result.ok && result.gateExitCode === 0 && result.unmeasured === null && result.unclassified === 0
+              && result.remote === opts.remote && !shardMismatch && !remoteMismatch;
+            const shardPlanningGap = fullFallback ? null : stamp.shardPlan?.unmeasured
+              ?.replace(remoteCapacityVerified ? /(?:^|; )remote gate host resources unmeasured before RC(?=; |$)/g : /$^/, '')
+              .replace(/^; |; $/g, '') || null;
+            const planningGap = shardPlanningGap || shardMismatch || remoteMismatch;
             const missingEvidence = result.introduced === null || result.unclassified === null
               || result.unmeasured !== null || result.unclassified > 0 || !!planningGap;
             stamp.outcome = result.introduced !== null && result.introduced > 0 ? missingEvidence ? 'unmeasured' : 'regression'
               : result.introduced === null || result.unclassified === null || result.unmeasured !== null || result.unclassified > 0 ? 'unmeasured'
               : result.unmeasured === null && (!result.ok || result.gateExitCode !== 0) ? 'error'
               : planningGap ? 'unmeasured' : 'ok';
-            stamp.summary = oneLine(`introduced ${result.introduced ?? 'UNKNOWN'} · preexisting ${result.preexisting ?? 'UNKNOWN'} · unclassified ${result.unclassified ?? 'UNKNOWN'} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}${result.unmeasured !== null ? ` · unmeasured: ${result.unmeasured || 'RC reason empty'}` : ''}${stamp.shardPlan?.unmeasured ? ` · unmeasured: ${stamp.shardPlan.unmeasured}` : ''}${shardMismatch ? ` · unmeasured: ${shardMismatch}` : ''}${remoteMismatch ? ` · unmeasured: ${remoteMismatch}` : ''}`);
+            stamp.summary = oneLine(`introduced ${result.introduced ?? 'UNKNOWN'} · preexisting ${result.preexisting ?? 'UNKNOWN'} · unclassified ${result.unclassified ?? 'UNKNOWN'} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}${result.unmeasured !== null ? ` · unmeasured: ${result.unmeasured || 'RC reason empty'}` : ''}${fullFallback ? ` · full-shards fallback (${selection.shards}): ${selection.fullFallback?.reason}` : shardPlanningGap ? ` · unmeasured: ${shardPlanningGap}` : ''}${shardMismatch ? ` · unmeasured: ${shardMismatch}` : ''}${remoteMismatch ? ` · unmeasured: ${remoteMismatch}` : ''}`);
             }
           }
         }

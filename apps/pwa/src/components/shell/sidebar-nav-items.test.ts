@@ -27,7 +27,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/',
   '/404',
   '/approvals',
-  '/autopilot',
+  '/apps',
   '/board',
   '/botlab',
   '/bots',
@@ -46,7 +46,6 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/live',
   '/loops',
   '/market',
-  '/missions',
   '/morning',
   '/ops/checklist',
   '/ops/release',
@@ -144,8 +143,8 @@ function expectCompleteRouteAccounting(
 const expectedGroups = [
   ['today', '오늘', true, ['/today', '/approvals', '/intake']],
   ['talk', '대화', true, ['/chat', '/exec']],
-  ['work', '일', true, ['/autopilot', '/outputs', '/scheduler', '/live', '/trace']],
-  ['make', '만들기', true, ['/term', '/editor', '/design-check', '/workspace']],
+  ['work', '일', true, ['/outputs', '/scheduler', '/live', '/trace']],
+  ['make', '만들기', true, ['/term', '/editor', '/design-check', '/apps', '/workspace']],
   ['files', '자료', false, ['/vault', '/field', '/market']],
   ['settings', '설정', false, ['/settings']],
   ['ops', '운영🔒', false, ['/ceo', '/loops', '/loops?view=interact', '/ops/release', '/ops/checklist', '/ops/seats', '/bots', '/observatory', '/worktrees', '/control']],
@@ -161,8 +160,8 @@ describe('NAV1a menu', () => {
     }
     expect(Object.fromEntries(SIDEBAR_NAV_ITEMS.map((item) => [item.href, item.label]))).toMatchObject({
       '/today': '오늘', '/approvals': '승인 대기', '/intake': '넣기', '/chat': '채팅', '/exec': 'COO 에게 맡기기',
-      '/autopilot': '미션', '/outputs': '산출물', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
-      '/term': '터미널', '/editor': '그래프', '/design-check': '디자인', '/workspace': '여러 탭',
+      '/outputs': '산출물', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
+      '/term': '터미널', '/editor': '그래프', '/design-check': '디자인', '/apps': '앱', '/workspace': '여러 탭',
       '/vault': 'Obsidian 노트', '/field': '현장 올리기', '/market': '마켓', '/settings': '설정',
       '/ceo': '대표 조망판', '/loops': '루프 현황', '/loops?view=interact': '루프 상호작용', '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
       '/observatory': '관측', '/worktrees': '작업 트리', '/control': '제어',
@@ -179,7 +178,6 @@ describe('NAV1a menu', () => {
       expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === href)?.kind).toBeNull();
       expect(NON_MENU_SIDEBAR_ROUTES.some((route) => route.href === href)).toBe(false);
     }
-    expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/autopilot')?.activeAlso).toEqual(['/tasks', '/missions']);
     expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/editor')?.activeAlso).toEqual(['/workflows']);
   });
 
@@ -225,8 +223,8 @@ describe('NAV1a menu', () => {
     expect(off).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
     expect(hrefs('general', false)).toEqual(off);
     const on = hrefs('general', true);
-    for (const path of ['/exec', '/field', '/trace', '/autopilot', '/vault', '/intake']) expect(on).toContain(path);
-    expect(on).toEqual(['/today', '/intake', '/chat', '/exec', '/autopilot', '/outputs', '/live', '/trace', '/live-run', '/term', '/editor', '/vault', '/field', '/market', '/settings']);
+    for (const path of ['/exec', '/field', '/trace', '/vault', '/intake']) expect(on).toContain(path);
+    expect(on).toEqual(['/today', '/intake', '/chat', '/exec', '/outputs', '/live', '/trace', '/live-run', '/term', '/editor', '/apps', '/vault', '/field', '/market', '/settings']);
     for (const path of ['/approvals', '/design-check', '/scheduler', '/ops/release', '/morning']) expect(on).not.toContain(path);
     for (const role of ['contributor', 'owner'] as const) expect(hrefs(role, true)).toEqual(hrefs(role));
     expect(hrefs('general', true, true).filter((path) => path.startsWith('/ops/'))).toEqual(['/ops/release', '/ops/checklist', '/ops/seats']);
@@ -258,14 +256,11 @@ describe('NAV1a menu', () => {
     const fixtureDirectory = mkdtempSync(join(tmpdir(), 'sidebar-route-accounting-'));
     try {
       mkdirSync(join(fixtureDirectory, 'foo', 'bar'), { recursive: true });
-      mkdirSync(join(fixtureDirectory, 'missions', '[id]'), { recursive: true });
       writeFileSync(join(fixtureDirectory, 'foo', 'bar', 'page.tsx'), 'export default null;');
-      writeFileSync(join(fixtureDirectory, 'missions', '[id]', 'page.tsx'), 'export default null;');
 
       expect(builtRouteHrefs(fixtureDirectory).sort()).toEqual([
         '/404',
         '/foo/bar',
-        '/missions',
       ]);
     } finally {
       rmSync(fixtureDirectory, { recursive: true, force: true });
@@ -277,7 +272,6 @@ describe('NAV1a menu', () => {
 
     expect(categoryByHref.get('/intake')).toBeUndefined();
     expect(categoryByHref.get('/share')).toBe('system-share-target');
-    expect(categoryByHref.get('/missions')).toBe('dynamic-route-parent');
     expect(categoryByHref.get('/setup')).toBe('provider-onboarding');
     expect(categoryByHref.get('/404')).toBe('error-page');
     expect(categoryByHref.get('/morning')).toBe('unwired-screen');
@@ -297,11 +291,9 @@ describe('탭 다이어트 — 메뉴 노출 등급', () => {
   const hrefs = (level: 'public' | 'labs' | 'hidden') =>
     SIDEBAR_NAV_ITEMS.filter((item) => (item.visibility ?? 'public') === level).map((item) => item.href);
 
-  test('Missions = Autopilot ⊕ Tasks 한 메뉴: Tasks 주소에서도 Missions 가 켜진다', () => {
-    expect(hrefs('public')).toContain('/autopilot');
+  test('미션 표면은 PWA 메뉴에서 제거됐다', () => {
+    expect(hrefs('public')).not.toContain('/autopilot');
     expect(hrefs('public')).not.toContain('/tasks');
-    const missions = SIDEBAR_NAV_ITEMS.find((item) => item.href === '/autopilot');
-    expect(missions?.activeAlso).toEqual(['/tasks', '/missions']);
   });
 
   test('Labs 는 별도 등급이며 Tasks·Sessions·Reflection 은 숨김이다', () => {

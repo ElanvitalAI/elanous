@@ -1,0 +1,388 @@
+#!/usr/bin/env bun
+/**
+ * Build a case-level inventory from Bun JUnit gate reports and the matching
+ * test source. JUnit is authoritative for which cases actually ran; source
+ * analysis adds static structure and a short contract cue.
+ *
+ *   bun scripts/test-census.ts [gate-logs/cut] [--source-root repo] [--format tsv|markdown|json] [--out path]
+ */
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import ts from 'typescript';
+import { XMLParser } from 'fast-xml-parser';
+
+type CaseAttempt = { report: string; document: number; seconds: number | null; result: 'passed' | 'failed' | 'skipped' };
+
+type JunitCase = {
+  file: string;
+  classname: string;
+  name: string;
+  suitePath: string[];
+  line: number | null;
+  seconds: number | null;
+  attempts: CaseAttempt[];
+  result: 'passed' | 'failed' | 'skipped';
+};
+
+type CaseSource = {
+  title: string;
+  templateFragments: string[];
+  suite: string[];
+  body: ts.Node | undefined;
+  line: number;
+  assertions: string[];
+};
+
+type SourceFacts = {
+  imports: number;
+  dynamicImports: number;
+  fileSignals: string[];
+  cases: CaseSource[];
+};
+
+type CensusRow = JunitCase & {
+  sourceStatus: 'parsed' | 'missing';
+  caseMatch: 'matched' | 'unmatched';
+  imports: number | null;
+  dynamicImports: number | null;
+  spawn: boolean | null;
+  sleep: boolean | null;
+  network: boolean | null;
+  loops: number | null;
+  numericCandidates: string[];
+  contract: string;
+  sourceLine: number | null;
+};
+
+function repositoryFile(file: string): string {
+  const normalized = file.replaceAll('\\', '/');
+  const knownRoot = '/elanous-source/';
+  const rootAt = normalized.lastIndexOf(knownRoot);
+  if (rootAt >= 0) return normalized.slice(rootAt + knownRoot.length);
+  return file;
+}
+
+function filesUnder(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    return entry.isDirectory() ? filesUnder(path) : [path];
+  });
+}
+
+function junitCases(reportPaths: string[], gateDir: string): JunitCase[] {
+  const cases = new Map<string, JunitCase>();
+  const retryNumber = (path: string): number => Number(/\.retry-(\d+)\.junit\.xml$/.exec(path)?.[1] ?? -1);
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: '@_',
+    isArray: (name) => name === 'testsuite' || name === 'testcase',
+  });
+  const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+    value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  const asArray = (value: unknown): unknown[] => Array.isArray(value) ? value : value === undefined ? [] : [value];
+  const caseElements = (root: unknown): Array<{ attrs: Record<string, unknown>; suitePath: string[] }> => {
+    const found: Array<{ attrs: Record<string, unknown>; suitePath: string[] }> = [];
+    const visit = (node: unknown, suitePath: string[] = []): void => {
+      if (Array.isArray(node)) { for (const item of node) visit(item, suitePath); return; }
+      const object = asRecord(node);
+      if (!object) return;
+      for (const [name, value] of Object.entries(object)) {
+        if (name === 'testcase') {
+          for (const item of asArray(value)) { const testcase = asRecord(item); if (testcase) found.push({ attrs: testcase, suitePath }); }
+        } else if (name === 'testsuite') {
+          for (const item of asArray(value)) {
+            const suite = asRecord(item);
+            if (!suite) continue;
+            const suiteName = String(suite['@_name'] ?? '');
+            const suiteFile = String(suite['@_file'] ?? '');
+            const isFileSuite = suiteName === suiteFile || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(suiteName);
+            visit(suite, suiteName && !isFileSuite ? [...suitePath, suiteName] : suitePath);
+          }
+        } else if (!name.startsWith('@_')) visit(value, suitePath);
+      }
+    };
+    visit(root);
+    return found;
+  };
+  for (const report of reportPaths.sort((a, b) => retryNumber(a) - retryNumber(b) || a.localeCompare(b))) {
+    const xml = readFileSync(report, 'utf8');
+    const documents = xml.split(/(?=<\?xml\b)/g).filter((part) => part.trim());
+    for (const [documentIndex, document] of documents.entries()) {
+      const parsed = parser.parse(document) as unknown;
+      for (const { attrs, suitePath } of caseElements(parsed)) {
+        const rawName = String(attrs['@_name'] ?? '<missing-name>');
+        const nameParts = rawName.split(' > ');
+        const nameHasFile = nameParts.length > 1 && /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(nameParts[0]!);
+        const file = repositoryFile(String(attrs['@_file'] ?? (nameHasFile ? nameParts[0] : '<missing-file>')));
+        const name = nameHasFile ? nameParts.slice(1).join(' > ') : rawName;
+        const classname = String(attrs['@_classname'] ?? '');
+        const line = Number(attrs['@_line']);
+        const time = Number(attrs['@_time']);
+        const key = `${file}\0${suitePath.join('\0')}\0${classname}\0${name}`;
+        const hasChild = (tag: string): boolean => Object.hasOwn(attrs, tag);
+        const result = hasChild('failure') || hasChild('error') ? 'failed' : hasChild('skipped') ? 'skipped' : 'passed';
+        const attempt: CaseAttempt = {
+          report: relative(gateDir, report).replaceAll('\\', '/'),
+          document: documentIndex + 1,
+          seconds: Number.isFinite(time) ? time : null,
+          result,
+        };
+        const existing = cases.get(key);
+        if (existing) {
+          existing.attempts.push(attempt);
+          existing.result = result;
+          continue;
+        }
+        cases.set(key, {
+          file,
+          classname,
+          name,
+          suitePath,
+          line: Number.isInteger(line) && line > 0 ? line : null,
+          seconds: attempt.seconds,
+          attempts: [attempt],
+          result,
+        });
+      }
+    }
+  }
+  return [...cases.values()].sort((a, b) => a.file.localeCompare(b.file) || a.classname.localeCompare(b.classname) || a.name.localeCompare(b.name));
+}
+
+const callName = (expression: ts.Expression): string => expression.getText().replace(/\s+/g, '');
+const isString = (node: ts.Expression | undefined): node is ts.StringLiteral | ts.NoSubstitutionTemplateLiteral =>
+  !!node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node));
+
+function apiRoot(expression: ts.Expression): string | undefined {
+  let current = expression;
+  while (ts.isCallExpression(current) || ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    current = ts.isCallExpression(current) ? current.expression : current.expression;
+  }
+  return ts.isIdentifier(current) ? current.text : undefined;
+}
+
+function titleFrom(node: ts.Expression | undefined): { title: string; fragments: string[] } | undefined {
+  if (isString(node)) return { title: node.text, fragments: [node.text] };
+  if (!node || !ts.isTemplateExpression(node)) return undefined;
+  const fragments = [node.head.text, ...node.templateSpans.map((span) => span.literal.text)].filter(Boolean);
+  return { title: node.getText(), fragments };
+}
+
+function assertionKinds(body: ts.Node | undefined): string[] {
+  const kinds = new Set<string>();
+  if (!body) return [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const name = callName(node.expression);
+      const matcher = /\.(to[A-Z]\w*|rejects|resolves)$/.exec(name)?.[1];
+      if (matcher) kinds.add(matcher);
+      if (/^(expect|assert|assert\.[\w$]+)$/.test(name)) kinds.add(name);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return [...kinds].sort();
+}
+
+function parseSource(path: string): SourceFacts {
+  const source = readFileSync(path, 'utf8');
+  const kind = path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const sf = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, kind);
+  const cases: CaseSource[] = [];
+  const suites: string[] = [];
+  let imports = 0;
+  let dynamicImports = 0;
+  const fileSignals = new Set<string>();
+  for (const statement of sf.statements) if (ts.isImportDeclaration(statement) || ts.isImportEqualsDeclaration(statement)) imports += 1;
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const rawName = callName(node.expression);
+      if (rawName === 'import' || rawName.startsWith('import(')) dynamicImports += 1;
+      if (/\b(?:Bun\.)?spawn(?:Sync)?\b|\b(?:exec|execSync|execFile|execFileSync|fork)\b|\.spawn\(/.test(rawName)) fileSignals.add('spawn');
+      if (/\b(?:sleep|delay)\b|\b(?:setTimeout|setInterval)\b|Bun\.sleep/.test(rawName)) fileSignals.add('sleep');
+      if (/\bfetch\b|\brequest\b|\b(?:https?|http|WebSocket)\.(?:request|get|connect)\b|\bnewWebSocket\b|\baxios\.(?:get|post|put|patch|delete)\b/.test(rawName)) fileSignals.add('network');
+      const root = apiRoot(node.expression);
+      const titleArg = node.arguments[0];
+      const title = titleFrom(titleArg);
+      if ((root === 'describe' || root === 'suite') && title?.fragments.length === 1) {
+        suites.push(title.fragments[0]!);
+        const callback = node.arguments[1];
+        if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
+          visit(callback.body);
+        }
+        suites.pop();
+        for (const arg of node.arguments.slice(2)) visit(arg);
+        return;
+      }
+      if (root === 'test' || root === 'it') {
+        const callback = node.arguments.find((arg, index) => index > 0 && (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)));
+        const body = callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) ? callback.body : undefined;
+        cases.push({ title: title?.title ?? '<dynamic-title>', templateFragments: title?.fragments ?? [], suite: [...suites], body, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1, assertions: assertionKinds(body) });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return { imports, dynamicImports, fileSignals: [...fileSignals].sort(), cases };
+}
+
+export function caseFor(row: JunitCase, cases: CaseSource[]): CaseSource | undefined {
+  const sameIdentity = cases.filter((item) => {
+    const suiteMatches = item.suite.length === row.suitePath.length && item.suite.every((part, index) => part === row.suitePath[index]);
+    const classnameMatches = row.classname === item.suite.join(' > ');
+    return suiteMatches && classnameMatches;
+  });
+  const sameTitle = sameIdentity.filter((item) => {
+    if (item.templateFragments.length === 0) return false;
+    if (/%[sdifjpoO#]/.test(item.title)) {
+      const fragments = item.title.split(/%[sdifjpoO#]/g);
+      let cursor = 0;
+      for (let index = 0; index < fragments.length; index += 1) {
+        const fragment = fragments[index]!;
+        if (!fragment) continue;
+        const found = row.name.indexOf(fragment, cursor);
+        if (found < 0 || (index === 0 && found !== 0)) return false;
+        cursor = found + fragment.length;
+        if (index === fragments.length - 1 && cursor !== row.name.length) return false;
+      }
+      return cursor < row.name.length || fragments.at(-1) !== '';
+    }
+    if (item.title === row.name) return true;
+    if (item.templateFragments.length < 2) return false;
+    let cursor = 0;
+    for (let index = 0; index < item.templateFragments.length; index += 1) {
+      const fragment = item.templateFragments[index]!;
+      const found = row.name.indexOf(fragment, cursor);
+      if (found < 0 || (index === 0 && found !== 0)) return false;
+      cursor = found + fragment.length;
+      if (index === item.templateFragments.length - 1 && cursor !== row.name.length) return false;
+    }
+    return true;
+  });
+  return sameTitle.length === 1 ? sameTitle[0] : undefined;
+}
+
+export function sourcePathFor(file: string, sourceRoot: string): string | undefined {
+  const root = resolve(sourceRoot);
+  const path = isAbsolute(file) ? resolve(file) : resolve(root, file);
+  const fromRoot = relative(root, path);
+  if (fromRoot === '..' || fromRoot.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(fromRoot)) return undefined;
+  return path;
+}
+
+function bodyMetrics(body: ts.Node | undefined): { loops: number | null; numericCandidates: string[] } {
+  if (!body) return { loops: null, numericCandidates: [] };
+  let loops = 0;
+  const numbers = new Set<string>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isForStatement(node) || ts.isForOfStatement(node) || ts.isForInStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node)) loops += 1;
+    if (ts.isNumericLiteral(node)) {
+      const n = Number(node.text.replace(/_/g, ''));
+      if (Number.isFinite(n) && Math.abs(n) > 1) numbers.add(node.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return { loops, numericCandidates: [...numbers].sort((a, b) => Number(a.replace(/_/g, '')) - Number(b.replace(/_/g, '')) || a.localeCompare(b)) };
+}
+
+function markdown(rows: CensusRow[], reportCount: number, gateDir: string, sourceRoot: string, shardStates?: Record<string, number>): string {
+  const esc = (text: string): string => text.replaceAll('|', '\\|').replaceAll('\n', ' ');
+  const numeric = (row: CensusRow): string => row.caseMatch === 'unmatched' || row.sourceStatus === 'missing'
+    ? '미확인' : row.numericCandidates.map(esc).join(', ') || '없음';
+  const attempts = (row: CensusRow): string => row.attempts.map((attempt) => `${attempt.report}#${attempt.document}:${attempt.seconds?.toFixed(4) ?? '미측정'}s/${attempt.result}`).join('<br>');
+  const lines = [
+    `# Test census — gate 0.3.5 cut`,
+    '',
+    `Source: \`${gateDir}\` · code: \`${sourceRoot}\` · JUnit reports ${reportCount} · shards ${JSON.stringify(shardStates ?? 'unknown')} · unique executed cases ${rows.length}. Import counts and call signals are static file-level indicators; loops and numeric candidates are scoped to uniquely matched case bodies. Numeric candidates require human review before classifying as magic numbers.`,
+    '',
+    '| 파일 | suite 경로 | classname | 케이스 | 게이트 소요(s, 첫 실행) | 시도별 소요·결과 | import 수(정적/동적) | spawn/sleep/네트워크(정적 신호) | 반복 루프 | 매직 넘버 후보(>1) | 계약 요약 | 소스 상태 | 케이스 연결 |',
+    '|---|---|---|---|---:|---|---:|---|---:|---|---|---|---|',
+  ];
+  for (const row of rows) {
+    const signalNames = ['spawn', 'sleep', 'network'].filter((key) => row[key as 'spawn' | 'sleep' | 'network']);
+    const staticSignals = row.sourceStatus === 'missing' ? '미확인' : signalNames.join(', ') || '없음';
+    lines.push(`| ${esc(row.file)} | ${esc(row.suitePath.join(' > '))} | ${esc(row.classname)} | ${esc(row.name)} | ${row.seconds?.toFixed(4) ?? '미측정'} | ${attempts(row)} | ${row.imports ?? '미확인'}/${row.dynamicImports ?? '미확인'} | ${staticSignals} | ${row.loops ?? '미확인'} | ${numeric(row)} | ${esc(row.contract)} | ${row.sourceStatus} | ${row.caseMatch} |`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function tsv(rows: CensusRow[], reportCount: number, gateDir: string, sourceRoot: string, shardStates?: Record<string, number>): string {
+  const escape = (value: unknown): string => String(value ?? '').replaceAll('\\', '\\\\').replaceAll('\t', '\\t').replaceAll('\r', '').replaceAll('\n', '\\n');
+  const columns: Array<keyof CensusRow> = ['file', 'suitePath', 'classname', 'name', 'line', 'seconds', 'result', 'attempts', 'sourceStatus', 'caseMatch', 'imports', 'dynamicImports', 'spawn', 'sleep', 'network', 'loops', 'numericCandidates', 'contract', 'sourceLine'];
+  const cellValue = (row: CensusRow, column: keyof CensusRow): unknown => {
+    if (column === 'attempts') return JSON.stringify(row.attempts);
+    if (column === 'suitePath') return row.suitePath.join(' > ');
+    if (['imports', 'dynamicImports', 'spawn', 'sleep', 'network', 'loops'].includes(column) && row[column] === null) return 'unknown';
+    if (column === 'numericCandidates' && (row.caseMatch === 'unmatched' || row.sourceStatus === 'missing')) return 'unknown';
+    return Array.isArray(row[column]) ? (row[column] as string[]).join(',') : row[column];
+  };
+  return [
+    `# gateDir=${gateDir} sourceRoot=${sourceRoot} reports=${reportCount} cases=${rows.length} shards=${JSON.stringify(shardStates ?? 'unknown')}; imports/call-signals are static file-level indicators; loops/numeric-candidates are from uniquely matched case bodies; unknown differs from none; seconds=first report, result=last parsed attempt, attempts=all report/document timings and outcomes`,
+    columns.join('\t'),
+    ...rows.map((row) => columns.map((column) => escape(cellValue(row, column))).join('\t')),
+  ].join('\n') + '\n';
+}
+
+function main(): void {
+  const args = process.argv.slice(2);
+  const root = process.cwd();
+  const positional = args[0] && !args[0]!.startsWith('--') ? args[0] : undefined;
+  const gateDir = resolve(positional ?? join(process.env.HOME ?? '', '.elanous/release/0.3.5/gate-logs/cut'));
+  const sourceRootIndex = args.indexOf('--source-root');
+  if (sourceRootIndex >= 0 && !args[sourceRootIndex + 1]) throw new Error('--source-root requires a directory');
+  const sourceRoot = resolve(sourceRootIndex >= 0 ? args[sourceRootIndex + 1]! : root);
+  const formatIndex = args.indexOf('--format');
+  const format = formatIndex >= 0 ? args[formatIndex + 1] : 'tsv';
+  const outIndex = args.indexOf('--out');
+  const out = outIndex >= 0 ? args[outIndex + 1] : undefined;
+  if (format !== 'markdown' && format !== 'json' && format !== 'tsv') throw new Error('--format must be markdown, tsv or json');
+  const reportPaths = filesUnder(gateDir).filter((path) => path.endsWith('.junit.xml'));
+  if (!reportPaths.length) throw new Error(`no JUnit reports under ${gateDir}`);
+  const manifestPath = join(gateDir, 'shards.json');
+  const manifest = (() => {
+    try { return JSON.parse(readFileSync(manifestPath, 'utf8')) as { shards?: Array<{ state?: string }> }; }
+    catch { return undefined; }
+  })();
+  const shardStates = manifest?.shards?.reduce<Record<string, number>>((counts, shard) => {
+    const state = shard.state ?? 'unknown';
+    counts[state] = (counts[state] ?? 0) + 1;
+    return counts;
+  }, {});
+  const cases = junitCases(reportPaths, gateDir);
+  const sourceCache = new Map<string, SourceFacts | null>();
+  const rows: CensusRow[] = cases.map((row) => {
+    const sourcePath = sourcePathFor(row.file, sourceRoot);
+    let facts = sourcePath ? sourceCache.get(sourcePath) : null;
+    if (sourcePath && facts === undefined) {
+      try { facts = parseSource(sourcePath); } catch { facts = null; }
+      sourceCache.set(sourcePath, facts);
+    }
+    const matched = facts ? caseFor(row, facts.cases) : undefined;
+    const metrics = bodyMetrics(matched?.body);
+    const signals = new Set(facts?.fileSignals ?? []);
+    const contract = matched ? `${row.name}${matched.assertions.length ? ` · 확인: ${matched.assertions.join(', ')}` : ''}` : row.name;
+    return {
+      ...row,
+      sourceStatus: facts ? 'parsed' : 'missing',
+      caseMatch: matched ? 'matched' : 'unmatched',
+      imports: facts?.imports ?? null,
+      dynamicImports: facts?.dynamicImports ?? null,
+      spawn: facts ? signals.has('spawn') : null,
+      sleep: facts ? signals.has('sleep') : null,
+      network: facts ? signals.has('network') : null,
+      loops: metrics.loops,
+      numericCandidates: metrics.numericCandidates,
+      contract,
+      sourceLine: matched?.line ?? null,
+    };
+  });
+  const output = format === 'json'
+    ? `${JSON.stringify({ gateDir, sourceRoot, reports: reportPaths.length, shardStates, complete: !!shardStates && Object.entries(shardStates).every(([state, count]) => state === 'done' || count === 0), cases: rows.length, rows }, null, 2)}\n`
+    : format === 'tsv' ? tsv(rows, reportPaths.length, gateDir, sourceRoot, shardStates) : markdown(rows, reportPaths.length, gateDir, sourceRoot, shardStates);
+  if (out) writeFileSync(out, output);
+  else process.stdout.write(output);
+}
+
+if (import.meta.main) main();

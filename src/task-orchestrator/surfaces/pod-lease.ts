@@ -755,7 +755,12 @@ export function harnessCpuSlotsBesideGate(measure: PoolLeaseMeasure): number | n
   return slots;
 }
 
-/** Per-node memory and per-member slots cannot be exchanged across nodes/clusters. */
+/**
+ * Cold Job admission: per-node memory and per-member slots cannot be exchanged across nodes/clusters.
+ * A zero recommendation closes new Job slots; it does not mean a compatible warm SI Pod is unavailable.
+ * Warm Pod acquire/return is owned by SiWarmPodProvider and cleanAndReturnChildPod, which gate reuse on
+ * the primary-control lease and successful cleanup; a cold-slot result is not the warm-pool availability signal.
+ */
 export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capacity: number; perGoalMemory?: string; liteGoalMemory?: string; accounts: number; perAccount: number }): PoolLeaseRecommendation {
   const empty: PoolLeaseRecommendation = { recommended: null, limitedBy: null, reason: null, capacitySlots: null, memorySlots: null, liteMemorySlots: null, placeableSlots: null, accountSlots: null, running: null, pending: null, unleasedRunning: null };
   const goalBytes = quantity(options.perGoalMemory ?? '16Gi', 'memory');

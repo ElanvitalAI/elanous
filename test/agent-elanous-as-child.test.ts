@@ -10,12 +10,10 @@ import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import {
   createElanousAsChildAdapter,
-  registerDefaultElanousAsChildAdapter,
   _resetElanousAsChildSessionSeqForTesting,
   ELANOUS_AGENT_DEPTH_ENV,
   ELANOUS_AGENT_DEPTH_CAP_ENV,
 } from '../src/agent/adapters/elanous-as-child.js';
-import { AdapterRegistry } from '../src/agent/adapter-registry.js';
 
 interface FakeChild {
   pid: number;
@@ -263,16 +261,5 @@ describe('session lifecycle', () => {
     expect(snap).toContain('elanous-as-child');
     expect(snap).toContain('pid=');
     expect(snap).toContain('status=');
-  });
-});
-
-describe('registerDefaultElanousAsChildAdapter', () => {
-  test('registers into a registry · returns disposer', () => {
-    const r = new AdapterRegistry();
-    const { spawn } = makeFakeSpawn();
-    const off = registerDefaultElanousAsChildAdapter(r, { _spawnFactory: spawn });
-    expect(r.list().map((x) => x.id)).toEqual(['elanous-as-child']);
-    off();
-    expect(r.list()).toEqual([]);
   });
 });

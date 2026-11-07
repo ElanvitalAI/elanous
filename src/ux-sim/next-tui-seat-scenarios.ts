@@ -542,7 +542,7 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
       ...base.env,
       ELANOUS_TEST_FAST_WAKEUP_CLOCK: '1',
       [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '예약해줘', name: 'ScheduleWakeup', args: { delaySeconds: 60, reason: '점검' } }),
-      [TEST_FAKE_LLM_DELAY_MS_ENV]: '5000',
+      [TEST_FAKE_LLM_DELAY_MS_ENV]: '3000',
       [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '긴 작업',
     },
     steps,

@@ -1,0 +1,37 @@
+version: 1
+kind: release-graph-simulation
+id: release-heal-macrophage-bus
+run:
+  graphId: release-loop
+  runId: sim-release-heal-macrophage
+  mode: simulation
+inject:
+  - event: node-end
+    sourceNode: pre-gate-join
+    data:
+      macrophageScraps:
+        - id: stale-draft
+          kind: stale-draft
+          owner: seat-sim
+          evidence: { draftAction: close, ownerRunStatus: done }
+  - event: release.gate.failed
+    sourceNode: gate-triage
+    data:
+      version: 0.3.6
+      outcome: regression
+      commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      introduced: ["src/release.test.ts > injected regression"]
+      visitState: { gate: 1, gateTriage: 1 }
+expect:
+  deliveries:
+    - { event: release.macrophage.decision, subscriber: simulation-ledger, action: plan-only }
+    - { event: release.gate.failed, subscriber: adaptive-gate-heal, action: append-repair-and-resume }
+  append:
+    afterNodeId: gate-triage
+    resumeFromPrefix: gate-repair-
+    rerunGateAt: gate
+  macrophage:
+    id: stale-draft
+    action: triage-draft
+    status: simulated
+    applied: true

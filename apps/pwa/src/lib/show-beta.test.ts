@@ -75,7 +75,7 @@ test('the general-only switch updates desktop and mobile beta menus and badges i
   expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').find((link) => link.props['aria-label'] === '오늘')?.props.href).toBe('/today');
   act(() => root.findByProps({ role: 'switch' }).props.onChange({ currentTarget: { checked: true } }));
   expect(root.findByProps({ role: 'switch' }).props.checked).toBe(true);
-  for (const path of ['/exec', '/field', '/trace', '/autopilot', '/vault', '/intake']) {
+  for (const path of ['/exec', '/field', '/trace', '/vault', '/intake']) {
     expect(hrefs()).toContain(path);
     expect(sidebar().findAllByType('a').find((link) => link.props.href === path)!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
   }

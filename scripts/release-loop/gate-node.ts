@@ -14,6 +14,7 @@ import { loadEnvKnownFailures, splitKnownEnv } from './env-known-failures';
 import { loadGateBatchSafe } from './gate-batch-safe';
 import { observeGatePrewarmCutShadow, type GatePrewarmInput } from './gate-prewarm-plan.js';
 import { gateHistory } from './gate-history.js';
+import { baselineUnmeasurableTimeoutIds } from './gate-baseline.js';
 import { baselineFromCutLogs } from './baseline-from-logs';
 import { changedFilesBetween, mergePartialFailures, readPartialPlanResult, testFileOfId, verifyDocsOnlyCarry } from './gate-partial';
 import { planGateRadiusShadow, shadowActual, writeGateRadiusShadow, type GateRadiusShadowPlan } from './gate-radius-shadow';
@@ -32,8 +33,10 @@ import { logPlanWalltime, planDurations, readFileMemory } from './shard-plan';
 import { defaultGateHostMirrorReaders, resolveGateHostMirror, type GateHostMirror, type GateHostMirrorReaders } from './gate-host-mirror';
 import { isGateSpawnLaneFile, planGateSpawnSeparatedShards } from './spawn-lane';
 import { GATE_POD_ENV_BASELINE, gateTestBaseline } from '../lib/gate-test-env.js';
+import { gateLockfileHashAtCommit, gateTestedFileHashesAtCommit, sameGateTestedFileHashes } from './gate-reuse-identity.js';
 export { GATE_POD_ENV_BASELINE } from '../lib/gate-test-env.js';
 import { readJunitFileSeconds } from './gate-method';
+import { firstParentCommitsBetween, planGateBisect } from './gate-bisect.js';
 import { deriveCdpTestPatterns } from '../test-deterministic';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
 import { isGateExecutor, type GateExecutor } from './gate-executor.js';
@@ -53,9 +56,9 @@ import { decideWarmReuse, type WarmReuseSwitchConfig, type WarmReuseEvidence } f
 import { invalidateWarmReuseEvidence, recordWarmReuseComparison, type ActualWarmLeaseEvidence } from '../../src/task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { getUserConfig, userConfigPath } from '../../src/user-config.js';
 import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateJobTerminal, type GateShard } from '../../src/release-loop/gate-shards.js';
-import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
-import { markGateShardUnmeasured, nextGateShardAttempt, readGateShardManifest, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
-import { planGateReceiptRadius, planGateShardDispatch, summarizeGateProgress, type GateProgressGroup, type GateShardReceipt } from './gate-shard-dispatch.js';
+import { appendGateShardLedgerBatch, appendGateShardLedgerForGate, gateShardLedgerBatchComplete, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
+import { carryGateShardResult, markGateShardUnmeasured, nextGateShardAttempt, readGateShardManifest, readGateShardManifestHistory, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
+import { gateProgressTransitionKey, gateShardRuntimeIdentityKey, planGateReceiptRadius, planGateShardDispatch, summarizeGateProgress, type GateProgressGroup, type GateShardReceipt } from './gate-shard-dispatch.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from './tui-node-checks.js';
 import { runWithReleaseGateTraffic, runWithReleasePwaTraffic } from './gate-traffic-mode.js';
@@ -65,6 +68,21 @@ import { startReleaseStageStallWatch } from '../../src/release-loop/stage-mail.j
 import { normRoot } from '../../src/instance/resolve.js';
 import { cleanRetryVerdict, junitFailedCaseIds, junitTestcaseCount, junitTestcaseFiles } from './gate-shard-load-flaky.js';
 import { decideAndRecordGateAutoheal, gateAutohealCause, type GateAutohealDecision } from './gate-autoheal.js';
+
+/** Gate roster pools must prove the same immutable image; a down pool may be excluded, a different image may not. */
+export function mismatchedGateRosterImagePools(
+  poolImages: ReadonlyMap<string, readonly string[]>, pinnedDigest: string,
+): string[] {
+  // The second-pool protocol is specifically the node-b + mshq roster. Other rosters retain
+  // the established behavior of excluding pools that cannot serve this run's pinned digest.
+  if (poolImages.size !== 2 || !poolImages.has('pool-node-b') || !poolImages.has('pool-mshq')) return [];
+  const expected = normalizeGateImageDigest(pinnedDigest);
+  if (!expected) return [...poolImages.keys()];
+  return [...poolImages].flatMap(([pool, images]) => {
+    const measured = images.filter((image) => image.trim().length > 0);
+    return measured.some((image) => normalizeGateImageDigest(image) !== expected) ? [pool] : [];
+  });
+}
 
 export interface WarmShadowObservation {
   files: string[];
@@ -140,6 +158,19 @@ export interface GateTools {
   admission?: GateAdmission;
   /** The live progress heartbeat scheduler; tests inject a deterministic tick, production uses an unref'd interval. */
   progressScheduler?: GateProgressScheduler;
+  /** Simulation seam for the detached regression-attribution sidecar launch. */
+  startBisectSidecar?: (inputPath: string, gateOutcome: GateResult['outcome']) => void | Promise<void>;
+  /** Simulation-only failure seam for the post-settlement HQ batch receiver. */
+  appendShardLedgerBatch?: typeof appendGateShardLedgerBatch;
+}
+
+function emitGatePhaseProgress(phase: string, data: Record<string, unknown> = {}): void {
+  const row = { phase, at: new Date().toISOString(), ...data };
+  debug.log('release-loop.gate', `phase-${phase}`, row, { level: /failed|rejected/.test(phase) ? 'error' : 'info' });
+  const path = process.env.ELANOUS_GATE_PROGRESS_FILE;
+  if (!path) return;
+  try { mkdirSync(dirname(path), { recursive: true }); appendFileSync(path, `${JSON.stringify(row)}\n`, { mode: 0o600 }); }
+  catch (error) { debug.log('release-loop.gate', 'phase-event-write-failed', { phase, error: String(error) }, { level: 'warn' }); }
 }
 
 export type GateProgressScheduler = (tick: () => void, intervalMs: number) => () => void;
@@ -171,6 +202,7 @@ export interface GateRunner {
   /** GATE-FLOW-SIM — the clock this runner measures with (the injected fake clock in a scenario); absent = `Date.now`. */
   now?(): number;
   progressScheduler?: GateProgressScheduler;
+  startBisectSidecar?(inputPath: string, gateOutcome: GateResult['outcome']): void | Promise<void>;
 }
 
 /** One watchdog tick. Batch Kubernetes reads per host and trust only the current attempt's result marker. */
@@ -247,6 +279,8 @@ export interface GateOptions {
   warmPrecutCanary?: { file: string };
   /** RELEASE-POLICY-PACK — the gate Pod image is tied to this resolved cut commit. */
   imagePin?: 'cut-commit';
+  /** Internal ARG repair mode: build/record the cut image pin without starting a gate sweep. */
+  imagePinPrepareOnly?: boolean;
   /** The graph run that launched this gate; direct hard rehearsal instead pins source bytes explicitly. */
   graphRunId?: string;
   /** Only a direct hard rehearsal may pin graph bytes from its measured Git commit. */
@@ -286,6 +320,8 @@ export interface GateOptions {
     /** Explicit gate-profile producer handoff; shadow-only callers keep their Job path. */
     warmProducerEnabled?: boolean;
     warmFinalize?: (command: WarmWorkerCommand) => Promise<void>;
+    /** Invocation-scoped receipt; called only after a warm producer is finalized for this gate result. */
+    onWarmPodFinalized?: () => void;
     /** Set only on the cut recheck; baseline Jobs never consume the cut worker. */
     warmCutSha?: string;
     /** A measured planner snapshot may accompany the cut; absent fields remain visibly unmeasured. */
@@ -465,7 +501,12 @@ async function startWarmGateControl(config: unknown, dependencies: WarmGateContr
 
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
+  summary?: string;
   commit: string;
+  /** Present only when the ARG image-repair node completed its cut-image preparation step. */
+  imagePin?: 'cut-commit';
+  imagePinRunId?: string;
+  imagePinDigest?: string;
   /** Formal receipt fallback decision observed by the real graph-scoped gate. */
   formalReceiptDecision?: string;
   /** Human-readable decision for a rehearsal receipt considered by this cut. */
@@ -482,6 +523,8 @@ export interface GateResult {
   unmeasuredRecheckFiles?: string[];
   /** Shadow only: Job verdict is unchanged even on a worker mismatch or failed quarantine. */
   warmShadow?: WarmShadowObservation[];
+  /** Successfully finalized warm Pods used by this cut's isolated gate rechecks. */
+  reusedWarmPods?: number;
   /** GATE-POD-STALL-FAILFAST ① — cut sweep shard Pods ended by the mid-run abort (their files went the timeout way). */
   abortedShards?: number;
   baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
@@ -2005,9 +2048,12 @@ function gateRuntimeSourceFingerprint(repo: string, commit: string, identity: { 
 
 export function gateReceiptReuseKey(receipt: GateShardReceipt | null, version: string, head40: string, fingerprint: string,
   expectedImageDigest: string | null | undefined, currentIdentity: import('./gate-radius-live.js').GatePodExecutionIdentity | null,
-  graphPins: ({ graphSha: string; recipeSha: string } & { graphEntry?: string; recipeCommand?: string; recipeTimeoutMs?: number }) | null): { envKey?: string; reason: string } {
+  graphPins: ({ graphSha: string; recipeSha: string } & { graphEntry?: string; recipeCommand?: string; recipeTimeoutMs?: number }) | null,
+  testedProof?: { lockfileHash: string | null; testedFileHashes: Record<string, string> | null }): { envKey?: string; reason: string } {
   if (!receipt) return { reason: 'receipt-missing' };
   if (receipt.status !== 'complete') return { reason: 'receipt-unmeasured' };
+  if (!Array.isArray(receipt.failureIds) || !Array.isArray(receipt.errorIds)) return { reason: 'receipt-failure-evidence-unmeasured' };
+  if (receipt.failureIds.length || receipt.errorIds.length) return { reason: 'receipt-has-failures' };
   if (!currentIdentity) return { reason: 'current-environment-unmeasured' };
   if (!graphPins?.graphEntry || !graphPins.recipeCommand) return { reason: 'current-shard-recipe-unmeasured' };
   if (!receipt.version || !receipt.head40 || !receipt.graphSha || !receipt.recipeSha || !receipt.graphEntry || !receipt.recipeCommand || !Number.isSafeInteger(receipt.recipeTimeoutMs) || !receipt.imageDigest || !receipt.runtimeIdentity || !receipt.envFingerprint)
@@ -2015,21 +2061,70 @@ export function gateReceiptReuseKey(receipt: GateShardReceipt | null, version: s
   if (receipt.graphEntry !== graphPins.graphEntry) return { reason: 'graph-entry-mismatch' };
   if (receipt.recipeCommand !== graphPins.recipeCommand) return { reason: 'recipe-command-mismatch' };
   if (receipt.recipeTimeoutMs !== graphPins.recipeTimeoutMs) return { reason: 'recipe-timeout-mismatch' };
-  const environmentFields = ['bunVersion', 'platform', 'architecture', 'envFingerprint', 'baseImageDigest'] as const;
-  const stored: Record<string, string> = { ...receipt.runtimeIdentity, envFingerprint: receipt.envFingerprint };
+  const environmentFields = ['bunVersion', 'platform', 'architecture', 'baseImageDigest'] as const;
+  const stored: Record<string, string> = { ...receipt.runtimeIdentity };
   const current: Record<string, string> = { ...currentIdentity };
   for (const field of environmentFields) {
     if (!stored[field] || !current[field]) return { reason: `environment-${field}-unmeasured` };
     if (stored[field] !== current[field]) return { reason: `environment-${field}-mismatch` };
   }
-  if (receipt.envFingerprint !== receipt.runtimeIdentity.envFingerprint || receipt.envKey !== `${receipt.envFingerprint}:${receipt.imageDigest}`)
+  const receiptRuntimeKey = gateShardRuntimeIdentityKey(receipt.runtimeIdentity, receipt.lockfileHash);
+  const currentRuntimeKey = gateShardRuntimeIdentityKey(currentIdentity, testedProof?.lockfileHash ?? receipt.lockfileHash);
+  if (receipt.envFingerprint !== receipt.runtimeIdentity.envFingerprint || !receiptRuntimeKey || receipt.envKey !== receiptRuntimeKey)
     return { reason: 'receipt-env-record-inconsistent' };
-  if (receipt.runtimeIdentity.envFingerprint !== fingerprint) return { reason: 'environment-envFingerprint-current-fingerprint-mismatch' };
+  if (!currentRuntimeKey || currentRuntimeKey !== receiptRuntimeKey) return { reason: 'runtime-identity-mismatch' };
+  if (testedProof && (!testedProof.lockfileHash || !/^[a-f0-9]{64}$/i.test(testedProof.lockfileHash)
+    || receipt.lockfileHash !== testedProof.lockfileHash)) return { reason: 'runtime-lockfile-mismatch-or-unmeasured' };
+  if (testedProof && (!testedProof.testedFileHashes || !sameGateTestedFileHashes(receipt.testedFileHashes, testedProof.testedFileHashes)))
+    return { reason: 'tested-file-content-mismatch-or-unmeasured' };
   const currentImageDigest = expectedImageDigest ?? currentIdentity.imageDigest;
   if (!currentImageDigest) return { reason: 'environment-imageDigest-current-pin-unmeasured' };
-  if (receipt.imageDigest !== currentImageDigest) return { reason: 'receipt-imageDigest-current-pin-mismatch' };
+  if (!/^sha256:[a-f0-9]{64}$/i.test(currentImageDigest)) return { reason: 'environment-imageDigest-current-pin-unmeasured' };
   if (currentImageDigest !== currentIdentity.imageDigest) return { reason: 'environment-imageDigest-current-pin-mismatch' };
-  return { envKey: receipt.envKey, reason: `environment-match; baseline=${receipt.version}@${receipt.head40.slice(0, 12)}; current=${version}@${head40.slice(0, 12)}` };
+  return { envKey: receipt.envKey, reason: `runtime-match; image-compatible; baseline=${receipt.version}@${receipt.head40.slice(0, 12)}; current=${version}@${head40.slice(0, 12)}` };
+}
+
+/** A prior shard is reusable across commits only when no changed input reaches one of its tests. */
+function gateReceiptChangedFileImpact(repo: string, from: string, to: string, tests: readonly string[]): { files: string[]; fullRerun?: string } {
+  let changed: string[];
+  try { changed = changedFilesBetween(repo, from, to); }
+  catch (error) { return { files: [...tests], fullRerun: `changed-file-diff-unreadable:${String(error).slice(0, 120)}` }; }
+  if (!changed.length) return { files: [] };
+  const runtimeWide = (file: string) => {
+    const base = file.split('/').at(-1) ?? file;
+    return base === 'package.json' || base === 'bun.lock' || base === 'bun.lockb' || base === 'bunfig.toml'
+      || /^tsconfig[^/]*\.json$/.test(base) || /^.+\.config\.[cm]?[jt]sx?$/.test(base)
+      || file.startsWith('docker/') || file.startsWith('.github/')
+      || /^(?:test|tests|scripts\/test)\/.+\/(?:setup|preload)[^/]*\.[^.]+$/.test(file)
+      || /^(?:test|tests|scripts\/test)\/(?:setup|preload)[^/]*\.[^.]+$/.test(file);
+  };
+  if (changed.some(runtimeWide)) return { files: [...tests], fullRerun: 'changed-runtime-environment-input' };
+  const testPath = /^(?:[\w.-]+\/)*[\w.-]+\.test\.ts$/;
+  const changedTests = changed.filter((file) => testPath.test(file));
+  const source = changed.filter((file) => !testPath.test(file) && file.endsWith('.ts'));
+  const nonTs = changed.filter((file) => !file.endsWith('.ts'));
+  // Non-runtime assets are dependencies only when tracked TypeScript names their exact path. An unsearchable tree
+  // cannot prove reuse, while grep's ordinary no-match result means that no TypeScript test/source names this input.
+  for (const file of nonTs) {
+    const grep = spawnSync('git', ['grep', '-l', '-F', '-e', file, to, '--', '*.ts'], { cwd: repo, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+    if (grep.error || (grep.status !== 0 && grep.status !== 1))
+      return { files: [...tests], fullRerun: `changed-non-ts-reference-search-failed:${String(grep.error ?? grep.stderr ?? `git grep rc=${grep.status}`).slice(0, 120)}` };
+    if (grep.status === 0) source.push(...grep.stdout.split(/\r?\n/).filter(Boolean).map((match) => {
+      const treePrefix = `${to}:`;
+      return match.startsWith(treePrefix) ? match.slice(treePrefix.length) : match;
+    }));
+  }
+  const impacted = new Set(changedTests);
+  if (source.length) {
+    try {
+      const tree = gitClosureTree(repo, to);
+      if (source.some((file) => !tree.files.includes(file))) return { files: [...tests], fullRerun: 'changed-source-missing-at-current-head' };
+      const closure = testsReachingChanged(tree, source, tests);
+      if (!closure.ok) return { files: [...tests], fullRerun: `changed-source-closure-unreadable:${closure.reason.slice(0, 120)}` };
+      for (const file of closure.tests) impacted.add(file);
+    } catch (error) { return { files: [...tests], fullRerun: `changed-source-closure-error:${String(error).slice(0, 120)}` }; }
+  }
+  return { files: [...impacted].sort() };
 }
 
 export type GateAdmissionOutcome = 'granted' | 'admission-timeout' | 'admission-error' | 'off';
@@ -2184,6 +2279,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     if (!pod.pool || !Number.isSafeInteger(shardCount) || shardCount < 1
       || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1
       || !Number.isSafeInteger(isolationConcurrency) || isolationConcurrency < 1) throw new Error('invalid pod sweep options');
+    // Validate remote ledger wiring before inventory, planning, or any Pod work.
+    // Parsing the configured roster is local and does not probe hosts.
+    const remoteLedgerRequired = !!pod.shardsFile && (poolOverride?.members ?? parsePodPool(pod.pool)).some((member) => !!member.sshHost);
+    if (remoteLedgerRequired && (!pod.shardsFile?.ledgerPath || !pod.shardsFile.envFingerprint)) {
+      emitGatePhaseProgress('preflight-failed', { reason: 'HQ shard ledger is not configured' });
+      throw new Error('remote gate refused: HQ shard ledger is not configured');
+    }
     const hasPinnedDigest = Boolean(pod.pinnedImageDigest?.trim());
     const hasPinnedRunId = Boolean(pod.pinnedRunId?.trim());
     if (hasPinnedDigest !== hasPinnedRunId) throw new Error('gate pinned image: both pinnedImageDigest and pinnedRunId are required');
@@ -2191,6 +2293,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     check(head, 'cut tree HEAD');
     const commit = head.output.trim();
     if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('invalid cut tree HEAD');
+    emitGatePhaseProgress('shard-planning', { total: shardCount, commit });
     const selectionStart = clock();
     const listed = await command('git', ['ls-files', '*.test.*'], tree);
     check(listed, 'git ls-files tests');
@@ -2230,13 +2333,55 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const riskPlan = planGateRiskLaneShards({ assignable, durations, shardCount, heavy, watchList });
     let shards = riskPlan.shards;
     const receiptRoot = pod.shardsFile?.receiptRoot;
-    const priorReceiptRows = only && receiptRoot && existsSync(receiptRoot) ? readdirSync(receiptRoot).filter((name) => /^pod-\d+\.receipt\.json$/.test(name))
-      .sort((a, b) => Number(a.slice(4).split('.')[0]) - Number(b.slice(4).split('.')[0]))
-      .map((name) => readGateShardManifest(receiptRoot, name.replace('.receipt.json', ''))).filter((row): row is GateShardReceipt => !!row) : [];
-    const radiusReceiptPlan = only && priorReceiptRows.length ? planGateReceiptRadius({ receipts: priorReceiptRows, tests: allAssignable, selectedFiles: only ?? files, priorCommit: pod.shardsFile?.radiusPriorCommit ?? '' }) : null;
+    const priorReceiptRows = !pod.freshShards && receiptRoot && existsSync(receiptRoot) ? (() => {
+      const ids = readdirSync(receiptRoot).flatMap((name) => {
+        const match = /^pod-(\d+)\.receipt(?:\.[a-f0-9]{40})?\.json$/i.exec(name);
+        return match ? [`pod-${Number(match[1])}`] : [];
+      });
+      const histories = [...new Set(ids)].flatMap((id) => readGateShardManifestHistory(receiptRoot, id));
+      const byHead = new Map<string, GateShardReceipt[]>();
+      for (const receipt of histories) {
+        const rows = byHead.get(receipt.head40) ?? [];
+        rows.push(receipt);
+        byHead.set(receipt.head40, rows);
+      }
+      const completeSets = [...byHead.values()].map((rows) => rows.sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4))))
+        .filter((rows) => rows.length > 0 && rows.every((row, index) => row.id === `pod-${index}` && row.status === 'complete'))
+        .sort((a, b) => Math.min(...b.map((row) => Date.parse(row.measuredAt))) - Math.min(...a.map((row) => Date.parse(row.measuredAt))));
+      return completeSets[0] ?? [];
+    })() : [];
+    const receiptHeads = [...new Set(priorReceiptRows.map((receipt) => receipt.head40))];
+    const changedReceiptFiles = new Set<string>();
+    let changedReceiptFullRerun: string | null = null;
+    for (const priorHead of receiptHeads) if (priorHead !== commit) {
+      const impact = gateReceiptChangedFileImpact(repo, priorHead, commit, allAssignable);
+      if (impact.fullRerun) changedReceiptFullRerun = impact.fullRerun;
+      for (const file of impact.files) changedReceiptFiles.add(file);
+    }
+    const radiusSelection = only ?? (changedReceiptFullRerun ? allAssignable : [...changedReceiptFiles]);
+    const radiusPriorCommit = only ? pod.shardsFile?.radiusPriorCommit ?? '' : receiptHeads.length === 1 ? receiptHeads[0]! : commit;
+    const radiusReceiptPlan = priorReceiptRows.length ? planGateReceiptRadius({ receipts: priorReceiptRows, tests: allAssignable,
+      selectedFiles: radiusSelection, priorCommit: radiusPriorCommit }) : null;
     const radiusUnchangedShardIds = radiusReceiptPlan?.unchangedShardIds ?? [];
     const radiusInvalidatedShardIds = radiusReceiptPlan?.invalidatedShardIds ?? [];
     if (radiusReceiptPlan) { assignable = allAssignable; shards = radiusReceiptPlan.shards.map((shard) => ({ ...shard, plannedSeconds: shard.files.reduce((total, file) => total + (durations.get(file) ?? 0), 0) })); shardCount = shards.length; }
+    else if (priorReceiptRows.length) {
+      // Keep the measured partition stable across commits when the complete test inventory is unchanged. Replanning from
+      // current durations can move tests between shard IDs and makes a valid per-shard impact proof unusable.
+      const ordered = [...priorReceiptRows].sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
+      const measuredFiles = ordered.flatMap((receipt) => receipt.files);
+      const inventory = new Set(allAssignable);
+      const stableLayout = ordered.every((receipt, index) => receipt.id === `pod-${index}` && receipt.status === 'complete'
+        && receipt.files.length > 0 && receipt.files.every((file) => inventory.has(file)))
+        && measuredFiles.length === allAssignable.length && new Set(measuredFiles).size === measuredFiles.length
+        && measuredFiles.every((file) => inventory.has(file));
+      if (stableLayout) {
+        assignable = allAssignable;
+        shards = ordered.map((receipt) => ({ id: receipt.id, files: [...receipt.files],
+          plannedSeconds: receipt.files.reduce((total, file) => total + (durations.get(file) ?? 0), 0) }));
+        shardCount = shards.length;
+      }
+    }
     const base40 = pod.shardsFile?.base40;
     const envFingerprint = pod.shardsFile?.envFingerprint;
     const expectedImageDigest = pod.shardsFile?.expectedImageDigest;
@@ -2247,6 +2392,11 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     : injectedGraphRecipePins ?? gateShardRecipeIdentityAtCommit(repo, commit);
   const currentGraphPins = sourceGraphPins && shardRecipeIdentity ? { ...sourceGraphPins, ...shardRecipeIdentity } : null;
   const currentExecutionIdentity = pod.shardsFile?.executionIdentity ?? preflightGateExecutionIdentity(pod.pool, process.env, commit);
+  const currentRuntimeSourceFingerprint = currentExecutionIdentity
+    ? gateRuntimeSourceFingerprint(repo, commit, currentExecutionIdentity) : null;
+    const currentLockfileHash = gateLockfileHashAtCommit(repo, commit);
+    const currentTestedFileHashesByShard = Object.fromEntries(shards.map((item, shard) =>
+      [`pod-${shard}`, gateTestedFileHashesAtCommit(repo, commit, item.files)])) as Record<string, Record<string, string> | null>;
     if (riskPlan.spawnFiles.length) debug.log('release-loop.gate', 'pod-spawn-lane', { files: riskPlan.spawnFiles, shards: riskPlan.spawnShardCount });
     if (riskPlan.riskFiles.length) debug.log('release-loop.gate', 'pod-risk-lane-plan', { files: riskPlan.riskFiles, shard: 0,
       plannedSeconds: riskPlan.riskPlannedSeconds, shards: shards.length, watch: watchList.length });
@@ -2268,38 +2418,60 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const ready = poolOverride ? undefined : checkPodPool(parsePodPool(pod.pool), kubectl);
     if (ready && !ready.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
     const poolScheduler = poolOverride ?? new PodPoolScheduler(ready!.ready);
+    // Remote gate evidence is part of the cut contract: a remote-only cut sweep cannot pass
+    // if its HQ ledger is unavailable or was not configured. Only the cut sweep carries shardsFile;
+    // baseline and attribution-recheck sweeps are not cut evidence and never write the HQ shard ledger.
+    emitGatePhaseProgress('shards-running', { planned: shards.length });
     type GateShardExecution = NonNullable<ReturnType<typeof parseGatePodRuntimeIdentity>>;
     type GateShardDetail = Partial<GateShardLedgerRow> & { runtimeIdentity?: GateShardExecution };
     const detailsById = new Map<string, GateShardDetail>();
     const executionsByShard = new Map<string, Array<{ branch: string; attemptId: string; imageDigest: string | null;
       runtimeIdentity: GateShardExecution | null; host: string | null }>>();
     const receiptChecks = shards.map((item, shard) => {
-      if (pod.freshShards) return { reason: 'fresh-shards' };
-      if (!receiptRoot || !base40 || !envFingerprint) return { reason: 'receipt-context-missing' };
-      const prior = readGateShardManifest(receiptRoot, `pod-${shard}`);
+      if (pod.freshShards) return { reason: 'fresh-shards', priorHead: null };
+      if (!receiptRoot || !base40 || !envFingerprint) return { reason: 'receipt-context-missing', priorHead: null };
+      const prior = priorReceiptRows.find((receipt) => receipt.id === `pod-${shard}`) ?? readGateShardManifest(receiptRoot, `pod-${shard}`);
       const sameHead = prior?.head40 === commit;
-      const priorRuntime = sameHead ? null : prior && gateRuntimeSourceFingerprint(repo, prior.head40, prior.runtimeIdentity);
-      const currentRuntime = sameHead ? null : currentExecutionIdentity && gateRuntimeSourceFingerprint(repo, commit, currentExecutionIdentity);
+      const shardImpact = prior && !sameHead
+        ? gateReceiptChangedFileImpact(repo, prior.head40, commit, allAssignable) : null;
+      const changedFileImpact = shardImpact?.fullRerun ?? (shardImpact?.files.some((file) => item.files.includes(file))
+        ? 'changed-file-reaches-shard-test' : null);
+      if (changedFileImpact) {
+        if (!radiusInvalidatedShardIds.includes(`pod-${shard}`)) radiusInvalidatedShardIds.push(`pod-${shard}`);
+        return { reason: changedFileImpact, priorHead: prior?.head40 ?? null };
+      }
+      if (prior && !sameHead && !radiusUnchangedShardIds.includes(`pod-${shard}`)) radiusUnchangedShardIds.push(`pod-${shard}`);
+      const priorRuntime = sameHead ? null : prior?.runtimeSourceFingerprint
+        ?? (prior && gateRuntimeSourceFingerprint(repo, prior.head40, prior.runtimeIdentity));
+      const currentRuntime = sameHead ? null : currentRuntimeSourceFingerprint;
+      const testedProof = { lockfileHash: currentLockfileHash, testedFileHashes: currentTestedFileHashesByShard[`pod-${shard}`] ?? null };
       const key = prior?.base40 !== base40 ? { reason: 'base40-mismatch' }
         : !sameHead && (!priorRuntime || !currentRuntime) ? { reason: 'runtime-fingerprint-unmeasured' }
           : !sameHead && priorRuntime !== currentRuntime ? { reason: 'runtime-fingerprint-mismatch' }
-            : gateReceiptReuseKey(prior, pod.shardsFile!.version, commit, envFingerprint, expectedImageDigest, currentExecutionIdentity, currentGraphPins);
+            : gateReceiptReuseKey(prior, pod.shardsFile!.version, commit, envFingerprint, expectedImageDigest, currentExecutionIdentity, currentGraphPins, testedProof);
       if (!key.envKey) {
-        return { reason: key.reason };
+        return { reason: key.reason, priorHead: prior?.head40 ?? null };
       }
       const result = readGateShardResult(receiptRoot, { shard: { id: `pod-${shard}`, files: item.files },
-        head40: prior!.head40, base40, envKey: key.envKey });
+        head40: prior!.head40, base40, envKey: key.envKey, receipt: prior! });
       const decision = result ? 'reuse' as const : 'rerun' as const;
       const reason = result ? key.reason : 'receipt-payload-or-shard-radius-mismatch';
 
-      return result ? { reason, result } : { reason };
+      return result ? { reason, result, priorHead: prior!.head40 } : { reason, priorHead: prior?.head40 ?? null };
     });
-    const receipts = receiptChecks.flatMap((check) => check.result ? [check.result.receipt] : []);
+    for (const [shard, check] of receiptChecks.entries()) debug.log('gate.receipt', 'receipt-check', {
+      shardId: `pod-${shard}`, decision: check.result ? 'reuse-candidate' : 'remeasure',
+      reason: check.reason ?? 'receipt-identity-valid', priorHead: check.priorHead, targetHead: commit,
+      priorRuntimeSourceFingerprint: check.result?.receipt.runtimeSourceFingerprint ?? null,
+      currentRuntimeSourceFingerprint,
+    });
+    const receipts = [...receiptChecks.flatMap((check) => check.result ? [check.result.receipt] : []),
+      ...priorReceiptRows.filter((receipt) => receipt.failureIds.length > 0 || receipt.errorIds.length > 0)];
     const requiredOs = pod.shardCapabilities ?? {};
     const envKnownIds = loadEnvKnownFailures(tree);
     const envKnownFiles = new Set([...envKnownIds].map(fileOf));
     const macPassShardIds = shards.flatMap((shard, index) => {
-      const prior = receipts.find((receipt) => receipt.id === `pod-${index}`);
+      const prior = [...priorReceiptRows].reverse().find((receipt) => receipt.id === `pod-${index}`);
       if (!prior) return [];
       const knownFailure = [...prior.failureIds, ...prior.errorIds].some((id) => envKnownIds.has(id));
       const knownUnmeasuredFile = prior.status === 'unmeasured' && shard.files.some((file) => envKnownFiles.has(file));
@@ -2324,6 +2496,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         ...(requiredOs[`pod-${shard}`]?.os ? { requiredOs: requiredOs[`pod-${shard}`]!.os } : {}) })), receipts,
       hosts,
       graphEntry: currentGraphPins?.graphEntry, recipeCommand: currentGraphPins?.recipeCommand, recipeTimeoutMs: currentGraphPins?.recipeTimeoutMs, environmentIdentity: currentExecutionIdentity ?? undefined,
+      lockfileHash: currentLockfileHash ?? undefined,
+      testedFileHashesByShard: Object.fromEntries(Object.entries(currentTestedFileHashesByShard).flatMap(([id, hashes]) => hashes ? [[id, hashes]] : [])),
       radiusUnchangedShardIds, invalidatedShardIds: radiusInvalidatedShardIds,
       macPassShardIds,
       ...(pod.rerouteShard ? { rerouteShard: pod.rerouteShard } : {}), ...(pod.shardHost ? { shardHost: pod.shardHost } : {}) });
@@ -2333,17 +2507,30 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       const prior = receiptChecks[Number(action.shardId.slice(4))]?.result?.receipt
         ?? readGateShardManifest(receiptRoot ?? '', action.shardId);
       detailsById.set(action.shardId, { reuseDecision: decision, reuseReason: reason });
-      debug.log('gate.receipt', 'reuse-decision', { shardId: action.shardId, decision, reason });
+      const receiptCheck = receiptChecks[Number(action.shardId.slice(4))];
+      debug.log('gate.receipt', 'reuse-decision', { shardId: action.shardId, decision, reason,
+        receiptCheckReason: receiptCheck?.reason ?? null, receiptCheckHead: receiptCheck?.priorHead ?? null,
+        targetHead: commit, host: action.kind === 'run' ? action.host : prior?.host ?? null,
+        replacingHead: action.kind === 'run' ? action.replacing?.head40 ?? null : null });
       if (pod.shardsFile?.ledgerPath && envFingerprint) {
-        try { appendGateShardLedger(pod.shardsFile.ledgerPath, {
+        try {
+          const error = appendGateShardLedgerForGate(pod.shardsFile.ledgerPath, {
           v: 1, version: pod.shardsFile!.version, phase: 'cut', shardId: action.shardId, files: [...action.files],
           host: action.kind === 'run' ? action.host : prior?.host ?? null, executor: 'pod',
-          imageDigest: prior?.imageDigest ?? null, commit, envFingerprint, startedAt: null, endedAt: null,
+          imageDigest: prior?.imageDigest ?? null, measuredImageDigest: prior?.imageDigest ?? null,
+          currentImageDigest: expectedImageDigest ?? currentExecutionIdentity?.imageDigest ?? null,
+          commit, envFingerprint, startedAt: null, endedAt: null,
           observedAt: new Date().toISOString(), state: action.kind === 'reuse' ? 'done' : 'pending',
           rc: null, pass: null, fail: null, errors: null, ran: null, failureIds: prior?.failureIds ?? null,
           errorIds: prior?.errorIds ?? null, attribution: action.kind === 'reuse' ? 'complete' : 'unmeasured',
           logPath: null, junitPath: null, stopReason: null, attemptId: null, reuseDecision: decision, reuseReason: reason,
-        }); } catch (error) { debug.log('gate.receipt', 'reuse-ledger-write-failed', { shardId: action.shardId, error: String(error) }); }
+          }, remoteLedgerRequired);
+          if (error) throw new Error(error);
+        } catch (error) {
+          debug.log('gate.receipt', 'reuse-ledger-write-failed', { shardId: action.shardId, error: String(error), failClosed: remoteLedgerRequired },
+            { level: remoteLedgerRequired ? 'error' : 'warn' });
+          if (remoteLedgerRequired) throw new Error(`remote gate refused: HQ shard ledger write failed (${action.shardId}): ${String(error)}`);
+        }
       }
     }
     // Leave ordinary shards to the live free-slot scheduler. A static plan can pick a busy member
@@ -2491,33 +2678,49 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     // GATE-LIVE-OBS — root rows stay stable; each recursive split/retry and tail gets its own row.
     // Otherwise a finished root Job can hide a still-running child (or tail) behind 80/80 done.
     const board: GateShard[] = shards.map((item, index) => ({ id: `pod-${index}`, state: 'pending', plannedMin: Math.round(item.plannedSeconds / 6) / 10 }));
-    const reportProgress = () => onProgress?.({ executor: 'pod', groups: board.map((row) => ({
-      id: row.id, state: row.state === 'retry' ? 'running' : row.state,
-      ...(row.host ? { host: row.host } : {}),
-      ...(row.startedAt ? { startedAtMs: Date.parse(row.startedAt) } : {}),
-      ...(row.endedAt ? { endedAtMs: Date.parse(row.endedAt) } : {}),
-    })) });
+    let collectionStarted = false;
+    const reportProgress = () => onProgress?.({ executor: 'pod', groups: board.map((row) => {
+      const detail = detailsById.get(row.id);
+      const measuredFailureCount = typeof detail?.fail === 'number' && typeof detail.errors === 'number'
+        ? detail.fail + detail.errors : row.state === 'done' && row.rc === 0 ? 0 : null;
+      return { id: row.id, state: row.state === 'retry' ? 'running' : row.state,
+        rawState: row.state, ...(row.attemptId ? { attemptId: row.attemptId } : {}),
+        failureCount: measuredFailureCount,
+        ...(row.host ? { host: row.host } : {}),
+        ...(row.startedAt ? { startedAtMs: Date.parse(row.startedAt) } : {}),
+        ...(row.endedAt ? { endedAtMs: Date.parse(row.endedAt) } : {}),
+      };
+    }) });
     reportProgress();
     const filesById = new Map(shards.map((item, index) => [`pod-${index}`, [...item.files]]));
     const observeShard = (row: GateShard) => {
-      if (!pod.shardsFile?.ledgerPath || !pod.shardsFile.envFingerprint) return;
+      if (!pod.shardsFile?.ledgerPath || !pod.shardsFile.envFingerprint) {
+        if (remoteLedgerRequired) throw new Error('remote gate refused: HQ shard ledger identity is unavailable');
+        return;
+      }
       const detail = detailsById.get(row.id) ?? {};
       const logName = row.resultFile?.replace(/\.json$/, '') ?? null;
       const logPath = logName && logDir ? join(logDir, `${logName}.log`) : null;
       const junitPath = logName && logDir ? join(logDir, `${logName}.junit.xml`) : null;
       try {
-        appendGateShardLedger(pod.shardsFile.ledgerPath, {
+        const error = appendGateShardLedgerForGate(pod.shardsFile.ledgerPath, {
           v: 1, version: pod.shardsFile.version, phase: 'cut', shardId: row.id,
           files: filesById.get(row.id) ?? [], host: row.host ?? null, executor: 'pod',
-          imageDigest: detail.imageDigest ?? null, commit, envFingerprint: pod.shardsFile.envFingerprint,
+          imageDigest: detail.imageDigest ?? null, measuredImageDigest: detail.imageDigest ?? null,
+          currentImageDigest: expectedImageDigest ?? currentExecutionIdentity?.imageDigest ?? null,
+          commit, envFingerprint: pod.shardsFile.envFingerprint,
           startedAt: row.startedAt ?? null, endedAt: row.endedAt ?? null, observedAt: new Date().toISOString(),
           state: row.state, rc: row.rc ?? null, pass: detail.pass ?? null, fail: detail.fail ?? null,
           errors: detail.errors ?? null, ran: detail.ran ?? null,
           failureIds: detail.failureIds ?? null, errorIds: detail.errorIds ?? null,
           attribution: detail.attribution ?? 'unmeasured', reuseDecision: detail.reuseDecision, reuseReason: detail.reuseReason, logPath, junitPath,
           stopReason: detail.stopReason ?? row.waitReason ?? null, attemptId: row.attemptId ?? null,
-        });
-      } catch (error) { debug.log('release-loop.gate', 'shard-ledger-write-failed', { shard: row.id, error: String(error) }, { level: 'warn' }); }
+        }, remoteLedgerRequired);
+        if (error) throw new Error(error);
+      } catch (error) {
+        debug.log('release-loop.gate', 'shard-ledger-write-failed', { shard: row.id, error: String(error), failClosed: remoteLedgerRequired }, { level: remoteLedgerRequired ? 'error' : 'warn' });
+        if (remoteLedgerRequired) throw new Error(`remote gate refused: HQ shard ledger write failed (${row.id}): ${String(error)}`);
+      }
     };
     const flushBoard = () => {
       if (!pod.shardsFile) return;
@@ -2534,6 +2737,12 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (JSON.stringify(next) === JSON.stringify(row)) return;
       board[index] = next;
       reportProgress();
+      if (!collectionStarted && (next.state === 'done' || next.state === 'failed' || next.state === 'timeout')) {
+        collectionStarted = true;
+        emitGatePhaseProgress('collection', { state: 'collecting', shardCount: shards.length,
+          completedShardCount: board.filter((shard) => shard.state === 'done' || shard.state === 'failed' || shard.state === 'timeout').length,
+          failureCount: null });
+      }
       observeShard(next);
       flushBoard();
     };
@@ -2574,6 +2783,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         errorIds: attributed ? [...new Set(errorIds)].sort() : null, attribution: attributed ? 'complete' : 'unmeasured',
         stopReason: done.stalled.map((item) => item.reason).join(', ') || null };
       detailsById.set(id, detail);
+      reportProgress();
       observeShard(board[index]!);
     };
     for (const row of board) observeShard(row);
@@ -2884,6 +3094,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         const unfinishedDestination = join(logDir, `pod-${shard}${branch}.unfinished.log`);
         if (unfinishedLog !== undefined) writeFileSync(unfinishedDestination, unfinishedLog, { mode: 0o600 });
         else rmSync(unfinishedDestination, { force: true });
+        const testedFileHashes = branch ? undefined : gateTestedFileHashesAtCommit(repo, commit, paths);
+        const lockfileHash = branch ? undefined : gateLockfileHashAtCommit(repo, commit);
         writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ completed: true, jobName: jobNameForCapture, durationMs, rc: rc ?? null,
           ...(shardLoadFlakyAttemptedFiles.length ? { samePodRetryFiles: shardLoadFlakyAttemptedFiles } : {}),
           ...(shardLoadFlaky.length ? { loadFlaky: shardLoadFlaky } : {}),
@@ -2902,6 +3114,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             ...(failureCapture.error ? { error: redactSecretText(failureCapture.error) } : {}),
           } } : {}),
           ...(imageDigest ? { imageDigest } : {}), ...(runtimeIdentity ? { runtimeIdentity } : {}),
+          ...(testedFileHashes ? { testedFileHashes } : {}), ...(lockfileHash ? { lockfileHash } : {}),
           ...(fileSeconds !== undefined ? { fileSeconds, testSeconds } : {}), ...(testWallSeconds !== undefined ? { testWallSeconds } : {}),
           ...(podOverheadSeconds !== undefined ? { podOverheadSeconds } : {}),
           ...(unfinishedLogBytes !== undefined ? { unfinishedLogBytes } : {}),
@@ -3184,9 +3397,18 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           const shardId = `pod-${shard}`;
           const expected = hostPlan[shard]?.kind === 'reuse' ? receiptChecks[shard]?.result : null;
           if (expected) {
+            if (receiptRoot && expected.receipt.head40 !== commit && radiusUnchangedShardIds.includes(shardId)) {
+              try {
+                const carried = carryGateShardResult(receiptRoot, expected, commit);
+                debug.log('gate.receipt', 'shard-receipt-carried', { shard: shardId, from: expected.receipt.head40, to: carried.head40 });
+              } catch (error) {
+                debug.log('release-loop.gate', 'shard-receipt-carry-failed', { shard: shardId, error: String(error) }, { level: 'error' });
+                throw new Error(`shard receipt carry failed; refusing unrecorded reuse: ${shardId}: ${String(error)}`);
+              }
+            }
             const done = { runs: expected.runs, stalled: [] };
             shardDurations[shard] = 0;
-            detailsById.set(shardId, { ...(detailsById.get(shardId) ?? {}), imageDigest: expected.receipt.envKey.slice(envFingerprint!.length + 1) });
+            detailsById.set(shardId, { ...(detailsById.get(shardId) ?? {}), imageDigest: expected.receipt.imageDigest });
             markShard(shard, { state: 'done', rc: done.runs.some((run) => run.fail || run.errors) ? 1 : 0,
               startedAt: expected.receipt.measuredAt, endedAt: new Date().toISOString(), host: expected.receipt.host }, ['waitReason']);
             recordShardResult(shardId, done);
@@ -3237,18 +3459,27 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             const attribution = detail?.attribution;
             const executionHosts = [...new Set(executionRows.map((execution) => execution.host).filter((host): host is string => !!host))];
             const executedHost = executionHosts[0];
-            if (executionEvidenceComplete && imageDigest && runtimeIdentity && executedHost && currentGraphPins && attribution === 'complete') {
-              try {
+            const testedFileHashes = currentTestedFileHashesByShard[shardId];
+            if (executionEvidenceComplete && imageDigest && runtimeIdentity && executedHost && currentGraphPins && attribution === 'complete'
+              && currentLockfileHash && testedFileHashes) {
+              const runtimeSourceFingerprint = gateRuntimeSourceFingerprint(repo, commit, runtimeIdentity);
+              if (!runtimeSourceFingerprint) {
+                debug.log('release-loop.gate', 'shard-receipt-not-saved', { shard: shardId, reason: 'runtime-source-fingerprint-unmeasured' });
+              } else try {
                 saveGateShardResult(receiptRoot, { receipt: { id: shardId, files: [...item.files], head40: commit, base40,
                   version: pod.shardsFile!.version, graphRunId: tools.graphRunId ?? undefined, graphSha: currentGraphPins!.graphSha, recipeSha: currentGraphPins!.recipeSha,
                   graphEntry: currentGraphPins?.graphEntry, recipeCommand: currentGraphPins?.recipeCommand, recipeTimeoutMs: currentGraphPins?.recipeTimeoutMs,
-                  host: executedHost, envKey: `${envFingerprint}:${imageDigest}`, envFingerprint, imageDigest, runtimeIdentity,
+                  host: executedHost, envKey: gateShardRuntimeIdentityKey(runtimeIdentity, currentLockfileHash)!, envFingerprint, imageDigest, runtimeIdentity,
+                  runtimeSourceFingerprint, lockfileHash: currentLockfileHash, testedFileHashes,
                   executions: executionRows.map((execution) => ({ branch: execution.branch, attemptId: execution.attemptId,
                     host: execution.host!, imageDigest: execution.imageDigest!, runtimeIdentity: execution.runtimeIdentity! })), status: 'complete',
                   failureIds: detail?.failureIds ?? [], errorIds: detail?.errorIds ?? [],
                   evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: new Date().toISOString(),
                   attempt: receiptAttempt }, runs: done.runs });
-              } catch (error) { debug.log('release-loop.gate', 'shard-receipt-write-failed', { shard: shardId, error: String(error) }, { level: 'warn' }); }
+              } catch (error) {
+                debug.log('release-loop.gate', 'shard-receipt-write-failed', { shard: shardId, error: String(error) }, { level: 'error' });
+                throw error;
+              }
             } else debug.log('release-loop.gate', 'shard-receipt-not-saved', { shard: shardId,
               missingImageDigest: !imageDigest, missingRuntimeIdentity: !runtimeIdentity, executionEvidenceComplete,
               executedHost: executedHost ?? null, attribution: attribution ?? 'unmeasured' });
@@ -3262,6 +3493,48 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     } finally { if (reconcileTimer) clearInterval(reconcileTimer); }
     const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (rejected) throw rejected.reason;
+    const shardFailureCounts = shards.map((_, index) => detailsById.get(`pod-${index}`)?.fail !== undefined
+      && detailsById.get(`pod-${index}`)?.errors !== undefined
+      ? Number(detailsById.get(`pod-${index}`)!.fail) + Number(detailsById.get(`pod-${index}`)!.errors) : null);
+    emitGatePhaseProgress('collection', { state: 'complete', shardCount: shards.length,
+      failureCount: shardFailureCounts.every((count) => count !== null)
+        ? shardFailureCounts.reduce<number>((sum, count) => sum + (count ?? 0), 0) : null });
+    if (remoteLedgerRequired) {
+      const observedAt = new Date().toISOString();
+      const batchRows: GateShardLedgerRow[] = shards.map((item, index) => {
+        const row = board.find((candidate) => candidate.id === `pod-${index}`);
+        const detail = detailsById.get(`pod-${index}`) ?? {};
+        if (!row || row.state !== 'done' || detail.attribution !== 'complete' || detail.ran === undefined)
+          throw new Error(`remote gate refused: HQ shard result batch is incomplete (pod-${index})`);
+        return { v: 1, version: pod.shardsFile!.version, phase: 'cut', shardId: row.id, files: [...item.files],
+          host: row.host ?? null, executor: 'pod', imageDigest: detail.imageDigest ?? null,
+          measuredImageDigest: detail.imageDigest ?? null,
+          currentImageDigest: expectedImageDigest ?? currentExecutionIdentity?.imageDigest ?? null,
+          commit, envFingerprint: pod.shardsFile!.envFingerprint!,
+          startedAt: row.startedAt ?? null, endedAt: row.endedAt ?? null, observedAt, state: 'done', rc: row.rc ?? null,
+          pass: detail.pass ?? null, fail: detail.fail ?? null, errors: detail.errors ?? null, ran: detail.ran,
+          failureIds: detail.failureIds ?? null, errorIds: detail.errorIds ?? null, attribution: 'complete', logPath: null, junitPath: null,
+          stopReason: null, attemptId: row.attemptId ?? null, reuseDecision: detail.reuseDecision, reuseReason: detail.reuseReason };
+      });
+      try {
+        const appendBatch = tools.appendShardLedgerBatch ?? appendGateShardLedgerBatch;
+        const batchId = randomUUID();
+        emitGatePhaseProgress('hq-ledger-recording', { shardCount: batchRows.length });
+        const error = appendBatch(pod.shardsFile!.ledgerPath!, batchRows, true, batchId);
+        if (error) throw new Error(error);
+        const persisted = readGateShardLedger(pod.shardsFile!.ledgerPath!);
+        if (!persisted || persisted.trailingPartial || persisted.malformed > 0 || !gateShardLedgerBatchComplete(persisted.rows, { batchId, version: pod.shardsFile!.version, commit,
+          phase: 'cut', observedAt, shardIds: batchRows.map((row) => row.shardId) })) {
+          throw new Error('incomplete completed shard batch in HQ ledger');
+        }
+        emitGatePhaseProgress('hq-ledger-recorded', { shardCount: batchRows.length });
+      } catch (error) {
+        emitGatePhaseProgress('hq-ledger-rejected', { shardCount: batchRows.length, reason: String(error) });
+        debug.log('release-loop.gate', 'shard-ledger-batch-write-failed', { shards: batchRows.length, error: String(error), failClosed: true }, { level: 'error' });
+        throw new Error(`remote gate refused: HQ shard result batch write failed: ${String(error)}`);
+      }
+      debug.log('release-loop.gate', 'shard-ledger-batch-written', { shards: batchRows.length });
+    }
     const results = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
     // GATE-RISK-LANE — planned vs measured for the shard that ran first, with its own result. Its Pods are ordinary
     // shard Pods: their runs join `measured` below, so the sweep's summary and every later judgment are unchanged.
@@ -3586,6 +3859,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       else {
         await pod.warmFinalize!(leased);
         closed = true;
+        pod.onWarmPodFinalized?.();
       }
     }
     return results;
@@ -3605,6 +3879,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     get remoteMirror() { return remoteMirror; },
     set remoteMirror(path) { remoteMirror = path; },
     progressScheduler: tools.progressScheduler ?? scheduleGateProgress,
+    ...(tools.startBisectSidecar ? { startBisectSidecar: tools.startBisectSidecar } : {}),
     async sweep(tree, logDir, pod, only, onProgress) {
       if (pod) return podSweep(tree, logDir, pod, only, onProgress);
       const listed = await command('git', ['ls-files', '*.test.*'], tree);
@@ -3798,6 +4073,11 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
   syncImages: typeof syncPoolImages = syncPoolImages): Promise<GateResult> {
   if (opts.pod?.warmReplay) opts = { ...opts, pod: { ...opts.pod,
     warmShadowScope: { requested: false, attempts: 0 } } };
+  if (opts.pod?.shardsFile?.ledgerPath) {
+    const priorLedger = readGateShardLedger(opts.pod.shardsFile.ledgerPath);
+    if (priorLedger?.trailingPartial || (priorLedger?.malformed ?? 0) > 0)
+      throw new Error('remote gate refused: HQ shard ledger contains an unterminated or malformed JSONL row');
+  }
   const explicitConfig = getElanousConfigDirOverride();
   const root = explicitConfig ? effectiveInstanceRoot() : (opts.instanceRoot ?? effectiveInstanceRoot());
   // The freeze is read from the same root the gate runs in (a config-dir override must not move it elsewhere).
@@ -3854,7 +4134,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     if (!Number.isSafeInteger(opts.recheckFileLimit ?? GATE_HOST_RECHECK_FILE_LIMIT) || (opts.recheckFileLimit ?? GATE_HOST_RECHECK_FILE_LIMIT) < 1)
       throw new Error('invalid gate recheck file limit');
     assertValidPodSweepOptions(opts);
-    if (opts.pod && opts.graphRunId) {
+    if (opts.pod && (opts.graphRunId || opts.rehearsalBaseline)) {
       const components = opts.pod.pool.split(',').map((part) => part.trim()).filter(Boolean);
       const members = parsePodPool(opts.pod.pool);
       const memberSpecs = members.map((member) => {
@@ -3869,7 +4149,9 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         currentImages[member.context] = digest;
         poolImages.set(member.context, digest ? [digest] : []);
       }
-      const pinRunId = opts.graphRunId;
+      // A scheduled hard rehearsal is a direct Pod gate with its own unique rc version, not a graph run.
+      // The version is stable across a retry of that rehearsal and scopes its immutable image pin.
+      const pinRunId = opts.graphRunId ?? opts.version;
       const pinPath = gateImagePinPath(root, opts.version, pinRunId);
       const gateImageTag = `${podCommandImageFor([], true).split(':')[0]}:${opts.commit.slice(0, 12)}`;
       let savedPin: ReturnType<typeof readGateImagePin>;
@@ -3903,8 +4185,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
           } catch { previouslyExecuted = true; }
         }
       }
-      if (!savedDigest && previouslyExecuted && !supersededPin) {
-        debug.log('release-loop.gate', 'image-pin', { runId: opts.graphRunId, savedDigest: null, currentImages,
+      if (!savedDigest && previouslyExecuted && !supersededPin && !opts.imagePinPrepareOnly) {
+        debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, savedDigest: null, currentImages,
           decision: 'fail-closed', reason: 'resume-pin-missing' }, { level: 'error' });
         throw new Error('gate resume refused: saved image digest pin is missing');
       }
@@ -3925,7 +4207,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         } catch (error) {
           debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, decision: 'fail-closed',
             reason: 'initial-image-sync-failed', error: String(error).slice(0, 300) }, { level: 'error' });
-          throw new Error('gate image pin refused: initial image sync failed');
+          throw new Error(`gate image pin refused: initial image sync failed (${String(error).slice(0, 300)})`);
         } finally {
           stopImageSyncWatch();
           rmSync(imageSourceRoot, { recursive: true, force: true });
@@ -3947,9 +4229,15 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       const resolution = resolveGateImagePin({ ...(savedDigest ? { savedDigest } : {}),
         ...(!savedDigest ? { initialDigest: [...poolImages.values()].flat().find(Boolean) ?? null } : {}), poolImages });
       if (!resolution.ok) {
-        debug.log('release-loop.gate', 'image-pin', { runId: opts.graphRunId ?? null, savedDigest, currentImages,
+        debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, savedDigest, currentImages,
           decision: 'fail-closed', reason: resolution.reason }, { level: 'error' });
         throw new Error(`gate image pin refused: ${resolution.reason}`);
+      }
+      const mismatchedPools = mismatchedGateRosterImagePools(poolImages, resolution.digest);
+      if (mismatchedPools.length) {
+        debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, savedDigest, currentImages,
+          decision: 'fail-closed', reason: 'pool-image-digest-mismatch', mismatchedPools }, { level: 'error' });
+        throw new Error(`gate image pin refused: pool image digest mismatch (${mismatchedPools.join(', ')})`);
       }
       const selected = memberSpecs.filter((member) => resolution.eligiblePools.includes(member.context));
       if (!selected.length) throw new Error('gate image pin refused: no eligible pool');
@@ -3967,12 +4255,21 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       }
       opts = { ...opts, pod: { ...opts.pod, pool: selected.map((member) => member.spec).join(','),
         pinnedImageDigest: resolution.digest, pinnedRunId: pinRunId } };
-      debug.log('release-loop.gate', 'image-pin', { runId: opts.graphRunId ?? null, pinnedDigest: resolution.digest,
+      debug.log('release-loop.gate', 'image-pin', { runId: pinRunId, pinnedDigest: resolution.digest,
         currentImages, eligiblePools: resolution.eligiblePools, excludedPools: members.map((member) => member.context)
           .filter((context) => !resolution.eligiblePools.includes(context)), decision: savedDigest ? 'resume-pinned' : 'pin-created' });
     } else if (opts.pod) {
       debug.log('release-loop.gate', 'image-pin-unscoped', { runId: null, decision: 'not-applicable',
         reason: 'direct-pod-gate-without-graph-run-id' });
+    }
+    if (opts.imagePinPrepareOnly) {
+      const pin = opts.pod?.pinnedImageDigest;
+      if (!opts.pod || !opts.graphRunId || !pin || opts.pod.pinnedRunId !== opts.graphRunId)
+        throw new Error('image repair did not produce a run-scoped cut pin');
+      return { outcome: 'ok', commit: opts.commit, introduced: [], preexisting: 0, fixed: null, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Math.max(0, clock() - start),
+        imagePin: 'cut-commit', imagePinRunId: opts.graphRunId,
+        imagePinDigest: pin };
     }
     if (opts.remote && !/^(?:[\w.-]+@)?[\w.-]+$/.test(opts.remote)) throw new Error('invalid ssh host');
     if (opts.remote) {
@@ -4202,10 +4499,25 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       if (selected?.kind === 'carry') return undefined;
       const progressFile = opts.graphRunId && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(opts.graphRunId)
         ? join(ledger, 'graph-runs', 'release-loop', `${opts.graphRunId}.json.contexts`, 'gate-progress.jsonl') : undefined;
+      const phaseSignatures = new Map<string, string>();
       let latest: GateSweepProgress | undefined;
       const emitProgress = () => {
         if (!latest) return;
         const nowMs = runner.now?.() ?? Date.now();
+        for (const group of latest.groups) {
+          const signature = gateProgressTransitionKey(group);
+          if (phaseSignatures.get(group.id) === signature) continue;
+          phaseSignatures.set(group.id, signature);
+          const phase = group.rawState === 'retry' ? 'shard-retry'
+            : group.state === 'pending' ? 'shard-planning' : `shard-${group.state}`;
+          const phaseEvent = { phase, shard: group.id, shardIndex: latest.groups.indexOf(group) + 1,
+            shardTotal: latest.groups.length, host: group.host ?? null,
+            state: group.rawState ?? group.state, attemptId: group.attemptId ?? null,
+            durationMs: group.startedAtMs === undefined ? null : Math.max(0, nowMs - group.startedAtMs),
+            failureCount: group.failureCount ?? null, introduced: null, preexisting: null, unmeasured: null,
+            runId: opts.graphRunId ?? null, at: new Date(nowMs).toISOString() };
+          emitGatePhaseProgress(phase, phaseEvent);
+        }
         const event = { version: opts.version, runId: opts.graphRunId ?? null, at: new Date(nowMs).toISOString(),
           ...summarizeGateProgress({ executor: latest.executor, groups: latest.groups, nowMs }) };
         debug.log('release-loop.gate', 'progress', event);
@@ -4433,6 +4745,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       result.baselineDeferred = { cutFiles: cutFiles.length, swept: present.length };
       debug.log('release-loop.gate', 'baseline-deferred', { version: baselineVersion, commit: baseSha, cutFiles: cutFiles.length, swept: present.length });
       if (present.length) {
+        emitGatePhaseProgress('remeasure', { fileCount: present.length, remeasureKind: 'baseline' });
         // K9b — the baseline is swept on the same Pod pool as the cut, not on this host (0.2.6: an hour of local baseline
         // after a 23-minute Pod cut).
         const baseRun = await runner.sweep(baseTree!, join(root, 'release', opts.version, 'gate-logs', 'baseline'),
@@ -4558,6 +4871,22 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
             const still = new Set([...again.failures, ...again.errors]);
             flaky = again.errors.length ? [] : shaped.filter((id) => !still.has(id));
           } catch { recheck = 'unreadable'; }
+        }
+        const stillTimedOut = recheck === 'timeout' ? shaped : shaped.filter((id) => {
+          try { return parseTimedOutFailures(stripPodRepoRoot(relaxed.output)).includes(id); } catch { return false; }
+        });
+        if (stillTimedOut.length) {
+          const baselineTree = opts.pod && runner.recheckPod ? undefined : await getBaseTree();
+          const baselineRetry = opts.pod && runner.recheckPod
+            ? await runner.recheckPod(file, baseSha, opts.pod, GATE_ISOLATED_TIMEOUT_MS, true)
+            : await runner.command('bun', ['run', 'test:deterministic', asPath(file), '--timeout', String(GATE_TIMEOUT_RECHECK_MS)], baselineTree!, GATE_ISOLATED_TIMEOUT_MS);
+          await recordWarmShadow(baselineRetry.warmShadow);
+          const baselineUnmeasurable = baselineUnmeasurableTimeoutIds({ output: stripPodRepoRoot(baselineRetry.output) }, stillTimedOut);
+          if (baselineUnmeasurable.length) {
+            candidates = candidates.filter((id) => !baselineUnmeasurable.includes(id));
+            debug.log('release-loop.gate', 'timeout-baseline-unmeasurable', { file, ids: baselineUnmeasurable,
+              baseline: baselineRetry.timedOut ? 'timeout' : 'timeout-or-skipped', remote: opts.remote ?? 'local' });
+          }
         }
         debug.log('release-loop.gate', 'timeout-recheck', { file, shaped: shaped.length, flaky: flaky.length, recheck, remote: opts.remote ?? 'local', limitMs: GATE_TIMEOUT_RECHECK_MS });
         if (flaky.length) {
@@ -4699,6 +5028,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       }
     }
   } catch (error) {
+    if (error instanceof Error && error.message.startsWith('remote gate refused: HQ shard result batch')) throw error;
     result.error = error instanceof Error ? error.message : String(error);
     const warmFailures = (error instanceof SettledRecheckFailures ? error.failures : [error])
       .filter((failure): failure is WarmRecheckIncomplete => failure instanceof WarmRecheckIncomplete);
@@ -4804,6 +5134,65 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       introducedIds: ids.introduced, knownEnvIds: ids.knownEnv, preexistingIds: ids.preexisting, loadFlakyIds: ids.loadFlaky,
       ...(result.outcome === 'error' ? { error: result.error } : {}),
     });
+    if (result.outcome === 'regression' && result.introduced.length && opts.pod && runner.recheckPodBatch &&
+        /^[0-9a-f]{40}$/i.test(baselineCommit) && /^[0-9a-f]{40}$/i.test(opts.commit)) {
+      emitGatePhaseProgress('remeasure', { fileCount: result.introduced.length, remeasureKind: 'regression-isolation' });
+      try {
+      const gateHosts = new Set(parsePodPool(opts.pod.pool).map((member) => {
+        const contextHost = member.context === 'pool-node-c' ? 'node-c' : member.context === 'pool-node-b' ? 'node-b' : undefined;
+        return (member.sshHost ?? contextHost ?? hostname()).toLowerCase().split('.')[0];
+      }));
+      const alternate = [{ host: 'node-c', pool: 'pool-node-c@node-c:1' }, { host: 'mshq', pool: 'pool-mshq@mshq:1' }]
+        .find((candidate) => !gateHosts.has(candidate.host));
+      if (!alternate) {
+        debug.log('release-loop.gate', 'bisect-unmeasured', { version: opts.version, commit: opts.commit, reason: 'no-parent-host-outside-release-gate-pool' });
+      } else {
+        // git-spawn-allow: read-only first-parent ancestry proves the baseline lies on the cut's first-parent path.
+        const history = await runner.command('git', ['rev-list', '--first-parent', '--parents', opts.commit], repo, 15_000);
+        const firstParentRows = history.rc === 0 ? history.output.trim().split(/\r?\n/).filter(Boolean).map((row) => row.split(/\s+/)[0]!) : [];
+        const range = firstParentCommitsBetween(firstParentRows, baselineCommit, opts.commit);
+        const planned = history.rc !== 0 ? { ok: false as const, reason: `first-parent history unreadable: ${history.output || history.rc}` }
+          : !range.ok ? { ok: false as const, reason: range.reason }
+            : planGateBisect({ version: opts.version, baseCommit: baselineCommit, cutCommit: opts.commit,
+              firstParentCommits: range.commits, introducedIds: result.introduced,
+              basePass: true, cutFail: true, host: alternate.host });
+        if (!planned.ok) {
+          debug.log('release-loop.gate', 'bisect-unmeasured', { version: opts.version, commit: opts.commit, reason: planned.reason });
+        } else {
+          const sidecarRunId = (opts.graphRunId ?? `direct-${randomUUID()}`).replace(/[^a-zA-Z0-9_.-]/g, '_');
+          const path = join(ledger, 'release', opts.version, `gate-bisect-${opts.commit}-${sidecarRunId}.json`);
+          const record = { plan: planned.plan, status: 'queued', createdAt: new Date(clock()).toISOString(), repo, ledger, path,
+            runId: sidecarRunId, alternatePool: alternate.pool,
+            pod: { pool: opts.pod.pool, imagePin: opts.pod.imagePin, pinnedImageDigest: opts.pod.pinnedImageDigest, pinnedRunId: opts.pod.pinnedRunId,
+              hostMirror: opts.pod.hostMirror, installSlots: opts.pod.installSlots, shardTimeoutSeconds: opts.pod.shardTimeoutSeconds } };
+          try {
+            mkdirSync(dirname(path), { recursive: true });
+            const temp = join(dirname(path), `.gate-bisect-${process.pid}-${randomUUID()}.tmp`);
+            try { writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 }); chmodSync(temp, 0o600); renameSync(temp, path); }
+            finally { if (existsSync(temp)) rmSync(temp); }
+          } catch (error) {
+            debug.log('release-loop.gate', 'bisect-unmeasured', { version: opts.version, commit: opts.commit, reason: `plan persistence: ${String(error)}` });
+          }
+          debug.log('release-loop.gate', 'bisect-plan', { version: opts.version, commit: opts.commit, baseCommit: baselineCommit,
+            files: planned.plan.files, commits: planned.plan.commits.length, host: alternate.host, path });
+          try {
+            if (runner.startBisectSidecar) {
+              await runner.startBisectSidecar(path, result.outcome);
+            } else {
+              const sidecar = spawn(process.execPath, [join(repo, 'scripts/release-loop/gate-bisect-sidecar.ts'), '--input', path],
+                { cwd: repo, detached: true, stdio: 'ignore', env: process.env });
+              sidecar.on('error', (error) => debug.log('release-loop.gate', 'bisect-sidecar-spawn-failed', { version: opts.version, commit: opts.commit, reason: String(error) }));
+              sidecar.unref();
+            }
+          } catch (error) {
+            debug.log('release-loop.gate', 'bisect-sidecar-spawn-failed', { version: opts.version, commit: opts.commit, reason: String(error) });
+          }
+        }
+      }
+      } catch (error) {
+        debug.log('release-loop.gate', 'bisect-sidecar-unavailable', { version: opts.version, commit: opts.commit, reason: String(error) });
+      }
+    }
   }
   if (radiusShadow) {
     try {
@@ -4828,6 +5217,13 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       debug.log('release-loop.gate', 'shards-verdict', { version: opts.version, path, written, introduced: result.introduced.length, preexisting: result.preexisting });
     } catch (error) { debug.log('release-loop.gate', 'shards-verdict-write-failed', { path, error: String(error) }); }
   }
+  const unmeasuredCount = result.stalledEnv.length + (result.unmeasuredErrors?.length ?? 0)
+    + (result.unmeasuredRecheckFiles?.length ?? 0) + (result.stalledShards?.length ?? 0);
+  const classifiedFailureCount = unmeasuredCount === 0 ? result.introduced.length + result.preexisting : null;
+  emitGatePhaseProgress('classification', { introduced: result.introduced.length, preexisting: result.preexisting,
+    unmeasured: unmeasuredCount, failureCount: classifiedFailureCount });
+  emitGatePhaseProgress('verdict', { outcome: result.outcome, introduced: result.introduced.length,
+    preexisting: result.preexisting, unmeasured: unmeasuredCount, failureCount: classifiedFailureCount });
   return result;
 }
 
@@ -4839,6 +5235,7 @@ export function graphGateResult(result: GateResult, graph: boolean) {
     summary: (result.partial ? `부분 재검 ${result.partial.files}파일(앞 게이트 ${result.partial.priorCommit.slice(0, 9)} 결과 이음) · ` : '')
       + (result.rehearsalReceiptDecision ? `예행 영수증 ${result.rehearsalReceiptDecision.action} · ${result.rehearsalReceiptDecision.reason} · ` : '')
       + (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed ?? '못 셈(기준선 미루기)'}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}`
+      + (result.reusedWarmPods !== undefined ? ` · 재활용 웜 Pod ${result.reusedWarmPods}` : '')
       + (result.rcNonzeroNoFailures.length ? ` · ⚠ 종료코드만 비영 ${result.rcNonzeroNoFailures.length}` : '')
       + (result.loadFlaky?.length ? ` · ⚠ 부하 흔들림 ${result.loadFlaky.length}(독립 재실행 통과 · 막지 않음)` : '')
       + (result.stalledEnv.length ? ` · 환경 멈춤 ${result.stalledEnv.length} (Pod 밖 통과 ${result.stalledEnv.filter((item) => item.local === 'passed').length})` : '')
@@ -4905,8 +5302,17 @@ function usesGraphContext(args: string[], env: NodeJS.ProcessEnv): boolean {
 export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOptions | 'help' {
   const context = usesGraphContext(args, env) ? readGraphContext(env) : undefined;
   const fromGraph: Record<string, unknown> = context?.input ?? {};
-  const graphCommit = context?.outputs['version-release']?.commit;
+  const landedRepair = context && Object.entries(context.outputs)
+    .filter(([nodeId, output]) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId) && output.outcome === 'ok'
+      && typeof output.commit === 'string' && /^[0-9a-f]{40}$/i.test(output.commit))
+    .at(-1)?.[1]?.commit;
+  const graphCommit = typeof landedRepair === 'string' ? landedRepair : context?.outputs['version-release']?.commit;
   if (typeof graphCommit === 'string') fromGraph.commit = graphCommit;
+  const imagePinRepair = context && Object.entries(context.outputs).some(([nodeId, output]) =>
+    /^gate-image-repair-[a-f0-9]{12}$/.test(nodeId) && output.outcome === 'ok' && output.imagePin === 'cut-commit'
+      && output.imagePinRunId === context.runId && output.commit === fromGraph.commit
+      && typeof output.imagePinDigest === 'string' && normalizeGateImageDigest(output.imagePinDigest) !== null);
+  if (imagePinRepair) fromGraph.gateImagePin = 'cut-commit';
   if (fromGraph.gateImagePin !== undefined && fromGraph.gateImagePin !== 'cut-commit') {
     throw new Error(`unsupported gate image pin: ${String(fromGraph.gateImagePin)}`);
   }
@@ -4928,6 +5334,8 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
     throw new Error('gateShardCapabilities must map pod-N to {os: darwin|linux}');
   const opts: GateOptions = {
     ...(context?.graphId ? { graphId: context.graphId } : {}),
+    // The pod image-pin guard runs before judge() receives context.runId; carry the run scope here.
+    ...(context?.runId ? { graphRunId: context.runId } : {}),
     dryRun: env.ELANOUS_GRAPH_DRY_RUN === '1',
     ...(fromGraph.gateImagePin === 'cut-commit' ? { imagePin: 'cut-commit' as const } : {}),
     rehearsalTui: fromGraph.rehearsalTui === true,
@@ -4972,7 +5380,12 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
       continue;
     }
     if (arg === '--full') { opts.full = true; continue; }
-    if (arg === '--rehearsal-baseline') { opts.rehearsalBaseline = true; continue; }
+    if (arg === '--rehearsal-baseline') {
+      opts.rehearsalBaseline = true;
+      // Hard rehearsals are direct Pod runs, but explicitly bind them to the measured cut image too.
+      opts.imagePin = 'cut-commit';
+      continue;
+    }
     // Applied after the loop and only to a Pod gate — on its own it must not turn a local gate into a Pod one (review r5).
     if (arg === '--fresh-shards') { freshShards = true; continue; }
     if (arg === '--reroute-shard') {
@@ -5041,22 +5454,45 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
   const start = Date.now();
   let result: GateResult | undefined;
   let version = '';
+  let requestedCommit = '';
   let graphRunId: string | null = null;
   let autohealStoreRoot = '';
   let placement: { executor: string | null; host: string | null } | undefined;
   let warmControlCleanup: (() => Promise<void>) | undefined;
+  let invocationWarmReuseCount = 0;
+  let reportsWarmReuseCount = false;
   try {
     const parsed = parseOptions(argv, env);
+    if (parsed !== 'help') requestedCommit = parsed.commit;
     let config: unknown = null;
     if (parsed !== 'help' && !runner && parsed.pod) {
       try { config = getUserConfig(); }
       catch (error) { debug.log('release-loop.gate', 'warm-profile-unavailable', { error: String(error) }); }
     }
-    const opts = parsed === 'help' ? parsed : withWarmGateHooks(parsed, config, !!runner,
+    let opts = parsed === 'help' ? parsed : withWarmGateHooks(parsed, config, !!runner,
       cleanup => { warmControlCleanup = cleanup; });
     if (opts !== 'help' && opts.pod) {
+      reportsWarmReuseCount = true;
+      opts = { ...opts, pod: { ...opts.pod, onWarmPodFinalized: () => { invocationWarmReuseCount++; } } };
+    }
+    if (opts !== 'help' && opts.pod) assertValidPodSweepOptions(opts);
+    if (opts !== 'help' && opts.pod) {
+      // Keep the production guard enabled on graph paths even when a simulator replaces only the outside
+      // Pod/Kubernetes boundary. Direct injected unit calls retain their explicit test bypass.
+      const path: 'graph' | 'rehearsal' | 'test-injected' = opts.rehearsalBaseline ? 'rehearsal'
+        : opts.graphRunId ? 'graph' : runner || judge !== judgeGate ? 'test-injected' : 'graph';
+      const reason = opts.imagePin !== 'cut-commit' ? 'pod-gate-missing-cut-image-pin'
+        : !(opts.graphRunId || opts.rehearsalBaseline) ? 'pod-gate-missing-run-scope' : null;
+      const decision = path === 'test-injected' ? 'test-bypass' : reason ? 'fail-closed' : 'allow';
+      debug.log('release-loop.gate', 'entry-guard-evaluated', { path, decision });
+      if (decision === 'fail-closed') {
+        debug.log('release-loop.gate', 'image-pin-unscoped', { runId: opts.graphRunId ?? null, version: opts.version,
+          commit: opts.commit, imagePin: opts.imagePin ?? null, decision, reason }, { level: 'error' });
+        throw new Error(`gate pod refused to start without a scoped cut image pin (${reason})`);
+      }
+    }
+    if (opts !== 'help' && opts.pod) {
       // Reject malformed shard settings before touching the live host pool.
-      assertValidPodSweepOptions(opts);
       // Supplying a runner or judge is the node's existing simulation seam; never issue a real Kubernetes read from it.
       const probe = poolResourceProbe ?? (runner || judge !== judgeGate
         ? (() => ({ status: 'measured' as const, empty: true, reservations: 0, authoringLeases: 0, waitingJobs: 0, activeJobs: 0 }))
@@ -5106,10 +5542,14 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
       throw new Error('release gate host reservation requires graph runId and pinned state root');
     const releaseHosts = context && hosts.length
       ? reserveReleaseGateHosts(reservationRoot!, context.runId!, hosts) : () => undefined;
-    try { result = await judge(context?.runId ? { ...opts, graphRunId: context.runId } : opts, runner, imageProbe); }
+    try {
+      result = await judge(context?.runId ? { ...opts, graphRunId: context.runId } : opts, runner, imageProbe);
+      if (reportsWarmReuseCount) result.reusedWarmPods = invocationWarmReuseCount;
+    }
     finally { releaseHosts(); }
   } catch (error) {
-    result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start,
+    result = { outcome: 'error', commit: requestedCommit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start,
+      ...(reportsWarmReuseCount ? { reusedWarmPods: invocationWarmReuseCount } : {}),
       error: error instanceof InvalidPodSweepOptionsError ? error.message : String(error) };
     placement ??= requestedGateExecutor(argv, env);
   } finally {

@@ -11,7 +11,19 @@ export interface AppManifest {
   readonly apiVersion: 'elanous.app/v0';
   readonly slug: string;
   readonly title: string;
+  readonly storage?: AppStorageDeclaration;
   readonly [key: string]: unknown;
+}
+
+export interface AppStorageDeclaration {
+  readonly prefix: string;
+  readonly quotaBytes?: number;
+  readonly upload?: {
+    readonly allow: readonly string[];
+    readonly types: readonly string[];
+    readonly maxBytes?: number;
+    readonly anonymous?: boolean;
+  };
 }
 
 export type AppManifestParseResult =
@@ -28,13 +40,26 @@ const TOP_LEVEL_KEYS = new Set([
 ]);
 // Host-name reservation examples named by 내부 문서 `nexus-backend-in-a-box` §③b.
 const RESERVED_SLUGS = new Set(['www', 'docs', 'api', 'admin', 'relay', 'mail']);
-const BUILTINS = new Set(['stt', 'summarize', 'tts', 'generate']);
+const BUILTINS = new Set(['stt', 'summarize', 'tts', 'generate', 'translate']);
 const DDL_WORDS = new Set(['CREATE', 'DROP', 'ALTER', 'ATTACH', 'PRAGMA']);
 const SQL_TABLE_KEYWORDS = new Set(['FROM', 'JOIN', 'INTO', 'UPDATE']);
 
-// OP #76053 (APP-CONTRACT-SECRET-ENTROPY): known key prefixes only. Entropy heuristics stay deferred;
-// do not add a length/entropy threshold here. Prefix examples are the OP-confirmed recognizers.
+// OP #76053 (APP-CONTRACT-SECRET-ENTROPY): retain known key prefixes and add a conservative
+// length/entropy classifier calibrated against the synthetic corpus device.
 const CREDENTIAL_VALUE_PREFIXES = ['sk-', 'xai-', 'ghp_', 'gho_', 'github_pat_', 'AKIA', 'AIza', 'xoxb-'] as const;
+const CREDENTIAL_VALUE_MIN_LENGTH = 32;
+const CREDENTIAL_VALUE_MIN_ENTROPY = 4.25;
+
+function shannonEntropy(value: string): number {
+  const symbols = [...value];
+  if (symbols.length === 0) return 0;
+  const counts = new Map<string, number>();
+  for (const symbol of symbols) counts.set(symbol, (counts.get(symbol) ?? 0) + 1);
+  return [...counts.values()].reduce((entropy, count) => {
+    const probability = count / symbols.length;
+    return entropy - probability * Math.log2(probability);
+  }, 0);
+}
 
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -42,6 +67,10 @@ function isRecord(value: unknown): value is RecordValue {
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isMimeType(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(value);
 }
 
 function push(errors: AppContractIssue[], path: string, reason: string): void {
@@ -65,7 +94,10 @@ function orderedMapKeys(root: unknown, field: string): string[] | undefined {
 
 function credentialLike(value: string): boolean {
   const lower = value.toLowerCase();
-  return CREDENTIAL_VALUE_PREFIXES.some(prefix => lower.includes(prefix.toLowerCase()));
+  return CREDENTIAL_VALUE_PREFIXES.some(prefix => lower.includes(prefix.toLowerCase()))
+    || (!isCredentialReference(value)
+      && [...value].length >= CREDENTIAL_VALUE_MIN_LENGTH
+      && shannonEntropy(value) >= CREDENTIAL_VALUE_MIN_ENTROPY);
 }
 
 function isCredentialReference(value: unknown): value is string {
@@ -267,7 +299,7 @@ function validateManifest(
       const raw = doc.actions[name];
       const path = mapEntryPath('/actions', index);
       if (!isRecord(raw)) { push(errors, path, '동작 선언은 맵이어야 한다'); continue; }
-      if (typeof raw.builtin !== 'string' || !BUILTINS.has(raw.builtin)) push(errors, `${path}/builtin`, '허용된 내장 동작(stt, summarize, tts, generate) 중 하나여야 한다');
+      if (typeof raw.builtin !== 'string' || !BUILTINS.has(raw.builtin)) push(errors, `${path}/builtin`, '허용된 내장 동작(stt, summarize, tts, generate, translate) 중 하나여야 한다');
       if (raw.uses !== undefined) validateCredentialList(raw.uses, `${path}/uses`, errors, false);
       if (raw.async === true && raw.builtin === 'generate' && !nonEmptyString(raw.spend)) push(errors, `${path}/spend`, '비동기 generate 는 spend 선언이 필요하다');
     }
@@ -276,7 +308,32 @@ function validateManifest(
   if (doc.credentials !== undefined) validateCredentialList(doc.credentials, '/credentials', errors, false);
   if (doc.storage !== undefined) {
     if (!isRecord(doc.storage)) push(errors, '/storage', 'storage 는 맵이어야 한다');
-    else if (typeof doc.slug === 'string' && doc.storage.prefix !== `apps/${doc.slug}/`) push(errors, '/storage/prefix', 'storage.prefix 는 apps/<slug>/ 와 같아야 한다');
+    else {
+      if (typeof doc.slug === 'string' && doc.storage.prefix !== `apps/${doc.slug}/`) push(errors, '/storage/prefix', 'storage.prefix 는 apps/<slug>/ 와 같아야 한다');
+      if (doc.storage.quotaBytes !== undefined && (!Number.isSafeInteger(doc.storage.quotaBytes) || Number(doc.storage.quotaBytes) <= 0)) {
+        push(errors, '/storage/quotaBytes', 'storage.quotaBytes 는 양의 안전한 정수여야 한다');
+      }
+      if (doc.storage.upload !== undefined) {
+        if (!isRecord(doc.storage.upload)) push(errors, '/storage/upload', 'storage.upload 는 맵이어야 한다');
+        else {
+          if (!Array.isArray(doc.storage.upload.allow) || doc.storage.upload.allow.length === 0
+            || doc.storage.upload.allow.some(role => typeof role !== 'string' || !roles.has(role))) {
+            push(errors, '/storage/upload/allow', 'storage.upload.allow 는 선언된 역할을 하나 이상 포함해야 한다');
+          }
+          if (!Array.isArray(doc.storage.upload.types) || doc.storage.upload.types.length === 0
+            || doc.storage.upload.types.some(type => !isMimeType(type))) {
+            push(errors, '/storage/upload/types', 'storage.upload.types 는 MIME 형식을 하나 이상 포함해야 한다');
+          }
+          if (doc.storage.upload.maxBytes !== undefined
+            && (!Number.isSafeInteger(doc.storage.upload.maxBytes) || Number(doc.storage.upload.maxBytes) <= 0)) {
+            push(errors, '/storage/upload/maxBytes', 'storage.upload.maxBytes 는 양의 안전한 정수여야 한다');
+          }
+          if (doc.storage.upload.anonymous !== undefined && typeof doc.storage.upload.anonymous !== 'boolean') {
+            push(errors, '/storage/upload/anonymous', 'storage.upload.anonymous 는 boolean 이어야 한다');
+          }
+        }
+      }
+    }
   }
   for (const issue of validateAppSimulation(doc.simulate, {
     actions: isRecord(doc.actions) ? Object.keys(doc.actions) : [],

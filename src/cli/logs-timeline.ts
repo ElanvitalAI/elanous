@@ -19,7 +19,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import type { LogStoreRow, LogQuery } from '../mss/logging/log-store.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { resolveLogTargets } from './logs-cli.js';
-import { formatClock } from '../time/format.js';
+import { formatClock } from '../time/clock.js';
 
 /** Category PREFIXES worth pulling for a timeline. Everything else (render
  *  frames, stream deltas, cache stats, tool-exposure) is noise and never

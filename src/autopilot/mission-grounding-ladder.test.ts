@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'bun:test';
+import { preflightArc } from './mission-arc-preflight.js';
 import {
   adaptiveGround, extractSymbols, isImplementationFile, parseAssess, GROUNDING_TIERS,
   normalizeExternalCompletion, deriveReuseBoundary,
@@ -195,5 +196,51 @@ describe('normalizeExternalCompletion / deriveReuseBoundary — AA4/AA5(phase 7�
   it('미완성 → reuseBoundary stale(적용 안 함·결정론)', () => {
     const c = normalizeExternalCompletion(g, { source: null, claimedScope: ['x'] });
     expect(deriveReuseBoundary(c, g).freshness).toBe('stale');
+  });
+});
+
+describe('MISSION-RM-SHARED-EXTRACT: existing production caller uses shared grounding', () => {
+  it('preflightArc uses the compatibility path backed by the extracted implementation', async () => {
+    let observedPrompt = '';
+    const groundingDeps = {
+      searchTerms: async () => [],
+      codebaseGrounding: {
+        persistent: false as const,
+        seedPaths: ['src/autopilot/mission-grounding-ladder.ts'],
+        skillIndex: () => [],
+        pickSkills: async () => [],
+        recallMemory: () => [],
+        recallSelf: async () => [],
+        refDigest: () => '',
+        listCapsules: () => [],
+      },
+      assess: async () => '{"confidence":"high","nextTier":"none"}',
+      maxTier: 1,
+    };
+    expect('ground' in groundingDeps).toBe(false);
+    const result = await preflightArc(
+      {
+        arcId: 'grounding-shared-extract',
+        name: 'shared grounding extraction',
+        intent: 'verify src/autopilot/mission-grounding-ladder.ts grounding',
+        phaseIds: ['task:grounding'],
+        dependsOnArcs: [],
+        acceptance: ['grounded evidence is visible'],
+        status: 'pending',
+      },
+      [{ id: 'task:grounding', title: 'grounding', description: 'inspect src/autopilot/mission-grounding-ladder.ts' }],
+      {
+        groundingDeps,
+        judge: async (prompt) => {
+          observedPrompt = prompt;
+          return JSON.stringify({ verdict: 'founded', reason: 'grounded evidence supplied', action: 'keep' });
+        },
+        repoRoot: process.cwd(),
+      },
+    );
+
+    expect(result.verdict).toBe('founded');
+    expect(observedPrompt).toContain('src/autopilot/mission-grounding-ladder.ts');
+    expect(observedPrompt).toContain('adaptiveGround');
   });
 });

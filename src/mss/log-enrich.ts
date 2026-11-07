@@ -10,7 +10,7 @@
 // frame or a writable identity file.
 
 import { getFlags } from './feature-flags.js';
-import { getOrCreateElanousId } from './identity.js';
+import { getOrCreateElanousId } from './identity-store.js';
 import { getParentSpanId, getSpanId, getTraceId } from './trace-context.js';
 import { inferCategoryFromPath } from './category-infer.js';
 

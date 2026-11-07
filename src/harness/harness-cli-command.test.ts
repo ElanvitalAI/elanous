@@ -227,8 +227,9 @@ describe.serial('harness CLI command', () => {
     say?: Parameters<typeof installHarnessCliCommand>[1]['say'],
     plan?: Parameters<typeof installHarnessCliCommand>[1]['plan'],
     processObservation?: Parameters<typeof installHarnessCliCommand>[1]['processObservation'],
-    mission?: Parameters<typeof installHarnessCliCommand>[1]['mission'],
-    missionLoop?: Parameters<typeof installHarnessCliCommand>[1]['missionLoop'],
+    // Retired positional slots keep the nearby draftSweep/podDispatchTask calls aligned.
+    _retiredMission?: (missionId: string, opts: { executor?: 'self-implement' }) => Promise<void>,
+    _retiredMissionLoop?: (missionIds: readonly string[], opts: { executor?: 'self-implement' }) => Promise<readonly unknown[]>,
     draftSweep?: Parameters<typeof installHarnessCliCommand>[1]['draftSweep'],
     podDispatchTask?: Parameters<typeof installHarnessCliCommand>[1]['podDispatchTask'],
     launchGate: NonNullable<Parameters<typeof installHarnessCliCommand>[1]['launchGate']> = {
@@ -243,8 +244,6 @@ describe.serial('harness CLI command', () => {
       say,
       plan,
       processObservation,
-      mission,
-      missionLoop,
       draftSweep,
       podDispatchTask,
       launchGate,
@@ -3114,14 +3113,13 @@ describe.serial('harness CLI command', () => {
     } finally { dispatch.mockRestore(); process.exitCode = previousExit ?? 0; }
   });
 
-  test('ask and say expose and forward opaque --correlation without exposing it to plan or mission', async () => {
+  test('ask and say expose opaque --correlation while the retired mission entry stays absent', async () => {
     const received: unknown[] = [];
     const { program, harness } = install(
       async (goalPath, options) => { received.push(['ask', goalPath, options]); },
       async (words, options) => { received.push(['say', words, options]); },
       undefined,
       undefined,
-      async () => {},
     );
     for (const name of ['ask', 'say'] as const) {
       const command = harness.commands.find((candidate) => candidate.name() === name)!;
@@ -3129,7 +3127,7 @@ describe.serial('harness CLI command', () => {
       expect(command.helpInformation()).toContain('--correlation <id>');
     }
     expect(harness.commands.find((command) => command.name() === 'plan')!.options.map((option) => option.long)).not.toContain('--correlation');
-    expect(harness.commands.find((command) => command.name() === 'mission')!.options.map((option) => option.long)).not.toContain('--correlation');
+    expect(harness.commands.map((command) => command.name())).not.toContain('mission');
 
     await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--correlation', 'request/run:opaque']);
     await program.parseAsync(['node', 'elanous', 'harness', 'say', 'write', 'goal', '--correlation', 'say-correlation']);
@@ -3275,92 +3273,8 @@ describe.serial('harness CLI command', () => {
     }
   });
 
-  test('registers mission only when injected and forwards its id with an explicit executor', async () => {
+  test('mission is absent from the harness command list', () => {
     expect(install().harness.commands.map((command) => command.name())).not.toContain('mission');
-
-    const received: unknown[] = [];
-    const { program, harness } = install(undefined, undefined, undefined, undefined, async (missionId, opts) => {
-      received.push([missionId, opts]);
-    });
-
-    expect(harness.commands.map((command) => command.name())).toContain('mission');
-    await program.parseAsync(['node', 'elanous', 'harness', 'mission', 'apm-default']);
-    await program.parseAsync(['node', 'elanous', 'harness', 'mission', 'apm-self', '--executor', 'self-implement']);
-
-    expect(received).toEqual([
-      ['apm-default', {}],
-      ['apm-self', { executor: 'self-implement' }],
-    ]);
-  });
-
-  test('rejects retired staged executor while retaining the self-implement choice', async () => {
-    const { program, harness } = install(undefined, undefined, undefined, undefined, async () => {});
-    const mission = harness.commands.find((command) => command.name() === 'mission')!;
-    expect(mission.helpInformation()).toContain('self-implement');
-    expect(mission.helpInformation()).not.toContain('staged');
-    await expect(program.parseAsync(['node', 'elanous', 'harness', 'mission', 'apm-staged', '--executor', 'staged'])).rejects.toThrow(/staged/);
-  });
-
-  test('multiple mission IDs use the loop, render every outcome, and preserve the single-ID handler', async () => {
-    const single: unknown[] = [];
-    const loops: unknown[] = [];
-    const { program } = install(
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      async (...args) => { single.push(args); },
-      async (missionIds, opts) => {
-        loops.push([missionIds, opts]);
-        return [
-          { missionId: 'apm-solved', status: 'solved', terminal: 'deployed' },
-          { missionId: 'apm-gone', status: 'not-found', detail: '미션 미존재' },
-          { missionId: 'apm-refused', status: 'refused', detail: 'not coding' },
-          { missionId: 'apm-error', status: 'error', detail: 'boom' },
-        ];
-      },
-    );
-
-    await program.parseAsync(['node', 'elanous', 'harness', 'mission', 'apm-single']);
-    const lines = await captureLog(() => program.parseAsync([
-      'node', 'elanous', 'harness', 'mission', 'apm-solved', 'apm-gone', 'apm-refused', 'apm-error', '--executor', 'self-implement',
-    ]));
-
-    expect(single).toEqual([['apm-single', {}]]);
-    expect(loops).toEqual([[[
-      'apm-solved', 'apm-gone', 'apm-refused', 'apm-error',
-    ], { executor: 'self-implement' }]]);
-    expect(lines).toEqual([
-      "🧩 미션 'apm-solved' — solved: deployed",
-      "🧩 미션 'apm-gone' — not-found: 미션 미존재",
-      "🧩 미션 'apm-refused' — refused: not coding",
-      "🧩 미션 'apm-error' — error: boom",
-    ]);
-  });
-
-  test('multi-mission dry-run lists every planned launch without calling the loop', async () => {
-    const loops: unknown[] = [];
-    const { program } = install(
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      async () => {},
-      async (...args) => { loops.push(args); return []; },
-    );
-
-    const lines = await captureLog(() => program.parseAsync([
-      'node', 'elanous', 'harness', 'mission', 'apm-one', 'apm-two', '--dry-run',
-    ]));
-
-    expect(loops).toEqual([]);
-    expect(lines).toEqual([
-      '[dry-run] 입력: apm-one apm-two',
-      '[dry-run] 입구: cli-harness-mission',
-      '[dry-run] 시작 예정: 기존 미션 apm-one, apm-two read · 순차 하니스 실행기',
-      '[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음',
-      '[dry-run] ask 마커 — 골 문서가 아직 없다 (⛔ 「경고 없음」이 아니다)',
-    ]);
   });
 
   test('ask dry-run renders marker warnings without dispatching', async () => {
@@ -3513,25 +3427,6 @@ describe.serial('harness CLI command', () => {
       rmSync(goalPath, { force: true });
     }
   });
-
-  test('mission dry-run prints the launch plan and does not call its injected handler', async () => {
-    const calls: unknown[] = [];
-    const { program } = install(undefined, undefined, undefined, undefined, async (...args) => { calls.push(args); });
-
-    const lines = await captureLog(() => program.parseAsync([
-      'node', 'elanous', 'harness', 'mission', 'apm-dry-run', '--dry-run',
-    ]));
-
-    expect(calls).toEqual([]);
-    expect(lines).toEqual([
-      '[dry-run] 입력: apm-dry-run',
-      '[dry-run] 입구: cli-harness-mission',
-      '[dry-run] 시작 예정: 기존 미션 read · 워크트리 · 하니스 실행기',
-      '[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음',
-      '[dry-run] ask 마커 — 골 문서가 아직 없다 (⛔ 「경고 없음」이 아니다)',
-    ]);
-  });
-
 
   // ⛔⭐⭐ 🩸 2026-09-12 — ***등록은 됐는데 «전달»이 «안» 됐다.***
   //    `--child-llm-effort` 를 옵션으로 «달았고» 판정 함수도 맞았는데,

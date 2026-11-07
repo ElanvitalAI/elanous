@@ -59,7 +59,7 @@ export function releaseResumeAcceptedRegressions(state: GraphRunState, additions
   return combined;
 }
 
-const SWEEP_INCOMPLETE = /^(?:pod sweep incomplete|sweep incomplete|[\w-]+ shard incomplete)\b/;
+const SWEEP_INCOMPLETE = /^(?:pod sweep incomplete|sweep incomplete|[\w-]+ shard incomplete|failure attribution incomplete)\b/;
 
 /**
  * RELEASE-WAIVE-UNMEASURED — why the saved gate record at `index` carries no verdict, or undefined when it does (or may).
@@ -110,7 +110,7 @@ export function gateUnmeasuredDetail(state: GraphRunState, index: number): strin
   }
   if (!failedAfterGate(state, index) || record.executed !== true) return undefined;
   const result = lastJsonObject(record.output);
-  if (result === undefined) {
+  if (result === undefined || !('outcome' in result)) {
     if (record.exit !== null || printedVerdict(record.output)) return undefined;
     return `no-verdict: gate process ended with exit null and no result line${record.error ? ` — ${record.error.split('\n')[0]!.slice(0, 120)}` : ''}`;
   }

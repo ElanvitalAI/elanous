@@ -1,6 +1,5 @@
 // FabricStageHeader 단계 표 배선 가드(F3 · 2026-07-09).
-// 4 표면(intake·autopilot·tasks·scheduler)이 파이프라인 순서로·정확한 라우트로
-// 연결됨을 잠근다. SIDEBAR_NAV_ITEMS 와 href 정합도 확인(사이드바 ↔ 단계 헤더 일치).
+// 작업·스케줄 링크가 정확한 라우트와 사이드바에 연결되는지 확인한다.
 
 import { describe, it, expect } from 'bun:test';
 import { FABRIC_STAGES, FabricStageHeader } from './FabricStageHeader';
@@ -11,9 +10,9 @@ import { createElement } from 'react';
 import { SIDEBAR_NAV_ITEMS } from './sidebar-nav-items';
 
 describe('FABRIC_STAGES', () => {
-  it('데이터 흐름 순서 = autopilot → tasks → scheduler (narrow-waist V3: intake 흡수)', () => {
+  it('남은 작업 흐름은 tasks → scheduler 순이다', () => {
     expect(FABRIC_STAGES.map((s) => s.key)).toEqual([
-      'autopilot', 'tasks', 'scheduler',
+      'tasks', 'scheduler',
     ]);
   });
 
@@ -23,7 +22,6 @@ describe('FABRIC_STAGES', () => {
 
   it('각 단계 href 가 canonical 라우트', () => {
     const byKey = Object.fromEntries(FABRIC_STAGES.map((s) => [s.key, s.href]));
-    expect(byKey.autopilot).toBe('/autopilot');
     expect(byKey.tasks).toBe('/tasks');
     expect(byKey.scheduler).toBe('/scheduler');
   });

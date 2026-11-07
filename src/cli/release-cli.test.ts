@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { createServer } from 'node:net';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { checklistHistory, listChecklist, devVersion, refRoots, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
@@ -20,7 +21,7 @@ import { releaseLedgerRoot } from '../instance/resolve.js';
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
-import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
+import { formatResumeGatePlan, isPrerelease, isReleaseVersion, planPublish, prepareRelease, publishRelease, registerReleaseCommands, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
 import { simInProcessCli } from '../ux-sim/in-process-cli.js';
@@ -32,6 +33,11 @@ const frozenGateRunner = {
   sweep: async () => ({ rc: 0, output: '' }),
   add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {},
 } as never;
+
+test('release resume plan shows corrupt shard IDs in the partial gate label', () => {
+  expect(formatResumeGatePlan('partial', undefined, { requested: true, applied: true, files: 2,
+    invalidatedShardIds: ['pod-2'] })).toBe('부분 gate 계획 2파일 · 손상 receipt 재측 pod-2');
+});
 
 function assertReleaseGateNodeRecipe(command: string, entrypoint: string): void {
   const expected = `bun ${entrypoint} --json`;
@@ -2160,6 +2166,7 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
 // 상태 왕복 가짜 — memory add 로 받은 nonce 를 search 가 돌려주고, logs 는 «지금» 쓰인 행을 낸다.
 let lastNonce = '';
 function stateOk(a: readonly string[]): { status: number; stdout: string; stderr: string } {
+  if (a[0] === 'nexus' && a[1] === '--status') return { status: 0, stdout: '  status    not running\n', stderr: '' };
   if (a[0] === 'memory' && a[1] === 'add') { lastNonce = String(a[3]).replace('release-verify-', ''); return { status: 0, stdout: 'saved', stderr: '' }; }
   if (a[0] === 'memory' && a[1] === 'search') return { status: 0, stdout: `match release-verify-${lastNonce}`, stderr: '' };
   if (a[0] === 'logs') return { status: 0, stdout: `{"_meta":{}}\n{"id":2,"ts_ms":${Date.now()}}\n`, stderr: '' };
@@ -2170,6 +2177,45 @@ function stateOk(a: readonly string[]): { status: number; stdout: string; stderr
 const notesCurl = (a: readonly string[], code = '200') => (a.includes('-w') ? { status: 0, stdout: code, stderr: '' } : null);
 
 describe('release verify — 공개 주소로 끝까지', () => {
+  test('verify stops its daemon and releases the default loopback port before cleanup', async () => {
+    const daemon = createServer();
+    await new Promise<void>((resolve, reject) => {
+      daemon.once('error', reject);
+      daemon.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = daemon.address();
+    if (!address || typeof address === 'string') throw new Error('test daemon did not bind a TCP port');
+    const port = address.port;
+    let stopCalled = false;
+    let daemonClosed: Promise<void> | undefined;
+    const runner: Runner = (command, args) => {
+      if (command.endsWith('/bin/elanous') && args[0] === 'nexus' && args[1] === '--stop') {
+        stopCalled = true;
+        daemonClosed = new Promise<void>((resolve, reject) => daemon.close((error) => error ? reject(error) : resolve()));
+        return { status: 0, stdout: 'stopping\n', stderr: '' };
+      }
+      if (command.endsWith('/bin/elanous') && args[0] === 'nexus' && args[1] === '--status')
+        return { status: 0, stdout: '  status    not running\n', stderr: '' };
+      if (command === 'curl') return notesCurl(args) ?? { status: 0, stdout: 'installer', stderr: '' };
+      if (args[0] === '--version') return { status: 0, stdout: '0.1.1 cafe\n', stderr: '' };
+      return stateOk(args);
+    };
+    try {
+      const verified = await verifyRelease({ version: '0.1.1', log: () => {} }, runner);
+      expect(verified.daemonStopped).toBe(true);
+      expect(stopCalled).toBe(true);
+      await daemonClosed;
+      const portProbe = createServer();
+      await new Promise<void>((resolve, reject) => {
+        portProbe.once('error', reject);
+        portProbe.listen(port, '127.0.0.1', () => resolve());
+      });
+      await new Promise<void>((resolve, reject) => portProbe.close((error) => error ? reject(error) : resolve()));
+    } finally {
+      if (daemon.listening) await new Promise<void>((resolve) => daemon.close(() => resolve()));
+    }
+  });
+
   test('prepare와 verify의 로컬 설치기는 명시적 동의 --yes를 전달한다', async () => {
     const calls: Array<{ command: string; args: readonly string[]; input?: string }> = [];
     const runner: Runner = (command, args, _cwd, options) => {
@@ -2177,7 +2223,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     runReleaseInstaller('local installer', '/tmp/prepare-home', {}, runner);
-    expect(calls[0]).toEqual({ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path'], input: 'local installer' });
+    expect(calls[0]).toEqual({ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path', '--no-setup'], input: 'local installer' });
 
     const verifyCalls: Array<{ command: string; args: readonly string[] }> = [];
     const verifyRunner: Runner = (command, args) => {
@@ -2186,12 +2232,71 @@ describe('release verify — 공개 주소로 끝까지', () => {
       return args[0] === '--version' ? { status: 0, stdout: '0.1.1 abc', stderr: '' } : stateOk(args);
     };
     await verifyRelease({ version: '0.1.1', log: () => {} }, verifyRunner);
-    expect(verifyCalls.find((call) => call.command === 'bash')).toEqual({ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path'] });
+    expect(verifyCalls.find((call) => call.command === 'bash')).toEqual({ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path', '--no-setup'] });
+  });
+
+  test('prepare installer failure includes its stderr tail in the node log and error', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'release-prepare-installer-failure-'));
+    const repoRoot = join(root, 'repo');
+    const out = join(root, 'out');
+    mkdirSync(join(repoRoot, 'node_modules'), { recursive: true });
+    writeFileSync(join(repoRoot, 'package.json'), JSON.stringify({ version: '0.1.1' }));
+    const git = (...args: string[]) => spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
+    expect(git('init', '-q').status).toBe(0);
+    expect(git('config', 'user.name', 'Fixture').status).toBe(0);
+    expect(git('config', 'user.email', 'fixture@example.invalid').status).toBe(0);
+    expect(git('add', 'package.json').status).toBe(0);
+    expect(git('commit', '-qm', 'fixture').status).toBe(0);
+    const stderrTail = 'installer-failure-'.repeat(70).slice(-1_000);
+    const log: string[] = [];
+    const runner: Runner = (command, args, cwd) => {
+      if (command === 'git') {
+        if (args[0] === 'clone') return { status: 1, stdout: '', stderr: 'offline fixture' };
+        const result = spawnSync(command, [...args], { cwd, encoding: 'utf8' });
+        return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+      }
+      if (command === 'bun' && args[0] === 'scripts/public-export.ts') {
+        const exportDir = String(args[args.indexOf('--out') + 1]);
+        mkdirSync(join(exportDir, 'scripts'), { recursive: true });
+        mkdirSync(join(exportDir, 'apps', 'pwa'), { recursive: true });
+        writeFileSync(join(exportDir, 'scripts', 'uninstall.sh'), '#!/bin/bash\n');
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (command === 'bun' && args[0] === 'bin/elanous.mjs') {
+        mkdirSync(join(cwd, 'apps', 'pwa', 'out'), { recursive: true });
+        writeFileSync(join(cwd, 'apps', 'pwa', 'out', 'index.html'), '<html></html>');
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (command === 'bun' && String(args[0]).endsWith('scripts/release-build.ts')) {
+        const distDir = String(args[args.indexOf('--out') + 1]);
+        mkdirSync(distDir, { recursive: true });
+        const files = ['elanous.tgz', 'install.sh', 'install.ps1'].map((name) => {
+          const body = `fixture ${name}`;
+          writeFileSync(join(distDir, name), body);
+          return { name, sha256: createHash('sha256').update(body).digest('hex'), bytes: body.length };
+        });
+        writeFileSync(join(distDir, 'SHA256SUMS'), files.map((file) => `${file.sha256}  ${file.name}`).join('\n') + '\n');
+        return { status: 0, stdout: JSON.stringify({ files }), stderr: '' };
+      }
+      if (command === 'bash' && args[0] === '-s') return { status: 1, stdout: '', stderr: `prefix${stderrTail}` };
+      if (command === 'bash') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === '--version') return { status: 1, stdout: '', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      await expect(prepareRelease({ version: '0.1.1', source: 'HEAD', out, repoRoot, log: (line) => log.push(line) }, runner))
+        .rejects.toThrow(`설치 stderr tail «${stderrTail}»`);
+      expect(log.some((line) => line.includes(`설치 stderr tail «${stderrTail}»`))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('고정 버전이면 download/v<버전> 설치기를 받고, --version 이 그 버전으로 시작해야 ok', async () => {
     const urls: string[] = [];
+    const calls: Array<{ command: string; args: readonly string[] }> = [];
     const run: Runner = (c, a) => {
+      calls.push({ command: c, args: a });
       if (c === 'curl') { const n = notesCurl(a); if (n) return n; urls.push(String(a[1])); return { status: 0, stdout: 'echo installer', stderr: '' }; }
       if (a[0] === '--version') return { status: 0, stdout: '0.1.1 cafe\n', stderr: '' };
       return stateOk(a);
@@ -2199,6 +2304,11 @@ describe('release verify — 공개 주소로 끝까지', () => {
     const r = await verifyRelease({ version: '0.1.1', log: () => {} }, run);
     expect(urls).toEqual(['https://github.com/ElanvitalAI/elanous/releases/download/v0.1.1/install.sh']);
     expect(r.ok).toBe(true);
+    expect(r.daemonStopped).toBe(true);
+    expect(r.steps?.daemonStop).toBe(0);
+    expect(calls.find((call) => call.command === 'bash' && call.args[0] === '-s')?.args).toContain('--no-setup');
+    expect(calls.some((call) => call.args[0] === 'nexus' && call.args[1] === '--stop')).toBe(true);
+    expect(calls.some((call) => call.args[0] === 'nexus' && call.args[1] === '--status')).toBe(true);
     const wrong: Runner = (c, a) => (c === 'curl' && notesCurl(a) ? notesCurl(a)! : a[0] === '--version' ? { status: 0, stdout: '0.1.0 cafe', stderr: '' } : stateOk(a));
     expect((await verifyRelease({ version: '0.1.1', log: () => {} }, wrong)).ok).toBe(false);
   });

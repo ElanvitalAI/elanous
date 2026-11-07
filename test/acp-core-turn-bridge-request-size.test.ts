@@ -20,8 +20,8 @@ import { PROVIDERS, streamLLMWithTools, type LLMMessage, type LLMToolSpec } from
 import type { ChatMessage } from '../src/chat/index.js';
 import type { AcpTurnContext } from '../src/acp/server.js';
 import { debug } from '../src/debug/log.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
-import type { CoreTurnContext, CoreTurnResult } from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
+import type { CoreTurnContext, CoreTurnResult } from '../src/core-turn/types.js';
 import * as userConfigModule from '../src/user-config.js';
 import { bootDashboardAcpSession, compactDashboardChatHistory } from '../src/dashboard/acp-boot.js';
 import { runDashboardHandoffMirror } from '../src/dashboard/handoff-mirror-runtime.js';

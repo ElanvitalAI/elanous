@@ -56,6 +56,7 @@ test('projectless secretary request honors the explicit team and never resolves 
   const dueDate = '2026-11-05';
   const result = await runLinearSecretaryRequest(`projectless=true teamKey=DEMO demo due ${dueDate}`, {
     getApiKey: async () => 'test-key',
+    now: () => new Date('2026-11-04T12:00:00.000Z'),
     getProject: () => { projectResolverCalls++; return 'wrong/default project'; },
     repositoryRoot: root,
     fetch: fakeFetch,

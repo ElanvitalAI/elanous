@@ -11,7 +11,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { join } from 'node:path';
-import { formatClock } from '../time/format.js';
+import { formatClock } from '../time/clock.js';
 
 export interface AuditEntry {
   ts: string;                // ISO-8601 UTC

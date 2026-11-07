@@ -146,12 +146,12 @@ describe('cron-run observation diagnostics', () => {
       const result = await runCron(`export { recordScheduledExecution } from ${JSON.stringify(join(REPOSITORY_ROOT, 'src', 'domains', 'schedule-observability.ts'))};\n`, {
         scheduleId: 'selected-id',
         shell: true,
-        targetBody: 'printf "arg=%s\\n" "$1"\nexit 7\n',
+        targetBody: 'printf "arg=%s schedule=%s\\n" "$1" "$CRON_RUN_SCHEDULE_ID"\nexit 7\n',
         targetArgs: ['--payload'],
         env: { ELANOUS_STATE_DIR: directory, ELANOUS_CONFIG_DIR: directory, PATH: `${directory}:${process.env.PATH}` },
       });
       expect(result.exitCode).toBe(7);
-      expect(result.stdout).toBe('arg=--payload\n');
+      expect(result.stdout).toBe('arg=--payload schedule=selected-id\n');
       expect(result.stderr).not.toContain('registry selection ambiguous');
       const rows = db.query(`SELECT id, last_status, last_exit, last_run, last_via FROM schedule_registry ORDER BY id`).all() as Array<{
         id: string; last_status: string | null; last_exit: number | null; last_run: string | null; last_via: string | null;
@@ -168,22 +168,28 @@ describe('cron-run observation diagnostics', () => {
   test('does not fall back to name matching when the explicit id is absent', async () => {
     const registry = join(REPOSITORY_ROOT, 'src', 'domains', 'schedule-registry.js');
     const result = await runCron("export function recordScheduledExecution(_name: string, _record: unknown, options: { id?: string }): void { process.stderr.write(`selected=${options.id ?? 'none'}\\n`); }\n", {
+      targetBody: 'process.stdout.write(`schedule=${process.env.CRON_RUN_SCHEDULE_ID}\\n`); process.exit(7);\n',
       scheduleId: 'missing-id',
+      env: { CRON_RUN_SCHEDULE_ID: 'e27030c5f0be' },
       registryMock: `import { mock } from 'bun:test';\nmock.module(${JSON.stringify(registry)}, () => ({ scriptName: () => 'target', openSchedulesDb: () => ({ close() {}, query: () => ({ get: () => undefined }) }), inventoryCrontab() {}, listSchedules: () => { throw new Error('name matching must not run'); } }));\n`,
     });
     expect(result.exitCode).toBe(7);
     expect(result.stderr).toContain('selected=none');
     expect(result.stderr).toContain('cron-run observation registry record skipped:');
     expect(result.stderr).not.toContain('name matching must not run');
+    expect(result.stdout).toBe('schedule=undefined\n');
   });
 
   test('records the first enabled duplicate instead of an earlier disabled row', async () => {
     const registry = join(REPOSITORY_ROOT, 'src', 'domains', 'schedule-registry.js');
     const result = await runCron("export function recordScheduledExecution(_name: string, _record: unknown, options: { id?: string }): void { process.stderr.write(`selected=${options.id}\\n`); }\n", {
+      targetBody: 'process.stdout.write(`schedule=${process.env.CRON_RUN_SCHEDULE_ID}\\n`); process.exit(7);\n',
+      env: { CRON_RUN_SCHEDULE_ID: 'stale-parent-id' },
       registryMock: `import { mock } from 'bun:test';\nmock.module(${JSON.stringify(registry)}, () => ({ scriptName: () => 'target.ts', openSchedulesDb: () => ({ close() {} }), inventoryCrontab() {}, listSchedules: () => [{ id: 'disabled-id', name: 'target.ts', enabled: false, last_status: 'error' }, { id: 'enabled-id', name: 'target.ts', enabled: true, last_status: null }] }));\n`,
     });
     expect(result.exitCode).toBe(7);
     expect(result.stderr).toContain('selected=enabled-id');
+    expect(result.stdout).toBe('schedule=enabled-id\n');
     expect(result.stderr).not.toContain('cron-run observation');
   });
 

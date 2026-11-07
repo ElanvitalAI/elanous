@@ -56,11 +56,11 @@ export type RepairPlan = { action: 'launch'; goal: string; boundaryFiles: string
 export type DriftLaunch = (goal: string, boundaryFiles: readonly string[]) => void | Promise<void>;
 export type DriftEscalate = (mail: string) => void;
 
-/** Missing configuration opts into live repair; `off` is the hard stop. */
+/** Live repair is an explicit opt-in; missing or invalid configuration stays observational. */
 export function resolveDriftAutorepairMode(value: unknown): 'off' | 'shadow' | 'live' {
   if (value === 'off') return 'off';
-  if (value === 'shadow') return 'shadow';
-  return 'live';
+  if (value === 'live') return 'live';
+  return 'shadow';
 }
 
 const defaultGit: DriftGit = (args, repo) => {
@@ -289,7 +289,9 @@ export async function executeDriftPlan(plan: RepairPlan, mode: 'off' | 'shadow' 
     await launch(plan.goal, plan.boundaryFiles);
     debug.log('pr.land', 'drift-repair-launched', { goalLength: plan.goal.length, boundaryFiles: plan.boundaryFiles });
   } else if (plan.action === 'launch') {
-    debug.log('pr.land', mode === 'off' ? 'drift-repair-disabled' : 'drift-repair-planned', { goalLength: plan.goal.length, boundaryFiles: plan.boundaryFiles });
+    debug.log('pr.land', mode === 'off' ? 'drift-repair-disabled' : 'drift-repair-planned', {
+      goal: mode === 'shadow' ? plan.goal : undefined, goalLength: plan.goal.length, boundaryFiles: plan.boundaryFiles,
+    });
   }
   if (plan.action === 'escalate') {
     escalate(plan.mail);

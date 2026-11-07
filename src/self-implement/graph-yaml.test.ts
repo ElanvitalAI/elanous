@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   canonicalGraphJson, edgeMapOf, graphVersionHash, loadGraphTemplates, parseGraphTemplateYaml,
@@ -19,6 +19,35 @@ import { PIPELINE_EDGES_BY_NODE, TERMINAL_STAGES_BY_NODE } from './pipeline-shap
 const GRAPHS_DIR = join(import.meta.dir, '../../graphs');
 
 describe('RFC §5 0단계 — YAML 파서', () => {
+  test('node emits and subscribes declarations are parsed and validated', () => {
+    const source = `graph_id: events
+version: 1
+entry_node: start
+terminal_nodes: [done]
+nodes:
+  - node_id: start
+    kind: gate
+    recipe: none
+    max_visits: 1
+    emits: [release.gate.failed]
+    subscribes:
+      - event: release.tip.moved
+        match: { scope: scripts/release-loop }
+        action: invalidate
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: start, to: done }
+`;
+    const parsed = parseGraphTemplateYaml(source);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.nodes[0]).toMatchObject({
+      emits: ['release.gate.failed'],
+      subscribes: [{ event: 'release.tip.moved', match: { scope: 'scripts/release-loop' }, action: 'invalidate' }],
+    });
+    const malformed = parseGraphTemplateYaml(source.replace('action: invalidate', 'action: ignore'));
+    expect(malformed.errors).toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/nodes/0/subscribes/0/action' })]));
+  });
+
   test('explicit fan-out requires unique declared branch destinations and a declared join', () => {
     const source = `graph_id: fanout
 version: 1
@@ -58,6 +87,50 @@ edges:
     expect(multistep.errors).toEqual(expect.arrayContaining([expect.objectContaining({
       path: '<inline>/edges/start/branches', message: expect.stringContaining('후속 간선'),
     })]));
+  });
+
+  test('node needs compile independent ready nodes into a shared fan-out barrier', () => {
+    const source = `graph_id: needs-fanout
+version: 1
+entry_node: start
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: start, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: a, kind: gate, recipe: none, max_visits: 1, needs: [start] }
+  - { node_id: b, kind: gate, recipe: none, max_visits: 1, needs: [start] }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1, needs: [a, b] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: start, on: outcome, map: { fail: failed, error: failed } }
+  - { from: joined, on: outcome, map: { ok: done, fail: failed, error: failed } }
+`;
+    const parsed = parseGraphTemplateYaml(source);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.nodes.find((node) => node.nodeId === 'joined')?.needs).toEqual(['a', 'b']);
+    expect(parsed.template?.edges[0]).toMatchObject({ from: 'start', branches: { ok: ['a', 'b'] }, join: 'joined' });
+    const unknown = parseGraphTemplateYaml(source.replace('needs: [a, b]', 'needs: [a, missing]'));
+    expect(unknown.template).toBeUndefined();
+    expect(unknown.errors).toEqual(expect.arrayContaining([expect.objectContaining({ path: '<inline>/nodes/joined/needs' })]));
+    const cycle = parseGraphTemplateYaml(source.replace('needs: [start] }\n  - { node_id: b', 'needs: [b] }\n  - { node_id: b')
+      .replace('needs: [start] }\n  - { node_id: joined', 'needs: [a] }\n  - { node_id: joined'));
+    expect(cycle.template).toBeUndefined();
+    expect(cycle.errors).toEqual(expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining('순환') })]));
+    const unsupportedJoinPrerequisite = parseGraphTemplateYaml(source.replace('  - { node_id: joined,', '  - { node_id: unrelated, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: joined,')
+      .replace('needs: [a, b] }', 'needs: [a, b, unrelated] }'));
+    expect(unsupportedJoinPrerequisite.template).toBeUndefined();
+    expect(unsupportedJoinPrerequisite.errors).toEqual(expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining('공통 join') })]));
+  });
+
+  test('release-loop readiness groups are derived from node needs, not edge branch lists', () => {
+    const parsed = parseGraphTemplateYaml(readFileSync(join(GRAPHS_DIR, 'release/release-loop.yaml'), 'utf8'));
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.edges.filter((edge) => edge.branches).map((edge) => ({ from: edge.from, branches: edge.branches, join: edge.join })))
+      .toEqual([
+        { from: 'export-check', branches: { ok: ['checklist-gate', 'prefetch'] }, join: 'pre-gate-join' },
+        { from: 'traffic-gate-passed', branches: { ok: ['mac-smoke', 'pwa'], fail: ['mac-smoke', 'pwa'], error: ['mac-smoke', 'pwa'] }, join: 'pre-prepare-join' },
+        { from: 'traffic-npm-published', branches: { ok: ['docs-land', 'version-dev-bump'], fail: ['docs-land', 'version-dev-bump'], error: ['docs-land', 'version-dev-bump'] }, join: 'release-post-publish-join' },
+      ]);
   });
 
   test('ARG L graph/node allowance is parsed and malformed declarations are rejected', () => {

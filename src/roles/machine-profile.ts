@@ -8,7 +8,21 @@ export interface MachineProfile {
   id: string;
   duties: string[];
   seats: Record<string, { rank: number }>;
+  /** Local, product-owned join record; external fleet registration remains OP-owned. */
+  membership?: { role: 'headquarters' | 'gate' | 'pod' | 'worker'; resourceCapGiB: number; joinedAt: string };
 }
+
+const validMembership = (value: unknown): MachineProfile['membership'] | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const membership = value as Record<string, unknown>;
+  if (Object.keys(membership).sort().join(',') !== 'joinedAt,resourceCapGiB,role' ||
+      !['headquarters', 'gate', 'pod', 'worker'].includes(String(membership.role)) ||
+      !Number.isSafeInteger(membership.resourceCapGiB) || (membership.resourceCapGiB as number) < 1 ||
+      (membership.resourceCapGiB as number) > 1024 || typeof membership.joinedAt !== 'string' ||
+      !Number.isFinite(Date.parse(membership.joinedAt)) || new Date(membership.joinedAt).toISOString() !== membership.joinedAt) return undefined;
+  return { role: membership.role as NonNullable<MachineProfile['membership']>['role'],
+    resourceCapGiB: membership.resourceCapGiB as number, joinedAt: membership.joinedAt };
+};
 
 export function validSeatRank(rank: number): boolean {
   return Number.isSafeInteger(rank) && rank >= 1 && rank <= 99;
@@ -27,7 +41,9 @@ export function readMachineProfile(root?: string): MachineProfile | undefined {
         !seats || typeof seats !== 'object' || Array.isArray(seats) ||
         !Object.entries(seats).every(([seat, value]) => MACHINE_NAME.test(seat) && value && typeof value === 'object' &&
           !Array.isArray(value) && validSeatRank((value as { rank?: number }).rank as number))) return undefined;
-    return { id, duties: [...duties], seats: { ...seats } as MachineProfile['seats'] };
+    const membership = doc.membership === undefined ? undefined : validMembership(doc.membership);
+    if (doc.membership !== undefined && !membership) return undefined;
+    return { id, duties: [...duties], seats: { ...seats } as MachineProfile['seats'], ...(membership ? { membership } : {}) };
   } catch { return undefined; }
 }
 
@@ -42,7 +58,8 @@ export function writeMachineProfile(profile: MachineProfile, root?: string): voi
   if (typeof profile.id !== 'string' || !MACHINE_NAME.test(profile.id) || !Array.isArray(profile.duties) ||
       !profile.duties.every(d => typeof d === 'string' && MACHINE_NAME.test(d)) ||
       !profile.seats || typeof profile.seats !== 'object' || Array.isArray(profile.seats) ||
-      !Object.entries(profile.seats).every(([seat, value]) => MACHINE_NAME.test(seat) && validSeatRank(value?.rank))) {
+      !Object.entries(profile.seats).every(([seat, value]) => MACHINE_NAME.test(seat) && validSeatRank(value?.rank)) ||
+      (profile.membership !== undefined && !validMembership(profile.membership))) {
     throw new Error('invalid machine profile (id, duties, seats or rank)');
   }
   assertJoinedMachineId(profile.id, root);
@@ -57,7 +74,8 @@ export function writeMachineProfile(profile: MachineProfile, root?: string): voi
     rmSync(tmp, { force: true });
     throw error;
   }
-  debug.log('roles.machine', 'profile-written', { id: profile.id, duties: profile.duties, seats: profile.seats });
+  debug.log('roles.machine', 'profile-written', { id: profile.id, duties: profile.duties, seats: profile.seats,
+    ...(profile.membership ? { membership: profile.membership } : {}) });
 }
 
 export function seatRank(profile: MachineProfile | undefined, seat: string): number | undefined {

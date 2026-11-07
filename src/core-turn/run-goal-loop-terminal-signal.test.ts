@@ -92,14 +92,47 @@ async function drive(dropTerminal: boolean, turns: LLMStreamEvent[][] = ANSWER_T
 }
 
 describe('goal loop terminal signal wiring (TUI-GOAL-LOOP-FRICTION)', () => {
-  test('research tool round followed by an explicit structured final answer does not launch another investigation', async () => {
+  test('research-intent goal with a structured completion signal does not start another goal-loop turn', async () => {
+    let calls = 0;
+    const userText = '최근 자료를 조사하고 근거와 결론을 정리해줘.';
+    const ctx: CoreTurnContext = {
+      sessionId: 'research-terminal-signal',
+      messages: [{ role: 'user', content: userText } as LLMMessage],
+      userText,
+      tools: [tool],
+      dispatchTool: async () => 'ok',
+      signal: new AbortController().signal,
+    };
+    const result = await runGoalLoop(ctx, {
+      controlSpaceId: null,
+      intentStallProvider: null,
+      changedFiles: () => [],
+      attachLifecycleBridge: () => () => {},
+      startLivenessHeartbeat: () => () => {},
+      runTurn: async (turnContext) => {
+        calls += 1;
+        turnContext.callbacks?.onTurnComplete?.([{
+          role: 'assistant',
+          content: [
+            { type: 'text', text: ANSWER },
+            { type: 'tool_use', id: 'complete-research', name: 'update_goal', input: { status: 'complete', evidence: '근거와 결론 대조 완료' } },
+          ],
+        }]);
+        return { stopReason: 'end_turn', finalText: ANSWER };
+      },
+    });
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 1, finalText: ANSWER });
+  });
+
+  test('tool round followed by an explicit structured final answer does not launch another investigation', async () => {
     const answer = '# HBM4 조사 결과\n\n## 근거\n' + '실측 자료와 출처를 대조했습니다. '.repeat(100)
       + '\n\n## 결론\n검증된 수치를 요약하고 남은 불확실성을 표시했습니다.';
     const r = await drive(false, [
       [{ type: 'tool_call', id: 'research-1', name: 'RunShell', args: {} }],
       [{ type: 'text', phase: 'final', delta: answer }, { type: 'turn_end', endTurn: true }],
       [{ type: 'tool_call', id: 'unwanted', name: 'RunShell', args: {} }],
-    ], 'openai-codex', 10, 'HBM4 최신 자료를 조사하고 근거와 결론을 분석해줘');
+    ], 'openai-codex', 10, 'HBM4 숫자를 한 줄과 결론으로 정리해줘.');
     expect(r.calls).toBe(2);
     expect(r.result).toMatchObject({ finalText: answer, stopReason: 'goal_complete', goalComplete: true, iterations: 1 });
   });

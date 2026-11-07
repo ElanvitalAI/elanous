@@ -5,7 +5,7 @@
 // 통합 타임라인으로 합성한다(READ-ONLY·순수 조립). revision(세대 스냅샷)도 합류.
 
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
-import { formatShortDateTime } from '../time/format.js';
+import { formatShortDateTime } from '../time/calendar.js';
 
 export type MissionHistoryKind = 'edit' | 'decision' | 'split' | 'drift' | 'revision' | 'external';
 

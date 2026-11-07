@@ -4,7 +4,7 @@ export type Role = 'owner' | 'contributor' | 'general';
 
 type SurfaceMaturity = { pwa: Maturity } & Partial<Record<Exclude<Surface, 'pwa'>, Maturity>>;
 
-/** App Router pages, including the generated 404 and the dynamic missions route. */
+/** App Router pages, including the generated 404. */
 export const FEATURE_MATURITY = {
   pwaRoute: {
     '/': { pwa: 'stable' },
@@ -25,8 +25,6 @@ export const FEATURE_MATURITY = {
     '/trace': { pwa: 'beta' },
     '/inside': { pwa: 'beta' },
     '/board': { pwa: 'beta' },
-    '/autopilot': { pwa: 'beta' },
-    '/missions/[id]': { pwa: 'beta' },
     '/tasks': { pwa: 'beta' },
     '/workspace': { pwa: 'beta' },
     '/reflection': { pwa: 'beta' },
@@ -34,6 +32,7 @@ export const FEATURE_MATURITY = {
     '/observatory': { pwa: 'beta' },
     '/exec': { pwa: 'beta' },
     '/outputs': { pwa: 'beta' },
+    '/apps': { pwa: 'beta' },
     '/field': { pwa: 'beta' },
     '/showroom': { pwa: 'beta' },
     '/workflows': { pwa: 'beta' },
@@ -71,13 +70,13 @@ export const FEATURE_MATURITY = {
     python: 'beta', 'self-update': 'stable', 'measure-fabric-arc-ab': 'beta', mcp: 'beta',
     relay: 'beta', 'telegram-test': 'beta', telegram: 'beta', 'discord-test': 'beta', bootstrap: 'stable',
     sync: 'beta', status: 'beta', git: 'beta', gh: 'beta', repro: 'system',
-    theme: 'beta', history: 'beta', inspect: 'beta', autopilot: 'beta', memory: 'beta',
+    theme: 'beta', history: 'beta', inspect: 'beta', memory: 'beta',
     decide: 'beta', 'ax-screen': 'beta', 'decide-recipe': 'beta', signals: 'beta',
     loops: 'beta', buzz: 'beta', harness: 'stable', self: 'beta', factcheck: 'beta',
     provider: 'stable', 'provider:set': 'beta', 'provider:restore': 'beta',
     'provider:rotate': 'beta', 'provider:use': 'beta', 'status-bar': 'beta',
     schedule: 'beta', guardian: 'beta', intake: 'beta', logs: 'stable', retro: 'beta', ad: 'beta', docs: 'beta', secret: 'beta',
-    decisions: 'beta', directives: 'beta', claims: 'beta', lesson: 'beta', fleet: 'beta', ops: 'stable', outputs: 'beta', publish: 'beta',
+    decisions: 'beta', directives: 'beta', claims: 'beta', lesson: 'beta', fleet: 'beta', ops: 'stable', outputs: 'beta', publish: 'beta', cred: 'beta',
     env: 'beta', 'agent-mission': 'beta', mission: 'beta', dev: 'beta', keys: 'beta', finance: 'beta',
     config: 'stable', tasks: 'stable', brief: 'beta', notify: 'beta', away: 'beta', labels: 'beta', msg: 'beta', ask: 'stable',
     onboarding: 'beta', login: 'stable', session: 'beta', chat: 'stable', repl: 'stable',
@@ -154,8 +153,6 @@ export const FEATURE_MATURITY = {
     control: 'ops',
     default: 'ops',
     qc: 'ops',
-    'voice-chat': 'beta',
-    'auto-tts': 'beta',
     directive: 'ops',
   },
   telegramCommand: {

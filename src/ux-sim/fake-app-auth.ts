@@ -6,10 +6,10 @@ const DEFAULT_INVITATION_TTL_MS = 15 * 60_000;
 const DEFAULT_SESSION_TTL_MS = 60 * 60_000;
 
 export interface FakeAppAuthOptions { readonly dir: string; readonly key?: string; readonly now?: () => number; readonly sessionTtlMs?: number }
-export interface IssueInvitationInput { readonly appSlug: string; readonly invitedBy: string; readonly ttlMs?: number }
-export interface IssuedInvitation { readonly token: string; readonly expiresAt: string; readonly appSlug: string; readonly invitedBy: string }
-export interface AppAuthResponse { readonly status: 200 | 401; readonly cookie?: string; readonly sessionToken?: string }
-export interface AppSessionRecord { readonly appSlug: string; readonly invitedBy: string; readonly expiresAt: string }
+export interface IssueInvitationInput { readonly appSlug: string; readonly invitedBy: string; readonly ttlMs?: number; readonly role?: string }
+export interface IssuedInvitation { readonly token: string; readonly expiresAt: string; readonly appSlug: string; readonly invitedBy: string; readonly role: string }
+export interface AppAuthResponse { readonly status: 200 | 401; readonly cookie?: string; readonly sessionToken?: string; readonly role?: string }
+export interface AppSessionRecord { readonly appSlug: string; readonly invitedBy: string; readonly expiresAt: string; readonly role: string }
 export type AppAuthAction = 'accept' | 'tamper' | 'cross-app' | 'session-cross-app' | 'expired' | 'session-expired' | 'revoke' | 'uninvited';
 export interface AppAuthCaseInput { readonly action: AppAuthAction; readonly appSlug: string; readonly invitedBy: string; readonly ttlMs: number }
 export interface AppAuthCookieExpectation { readonly hostPrefix: boolean; readonly secure: boolean; readonly pathRoot: boolean; readonly domain: boolean }
@@ -145,7 +145,7 @@ function isValidSlug(slug: string): boolean { return /^[a-z0-9](?:[a-z0-9-]{0,61
 function appLabel(slug: string): string { return `app-${createHash('sha256').update(slug).digest('hex').slice(0, 32)}`; }
 function signature(payload: string, key: string): string { return createHmac('sha256', key).update(payload).digest('base64url'); }
 
-function readInvitation(token: string, key: string, now: number): { appSlug: string; invitedBy: string } | null {
+function readInvitation(token: string, key: string, now: number): { appSlug: string; invitedBy: string; role: string } | null {
   const parts = token.split('.');
   if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
   const expected = Buffer.from(signature(parts[0], key));
@@ -156,7 +156,7 @@ function readInvitation(token: string, key: string, now: number): { appSlug: str
     if (claims.v !== 1 || typeof claims.appSlug !== 'string' || !isValidSlug(claims.appSlug)
       || typeof claims.invitedBy !== 'string' || !claims.invitedBy.trim() || typeof claims.exp !== 'number'
       || !Number.isFinite(claims.exp) || now >= claims.exp) return null;
-    return { appSlug: claims.appSlug, invitedBy: claims.invitedBy };
+    return { appSlug: claims.appSlug, invitedBy: claims.invitedBy, role: typeof claims.role === 'string' ? claims.role : 'viewer' };
   } catch { return null; }
 }
 
@@ -173,8 +173,9 @@ export function createFakeAppAuth(options: FakeAppAuthOptions) {
     const ttlMs = input.ttlMs ?? DEFAULT_INVITATION_TTL_MS;
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error('invitation ttlMs must be positive and finite');
     const exp = now() + ttlMs;
-    const payload = Buffer.from(JSON.stringify({ v: 1, appSlug: input.appSlug, invitedBy: input.invitedBy, exp })).toString('base64url');
-    return { token: `${payload}.${signature(payload, key)}`, expiresAt: new Date(exp).toISOString(), appSlug: input.appSlug, invitedBy: input.invitedBy };
+    const role = input.role ?? 'viewer';
+    const payload = Buffer.from(JSON.stringify({ v: 1, appSlug: input.appSlug, invitedBy: input.invitedBy, role, exp })).toString('base64url');
+    return { token: `${payload}.${signature(payload, key)}`, expiresAt: new Date(exp).toISOString(), appSlug: input.appSlug, invitedBy: input.invitedBy, role };
   }
 
   function acceptInvitation(input: { appSlug: string; token: string }): AppAuthResponse {
@@ -182,8 +183,8 @@ export function createFakeAppAuth(options: FakeAppAuthOptions) {
     const invite = readInvitation(input.token, key, now());
     if (!invite || invite.appSlug !== input.appSlug) return { status: 401 };
     const issued = issueTempToken({ ttlMs: sessionTtlMs, label: appLabel(invite.appSlug), dir: options.dir, now: now() });
-    records.set(issued.token, { appSlug: invite.appSlug, invitedBy: invite.invitedBy, expiresAt: issued.expiresAt });
-    return { status: 200, cookie: `${COOKIE_NAME}=${issued.token}; Path=/; Secure; HttpOnly; SameSite=Lax`, sessionToken: issued.token };
+    records.set(issued.token, { appSlug: invite.appSlug, invitedBy: invite.invitedBy, expiresAt: issued.expiresAt, role: invite.role });
+    return { status: 200, cookie: `${COOKIE_NAME}=${issued.token}; Path=/; Secure; HttpOnly; SameSite=Lax`, sessionToken: issued.token, role: invite.role };
   }
 
   function tokenOf(value: string): string {
@@ -195,7 +196,7 @@ export function createFakeAppAuth(options: FakeAppAuthOptions) {
     const token = tokenOf(input.token);
     const matched = matchTempToken(token, { dir: options.dir, now: now() });
     const record = records.get(token);
-    return matched && matched.label === appLabel(input.appSlug) && record?.appSlug === input.appSlug ? { status: 200 } : { status: 401 };
+    return matched && matched.label === appLabel(input.appSlug) && record?.appSlug === input.appSlug ? { status: 200, role: record.role } : { status: 401 };
   }
 
   function revokeSession(value: string): boolean {

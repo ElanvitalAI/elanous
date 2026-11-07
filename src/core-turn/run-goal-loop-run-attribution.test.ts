@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { CoreTurnContext, CoreTurnResult } from './types.js';
 import { runGoalLoop } from './run-goal-loop.js';
@@ -117,8 +119,6 @@ describe('runGoalLoop — goal.loop run attribution', () => {
   });
 
   test('all sessionId-bearing goal.loop payloads reuse one conditional run attribution', async () => {
-    const { readFileSync } = await import('node:fs');
-    const { join } = await import('node:path');
     const source = readFileSync(join(import.meta.dir, 'run-goal-loop.ts'), 'utf8');
 
     const sessionIdPayloads = source.match(/sessionId: ctx\.sessionId/g) ?? [];

@@ -7,7 +7,7 @@
 
 import { describe, it, expect, afterEach, spyOn } from 'bun:test';
 import * as skillRunner from '../src/skills/runner.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir.js';
@@ -15,6 +15,7 @@ import { CardStore } from '../src/task-cards/card-store.js';
 import { FEATURE_MATURITY } from '../src/maturity/feature-maturity.js';
 import { SLASH_COMMANDS } from '../src/chat/index.js';
 import { TelegramBot, botFromConfig } from '../src/telegram.js';
+import { MsgStore } from '../src/msg/msg-store.js';
 
 const originalStateDir = process.env.ELANOUS_STATE_DIR;
 const wishRoots: string[] = [];
@@ -28,6 +29,7 @@ import {
   parseTelegramSlash,
   buildUnknownSlashReply,
   defaultTelegramCommands,
+  createAskOpTelegramSlashCommand,
   toTelegramBotCommands,
   type TgSlashCommand,
 } from '../src/telegram-commands.js';
@@ -109,7 +111,7 @@ const LEGACY_TELEGRAM_PROBES: Record<(typeof LEGACY_TELEGRAM_HANDLERS)[number], 
   resume: { text: '/resume', matches: /^Usage: `\/resume/ },
   ad: { text: '/ad', matches: /^Cannot run \/ad:/ },
   intake: { text: '/intake', matches: /^Usage: intake/ },
-  decisions: { text: '/decisions', matches: /결정 카드가 이 봇에 연결되어 있지 않습니다|결정은/ },
+  decisions: { text: '/decisions', matches: /결정 카드가 이 봇에 연결되어 있지 않습니다|결정은|열린 결정이 없습니다/ },
   coo: { text: '/coo', matches: /소유자만 쓸 수 있습니다|사용법: \/coo/ },
   cto: { text: '/cto', matches: /소유자만 쓸 수 있습니다|사용법: \/cto/ },
   cmo: { text: '/cmo', matches: /소유자만 쓸 수 있습니다|사용법: \/cmo/ },
@@ -129,6 +131,107 @@ const LEGACY_TELEGRAM_PROBES: Record<(typeof LEGACY_TELEGRAM_HANDLERS)[number], 
 };
 
 describe('Telegram common slash catalog wiring', () => {
+  it('keeps one explicit implementation when extra command names repeat', () => {
+    const first: TgSlashCommand = { name: 'askop', description: 'first', handler: async () => 'first' };
+    const second: TgSlashCommand = { name: 'askop', description: 'second', handler: async () => 'second' };
+    const bot = botFromConfig({ userConfig: baseConfig(), extraSlashCommands: [first, second], telegramBotOpts: { nowImpl: () => 1 } });
+    const commands = (bot as unknown as { slashCommands: TgSlashCommand[] }).slashCommands;
+    expect(commands.filter((command) => command.name === 'askop')).toHaveLength(1);
+    expect(commands.find((command) => command.name === 'askop')).toBe(first);
+    bot.stop();
+  });
+
+  it('does not claim forwarding succeeded when an askop failure notice must be resent', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    let sendCount = 0;
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      sendCount++;
+      const result = sendCount === 1
+        ? { ok: false, error_code: 400, description: 'permanent send failure for this attempt' }
+        : { ok: true, result: { message_id: 901 } };
+      return { ok: result.ok, status: result.ok ? 200 : 400, json: async () => result } as Response;
+    }) as typeof fetch;
+    const explicitAskOp = createAskOpTelegramSlashCommand({ allowedUserIds: [42], append: () => { throw new Error('test store failure'); } });
+    const bot = botFromConfig({
+      userConfig: baseConfig(), fetchImpl, extraSlashCommands: [explicitAskOp],
+      telegramBotOpts: { nowImpl: () => Date.now(), perChatGapMs: 0, globalMaxPerSec: 100 },
+    });
+    try {
+      const handleIncoming = (bot as unknown as { handleIncoming: (ctx: TgIncoming) => Promise<void> }).handleIncoming.bind(bot);
+      await handleIncoming(fakeCtx('/askop a question', { updateId: 5 }));
+      expect(bodies).toHaveLength(2);
+      expect(String(bodies[1]?.text)).toContain('OP에게 전달하지 못했습니다');
+      expect(String(bodies[1]?.text)).not.toContain('OP에게 질문 #');
+    } finally { bot.stop(); }
+  });
+
+  it('routes ten fake questions through botFromConfig and the subscribed OP reply route', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'telegram-askop-e2e-'));
+    wishRoots.push(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    const previousConfigDir = getElanousConfigDirOverride();
+    setElanousConfigDir(root);
+    const dbPath = join(root, 'msg', 'messages.db');
+    mkdirSync(join(root, 'msg'), { recursive: true });
+    const telegramSends: Array<Record<string, unknown>> = [];
+    let updatesServed = false;
+    const updates = Array.from({ length: 10 }, (_, index) => ({
+      update_id: 700 + index,
+      message: {
+        message_id: 80 + index,
+        from: { id: 42, first_name: 'fake' },
+        chat: { id: 42, type: 'private' },
+        text: `/askop fake question ${index}`,
+      },
+    }));
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const method = String(input).split('/').pop() ?? '';
+      if (method === 'getUpdates') {
+        if (!updatesServed) { updatesServed = true; return new Response(JSON.stringify({ ok: true, result: updates })); }
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return new Response(JSON.stringify({ ok: true, result: [] }));
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      if (method === 'sendMessage') telegramSends.push(body);
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 900 + telegramSends.length } }));
+    }) as typeof fetch;
+    const config = baseConfig();
+    config.telegram.botToken = '987654:fake-token';
+    const bot = botFromConfig({
+      userConfig: config, fetchImpl,
+      telegramBotOpts: { nowImpl: () => Date.now(), perChatGapMs: 0, globalMaxPerSec: 100, errorBackoffMs: 0, sleepImpl: async () => {} },
+    });
+    const startPromise = bot.start();
+    try {
+      let questions: ReturnType<MsgStore['listByRecipient']> = [];
+      for (let attempt = 0; attempt < 200 && questions.length < 10; attempt++) {
+        const store = new MsgStore(dbPath);
+        try { questions = store.listByRecipient('COORDINATOR'); }
+        finally { store.close(); }
+        if (questions.length < 10) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(questions).toHaveLength(10);
+      const store = new MsgStore(dbPath);
+      try {
+        for (let index = 0; index < questions.length; index++) {
+          store.append({ from: 'OP', to: 'TELEGRAM', body: `fake answer ${index}`, replyTo: questions[index]!.id });
+        }
+      } finally { store.close(); }
+      const answerSends = () => telegramSends.filter((body) => String(body.text).startsWith('fake answer'));
+      for (let attempt = 0; attempt < 200 && answerSends().length < 10; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(answerSends()).toHaveLength(10);
+      expect(answerSends().map((body) => body.chat_id)).toEqual(Array(10).fill(42));
+      expect(answerSends().map((body) => body.text)).toEqual(Array.from({ length: 10 }, (_, index) => `fake answer ${index}`));
+    } finally {
+      bot.stop();
+      await startPromise;
+      if (previousConfigDir === undefined) resetElanousConfigDir();
+      else setElanousConfigDir(previousConfigDir);
+    }
+  }, 10_000);
+
   it('registers and executes every pre-existing Telegram handler without a support stub', async () => {
     const root = mkdtempSync(join(tmpdir(), 'telegram-commands-preservation-'));
     wishRoots.push(root);
@@ -184,6 +287,7 @@ describe('Telegram common slash catalog wiring', () => {
       });
       await bot.start();
       expect(registered.some(entry => entry.command === 'persona' && entry.description.includes('텔레그램 미지원'))).toBe(true);
+      expect(registered.some(entry => entry.command === 'askop' && entry.description.includes('운영 책임자'))).toBe(true);
       for (const name of LEGACY_TELEGRAM_HANDLERS) expect(registered.some(entry => entry.command === name)).toBe(true);
     } finally {
       if (previous === undefined) delete grades.persona;

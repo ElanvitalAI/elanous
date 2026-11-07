@@ -7,10 +7,7 @@
 // full `{cmd, args}` composition that reaches spawnPty.
 
 import { describe, test, expect, afterEach } from 'bun:test';
-import {
-  createLocalLlmPtyAdapter,
-  registerDefaultLocalLlmPtyAdapter,
-} from '../src/agent/adapters/local-llm-pty.js';
+import { createLocalLlmPtyAdapter, registerDefaultLocalLlmPtyAdapter } from '../src/agent/adapters/local-llm-pty.js';
 import { AdapterRegistry } from '../src/agent/adapter-registry.js';
 import {
   resetForTesting,
@@ -116,14 +113,6 @@ describe('createLocalLlmPtyAdapter · launch()', () => {
 });
 
 describe('registerDefaultLocalLlmPtyAdapter', () => {
-  test('registers into a registry · returns disposer', () => {
-    const r = new AdapterRegistry();
-    const off = registerDefaultLocalLlmPtyAdapter(r);
-    expect(r.list().map((x) => x.id)).toEqual(['local-llm-pty']);
-    off();
-    expect(r.list()).toEqual([]);
-  });
-
   test('pick() routes local-llm brand to the registered adapter', () => {
     const r = new AdapterRegistry();
     registerDefaultLocalLlmPtyAdapter(r);

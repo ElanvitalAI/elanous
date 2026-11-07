@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { decide, listOpenDecisions, type OpenDecision } from '@/lib/decisions-api';
 import type { DaemonClient } from '@/lib/daemon-client';
-import { DecisionCard } from '@/components/missions/DecisionCard';
+import { DecisionCard } from '@/components/decisions/DecisionCard';
 
 type DecisionState = { client: DaemonClient; item: OpenDecision | null; busy: boolean };
 

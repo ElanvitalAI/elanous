@@ -3,11 +3,7 @@
 // Uses pty-shell test-seam so we don't spawn a real codex binary.
 
 import { describe, test, expect, afterEach } from 'bun:test';
-import {
-  createCodexPtyAdapter,
-  registerDefaultCodexPtyAdapter,
-} from '../src/agent/adapters/codex-pty.js';
-import { AdapterRegistry } from '../src/agent/adapter-registry.js';
+import { createCodexPtyAdapter } from '../src/agent/adapters/codex-pty.js';
 import {
   resetForTesting,
   setPtyAdapterForTesting,
@@ -80,7 +76,6 @@ afterEach(() => {
   resetForTesting();
   setPtyAdapterForTesting(null);
 });
-
 describe('createCodexPtyAdapter · supports()', () => {
   test('matches codex brand and pty-direct/hybrid/auto mode', () => {
     const a = createCodexPtyAdapter();
@@ -232,15 +227,5 @@ describe('EmbodiedAgentSession (codex-pty) · lifecycle', () => {
       err = e;
     }
     expect((err as Error).message).toMatch(/disposed/);
-  });
-});
-
-describe('registerDefaultCodexPtyAdapter', () => {
-  test('registers into a registry · returns disposer', () => {
-    const r = new AdapterRegistry();
-    const off = registerDefaultCodexPtyAdapter(r);
-    expect(r.list().map((x) => x.id)).toEqual(['codex-pty']);
-    off();
-    expect(r.list()).toEqual([]);
   });
 });

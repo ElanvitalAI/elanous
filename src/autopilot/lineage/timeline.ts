@@ -8,7 +8,7 @@
 
 import type { LineageEntry, LineageStoreKind } from './types.js';
 import { listLineageSources } from './registry.js';
-import { formatShortDateTime } from '../../time/format.js';
+import { formatShortDateTime } from '../../time/calendar.js';
 
 const STORE_ICON: Record<LineageStoreKind, string> = {
   'generation-archive': '🗂️ ',

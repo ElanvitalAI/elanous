@@ -2,7 +2,7 @@ import type { Database } from 'bun:sqlite';
 import { debug, redactSecretText } from '../debug/log.js';
 import { openSurfaceEventsDb, recordEvent } from '../domains/surface-events.js';
 
-export type ExternalEventOrigin = 'claude-code' | 'codex-agent-mission' | 'harness-child';
+export type ExternalEventOrigin = 'claude-code' | 'codex-agent-mission' | 'harness-child' | 'release-graph';
 export type ContextHookKind = 'claimed' | 'done' | 'asked' | 'guide-changed';
 export type ExternalEventKind = ContextHookKind | 'started' | 'finished' | 'exit';
 export const CONTEXT_SUMMARY_MAX = 120;
@@ -13,15 +13,20 @@ export interface ExternalEventInput {
   kind: ExternalEventKind;
   summary: string;
   source: string;
+  /** Durable subscriber receipt key; present only for idempotent release-graph delivery. */
+  delivery?: { eventId: string; subscriberId: string };
   at?: string;
 }
 
 /** Only a single, bounded, redacted summary and a locator enter the journal; no prompt or transcript. */
 export function recordExternalEvent(input: ExternalEventInput, deps: { db?: Database } = {}): string {
-  if (!['claude-code', 'codex-agent-mission', 'harness-child'].includes(input.origin)) throw new Error('invalid context origin');
+  if (!['claude-code', 'codex-agent-mission', 'harness-child', 'release-graph'].includes(input.origin)) throw new Error('invalid context origin');
   if (input.origin === 'claude-code'
     ? !['claimed', 'done', 'asked', 'guide-changed'].includes(input.kind)
     : !['started', 'finished', 'exit'].includes(input.kind)) throw new Error('invalid context kind');
+  if (input.origin === 'release-graph' && (!input.delivery || !input.delivery.eventId.trim() || !input.delivery.subscriberId.trim()))
+    throw new Error('release graph context delivery requires eventId and subscriberId');
+  if (input.delivery && input.origin !== 'release-graph') throw new Error('delivery receipts are only valid for release-graph events');
   const summary = redactSecretText(input.summary.split(/\r?\n/, 1)[0] ?? '').trim().slice(0, CONTEXT_SUMMARY_MAX);
   const source = redactSecretText(input.source.split(/\r?\n/, 1)[0] ?? '').trim();
   if (!summary) throw new Error('context summary must be one nonempty line');
@@ -31,13 +36,21 @@ export function recordExternalEvent(input: ExternalEventInput, deps: { db?: Data
   }
   const db = deps.db ?? openSurfaceEventsDb();
   try {
-    return recordEvent(db, {
-      surface: 'context:external', direction: 'outbound', domain: 'elanous', category: 'coordination',
-      kind: input.kind, text: summary, summary,
-      refs: JSON.stringify({ seat: input.origin, recipients: [], all: false, kind: input.kind,
-        slot: null, deadline: null, url: source, origin: input.origin, source }),
-      ...(input.at ? { ts: input.at } : {}),
-    });
+    const refs = JSON.stringify({ seat: input.origin, recipients: [], all: false, kind: input.kind,
+      slot: null, deadline: null, url: source, origin: input.origin, source, ...(input.delivery ?? {}) });
+    return db.transaction(() => {
+      if (input.delivery) {
+        const prior = db.prepare(`SELECT id FROM events WHERE surface='context:external'
+          AND json_extract(refs,'$.eventId')=? AND json_extract(refs,'$.subscriberId')=? LIMIT 1`)
+          .get(input.delivery.eventId, input.delivery.subscriberId) as { id: string } | null;
+        if (prior) return prior.id;
+      }
+      return recordEvent(db, {
+        surface: 'context:external', direction: 'outbound', domain: 'elanous', category: 'coordination',
+        kind: input.kind, text: summary, summary, refs,
+        ...(input.at ? { ts: input.at } : {}),
+      });
+    }).immediate();
   } finally { if (!deps.db) db.close(); }
 }
 

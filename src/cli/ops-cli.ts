@@ -11,7 +11,7 @@ export function registerOpsCommands(program: Command): void {
 const opsCmd = program.command('ops')
   .description('운영 관측(READ-ONLY) — 미션·태스크·계약 루프·오케스트레이터 현재 상태·이상·전이. --json 프로그래매틱.');
 
-interface OpsOpts { id?: string; entityType?: string; event?: string; sinceHours?: string; limit?: string; json?: boolean }
+interface OpsOpts { entityType?: string; event?: string; sinceHours?: string; limit?: string; json?: boolean }
 
 // ops 연합(fleet · --all-instances) — 각 인스턴스에 opsSnapshot 을 인스턴스별 스토어 경로로
 // 호출해 미션·태스크뿐 아니라 loops(계약루프)·스케줄·오케스트레이션까지 전체 종합한다.
@@ -59,7 +59,6 @@ async function runOps(action: string, opts: OpsOpts): Promise<never> {
   const { dispatchOpsStatus } = await import('../domains/ops-status-tool.js');
   const result = await dispatchOpsStatus({
     action,
-    ...(opts.id ? { id: opts.id } : {}),
     ...(opts.entityType ? { entityType: opts.entityType } : {}),
     ...(opts.event ? { event: opts.event } : {}),
     ...(opts.sinceHours ? { sinceHours: Number(opts.sinceHours) } : {}),
@@ -68,35 +67,6 @@ async function runOps(action: string, opts: OpsOpts): Promise<never> {
   const isErr = !!result && typeof result === 'object' && 'error' in (result as object);
   if (opts.json || isErr) {
     await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
-  } else if (action === 'mission') {
-    const r = result as { mission: { goal: string; disposition: string; source: string; engine: string | null; rationale: string | null; createdAt: string } | null; derived: Array<{ kind: string; name: string; status: string; detail?: string }>; transitions: Array<{ ts: string; event: string; toState: string | null }>; phases: Array<{ index: number; title: string; status: string; failClass?: string; diagnosis?: { narrative: string; rootCause: string; heal: string; confidence: string }; prUrl?: string }>; runLogPath: string | null; planDraft: string | null; note: string };
-    if (!r.mission) { console.log(r.note); }
-    else {
-      ui.header(`미션 상세 · ${r.mission.disposition}`);
-      console.log(`  목표    ${r.mission.goal}`);
-      console.log(`  출처    ${r.mission.source}${r.mission.engine ? ` · engine=${r.mission.engine}` : ''}  · 생성 ${r.mission.createdAt.slice(0, 16)}`);
-      if (r.mission.rationale) console.log(`  근거    ${r.mission.rationale}`);
-      if (r.planDraft) { console.log(`\n  ── 멀티페이즈 플랜 (승인 전 검토) ──`); for (const line of r.planDraft.split('\n')) console.log(`  ${line}`); console.log(''); }
-      // ★ 페이즈 + 저장 진단(P1) — 실패 페이즈는 failClass·근본원인·권장 힐을 그대로(재계산 없음).
-      if (r.phases?.length) {
-        console.log(`  페이즈 ${r.phases.length}건:`);
-        for (const p of r.phases) {
-          const mark = p.status === 'done' ? '✅' : p.status === 'failed' ? '❌' : p.status === 'running' ? '🔧' : '·';
-          console.log(`    ${mark} ${p.index}. [${p.status}${p.failClass ? `·${p.failClass}` : ''}] ${p.title}${p.prUrl ? ` · PR ${p.prUrl}` : ''}`);
-          if (p.diagnosis) {
-            console.log(`       🧭 ${p.diagnosis.rootCause}`);
-            console.log(`       💡 권장: ${p.diagnosis.heal}(${p.diagnosis.confidence})`);
-          }
-        }
-      }
-      if (r.runLogPath) console.log(`  실행 로그  ${r.runLogPath}`);
-      console.log(`  관련 파생물 (태스크/스케줄/자율행동) ${r.derived.length}건:`);
-      for (const d of r.derived) console.log(`    [${d.kind}] ${d.name}  — ${d.status}${d.detail ? ` (${d.detail})` : ''}`);
-      if (r.transitions.length) {
-        console.log(`  상태 전이 ${r.transitions.length}건:`);
-        for (const t of r.transitions) console.log(`    ${t.ts.slice(0, 16)}  ${t.event} ${t.toState ?? ''}`);
-      }
-    }
   } else if (action === 'health') {
     const r = result as { healthy: boolean; anomalies: Array<{ kind: string; entity: string; detail: string }>; note: string };
     ui.header(r.healthy ? '운영 상태: 정상 ✓' : `운영 상태: 이상 ${r.anomalies.length}건 ⚠`);
@@ -198,7 +168,7 @@ opsCmd.command('status').description('현재 상태 종합(미션·태스크·�
   .option('--include-test', '연합에 격리 test 인스턴스도 포함(기본 제외)')
   // ⛔ `-r` 은 값을 받지 않는다 — default 북마크만. 이름은 `--remote <name>` 으로만 준다.
   .option('-r', 'query ops status on the default remote bookmark (does not take a value)')
-  .option('--remote <name>', 'query ops status on a named remote bookmark via GET /v1/missions · /v1/tasks · /v1/autopilot/arming')
+  .option('--remote <name>', 'query ops status on a named remote bookmark via GET /v1/tasks · /v1/autopilot/arming')
   .action(async (o: OpsOpts & { allInstances?: boolean; includeTest?: boolean; r?: boolean; remote?: string }) => {
     if (o.remote !== undefined || o.r === true) {
       const { runOpsStatusRemote } = await import('./ops-status-remote.js');
@@ -231,8 +201,6 @@ opsCmd.command('timeline').description('상태 전이 최근순 통합')
   .option('--event <e>', 'created|status_change|cycle_start|cycle_end|merge|alloc|blocked')
   .option('--since-hours <n>', '조회 기간(기본 48)').option('--limit <n>', '건수(기본 40)').option('--json')
   .action((o: OpsOpts) => runOps('timeline', o));
-opsCmd.command('mission <id>').description('미션 1건 상세 — 내용 + 페이즈별 진단(failClass·권장 힐) + 관련 태스크/스케줄/자율행동 fan-in + 전이')
-  .option('--json').action((id: string, o: OpsOpts) => runOps('mission', { ...o, id }));
 // P5 (2026-07-13) — 미션별 영속 run.log tail(O3 의 표면 완결·READ-ONLY). 빌드 단위 실시간
 // follow 는 `elanous ops build --follow`(B3) — 여긴 미션 레벨 스냅샷 tail.
 opsCmd.command('mission-log <id>').description('미션 실행 로그(run.log) tail — 진단 근거의 실체(재부팅에도 영속)')

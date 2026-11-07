@@ -20,11 +20,21 @@ export interface GraphNodeContract {
   readonly outputs: readonly string[];
 }
 
+export interface GraphNodeSubscription {
+  readonly event: string;
+  readonly match?: Readonly<Record<string, string | number | boolean | null>>;
+  readonly action: 'wake' | 'invalidate' | 'reroute';
+}
+
 export interface GraphNodeSpec {
   readonly nodeId: string;
   readonly kind: GraphNodeKind | (string & {});
   readonly recipe: string;
   readonly maxVisits: number;
+  /** Direct prerequisite node IDs; independent nodes with one source and a common dependent are compiled to a fan-out barrier. */
+  readonly needs?: readonly string[];
+  /** Named shared resources; nodes with a common lock are never dispatched together. */
+  readonly resourceLocks?: readonly string[];
   /** L0 journey-stage declaration (optional for other graph templates). */
   readonly journeyStage?: string;
   readonly progress?: readonly string[];
@@ -33,6 +43,12 @@ export interface GraphNodeSpec {
   /** ⭐ 「아크마다 한 번」처럼 «한 노드가 여럿 돈다」를 값으로. 없으면 한 번이다. */
   readonly fanOut?: string;
   readonly contract?: GraphNodeContract;
+  /** Optional node-scoped payload, used by persisted run-local graph additions. */
+  readonly input?: unknown;
+  /** Structured event kinds this node is allowed to publish. */
+  readonly emits?: readonly string[];
+  /** Structured event subscriptions dispatched by the graph runner. */
+  readonly subscribes?: readonly GraphNodeSubscription[];
   readonly call?: string;
   /** Entry selected by this call when a unit exposes more than one entry. */
   readonly callEntry?: string;
@@ -66,6 +82,8 @@ export interface GraphTemplateSpec {
   readonly loop?: { readonly title?: string; readonly description?: string; readonly trigger?: { readonly cron?: string; readonly events?: readonly string[] } };
   readonly graphId: string;
   readonly version: number;
+  /** Maximum number of ready fan-out nodes; omitted means legacy unbounded fan-out. */
+  readonly maxParallelNodes?: number;
   readonly entryNode: string;
   readonly terminalNodes: readonly string[];
   readonly journeyStages?: readonly string[];
@@ -154,6 +172,10 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   if (version === undefined) errors.push({ path: `${label}/version`, message: 'version 이 없거나 정수가 아니다' });
   const entryNode = typeof doc.entry_node === 'string' ? doc.entry_node : undefined;
   if (entryNode === undefined) errors.push({ path: `${label}/entry_node`, message: 'entry_node 가 없거나 문자열이 아니다' });
+  const maxParallelNodes = doc.max_parallel_nodes === undefined ? undefined
+    : Number.isSafeInteger(doc.max_parallel_nodes) && (doc.max_parallel_nodes as number) > 0 ? doc.max_parallel_nodes as number : undefined;
+  if (doc.max_parallel_nodes !== undefined && maxParallelNodes === undefined)
+    errors.push({ path: `${label}/max_parallel_nodes`, message: 'max_parallel_nodes 는 1 이상의 안전한 정수여야 한다' });
 
   const terminalNodes = asArray(doc.terminal_nodes).filter((v): v is string => typeof v === 'string');
   if (terminalNodes.length === 0) errors.push({ path: `${label}/terminal_nodes`, message: 'terminal_nodes 가 비었다 — 끝날 수 없는 그래프다' });
@@ -196,6 +218,20 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       errors.push({ path: `${at}/max_visits`, message: 'max_visits 는 1 이상의 정수여야 한다' });
       continue;
     }
+    let needs: string[] | undefined;
+    if (n.needs !== undefined) {
+      if (!Array.isArray(n.needs) || !n.needs.every((dependency) => typeof dependency === 'string' && dependency.trim()) ||
+          new Set(n.needs as string[]).size !== n.needs.length || (n.needs as string[]).includes(nodeId)) {
+        errors.push({ path: `${at}/needs`, message: 'needs 는 자기 자신·중복·빈 값을 포함하지 않는 노드 id 목록이어야 한다' });
+      } else needs = n.needs as string[];
+    }
+    let resourceLocks: string[] | undefined;
+    if (n.resource_locks !== undefined) {
+      if (!Array.isArray(n.resource_locks) || !n.resource_locks.every((lock) => typeof lock === 'string' && lock.trim()) ||
+          new Set(n.resource_locks as string[]).size !== n.resource_locks.length) {
+        errors.push({ path: `${at}/resource_locks`, message: 'resource_locks 는 중복 없는 비어 있지 않은 문자열 목록이어야 한다' });
+      } else resourceLocks = n.resource_locks as string[];
+    }
     if (n.journey_stage !== undefined && (typeof n.journey_stage !== 'string' || !n.journey_stage.trim()
       || (Array.isArray(journeyStages) && !journeyStages.includes(n.journey_stage)))) {
       errors.push({ path: `${at}/journey_stage`, message: typeof n.journey_stage === 'string' && n.journey_stage.trim()
@@ -217,6 +253,52 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
           outputs: asArray(contractRaw.outputs).filter((v): v is string => typeof v === 'string'),
         }
       : undefined;
+    let emits: string[] | undefined;
+    if (n.emits !== undefined) {
+      if (!Array.isArray(n.emits) || !n.emits.every((event) => typeof event === 'string' && event.trim()) ||
+          new Set(n.emits).size !== n.emits.length) {
+        errors.push({ path: `${at}/emits`, message: 'emits 는 중복 없는 비어 있지 않은 문자열 목록이어야 한다' });
+      } else emits = n.emits as string[];
+    }
+    let subscribes: GraphNodeSubscription[] | undefined;
+    if (n.subscribes !== undefined) {
+      if (!Array.isArray(n.subscribes)) {
+        errors.push({ path: `${at}/subscribes`, message: 'subscribes 는 구독 선언 목록이어야 한다' });
+      } else {
+        subscribes = [];
+        for (const [subscriptionIndex, raw] of n.subscribes.entries()) {
+          const subscriptionPath = `${at}/subscribes/${subscriptionIndex}`;
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+            errors.push({ path: subscriptionPath, message: '구독 선언은 맵이어야 한다' });
+            continue;
+          }
+          const item = raw as Record<string, unknown>;
+          const allowed = new Set(['event', 'match', 'action']);
+          if (Object.keys(item).some((key) => !allowed.has(key)))
+            errors.push({ path: subscriptionPath, message: '구독 선언에는 event·match·action만 허용된다' });
+          if (typeof item.event !== 'string' || !item.event.trim())
+            errors.push({ path: `${subscriptionPath}/event`, message: 'event 는 비어 있지 않은 문자열이어야 한다' });
+          if (item.action !== 'wake' && item.action !== 'invalidate' && item.action !== 'reroute')
+            errors.push({ path: `${subscriptionPath}/action`, message: 'action 은 wake|invalidate|reroute 중 하나여야 한다' });
+          let match: Record<string, string | number | boolean | null> | undefined;
+          if (item.match !== undefined) {
+            if (!item.match || typeof item.match !== 'object' || Array.isArray(item.match)) {
+              errors.push({ path: `${subscriptionPath}/match`, message: 'match 는 스칼라 값 맵이어야 한다' });
+            } else {
+              const entries = Object.entries(item.match as Record<string, unknown>);
+              if (entries.some(([key, value]) => !key.trim() || !(value === null || ['string', 'number', 'boolean'].includes(typeof value))))
+                errors.push({ path: `${subscriptionPath}/match`, message: 'match 키는 비어 있을 수 없고 값은 문자열·수·불리언·null이어야 한다' });
+              else match = Object.fromEntries(entries) as Record<string, string | number | boolean | null>;
+            }
+          }
+          if (typeof item.event === 'string' && item.event.trim() &&
+              (item.action === 'wake' || item.action === 'invalidate' || item.action === 'reroute') &&
+              (item.match === undefined || match !== undefined)) {
+            subscribes.push({ event: item.event, action: item.action, ...(match === undefined ? {} : { match }) });
+          }
+        }
+      }
+    }
     // A subgraph node becomes a unit call only when it names `call:`; without it the node keeps the
     // pre-unit meaning (catalog role / recipe node), so existing declarations stay valid.
     if (kind === 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.allowance !== undefined || n.call_entry !== undefined)) {
@@ -248,12 +330,17 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
 
     nodes.push({
       nodeId, kind, recipe, maxVisits,
+      ...(needs === undefined ? {} : { needs }),
+      ...(resourceLocks === undefined ? {} : { resourceLocks }),
       ...(typeof n.journey_stage === 'string' ? { journeyStage: n.journey_stage } : {}),
       ...(Array.isArray(n.progress) ? { progress: n.progress.filter((v): v is string => typeof v === 'string') } : {}),
       ...(Array.isArray(n.phases) ? { phases: n.phases.filter((v): v is string => typeof v === 'string') } : {}),
       ...(Array.isArray(n.terminal_stages) ? { terminalStages: n.terminal_stages.filter((v): v is string => typeof v === 'string') } : {}),
       ...(typeof n.fan_out === 'string' ? { fanOut: n.fan_out } : {}),
       ...(contract ? { contract } : {}),
+      ...(Object.hasOwn(n, 'input') ? { input: n.input } : {}),
+      ...(emits === undefined ? {} : { emits }),
+      ...(subscribes === undefined ? {} : { subscribes }),
       ...(kind === 'subgraph' && typeof n.call === 'string' ? { call: n.call } : {}),
       ...(kind === 'subgraph' && typeof n.call_entry === 'string' ? { callEntry: n.call_entry } : {}),
       ...(kind === 'subgraph' && n.budget && typeof n.budget === 'object' && !Array.isArray(n.budget) &&
@@ -268,6 +355,25 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   if (nodes.length === 0) errors.push({ path: `${label}/nodes`, message: '노드가 하나도 없다' });
 
   const known = new Set(nodes.map((n) => n.nodeId));
+  for (const node of nodes) for (const dependency of node.needs ?? []) {
+    if (!known.has(dependency)) errors.push({ path: `${label}/nodes/${node.nodeId}/needs`, message: `'${dependency}' 는 선언된 노드가 아니다` });
+  }
+  const dependencyVisiting = new Set<string>();
+  const dependencyVisited = new Set<string>();
+  const visitDependency = (nodeId: string): void => {
+    if (dependencyVisited.has(nodeId)) return;
+    if (dependencyVisiting.has(nodeId)) {
+      errors.push({ path: `${label}/nodes/${nodeId}/needs`, message: 'needs 의존성 그래프에 순환이 있다' });
+      return;
+    }
+    dependencyVisiting.add(nodeId);
+    for (const dependency of nodes.find((node) => node.nodeId === nodeId)?.needs ?? []) {
+      if (known.has(dependency)) visitDependency(dependency);
+    }
+    dependencyVisiting.delete(nodeId);
+    dependencyVisited.add(nodeId);
+  };
+  for (const node of nodes) visitDependency(node.nodeId);
   const edges: GraphEdgeSpec[] = [];
   for (const [index, entry] of asArray(doc.edges).entries()) {
     const at = `${label}/edges/${index}`;
@@ -278,7 +384,28 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     if (!known.has(from)) { errors.push({ path: `${at}/from`, message: `'${from}' 은 선언된 노드가 아니다` }); continue; }
     const hasTo = typeof e.to === 'string';
     const hasMap = e.map !== null && typeof e.map === 'object';
-    const hasBranches = e.branches !== null && typeof e.branches === 'object' && !Array.isArray(e.branches);
+    const hasExplicitBranches = e.branches !== null && typeof e.branches === 'object' && !Array.isArray(e.branches);
+    const mappedTargets = hasMap ? Object.values(e.map as Record<string, unknown>).filter((value): value is string => typeof value === 'string') : [];
+    const needsBranches = nodes.filter((node) => node.needs?.includes(from) && !mappedTargets.includes(node.nodeId));
+    const needsJoins = needsBranches.length >= 2
+      ? nodes.filter((node) => node.needs?.length === needsBranches.length &&
+        needsBranches.every((branch) => node.needs?.includes(branch.nodeId))) : [];
+    let derivedBranches: Record<string, string[]> | undefined;
+    let derivedJoin: string | undefined;
+    if (!hasExplicitBranches && needsBranches.length >= 2) {
+      if (needsJoins.length !== 1) {
+        errors.push({ path: `${at}/from`, message: `needs 가 병렬 노드 ${needsBranches.map((node) => node.nodeId).join(', ')} 를 선언했지만 공통 join needs 를 가진 노드가 정확히 하나여야 한다` });
+      } else {
+        derivedJoin = needsJoins[0]!.nodeId;
+        const branchOutcomes = ['ok', 'fail', 'error'].filter((outcome) => !(hasMap && Object.hasOwn(e.map as object, outcome)));
+        if (branchOutcomes.length) derivedBranches = Object.fromEntries(branchOutcomes.map((outcome) =>
+          [outcome, needsBranches.map((node) => node.nodeId)]));
+      }
+    }
+    const branchDeclaration: Record<string, unknown> | undefined = hasExplicitBranches
+      ? e.branches as Record<string, unknown> : derivedBranches;
+    const joinId = typeof e.join === 'string' ? e.join : derivedJoin;
+    const hasBranches = branchDeclaration !== undefined;
     if (e.when !== undefined && (typeof e.when !== 'string' || !parseOverlayCondition(e.when).ok))
       errors.push({ path: `${at}/when`, message: 'when 은 오버레이 조건 한 개(key op literal)여야 한다' });
     if (e.when !== undefined && (L1_PROTECTED_ROUTE_NODES.has(from) || nodes.some(node => node.nodeId === from && node.kind === 'gate') || terminalNodes.includes(from)))
@@ -306,7 +433,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     let warningBranches: readonly string[] | undefined;
     if (hasBranches) {
       branches = {};
-      for (const [outcome, destinations] of Object.entries(e.branches as Record<string, unknown>)) {
+      for (const [outcome, destinations] of Object.entries(branchDeclaration!)) {
         if (!Array.isArray(destinations) || destinations.length < 2 || !destinations.every((value) => typeof value === 'string')) {
           errors.push({ path: `${at}/branches/${outcome}`, message: 'branches 목적지는 두 개 이상의 노드 id 목록이어야 한다' });
           continue;
@@ -318,10 +445,10 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
         }
         branches[outcome] = destinations as string[];
       }
-      if (typeof e.on !== 'string' || typeof e.join !== 'string' || !known.has(e.join))
+      if (typeof e.on !== 'string' || typeof joinId !== 'string' || !known.has(joinId))
         errors.push({ path: at, message: 'branches 에는 on 과 선언된 join 노드가 필요하다' });
       if (e.fallback !== undefined || e.when !== undefined) errors.push({ path: at, message: 'branches 는 fallback·when 과 함께 쓸 수 없다' });
-      if (hasMap && Object.keys(map).some((outcome) => Object.hasOwn(e.branches as object, outcome)))
+      if (hasMap && Object.keys(map).some((outcome) => Object.hasOwn(branchDeclaration!, outcome)))
         errors.push({ path: `${at}/branches`, message: 'map 과 branches 의 outcome 키는 겹칠 수 없다' });
       if (e.warning_branches !== undefined) {
         if (!Array.isArray(e.warning_branches) || e.warning_branches.some((branch) => typeof branch !== 'string' || !branch.trim()) ||
@@ -348,7 +475,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       from,
       ...(hasTo ? { to: e.to as string } : {}),
       ...(hasMap ? { on: String(e.on), map } : {}),
-      ...(branches ? { on: String(e.on), branches, join: String(e.join), ...(warningBranches ? { warningBranches } : {}) } : {}),
+      ...(branches ? { on: String(e.on), branches, join: String(joinId), ...(warningBranches ? { warningBranches } : {}) } : {}),
       ...(fallback.length > 0 ? { fallback } : {}),
       ...(typeof e.observed === 'number' ? { observed: e.observed } : {}),
       ...(typeof e.when === 'string' ? { when: e.when } : {}),
@@ -365,6 +492,15 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     if (edge.when === undefined) continue;
     if (!edges.some(candidate => candidate.from === edge.from && candidate.when === undefined))
       errors.push({ path: `${label}/edges/${edge.from}/when`, message: 'when 간선에는 모호·미관측 때 탈 무조건 기본 간선이 필요하다' });
+  }
+  for (const node of nodes) for (const dependency of node.needs ?? []) {
+    if (!known.has(dependency)) continue;
+    const direct = edges.some((edge) => edge.from === dependency &&
+      (edge.to === node.nodeId || Object.values(edge.branches ?? {}).some((destinations) => destinations.includes(node.nodeId))));
+    const joined = edges.some((edge) => edge.join === node.nodeId &&
+      Object.values(edge.branches ?? {}).some((destinations) => destinations.includes(dependency)));
+    if (!direct && !joined) errors.push({ path: `${label}/nodes/${node.nodeId}/needs`,
+      message: `'${dependency}' 선행 조건이 실행 엣지 또는 병렬 합류에 연결되지 않았다` });
   }
   const fanOutDestinations = new Map<string, string>();
   const fanOutJoins = new Map<string, string>();
@@ -432,7 +568,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   if (errors.length > 0) return { errors, warnings };
   return {
     template: {
-      graphId: graphId!, version: version!, entryNode: entryNode!, terminalNodes, nodes, edges,
+      graphId: graphId!, version: version!, ...(maxParallelNodes === undefined ? {} : { maxParallelNodes }), entryNode: entryNode!, terminalNodes, nodes, edges,
       ...(unit ? { unit } : {}),
       ...(policy ? { policy } : {}),
       ...(Array.isArray(journeyStages) ? { journeyStages: journeyStages as string[] } : {}),

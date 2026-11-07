@@ -111,6 +111,76 @@ test('rm removes by id and does not render the value', async () => {
   expect(f.exitCodes).toEqual([0]);
 });
 
+test('rm retains a recovery path for legacy app-prefixed identifiers', async () => {
+  const f = makeProgram();
+  f.values.set('app/Bad/KEY', 'legacy-secret-value');
+  await parse(f, 'secret', 'rm', 'app/Bad/KEY');
+  expect(f.values.has('app/Bad/KEY')).toBe(false);
+  expect(f.output).toEqual(['removed app/Bad/KEY']);
+  expect(f.output.join('\n')).not.toContain('legacy-secret-value');
+});
+
+test('app secrets use an isolated namespace and issue/revoke ledger never receives values', async () => {
+  const f = makeProgram((fixture) => { fixture.deps.storageBackend = () => 'file'; });
+  await parse(f, 'secret', 'app', 'set', 'voice-note', 'ELEVENLABS_API_KEY');
+  expect([...f.values.keys()]).toEqual(['app/voice-note/ELEVENLABS_API_KEY']);
+  await parse(f, 'secret', 'app', 'revoke', 'voice-note');
+  expect(f.values.size).toBe(0);
+  expect(f.output.join('\n')).not.toContain('mock-secret-value');
+  expect(f.exitCodes).toEqual([0, 0]);
+});
+
+test('app secret command reports mutation failures without exposing submitted values', async () => {
+  const f = makeProgram((fixture) => {
+    fixture.deps.storageBackend = () => 'file';
+    fixture.deps.saveAppSecret = async () => { throw new Error('ledger unavailable'); };
+  });
+  await parse(f, 'secret', 'app', 'set', 'voice-note', 'API_KEY');
+  expect(f.errors).toEqual(['app secret could not be issued']);
+  expect(f.errors.join('\n')).not.toContain('mock-secret-value');
+  expect(f.exitCodes).toEqual([1]);
+});
+
+test('app revoke uses its transactional result and treats a repeated exact revoke as successful', async () => {
+  let recovered = false;
+  const f = makeProgram((fixture) => {
+    fixture.deps.storageBackend = () => 'file';
+    fixture.deps.revokeAppSecrets = async (app, name) => { expect(app).toBe('voice-note'); expect(name).toBe('API_KEY'); recovered = true; return { revoked: 1, alreadyAbsent: false }; };
+  });
+  await parse(f, 'secret', 'app', 'revoke', 'voice-note', 'API_KEY');
+  expect(recovered).toBe(true);
+  expect(f.output).toEqual(['revoked voice-note · 1 secret(s)']);
+  expect(f.exitCodes).toEqual([0]);
+});
+
+test('app secret commands reject invalid or reserved app names before prompting', async () => {
+  const f = makeProgram();
+  await parse(f, 'secret', 'app', 'set', 'api', 'KEY');
+  expect(f.values.size).toBe(0);
+  expect(f.errors).toEqual(['invalid app secret name']);
+  expect(f.exitCodes).toEqual([1]);
+});
+
+test('app secret mutations fail closed on remote backends before prompting or writing', async () => {
+  let prompts = 0;
+  let writes = 0;
+  let deletes = 0;
+  const f = makeProgram((fixture) => {
+    fixture.deps.storageBackend = () => 'gcp';
+    fixture.deps.promptSecret = async () => { prompts += 1; return 'must-not-be-used'; };
+    fixture.deps.saveSecret = async () => { writes += 1; };
+    fixture.deps.removeSecret = async () => { deletes += 1; return true; };
+    fixture.deps.isInteractive = () => true;
+  });
+  await parse(f, 'secret', 'app', 'set', 'voice-note', 'API_KEY');
+  await parse(f, 'secret', 'app', 'revoke', 'voice-note', 'API_KEY');
+  expect(prompts).toBe(0);
+  expect(writes).toBe(0);
+  expect(deletes).toBe(0);
+  expect(f.errors).toEqual(['app secret operations require the file backend', 'app secret operations require the file backend']);
+  expect(f.exitCodes).toEqual([1, 1]);
+});
+
 test('test on the fixed empty helper makes no verifier call and reports missing only', async () => {
   const f = makeProgram();
   await parse(f, 'secret', 'test', 'exa');
@@ -304,8 +374,9 @@ test('SSH sync writes through stdin with remote 0600 verification and attempts c
 });
 
 test('SSH stdin EPIPE is converted to a rejected operation instead of an uncaught process error', async () => {
-  const child = process.execPath;
-  await expect(runProcess(child, ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(0), 50)'], 'fake-ciphertext'.repeat(200_000)))
+  // Close stdin after its first chunk so a remaining payload reliably hits EPIPE.
+  const script = 'process.stdin.once("data", () => { process.stdin.destroy(); setTimeout(() => process.exit(0), 50) })';
+  await expect(runProcess(process.execPath, ['-e', script], 'fake-ciphertext'.repeat(1_000_000)))
     .rejects.toThrow('credential transfer process failed');
 });
 

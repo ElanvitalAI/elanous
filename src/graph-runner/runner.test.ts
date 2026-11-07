@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
@@ -12,10 +12,12 @@ import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT } from '../self-impl
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import { subscribeInsideEvent } from '../nexus/api/inside-events.js';
 import { readFailureInbox, recordFailureEvent } from '../self-implement/heal-intake.js';
 import { runSelfImplement } from '../self-implement/orchestrator.js';
 import { seams } from '../self-implement/test-seams.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
+import { createGraphEventBus, publishNodeGraphEvent } from './graph-events.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -193,6 +195,482 @@ function fixture(command: string, loop = false): { graph: string; root: string }
   return { graph, root };
 }
 
+test('graph runner emits node lifecycle phases and isolates failing observer hooks', async () => {
+  const { graph, root } = fixture('printf first');
+  const events: Array<{ phase: string; nodeId: string; visit: number; nextNodeId?: string }> = [];
+  const envelope: Array<{ eventId: string; seq: number; source: string; phase: string; attempt: number; data: { phase: string; visit: number } }> = [];
+  const failures: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const unsubscribe = subscribeInsideEvent((event) => {
+    if (event.kind === 'node.lifecycle') events.push({ phase: String(event.phase), nodeId: String(event.nodeId), visit: Number(event.visit),
+      ...(typeof event.nextNodeId === 'string' ? { nextNodeId: event.nextNodeId } : {}) });
+  });
+  try {
+    const run = await runGraph(graph, { deps: { root,
+      nodeLifecycle: (event) => { envelope.push(event); throw new Error('release-loop observer unavailable'); },
+      log: (event, data) => { if (event === 'node-lifecycle-hook-failed') failures.push({ event, data }); },
+    } });
+    expect(run.status).toBe('done');
+  } finally { unsubscribe(); }
+  expect(events.map(({ nodeId, phase }) => `${nodeId}:${phase}`)).toEqual([
+    'first:arrival', 'first:start', 'first:end', 'first:leave',
+    'second:arrival', 'second:start', 'second:end', 'second:leave',
+    'done:arrival', 'done:start', 'done:end', 'done:leave',
+  ]);
+  expect(events.find((event) => event.nodeId === 'first' && event.phase === 'leave')?.nextNodeId).toBe('second');
+  expect(events.every((event) => event.visit === 1)).toBe(true);
+  expect(envelope.map((event) => event.seq)).toEqual(envelope.map((_, index) => index + 1));
+  expect(new Set(envelope.map((event) => event.eventId)).size).toBe(envelope.length);
+  expect(envelope.every((event) => event.source === 'graph-runner' && event.attempt === event.data.visit && event.phase === event.data.phase)).toBe(true);
+  expect(failures).toHaveLength(events.length);
+});
+
+test('node lifecycle hook can shadow-classify events then switch to operational traffic updates mid-run', async () => {
+  const { graph, root } = fixture('printf first');
+  let mode: 'shadow' | 'operational' = 'shadow';
+  let matchedShadowEvents = 0;
+  const shadowEvents: string[] = [];
+  const trafficUpdates: string[] = [];
+  const expected = ['first:arrival', 'first:start', 'first:end'];
+  let releaseTransition!: () => void;
+  let transitionStarted!: () => void;
+  let graphReachedDone!: () => void;
+  let beforeNodes = 0;
+  const transitionGate = new Promise<void>((resolve) => { releaseTransition = resolve; });
+  const transition = new Promise<void>((resolve) => { transitionStarted = resolve; });
+  const graphDone = new Promise<void>((resolve) => { graphReachedDone = resolve; });
+  const run = runGraph(graph, { deps: { root,
+    beforeNode: () => { if (++beforeNodes === 3) graphReachedDone(); },
+    nodeLifecycle: async (event) => {
+      const observed = `${event.nodeId}:${event.phase}`;
+      if (mode === 'shadow') {
+        shadowEvents.push(observed);
+        if (expected[matchedShadowEvents] === observed) matchedShadowEvents++;
+        if (matchedShadowEvents >= 3) {
+          transitionStarted();
+          await transitionGate;
+          mode = 'operational';
+        }
+      } else if (event.phase === 'arrival') {
+        trafficUpdates.push(`traffic-update:${event.nodeId}`);
+      }
+    },
+  } });
+  await transition;
+  await graphDone;
+  expect(trafficUpdates).toEqual([]);
+  releaseTransition();
+  const result = await run;
+  expect(result.status).toBe('done');
+  expect(shadowEvents).toEqual(['first:arrival', 'first:start', 'first:end']);
+  expect(trafficUpdates).toEqual(['traffic-update:second', 'traffic-update:done']);
+  expect(String(mode)).toBe('operational');
+});
+
+test('node lifecycle observers are serialized without blocking graph execution and flush before return', async () => {
+  const { graph, root } = fixture('printf first');
+  const observed: string[] = [];
+  let releaseFirst!: () => void;
+  let firstStarted!: () => void;
+  let graphReachedDone!: () => void;
+  const firstObserverStarted = new Promise<void>((resolve) => { firstStarted = resolve; });
+  const doneReached = new Promise<void>((resolve) => { graphReachedDone = resolve; });
+  const firstObserverGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let visits = 0;
+  let observerInFlight = false;
+  let concurrentObservers = false;
+  const run = runGraph(graph, { deps: { root,
+    beforeNode: () => { if (++visits === 3) graphReachedDone(); },
+    nodeLifecycle: async (event) => {
+      if (observerInFlight) concurrentObservers = true;
+      observerInFlight = true;
+      if (event.nodeId === 'first' && event.phase === 'arrival') {
+        firstStarted();
+        await firstObserverGate;
+      }
+      observed.push(`${event.nodeId}:${event.phase}`);
+      observerInFlight = false;
+    },
+  } });
+
+  await firstObserverStarted;
+  await doneReached;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(observed).toEqual([]);
+  releaseFirst();
+  const result = await run;
+
+  expect(result.status).toBe('done');
+  expect(concurrentObservers).toBe(false);
+  expect(observed.slice(0, 4)).toEqual(['first:arrival', 'first:start', 'first:end', 'first:leave']);
+  expect(observed.at(-1)).toBe('done:leave');
+});
+
+test('resuming an already completed visit does not emit a duplicate lifecycle', async () => {
+  const { graph, root } = fixture('printf first');
+  const initialEvents: string[] = [];
+  const first = await runGraph(graph, { deps: { root, nodeLifecycle: (event) => { initialEvents.push(`${event.nodeId}:${event.phase}`); } } });
+  expect(first.status).toBe('done');
+  const saved = JSON.parse(readFileSync(first.statePath, 'utf8')) as Record<string, unknown>;
+  saved.status = 'running';
+  delete saved.reason;
+  writeFileSync(first.statePath, `${JSON.stringify(saved, null, 2)}\n`);
+
+  const resumedEvents: string[] = [];
+  const resumed = await runGraph(graph, { resumeRunId: first.runId,
+    deps: { root, nodeLifecycle: (event) => { resumedEvents.push(`${event.nodeId}:${event.phase}`); } } });
+
+  expect(resumed.status).toBe('done');
+  expect(resumedEvents).toEqual([]);
+  expect(initialEvents.at(-1)).toBe('done:leave');
+});
+
+test('lifecycle envelope ids and sequence continue across a resumed run', async () => {
+  const { graph, root } = fixture('exit 1');
+  const firstEvents: Array<{ eventId: string; seq: number }> = [];
+  const first = await runGraph(graph, { deps: { root, nodeLifecycle: (event) => { firstEvents.push(event); } } });
+  expect(first.status).toBe('failed');
+  const resumedEvents: Array<{ eventId: string; seq: number }> = [];
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', deps: { root,
+    nodeLifecycle: (event) => { resumedEvents.push(event); } } });
+
+  expect(resumed.status).toBe('failed');
+  expect(firstEvents.length).toBeGreaterThan(0);
+  expect(resumedEvents.length).toBeGreaterThan(0);
+  expect(resumedEvents[0]!.seq).toBeGreaterThan(firstEvents.at(-1)!.seq);
+  expect(new Set([...firstEvents, ...resumedEvents].map((event) => event.eventId)).size).toBe(firstEvents.length + resumedEvents.length);
+});
+
+test('an unknown node recipe is rejected before publishing lifecycle events', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(join(root, 'recipes.yaml'), 'second:\n  command: "exit 0"\n');
+  const source = readFileSync(graph, 'utf8').replace("recipe: 'cmd:first'", "recipe: 'cmd:missing'");
+  writeFileSync(graph, source);
+  const phases: string[] = [];
+
+  await expect(runGraph(graph, { deps: { root, nodeLifecycle: (event) => { phases.push(`${event.nodeId}:${event.phase}`); } } }))
+    .rejects.toThrow();
+
+  expect(phases).toEqual([]);
+});
+
+test('a post-arrival binding validation exception emits exactly one leave', async () => {
+  const { graph, root } = fixture('exit 0');
+  const phases: string[] = [];
+
+  await expect(runGraph(graph, { deps: { root,
+    nodeLifecycle: (event) => { phases.push(`${event.nodeId}:${event.phase}`); },
+    validateNodeBinding: () => { throw new Error('injected binding validation failure'); },
+  } })).rejects.toThrow('injected binding validation failure');
+
+  expect(phases).toEqual(['first:arrival', 'first:leave']);
+});
+
+test('a transient ledger persist exception closes the visit and resume continues its lifecycle sequence', async () => {
+  const { graph, root } = fixture('exit 0');
+  const runId = 'transient-persist-after-arrival';
+  const statePath = join(root, 'graph-runs', 'test-graph', `${runId}.json`);
+  const firstEvents: Array<{ phase: string; seq: number; eventId: string }> = [];
+  let failedPersist = false;
+
+  await expect(runGraph(graph, { runId, deps: { root,
+    nodeLifecycle: (event) => { firstEvents.push({ phase: event.phase, seq: event.seq, eventId: event.eventId }); },
+    beforePersist: (state) => {
+      if (!failedPersist && state.graphEventSequence === 3) {
+        failedPersist = true;
+        throw new Error('transient ledger persist failure');
+      }
+    },
+  } })).rejects.toThrow('transient ledger persist failure');
+
+  expect(firstEvents.map((event) => event.phase)).toEqual(['arrival', 'start', 'leave']);
+  expect(firstEvents.filter((event) => event.phase === 'leave')).toHaveLength(1);
+  const failedState = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+  expect(failedState.graphEventSequence).toBe(firstEvents.at(-1)!.seq);
+  failedState.status = 'failed';
+  failedState.reason = 'resume lifecycle sequence test';
+  writeFileSync(statePath, `${JSON.stringify(failedState, null, 2)}\n`);
+
+  const resumedEvents: Array<{ phase: string; seq: number; eventId: string }> = [];
+  const resumed = await runGraph(graph, { resumeRunId: runId, fromNodeId: 'first', deps: { root,
+    nodeLifecycle: (event) => { resumedEvents.push({ phase: event.phase, seq: event.seq, eventId: event.eventId }); },
+  } });
+
+  expect(resumed.status).toBe('done');
+  expect(resumedEvents[0]!.seq).toBeGreaterThan(firstEvents.at(-1)!.seq);
+  expect(new Set([...firstEvents, ...resumedEvents].map((event) => event.eventId)).size)
+    .toBe(firstEvents.length + resumedEvents.length);
+});
+
+test('runGraph publishes ordered node lifecycle events and dispatches matching node subscriptions', async () => {
+  const { graph, root } = fixture('echo ok');
+  const yaml = readFileSync(graph, 'utf8').replace(
+    '- { node_id: first, kind: agent, recipe: \'cmd:first\', max_visits: 1 }',
+    '- node_id: first\n    kind: agent\n    recipe: handler:emit-event\n    max_visits: 1\n    emits: [release.gate.failed]',
+  ).replace(
+    '- { node_id: second, kind: agent, recipe: \'cmd:second\', max_visits: 1 }',
+    '- node_id: second\n    kind: agent\n    recipe: \'cmd:second\'\n    max_visits: 1\n    subscribes:\n      - event: release.gate.failed\n        match: { nodeId: first }\n        action: wake\n      - event: node-end\n        match: { nodeId: first, ok: true }\n        action: wake',
+  );
+  writeFileSync(graph, yaml);
+  const bus = createGraphEventBus();
+  bus.registerType('release.gate.failed');
+  const events: { type: string; runId: string; source: { nodeId?: string }; sequence: number }[] = [];
+  const dispatches: { nodeId: string; action: string; runId: string; sourceNodeId?: string }[] = [];
+  const edgeProposalResults: string[] = [];
+  bus.subscribe((event) => { events.push(event); });
+  const options: GraphRunOptions = { eventBus: bus, deps: {
+    root,
+    runBash: async () => ({ stdout: 'ok', stderr: '', exitCode: 0 }),
+    inProcessHandlers: { 'emit-event': async (context) => {
+      await context.emitEvent?.('release.gate.failed', { severity: 'introduced' });
+      return { ok: true, outcome: 'ok' };
+    } },
+    proposeGraphEdge: async (proposal) => { edgeProposalResults.push(proposal.mode ?? 'live');
+      return { disposition: 'added', reason: 'live policy approved' }; },
+    dispatchGraphSubscription: async ({ nodeId, action, event, proposeEdge }) => {
+      dispatches.push({ nodeId, action, runId: event.runId, sourceNodeId: event.source.nodeId });
+      if (proposeEdge) {
+        const result = await proposeEdge({ from: 'first', to: nodeId, triggerEvent: event.type, rationale: 'exercise the edge proposal port' });
+        edgeProposalResults.push(result.disposition);
+      }
+      if (proposeEdge) await expect(proposeEdge({ from: 'first', to: nodeId, triggerEvent: event.type,
+        rationale: 'blank shadow axis is refused', mode: 'shadow', unmeasuredAxis: '  ' }))
+        .rejects.toThrow('shadow graph edge proposal requires a non-empty unmeasuredAxis');
+    },
+  } };
+  const states = await Promise.all([
+    runGraph(graph, { ...options, runId: 'event-dispatch-a' }),
+    runGraph(graph, { ...options, runId: 'event-dispatch-b' }),
+  ]);
+  expect(states.map((state) => state.status)).toEqual(['done', 'done']);
+  for (const runId of ['event-dispatch-a', 'event-dispatch-b']) {
+    expect(events.filter((event) => event.runId === runId && event.source.nodeId === 'first').map((event) => event.type))
+      .toEqual(['node-arrival', 'node-start', 'release.gate.failed', 'node-end', 'node-leave']);
+    expect(dispatches.filter((dispatch) => dispatch.runId === runId).map((dispatch) => dispatch.sourceNodeId))
+      .toEqual(['first', 'first']);
+  }
+  expect(events.map((event) => event.sequence)).toEqual(events.map((_event, index) => index + 1));
+  expect(dispatches.map(({ nodeId, action }) => [nodeId, action])).toEqual([
+    ['second', 'wake'], ['second', 'wake'], ['second', 'wake'], ['second', 'wake'],
+  ]);
+  expect(edgeProposalResults.filter((result) => result === 'live')).toHaveLength(4);
+  expect(edgeProposalResults.filter((result) => result === 'added')).toHaveLength(4);
+});
+
+test('runGraph publishes release.gate.failed only with complete triage evidence', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-triage-event-'));
+  dirs.push(root);
+  const graph = join(root, 'release-loop.yaml');
+  const sha = 'a'.repeat(40);
+  writeFileSync(join(root, 'recipes.yaml'), [
+    'gate:', '  command: "bun scripts/release-loop/gate-node.ts --json"',
+    'gate-triage:', '  command: "bun scripts/release-loop/gate-triage-node.ts"',
+  ].join('\n') + '\n');
+  writeFileSync(graph, [
+    'graph_id: release-loop', 'version: 1', 'entry_node: gate', 'terminal_nodes: [done, failed]', 'nodes:',
+    "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 2 }",
+    "  - { node_id: gate-triage, kind: judge, recipe: 'cmd:gate-triage', max_visits: 1 }",
+    "  - { node_id: done, kind: gate, recipe: 'none', max_visits: 1 }",
+    "  - { node_id: failed, kind: gate, recipe: 'none', max_visits: 1 }", 'edges:',
+    '  - { from: gate, on: outcome, map: { ok: done, fail: gate-triage, error: gate-triage } }',
+    '  - { from: gate-triage, on: outcome, map: { ok: done, fail: failed, error: failed } }',
+  ].join('\n') + '\n');
+
+  const triageCases: Array<{ name: string; triage: Record<string, unknown>; publishes: boolean }> = [
+    { name: 'minimal stub', triage: { outcome: 'ok', verdict: 'pass' }, publishes: false },
+    { name: 'empty values', triage: { classification: '', commit: '', introduced: [null] }, publishes: false },
+    { name: 'malformed introduced', triage: { classification: 'load', commit: sha, introduced: [null] }, publishes: false },
+    { name: 'empty introduced', triage: { classification: 'load', commit: sha, introduced: [] }, publishes: false },
+    { name: 'valid evidence', triage: { classification: 'load', commit: sha, introduced: ['src/example.test.ts > fails'], reason: 'measured load', outcome: 'ok' }, publishes: true },
+  ];
+  for (const [index, item] of triageCases.entries()) {
+    const bus = createGraphEventBus();
+    const events: string[] = [];
+    const progressPhases: string[] = [];
+    const progressHosts: Array<unknown> = [];
+    bus.subscribe((event) => { if (event.type === 'release.gate.failed') events.push(event.eventId); });
+    bus.subscribe((event) => { if (event.type === 'release.gate.progress') {
+      progressPhases.push(String(event.data?.phase)); progressHosts.push(event.data?.host);
+    } });
+    const state = await runGraph(graph, { runId: `triage-evidence-${index}`, input: { version: '0.3.5', previousVersion: '0.3.4' }, eventBus: bus,
+      deps: { root, releaseGraphEventAdapters: false, runBash: async (command, opts) => {
+        if (command.includes('gate-triage-node.ts')) return (() => {
+          const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { input: Record<string, unknown> };
+          return { exitCode: 0, stdout: `${JSON.stringify({ ...item.triage,
+            ...(item.publishes ? { gateExecutionId: context.input.adaptiveGateExecutionId } : {}) })}\n`, stderr: '' };
+        })();
+        const progressPath = opts.env?.ELANOUS_GATE_PROGRESS_FILE;
+        if (progressPath) {
+          const rows = ['shard-planning', 'collection', 'classification', 'verdict']
+            .map((phase) => JSON.stringify({ phase, shardIndex: 1, shardTotal: 1, host: index === 0 ? 'node-c-호스트' : 'sim-host', durationMs: 10,
+              failureCount: 0, introduced: 0, preexisting: 0, unmeasured: 0 }));
+          const payload = Buffer.from(`${rows.join('\n')}\n`);
+          if (index === 0) {
+            const splitAt = payload.indexOf(Buffer.from('호스트')) + 1;
+            writeFileSync(progressPath, payload.subarray(0, splitAt));
+            await new Promise((resolve) => setTimeout(resolve, 150));
+            appendFileSync(progressPath, payload.subarray(splitAt));
+          } else writeFileSync(progressPath, payload);
+        }
+        return { exitCode: 1, stdout: `${JSON.stringify({ outcome: 'fail', commit: sha, introduced: ['src/example.test.ts > fails'] })}\n`, stderr: '' };
+      } } });
+    expect(state.status, item.name).toBe('done');
+    expect(events, item.name).toHaveLength(item.publishes ? 1 : 0);
+    expect(progressPhases).toEqual(['shard-planning', 'collection', 'classification', 'verdict']);
+    if (index === 0) expect(progressHosts).toContain('node-c-호스트');
+  }
+
+  const staleGateBus = createGraphEventBus();
+  const staleGateEvents: string[] = [];
+  staleGateBus.subscribe((event) => { if (event.type === 'release.gate.failed') staleGateEvents.push(event.eventId); });
+  let staleTriageRuns = 0;
+  await expect(runGraph(graph, { runId: 'stale-gate-execution-id', input: { version: '0.3.5', previousVersion: '0.3.4' },
+    eventBus: staleGateBus, deps: { root, releaseGraphEventAdapters: false, runBash: async (command) => {
+      if (command.includes('gate-node.ts')) return { exitCode: 1,
+        stdout: `${JSON.stringify({ outcome: 'fail', commit: sha, introduced: ['src/example.test.ts > fails'], executionId: 'prior-gate-execution' })}\n`, stderr: '' };
+      if (command.includes('gate-triage-node.ts')) staleTriageRuns++;
+      return { exitCode: 0, stdout: `${JSON.stringify({ classification: 'load', commit: sha,
+        introduced: ['src/example.test.ts > fails'], outcome: 'ok' })}\n`, stderr: '' };
+    } } })).rejects.toThrow('gate output execution id does not match the current gate execution');
+  expect(staleTriageRuns).toBe(0);
+  expect(staleGateEvents).toEqual([]);
+
+  const legacyRunId = 'legacy-gate-execution-id-resume';
+  const legacyBus = createGraphEventBus();
+  const legacyEvents: string[] = [];
+  legacyBus.subscribe((event) => { if (event.type === 'release.gate.failed') legacyEvents.push(event.eventId); });
+  let legacyGateVisits = 0;
+  const legacyRunBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (command, opts) => {
+    if (command.includes('gate-node.ts')) {
+      legacyGateVisits++;
+      return { exitCode: 1, stdout: `${JSON.stringify({ outcome: 'fail', commit: sha, introduced: ['src/example.test.ts > fails'] })}\n`, stderr: '' };
+    }
+    if (command.includes('gate-triage-node.ts')) {
+      const contextPath = opts.env?.ELANOUS_GRAPH_CONTEXT;
+      if (!contextPath) throw new Error('graph runner context path is missing');
+      const context = JSON.parse(readFileSync(contextPath, 'utf8')) as { input: Record<string, unknown> };
+      return { exitCode: 0, stdout: `${JSON.stringify({ classification: 'load', commit: sha,
+        introduced: ['src/example.test.ts > fails'], outcome: 'ok', gateExecutionId: context.input.adaptiveGateExecutionId })}\n`, stderr: '' };
+    }
+    return { exitCode: 0, stdout: `${JSON.stringify({ outcome: 'ok' })}\n`, stderr: '' };
+  };
+  const legacyDeps = { root, releaseGraphEventAdapters: false, runBash: legacyRunBash };
+  await expect(runGraph(graph, { runId: legacyRunId, input: { version: '0.3.5', previousVersion: '0.3.4' },
+    deps: { ...legacyDeps, beforeNode: () => { if (legacyGateVisits === 1) throw new Error('interrupt after legacy gate'); } } }))
+    .rejects.toThrow('interrupt after legacy gate');
+  const legacyPath = join(root, 'graph-runs', 'release-loop', `${legacyRunId}.json`);
+  const legacySaved = JSON.parse(readFileSync(legacyPath, 'utf8')) as { nodes: Array<{ nodeId: string; executionId?: string; output?: unknown }> };
+  const oldGate = legacySaved.nodes.find((record) => record.nodeId === 'gate')!;
+  delete oldGate.executionId;
+  const oldGateOutput = JSON.parse(String(oldGate.output)) as Record<string, unknown>;
+  delete oldGateOutput.executionId;
+  oldGate.output = JSON.stringify(oldGateOutput);
+  writeFileSync(legacyPath, `${JSON.stringify({ ...legacySaved, status: 'running' }, null, 2)}\n`);
+  const legacyResumed = await runGraph(graph, { resumeRunId: legacyRunId, input: { version: '0.3.5', previousVersion: '0.3.4' },
+    eventBus: legacyBus, deps: legacyDeps });
+  expect(legacyResumed.status).toBe('done');
+  expect(legacyGateVisits).toBe(2);
+  expect(legacyEvents).toHaveLength(1);
+  expect(legacyResumed.nodes.filter((record) => record.nodeId === 'gate').at(-1)?.executionId).toEqual(expect.any(String));
+});
+
+test('runGraph routes on a matching live adaptive event vocabulary edge and keeps unmatched proposals off-path', async () => {
+  for (const matchesTrigger of [true, false]) {
+    const { graph, root } = fixture('printf first');
+    writeFileSync(graph, readFileSync(graph, 'utf8').replace(
+      '- { node_id: first, kind: agent, recipe: \'cmd:first\', max_visits: 1 }',
+      '- node_id: first\n    kind: agent\n    recipe: handler:emit-event\n    max_visits: 1\n    emits: [release.gate.failed]',
+    ).replace(
+      '  - { node_id: done, kind: gate, max_visits: 1 }',
+      '  - { node_id: adaptive, kind: agent, recipe: \'cmd:second\', max_visits: 1, subscribes: [{ event: release.gate.failed, action: reroute }] }\n  - { node_id: done, kind: gate, max_visits: 1 }',
+    ).replace(
+      '  - from: second\n',
+      '  - from: adaptive\n    on: outcome\n    map: { ok: second, fail: failed }\n  - from: second\n',
+    ));
+    const bus = createGraphEventBus();
+    bus.registerType('release.gate.failed');
+    const edgeResults: unknown[] = [];
+    const state = await runGraph(graph, { eventBus: bus, deps: { root,
+      inProcessHandlers: { 'emit-event': async (context) => {
+        await context.emitEvent?.('release.gate.failed', { code: 'new-incident' });
+        return { ok: true, outcome: 'ok' };
+      } },
+      dispatchGraphSubscription: async ({ event, nodeId, proposeEdge }) => {
+        if (event.type !== 'release.gate.failed' || nodeId !== 'adaptive' || !proposeEdge) return;
+        const triggerEvent = matchesTrigger ? event.type : 'release.incident.new-code';
+        const result = await proposeEdge({ from: 'first', to: 'adaptive', triggerEvent,
+          rationale: 'new incident vocabulary routes the affected release node', mode: 'live' });
+        edgeResults.push(result);
+      },
+    } });
+    expect(edgeResults).toEqual([{ disposition: 'added', reason: 'event vocabulary and run-local edge persisted' }]);
+    expect(state.status).toBe('done');
+    expect(state.path.includes('adaptive')).toBe(matchesTrigger);
+    expect(state.adaptiveGraphVocabulary).toContain(matchesTrigger ? 'release.gate.failed' : 'release.incident.new-code');
+    expect(state.adaptiveGraphEdges).toMatchObject([{ from: 'first', to: 'adaptive',
+      triggerEvent: matchesTrigger ? 'release.gate.failed' : 'release.incident.new-code', rationale: 'new incident vocabulary routes the affected release node' }]);
+  }
+});
+
+test('GraphEventBus serializes concurrent publishers and rejects unregistered vocabulary', async () => {
+  const bus = createGraphEventBus();
+  bus.registerType('release.gate.failed');
+  const delivered: number[] = [];
+  bus.subscribe(async (event) => { await Bun.sleep(1); delivered.push(event.sequence); });
+  const [first, second] = await Promise.all([
+    bus.publish({ graphId: 'release-loop', runId: 'concurrent', type: 'release.gate.failed', source: { kind: 'node', nodeId: 'gate' } }),
+    bus.publish({ graphId: 'release-loop', runId: 'concurrent', type: 'node-start', source: { kind: 'node', nodeId: 'gate-bisect' } }),
+  ]);
+  expect([first.sequence, second.sequence]).toEqual([1, 2]);
+  expect(delivered).toEqual([1, 2]);
+  await expect(bus.publish({ graphId: 'release-loop', runId: 'concurrent', type: 'release.unknown', source: { kind: 'runner' } }))
+    .rejects.toThrow('unregistered graph event type: release.unknown');
+  await expect(publishNodeGraphEvent(bus, { graphId: 'release-loop', runId: 'concurrent', type: 'release.gate.failed',
+    source: { kind: 'node', nodeId: 'prepare' } }, ['release.prepare.failed']))
+    .rejects.toThrow('node prepare emitted undeclared graph event: release.gate.failed');
+});
+
+test('GraphEventBus queues an awaited reentrant publish and continues after a handler failure', async () => {
+  const bus = createGraphEventBus();
+  bus.registerType('release.follow-up');
+  const delivered: string[] = [];
+  bus.subscribe(async (event) => {
+    delivered.push(`first:${event.type}`);
+    if (event.type === 'node-start') await bus.publish({ graphId: event.graphId, runId: event.runId,
+      type: 'release.follow-up', source: { kind: 'runner' } });
+    if (event.type === 'node-end') throw new Error('subscriber failed');
+  });
+  bus.subscribe((event) => { delivered.push(`second:${event.type}`); });
+  await expect(bus.publish({ graphId: 'g', runId: 'reentrant', type: 'node-end', source: { kind: 'runner' } }))
+    .rejects.toThrow('graph event reentrant:1 delivery failed');
+  await bus.publish({ graphId: 'g', runId: 'reentrant', type: 'node-start', source: { kind: 'runner' } });
+  await bus.flush();
+  expect(delivered).toEqual([
+    'first:node-end', 'second:node-end',
+    'first:node-start', 'second:node-start', 'first:release.follow-up', 'second:release.follow-up',
+  ]);
+});
+
+test('GraphEventBus reports reentrant delivery failures to their owning run', async () => {
+  const bus = createGraphEventBus();
+  bus.registerType('release.follow-up');
+  let releaseNested!: () => void;
+  const nestedDelivered = new Promise<void>((resolve) => { releaseNested = resolve; });
+  bus.subscribe(async (event) => {
+    if (event.type === 'node-start' && event.runId === 'run-a')
+      await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.follow-up', source: { kind: 'runner' } });
+    if (event.type === 'release.follow-up' && event.runId === 'run-a') {
+      releaseNested();
+      throw new Error('run-a subscriber failed');
+    }
+  });
+  const runA = bus.publish({ graphId: 'g', runId: 'run-a', type: 'node-start', source: { kind: 'runner' } });
+  await runA;
+  await nestedDelivered;
+  await bus.publish({ graphId: 'g', runId: 'run-b', type: 'node-end', source: { kind: 'runner' } });
+  await bus.flush({ graphId: 'g', runId: 'run-b' });
+  await expect(bus.flush({ graphId: 'g', runId: 'run-a' })).rejects.toThrow('reentrant graph event delivery failed');
+});
+
 test('aborting a graph cancels the active command and prevents dispatch of later nodes', async () => {
   const { graph, root } = fixture('sleep 30');
   const controller = new AbortController();
@@ -209,32 +687,37 @@ test('aborting a graph cancels the active command and prevents dispatch of later
   expect(run.path).not.toContain('second');
 });
 
-test('explicit fan-out runs branches concurrently, joins failures and resumes only the selected failed branch', async () => {
+test('explicit fan-out runs concurrently and reruns a completed branch when its input receipt changes', async () => {
   const root = mkdtempSync(join(tmpdir(), 'graph-fanout-'));
   dirs.push(root);
   const graph = join(root, 'graph.yaml');
   writeFileSync(join(root, 'recipes.yaml'), [
+    'version-release:', '  command: commit-source',
     'start:', '  command: "printf \'{\\\"outcome\\\":\\\"ok\\\"}\'"',
     'a:', '  command: branch-a', 'b:', '  command: branch-b', '',
   ].join('\n'));
   writeFileSync(graph, `graph_id: operate-loop
 version: 1
-entry_node: start
+entry_node: version-release
 terminal_nodes: [landed, operate-blocked]
 nodes:
+  - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
   - { node_id: start, kind: agent, recipe: 'cmd:start', max_visits: 1 }
-  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1 }
-  - { node_id: b, kind: agent, recipe: 'cmd:b', max_visits: 1 }
-  - { node_id: joined, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, needs: [start] }
+  - { node_id: b, kind: agent, recipe: 'cmd:b', max_visits: 1, needs: [start] }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1, needs: [a, b] }
   - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: operate-blocked, kind: gate, recipe: none, max_visits: 1 }
 edges:
-  - from: start
-    on: outcome
-    branches: { ok: [a, b] }
-    join: joined
+  - { from: version-release, on: outcome, map: { ok: start, fail: operate-blocked } }
+  - { from: start, on: outcome, map: { fail: operate-blocked, error: operate-blocked } }
   - { from: joined, on: outcome, map: { ok: landed, fail: operate-blocked } }
 `);
+  execFileSync('git', ['init', '--quiet'], { cwd: root });
+  execFileSync('git', ['add', 'graph.yaml', 'recipes.yaml'], { cwd: root });
+  execFileSync('git', ['-c', 'user.name=release-root-test', '-c', 'user.email=release-root-test@invalid', 'commit', '--quiet', '-m', 'fanout source'], { cwd: root });
+  const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+  const branchArtifact = join(root, 'branch-b-artifact.txt');
   let failA = true;
   let active = 0;
   let maxActive = 0;
@@ -247,6 +730,7 @@ edges:
   let finishBranchB!: () => void;
   const branchBFinished = new Promise<void>((resolve) => { finishBranchB = resolve; });
   const deps = { root, runBash: async (command: string) => {
+    if (command === 'commit-source') return { stdout: JSON.stringify({ outcome: 'ok', commit: sourceCommit }), stderr: '', exitCode: 0 };
     if (command === 'branch-a' || command === 'branch-b') {
       counts.set(command, (counts.get(command) ?? 0) + 1);
       active++;
@@ -254,15 +738,16 @@ edges:
       startedBranches.add(command);
       if (startedBranches.size === 2) releaseBothStarted();
       if (command === 'branch-a') await branchAGate;
-      else { await bothStarted; finishBranchB(); }
+      else { await bothStarted; writeFileSync(branchArtifact, 'branch-b-artifact'); finishBranchB(); }
       active--;
       const ok = command === 'branch-a' ? !failA : true;
-      return { stdout: JSON.stringify({ outcome: ok ? 'ok' : 'fail', artifact: command }), stderr: '', exitCode: ok ? 0 : 1 };
+      return { stdout: JSON.stringify({ outcome: ok ? 'ok' : 'fail', result: command === 'branch-b' ? { artifacts: [branchArtifact] } : command }),
+        stderr: '', exitCode: ok ? 0 : 1 };
     }
     return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
   } };
   const runId = 'fanout-incremental-persist';
-  const firstPromise = runGraph(graph, { runId, deps });
+  const firstPromise = runGraph(graph, { runId, input: { releaseInput: 'before' }, deps });
   await branchBFinished;
   const parentStatePath = join(root, 'graph-runs', 'operate-loop', `${runId}.json`);
   let observedBranchCompletion = false;
@@ -284,17 +769,186 @@ edges:
   expect(first.status).toBe('failed');
   const fork = first.fanOuts?.['start:ok'];
   expect(fork?.branches.a).toMatchObject({ status: 'failed', output: expect.any(String), artifactSha256: expect.any(String) });
-  expect(fork?.branches.b).toMatchObject({ status: 'done', output: expect.any(String), artifactSha256: expect.any(String) });
+  expect(fork?.branches.b).toMatchObject({ status: 'done', output: expect.any(String), artifactSha256: expect.any(String),
+    completionReceipt: { inputSha256: expect.any(String), commit: expect.any(String), artifactSha256: expect.any(String) } });
+  const childLedgerPath = join(root, 'graph-runs', 'operate-loop', `${fork!.branches.b!.runId}.json`);
+  const childLedger = JSON.parse(readFileSync(childLedgerPath, 'utf8')) as { nodes: Array<{ nodeId: string; completionReceipt?: unknown }> };
+  expect(childLedger.nodes.find((node) => node.nodeId === 'b')?.completionReceipt).toMatchObject({
+    inputSha256: expect.any(String), commit: sourceCommit, artifactSha256: expect.any(String),
+  });
   const successfulBranch = { ...fork!.branches.b! };
 
-  failA = false;
   await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'a', deps }))
     .rejects.toThrow("--from cannot resume fan-out branch 'a'; resume from fan-out source 'start' instead");
+  const unchanged = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
+  expect(unchanged.status).toBe('failed');
+  expect(counts).toEqual(new Map([['branch-a', 2], ['branch-b', 1]]));
+  writeFileSync(branchArtifact, 'tampered-artifact');
+  const artifactChanged = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
+  expect(artifactChanged.status).toBe('failed');
+  expect(counts).toEqual(new Map([['branch-a', 3], ['branch-b', 2]]));
+  const savedState = JSON.parse(readFileSync(first.statePath, 'utf8')) as { input: unknown };
+  savedState.input = { releaseInput: 'after' };
+  writeFileSync(first.statePath, JSON.stringify(savedState));
+  failA = false;
   const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
   expect(resumed.status).toBe('done');
-  expect(counts).toEqual(new Map([['branch-a', 2], ['branch-b', 1]]));
-  expect(resumed.fanOuts?.['start:ok']?.branches.b).toEqual(successfulBranch);
-  expect(resumed.path).toEqual(['start', 'joined', 'landed']);
+  expect(counts).toEqual(new Map([['branch-a', 4], ['branch-b', 3]]));
+  expect(resumed.fanOuts?.['start:ok']?.branches.b?.completionReceipt?.inputSha256)
+    .not.toBe(successfulBranch.completionReceipt?.inputSha256);
+  expect(resumed.path).toEqual(['version-release', 'start', 'joined', 'landed']);
+}, 30_000);
+
+test('explicit fan-out reruns a completed branch when current source commit differs from its receipt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-fanout-source-commit-'));
+  dirs.push(root);
+  execFileSync('git', ['init', '--quiet'], { cwd: root });
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'version-release:\n  command: commit-source\nstart:\n  command: start\na:\n  command: branch-a\nb:\n  command: branch-b\n');
+  writeFileSync(graph, `graph_id: operate-loop
+version: 1
+entry_node: version-release
+terminal_nodes: [landed, operate-blocked]
+nodes:
+  - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
+  - { node_id: start, kind: agent, recipe: 'cmd:start', max_visits: 1 }
+  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, needs: [start] }
+  - { node_id: b, kind: agent, recipe: 'cmd:b', max_visits: 1, needs: [start] }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1, needs: [a, b] }
+  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: operate-blocked, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: version-release, on: outcome, map: { ok: start, fail: operate-blocked } }
+  - { from: start, on: outcome, branches: { ok: [a, b], fail: [operate-blocked, landed] }, join: joined }
+  - { from: joined, on: outcome, map: { ok: landed, fail: operate-blocked } }
+`);
+  execFileSync('git', ['add', 'graph.yaml', 'recipes.yaml'], { cwd: root });
+  execFileSync('git', ['-c', 'user.name=release-root-test', '-c', 'user.email=release-root-test@invalid', 'commit', '--quiet', '-m', 'fanout source'], { cwd: root });
+  const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+  let failA = true;
+  const counts = new Map<string, number>();
+  const deps = { root, runBash: async (command: string) => {
+    if (command === 'commit-source') return { stdout: JSON.stringify({ outcome: 'ok', commit: sourceCommit }), stderr: '', exitCode: 0 };
+    if (command === 'branch-a' || command === 'branch-b') {
+      counts.set(command, (counts.get(command) ?? 0) + 1);
+      const ok = command !== 'branch-a' || !failA;
+      return { stdout: JSON.stringify({ outcome: ok ? 'ok' : 'fail' }), stderr: '', exitCode: ok ? 0 : 1 };
+    }
+    return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+  } };
+  const first = await runGraph(graph, { runId: 'fanout-source-commit', deps });
+  expect(first.status).toBe('failed');
+  expect(counts.get('branch-b')).toBe(1);
+
+  writeFileSync(join(root, 'source-change'), 'changed');
+  execFileSync('git', ['add', 'source-change'], { cwd: root });
+  execFileSync('git', ['-c', 'user.name=release-root-test', '-c', 'user.email=release-root-test@invalid', 'commit', '--quiet', '-m', 'move source'], { cwd: root });
+  failA = false;
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
+  expect(resumed.status).toBe('done');
+  expect(counts.get('branch-b')).toBe(2);
+}, 30_000);
+
+test('fan-out scheduler enforces the graph concurrency cap and serializes shared resource locks', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-fanout-locks-'));
+  dirs.push(root);
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), [
+    'start:', '  command: "printf \'{\\"outcome\\":\\"ok\\"}\'"',
+    'a:', '  command: resource-a', 'b:', '  command: resource-b', 'c:', '  command: independent-c', '',
+  ].join('\n'));
+  writeFileSync(graph, `graph_id: operate-loop
+version: 1
+max_parallel_nodes: 2
+entry_node: start
+terminal_nodes: [landed, operate-blocked]
+nodes:
+  - { node_id: start, kind: agent, recipe: 'cmd:start', max_visits: 1 }
+  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, resource_locks: [checkout] }
+  - { node_id: b, kind: agent, recipe: 'cmd:b', max_visits: 1, resource_locks: [checkout] }
+  - { node_id: c, kind: agent, recipe: 'cmd:c', max_visits: 1 }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: operate-blocked, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: start
+    on: outcome
+    branches: { ok: [a, b, c] }
+    join: joined
+  - { from: joined, on: outcome, map: { ok: landed, fail: operate-blocked } }
+`);
+  let releaseA!: () => void;
+  let signalAc!: () => void;
+  const heldA = new Promise<void>((resolve) => { releaseA = resolve; });
+  const startedAc = new Promise<void>((resolve) => { signalAc = resolve; });
+  const started: string[] = [];
+  let active = 0;
+  let maximumActive = 0;
+  let aFinished = false;
+  let bStartedAfterA = false;
+  const deps = { root, runBash: async (command: string) => {
+    if (command === 'resource-a' || command === 'resource-b' || command === 'independent-c') {
+      started.push(command);
+      active++;
+      maximumActive = Math.max(maximumActive, active);
+      if (command === 'resource-a') {
+        signalAc();
+        await heldA;
+        aFinished = true;
+      } else if (command === 'resource-b') bStartedAfterA = aFinished;
+      else signalAc();
+      active--;
+      return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+    }
+    return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+  } };
+  const run = runGraph(graph, { deps });
+  await startedAc;
+  await Bun.sleep(10);
+  expect(started).toEqual(['resource-a', 'independent-c']);
+  releaseA();
+  const result = await run;
+  expect(result.status).toBe('done');
+  expect(maximumActive).toBe(2);
+  expect(bStartedAfterA).toBe(true);
+});
+
+test('fan-out without a configured cap keeps all legacy branches concurrent', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-fanout-default-cap-'));
+  dirs.push(root);
+  writeFileSync(join(root, 'recipes.yaml'), ['a:', '  command: a', 'b:', '  command: b', 'c:', '  command: c',
+    'd:', '  command: d', 'e:', '  command: e', ''].join('\n'));
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(graph, [
+    'graph_id: operate-loop', 'version: 1', 'entry_node: start', 'terminal_nodes: [landed, operate-blocked]',
+    'nodes:',
+    '  - { node_id: start, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: a, kind: agent, recipe: cmd:a, max_visits: 1 }',
+    '  - { node_id: b, kind: agent, recipe: cmd:b, max_visits: 1 }',
+    '  - { node_id: c, kind: agent, recipe: cmd:c, max_visits: 1 }',
+    '  - { node_id: d, kind: agent, recipe: cmd:d, max_visits: 1 }',
+    '  - { node_id: e, kind: agent, recipe: cmd:e, max_visits: 1 }',
+    '  - { node_id: joined, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: operate-blocked, kind: gate, recipe: none, max_visits: 1 }',
+    'edges:',
+    '  - from: start',
+    '    on: outcome',
+    '    branches: { ok: [a, b, c, d, e] }',
+    '    join: joined',
+    '  - { from: joined, on: outcome, map: { ok: landed, fail: operate-blocked } }',
+  ].join('\n'));
+  let active = 0;
+  let maximumActive = 0;
+  const result = await runGraph(graph, { deps: { root, runBash: async () => {
+    active++;
+    maximumActive = Math.max(maximumActive, active);
+    await Bun.sleep(20);
+    active--;
+    return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+  } } });
+  expect(result.status).toBe('done');
+  expect(maximumActive).toBe(5);
 });
 
 // A real ledger resolves release versions from git (seconds); park tests only need a card id.
@@ -1065,8 +1719,8 @@ test('two successful commands reach done and persist both outcomes', async () =>
   expect(result.statePath).toBe(join(root, 'graph-runs', 'test-graph', 'success.json'));
   expect(existsSync(join(root, 'heal', 'inbox.jsonl'))).toBe(false);
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).nodes.slice(0, 2)).toEqual([
-    { nodeId: 'first', ok: true, exit: 0, executed: true, output: '', startedAt: expect.any(String), endedAt: expect.any(String), seconds: expect.any(Number) },
-    { nodeId: 'second', ok: true, exit: 0, executed: true, output: '', startedAt: expect.any(String), endedAt: expect.any(String), seconds: expect.any(Number) },
+    expect.objectContaining({ nodeId: 'first', executionId: expect.any(String), ok: true, exit: 0, executed: true, output: '', startedAt: expect.any(String), endedAt: expect.any(String), seconds: expect.any(Number) }),
+    expect.objectContaining({ nodeId: 'second', executionId: expect.any(String), ok: true, exit: 0, executed: true, output: '', startedAt: expect.any(String), endedAt: expect.any(String), seconds: expect.any(Number) }),
   ]);
 });
 
@@ -1102,13 +1756,13 @@ test('GRAPH-NODE-TIMES: each run node records start, end and seconds in the ledg
 
 test('GRAPH-NODE-TIMES: the ledger names the running node and its start while it runs', async () => {
   const { graph, root } = fixture('exit 0');
-  let seen: { currentNode?: { nodeId: string; startedAt: string }; nodes: unknown[] } | undefined;
+  let seen: { currentNode?: { nodeId: string; executionId: string; startedAt: string }; nodes: unknown[] } | undefined;
   const result = await runGraph(graph, { runId: 'running', deps: { root, runBash: async () => {
     seen ??= JSON.parse(readFileSync(join(root, 'graph-runs', 'test-graph', 'running.json'), 'utf8'));
     return { stdout: '', stderr: '', exitCode: 0 };
   } } });
   expect(seen?.nodes).toEqual([]);
-  expect(seen?.currentNode).toEqual({ nodeId: 'first', startedAt: expect.any(String) });
+  expect(seen?.currentNode).toEqual({ nodeId: 'first', executionId: expect.any(String), startedAt: expect.any(String) });
   expect(result.nodes[0]?.startedAt).toBe(seen!.currentNode!.startedAt);
 });
 
@@ -1207,8 +1861,8 @@ second:
   } });
   expect(seen).toHaveLength(2);
   expect(seen[0]?.path).not.toBe(seen[1]?.path);
-  expect(seen[0]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, nodeId: 'first', input: { request: 'hello' }, outputs: {} });
-  expect(seen[1]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, nodeId: 'second', input: { request: 'hello' }, outputs: { first: 'first-output' } });
+  expect(seen[0]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'first', input: { request: 'hello' }, outputs: {} });
+  expect(seen[1]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'second', input: { request: 'hello' }, outputs: { first: 'first-output' } });
   expect(result.input).toEqual({ request: 'hello' });
   expect(result.nodes.slice(0, 2).map((node) => node.output)).toEqual(['first-output', 'second-output']);
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).input).toEqual({ request: 'hello' });
@@ -1313,7 +1967,7 @@ second:
   const result = await runGraph(graph, { input: ['payload'], deps: { root } });
   expect(result.status).toBe('done');
   expect(JSON.parse(result.nodes[1]?.output as string)).toEqual({
-    graphId: result.graphId, runId: result.runId, startedAt: result.startedAt, nodeId: 'second', input: ['payload'], outputs: { first: 'first-output' },
+    graphId: result.graphId, runId: result.runId, startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'second', input: ['payload'], outputs: { first: 'first-output' },
   });
 });
 
@@ -1771,7 +2425,7 @@ test('approval pauses without running b; undecided resume stays pending; decisio
 
 test('resume keeps persisted input and exposes pre-approval outputs to the next cmd', async () => {
   const { graph, root } = approvalFixture();
-  const contexts: Array<{ graphId: string; runId: string; startedAt: string; nodeId: string; input: unknown; outputs: Record<string, unknown> }> = [];
+  const contexts: Array<{ graphId: string; runId: string; startedAt: string; executionId: string; nodeId: string; input: unknown; outputs: Record<string, unknown> }> = [];
   const deps = { root, runBash: async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     contexts.push(JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')));
     return { stdout: `output-${contexts.length}`, stderr: '', exitCode: 0 };
@@ -1783,8 +2437,8 @@ test('resume keeps persisted input and exposes pre-approval outputs to the next 
   const resumed = await runGraph(graph, { resumeRunId: first.runId, input: { original: false }, deps });
   expect(resumed.input).toEqual({ original: true });
   expect(contexts).toEqual([
-    { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, nodeId: 'a', input: { original: true }, outputs: {} },
-    { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, nodeId: 'b', input: { original: true }, outputs: { a: 'output-1', gate: expect.objectContaining({ outcome: 'approved', decidedBy: 'reviewer' }) } },
+    { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, executionId: expect.any(String), nodeId: 'a', input: { original: true }, outputs: {} },
+    { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, executionId: expect.any(String), nodeId: 'b', input: { original: true }, outputs: { a: 'output-1', gate: expect.objectContaining({ outcome: 'approved', decidedBy: 'reviewer' }) } },
   ]);
   expect(JSON.parse(readFileSync(resumed.statePath, 'utf8')).input).toEqual({ original: true });
 });

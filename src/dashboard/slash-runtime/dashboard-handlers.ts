@@ -87,7 +87,7 @@
 //                   board-local refs so they thread through ctx.
 //   B-1.a (#1452) — registry shape + 3 pilot cases (quit · clear · help)
 //   B-1.b (#1455) — 6 tiny standalone cases (fork · ctoggle · dashboard ·
-//                   sync · voice-chat · skill-reload)
+//                   sync · skill-reload)
 //   B-1.c         — 8 small standalone cases (cache · attach-pin · attach-
 //                   unpin · attach-clear · rebind · perf · pty-list/ptys ·
 //                   sweep-tool-results)
@@ -98,10 +98,10 @@
 //                   `runDeferredSkillToolSlash` helper to keep net code
 //                   add minimal at this tier.
 //   B-1.e         — 4 tiny standalone toggles / state-mutation cases
-//                   (pause · chat · qc · auto-tts/autotts/tts). Mixed dep
+//                   (pause · chat · qc). Mixed dep
 //                   patterns: static import (armSessionQuickControl ·
-//                   handleAutoTtsSlash) · dynamic import (turn-checkpoint
-//                   for /pause) · context threading (autoTtsRef).
+//                   dynamic import (turn-checkpoint
+//                   for /pause) · context threading.
 //   B-1.f         — 3 companion-popup cases (clipboard/clip/cb · memo/
 //                   note/me · detail/report/dv). All share the
 //                   companionPopupHost + companionSlashRuntime deps.
@@ -331,7 +331,6 @@ import {
   setSessionPreferredSurface,
   buildSessionSurfaceStatusLines,
 } from '../../session-runtime/index.js';
-import { handleAutoTtsSlash } from '../auto-tts/auto-tts-host-boot.js';
 import { registerDashboardDelegatedSlashes } from './dashboard-delegated-slashes.js';
 import {
   addAllowed,
@@ -489,8 +488,6 @@ export interface DashboardSlashContext {
   getChatOnlyMode(): boolean;
   setChatOnlyLayout(value: boolean, opts: { announce: boolean }): void;
   enterSyncMode(): void;
-  handleVoiceChatSlash(state: unknown, args: string[]): Promise<string>;
-  voiceChatStateRef: { value: unknown };
   reloadSkillIndex(): number;
 
   // B-1.c additions
@@ -519,15 +516,6 @@ export interface DashboardSlashContext {
     list(): readonly { id: string; kind: string; runId: string; alive: boolean; manifestDbPath: string }[];
     snapshot(id: string, manifestDbPath: string): Promise<{ exitCode: number; message: string }>;
     show(opts: { title: string; lines: readonly string[] }): void;
-  };
-
-  // B-1.e additions — auto-tts state is showDashboard-local (built in
-  // the input-loop scope), so we thread the controller + providerId
-  // through ctx as opaque shapes. `handleAutoTtsSlash` is statically
-  // imported in this module since the function itself is module-level.
-  autoTtsRef: {
-    controller: Parameters<typeof handleAutoTtsSlash>[0];
-    providerId: Parameters<typeof handleAutoTtsSlash>[1];
   };
 
   // B-1.g additions — signals and widget delegation runtimes are
@@ -1121,7 +1109,7 @@ export interface DashboardSlashContext {
   // TUI-LOOP-COMMAND — /loop <간격> <프롬프트> idle-gated 루프 스케줄러
   // (src/dashboard/loop-scheduler.ts · 판정: idle 발사 1 · busy 미룸 · stop 0).
   // 스케줄러 인스턴스와 idle/busy 신호는 showDashboard 로컬 상태라
-  // chatModeStateRef / voiceChatStateRef 선례대로 ctx 로 스레드한다.
+  // chatModeStateRef 선례대로 ctx 로 스레드한다.
   // Optional — 배선 없는 격리 dispatch 시험은 /loop 가 «배선 없음» 줄로
   // 답하는 것이 규약(던지지 않는다).
   loopCommand?: {
@@ -1204,15 +1192,15 @@ export const DASHBOARD_SLASH_CATALOG_BASELINE = {
     'skills-reload', 'spend', 'squeeze',
     'tk', 'tokens',
     'undo', 'w', 'wd',
-    'ad', 'agent-room', 'api', 'api-allow', 'auto-tts', 'autotts',
+    'ad', 'agent-room', 'api', 'api-allow',
     'board', 'capture', 'chat', 'claude', 'codex', 'control', 'conv',
     'dash', 'dashboard', 'debug', 'default', 'delta', 'design', 'design-check', 'diffs',
     'directive', 'export', 'fork', 'gemini', 'handoff', 'hist', 'history', 'inject', 'inputs',
     'lane', 'll', 'local', 'log', 'loops', 'p', 'paste', 'persona', 'plan', 'plugin',
     'plugins', 'prompt', 'prompts', 'provider', 'qc', 'r', 'reasoning', 'rebind', 'relay',
     'reply', 'research', 'resume-turn', 'rewind', 'rs', 'run', 'run-skill', 's', 'showroom',
-    'surface', 'sync', 'tablet', 'telegram', 'term', 'terminal', 'tg', 'theme', 'think', 'tts',
-    'vc', 'voice-chat', 'widget', 'widgets', 'wish',
+    'surface', 'sync', 'tablet', 'telegram', 'term', 'terminal', 'tg', 'theme', 'think',
+    'widget', 'widgets', 'wish',
   ],
   listedOnly: [
     'acp', 'rsh', 'sr',
@@ -1640,16 +1628,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     ctx.setExitInputLoop(true);
   });
 
-  registry.register(['voice-chat', 'vc'], async (args, ctx) => {
-    // Phase 4 — continuous voice conversation mode. Subcommands: start
-    // (default) / stop / status.
-    const status = await ctx.handleVoiceChatSlash(ctx.voiceChatStateRef.value, args);
-    ctx.chatLines.push('');
-    ctx.chatLines.push(ctx.accent(`❯ /voice-chat ${args.join(' ').trim() || 'start'}`));
-    ctx.chatLines.push(ctx.muted(`  ${status}`));
-    ctx.setChatScrollOffset(-1);
-  });
-
   registry.register(['skill-reload', 'skills-reload'], (_args, ctx) => {
     // Force the router cache to re-scan ~/.claude/skills. Useful after
     // the user edits triggers in a SKILL.md frontmatter and wants the
@@ -1935,21 +1913,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       ' — your next message runs in control mode, then back to chat.',
     ));
     if (intent) ctx.chatLines.push(ctx.muted(`  intent: ${intent}`));
-    ctx.setChatScrollOffset(-1);
-  });
-
-  registry.register(['auto-tts', 'autotts', 'tts'], (args, ctx) => {
-    // Phase 2 — toggle auto-TTS for chat responses. Subcommands: on /
-    // off / toggle / status (default). `handleAutoTtsSlash` returns the
-    // status string for surfacing.
-    const status = handleAutoTtsSlash(
-      ctx.autoTtsRef.controller,
-      ctx.autoTtsRef.providerId,
-      args,
-    );
-    ctx.chatLines.push('');
-    ctx.chatLines.push(ctx.accent(`❯ /auto-tts ${args.join(' ').trim() || 'status'}`));
-    ctx.chatLines.push(ctx.muted(`  ${status}`));
     ctx.setChatScrollOffset(-1);
   });
 

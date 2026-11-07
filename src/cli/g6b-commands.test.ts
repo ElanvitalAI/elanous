@@ -15,7 +15,6 @@ const before = {
     { name: 'overview', flags: ['--json', '--watch [seconds]', '--since <window>', '--owner <owner>', '--version <v>'] },
     { name: 'health', flags: ['--json'] },
     { name: 'timeline', flags: ['--entity-type <t>', '--event <e>', '--since-hours <n>', '--limit <n>', '--json'] },
-    { name: 'mission', flags: ['--json'] },
     { name: 'mission-log', flags: ['-n, --lines <n>', '--json'] },
     { name: 'build', flags: ['--stop', '--all', '--follow', '--tail <n>', '--json'] },
   ],
@@ -47,6 +46,6 @@ describe('G6b extracted command registration', () => {
     expect((source.match(/^registerOpsCommands\(program\);$/gm) ?? []).length).toBe(1);
     expect((source.match(/^registerPublishCommands\(program\);$/gm) ?? []).length).toBe(1);
     expect(source.indexOf('registerOpsCommands(program);')).toBeLessThan(source.indexOf('registerPublishCommands(program);'));
-    expect(source.indexOf('registerPublishCommands(program);')).toBeGreaterThan(source.indexOf("autopilotCmd.command('negotiate <id> <phase>')"));
+    expect(source.indexOf('registerPublishCommands(program);')).toBeGreaterThan(source.indexOf('registerOpsCommands(program);'));
   });
 });

@@ -21,7 +21,7 @@ export function readConfiguredMachine(root: string = effectiveInstanceRoot()): s
 export function writeConfiguredMachine(machine: string, root: string = effectiveInstanceRoot()): void {
   if (!MACHINE_NAME.test(machine)) throw new Error(`invalid machine: ${machine}`);
   const previous = readMachineProfile(root);
-  writeMachineProfile({ id: machine, duties: previous?.duties ?? [], seats: previous?.seats ?? {} }, root);
+  writeMachineProfile({ id: machine, duties: previous?.duties ?? [], seats: previous?.seats ?? {}, ...(previous?.id === machine && previous.membership ? { membership: previous.membership } : {}) }, root);
 }
 
 /**

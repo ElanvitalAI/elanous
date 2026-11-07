@@ -38,8 +38,6 @@ describe('http-server imports cascade-zyu handlers', () => {
     ['approval-showroom', 'parseApprovalShowroomPath'],
     ['workflow-design',   'handleWorkflowDesign'],
     ['workflow-design',   'parseWorkflowDesignPath'],
-    ['mission-showroom',  'handleMissionShowroom'],
-    ['mission-showroom',  'parseMissionShowroomPath'],
     ['devices',           'handleDevices'],
     ['devices',           'handleTemplateCapabilityPreview'],
     ['devices',           'isDevicesPath'],
@@ -60,7 +58,6 @@ describe('http-server NexusHttpServerOpts fields', () => {
   test.each([
     'approvalShowroom?: ApprovalShowroomRouteOpts',
     'workflowDesign?: WorkflowDesignRouteOpts',
-    'missionShowroom?: MissionShowroomRouteOpts',
     'devices?: DevicesRouteOpts',
     'nextFluent?: NextFluentRouteOpts',
     'morningShowroom?: MorningShowroomRouteOpts',
@@ -74,7 +71,6 @@ describe('http-server dispatch · 503 envelope strings frozen', () => {
   test.each([
     'approval-showroom-not-wired',
     'workflow-design-not-wired',
-    'mission-showroom-not-wired',
     'devices-not-wired',
     'next-fluent-not-wired',
     'morning-showroom-not-wired',
@@ -147,9 +143,6 @@ describe('http-server dispatch · pathname match wiring', () => {
   });
   test('workflow design dispatch is gated by parseWorkflowDesignPath', () => {
     expect(SOURCE).toMatch(/const workflowDesignName = parseWorkflowDesignPath\(pathname\);/);
-  });
-  test('mission showroom dispatch is gated by parseMissionShowroomPath', () => {
-    expect(SOURCE).toMatch(/const missionShowroomRoute = parseMissionShowroomPath\(pathname\);/);
   });
   test('devices + template-capability-preview share opts.devices', () => {
     expect(SOURCE).toMatch(/isDevicesPath\(pathname\)/);

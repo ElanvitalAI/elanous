@@ -97,7 +97,7 @@ test('compact AppShell reserves space for four tabs and more, wide shell has no 
 });
 
 test('active group follows direct, nested and activeAlso routes, including more', () => {
-  pathname = '/missions/123';
+  pathname = '/outputs';
   mount();
   expect(bottomNav().findByProps({ 'aria-label': '일' }).props.className).toContain('text-primary');
   act(() => tree!.unmount());
@@ -147,9 +147,9 @@ test('single visible item navigates directly without a sheet, and role/Labs hide
   act(() => tree!.unmount());
   store.set(PWA_ROLE_KEY, 'owner');
   mount();
-  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check']);
+  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check', '/apps']);
   act(() => { store.set(NAV_SHOW_LABS_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });
-  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check', '/workspace', '/showroom']);
+  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check', '/apps', '/workspace', '/showroom']);
   act(() => { store.set(NAV_SHOW_HIDDEN_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).not.toContain('/control');
   act(() => tree!.root.findByProps({ role: 'dialog' }).findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());

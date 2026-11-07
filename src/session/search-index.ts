@@ -18,6 +18,13 @@ function toPhraseQuery(query: string): string {
   return `"${query.replace(/"/g, '""')}"`;
 }
 
+function toTrigramOverlapQuery(query: string): string | null {
+  const chars = [...query.normalize('NFKC').toLocaleLowerCase()];
+  const trigrams = new Set<string>();
+  for (let index = 0; index <= chars.length - 3; index += 1) trigrams.add(chars.slice(index, index + 3).join(''));
+  return trigrams.size ? [...trigrams].map(toPhraseQuery).join(' OR ') : null;
+}
+
 /** trigram FTS5 최소 유효 길이(공백 제외 3자). 미만이면 폴백 신호로 null. */
 export function isTrigramRankable(query: string): boolean {
   return query.replace(/\s+/g, '').length >= 3;
@@ -28,21 +35,26 @@ export function isTrigramRankable(query: string): boolean {
  * 반환 = 매칭 세션만 score 오름차순(SQLite bm25 는 낮을수록 관련도 높음).
  * query<3자 또는 FTS 오류 → null(호출자가 substring/최신순 폴백).
  */
-export function rankByTrigramFts(query: string, docs: RankedDoc[]): RankResult[] | null {
+export function rankByTrigramFts(query: string, docs: RankedDoc[], match: 'phrase' | 'trigram-overlap' = 'phrase'): RankResult[] | null {
   const q = query.trim();
-  if (!isTrigramRankable(q) || docs.length === 0) return null;
+  const rankable = match === 'trigram-overlap'
+    ? [...q.normalize('NFKC')].length >= 3
+    : isTrigramRankable(q);
+  if (!rankable || docs.length === 0) return null;
+  const matchQuery = match === 'trigram-overlap' ? toTrigramOverlapQuery(q) : toPhraseQuery(q);
+  if (!matchQuery) return null;
   let db: Database | null = null;
   try {
     db = new Database(':memory:');
     db.run("CREATE VIRTUAL TABLE d USING fts5(sid UNINDEXED, content, tokenize='trigram')");
     const ins = db.prepare('INSERT INTO d(sid, content) VALUES (?, ?)');
     const tx = db.transaction((rows: RankedDoc[]) => {
-      for (const r of rows) ins.run(r.sessionId, r.content);
+      for (const r of rows) ins.run(r.sessionId, match === 'trigram-overlap' ? r.content.normalize('NFKC') : r.content);
     });
     tx(docs);
     const rows = db.query(
       'SELECT sid AS sessionId, bm25(d) AS score FROM d WHERE d MATCH ? ORDER BY score',
-    ).all(toPhraseQuery(q)) as RankResult[];
+    ).all(matchQuery) as RankResult[];
     return rows;
   } catch {
     return null; // FTS 미지원/오류 → 폴백

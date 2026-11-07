@@ -2,9 +2,16 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { runReleaseSimGateReceiptSeam, runReleaseSimRigIfFile, runReleaseSimRigScenario } from './release-sim-rig.js';
 import { resolveScenarioFilePath } from './scenario.js';
+
+function retainCases(source: string, keep: string[]): string {
+  const scenario = parseYaml(source) as { cases: Array<{ id: string }> };
+  scenario.cases = scenario.cases.filter((item) => keep.includes(item.id));
+  return stringifyYaml(scenario);
+}
 
 test('receipt seam blocks fake publish when the final injected gate outcome fails', () => {
   const commit = 'a'.repeat(40);
@@ -57,11 +64,51 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(result.universe).toBe(root);
     expect(result.artifactPath).toBe(join(root, 'ux-sim', 'evidence', 'release-sim-rig-0241.json'));
     expect(existsSync(result.artifactPath)).toBe(true);
-    expect(result.cases).toHaveLength(18);
+    expect(result.cases).toHaveLength(25);
     expect(result.cases.every((item) => item.pass && item.unexpectedEdges.length === 0)).toBe(true);
+    expect(result.cases.find((item) => item.id === 'baseline-full-graph')).toMatchObject({
+      checks: { events: true }, injectedEvidence: { eventTrace: { pass: true, matched: 2, missing: [] } },
+    });
+    expect(result.cases.find((item) => item.id === 'gate-attribution-incomplete')).toMatchObject({
+      pass: true, status: 'failed', path: ['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate', 'gate-triage', 'traffic-failed-restore', 'failed'],
+      injectedEvidence: { actualGateTriage: { gate: { outcome: 'error', introduced: [] }, triage: { outcome: 'ok', classification: 'unmeasured' } } },
+    });
+    const threeRegressions = result.cases.find((item) => item.id === 'gate-three-new-regressions')!;
+    expect(threeRegressions).toMatchObject({ pass: true, status: 'failed', checks: { adaptiveRepair: true },
+      injectedEvidence: { adaptiveRepair: { disposition: 'append-repair-and-resume', appendCount: 1 } } });
+    expect(threeRegressions.path.filter((nodeId) => nodeId === 'gate')).toHaveLength(2);
+    expect(threeRegressions.path.some((nodeId, index, path) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId)
+      && path[index + 1] === 'gate')).toBe(true);
+
+    expect(result.cases.find((item) => item.id === 'baseline-full-graph')?.ledgerEvents.some((event) => event.observedBy === 'GraphEventBus')).toBe(true);
     expect(result.cases.every((item) => item.dispatchedNodes.every((node) => item.path.includes(node) ||
       Object.values(item.fanOuts ?? {}).some((fanout) => Object.hasOwn(fanout.branches, node))))).toBe(true);
     expect(result.table.every((row) => row.unexpectedEdges === 'none')).toBe(true);
+    const macrophage = result.cases.find((item) => item.id === 'macrophage-scrap-live-and-simulation')!;
+    expect(macrophage).toMatchObject({ pass: true, status: 'done', checks: { status: true, mustVisit: true, mustNotVisit: true, overlap: true, ledgerEvents: true } });
+    expect(macrophage.ledgerEvents).toHaveLength(15);
+    const expectedMacrophageEvents = [
+      ['pr-repair', 'repair recipe=retry-review', 'planned attempt-repair; no cleanup applied'],
+      ['draft-stale', 'existing draft policy approved close', 'planned triage-draft; no cleanup applied'],
+      ['test-repeated', 'consecutive failures=5; owner=seat-c', 'planned open-cell; no cleanup applied'],
+      ['test-timeout', 'flaky=unknown; timeoutBurned=true', 'planned quarantine-test; no cleanup applied'],
+      ['artifact-stale', 'source=new; generated=old', 'planned regenerate; no cleanup applied'],
+      ['worktree-orphan', 'kind=orphan-worktree; branch merged to main; clean and inactive worktree verified', 'planned remove-resource; no cleanup applied'],
+      ['pod-orphan', 'kind=orphan-pod; owner run=failed; ownership verified', 'planned remove-resource; no cleanup applied'],
+      ['job-orphan', 'kind=orphan-job; owner run=done; ownership verified', 'planned remove-resource; no cleanup applied'],
+      ['hold-expired', 'hold expired at=2026-11-05T00:00:00.000Z; owner=seat-d', 'planned release-hold; no cleanup applied'],
+      ['hold-live-owner', 'hold owner run=running; expiry=2026-11-05T00:00:00Z; owner=seat-e', 'planned retain; no cleanup applied'],
+      ['draft-live-owner', 'draft owner run=running; owner=seat-f', 'planned retain; no cleanup applied'],
+      ['receipt-stale', 'stale and verified; owner run=done', 'planned archive-receipt; no cleanup applied'],
+      ['worktree-live', 'kind=orphan-worktree; owner run=running; owner=seat-live', 'planned retain; no cleanup applied'],
+      ['land-row-merged', 'PR merged; exact queued row verified (land-row-merged)', 'planned remove-queue-row; no cleanup applied'],
+      ['receipt-unverified', 'stale=true; verified=false; owner run=done', 'planned retain; no cleanup applied'],
+    ];
+    expect(macrophage.ledgerEvents.map((event) => [event.id, event.evidence, event.result])).toEqual(expectedMacrophageEvents);
+    expect(macrophage.ledgerEvents.every((event) => event.applied === false)).toBe(true);
+    expect(macrophage.injectedEvidence.overlap).toEqual({ expected: false, actual: false });
+    expect((macrophage.injectedEvidence.simulation as { remaining: string[] }).remaining).toContain('worktree-live');
+    expect((macrophage.injectedEvidence.simulation as { remaining: string[] }).remaining).toContain('receipt-unverified');
     const realCutoff = result.cases.find((item) => item.id === 'cutoff-notes-empty-real-cli')!;
     expect(realCutoff).toMatchObject({ pass: true, status: 'failed', path: ['version-release', 'traffic-cut-start', 'cutoff', 'traffic-failed-restore', 'failed'],
       injectedEvidence: { actualCli: 'version-node.ts release → node-verdict.ts cutoff → cutoff.ts' } });
@@ -81,6 +128,19 @@ test('release simulation runs the real release graph with injected node outcomes
       pass: true, status: 'done', checks: { status: true, mustVisit: true, mustNotVisit: true, ledgerEvents: true },
       path: ['cut', 'gate-cut', 'append-a', 'resume-a', 'gate-a', 'append-b', 'resume-b', 'gate-b', 'publish', 'done'],
       injectedEvidence: { universe: 'test', releaseVersion: '0.3.1', appendedOnlyChangedTestRadius: true, fakePublish: 'eligible',
+        sameCommitCarryOk: true, sameCommitResume: { inspectionKind: 'valid', inspectedReceiptCount: 4,
+          expectedCarry: ['pod-0', 'pod-1', 'pod-2', 'pod-3'], carriedShardIds: ['pod-0', 'pod-1', 'pod-2', 'pod-3'],
+          rerunShardIds: [], totalPods: 0, output: expect.stringContaining('Ran 4 tests across 4 files.'), events: [
+            { event: 'receipt-preflight', kind: 'valid', receiptCount: 4 },
+            { event: 'shard-carried', shardId: 'pod-0' }, { event: 'shard-carried', shardId: 'pod-1' },
+            { event: 'shard-carried', shardId: 'pod-2' }, { event: 'shard-carried', shardId: 'pod-3' },
+            { event: 'gate-sweep-complete', rc: 0, totalPods: 0 },
+          ] },
+        carryRegressionFixture: { source: 'OPT #35384 draft body + preserved AWS evidence',
+          expected: { carriedShardIds: ['pod-0', 'pod-1', 'pod-2', 'pod-3'], rerunShardIds: [], totalPods: 0 },
+          draftObserved: { host: 'node-b', rerunShardIds: ['pod-0', 'pod-1', 'pod-2'], totalPods: 3 },
+          optObserved: { head40: 'acb26b11af8dac1b4592d9b0f5081a5d48005212', host: 'aws1', cohort: 2, introduced: 1, preexisting: 3,
+            reason: 'pinned graph or recipe SHA absent' } },
         formalReceiptInspection: { kind: 'absent' }, receiptCase: {
           formalReceiptDecision: { kind: 'absent', reason: 'formal-receipt-set-absent' },
           formalGateRun: { outcome: 'ok', formalReceiptDecision: 'formal-receipt-set-absent', baselineVersion: '0.3.0', cutSweepCount: 1, fullSweep: true },
@@ -89,7 +149,8 @@ test('release simulation runs the real release graph with injected node outcomes
     const alternateBaselineScenario = readFileSync(scenarioPath, 'utf8')
       .replace('id: release-sim-rig-0241', 'id: release-sim-alternate-baseline-34922')
       .replace("previousVersion: '0.3.0'", "previousVersion: '0.2.99'");
-    const alternateBaseline = await runReleaseSimRigScenario(alternateBaselineScenario);
+    const alternateBaseline = await runReleaseSimRigScenario(retainCases(alternateBaselineScenario,
+      ['append-receipt-set-absent-and-continuous-radius']));
     const alternateReceiptCase = alternateBaseline.cases.find((item) => item.id === 'append-receipt-set-absent-and-continuous-radius')!;
     expect(alternateReceiptCase.injectedEvidence).toMatchObject({ receiptCase: { formalGateRun: { baselineVersion: '0.2.99' } } });
     const appendEvidence = appendReceiptCase.injectedEvidence as { receiptCase: { plan: { rerunShardIds: string[] }; aggregate: string; receiptIds: string[] };
@@ -104,12 +165,26 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(result.cases.find((item) => item.id === 'cut-tip-moved-after-resume')).toMatchObject({
       status: 'resume-refused', dispatchedNodes: ['version-release'], checks: { mustVisit: true, mustNotVisit: true },
     });
-    expect(result.cases.find((item) => item.id === 'gate-measured-regression-waive')).toMatchObject({
-      pass: true, status: 'done', injectedEvidence: { waived: true, publishReached: true, initialStatus: 'failed' },
-    });
-    const ownerWaiverCase = result.cases.find((item) => item.id === 'owner-waive-malformed-gate-schema')!;
+    const appendedTipRegate = result.cases.find((item) => item.id === 'appended-tip-regate-before-waiver')!;
+    expect(appendedTipRegate).toMatchObject({ pass: true, status: 'done', checks: {
+      status: true, mustVisit: true, mustNotVisit: true, ledgerEvents: true,
+    }, injectedEvidence: {
+      invalidWaiverRejected: true, invalidAttemptUnchanged: true, movedTipWaiverRefused: true, movedTipAttemptUnchanged: true,
+      regateFailed: true, regatePartial: { requested: true, applied: false, auto: true },
+      gateRuns: 2, sameTipWaiver: true, acceptedIssuesOk: true, notesOk: true, releaseTailOk: true,
+    } });
+    const measuredRegression = result.cases.find((item) => item.id === 'gate-measured-regression-adaptive-repair')!;
+    expect(measuredRegression).toMatchObject({ pass: true, status: 'failed', checks: { adaptiveRepair: true }, injectedEvidence: {
+      actualGateTriage: { triage: { classification: 'regression', adaptiveHeal: { disposition: { action: 'append-repair-and-resume' } } } },
+      adaptiveRepair: { disposition: 'append-repair-and-resume', appendCount: 1 },
+    } });
+    expect(measuredRegression.path.filter((nodeId) => nodeId === 'gate')).toHaveLength(2);
+    expect(measuredRegression.path.some((nodeId, index, path) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId)
+      && path[index + 1] === 'gate')).toBe(true);
+    const ownerWaiverCase = result.cases.find((item) => item.id === 'owner-waive-unmeasured-gate')!;
     expect(ownerWaiverCase).toMatchObject({
-      pass: true, status: 'done', injectedEvidence: { ownerRecordOk: true, publishReached: true },
+      pass: true, status: 'done', injectedEvidence: { ownerRecordOk: true, publishReached: true,
+        actualGateTriage: { classification: 'unmeasured' }, waiverResult: { nodeId: 'gate', ownerWaived: true, approvedBy: 'OP' } },
     });
     const ledgerPath = String(ownerWaiverCase.injectedEvidence?.ownerLedgerPath);
     expect(ledgerPath).toContain(join(root, 'graph-runs', 'release-loop'));
@@ -117,9 +192,56 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(persistedRun.nodes.find((node) => node.nodeId === 'gate')?.waiver).toMatchObject({
       ownerWaived: true, approvedBy: 'OP', reason: ownerWaiverCase.injectedEvidence?.reason,
     });
+    const unmeasuredStatePaths = new Set<string>();
+    for (const [id, expected] of [
+      ['owner-waive-stopped-gate', /^stopped:/],
+      ['owner-waive-killed-gate', /^no-verdict:.*SIGTERM/],
+      ['waive-sweep-incomplete-gate', /^sweep incomplete:/],
+    ] as const) {
+      const simulated = result.cases.find((item) => item.id === id)!;
+      expect(simulated).toMatchObject({ pass: true, status: 'done', checks: {
+        waiverOriginalPersisted: true, gateNotRerun: true, missingReasonRejected: true, secondWaiverRejected: true,
+      } });
+      const original = simulated.injectedEvidence?.originalGateRecord as { exit?: number | null; output?: string; error?: string };
+      if (id === 'owner-waive-stopped-gate') {
+        expect(original).toMatchObject({ exit: null, error: expect.stringContaining('stopped') });
+        expect(original.output).toBeUndefined();
+      } else if (id === 'owner-waive-killed-gate') {
+        expect(original).toMatchObject({ exit: null, error: expect.stringContaining('SIGTERM') });
+        const output = JSON.parse(String(original.output)) as { executionId?: string; error?: string };
+        expect(output).toMatchObject({ executionId: original.executionId, error: 'process terminated by SIGTERM' });
+      } else {
+        expect(original).toMatchObject({ exit: 1, error: 'bash exit 1' });
+        expect(JSON.parse(original.output ?? 'null')).toMatchObject({ outcome: 'error', error: 'pod sweep incomplete: stalled shards 3',
+          stalledShards: [{ shard: 3, files: ['a.test.ts'], reason: 'no-output' }] });
+      }
+      expect(simulated.injectedEvidence?.waiverResult).toMatchObject({ nodeId: 'gate', reason: expect.any(String) });
+      expect(simulated.injectedEvidence?.sharedRunId).toBe('release-sim-release-sim-rig-0241-unmeasured-gate-shared');
+      expect(simulated.injectedEvidence?.sharedInitialGraphRuns).toBe(1);
+      expect(simulated.injectedEvidence?.releaseNotesOk).toBe(true);
+      expect(String(simulated.injectedEvidence?.releaseNotes)).toContain(`- ${String(simulated.injectedEvidence?.reason)}`);
+      const unmeasured = (simulated.injectedEvidence?.waiverResult as { unmeasured?: string }).unmeasured ?? '';
+      expect(unmeasured).toMatch(expected);
+      unmeasuredStatePaths.add(String(simulated.statePath));
+      const persistedRun = JSON.parse(readFileSync(String(simulated.statePath), 'utf8')) as { nodes: Array<{ nodeId: string; waiver?: { original?: unknown } }> };
+      const persisted = persistedRun.nodes.find((node) => node.nodeId === 'gate')?.waiver;
+      expect(persisted?.original).toEqual(original && {
+        exit: original.exit, ...(original.output === undefined ? {} : { output: original.output }), ...(original.error === undefined ? {} : { error: original.error }),
+      });
+      expect(JSON.stringify(persisted)).toBe(JSON.stringify(simulated.injectedEvidence?.persistedWaiver));
+    }
+    expect(unmeasuredStatePaths.size).toBe(3);
     const fixtureOwnerCase = result.cases.find((item) => item.id === 'owner-waive-0246-verdict-fixture')!;
-    expect(fixtureOwnerCase).toMatchObject({ pass: true, status: 'done', injectedEvidence: { ownerRecordOk: true, releaseTailOk: true, publishReached: true } });
+    expect(fixtureOwnerCase).toMatchObject({ pass: true, status: 'done', injectedEvidence: {
+      ownerRecordOk: true, releaseTailOk: true, publishReached: true, actualGateTriage: { classification: 'exhausted' },
+    } });
+    expect(fixtureOwnerCase.ledgerEvents.filter((event) => event.observedBy === 'GraphEventBus').some((event) =>
+      event.event === 'node-end' && event.nodeId === 'verify' && event.ok === true)).toBe(true);
     expect(fixtureOwnerCase.injectedEvidence?.introducedIds).toHaveLength(101);
+    expect(fixtureOwnerCase.injectedEvidence?.npmPublishEvidence).toMatchObject({
+      publishNodeResult: { outcome: 'ok', verdict: 'pass', tag: 'v0.2.46' },
+      publishNodeExternalCalls: expect.arrayContaining([expect.stringContaining('bun bin/elanous.mjs release publish')]),
+    });
     expect(fixtureOwnerCase.injectedEvidence?.npmPublishEvidence).toMatchObject({ result: { outcome: 'ok', npm: 'published' }, publishedCommands: [expect.any(String)] });
     expect(fixtureOwnerCase.injectedEvidence?.verifyEvidence).toMatchObject({ result: { outcome: 'ok' }, npmLatest: '0.2.46' });
     const fixtureLedgerPath = String(fixtureOwnerCase.injectedEvidence?.ownerLedgerPath);
@@ -130,7 +252,7 @@ test('release simulation runs the real release graph with injected node outcomes
       '      mustNotVisit: [cutoff, gate, publish]\n',
       '      mustNotVisit: [cutoff, gate, publish]\n      overlap: [checklist-gate, prefetch]\n',
     );
-    const negativeOverlap = await runReleaseSimRigScenario(negativeOverlapSource);
+    const negativeOverlap = await runReleaseSimRigScenario(retainCases(negativeOverlapSource, ['cut-tip-moved-after-resume']));
     expect(negativeOverlap.pass).toBe(false);
     expect(negativeOverlap.cases.find((item) => item.id === 'cut-tip-moved-after-resume')).toMatchObject({
       pass: false, checks: { status: true, overlap: false },
@@ -139,9 +261,17 @@ test('release simulation runs the real release graph with injected node outcomes
       .replace('id: release-sim-rig-0241', 'id: release-sim-negative-status-0245')
       .replace('      mustNotVisit: [cutoff, gate, publish]\n',
         '      mustNotVisit: [cutoff, gate, publish]\n      refusalIncludes: expected-but-different\n');
-    const statusRegression = await runReleaseSimRigScenario(wrongRefusalExpectation);
+    const statusRegression = await runReleaseSimRigScenario(retainCases(wrongRefusalExpectation, ['cut-tip-moved-after-resume']));
     expect(statusRegression.pass).toBe(false);
     expect(statusRegression.cases.find((item) => item.id === 'cut-tip-moved-after-resume')?.checks.status).toBe(false);
+    const wrongEventExpectation = readFileSync(scenarioPath, 'utf8')
+      .replace('id: release-sim-rig-0241', 'id: release-sim-negative-resume-events-0245')
+      .replace('      mustNotVisit: [cutoff, gate, publish]\n',
+        '      mustNotVisit: [cutoff, gate, publish]\n      events: [{ event: node-start, node: never-started }]\n');
+    const eventRegression = await runReleaseSimRigScenario(retainCases(wrongEventExpectation, ['cut-tip-moved-after-resume']));
+    expect(eventRegression.pass).toBe(false);
+    expect(eventRegression.cases.find((item) => item.id === 'cut-tip-moved-after-resume')?.checks)
+      .toMatchObject({ status: true, events: false });
     const unattributedGate = result.cases.find((item) => item.id === 'gate-attribution-incomplete')!;
     expect(unattributedGate.path).toContain('traffic-failed-restore');
     const unattributedRun = JSON.parse(readFileSync(unattributedGate.statePath, 'utf8')) as {
@@ -156,6 +286,12 @@ test('release simulation runs the real release graph with injected node outcomes
     const prefetchWarningTimings = prefetchWarning.nodeTimings!;
     expect(prefetchWarningTimings['checklist-gate']!.startedAtMs).toBeLessThan(prefetchWarningTimings.prefetch!.endedAtMs);
     expect(prefetchWarningTimings.prefetch!.startedAtMs).toBeLessThan(prefetchWarningTimings['checklist-gate']!.endedAtMs);
+    const needsFailure = result.cases.find((item) => item.id === 'needs-prep-required-failure-preserves-sibling')!;
+    expect(needsFailure).toMatchObject({ pass: true, status: 'failed', checks: { overlap: true } });
+    expect(needsFailure.fanOuts?.['export-check:ok']?.branches).toMatchObject({
+      'checklist-gate': { status: 'failed', output: expect.any(String) },
+      prefetch: { status: 'done', output: expect.any(String) },
+    });
     const macWarning = result.cases.find((item) => item.id === 'mac-smoke-warning-failure-overlaps-pwa')!;
     expect(macWarning.path.indexOf('pre-prepare-join')).toBeLessThan(macWarning.path.indexOf('prepare'));
     expect(macWarning.fanOuts?.['traffic-gate-passed:ok']?.branches).toMatchObject({
@@ -170,8 +306,35 @@ test('release simulation runs the real release graph with injected node outcomes
     const pwaFailure = result.cases.find((item) => item.id === 'pwa-node-times-out')!;
     expect(pwaFailure.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa).toMatchObject({ status: 'failed' });
     expect(pwaFailure.path).toContain('traffic-failed-restore');
+    const pwaFailurePreservesSibling = result.cases.find((item) => item.id === 'pwa-failure-preserves-mac-smoke-result')!;
+    expect(pwaFailurePreservesSibling).toMatchObject({ pass: true, status: 'failed', checks: { overlap: true, events: true } });
+    expect(pwaFailurePreservesSibling.fanOuts?.['traffic-gate-passed:ok']?.branches).toMatchObject({
+      'mac-smoke': { status: 'done' }, pwa: { status: 'failed' },
+    });
   } finally {
     setTestStateRoot(previous ?? null);
     rmSync(root, { recursive: true, force: true });
   }
-}, 120_000);
+}, 300_000);
+
+test('release receipt and waiver modes reject expectations absent from the GraphEventBus trace', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'release-event-negative-test-'));
+  const previous = getTestStateRoot();
+  setTestStateRoot(root);
+  try {
+    const source = readFileSync(resolveScenarioFilePath('scenarios/ux-sim/release-sim-rig.yaml'), 'utf8');
+    const scenario = parseYaml(source) as { id: string; cases: Array<{ id: string; expect: Record<string, unknown> }> };
+    scenario.id = 'release-sim-event-negative';
+    scenario.cases = scenario.cases.filter((item) => item.id === 'append-receipt-set-absent-and-continuous-radius'
+      || item.id === 'gate-measured-regression-adaptive-repair');
+    for (const item of scenario.cases) item.expect.events = [{ event: 'node-start', nodeId: 'never-started' }];
+    const result = await runReleaseSimRigScenario(stringifyYaml(scenario));
+    expect(result.pass).toBe(false);
+    expect(result.cases).toHaveLength(2);
+    expect(result.cases.every((item) => item.pass === false && item.checks.events === false)).toBe(true);
+    expect(result.cases.every((item) => (item.injectedEvidence.eventTrace as { pass?: boolean } | undefined)?.pass === false)).toBe(true);
+  } finally {
+    setTestStateRoot(previous ?? null);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);

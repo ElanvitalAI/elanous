@@ -6,7 +6,9 @@
 // + 관측 로그(session.*)만 얇게 조립. 팩에 없으면 "기록 없음"(유사 과거 회수 금지).
 
 import { loadSession, subscriberKey, type SessionSubscriber, type SessionBindings } from './index.js';
-import { formatClock, formatDateTime, resolveTimeZone } from '../time/format.js';
+import { formatClock } from '../time/clock.js';
+import { formatDateTime } from '../time/calendar.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 
 /** 세션 자기인지 문맥 — 봇 답변/PWA presence 카드에 주입할 결정론 ground-truth. */
 export interface SessionContext {

@@ -129,9 +129,6 @@ async function runThroughTuiPath(provider: LLMProvider) {
     onToolCall: () => {},
     onToolResult: () => {},
     onUsage: () => {},
-    autoTts: { pushChunk: () => {}, commit: () => {}, cancel: () => {} },
-    voiceChat: { getPhase: () => 'idle', transitionToSpeaking: () => {}, notifyResponseDone: () => {} },
-    drainCooldownMs: 0,
     resetTurnRef: () => {},
   });
   return [...committed, ...current].join('\n');

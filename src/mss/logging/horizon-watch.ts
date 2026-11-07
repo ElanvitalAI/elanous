@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { dirname, join } from 'node:path';
 
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { debug } from '../../debug/log.js';
+import { logDiagnostic } from './diagnostic-sink.js';
 import { registerStandaloneLogSink } from '../../domains/standalone-log-sink.js';
 import { LogStore, logsDbPath } from './log-store.js';
 
@@ -116,7 +116,7 @@ export function runHorizonWatchTick(opts: HorizonWatchOptions = {}, deps: Horizo
       }).length;
     }
   } catch (error) {
-    debug.log('log-store.horizon', 'read-failed', { reason: String(error) }, { level: 'warn' });
+    logDiagnostic('log-store.horizon', 'read-failed', { reason: String(error) }, { level: 'warn' });
     status = 'unreadable';
     oldestTsMs = null;
   } finally { store?.close(); }
@@ -135,10 +135,10 @@ export function runHorizonWatchTick(opts: HorizonWatchOptions = {}, deps: Horizo
   };
   try { saveSample(path, sample); }
   catch (error) {
-    debug.log('log-store.horizon', 'sample-write-failed', { reason: String(error) }, { level: 'warn' });
+    logDiagnostic('log-store.horizon', 'sample-write-failed', { reason: String(error) }, { level: 'warn' });
     return { ...sample, outcome: 'fail' };
   }
-  debug.log('log-store.horizon', 'sample', {
+  logDiagnostic('log-store.horizon', 'sample', {
     oldestTs: oldestTsMs === null ? null : new Date(oldestTsMs).toISOString(),
     spanHours: sample.spanHours, advancedMs, deletedEvents, attribution,
   }, { level: attribution === 'unattributed-loss' ? 'warn' : 'info' });

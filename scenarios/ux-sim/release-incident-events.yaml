@@ -1,0 +1,98 @@
+id: release-incident-events-035
+version: 1
+cases:
+  - id: incident-01-tip-moved
+    fault: { event: release.tip-moved, changedPaths: [scripts/release-loop/resume-release.ts] }
+    intendedEvents:
+        - { event: node-invalidated, node: export-check, reason: input-fingerprint-changed }
+        - { event: node-carried, node: gate, reason: input-fingerprint-unchanged }
+        - { event: node-carried, node: publish, reason: input-fingerprint-unchanged }
+    expect:
+      events: [{ event: node-start, nodeId: version-release }, { event: node-end, nodeId: version-release, ok: true }]
+  - id: incident-02-pod-4-receipt-corrupt
+    fault: { event: release.receipt-corrupt, shardId: pod-4 }
+    intendedEvents:
+        - { event: receipt-invalidated, shardId: pod-4 }
+        - { event: shard-rerun, shardId: pod-4 }
+        - { event: shard-carried, shardId: pod-3 }
+        - { event: publish-unblocked, after: gate-complete }
+    expect:
+      events: [{ event: node-start, nodeId: cut }, { event: node-end, nodeId: cut, ok: true }]
+  - id: incident-03-gate-waiver-approval-mismatch
+    fault: { event: release.gate-waived, waiver: owner-waive }
+    intendedEvents:
+        - { event: waiver-recorded, node: gate }
+        - { event: auto-approve-blocked, reason: gate-unmeasured }
+        - { event: publish-authorized, by: explicit-owner-waiver }
+    expect:
+      events: [{ event: node-start, nodeId: gate }, { event: node-end, nodeId: gate, ok: false }]
+  - id: incident-04-approval-graph-path-mismatch
+    fault: { event: release.approval-requested, graphPath: snapshot-path, cwdGraphPath: other-path }
+    intendedEvents:
+        - { event: approval-refused, reason: graph-path-mismatch }
+        - { event: publish-blocked, reason: approval-not-recorded }
+    expect:
+      events: [{ event: node-start, nodeId: auto-approve }, { event: node-end, nodeId: auto-approve, ok: false }]
+  - id: incident-05-known-issues-ascii-fixed
+    fault: { event: release.known-issues-checked, text: ASCII-fixed-without-evidence }
+    intendedEvents:
+        - { event: known-issue-unresolved, evidenceRequired: true }
+        - { event: publish-blocked, reason: known-issue-unresolved }
+    expect:
+      events: [{ event: node-start, nodeId: known-issues }, { event: node-end, nodeId: known-issues, ok: false }]
+  - id: incident-06-pwa-costly-opt-in
+    fault: { event: release.pwa-costly-requested, optedIn: false }
+    intendedEvents:
+        - { event: pwa-costly-skipped, reason: opt-in-required }
+        - { event: pwa-node-complete, costlyModelExecuted: false }
+    expect:
+      events: [{ event: node-start, nodeId: pwa }, { event: node-end, nodeId: pwa, ok: true }]
+  - id: incident-07-install-consent-missing
+    fault: { event: release.install-requested, consent: false, sources: [prepare-e2e, upgrade] }
+    intendedEvents:
+        - { event: install-blocked, source: prepare-e2e, reason: consent-required }
+        - { event: install-blocked, source: upgrade, reason: consent-required }
+        - { event: release-failed, before: publish }
+    expect:
+      events:
+        - { event: node-start, nodeId: prepare }
+        - { event: node-end, nodeId: prepare, ok: false }
+        - { event: node-start, nodeId: upgrade }
+        - { event: node-end, nodeId: upgrade, ok: false }
+  - id: incident-08-version-dev-merge-marker-missing
+    fault: { event: release.version-dev-bump-merge, mergeMarker: missing }
+    intendedEvents:
+        - { event: merge-marker-missing, node: version-dev-bump }
+        - { event: node-failed, node: version-dev-bump }
+        - { event: release-failed, after: verify }
+    expect:
+      events: [{ event: node-start, nodeId: version-dev-bump }, { event: node-end, nodeId: version-dev-bump, ok: false }]
+  - id: incident-09-verify-self-update-consent
+    fault: { event: release.verify-self-update, exitCode: 1, reason: installer-consent-required }
+    intendedEvents:
+        - { event: self-update-failed, exitCode: 1, reason: installer-consent-required }
+        - { event: verify-failed, node: verify }
+        - { event: release-failed, after: verify }
+    expect:
+      events: [{ event: node-start, nodeId: verify }, { event: node-end, nodeId: verify, ok: false }]
+  - id: subscription-tip-moved-invalidates-affected-only
+    fault: { event: release.tip-moved, changedPaths: [scripts/release-loop/resume-release.ts] }
+    expect:
+      events:
+        - { event: subscription-delivered, subscriber: release-loop, source: release.tip-moved }
+        - { event: node-invalidated, node: export-check }
+        - { event: node-carried, node: gate }
+  - id: subscription-gate-failure-wakes-bisection
+    fault: { event: release.gate-failed, introduced: 3 }
+    expect:
+      events:
+        - { event: subscription-delivered, subscriber: gate-bisect, source: release.gate-failed }
+        - { event: node-woken, node: gate-bisect, reason: subscribed-event }
+  - id: subscription-gate-failure-appends-arg-repair
+    fault: { event: release.gate.failed, introduced: 1, visitState: { gate: 1, gateTriage: 1 } }
+    expect:
+      events:
+        - { event: subscription-delivered, subscriber: arg-adaptive-heal, source: release.gate.failed }
+        - { event: arg-plan, action: append-repair-and-resume }
+        - { event: appendNode-request, nodeId: gate-repair-d3e23f6622bd, after: gate-triage }
+        - { event: resume-request, from: gate-repair-d3e23f6622bd, then: gate }

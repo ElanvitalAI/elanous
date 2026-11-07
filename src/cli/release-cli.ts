@@ -73,7 +73,7 @@ export type Runner = (command: string, args: readonly string[], cwd: string, opt
 
 /** Installers require explicit consent even in isolated local release verification. */
 export function runReleaseInstaller(script: string, cwd: string, env: NodeJS.ProcessEnv, run: Runner): RunResult {
-  return run('bash', ['-s', '--', '--yes', '--no-modify-path'], cwd, { env, input: script });
+  return run('bash', ['-s', '--', '--yes', '--no-modify-path', '--no-setup'], cwd, { env, input: script });
 }
 
 export const defaultRunner: Runner = (command, args, cwd, opts = {}) => {
@@ -211,10 +211,15 @@ export async function prepareRelease(opts: PrepareOptions, run: Runner = default
       const install = runReleaseInstaller(readFileSync(join(distDir, 'install.sh'), 'utf8'), home, env, run);
       const version = run(join(prefix, 'bin', 'elanous'), ['--version'], home, { env });
       const versionLine = version.stdout.trim();
-      const ok = install.status === 0 && versionLine.startsWith(`${opts.version} ${publicCommit}`);
       run('bash', [join(publicDir, 'scripts', 'uninstall.sh')], home, { env });
+      const ok = install.status === 0 && versionLine.startsWith(`${opts.version} ${publicCommit}`);
       e2e = { ran: true, ok, versionLine };
-      if (!ok) throw new Error(`로컬 끝까지 실패 — 설치 rc=${install.status} · --version «${versionLine}» (기대 ${opts.version} ${publicCommit.slice(0, 12)}…)`);
+      if (!ok) {
+        const stderrTail = install.stderr.trim().slice(-1_000) || '(empty)';
+        const detail = `설치 rc=${install.status} · 설치 stderr tail «${stderrTail}» · --version «${versionLine}» (기대 ${opts.version} ${publicCommit.slice(0, 12)}…)`;
+        log(`⑥ 로컬 끝까지 실패 — ${detail}`);
+        throw new Error(`로컬 끝까지 실패 — ${detail}`);
+      }
       log(`⑥ 로컬 끝까지: ${versionLine}`);
     }
 
@@ -457,33 +462,49 @@ export function checkReleaseNotesPage(version: string | undefined, run: Runner, 
   return { notesPage: r.status === 0 && r.stdout.trim() === '200' ? 'ok' : 'missing', url };
 }
 
-export async function verifyRelease(opts: { version?: string; publicRepo?: string; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ ok: boolean; versionLine: string; installerUrl: string; steps?: { install: number | null; selfUpdate: number | null; uninstall: number | null }; state?: { memory: boolean; logs: LogRoundTrip }; notesPage?: NotesPage }> {
+export async function verifyRelease(opts: { version?: string; publicRepo?: string; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ ok: boolean; versionLine: string; installerUrl: string; steps?: { install: number | null; selfUpdate: number | null; uninstall: number | null; daemonStop: number | null }; state?: { memory: boolean; logs: LogRoundTrip }; notesPage?: NotesPage; daemonStopped?: boolean }> {
   const log = opts.log ?? ((l: string) => console.log(l));
   if (opts.version !== undefined && !isReleaseVersion(opts.version)) throw new Error(`버전 모양이 아니다: ${opts.version}`);
   const repo = opts.publicRepo ?? DEFAULT_PUBLIC_REPO;
   const installerUrl = `https://github.com/${repo}/releases/${opts.version ? `download/v${opts.version}` : 'latest/download'}/install.sh`;
   const root = mkdtempSync(join(tmpdir(), 'elanous-release-verify-'));
+  const home = join(root, 'home');
+  const prefix = join(root, 'prefix');
+  const binary = join(prefix, 'bin', 'elanous');
+  let daemonStopAttempted = false;
+  let isolatedEnv: NodeJS.ProcessEnv | undefined;
   const startedAtMs = Date.now();
   try {
-    const home = join(root, 'home');
-    const prefix = join(root, 'prefix');
     mkdirSync(home);
     // 검증은 «빈 HOME» 에서만 쓴다 — 물려받은 ELANOUS_*(STATE_DIR 등)·XDG_* 가 있으면 상태 왕복이 운영 저장소에 쓴다.
     const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ELANOUS_') && !key.startsWith('XDG_')));
     const env = envLiteral({ ...inherited, HOME: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: opts.version ?? '', SHELL: '/bin/zsh' });
+    isolatedEnv = env;
     const script = must(run('curl', ['-fsSL', installerUrl], home), `설치기 받기 ${installerUrl}`);
     const install = runReleaseInstaller(script, home, env, run);
-    const versionLine = run(join(prefix, 'bin', 'elanous'), ['--version'], home, { env }).stdout.trim();
-    const state = stateRoundTrip(join(prefix, 'bin', 'elanous'), home, env, run, startedAtMs);
-    const update = run(join(prefix, 'bin', 'elanous'), ['self-update', '--json'], home, { env });
+    const versionLine = run(binary, ['--version'], home, { env }).stdout.trim();
+    const state = stateRoundTrip(binary, home, env, run, startedAtMs);
+    const update = run(binary, ['self-update', '--json'], home, { env });
+    const daemonStop = run(binary, ['nexus', '--stop'], home, { env });
+    daemonStopAttempted = true;
+    let daemonStatus = run(binary, ['nexus', '--status'], home, { env });
+    for (let attempt = 0; attempt < 49 && !/status\s+not running\b/.test(daemonStatus.stdout); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      daemonStatus = run(binary, ['nexus', '--status'], home, { env });
+    }
+    const daemonStopped = daemonStop.status === 0 && daemonStatus.status === 0 && /status\s+not running\b/.test(daemonStatus.stdout);
     const uninstall = existsSync(join(prefix, 'current', 'node_modules', 'elanous', 'scripts', 'uninstall.sh'))
       ? run('bash', [join(prefix, 'current', 'node_modules', 'elanous', 'scripts', 'uninstall.sh')], home, { env })
       : { status: null, stdout: '', stderr: 'uninstall.sh 없음' };
     const notes = checkReleaseNotesPage(opts.version, run, home);
-    const ok = install.status === 0 && (opts.version ? versionLine.startsWith(`${opts.version} `) : versionLine.length > 0) && update.status === 0 && state.memory && state.logs !== 'fail' && notes.notesPage !== 'missing';
-    log(`${ok ? '✅' : '⛔'} ${installerUrl}\n  설치 rc=${install.status} · --version «${versionLine}» · 기억 왕복 ${state.memory ? 'ok' : 'FAIL'} · 로그 왕복 ${state.logs === 'ok' ? 'ok' : state.logs === 'fail' ? 'FAIL' : '안 잼(스토어 없음 — 데몬이 한 번 떠야 생긴다)'} · self-update rc=${update.status} · 제거 rc=${uninstall.status} · 노트 페이지 ${notes.notesPage === 'ok' ? 'ok' : notes.notesPage === 'missing' ? `없음 — release/public/docs/releases/${opts.version}.md ⊕ website/pages.json ⊕ \`bun website/scripts/deploy-pages.ts\` (${notes.url})` : '해당 없음'}`);
-    return { ok, versionLine, installerUrl, steps: { install: install.status, selfUpdate: update.status, uninstall: uninstall.status }, state, notesPage: notes.notesPage };
+    const ok = install.status === 0 && (opts.version ? versionLine.startsWith(`${opts.version} `) : versionLine.length > 0) && update.status === 0 && daemonStopped && state.memory && state.logs !== 'fail' && notes.notesPage !== 'missing';
+    log(`${ok ? '✅' : '⛔'} ${installerUrl}\n  설치 rc=${install.status} · --version «${versionLine}» · 기억 왕복 ${state.memory ? 'ok' : 'FAIL'} · 로그 왕복 ${state.logs === 'ok' ? 'ok' : state.logs === 'fail' ? 'FAIL' : '안 잼(스토어 없음 — 데몬이 한 번 떠야 생긴다)'} · self-update rc=${update.status} · NEXUS 종료 ${daemonStop.status}/${daemonStatus.status} «${daemonStopped ? 'not running' : daemonStatus.stdout.trim().slice(-240)}» · 제거 rc=${uninstall.status} · 노트 페이지 ${notes.notesPage === 'ok' ? 'ok' : notes.notesPage === 'missing' ? `없음 — release/public/docs/releases/${opts.version}.md ⊕ website/pages.json ⊕ \`bun website/scripts/deploy-pages.ts\` (${notes.url})` : '해당 없음'}`);
+    return { ok, versionLine, installerUrl, steps: { install: install.status, selfUpdate: update.status, uninstall: uninstall.status, daemonStop: daemonStop.status }, state, notesPage: notes.notesPage, daemonStopped };
   } finally {
+    if (!daemonStopAttempted && existsSync(binary)) {
+      try { run(binary, ['nexus', '--stop'], home, { env: isolatedEnv }); }
+      catch { /* Preserve the primary verification error while making a best-effort isolated cleanup. */ }
+    }
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -612,6 +633,13 @@ function compareReleaseVersions(a: string, b: string): number {
   const left = parse(a), right = parse(b);
   for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return left[i]! - right[i]!;
   return 0;
+}
+
+export function formatResumeGatePlan(mode: 'not-run' | 'partial' | 'full', reason: string | undefined,
+  partial: { requested: boolean; applied?: boolean; files?: number; invalidatedShardIds?: string[] }): string {
+  if (mode === 'not-run') return 'gate 실행 없음';
+  if (mode === 'full') return `전체 gate${reason ? ` (${reason})` : ''}`;
+  return `부분 gate 계획 ${partial.requested && partial.applied ? `${partial.files}파일${partial.invalidatedShardIds?.length ? ` · 손상 receipt 재측 ${partial.invalidatedShardIds.join(',')}` : ''}` : '미상'}`;
 }
 
 export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: RecoverReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader): void {
@@ -1382,9 +1410,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           ...(shardOs === undefined ? {} : { shardOs }) };
         if (o.dryRun) {
           const plan = await planResumeReleaseRun(resumeOptions, { ...resumeDeps, onSource: log });
-          const gate = plan.gatePlan.mode === 'not-run' ? 'gate 실행 없음'
-            : plan.gatePlan.mode === 'partial' ? `부분 gate 계획 ${plan.partial.requested && plan.partial.applied ? `${plan.partial.files}파일` : '미상'}`
-              : `전체 gate${plan.gatePlan.reason ? ` (${plan.gatePlan.reason})` : ''}`;
+          const gate = formatResumeGatePlan(plan.gatePlan.mode, plan.gatePlan.reason, plan.partial);
           log(`· 재개 preflight 통과 · ${plan.version} · ${plan.fromNode}부터 · tip ${plan.tip.to.slice(0, 12)}${plan.tip.changed ? ` (기록 tip ${plan.tip.from.slice(0, 12)}에서 이동)` : ''} · ${gate} · ${plan.priorCountKnown ? `시도 ${plan.nextAttempt}` : `새 원장 기록 ${plan.nextAttempt} (이전 횟수 미측정)`} · 실행·원장 변경 없음`);
           return plan;
         }
@@ -1394,7 +1420,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (o.gateExecutor !== undefined && executorOverride?.kind === 'gate-executor') log(`⇄ gate 실행기 ${executorOverride.set.gateExecutor}${executorOverride.set.gateRemote ? ` @ ${executorOverride.set.gateRemote}` : ''} (런 입력에 기록 · 면제 아님)`);
         if (o.gatePodPool !== undefined && poolOverride?.kind === 'gate-pod-pool') log(`⇄ gate Pod 풀 ${poolOverride.set.gatePodPool} (런 입력에 기록)`);
         if (result.partial.requested) log(result.partial.applied
-          ? `◐ 부분 재검${result.partial.auto ? '(기본)' : ''}: ${result.partial.files}파일${result.partial.closure ? ` (코드 닿음 ${result.partial.closure.reached} · 닫힘 불투명 ${result.partial.closure.opaque})` : ''} · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
+          ? `◐ 부분 재검${result.partial.auto ? '(기본)' : ''}: ${result.partial.files}파일${result.partial.invalidatedShardIds?.length ? ` · 손상 receipt 재측 ${result.partial.invalidatedShardIds.join(',')}` : ''}${result.partial.closure ? ` (코드 닿음 ${result.partial.closure.reached} · 닫힘 불투명 ${result.partial.closure.opaque})` : ''} · 나머지는 앞 게이트(${result.partial.priorCommit.slice(0, 12)}) 결과를 잇는다`
           : `● 전체 게이트로: ${result.partial.reason}`);
         log(`${result.tip.changed ? `↻ ${result.tip.branch} ${result.tip.from.slice(0, 12)} → ${result.tip.to.slice(0, 12)} (백업 ${result.tip.backup})` : `· ${result.tip.branch} 끝 그대로 ${result.tip.to.slice(0, 12)}`} · ${from} 부터 → ${result.state.status}`);
         return { tip: result.tip, partial: result.partial, status: result.state.status, runId: result.state.runId,

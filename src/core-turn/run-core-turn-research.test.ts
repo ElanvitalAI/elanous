@@ -95,12 +95,15 @@ test('ordered Linear → research → aside workflow dispatches native Linear be
 
 function createManualTimers() {
   const scheduled: Array<{ delayMs: number; callback: () => void; handle: ReturnType<typeof setTimeout>; cleared: boolean }> = [];
+  const scheduleWaiters = new Map<number, Array<() => void>>();
   return {
     scheduled,
     timers: {
       setTimeout(callback: () => void, delayMs: number) {
         const entry = { delayMs, callback, handle: globalThis.setTimeout(() => {}, 60_000), cleared: false };
         scheduled.push(entry);
+        for (const resolve of scheduleWaiters.get(delayMs) ?? []) resolve();
+        scheduleWaiters.delete(delayMs);
         return entry.handle;
       },
       clearTimeout(handle: ReturnType<typeof setTimeout>) {
@@ -113,6 +116,12 @@ function createManualTimers() {
       const entry = scheduled.find(timer => timer.delayMs === delayMs && !timer.cleared);
       if (!entry) throw new Error(`no active timer for ${delayMs}ms`);
       entry.callback();
+    },
+    waitFor(delayMs: number) {
+      if (scheduled.some(timer => timer.delayMs === delayMs && !timer.cleared)) return Promise.resolve();
+      return new Promise<void>(resolve => {
+        scheduleWaiters.set(delayMs, [...(scheduleWaiters.get(delayMs) ?? []), resolve]);
+      });
     },
   };
 }
@@ -823,6 +832,8 @@ test('the research deadline synthesizes when a cancelled native tool never settl
   await researchStarted;
   await Promise.resolve();
   manual.fire(30);
+  await manual.waitFor(50);
+  manual.fire(50);
   const result = await pending;
 
   expect(researchSignal?.aborted).toBe(true);

@@ -146,12 +146,17 @@ export interface NextTuiWakeup {
 /** next TUI 에 클래식 문 ⊕ 클래식 스케줄러를 잇는다. */
 export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
   const env = deps.env ?? process.env;
+  const acceleratedTestClock = env.ELANOUS_TEST_FAKE_LLM === '1'
+    && env.ELANOUS_TEST_FAST_WAKEUP_CLOCK === '1';
   const gate = createInternalTurnGate({
     isTurnRunning: deps.isTurnRunning,
     getBufferText: deps.getBufferText,
     getTypeaheadCount: deps.getQueuedCount,
     isEnabled: () => isInternalTurnEnabledByEnv(env),
     ...(deps.now ? { now: deps.now } : {}),
+    // The test clock advances scheduler time while lastHumanKeyAt is a real wall-clock value.
+    // Keep the busy-turn deferral under test without waiting out the production 10s quiet window.
+    ...(acceleratedTestClock ? { humanQuietMs: 0 } : {}),
     ...(deps.lastHumanKeyAt ? { lastHumanKeyAt: deps.lastHumanKeyAt } : {}),
     ...(deps.pendingKeyCount ? { pendingKeyCount: deps.pendingKeyCount } : {}),
     ...(deps.log ? { log: deps.log } : {}),

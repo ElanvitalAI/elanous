@@ -75,10 +75,8 @@ export const KEYBINDINGS: KeyBinding[] = [
   { keys: ['Alt+1..9'],            action: 'Switch directly to Nth virtual window',             context: 'global', note: 'VW-U2 — guarded by list().length>1' },
   { keys: ['Alt+0'],               action: 'Open window picker (fast, no chord)',               context: 'global', note: 'VW-U2' },
   { keys: ['Ctrl+X b'],            action: 'Toggle notification bell modal',  context: 'pane', note: 'NT5 — open/close bell modal with unread + error filter' },
-  { keys: ['Ctrl+Shift+V', 'Ctrl+Shift+ㅍ'], action: 'Enter Voice mode (Space hold push-to-talk · Esc to exit)', context: 'global', note: 'PR-S1V.4 — voice-input-host · kitty >3u on entry · brand prefix routing' },
-  { keys: ['Alt+S', 'Alt+ㄴ'], action: 'Toggle continuous voice-chat mode (real-time STT + auto-TTS · ESC or chord again to exit)', context: 'global', note: '2026-05-03 — moved from Alt+R to free R for reasoning cycle (V/D/R mnemonic)' },
-  { keys: ['Alt+R', 'Alt+ㄱ'], action: 'Cycle reasoning level (off → low → medium → high → xhigh). Codex / Claude reasoning models only — no-op on grok/gemini', context: 'global', note: '2026-05-03 — provider-agnostic ReasoningLevel cycle, same effect as `/reasoning` slash. V/D/R mnemonic: V=voice control (Ctrl+Shift+V), D=batch dictation (Space-longpress), R=reasoning' },
-  { keys: ['Alt+M', 'Alt+ㅡ'], action: 'Cycle active LLM provider through rotation pool (e.g. qwen3.6 local → claude haiku cloud → grok-fast). Toast shows new active entry. Empty pool → hint to /setup.', context: 'global', note: '2026-05-05 — same effect as `/provider next` slash. Mnemonic: M = Model. Pairs with V/D/R: V=voice, D=dictation, R=reasoning, M=model' },
+  { keys: ['Alt+R', 'Alt+ㄱ'], action: 'Cycle reasoning level (off → low → medium → high → xhigh). Codex / Claude reasoning models only — no-op on grok/gemini', context: 'global', note: '2026-05-03 — provider-agnostic ReasoningLevel cycle, same effect as `/reasoning` slash.' },
+  { keys: ['Alt+M', 'Alt+ㅡ'], action: 'Cycle active LLM provider through rotation pool (e.g. qwen3.6 local → claude haiku cloud → grok-fast). Toast shows new active entry. Empty pool → hint to /setup.', context: 'global', note: '2026-05-05 — same effect as `/provider next` slash. Mnemonic: M = Model.' },
   { keys: ['F1', '?'],             action: 'Toggle help overlay',            context: 'global' },
   // Plan-Mode UX P1.4 (2026-05-05) — Shift+Tab globally toggles plan
   // mode (read-only planning posture). When plan inactive: enters
@@ -100,7 +98,6 @@ export const KEYBINDINGS: KeyBinding[] = [
   // ── Chat input ───────────────────────────────────────────
   { keys: ['Enter'],               action: 'Submit message or slash command', context: 'input' },
   { keys: ['Shift+Enter', 'Alt+Enter', 'Ctrl+J'], action: 'Insert newline', context: 'input', note: 'Shift+Enter 가 안 되는 터미널은 Alt+Enter / Ctrl+J' },
-  { keys: ['Ctrl+Shift+V'],        action: 'Paste clipboard image',          context: 'input' },
   { keys: ['Ctrl+T'],              action: 'Toggle → pane mode',             context: 'input', note: 'also Ctrl+M on Kitty-protocol terminals' },
   { keys: ['Tab'],                 action: 'Autocomplete slash command / path', context: 'input' },
   { keys: ['Esc'],                 action: 'Abort current stream or exit input', context: 'input' },

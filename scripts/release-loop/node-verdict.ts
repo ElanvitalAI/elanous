@@ -11,8 +11,10 @@ export interface GraphContext {
   graphId?: string;
   nodeId?: string;
   runId?: string;
+  executionId?: string;
   startedAt?: string;
   input: { version: string; previousVersion: string; [key: string]: unknown };
+  nodeInput?: Record<string, unknown>;
   outputs: Record<string, Record<string, unknown>>;
 }
 
@@ -28,8 +30,12 @@ export function readGraphContext(env: NodeJS.ProcessEnv = process.env): GraphCon
   return { ...(typeof context.graphId === 'string' ? { graphId: context.graphId } : {}),
     ...(typeof context.nodeId === 'string' ? { nodeId: context.nodeId } : {}),
     ...(typeof context.runId === 'string' ? { runId: context.runId } : {}),
+    ...(typeof context.executionId === 'string' ? { executionId: context.executionId } : {}),
     ...(typeof context.startedAt === 'string' ? { startedAt: context.startedAt } : {}),
-    input: input as GraphContext['input'], outputs: context.outputs && typeof context.outputs === 'object' ? context.outputs as GraphContext['outputs'] : {} };
+    input: input as GraphContext['input'],
+    ...(context.nodeInput && typeof context.nodeInput === 'object' && !Array.isArray(context.nodeInput)
+      ? { nodeInput: context.nodeInput as Record<string, unknown> } : {}),
+    outputs: context.outputs && typeof context.outputs === 'object' ? context.outputs as GraphContext['outputs'] : {} };
 }
 
 export function nodeOutput(context: GraphContext, node: string, key: string): string {

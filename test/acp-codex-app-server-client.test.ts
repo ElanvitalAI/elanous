@@ -5,11 +5,18 @@
 // is wired into agent-manager and tested via dogfood.
 
 import { describe, test, expect, spyOn } from 'bun:test';
+import { EventEmitter } from 'node:events';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { debug } from '../src/debug/log.js';
 import {
   CodexAppServerClient,
   buildCodexAppServerArgs,
+  resolveCodexCodeModeHostBinary,
+  spawnCodexAppServer,
   type CodexAppServerClientOpts,
 } from '../src/acp/codex-app-server-client.js';
 import {
@@ -30,6 +37,15 @@ interface Harness {
   serverSend(msg: JsonRpcResponse | JsonRpcRequest | JsonRpcNotification): void;
   serverSendRaw(raw: string): void;
   close(): Promise<void>;
+}
+
+function mockChild(): ChildProcessWithoutNullStreams {
+  return Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: () => true,
+  }) as unknown as ChildProcessWithoutNullStreams;
 }
 
 function makeHarness(opts: Partial<CodexAppServerClientOpts> = {}): Harness {
@@ -581,17 +597,218 @@ describe('CodexAppServerClient · M5 stdin backpressure', () => {
   });
 });
 
-describe('buildCodexAppServerArgs — code_mode always off', () => {
-  test('default args force features.code_mode_host=false', () => {
-    // codex 0.144.0's code_mode needs a codex-code-mode-host binary the
-    // cask omits — disabling it is non-optional so /cdx tool calls work.
+describe('buildCodexAppServerArgs — code_mode_host follows adjacent binary detection', () => {
+  test('keeps code_mode_host off when no adjacent host binary exists', () => {
     expect(buildCodexAppServerArgs()).toEqual(['app-server', '-c', 'features.code_mode_host=false']);
   });
 
-  test('appends the disable flag to caller-supplied args', () => {
+  test('enables code_mode_host only when detection found the adjacent host binary', () => {
+    expect(buildCodexAppServerArgs(undefined, true)).toEqual(['app-server', '-c', 'features.code_mode_host=true']);
+  });
+
+  test('detects both adjacent-host present and absent cases', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-code-mode-host-'));
+    const codex = join(dir, process.platform === 'win32' ? 'codex.exe' : 'codex');
+    try {
+      writeFileSync(codex, 'test executable');
+      chmodSync(codex, 0o755);
+      expect(resolveCodexCodeModeHostBinary(codex).available).toBe(false);
+      const host = resolveCodexCodeModeHostBinary(codex).path;
+      writeFileSync(host, 'test host');
+      if (process.platform !== 'win32') {
+        expect(resolveCodexCodeModeHostBinary(codex).available).toBe(false);
+      }
+      chmodSync(host, 0o755);
+      const resolvedHost = realpathSync(host);
+      const resolvedCodex = realpathSync(codex);
+      expect(resolveCodexCodeModeHostBinary(codex)).toEqual({ binaryPath: resolvedCodex, path: resolvedHost, available: true });
+      expect(resolveCodexCodeModeHostBinary('./codex', dir)).toEqual({ binaryPath: resolvedCodex, path: resolvedHost, available: true });
+      expect(resolveCodexCodeModeHostBinary('codex', dir, { PATH: dir })).toEqual({ binaryPath: resolvedCodex, path: resolvedHost, available: true });
+      if (process.platform !== 'win32') {
+        const isolatedCwd = join(dir, 'isolated-cwd');
+        mkdirSync(isolatedCwd);
+        expect(resolveCodexCodeModeHostBinary('codex', isolatedCwd, { Path: dir }).available).toBe(false);
+      }
+      if (process.platform !== 'win32') {
+        const aliasDir = join(dir, 'path-bin');
+        mkdirSync(aliasDir);
+        const alias = join(aliasDir, 'codex');
+        symlinkSync(codex, alias);
+        expect(resolveCodexCodeModeHostBinary(alias)).toEqual({ binaryPath: resolvedCodex, path: resolvedHost, available: true });
+        expect(resolveCodexCodeModeHostBinary('codex', dir, { PATH: aliasDir })).toEqual({ binaryPath: resolvedCodex, path: resolvedHost, available: true });
+      }
+      const directoryCase = join(dir, 'directory-case');
+      mkdirSync(directoryCase);
+      const directoryCodex = join(directoryCase, 'codex');
+      writeFileSync(directoryCodex, 'test executable');
+      const hostDirectory = resolveCodexCodeModeHostBinary(directoryCodex).path;
+      mkdirSync(hostDirectory);
+      expect(resolveCodexCodeModeHostBinary(directoryCodex).available).toBe(false);
+
+      const windowsDir = join(dir, 'windows-path');
+      mkdirSync(windowsDir);
+      const windowsCodex = join(windowsDir, 'codex.exe');
+      const windowsHost = join(windowsDir, 'codex-code-mode-host.exe');
+      writeFileSync(windowsCodex, 'test executable');
+      writeFileSync(windowsHost, 'test host');
+      expect(resolveCodexCodeModeHostBinary(windowsCodex, dir, {}, 'win32'))
+        .toEqual({ binaryPath: realpathSync(windowsCodex), path: realpathSync(windowsHost), available: true });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('matches Windows spawn cwd-first lookup and ignores PATHEXT', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codex-win-spawn-'));
+    const cwd = join(root, 'cwd');
+    const pathDir = join(root, 'path');
+    mkdirSync(cwd);
+    mkdirSync(pathDir);
+    try {
+      const cwdExe = join(cwd, 'codex.exe');
+      const cwdBare = join(cwd, 'codex');
+      const cwdHost = join(cwd, 'codex-code-mode-host.exe');
+      const pathExe = join(pathDir, 'codex.exe');
+      const pathHost = join(pathDir, 'codex-code-mode-host.exe');
+      writeFileSync(join(cwd, 'codex.bat'), 'bat shim');
+      writeFileSync(cwdBare, 'extensionless file is not a Windows spawn target');
+      writeFileSync(cwdExe, 'cwd executable');
+      writeFileSync(cwdHost, 'cwd host');
+      writeFileSync(pathExe, 'path executable');
+      writeFileSync(pathHost, 'path host');
+
+      expect(resolveCodexCodeModeHostBinary('codex', cwd, {
+        Path: pathDir,
+        PATHEXT: '.BAT;.COM;.EXE',
+      }, 'win32')).toEqual({
+        binaryPath: realpathSync(cwdExe),
+        path: realpathSync(cwdHost),
+        available: true,
+      });
+
+      // Without an extension libuv tries .com then .exe; it does not try the
+      // literal extensionless file or PATHEXT's earlier .bat entry.
+      rmSync(cwdExe);
+      writeFileSync(join(cwd, 'codex.com'), 'cwd com executable');
+      const comHost = join(cwd, 'codex-code-mode-host.exe');
+      writeFileSync(comHost, 'host adjacent to selected .com');
+      expect(resolveCodexCodeModeHostBinary('codex', cwd, { Path: pathDir, PATHEXT: '.BAT;.EXE;.COM' }, 'win32'))
+        .toMatchObject({ binaryPath: realpathSync(join(cwd, 'codex.com')), path: realpathSync(comHost), available: true });
+
+      // A host next to an absent/fallback command is not enough to enable it.
+      rmSync(join(cwd, 'codex.com'));
+      rmSync(join(cwd, 'codex.bat'));
+      rmSync(pathExe);
+      rmSync(pathHost);
+      expect(resolveCodexCodeModeHostBinary('codex', cwd, {}, 'win32').available).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('reports a Windows .cmd shim that requires a shell wrapper and stops exact lookup', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codex-win-cmd-diagnostic-'));
+    const cwd = join(root, 'cwd');
+    const pathDir = join(root, 'path');
+    mkdirSync(cwd);
+    mkdirSync(pathDir);
+    try {
+      const shim = join(cwd, 'codex.cmd');
+      const laterExecutable = join(pathDir, 'codex.cmd.exe');
+      writeFileSync(shim, '@echo off');
+      writeFileSync(laterExecutable, 'later executable');
+      expect(resolveCodexCodeModeHostBinary('codex', cwd, {}, 'win32')).toMatchObject({
+        available: false,
+        shellWrapperCandidate: realpathSync(shim),
+      });
+      expect(resolveCodexCodeModeHostBinary('codex.cmd', cwd, { Path: pathDir }, 'win32')).toMatchObject({
+        available: false,
+        shellWrapperCandidate: realpathSync(shim),
+      });
+      expect(resolveCodexCodeModeHostBinary(shim, cwd, {}, 'win32')).toMatchObject({
+        available: false,
+        shellWrapperCandidate: realpathSync(shim),
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('logs the Windows shim diagnostic from spawn and disables code mode', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'codex-win-cmd-spawn-'));
+    const shim = join(cwd, 'codex.cmd');
+    const host = join(cwd, 'codex-code-mode-host.exe');
+    writeFileSync(shim, '@echo off');
+    writeFileSync(host, 'host');
+    const child = mockChild();
+    const log = spyOn(debug, 'log');
+    let argv: string[] = [];
+    const spawned = spawnCodexAppServer({
+      codexBinary: 'codex', cwd, env: { PATH: '' }, platform: 'win32', requestTimeoutMs: null,
+      spawnImpl: ((_command: string, args: readonly string[]) => {
+        argv = [...args];
+        return child;
+      }) as unknown as typeof import('node:child_process').spawn,
+    });
+    try {
+      expect(argv.slice(-2)).toEqual(['-c', 'features.code_mode_host=false']);
+      expect(log).toHaveBeenCalledWith('acp.codex.command-resolution', 'windows-shell-wrapper-required', {
+        binary: 'codex', candidate: realpathSync(shim), requiredInvocation: 'cmd.exe /d /s /c',
+      });
+    } finally {
+      await spawned.client.close();
+      spawned.child.kill();
+      log.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps an explicit Windows executable extension and relative path pinned', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codex-win-explicit-'));
+    const cwd = join(root, 'cwd');
+    const pathDir = join(root, 'path');
+    mkdirSync(cwd);
+    mkdirSync(pathDir);
+    try {
+      const cwdExe = join(cwd, 'codex.exe');
+      const cwdHost = join(cwd, 'codex-code-mode-host.exe');
+      const pathExe = join(pathDir, 'codex.exe');
+      writeFileSync(cwdExe, 'cwd executable');
+      writeFileSync(cwdHost, 'cwd host');
+      writeFileSync(pathExe, 'path executable');
+
+      expect(resolveCodexCodeModeHostBinary('./codex.exe', cwd, { PATH: pathDir }, 'win32')).toEqual({
+        binaryPath: realpathSync(cwdExe),
+        path: realpathSync(cwdHost),
+        available: true,
+      });
+
+      const explicitCom = join(cwd, 'codex.exe.com');
+      writeFileSync(explicitCom, 'appended extension candidate');
+      expect(resolveCodexCodeModeHostBinary('codex.exe', cwd, { PATH: pathDir }, 'win32').binaryPath)
+        .toBe(realpathSync(cwdExe));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps the existing POSIX cwd fallback when PATH has no matching binary', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'codex-posix-fallback-'));
+    try {
+      const host = join(cwd, 'codex-code-mode-host');
+      writeFileSync(host, 'host');
+      chmodSync(host, 0o755);
+      expect(resolveCodexCodeModeHostBinary('codex', cwd, { PATH: join(cwd, 'empty-path') }, 'linux'))
+        .toEqual({ binaryPath: join(cwd, 'codex'), path: host, available: true });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('appends the selected feature value to caller-supplied args', () => {
     const args = buildCodexAppServerArgs(['app-server', '-c', 'model=o3']);
     expect(args.slice(0, 3)).toEqual(['app-server', '-c', 'model=o3']);
-    // still ends with the code_mode disable — not optional.
+    // Detection is false unless the production spawn path supplies a positive result.
     expect(args.join(' ')).toContain('-c features.code_mode_host=false');
   });
 });

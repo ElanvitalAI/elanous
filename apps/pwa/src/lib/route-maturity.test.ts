@@ -96,8 +96,8 @@ describe('PWA route maturity', () => {
         expect(visibleForRole(role, path)).toBe(visibleOn(path, 'pwa', role));
       }
     }
-    expect(routeMaturity('/missions/123')).toBe('beta');
-    expect(visibleForRole('contributor', '/missions/123?view=detail')).toBe(visibleOn('/missions/[id]', 'pwa', 'contributor'));
+    expect(routeMaturity('/missions/123')).toBeUndefined();
+    expect(visibleForRole('contributor', '/missions/123?view=detail')).toBe(false);
     expect(routeMaturity('/workflows/chat-ui/')).toBe('broken');
     expect(visibleForRole('contributor', '/workflows/chat-ui')).toBe(false);
   });
@@ -111,10 +111,10 @@ describe('PWA route maturity', () => {
         expect(visibleForRole(role, path, { showBeta: true })).toBe(visibleForRole(role, path));
       }
     }
-    for (const path of ['/unknown', '/missions/123/extra', '/share', '/morning', '/approvals', '/scheduler']) {
+    for (const path of ['/unknown', '/missions/123', '/missions/123/extra', '/share', '/morning', '/approvals', '/scheduler']) {
       expect(visibleForRole('general', path, { showBeta: true })).toBe(false);
     }
-    expect(visibleForRole('general', '/missions/123?view=detail', { showBeta: true })).toBe(true);
+    expect(visibleForRole('general', '/missions/123?view=detail', { showBeta: true })).toBe(false);
     expect(visibleForRole('general', '/settings', { showBeta: false })).toBe(true);
   });
 
@@ -123,8 +123,8 @@ describe('PWA route maturity', () => {
       expect(routeMaturity(route)).toBe(pwa);
       expect(routeMaturity(`${route}?view=compact#top`)).toBe(pwa);
     }
-    expect(routeMaturity('/missions/123/')).toBe(FEATURE_MATURITY.pwaRoute['/missions/[id]'].pwa);
-    expect(routeMaturity('/missions/123?view=detail')).toBe(FEATURE_MATURITY.pwaRoute['/missions/[id]'].pwa);
+    expect(routeMaturity('/missions/123/')).toBeUndefined();
+    expect(routeMaturity('/missions/123?view=detail')).toBeUndefined();
     for (const route of ['/unknown', '/missions/123/extra', '/chat/extra', '/toString', '/__proto__']) {
       expect(routeMaturity(route)).toBeUndefined();
       for (const role of ['owner', 'contributor', 'general'] as const) {

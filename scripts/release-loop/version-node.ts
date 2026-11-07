@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -409,13 +409,48 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
       }
     }
     const title = kind === 'release' ? `release: ${target}` : `version: ${target}`;
-    const land = spawnSync('bun', ['bin/elanous.mjs', 'pr', 'land', '--commit-message', title, '--title', title, '--body', `Set package.json version to ${target}.`,
-      ...(forceFreeze ? ['--force-freeze', `release run version bump ${target}`] : [])], {
-      cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
-    });
+    const commandTail = (value: string | null | undefined): string => value?.trim().slice(-1_000) || '(empty)';
+    const stageFailure = (stage: string, result: SpawnSyncReturns<string>, reason?: string): Error => new Error(
+      `${stage} failed (rc=${result.status ?? 'unknown'}${reason ? `; ${reason}` : ''}; stderr tail «${commandTail(result.stderr)}»; output tail «${commandTail(result.stdout)}»)`,
+    );
+    let land: SpawnSyncReturns<string>;
+    if (kind === 'dev-bump') {
+      // Create/update as draft, explicitly make it ready, then land that exact head. The train's pinned path
+      // refuses a draft PR, so never let a draft creation flow fall through to an unpinned squash attempt.
+      const held = spawnSync('bun', ['bin/elanous.mjs', 'pr', 'land', '--commit-message', title, '--title', title,
+        '--body', `Set package.json version to ${target}.`, '--hold'], {
+        cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+      });
+      const heldText = `${held.stdout ?? ''}\n${held.stderr ?? ''}`;
+      const prMatch = /✓ upsert-ready:\s+https:\/\/[^/]+\/[^/]+\/[^/]+\/pull\/(\d+)\b/.exec(heldText);
+      if (held.status !== 0 || held.error || !heldText.includes('✓ hold:') || !prMatch) {
+        throw stageFailure('dev-bump pr land --hold', held, !prMatch ? 'PR number/hold marker missing' : undefined);
+      }
+      const pr = prMatch[1]!;
+      const headResult = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+      const head = headResult.stdout?.trim() ?? '';
+      if (headResult.status !== 0 || headResult.error || !/^[a-f0-9]{40}$/i.test(head)) {
+        throw stageFailure('dev-bump HEAD pin', headResult, 'full HEAD SHA missing');
+      }
+      const ready = spawnSync('bun', ['bin/elanous.mjs', 'gh', 'pr', 'ready', pr], {
+        cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+      });
+      if (ready.status !== 0 || ready.error) throw stageFailure(`dev-bump gh pr ready #${pr}`, ready);
+      land = spawnSync('bun', ['bin/elanous.mjs', 'pr', 'land', '--pr', pr, '--expected-head', head,
+        '--commit-message', title, '--title', title, '--body', `Set package.json version to ${target}.`,
+        ...(forceFreeze ? ['--force-freeze', `release run version bump ${target}`] : [])], {
+        cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+      });
+    } else {
+      land = spawnSync('bun', ['bin/elanous.mjs', 'pr', 'land', '--commit-message', title, '--title', title, '--body', `Set package.json version to ${target}.`,
+        ...(forceFreeze ? ['--force-freeze', `release run version bump ${target}`] : [])], {
+        cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
+      });
+    }
     const transcript = `${land.stdout ?? ''}\n${land.stderr ?? ''}`;
     if (land.status !== 0 || land.error || !transcript.includes('✓ merge:')) {
-      throw new Error(`pr land failed (rc=${land.status ?? 'unknown'}; merge marker ${transcript.includes('✓ merge:') ? 'present' : 'missing'}): ${transcript.trim() || land.error || 'no output'}`);
+      const stage = kind === 'dev-bump' ? 'dev-bump pinned pr land' : 'pr land';
+      throw stageFailure(stage, land, `merge marker ${transcript.includes('✓ merge:') ? 'present' : 'missing'}`);
     }
     const mergeLine = transcript.split('\n').find((line) => line.includes('✓ merge:')) ?? '';
     const pr = /(?:#|\/pull\/)(\d+)\b/.exec(mergeLine);

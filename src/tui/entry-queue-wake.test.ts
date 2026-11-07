@@ -109,6 +109,33 @@ describe('REPL child ↔ next TUI wakeup hop', () => {
     const replTool = createReplWakeupTool({ send: () => true, on: () => {}, off: () => {} }, { [NEXT_TUI_WAKEUP_IPC_ENV]: '1' }, { timeoutMs: 20 })!;
     expect(await replTool.dispatch({ action: 'list' })).toEqual({ error: 'ScheduleWakeup: next TUI did not answer' });
   });
+
+  test('the accelerated fake clock skips only the wall-clock quiet window', () => {
+    const makeWake = (env: NodeJS.ProcessEnv) => createNextTuiWakeup({
+      isTurnRunning: () => false,
+      getBufferText: () => '',
+      getQueuedCount: () => 0,
+      requestYield: () => true,
+      notify: () => {},
+      env,
+      now: () => 10_000,
+      lastHumanKeyAt: () => 9_999,
+      log: () => {},
+    });
+    const fast = makeWake({ ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAST_WAKEUP_CLOCK: '1' });
+    expect(fast.gate.startTurnIfIdle('scheduled test', { origin: 'scheduled', reason: 'test' }).opened).toBe(true);
+    fast.dispose();
+
+    for (const env of [
+      { ELANOUS_TEST_FAKE_LLM: '1' },
+      { ELANOUS_TEST_FAST_WAKEUP_CLOCK: '1' },
+    ]) {
+      const wake = makeWake(env);
+      expect(wake.gate.startTurnIfIdle('scheduled test', { origin: 'scheduled', reason: 'test' }))
+        .toMatchObject({ opened: false, reason: 'HumanTyping', detail: 'quiet-window' });
+      wake.dispose();
+    }
+  });
 });
 
 describe('next TUI on N03 (this tree · fake LLM)', () => {

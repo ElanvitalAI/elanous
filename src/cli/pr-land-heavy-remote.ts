@@ -154,6 +154,22 @@ function extraGatesFromOutput(output: Buffer): { interferenceMeasured: boolean }
   return match ? { interferenceMeasured: match[1] === 'measured' } : null;
 }
 
+/** Classify only an explicit pinned-main delta summary; absent or malformed proof stays unmeasured. */
+export function assessPrLandTypecheckDrift(output: string, expectedMain: string): NonNullable<HeavyRemoteResult['typecheckDrift']> {
+  const taggedLines = output.split(/\r?\n/).filter((line) => line.startsWith('[tsc-main-delta]'));
+  const summaries = taggedLines.filter((line) => !line.startsWith('[tsc-main-delta] dependency inputs changed;'));
+  if (summaries.length !== 1) return 'drift-unmeasured';
+  const summary = /^\[tsc-main-delta\] base=([0-9a-f]{40}) base_rc=[012] head=[0-9a-f]{40} head_rc=[012] baseline_errors=\d+ head_errors=\d+ new_errors=(\d+)$/i.exec(summaries[0]!);
+  if (!summary || summary[1]!.toLowerCase() !== expectedMain.toLowerCase()) return 'drift-unmeasured';
+  const newErrors = Number(summary[2]);
+  if (!Number.isSafeInteger(newErrors)) return 'drift-unmeasured';
+  const markers = output.split(/\r?\n/).filter((line) => line.startsWith('error: main-baseline tsc introduced '));
+  if (newErrors === 0) return markers.length === 0 ? 'drift-unrelated' : 'drift-unmeasured';
+  if (markers.length !== 1) return 'drift-unmeasured';
+  const marker = /^error: main-baseline tsc introduced (\d+) TypeScript diagnostic\(s\)$/.exec(markers[0]!);
+  return marker && Number(marker[1]) === newErrors ? 'drift' : 'drift-unmeasured';
+}
+
 /** Only gate verdict lines reach the landing error. Keep it one line and bounded even for a large remote log. */
 function failedGateSummary(stdout: Buffer, stderr: Buffer): string | undefined {
   const boundLine = (line: string): string => {
@@ -328,6 +344,9 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   const base = { pr: input.pr, head: input.head, main: input.main, host: actualHost ?? null, attemptedHost: selectedHost, elapsedMs };
   // The outcome must identify the selected allowlisted host; the configured host alone is not evidence.
   if (outcome.kind !== 'ran' || outcome.commit !== input.head || outcome.rc !== 0 || outcome.host !== selectedHost) {
+    const typecheckDrift = outcome.kind === 'ran' && outcome.host === selectedHost && outcome.commit === input.head
+      ? assessPrLandTypecheckDrift(`${outcome.stdout.toString('utf8')}\n${outcome.stderr.toString('utf8')}`, input.main)
+      : undefined;
     const summary = outcome.kind === 'ran' && outcome.rc !== 0 ? failedGateSummary(outcome.stdout, outcome.stderr) : undefined;
     // A different host cannot attest to this gate, so do not promote its file list into the refusal.
     const files = outcome.kind === 'ran' && outcome.rc !== 0 && outcome.host === selectedHost && outcome.commit === input.head
@@ -339,7 +358,8 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
         : `gate-rc-${outcome.rc}${outcome.commit !== input.head ? '-head-mismatch' : ''}${files ? ` · ${files}` : ''}${summary ? ` · remote: ${summary}` : ''}${failureLogPath ? ` · remote-log: ${failureLogPath}` : ' · remote-log: unavailable'}`
       : outcome.kind === 'busy' ? 'gate-host-busy' : outcome.reason;
     observe('heavy-remote', { ...base, outcome: outcome.kind === 'ran' ? 'fail' : 'unmeasured', reason, failureLogPath: failureLogPath ?? null });
-    return { ok: false, ...(actualHost ? { host: actualHost } : {}), attemptedHost: selectedHost, source: 'unmeasured', reason, elapsedMs, evidencePath: path, ...(failureLogPath ? { failureLogPath } : {}) };
+    return { ok: false, ...(actualHost ? { host: actualHost } : {}), attemptedHost: selectedHost, source: 'unmeasured', reason, elapsedMs, evidencePath: path,
+      ...(typecheckDrift ? { typecheckDrift } : {}), ...(failureLogPath ? { failureLogPath } : {}) };
   }
   const extraGates = extraGatesFromOutput(outcome.stdout);
   if (!extraGates) {

@@ -54,7 +54,45 @@ test('registered --test CLI sets and shows an isolated profile end-to-end', () =
     const show = run(['machine', 'show']);
     expect(show.status).toBe(0);
     expect(show.stdout).toContain('demo · config · workstation · control:1');
+    const captureHelp = run(['machine', 'capture', '--help']);
+    expect(captureHelp.status).toBe(0);
+    expect(captureHelp.stdout).toContain('Capture a machine profile without reading credential values');
+    expect(captureHelp.stdout).toContain('--out <file>');
+    const plan = run(['machine', 'setup', 'plan', '--platform', 'macos', '--profile', 'default', '--json']);
+    expect(plan.status).toBe(0);
+    expect(JSON.parse(plan.stdout)).toMatchObject({ kind: 'machine-setup-plan', platform: 'macos', profile: 'default', dryRun: true });
+    const planHelp = run(['machine', 'setup', 'plan', '--help']);
+    expect(planHelp.status).toBe(0);
+    expect(planHelp.stdout).toContain('--platform <platform>');
+    const apply = run(['machine', 'setup', 'apply', '--platform', 'linux', '--json']);
+    expect(apply.status).toBe(0);
+    expect(JSON.parse(apply.stdout)).toMatchObject({ kind: 'machine-setup-apply-result', platform: 'linux', applied: false, attempted: 0 });
+    const source = join(root, 'source-machine.json');
+    writeFileSync(source, JSON.stringify({ kind: 'machine-capture', schemaVersion: 1, platform: 'darwin', packages: {
+      status: 'captured', formulaeStatus: 'captured', casksStatus: 'captured', tapsStatus: 'captured',
+      formulae: [{ name: 'ripgrep' }], casks: [], taps: ['homebrew/cask'],
+    } }));
+    const copy = run(['machine', 'apply', '--from', source, '--json']);
+    expect(copy.status).toBe(0);
+    expect(JSON.parse(copy.stdout)).toMatchObject({ kind: 'machine-setup-apply-result', applied: false, attempted: 0 });
+    const applyHelp = run(['machine', 'apply', '--help']);
+    expect(applyHelp.stdout).toContain('--from <capture>');
+    expect(applyHelp.stdout).toContain('--yes');
+    expect(applyHelp.stdout).toContain('--distribution <name>');
+    expect(applyHelp.stdout).toContain('--wsl-user <name>');
+    expect(applyHelp.stdout).toContain('--resume');
+    const doctorHelp = run(['doctor', '--help']);
+    expect(doctorHelp.status).toBe(0);
+    expect(doctorHelp.stdout).not.toMatch(/^\s+capture\b/m);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('machine command list snapshot includes capture and both apply surfaces', () => {
+  const program = new Command();
+  registerMachineCommands(program);
+  const machine = program.commands.find(command => command.name() === 'machine');
+  expect(machine?.commands.map(command => command.name())).toEqual(['set', 'render', 'ledger-set', 'show', 'setup', 'apply', 'capture', 'join', 'leave']);
+  expect(machine?.commands.find(command => command.name() === 'setup')?.commands.map(command => command.name())).toEqual(['plan', 'apply']);
 });
 
 test('joined machine refuses a different profile id and leaves its join identity intact', async () => {

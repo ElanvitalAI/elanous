@@ -1,6 +1,6 @@
 import { test, expect, describe } from 'bun:test';
 import { matchField, cronMatches, prevScheduledFire } from './cron-match.js';
-import { resolveTimeZone } from '../time/format.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 
 describe('matchField', () => {
   test('별표는 항상 매칭', () => {

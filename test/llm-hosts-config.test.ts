@@ -15,6 +15,7 @@ import {
   type LlmHostConfig,
 } from '../src/nexus/api/llm-hosts.js';
 import { handleLlmModels } from '../src/nexus/api/llm-models.js';
+import { expectMalformedJson400 } from './helpers/http-error-contract';
 
 type FetchFn = typeof globalThis.fetch;
 const realFetch = globalThis.fetch;
@@ -185,9 +186,7 @@ describe('handleLlmHostsConfig · PUT', () => {
         body: '{not json',
       }),
     );
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe('invalid-json');
+    await expectMalformedJson400(res, 'invalid-json');
   });
   test('non-array body → 400', async () => {
     const res = await handleLlmHostsConfig(

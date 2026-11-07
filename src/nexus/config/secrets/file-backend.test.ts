@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../../elanous-config-dir.js';
@@ -42,12 +42,29 @@ test('set and delete retain other keys and keep one previous-file backup', async
   writeFileSync(path, original);
   await fileBackend.set('new', 'value');
   expect(JSON.parse(readFileSync(path, 'utf8')).secrets).toEqual({ retained: 'old', new: 'value' });
-  expect(readFileSync(`${path}.bak`, 'utf8')).toBe(original);
+  expect(JSON.parse(readFileSync(`${path}.bak`, 'utf8'))).toEqual({ version: 1, secrets: { retained: 'old' } });
   const previous = readFileSync(path, 'utf8');
   expect(await fileBackend.delete('new')).toBe(true);
-  expect(readFileSync(`${path}.bak`, 'utf8')).toBe(previous);
+  expect(JSON.parse(readFileSync(`${path}.bak`, 'utf8'))).toEqual(JSON.parse(previous));
   expect(JSON.parse(readFileSync(path, 'utf8')).secrets).toEqual({ retained: 'old' });
   expect(readdirSync(dir).sort()).toEqual(['secrets.json', 'secrets.json.bak']);
+});
+
+test('backups retain legacy app values while excluding lifecycle-owned app values', async () => {
+  const path = join(dir, 'secrets.json');
+  writeFileSync(path, JSON.stringify({ version: 1, secrets: { 'app/legacy/OLD_KEY': 'old-value', ordinary: 'kept' } }));
+  await fileBackend.set('new-shared', 'new-value');
+  expect(JSON.parse(readFileSync(`${path}.bak`, 'utf8')).secrets).toEqual({ 'app/legacy/OLD_KEY': 'old-value', ordinary: 'kept' });
+});
+
+test('unreadable app ledger prevents making a secret-bearing backup', async () => {
+  const path = join(dir, 'secrets.json');
+  const original = JSON.stringify({ version: 1, secrets: { 'app/voice-note/API_KEY': 'ledger-owned-value' } });
+  writeFileSync(path, original, { mode: 0o600 });
+  writeFileSync(join(dir, 'app-secret-ledger.json'), '{invalid-ledger');
+  await expect(fileBackend.set('shared', 'new-value')).rejects.toThrow();
+  expect(readFileSync(path, 'utf8')).toBe(original);
+  expect(existsSync(`${path}.bak`)).toBe(false);
 });
 
 test('batch import checks collisions under the file lock and pins overwrite confirmation to exact names', () => {

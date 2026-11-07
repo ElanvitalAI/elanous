@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { shouldSkipKernelPtyIntegration } from './helpers/host-pty.js';
 
 import {
   PreviewTerminal,
@@ -154,7 +155,8 @@ describe('PreviewTerminal', () => {
   // 부하 걸린 Pod 에서 `-l -i` 로그인 셸이 3초 안에 안 떠 «echo READY» 의 tty 메아리만 보고 넘어갔다 → 셸이 아직
   // 안 읽은 줄에 SZ 가 영영 안 찍혔다). ⓐ 프로필을 안 읽는 셸 ⓑ 메아리가 아니라 «셸의 출력»을 기다린다
   // (`RE""ADY` 는 메아리엔 따옴표째 보이고 출력에만 `READY` 로 붙는다) ⓒ 고정 sleep 0 · 상한은 넉넉히.
-  test.skipIf(!hasNodePtyBinding)('resize reaches the kernel PTY — the shell sees the new size (stty size)', async () => {
+  // The gate's Linux Pod has a known 60s timeout for this host-kernel PTY probe; keep it active on host runs.
+  test.skipIf(shouldSkipKernelPtyIntegration({ nodePtyAvailable: hasNodePtyBinding, substrate: process.env.ELANOUS_SUBSTRATE }))('resize reaches the kernel PTY — the shell sees the new size (stty size)', async () => {
     const shellDir = mkdtempSync(join(tmpdir(), 'preview-terminal-slow-shell-'));
     const rcFile = join(shellDir, 'bashrc');
     writeFileSync(rcFile, "sleep 0.3\nPS1='__ELANOUS_TEST_PROMPT__# '\n");

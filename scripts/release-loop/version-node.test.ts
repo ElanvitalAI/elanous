@@ -1,9 +1,10 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { nextDevVersion } from './version-node';
+import { createTempGitRemote } from '../../src/ux-sim/temp-git-remote';
 import { runGraph } from '../../src/graph-runner/runner';
 import { parseOptions } from './gate-node';
 import { runPrepare } from './prepare-node';
@@ -84,18 +85,25 @@ else if (args[0] === 'worktree' && args[1] === 'add') {
 } else if (args[0] === 'remote' && args[1] === 'get-url' && args[2] === 'origin') console.log(state.remoteUrl || 'git@example.com:repo.git');
 else if (args[0] === 'add') { /* staged in the caller's worktree */ }
 else if (args[0] === 'commit') console.log('[cut ' + (state.cutHead || 'cut-head-sha') + ']');
-else if (args[0] === 'rev-parse' && args[1] === 'HEAD') console.log(state.cutHead || 'cut-head-sha');
+else if (args[0] === 'rev-parse' && args[1] === 'HEAD') console.log(state.prHead || state.cutHead || 'cut-head-sha');
 else if (args[0] === 'push') console.log('*\\t' + args[4] + '\\t[new branch]');
 else { console.error('unexpected fake git ' + args.join(' ')); process.exit(2); }
 `;
 const fakeBun = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const root = process.env.VERSION_NODE_TEST_ROOT;
 const stateFile = path.join(root, 'state.json');
 const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
 const args = process.argv.slice(2);
 fs.appendFileSync(path.join(root, 'calls'), 'bun ' + args.join(' ') + '\\n');
+const gh = (...argv) => {
+  const result = spawnSync('gh', argv, { encoding: 'utf8' });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.error || result.status !== 0) process.exit(result.status ?? 1);
+};
 if (args[0] === 'install' && args[1] === '--frozen-lockfile') {
   const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
   const lock = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'bun.lock'), 'utf8'));
@@ -110,36 +118,90 @@ if (args[0] === 'install' && args[1] === '--frozen-lockfile') {
   const agentPath = path.join(process.cwd(), 'integrations', 'acp-registry', 'elanous', 'agent.json');
   state.landedAgentJson = fs.existsSync(agentPath) ? JSON.parse(fs.readFileSync(agentPath, 'utf8')) : null;
   state.landedAgentText = fs.existsSync(agentPath) ? fs.readFileSync(agentPath, 'utf8') : null;
-  if (state.land === 'fail') { console.error('merge rejected'); process.exit(1); }
-  if (state.land === 'no-marker') { console.log('nothing merged'); process.exit(0); }
+  if (args.includes('--hold')) {
+    state.prHead = 'c'.repeat(40);
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    gh('pr', 'create', '--draft', '--head', state.prHead);
+    console.log('✓ upsert-ready: https://github.com/example/repo/pull/42');
+    console.log('✓ hold: https://github.com/example/repo/pull/42');
+    process.exit(0);
+  }
+  if (args.includes('--pr')) {
+    const expectedHead = args[args.indexOf('--expected-head') + 1];
+    gh('pr', 'merge', '42', '--squash', '--match-head-commit', expectedHead);
+    Object.assign(state, JSON.parse(fs.readFileSync(stateFile, 'utf8')));
+    if (state.land === 'no-marker') process.exit(0);
+  } else if (state.land === 'fail') { console.error('merge rejected'); process.exit(1); }
+  else if (state.land === 'no-marker') { console.log('nothing merged'); process.exit(0); }
   if (state.land !== 'no-advance') {
     state.version = version;
     state.sha = 'merged-sha';
     fs.writeFileSync(stateFile, JSON.stringify(state));
   }
   console.log('✓ merge: squash https://github.com/example/repo/pull/42 → origin/main');
+} else if (args[0] === 'bin/elanous.mjs' && args[1] === 'gh' && args[2] === 'pr' && args[3] === 'ready') {
+  gh('pr', 'ready', args[4]);
 } else { console.error('unexpected fake bun ' + args.join(' ')); process.exit(2); }
 `;
 
-function fixture(version: string, land = 'ok', install = 'ok') {
+const fakeGh = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.env.VERSION_NODE_TEST_ROOT;
+const stateFile = path.join(root, 'state.json');
+const callsFile = path.join(root, 'gh-calls');
+const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+const args = process.argv.slice(2);
+fs.appendFileSync(callsFile, JSON.stringify(args) + '\\n');
+if (args[0] !== 'pr') { console.error('unsupported fake gh command'); process.exit(2); }
+if (args[1] === 'create' && args.includes('--draft')) {
+  if (state.land === 'hold-fail') { console.error('draft PR create failed'); process.exit(1); }
+  if (args[args.indexOf('--head') + 1] !== state.prHead) { console.error('draft head mismatch'); process.exit(1); }
+  state.draft = true;
+  state.sequence = [...(state.sequence || []), 'draft'];
+  fs.writeFileSync(stateFile, JSON.stringify(state));
+  console.log('https://github.com/example/repo/pull/42');
+} else if (args[1] === 'ready') {
+  if (state.ready === 'fail') { console.error('ready refused'); process.exit(1); }
+  if (!state.draft) { console.error('PR was not draft'); process.exit(1); }
+  state.draft = false;
+  if (state.ready === 'head-drift') state.remotePrHead = 'd'.repeat(40);
+  state.sequence = [...(state.sequence || []), 'ready'];
+  fs.writeFileSync(stateFile, JSON.stringify(state));
+  console.log('✓ ready: https://github.com/example/repo/pull/' + args[2]);
+} else if (args[1] === 'merge') {
+  const headIndex = args.indexOf('--match-head-commit');
+  if (state.draft) { console.error('PR is draft'); process.exit(1); }
+  if (headIndex < 0 || args[headIndex + 1] !== (state.remotePrHead || state.prHead)) { console.error('expected head mismatch'); process.exit(1); }
+  if (state.land === 'fail') { console.error('pinned merge rejected'); process.exit(1); }
+  if (state.land === 'no-marker') { console.error('merge marker missing from train'); console.log('nothing merged'); process.exit(0); }
+  state.sequence = [...(state.sequence || []), 'merge'];
+  state.mergedPrHead = state.prHead;
+  state.prHead = null;
+  fs.writeFileSync(stateFile, JSON.stringify(state));
+} else { console.error('unexpected fake gh ' + args.join(' ')); process.exit(2); }
+`;
+
+function fixture(version: string, land = 'ok', install = 'ok', ready = 'ok') {
   const root = mkdtempSync(join(tmpdir(), 'version-node-test-'));
   scratch.push(root);
   const bin = join(root, 'bin');
   mkdirSync(bin);
-  for (const [name, source] of [['git', fakeGit], ['bun', fakeBun]]) {
+  for (const [name, source] of [['git', fakeGit], ['bun', fakeBun], ['gh', fakeGh]]) {
     const path = join(bin, name!);
     writeFileSync(path, source!);
     chmodSync(path, 0o755);
   }
-  writeFileSync(join(root, 'state.json'), JSON.stringify({ version, sha: 'base-sha', land, install }));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ version, sha: 'base-sha', land, install, ready }));
   writeFileSync(join(root, 'calls'), '');
+  writeFileSync(join(root, 'gh-calls'), '');
   const run = (...args: string[]) => {
     const result = spawnSync(process.execPath, [resolve(import.meta.dir, 'version-node.ts'), ...args], {
       cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, VERSION_NODE_TEST_ROOT: root },
     });
     return { status: result.status, output: JSON.parse(result.stdout.trim().split('\n').at(-1)!), calls: readFileSync(join(root, 'calls'), 'utf8'), stderr: result.stderr, stdout: result.stdout };
   };
-  return { root, run };
+  return { root, run, ghCalls: () => readFileSync(join(root, 'gh-calls'), 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)) };
 }
 
 test('nextDevVersion increments patch without changing major/minor', () => {
@@ -173,7 +235,8 @@ test('version landing passes a reasoned freeze override only when graph input.fo
     try {
       const result = run(kind, '--json');
       expect(result.status).toBe(0);
-      const landing = result.calls.split('\n').find((line) => line.startsWith('bun bin/elanous.mjs pr land '));
+      const landing = result.calls.split('\n').find((line) => line.startsWith('bun bin/elanous.mjs pr land ')
+        && (kind === 'release' || line.includes('--pr ')));
       expect(landing).toBeDefined();
       if (forceFreeze) expect(landing).toContain(`--force-freeze release run version bump ${kind === 'release' ? '0.2.4' : '0.2.5-dev.0'}`);
       else expect(landing).not.toContain('--force-freeze');
@@ -575,6 +638,269 @@ test('dev-bump computes next patch from graph context, lands, then becomes idemp
     if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
     else process.env.ELANOUS_GRAPH_CONTEXT = previous;
   }
+});
+
+test('dev-bump transitions draft PR through ready before pinned merge of the same head', () => {
+  const { root, run, ghCalls } = fixture('0.2.4');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4' } });
+  try {
+    const result = run('dev-bump', '--json');
+    expect(result.output.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ outcome: 'ok', kind: 'dev-bump', version: '0.2.5-dev.0', pr: 42 });
+    const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+    expect(state.sequence).toEqual(['draft', 'ready', 'merge']);
+    expect(state.draft).toBe(false);
+    expect(ghCalls()).toEqual([
+      ['pr', 'create', '--draft', '--head', 'c'.repeat(40)],
+      ['pr', 'ready', '42'],
+      ['pr', 'merge', '42', '--squash', '--match-head-commit', 'c'.repeat(40)],
+    ]);
+    const calls = result.calls.split('\n');
+    const draftAt = calls.findIndex((line) => line.includes('pr land --commit-message version: 0.2.5-dev.0') && line.includes('--hold'));
+    const readyAt = calls.findIndex((line) => line.includes('gh pr ready 42'));
+    const mergeAt = calls.findIndex((line) => line.includes('pr land --pr 42 --expected-head'));
+    expect(draftAt).toBeGreaterThanOrEqual(0);
+    expect(readyAt).toBeGreaterThan(draftAt);
+    expect(mergeAt).toBeGreaterThan(readyAt);
+    expect(calls[mergeAt]).toContain('c'.repeat(40));
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+function runRealDevBumpCliScenario(failReady = false) {
+  const project = resolve(import.meta.dir, '../..');
+  const previousAuthorDate = process.env.GIT_AUTHOR_DATE;
+  const previousCommitterDate = process.env.GIT_COMMITTER_DATE;
+  process.env.GIT_AUTHOR_DATE = '2000-01-01T00:00:00Z';
+  process.env.GIT_COMMITTER_DATE = '2000-01-01T00:00:00Z';
+  const fixtureRemote = createTempGitRemote();
+  if (previousAuthorDate === undefined) delete process.env.GIT_AUTHOR_DATE;
+  else process.env.GIT_AUTHOR_DATE = previousAuthorDate;
+  if (previousCommitterDate === undefined) delete process.env.GIT_COMMITTER_DATE;
+  else process.env.GIT_COMMITTER_DATE = previousCommitterDate;
+  scratch.push(fixtureRemote.root);
+  const { seed, checkout, remote, git, gitEnv } = fixtureRemote;
+  const statePath = join(fixtureRemote.root, 'fake-gh-state.json');
+  const callsPath = join(fixtureRemote.root, 'fake-gh-calls.jsonl');
+  const fakeBin = join(fixtureRemote.root, 'fake-bin');
+  mkdirSync(fakeBin);
+  const fakeSshPath = join(fakeBin, 'ssh-local-git-transport');
+  writeFileSync(fakeSshPath, `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const request = process.argv.at(-1) || '';
+const remote = ${JSON.stringify(remote)};
+const match = /^(git-upload-pack|git-receive-pack)\\s+['\"]?[^'\"]+['\"]?$/.exec(request);
+if (!match) { console.error('unsupported local SSH transport request'); process.exit(2); }
+const result = spawnSync(match[1], [remote], { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`);
+  chmodSync(fakeSshPath, 0o755);
+  const fakeGhPath = join(fakeBin, 'gh');
+  writeFileSync(fakeGhPath, `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+const statePath = process.env.DEV_BUMP_FAKE_GH_STATE;
+const callsPath = process.env.DEV_BUMP_FAKE_GH_CALLS;
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const cwdHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: process.cwd(), encoding: 'utf8' }).stdout.trim();
+fs.appendFileSync(callsPath, JSON.stringify({ args, cwdHead }) + '\\n');
+if (args[0] !== 'pr') process.exit(2);
+if (args[1] === 'list') {
+  if (args.includes('--jq')) console.log(state.head ? 'https://github.com/example/repo/pull/42' : '');
+  else console.log(state.head ? JSON.stringify([{ url: 'https://github.com/example/repo/pull/42' }]) : '[]');
+  process.exit(0);
+}
+if (args[1] === 'create') {
+  state.head = cwdHead; state.number = 42; state.branch = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: process.cwd(), encoding: 'utf8' }).stdout.trim();
+  state.isDraft = args.includes('--draft'); state.state = 'OPEN';
+  fs.writeFileSync(statePath, JSON.stringify(state)); console.log('https://github.com/example/repo/pull/42'); process.exit(0);
+}
+if (args[1] === 'ready') {
+  if (state.failReady) { console.error('ready refused'); process.exit(1); }
+  if (state.head !== cwdHead || !state.isDraft) { console.error('ready head/draft mismatch'); process.exit(1); }
+  state.isDraft = false; fs.writeFileSync(statePath, JSON.stringify(state));
+  console.log('https://github.com/example/repo/pull/42'); process.exit(0);
+}
+if (args[1] === 'view') {
+  const jsonAt = args.indexOf('--json');
+  const fields = jsonAt >= 0 ? args[jsonAt + 1].split(',') : [];
+  const result = { headRefOid: state.head, state: state.state, isDraft: state.isDraft, headRefName: state.branch || 'version-dev-bump',
+    baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', url: 'https://github.com/example/repo/pull/42', labels: [],
+    headRepository: { nameWithOwner: 'example/repo' }, mergeCommit: state.state === 'MERGED' ? { oid: state.head } : null };
+  if (args.includes('--jq')) {
+    const expr = args[args.indexOf('--jq') + 1];
+    if (expr === '.baseRefName') console.log(result.baseRefName);
+    else if (expr === '.mergeable') console.log(result.mergeable);
+    else if (expr.includes('mergeStateStatus')) console.log('MERGEABLE CLEAN');
+    else console.log('');
+  } else console.log(JSON.stringify(Object.fromEntries(fields.map((field) => [field, result[field]]))));
+  process.exit(0);
+}
+if (args[1] === 'merge') {
+  const pinned = args[args.indexOf('--match-head-commit') + 1];
+  if (!state.head || state.head !== pinned || cwdHead !== pinned || state.isDraft) {
+    console.error('pinned head mismatch'); process.exit(1);
+  }
+  const update = spawnSync('git', ['--git-dir', process.env.DEV_BUMP_FAKE_GH_REMOTE, 'update-ref', 'refs/heads/main', pinned], { encoding: 'utf8' });
+  if (update.status !== 0) { process.stderr.write(update.stderr); process.exit(1); }
+  state.state = 'MERGED'; fs.writeFileSync(statePath, JSON.stringify(state));
+  console.log('✓ merged'); process.exit(0);
+}
+if (args[0] === 'api') process.exit(0);
+console.error('unsupported fake gh: ' + args.join(' ')); process.exit(2);
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  // Build a full source fixture so the production CLI's real checks see the same files. Git pushes
+  // and fetches stay inside the temporary bare remote; only GitHub's `gh` boundary is faked.
+  const excluded = new Set(['.git', '.elanous', '.elanous-test', '.gate-artifacts', 'node_modules', 'coverage', 'dist', '.next', '.turbo']);
+  cpSync(project, seed, { recursive: true, filter: (source) => {
+    const path = relative(project, source);
+    return !path || !path.split(sep).some((part) => excluded.has(part));
+  } });
+  const packageJson = JSON.parse(readFileSync(join(project, 'package.json'), 'utf8')) as { version: string };
+  packageJson.version = '0.2.4';
+  writeFileSync(join(seed, 'package.json'), `${JSON.stringify(packageJson, null, 2)}\n`);
+  git(seed, ['add', '-A']);
+  const committed = spawnSync('git', ['commit', '-m', 'simulation source fixture'], {
+    cwd: seed, env: { ...process.env, ...gitEnv, GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z' },
+    stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
+  });
+  if (committed.status !== 0 || committed.error) throw new Error(`could not commit dev-bump simulation source: ${committed.stderr}`);
+  git(seed, ['push', 'origin', 'main']);
+  git(checkout, ['remote', 'set-url', 'origin', 'git@github.com:example/repo.git']);
+  gitEnv.GIT_SSH_COMMAND = fakeSshPath;
+  gitEnv.GIT_ALLOW_PROTOCOL = 'file:ssh';
+  git(checkout, ['config', 'core.sshCommand', fakeSshPath]);
+  git(checkout, ['fetch', 'origin']);
+  git(checkout, ['config', 'user.email', 'test@example.com']);
+  git(checkout, ['config', 'user.name', 'Test User']);
+
+  writeFileSync(statePath, JSON.stringify({ head: null, state: 'OPEN', isDraft: false, failReady }));
+  writeFileSync(callsPath, '');
+  const priorEnv = { ...process.env };
+  const stateRoot = join(fixtureRemote.root, 'state');
+  mkdirSync(stateRoot);
+  process.env.PATH = `${fakeBin}:${process.env.PATH}`;
+  process.env.ELANOUS_STATE_DIR = stateRoot;
+  process.env.ELANOUS_CONFIG_DIR = stateRoot;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4' } });
+  process.env.DEV_BUMP_FAKE_GH_STATE = statePath;
+  process.env.DEV_BUMP_FAKE_GH_CALLS = callsPath;
+  process.env.DEV_BUMP_FAKE_GH_REMOTE = remote;
+  for (const [key, value] of Object.entries(gitEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  delete process.env.GIT_SSH;
+  try {
+    const ghPath = spawnSync('which', ['gh'], { encoding: 'utf8', env: process.env });
+    if (ghPath.status !== 0 || ghPath.stdout.trim() !== fakeGhPath)
+      throw new Error(`PATH resolved gh to ${ghPath.stdout.trim() || '(missing)'}, expected test fake ${fakeGhPath}`);
+    const ghProbe = spawnSync('gh', ['pr', 'list', '--head', 'simulation-probe', '--state', 'open', '--json', 'url', '--jq', '.[0].url // ""'], {
+      cwd: checkout, encoding: 'utf8', env: process.env,
+    });
+    if (ghProbe.status !== 0 || ghProbe.error) throw new Error(`fake-gh probe failed: ${ghProbe.stderr || ghProbe.error} (PATH=${process.env.PATH})`);
+    const run = spawnSync(process.execPath, [resolve(import.meta.dir, 'version-node.ts'), 'dev-bump', '--json'], {
+      cwd: checkout, encoding: 'utf8', env: process.env, timeout: 180_000, maxBuffer: 32 * 1024 * 1024,
+    });
+    const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { outcome?: string; kind?: string; version?: string; pr?: number | null; error?: string; worktree?: string };
+    const calls = readFileSync(callsPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { args: string[]; cwdHead: string });
+    if (output.worktree) scratch.push(dirname(output.worktree));
+    return { status: run.status, stderr: run.stderr, output, calls, state: JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown> & { head?: string }, mainPackage: git(checkout, ['show', 'origin/main:package.json']) };
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in priorEnv)) delete process.env[key];
+    Object.assign(process.env, priorEnv);
+  }
+}
+
+test('dev-bump runs the real CLI draft, ready, and pinned merge path against only a fake GitHub boundary', () => {
+  const { status, output, calls, state, mainPackage } = runRealDevBumpCliScenario();
+  expect(status).toBe(0);
+  expect(output).toMatchObject({ outcome: 'ok', kind: 'dev-bump', version: '0.2.5-dev.0', pr: 42 });
+  const create = calls.find(({ args }) => args[1] === 'create');
+  const ready = calls.find(({ args }) => args[1] === 'ready');
+  const merge = calls.find(({ args }) => args[1] === 'merge');
+  expect(create?.args).toContain('--draft');
+  expect(ready?.args).toEqual(['pr', 'ready', '42']);
+  expect(merge?.args.slice(0, 4)).toEqual(['pr', 'merge', '42', '--squash']);
+  const pin = merge?.args[merge.args.indexOf('--match-head-commit') + 1];
+  expect(pin).toMatch(/^[a-f0-9]{40}$/);
+  expect(create?.cwdHead).toBe(pin);
+  expect(ready?.cwdHead).toBe(pin);
+  expect(merge?.cwdHead).toBe(pin);
+  expect(state).toMatchObject({ head: pin, state: 'MERGED', isDraft: false });
+  expect(mainPackage).toContain('0.2.5-dev.0');
+}, 180_000);
+
+test('dev-bump records a real CLI ready-stage refusal with rc and stderr from fake-gh', () => {
+  const { status, output, calls, state } = runRealDevBumpCliScenario(true);
+  expect(status).toBe(1);
+  expect(output).toMatchObject({ outcome: 'error', kind: 'dev-bump', pr: null });
+  expect(output.error).toContain('dev-bump gh pr ready #42 failed (rc=1');
+  expect(output.error).toContain('stderr tail «ready refused\n[gh] pr ready FAILED rc=1»');
+  const create = calls.find(({ args }) => args[1] === 'create');
+  const ready = calls.find(({ args }) => args[1] === 'ready');
+  expect(create?.args).toContain('--draft');
+  expect(ready?.args).toEqual(['pr', 'ready', '42']);
+  expect(ready?.cwdHead).toBe(state.head);
+  expect(calls.some(({ args }) => args[1] === 'merge')).toBe(false);
+}, 180_000);
+
+test('dev-bump stage errors name the failed draft, ready, or pinned land step with rc and stderr tail', () => {
+  const draft = fixture('0.2.4', 'hold-fail');
+  const draftResult = draft.run('dev-bump', '--version', '0.2.4', '--json');
+  expect(draftResult.status).toBe(1);
+  expect(draftResult.output.error).toContain('dev-bump pr land --hold failed (rc=1');
+  expect(draftResult.output.error).toContain('stderr tail «draft PR create failed»');
+  expect(draftResult.calls).not.toContain('gh pr ready 42');
+  expect(draftResult.output.worktree).toBeString();
+  expect(existsSync(draftResult.output.worktree!)).toBe(true);
+  scratch.push(dirname(draftResult.output.worktree!));
+
+  const ready = fixture('0.2.4', 'ok', 'ok', 'fail');
+  const readyResult = ready.run('dev-bump', '--version', '0.2.4', '--json');
+  expect(readyResult.status).toBe(1);
+  expect(readyResult.output.error).toContain('dev-bump gh pr ready #42 failed (rc=1');
+  expect(readyResult.output.error).toContain('stderr tail «ready refused»');
+  expect(readyResult.calls).not.toContain('pr land --pr 42 --expected-head');
+  expect(readyResult.output.worktree).toBeString();
+  expect(existsSync(readyResult.output.worktree!)).toBe(true);
+  scratch.push(dirname(readyResult.output.worktree!));
+
+  const staleHead = fixture('0.2.4', 'ok', 'ok', 'head-drift');
+  const staleHeadResult = staleHead.run('dev-bump', '--version', '0.2.4', '--json');
+  expect(staleHeadResult.status).toBe(1);
+  expect(staleHeadResult.output.error).toContain('dev-bump pinned pr land failed (rc=1');
+  expect(staleHeadResult.output.error).toContain('stderr tail «expected head mismatch»');
+  expect(staleHead.ghCalls().at(-1)).toEqual(['pr', 'merge', '42', '--squash', '--match-head-commit', 'c'.repeat(40)]);
+  expect(staleHeadResult.output.worktree).toBeString();
+  expect(existsSync(staleHeadResult.output.worktree!)).toBe(true);
+  scratch.push(dirname(staleHeadResult.output.worktree!));
+
+  const merge = fixture('0.2.4', 'fail');
+  const mergeResult = merge.run('dev-bump', '--version', '0.2.4', '--json');
+  expect(mergeResult.status).toBe(1);
+  expect(mergeResult.output.error).toContain('dev-bump pinned pr land failed (rc=1');
+  expect(mergeResult.output.error).toContain('stderr tail «pinned merge rejected»');
+  expect(mergeResult.output.worktree).toBeString();
+  expect(existsSync(mergeResult.output.worktree!)).toBe(true);
+  scratch.push(dirname(mergeResult.output.worktree!));
+
+  const noMarker = fixture('0.2.4', 'no-marker');
+  const noMarkerResult = noMarker.run('dev-bump', '--version', '0.2.4', '--json');
+  expect(noMarkerResult.status).toBe(1);
+  expect(noMarkerResult.output.error).toContain('dev-bump pinned pr land failed (rc=0; merge marker missing');
+  expect(noMarkerResult.output.error).toContain('output tail «nothing merged»');
+  expect(noMarkerResult.output.worktree).toBeString();
+  expect(existsSync(noMarkerResult.output.worktree!)).toBe(true);
+  scratch.push(dirname(noMarkerResult.output.worktree!));
 });
 
 test('dev-bump removes released lines but keeps Target: later and the next.md skeleton in the landing', () => {

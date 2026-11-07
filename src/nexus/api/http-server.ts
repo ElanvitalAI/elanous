@@ -79,11 +79,6 @@ import {
   type WorkflowDesignRouteOpts,
 } from './workflow-design.js';
 import {
-  handleMissionShowroom,
-  parseMissionShowroomPath,
-  type MissionShowroomRouteOpts,
-} from './mission-showroom.js';
-import {
   handleDevices,
   handleTemplateCapabilityPreview,
   isDevicesPath,
@@ -91,11 +86,6 @@ import {
   type DevicesRouteOpts,
 } from './devices.js';
 import { handleUxSimDevices, isUxSimDevicesPath } from './ux-sim-devices.js';
-import {
-  handleMissionsTest,
-  isMissionsTestPath,
-  type MissionsTestRouteOpts,
-} from './missions-emit.js';
 import {
   handleConversationStats,
   isConversationStatsPath,
@@ -162,9 +152,7 @@ import {
   type DashboardRouteOpts,
 } from './dashboard.js';
 import {
-  handleTriagePreview,
   handleAutopilotGet,
-  handleMissionAction,
   parseAutopilotPath,
 } from './autopilot-api.js';
 import {
@@ -238,7 +226,9 @@ import { handleExecRequests } from './exec-requests.js';
 import { handleSeatRequests, SEAT_REQUESTS_PATH, type SeatRequestsDeps } from './seat-requests.js';
 import { handleConsultRequests, CONSULT_REQUESTS_PATH, type ConsultRequestsDeps } from './consult-requests.js';
 import { ExecRequestRunner } from '../../exec-requests/runner.js';
-import { FIELD_SERVER_MAX_BODY_BYTES, FIELD_UPLOADS_PATH, FIELD_REEL_PATH, FIELD_REEL_FILE_PATH, handleFieldUploads } from './field-uploads.js';
+import { FIELD_SERVER_MAX_BODY_BYTES, FIELD_UPLOADS_PATH, FIELD_REEL_PATH, FIELD_REEL_FILE_PATH, handleFieldUploads, handleAppUploads, isAppUploadsPath } from './field-uploads.js';
+import { createAppUpload } from '../apps/app-upload.js';
+import { resolveStorageConfig } from '../../storage/object-store.js';
 import { handleLiveDetail, LIVE_DETAIL_PATH } from './live-detail.js';
 import { handleLiveShipped, LIVE_SHIPPED_PATH } from './live-shipped.js';
 import { handleMcpWidgetCall, MCP_WIDGET_CALL_ROUTE_PATH, persistWidgetTurnToSessionStore } from './mcp-widget-call-route.js';
@@ -308,7 +298,6 @@ import { isPublicRoute } from './public-routes.js';
 import { handleSchedulesActionPost } from './schedules-action.js';
 import { handleSchedulesList, handleScheduleDetail, handleScheduleRuns } from './schedules-read.js';
 import { handleIntakeRunsList } from './intake-runs.js';
-import { handleMissionsList, handleMissionDetail } from './missions.js';
 import { handleSessionsStoreList, handleSessionsStoreGet, handleSessionsStoreFork, handleSessionsStoreDelete, handleSessionsStorePatch } from './sessions-store.js';
 import { handleLogsQuery, handleLogsStream, handleLogsLevelGet, handleLogsLevelPost, handleLogsFacets, handleLogsHistogram, handleLogsInstances } from './log-fabric.js';
 import { handleTrace, handleTraceEvidence } from './trace.js';
@@ -504,7 +493,7 @@ export interface NexusHttpServerOpts {
   projectFolderRoots?: string[];
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
-  /** Mission-addressed hand line storage; production uses the current instance state root. */
+  /** Agent-mission line state root; the scoped POST remains independent of mission CRUD APIs. */
   missionLineRoot?: string;
   outputs?: OutputsDeps;
   /** Read-only grid measurement seam; omitted in production for live HQ and Pod pool reads. */
@@ -582,6 +571,8 @@ export interface NexusHttpServerOpts {
   /** NEXUS-APP-HOST-S1 — app static exports are routed only on their dedicated
    *  `<slug>.app.localhost` hostname. Known app hosts never fall through to PWA/API routes. */
   appHost?: NexusAppHost;
+  /** Ordered app-scoped route handlers. Backends register here so host dispatch stays centralized. */
+  appRoutes?: readonly ((request: Request) => Response | undefined | Promise<Response | undefined>)[];
   /** P-2D.2 — runtime mutable ref for the dev-proxy upstream.
    *  Replaced the static `devProxy: {upstream}` option so admin
    *  HTTP calls (`POST /v1/nexus/admin/pwa-dev-proxy`) can flip the
@@ -651,24 +642,11 @@ export interface NexusHttpServerOpts {
   /** W9 Z6 (#2429) — `POST /v1/workflows/:name/design` deps. When
    *  omitted the endpoint returns 503. */
   workflowDesign?: WorkflowDesignRouteOpts;
-  /** W9b Z2 (#2439) — Mission Deliberation Room endpoints
-   *  (`GET /v1/missions/:id/showroom` + `POST .../deliberate` + `POST
-   *  .../decision` + `POST .../archive`). Wires the mission resolver
-   *  + persona loader + room store. */
-  missionShowroom?: MissionShowroomRouteOpts;
   /** W9c Z13-d (#2445) — `GET /v1/devices` + `POST /v1/templates/
    *  capability-preview` deps. Wires the device fleet source
    *  (`~/.elanous/devices.json` reader); when omitted both endpoints
    *  return 503. */
   devices?: DevicesRouteOpts;
-  /** cascade-zyu W8-A 옵션 A (2026-05-14) — `POST /v1/missions/test`
-   *  mock emitter for the iOS Companion shell's "Test Mission" button.
-   *  Emits a 5-step progress mission.update envelope chain over ~30s so
-   *  the Dynamic Island Live Activity can be dogfooded without a real
-   *  mission orchestrator. Wired in runNexus from
-   *  `getActiveAcpFeedbackBroadcaster()`. When omitted (no ACP peer up)
-   *  the endpoint returns 503. */
-  missionsTest?: MissionsTestRouteOpts;
   /** W9c Z13-a (#2447) — `POST /v1/next-fluent/preview` deps. Wires
    *  the lane callable + next-action source. When omitted returns 503. */
   nextFluent?: NextFluentRouteOpts;
@@ -1029,30 +1007,38 @@ export async function routeRequest(
   // NEXUS-APP-HOST-S1 — app host is a separate hostname/origin from the PWA.
   // Handle it before owner API routing; an app-host request must never reach /v1.
   const appResponse = opts.appHost?.handle(req);
-  if (appResponse) return appResponse;
-  // Mission lines use a scoped per-mission bearer issued by the mission
-  // parent, not the owner/API bearer checked by the general scope guard.
+  const resolvedAppResponse = appResponse instanceof Promise ? await appResponse : appResponse;
+  if (resolvedAppResponse) return resolvedAppResponse;
+  const requestPath = new URL(req.url).pathname;
+  // Signed app-storage uploads use their own path so the bearer-authenticated
+  // app API never shares credentials with the object PUT, but both endpoints
+  // are consumers of the same appRoutes registry.
+  if (requestPath.startsWith('/v1/apps/') || requestPath.startsWith('/_app-storage/')) {
+    for (const appRoute of opts.appRoutes ?? []) {
+      const response = await appRoute(req);
+      if (response) return response;
+    }
+  }
+  // The agent-mission line is still used by mission-out and hand hooks. Its
+  // scoped token and SSE event remain live even though mission CRUD routes retire.
   if (new URL(req.url).pathname.startsWith('/v1/missions/')) {
-    // MissionOutStore uses effectiveInstanceRoot too; share the resolver
-    // directly so custom ELANOUS_STATE_DIR/config-dir cannot split the token
-    // authority from the reply ledger.
     const root = opts.missionLineRoot ?? effectiveInstanceRoot();
     const response = await handleMissionLineRequest(req, root, async (input, authority) => {
       const { createMissionOutStore, MissionReplyStateError } = await import('../../agent-mission/mission-out.js');
       const reply = await createMissionOutStore(root).reply(input.missionId, input.text, input.type === 'final', {
-          lineId: input.lineId,
-          ...(input.runId ? { runId: input.runId } : {}), ...(input.ptyId ? { ptyId: input.ptyId } : {}),
-          ...(input.replyTo ? { replyTo: input.replyTo } : {}),
-          attemptId: input.attemptId, agent: input.agent, lineType: input.type, source: input.source,
-          ...(input.kind ? { kind: input.kind } : {}),
-          ...(input.defaults ? { defaults: input.defaults } : {}),
-          ...(input.deadline ? { deadline: input.deadline } : {}),
-          ...(input.scope ? { scope: input.scope } : {}),
-          ...(input.stop !== undefined ? { stop: input.stop } : {}),
-          ...(input.priority ? { priority: input.priority } : {}),
-          ...(input.state ? { state: input.state } : {}), who: authority.who, what: authority.what,
-          ...(input.type === 'ask' || input.type === 'answer' || input.type === 'correct' ? { kind: input.type } : {}),
-        }).catch((error: unknown) => {
+        lineId: input.lineId,
+        ...(input.runId ? { runId: input.runId } : {}), ...(input.ptyId ? { ptyId: input.ptyId } : {}),
+        ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+        attemptId: input.attemptId, agent: input.agent, lineType: input.type, source: input.source,
+        ...(input.kind ? { kind: input.kind } : {}),
+        ...(input.defaults ? { defaults: input.defaults } : {}),
+        ...(input.deadline ? { deadline: input.deadline } : {}),
+        ...(input.scope ? { scope: input.scope } : {}),
+        ...(input.stop !== undefined ? { stop: input.stop } : {}),
+        ...(input.priority ? { priority: input.priority } : {}),
+        ...(input.state ? { state: input.state } : {}), who: authority.who, what: authority.what,
+        ...(input.type === 'ask' || input.type === 'answer' || input.type === 'correct' ? { kind: input.type } : {}),
+      }).catch((error: unknown) => {
         if (error instanceof MissionReplyStateError) throw new MissionLineHttpError(error.status);
         throw error;
       });
@@ -1237,6 +1223,28 @@ export async function routeRequest(
     return handleInsideEvents(req);
   }
 
+  const appInvitationMatch = /^\/v1\/nexus\/apps\/([a-z0-9-]+)\/invitations$/.exec(pathname);
+  if (appInvitationMatch) {
+    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.appHost) return jsonResponse({ error: 'app-host-not-wired' }, 503);
+    let body: unknown;
+    try { body = await req.json(); } catch { return jsonResponse({ error: 'invalid-json' }, 400); }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonResponse({ error: 'invalid-invitation' }, 400);
+    const input = body as Record<string, unknown>;
+    if (typeof input.invitedBy !== 'string' || !input.invitedBy.trim()
+      || (input.role !== undefined && (typeof input.role !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(input.role)))
+      || (input.ttlMs !== undefined && (typeof input.ttlMs !== 'number' || !Number.isSafeInteger(input.ttlMs)))) {
+      return jsonResponse({ error: 'invalid-invitation' }, 400);
+    }
+    try {
+      const invitation = opts.appHost.issueInvitation(appInvitationMatch[1]!, input.invitedBy, input.ttlMs as number | undefined, input.role as string | undefined);
+      return jsonResponse({ invitation }, 201);
+    } catch {
+      return jsonResponse({ error: 'invalid-invitation' }, 400);
+    }
+  }
+
   if (pathname === LIVE_SHIPPED_PATH) {
     return handleLiveShipped(req, { authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) });
   }
@@ -1269,6 +1277,16 @@ export async function routeRequest(
     return handleGraphApprovals(req, {
       authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
       authReason: (request) => (opts.metaApi ? bearerCredential(request, opts.metaApi) : undefined),
+    });
+  }
+  if (isAppUploadsPath(pathname)) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) {
+      return handleAppUploads(req, { authorize: () => false });
+    }
+    const appUpload = createAppUpload({ config: resolveStorageConfig(getUserConfig() as Parameters<typeof resolveStorageConfig>[0]) });
+    return handleAppUploads(req, {
+      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      appUpload,
     });
   }
   // 현장 업로드(owner 전용) — GET 목록 · POST 저장. 저장 규칙 정본 = src/field/field-media.ts.
@@ -2264,18 +2282,7 @@ export async function routeRequest(
       if (!opts.workflowDesign) return jsonResponse({ error: 'workflow-design-not-wired' }, 503);
       return handleWorkflowDesign(req, workflowDesignName, opts.workflowDesign);
     }
-    // W9b Z2 (#2439) — Mission Deliberation Room (4 sub-routes).
-    const missionShowroomRoute = parseMissionShowroomPath(pathname);
-    if (missionShowroomRoute !== null) {
-      if (!opts.missionShowroom) return jsonResponse({ error: 'mission-showroom-not-wired' }, 503);
-      return handleMissionShowroom(req, missionShowroomRoute, opts.missionShowroom);
-    }
     // W9c Z13-d (#2445) — Template capability preview.
-    // cascade-zyu W8-A 옵션 A — POST /v1/missions/test mock emitter.
-    if (isMissionsTestPath(pathname)) {
-      if (!opts.missionsTest) return jsonResponse({ error: 'missions-test-not-wired' }, 503);
-      return handleMissionsTest(req, opts.missionsTest);
-    }
     // W8-A 후속 #5 (2026-05-14) — GET /v1/agent-cli/conversation-stats?chatId=
     // per-backend usage count for iOS picker hint. 사용자 prior pattern visibility.
     if (isConversationStatsPath(pathname)) {
@@ -2549,15 +2556,6 @@ export async function routeRequest(
     // POST 라 mutation 블록 안(memory `feedback_post_route_must_be_in_method_block`).
     if (pathname === '/v1/schedules/action' && method === 'POST') {
       return handleSchedulesActionPost(req);
-    }
-    // Autopilot Phase B1 (2026-07-09) — 골 → 실행모델 triage 미리보기(휴리스틱·무LLM).
-    // POST 라 mutation 블록 안(memory `feedback_post_route_must_be_in_method_block`).
-    if (pathname === '/v1/autopilot/triage-preview' && method === 'POST') {
-      return handleTriagePreview(req);
-    }
-    if (pathname === '/v1/autopilot/mission-action' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      return handleMissionAction(req);
     }
     // 흡수 원장 입구(RFC-pwa-intake-front-door A3 absorb) — 넣기·추적 둘 다 인증(PWA 칸은 user-private).
     if (pathname === '/v1/intake-ledger/items' && method === 'POST') {
@@ -2968,19 +2966,6 @@ export async function routeRequest(
   if (pathname === '/v1/intake/runs') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
     return handleIntakeRunsList(req, opts.metaApi);
-  }
-  // M4-3 (2026-05-12) — Mission ↔ workflow folder surface. Reads
-  // ~/.elanous/tasks/tasks.db (TOX_SCHEMA_VERSION=2 · tox_missions
-  // table) + joins per-mission task summaries. Sibling to /v1/tasks.
-  if (pathname === '/v1/missions') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    return handleMissionsList(req, opts.metaApi);
-  }
-  if (pathname.startsWith('/v1/missions/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    const missionId = pathname.slice('/v1/missions/'.length);
-    if (!missionId) return jsonResponse({ error: 'missing_mission_id' }, 400);
-    return handleMissionDetail(req, missionId, opts.metaApi);
   }
   // D8 (2026-05-12) — Phase 2 dispatch dogfood retrospective. Sibling
   // to /v1/intake/runs (I10). Reads ~/.elanous/dispatch/runs.jsonl +

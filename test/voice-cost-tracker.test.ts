@@ -21,7 +21,6 @@ import {
 import { costForStt } from '../src/models/voice-costs.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../src/instance/resolve.js';
-import { voiceCostSegment } from '../src/status/bar.js';
 
 function tmpEventPath(): { path: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), 'voice-cost-tracker-'));
@@ -206,27 +205,6 @@ describe('PR-S1V.5 · voice cost-tracker · JSONL persist + replay', () => {
     } finally {
       cleanup();
     }
-  });
-});
-
-describe('PR-S1V.5 · voiceCostSegment renderer', () => {
-  test('returns empty when usd is 0 / negative / non-finite', () => {
-    expect(voiceCostSegment(0)).toBe('');
-    expect(voiceCostSegment(-1)).toBe('');
-    expect(voiceCostSegment(Number.NaN)).toBe('');
-    expect(voiceCostSegment(Number.POSITIVE_INFINITY)).toBe('');
-  });
-
-  test('formats sub-cent values as <$0.01', () => {
-    const out = voiceCostSegment(0.0001);
-    expect(out).toContain('<$0.01');
-    expect(out).toContain('🎙');
-    expect(out).toContain('/mo');
-  });
-
-  test('formats round dollars with 2 decimals', () => {
-    expect(voiceCostSegment(0.42)).toContain('$0.42/mo');
-    expect(voiceCostSegment(12.345)).toContain('$12.35/mo'); // rounds half-up via toFixed
   });
 });
 

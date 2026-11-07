@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { registerSimCommands } from './sim-cli.js';
 import { listMockDeviceRequests } from '../ux-sim/mock-device-requests.js';
+import { createWorld } from '../ux-sim/world.js';
+import { appendSimWorldWatchEvents } from '../ux-sim/world-watch.js';
 
 const roots: string[] = [];
 const originalLog = console.log;
@@ -22,6 +24,37 @@ afterEach(() => {
 });
 
 describe('sim world CLI', () => {
+  test('sim watch streams world observation rows from the isolated test world', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-world-watch-'));
+    roots.push(root);
+    priorTestRoot = getTestStateRoot();
+    setTestStateRoot(root);
+    const worldFile = join(root, 'watched-world.yaml');
+    writeFileSync(worldFile, 'world: watched-world\ndevices: [fake-clock]\nevents: []\n', { mode: 0o600 });
+    const world = await createWorld(worldFile);
+    appendSimWorldWatchEvents(world, 'run-watch-1', [
+      { event: 'gate-node', verdict: 'passed' },
+      { event: 'release-event', verdict: 'injected' },
+      { event: 'release-event', verdict: 'injected' },
+    ]);
+    const output: string[] = [];
+    const errors: string[] = [];
+    console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
+    process.exitCode = 0;
+    const program = new Command();
+    registerSimCommands(program);
+
+    await program.parseAsync(['node', 'test', 'sim', 'watch', world.id, '--once']);
+    expect(output).toHaveLength(3);
+    expect(output[0]).toContain('run-watch-1 · gate-node · passed');
+    expect(output[1]).toContain('run-watch-1 · release-event · injected');
+    expect(output[2]).toContain('run-watch-1 · release-event · injected');
+    expect(new Set(output.map((line) => line.match(/^\[([^\]]+)\]/)?.[1])).size).toBe(3);
+    expect(errors).toEqual([]);
+    expect(process.exitCode).toBe(0);
+  });
+
   test('sim coverage reports an empty test universe and queues uncovered modules', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sim-coverage-cli-'));
     roots.push(root);
@@ -66,14 +99,16 @@ describe('sim world CLI', () => {
     const run = JSON.parse(readFileSync(result.cases[0]!.statePath, 'utf8')) as {
       path: string[]; nodes: Array<{ nodeId: string; output?: string }>;
     };
-    const outputFor = (nodeId: string) => JSON.parse(run.nodes.find((node) => node.nodeId === nodeId)!.output!);
+    const outputFor = (nodeId: string) => JSON.parse([...run.nodes].reverse().find((node) => node.nodeId === nodeId && node.output !== undefined)!.output!);
     const failureIds = [
       'src/auth/session.test.ts > rejects expired sessions',
       'src/graph/runner.test.ts > preserves failed edge attribution',
       'src/ux-sim/release.test.ts > blocks publish after a gate regression',
     ];
-    expect(run.path).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate',
-      'gate-triage', 'traffic-failed-restore', 'failed']);
+    expect(run.path.slice(0, 6)).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate']);
+    expect(run.path[6]).toBe('gate-triage');
+    expect(run.path[7]).toMatch(/^gate-repair-[a-f0-9]{12}$/);
+    expect(run.path.slice(8)).toEqual(['gate', 'gate-triage', 'traffic-failed-restore', 'failed']);
     expect(result.cases[0]!.dispatchedNodes).toEqual(expect.arrayContaining(['checklist-gate', 'prefetch']));
     expect(outputFor('gate')).toMatchObject({ introduced: failureIds, autoheal: { action: 'hitl', cause: 'true-regression' } });
     expect(outputFor('gate-triage')).toMatchObject({ introduced: failureIds, failureIds,

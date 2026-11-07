@@ -4,7 +4,7 @@ import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import * as coreTurn from '../core-turn/index.js';
+import * as coreTurn from '../core-turn/run-core-turn.js';
 import { debug } from '../debug/log.js';
 import { createSession } from '../session/index.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';

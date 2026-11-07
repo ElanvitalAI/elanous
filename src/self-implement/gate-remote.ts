@@ -8,7 +8,7 @@ import { loadavg } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
-import { gateHostReservationRoot, inspectReleaseGateHost, readGateHostResourcesForHost, type GateHostResourceReading } from '../release-loop/gate-host-reservation.js';
+import { ensureGateHostReservationDirectory, gateHostReservationRoot, inspectReleaseGateHost, readGateHostResourcesForHost, type GateHostResourceReading } from '../release-loop/gate-host-reservation.js';
 import type { GateRemoteConfig } from '../user-config.js';
 
 export type GateRemoteTool = 'self-gate' | 'ci-typecheck-changed' | 'public-export-test-run';
@@ -654,6 +654,13 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   const reservationRoot = opts.tool === 'self-gate' || opts.tool === 'ci-typecheck-changed'
     ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
   if (reservationRoot) {
+    try { ensureGateHostReservationDirectory(reservationRoot); }
+    catch (error) {
+      const reason = `reservation directory initialization failed: ${String(error)}`;
+      debug.log('gate.remote', 'host-reservation-unmeasured', { host, reason });
+      write.err(`[gate.remote] remote unmeasured — ${reason}\n`);
+      return 1;
+    }
     type ReservationObservation = { status: 'free'; probeFailed: boolean; probeFailure?: string }
       | { status: 'reserved' | 'unknown'; reason: string; runId?: string; reservedAt?: number; podReservations?: number };
     const resourceStatus = (target: string) => {

@@ -21,6 +21,7 @@ import {
   createFeedbackStore,
   INTENT_BUTTON_LABELS,
 } from '../src/intent-prediction/index.js';
+import { expectMalformedJson400 } from './helpers/http-error-contract';
 
 function makeService() {
   return createIntentPredictionService({
@@ -177,7 +178,7 @@ describe('handleNotificationAction', () => {
         body: 'not json{',
       });
       const res = await handleNotificationAction(req, { service });
-      expect(res.status).toBe(400);
+      await expectMalformedJson400(res);
     } finally {
       service.dispose();
     }

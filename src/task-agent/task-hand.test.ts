@@ -7,7 +7,6 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { defaultTaskLauncher, registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
-import { registerAutopilotCommands } from '../cli/autopilot-cli.js';
 import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -2920,46 +2919,6 @@ test('TIER-SPLIT (f) 분해기 미배선(seam undefined 명시) = decomposer-una
       expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'whole', reason: 'decomposer-unavailable', slices: [], unavoidable: [],
         countScope: 'accepted-slices', totalSlices: 0, highSlices: 0, unavoidableCount: 0, unavoidableReasons: [] }]);
     } finally { h.off(); }
-  }
-});
-
-test('OP entrance tick records all reviewed candidates separately from dispatched actions', async () => {
-  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { Command } = await import('commander');
-  const dir = mkdtempSync(join(tmpdir(), 'entrance-tick-'));
-  mkdirSync(join(dir, '.elanous-test'), { recursive: true });
-  const config = join(dir, 'config');
-  mkdirSync(config, { recursive: true });
-  setElanousConfigDir(config);
-  const events: Array<{ category: string; data: Record<string, unknown> }> = [];
-  const launches: string[][] = [];
-  const off = debug.registerSink({ name: 'entrance-denominator-integration', emit: record => {
-    if (record.category === 'task-agent') events.push({ category: record.category, data: record.data as Record<string, unknown> });
-  } });
-  try {
-    const candidates = [0, 1, 2].map(index => ({
-      action: { kind: 'retry' as const, variant: 'narrow' as const, taskId: `tick-${index}`, rationale: 'tick fixture', pr: 0, runId: `run-${index}`, original: 'goal', checklistId: '' },
-      ...(index === 2 ? { refusal: 'candidate policy refusal' } : {}),
-    }));
-    const program = new Command().name('elanous').exitOverride();
-    registerAutopilotCommands(program, { registerSink: async () => true, actionDeps: {
-      mode: 'live', command: async args => { launches.push(args); return { status: 0, stdout: 'launched' }; },
-      observe: (event, data) => events.push({ category: event, data: data as unknown as Record<string, unknown> }),
-    } });
-    const originalExit = process.exitCode;
-    process.exitCode = 0;
-    await program.parseAsync(['node', 'elanous', 'autopilot', 'task-agent-action', JSON.stringify(candidates)]);
-    process.exitCode = originalExit ?? 0;
-    const denominator = events.map(event => event.data).find(data => data.kind === 'entrance-tick');
-    expect(denominator).toMatchObject({ reviewed: 3, allowed: 2, refused: 1, reasons: { 'candidate policy refusal': 1 } });
-    expect(events.filter(event => event.data.kind === 'retry')).toHaveLength(2);
-    expect(launches).toHaveLength(2);
-    expect(launches.every(args => args[0] === 'harness' && args[1] === 'say')).toBe(true);
-  } finally {
-    off();
-    resetElanousConfigDir();
   }
 });
 

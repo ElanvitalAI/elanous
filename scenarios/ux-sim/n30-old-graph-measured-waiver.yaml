@@ -1,0 +1,15 @@
+version: 1
+kind: release-graph
+id: n30-old-graph-measured-waiver-0311
+isolation: test
+input:
+  version: '0.2.45'
+  previousVersion: '0.2.44'
+cases:
+  - id: old-graph-measured-waiver-stops-before-resume-dispatch
+    mode: old-graph-measured-waiver
+    expect:
+      status: resume-refused
+      mustVisit: [version-release, gate]
+      mustNotVisit: [known-issues, publish]
+      refusalIncludes: waived node must reach known-issues before publication

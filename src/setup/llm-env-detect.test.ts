@@ -31,7 +31,17 @@ describe('11-04 setup service catalog', () => {
       expect(item.usedBy.length).toBeGreaterThan(0);
       expect(item.verification.length).toBeGreaterThan(0);
     }
-    expect(JSON.stringify(SERVICE_KEY_CATALOG)).not.toMatch(/secret|token-value|api-key-value/i);
+    const metadataWithoutAllowedHiggsfieldSlot = JSON.stringify(SERVICE_KEY_CATALOG).replace(/higgsfield\.secret/g, '');
+    expect(metadataWithoutAllowedHiggsfieldSlot).not.toMatch(/secret|token-value|api-key-value/i);
+    expect(SERVICE_KEY_CATALOG.find(item => item.id === 'elevenlabs')?.appAttachable).toBe(true);
+    const higgsfield = SERVICE_KEY_CATALOG.find(item => item.id === 'higgsfield');
+    expect(higgsfield?.kind).toBe('api-key');
+    expect(higgsfield?.envNames).toEqual([]);
+    expect(higgsfield?.storeIds).toEqual(['higgsfield.key_id', 'higgsfield.secret']);
+    expect(higgsfield?.verification).toContain('HTTP 상태 코드만');
+    expect(higgsfield?.verification).toContain('응답 본문 미기록');
+    expect(higgsfield?.appAttachable).toBe(true);
+    expect(SERVICE_KEY_CATALOG.filter(item => item.appAttachable).map(item => item.id)).toEqual(['openai-api', 'elevenlabs', 'higgsfield']);
   });
 
   test('manual catalog table stays identical to the runtime catalog', () => {

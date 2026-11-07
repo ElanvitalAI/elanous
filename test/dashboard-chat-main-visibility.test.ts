@@ -13,7 +13,6 @@ describe('chat-main visibility helpers', () => {
       blockingForegroundModalOpen: false,
       pluginActive: true,
       chordArmed: false,
-      voiceModeActive: false,
       vwLocalComposerActive: true,
       overlayInputActive: false,
     })).toEqual({
@@ -21,7 +20,6 @@ describe('chat-main visibility helpers', () => {
       blockingForegroundModalOpen: false,
       pluginActive: true,
       chordArmed: false,
-      voiceModeActive: false,
       vwLocalComposerActive: true,
       overlayInputActive: false,
       inputOwnership: {
@@ -151,16 +149,6 @@ describe('chat-main visibility helpers', () => {
       blockingForegroundModalOpen: false,
       pluginActive: false,
       chordArmed: true,
-    })).toBe(false);
-  });
-
-  test('auto-entry stays off while voice mode is active', () => {
-    expect(shouldAutoEnterChatMainInput({
-      workingFocus: 'input',
-      blockingForegroundModalOpen: false,
-      pluginActive: false,
-      chordArmed: false,
-      voiceModeActive: true,
     })).toBe(false);
   });
 

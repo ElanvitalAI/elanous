@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { formatVerifyUrlReport, verifyDeployedPage } from './browser-verify.js';
+import { CDP_LOAD_WAIT_TIMEOUT_MS, formatVerifyUrlReport, verifyDeployedPage } from './browser-verify.js';
 import { CdpUnavailable, type CdpClient, type CdpEventListener } from '../browser-cdp/client.js';
 import { debug } from '../debug/log.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
@@ -73,7 +73,7 @@ function fakeClient(over: FakeOptions = {}): CdpClient {
         over.events?.push('load');
         listeners.get('Page.loadEventFired')?.({ method: 'Page.loadEventFired', params: {} });
       };
-      if (over.emitLoad) {
+      if (over.emitLoad ?? true) {
         if (over.emitLoadAfterNavigate) {
           setTimeout(emitLoad, over.loadDelayMs ?? 0);
         } else {
@@ -178,20 +178,20 @@ describe('verifyDeployedPage (B2)', () => {
     await withSimClock(0, async (clock) => {
       const events: string[] = [];
       const verification = verifyDeployedPage('https://load-timeout.vercel.app', {
-        connect: async () => fakeClient({ navigateDelayMs: 75, events }),
+        connect: async () => fakeClient({ navigateDelayMs: 75, emitLoad: false, events }),
       });
       await Promise.resolve();
-      clock.tick(75); // real fakeClient.navigate delay, now complete
+      clock.tick(75); // fakeClient.navigate delay, now complete
       await Promise.resolve();
       await Promise.resolve();
       expect(events).toEqual(['navigate-start', 'navigate-complete']);
-      clock.tick(2_999);
+      clock.tick(CDP_LOAD_WAIT_TIMEOUT_MS - 1);
       expect(events).toEqual(['navigate-start', 'navigate-complete']);
       clock.tick(1); // actual waitForCdpLoad timeout
       const r = await verification;
       expect(r).toMatchObject({ ok: true, title: 'Deployed Page', bodyLength: 500 });
       expect(events).toEqual(['navigate-start', 'navigate-complete', 'evaluate', 'screenshot']);
-      expect(clock.now()).toBe(3_075);
+      expect(clock.now()).toBe(CDP_LOAD_WAIT_TIMEOUT_MS + 75);
     });
   });
 
@@ -202,7 +202,13 @@ describe('verifyDeployedPage (B2)', () => {
     });
     try {
       await verifyDeployedPage('https://load-event.vercel.app', { connect: async () => fakeClient({ emitLoad: true }) });
-      await verifyDeployedPage('https://load-timeout.vercel.app', { connect: async () => fakeClient() });
+      await withSimClock(0, async (clock) => {
+        const verification = verifyDeployedPage('https://load-timeout.vercel.app', { connect: async () => fakeClient({ emitLoad: false }) });
+        for (let turn = 0; turn < 5 && clock.pendingTimers() === 0; turn++) await Promise.resolve();
+        expect(clock.pendingTimers()).toBe(1);
+        clock.tick(CDP_LOAD_WAIT_TIMEOUT_MS);
+        await verification;
+      });
     } finally {
       log.mockRestore();
     }

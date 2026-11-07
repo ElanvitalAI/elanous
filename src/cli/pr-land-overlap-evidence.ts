@@ -168,7 +168,13 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
       return !failed.ok && /^review-(?:verdict-fail|must-fix-[1-9][0-9]*)$/.test(failed.reason)
         && reviewAttemptHasExactSameHeadFail(input, path, selectedHead);
     });
-    if (!linkedSameHeadFailure) return { ok: false, reason: 'review-op-waiver-same-head-failure-missing' };
+    const linkedPriorHeadFailure = names.some((name) => {
+      const path = join(dir, name);
+      if (!adjudicatesReviewFile(waiver.adjudicates, path)) return false;
+      const prior = reviewAttemptHasTerraFailOnPriorHead(input, path, selectedHead);
+      return prior !== undefined && waiverHasFixedAfterReviewDiffEvidence(selectedRecord!, path, prior, selectedHead, input.pr);
+    });
+    if (!linkedSameHeadFailure && !linkedPriorHeadFailure) return { ok: false, reason: 'review-op-waiver-same-head-failure-missing' };
   }
   const actionableSupersedes = (entries ?? []).some((entry) => typeof entry?.reviewResult === 'string' && !errorCandidates.has(entry.reviewResult));
   if (actionableSupersedes || hasResolvedPrior) {
@@ -262,7 +268,7 @@ function lastReviewRecord(text: string): Record<string, unknown> | undefined {
   return undefined;
 }
 
-const OP_WAIVER_DISPOSITIONS = new Set(['already-fixed', 'out-of-scope-followup', 'reviewer-error']);
+const OP_WAIVER_DISPOSITIONS = new Set(['already-fixed', 'out-of-scope-followup', 'reviewer-error', 'fixed-after-review']);
 
 function canonicalWaiverDisposition(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -475,6 +481,66 @@ function reviewAttemptHasExactSameHeadFail(input: VerifyOverlapEvidenceInput, fa
     && failed.reviewed === true && failed.verdict === 'fail'
     && typeof failed.headCommit === 'string' && failed.headCommit.toLowerCase() === head
     && findingList(failed.mustFix).length > 0);
+}
+
+function reviewAttemptHasTerraFailOnPriorHead(input: VerifyOverlapEvidenceInput, failedPath: string, currentHead: string):
+  { head: string; findings: string[]; changedPaths: ReadonlySet<string> } | undefined {
+  const name = new RegExp(`^pr-${input.pr}-([a-f0-9]{12})\\.json$`, 'i').exec(basename(failedPath));
+  if (!name || !input.reviewResultsDir || !input.reviewRealPath) return undefined;
+  let physicalDir: string;
+  let physicalPath: string;
+  try {
+    physicalDir = input.reviewRealPath(input.reviewResultsDir);
+    physicalPath = input.reviewRealPath(failedPath);
+  } catch { return undefined; }
+  if (resolve(dirname(physicalPath)) !== resolve(physicalDir)) return undefined;
+
+  let failed: Record<string, unknown> | undefined;
+  try { failed = lastReviewRecord(input.readFile(failedPath)); } catch { return undefined; }
+  const priorHead = typeof failed?.headCommit === 'string' ? failed.headCommit.toLowerCase() : '';
+  const modelFields = [failed?.model, failed?.requestedModel, failed?.respondedModel]
+    .filter((value): value is string => typeof value === 'string').map((value) => value.toLowerCase());
+  const findings = findingList(failed?.mustFix);
+  if (!failed || failed.pr === undefined || String(failed.pr) !== String(input.pr)
+    || failed.reviewed !== true || failed.verdict !== 'fail'
+    || !SHA40.test(priorHead) || priorHead === currentHead
+    || !priorHead.startsWith(name[1]!.toLowerCase())
+    || !modelFields.includes('gpt-6.1-terra') || findings.length === 0) return undefined;
+  const ancestor = input.run('git', ['merge-base', '--is-ancestor', priorHead, currentHead], { cwd: input.cwd });
+  if (!ancestor.ok) return undefined;
+  const changed = input.run('git', ['diff', '--name-only', '--no-renames', `${priorHead}..${currentHead}`], { cwd: input.cwd });
+  if (!changed.ok) return undefined;
+  const changedPaths = new Set(changed.out.split(/\r?\n/).map((path) => path.trim()).filter(Boolean));
+  if (changedPaths.size === 0) return undefined;
+  return { head: priorHead, findings, changedPaths };
+}
+
+function waiverHasFixedAfterReviewDiffEvidence(
+  record: Record<string, unknown>, failedPath: string,
+  prior: { head: string; findings: string[]; changedPaths: ReadonlySet<string> }, currentHead: string, pr: number,
+): boolean {
+  const waiver = record.waiver;
+  if (!waiver || typeof waiver !== 'object' || Array.isArray(waiver)) return false;
+  const value = waiver as Record<string, unknown>;
+  if (!adjudicatesReviewFile(String(value.adjudicates ?? ''), failedPath)
+    || !opWaiverTestResult(value.headTestRun, currentHead)
+    || !Array.isArray(value.dispositions) || value.dispositions.length !== prior.findings.length) return false;
+  const rows = new Map<number, Record<string, unknown>>();
+  for (const raw of value.dispositions) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+    const row = raw as Record<string, unknown>;
+    if (!Number.isSafeInteger(row.finding) || rows.has(row.finding as number)) return false;
+    rows.set(row.finding as number, row);
+  }
+  if (rows.size !== prior.findings.length) return false;
+  for (let finding = 1; finding <= prior.findings.length; finding++) {
+    const row = rows.get(finding);
+    if (!row || row.disposition !== 'fixed-after-review' || typeof row.evidence !== 'string' || !row.evidence.trim()) return false;
+    const evidenceTokens = new Set(row.evidence.split(/\s+/).map((token) => token
+      .replace(/^[`"'([{]+|[`"',;:)}\]]+$/g, '').replace(/:\d+(?:-\d+)?$/, '')));
+    if (![...prior.changedPaths].some((path) => evidenceTokens.has(path))) return false;
+  }
+  return Number(record.pr) === pr && prior.head !== currentHead;
 }
 
 type EvidenceReviewCheck =

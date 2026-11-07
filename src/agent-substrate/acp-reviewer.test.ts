@@ -58,14 +58,13 @@ describe('isReadOnlyReviewTool', () => {
   });
 });
 
-// ⛔⭐⭐⭐ ACP 기본 백엔드 결속 — **세 경로가 한 값을 공유해야 한다** (2026-08-01 · JDG-S9).
-//   교차 리뷰에서 `acp-reviewer` → `acp-judge` → `autopilot-run` **셋이 갈려** 있었고,
-//   ***-32602 를 실제로 낸 것은 내가 처음 안 고친 심판 경로였다.***
+// ⛔⭐⭐⭐ ACP 기본 백엔드 결속 — **두 경로가 한 값을 공유해야 한다** (2026-08-01 · JDG-S9).
+//   교차 리뷰에서 `acp-reviewer` 와 `acp-judge` 의 기본값이 갈려
+//   ***-32602 를 실제로 낸 것은 처음 안 고친 심판 경로였다.***
 //   ⇒ 한 곳만 고치고 "그 기능을 고쳤다" 로 읽지 않는다. 이 검사가 전수를 고정한다.
 describe('ACP 기본 백엔드 결속 (전수)', () => {
   const paths = [
     ['../agent-mission/acp-judge.ts', 'input.backend ?? DEFAULT_REVIEW_BACKEND'],
-    ['../cli/autopilot-run.ts', 'opts.backend ?? DEFAULT_REVIEW_BACKEND'],
   ] as const;
   for (const [rel, expected] of paths) {
     it(`${rel} 이 상수를 공유한다`, async () => {

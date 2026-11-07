@@ -36,6 +36,8 @@ import { createSimWorld, destroySimWorld, listSimWorlds } from './world-store.js
 import { applyDeviceFidelity } from './device-fidelity.js';
 import { recordSimWorldCoverage } from './sim-coverage.js';
 import { createPodReuseResidueFaultFixture } from './fault-pod-reuse-residue.js';
+import { appendSimWorldWatchEvents } from './world-watch.js';
+import type { GateRosterScenario } from './gate-roster-second-pool.js';
 import { runWarmSiReuseSimulation } from './warm-si-reuse-sim.js';
 import { podSelfImplementSpawn, type SiWarmChildAttempt } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from '../task-orchestrator/surfaces/pod-si-warm-protocol.js';
@@ -45,6 +47,19 @@ import type { ChildPodReuseOperations } from '../task-orchestrator/surfaces/pod-
 const WORLD_EVENT_TO_SCENARIO_INPUT: Readonly<Record<string, string>> = {
   'EV-0042': 'dead-pid-lock',
 } as const;
+
+const GATE_ROSTER_WORLD_CASES: Readonly<Record<string, { scenario: GateRosterScenario; verdict: string }>> = {
+  'gate-pools-pinned-sweep': { scenario: { poolSpec: 'pool-node-b@node-b:4,pool-mshq@mshq:2',
+    imageDigests: { 'pool-node-b': `sha256:${'a'.repeat(64)}`, 'pool-mshq': `sha256:${'a'.repeat(64)}` } }, verdict: 'pass' },
+  'gate-mshq-unavailable': { scenario: { poolSpec: 'pool-mshq@mshq:2,pool-node-b@node-b:4', fileCount: 1,
+    imageDigests: { 'pool-node-b': `sha256:${'a'.repeat(64)}`, 'pool-mshq': `sha256:${'a'.repeat(64)}` }, unreachableHosts: ['pool-mshq'] }, verdict: 'pass' },
+  'gate-both-unavailable': { scenario: { poolSpec: 'pool-node-b@node-b:4,pool-mshq@mshq:2',
+    imageDigests: { 'pool-node-b': `sha256:${'a'.repeat(64)}`, 'pool-mshq': `sha256:${'a'.repeat(64)}` }, unreachableHosts: ['pool-node-b', 'pool-mshq'] }, verdict: 'measurement-unavailable' },
+  'gate-digest-mismatch': { scenario: { poolSpec: 'pool-node-b@node-b:4,pool-mshq@mshq:2',
+    imageDigests: { 'pool-node-b': `sha256:${'a'.repeat(64)}`, 'pool-mshq': `sha256:${'b'.repeat(64)}` } }, verdict: 'image-fingerprint-mismatch' },
+  'gate-no-pinned-image': { scenario: { poolSpec: 'pool-node-b@node-b:4,pool-mshq@mshq:2',
+    imageDigests: { 'pool-node-b': null, 'pool-mshq': null } }, verdict: 'measurement-unavailable' },
+};
 
 export interface SimWorldSpec {
   world: string;
@@ -83,11 +98,26 @@ export interface SimMailbox {
 }
 export interface WorldScenarioResult {
   pass: boolean;
-  observations: Array<{ event: string; verdict: string }>;
+  observations: Array<{
+    event: string; verdict: string; gateOutcome?: string; gateError?: string | null;
+    placements?: readonly { context: string; files: readonly string[]; available: boolean }[];
+    reassignments?: readonly { from: string; to: string; files: readonly string[] }[];
+    completedFiles?: readonly string[];
+  }>;
   devices: string[];
   recovery?: WorldChaosRun;
   verdict?: 'green' | 'yellow' | 'red';
   fidelity?: Array<{ deviceId: string; verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] }>;
+}
+
+function worldWatchObservations(world: SimWorld, runId: string): Array<{ event: string; verdict: string }> {
+  const rows: Array<{ event: string; verdict: string }> = [];
+  const push = rows.push.bind(rows);
+  rows.push = (...events) => {
+    appendSimWorldWatchEvents(world, runId, events);
+    return push(...events);
+  };
+  return rows;
 }
 
 const WORLD_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -484,7 +514,7 @@ export async function runWarmPoolUncertainExecution(
     adopt: async () => { adoptions++; },
   };
   const result = await podSelfImplementSpawn({
-    env: { ELANOUS_STATE_DIR: stateRoot, ELANOUS_STATE_DIR_SOURCE: 'derived', ELANOUS_RUN_ID: runId },
+    env: { NODE_ENV: 'test', ELANOUS_STATE_DIR: stateRoot, ELANOUS_STATE_DIR_SOURCE: 'derived', ELANOUS_RUN_ID: runId },
     kubectl: () => { coldJobStarts++; return { status: 1, stdout: '', stderr: 'cold Job must not be dispatched after uncertain exec' }; },
     siWarmAttempt: async () => attempt,
     siWarmHostPostprocess: async childResult => childResult,
@@ -879,7 +909,7 @@ export async function runInWorld<T>(world: SimWorld, run: (runtime: WorldExecuti
       let child: ReturnType<typeof childProcess.spawnSync>;
       try {
         child = spawnSyncForPromotion('/usr/bin/python3', ['-'], { cwd: physicalRoot, input: source, encoding: 'utf8',
-          env: { PATH: '/usr/bin:/bin', HOME: requestedHome, ...env } });
+          env: { PATH: '/usr/bin:/bin', HOME: requestedHome, NODE_ENV: 'test', ...env } });
       } finally {
         if (bunRuntime && guardedBunSpawnSync) bunRuntime.spawnSync = guardedBunSpawnSync;
       }
@@ -935,13 +965,66 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
     if (scenario.world !== world.id || !Array.isArray(scenario.steps)) throw new Error('scenario must target its declared world and list steps');
     const steps = scenario.steps.map((step) => object(step, 'scenario step'));
     const stepKeys = steps.map((step) => Object.keys(step).sort().join(','));
+    if (steps.length === 2 && stepKeys[0] === 'inject' && stepKeys[1] === 'observe'
+      && object(steps[0]!.inject, 'scenario inject').id === 'gate-roster-second-pool') {
+      if (steps[1]?.observe !== 'gate-roster-second-pool') throw new Error('gate roster scenario must observe gate-roster-second-pool');
+      const event = object(steps[0]!.inject, 'scenario inject');
+      if (Object.keys(event).sort().join(',') !== 'id') throw new Error('gate roster scenario accepts only its registered world events');
+      const declarations = world.spec.events.filter((entry) => Object.hasOwn(GATE_ROSTER_WORLD_CASES, entry.id));
+      const expectedIds = Object.keys(GATE_ROSTER_WORLD_CASES);
+      if (declarations.length !== expectedIds.length || expectedIds.some((id) => !declarations.some((entry) => entry.id === id))) {
+        throw new Error('gate roster world must declare all five registered gate-roster events');
+      }
+      const expected = object(scenario.expect, 'scenario.expect');
+      if (Object.keys(expected).join(',') !== 'observations' || !Array.isArray(expected.observations)) {
+        throw new Error('gate roster expectation must contain the exact observations stream');
+      }
+      const expectedObservations = expected.observations.map((row) => {
+        const item = object(row, 'scenario.expect.observations[]');
+        const allowed = ['completedFiles', 'event', 'gateError', 'gateOutcome', 'placements', 'reassignments', 'verdict'];
+        if (Object.keys(item).some((key) => !allowed.includes(key)) || typeof item.event !== 'string'
+          || typeof item.verdict !== 'string' || typeof item.gateOutcome !== 'string'
+          || ('gateError' in item && item.gateError !== null && typeof item.gateError !== 'string')) {
+          throw new Error('gate roster expected observation requires event, verdict, gateOutcome, and only known evidence fields');
+        }
+        return item;
+      });
+      const runId = `run-gate-roster-${randomUUID()}`;
+      const observations: WorldScenarioResult['observations'] = [];
+      const { simGateRosterSecondPool } = await import('./gate-roster-second-pool.js');
+      const runtimeDevice = assembled.devices.get('world-runtime') as { inject?: typeof injectAnyEvent } | undefined;
+      if (!runtimeDevice?.inject) throw new Error('gate roster world requires the world-runtime device');
+      const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
+      if (!Number.isFinite(baseTimeMs)) throw new Error('world clock start must be a valid timestamp');
+      const actions: WorldChaosAction[] = declarations.map((declaration, index) => {
+        const gateCase = GATE_ROSTER_WORLD_CASES[declaration.id]!;
+        return {
+          atMs: worldOffsetMs(declaration.at), target: `gate-roster:${declaration.id}`,
+          run: async (now) => {
+            const injectionId = `inj-${runId.slice(4, 16)}-${index}`;
+            runtimeDevice.inject!({ runId, stateRoot: world.root, injectionId, now,
+              ledger: [{ event: 'gate-roster-world-event-injected', data: { worldEvent: declaration.id, scenario: gateCase.scenario } }],
+              logs: [{ category: 'release.gate-roster', event: 'scenario-injected', data: { worldEvent: declaration.id, scenario: gateCase.scenario } }] });
+            observations.push({ event: `${declaration.id}:injected`, verdict: 'injected', gateOutcome: 'not-run' });
+            const result = await simGateRosterSecondPool(gateCase.scenario, world.root);
+            const verdict = result.verdict === gateCase.verdict ? result.verdict : `unexpected:${result.verdict}`;
+            observations.push({ event: declaration.id, verdict, gateOutcome: result.gateOutcome, gateError: result.gateError,
+              ...(result.reassignments.length ? { placements: result.placements, reassignments: result.reassignments,
+                completedFiles: result.completedFiles } : {}) });
+          },
+        };
+      });
+      const recovery = await runWorldChaosSchedule([], [], undefined, undefined, [], undefined, baseTimeMs, undefined, undefined, actions);
+      const pass = JSON.stringify(observations) === JSON.stringify(expectedObservations);
+      return { pass, observations, devices: [...assembled.devices.keys()], recovery };
+    }
     if (steps.length === 1 && stepKeys[0] === 'observe' && steps[0]?.observe === 'app-host') {
       if (!world.spec.apps?.length) throw new Error('app-host observation requires world.apps');
       const clockDevice = assembled.devices.get('fake-clock') as { withClock?: typeof withSimClock } | undefined;
       if (!clockDevice?.withClock) throw new Error('app-host scenario requires the fake-clock device');
-      const observations: Array<{ event: string; verdict: string }> = [];
       const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
       const runId = `run-${randomUUID()}`;
+      const observations = worldWatchObservations(world, runId);
       const injectedRows: RunLedgerEntry[] = [];
       const scheduledInjections = worldInjectionEvents(world, runId, injectedRows);
       const hasLedgerInjections = world.spec.injections?.some((injection) => injection.ledger?.length) ?? false;
@@ -960,8 +1043,8 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
       return { pass: recovery.evaluation?.pass ?? true, observations, devices: [...assembled.devices.keys()], ...(scheduled ? { recovery } : {}) };
     }
     if (steps.length !== 2 || stepKeys[0] !== 'inject' || stepKeys[1] !== 'observe'
-      || !['release-readiness', 'hq-move'].includes(String(steps[1]?.observe))) {
-      throw new Error('scenario steps must be inject followed by observe: release-readiness or hq-move');
+      || !['release-readiness', 'hq-move', 'gate-roster-second-pool'].includes(String(steps[1]?.observe))) {
+      throw new Error('scenario steps must be inject followed by observe: release-readiness, hq-move, or gate-roster-second-pool');
     }
     const injection = steps[0]!;
     const event = object(injection.inject, 'scenario inject');
@@ -1021,7 +1104,6 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
     if (!offset) throw new Error(`unsupported event time: ${declaration?.at ?? 'missing'}`);
     const eventDelay = Number(offset[1]) * ({ ms: 1, s: 1_000, m: 60_000, h: 3_600_000 } as const)[offset[2] as 'ms' | 's' | 'm' | 'h'];
     return clockDevice.withClock(new Date(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z'), async (clock) => {
-      const observations: Array<{ event: string; verdict: string }> = [];
       const expected = object(scenario.expect, 'scenario.expect');
       const expectAlive = object(expected.livePidLock, 'scenario.expect.livePidLock');
       const expectDead = object(expected.deadPidLock, 'scenario.expect.deadPidLock');
@@ -1029,6 +1111,7 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
         || Object.keys(expectAlive).sort().join(',') !== 'ready,reason'
         || Object.keys(expectDead).sort().join(',') !== 'ready,reason') throw new Error('unsupported scenario expectation field');
       const runId = `run-${randomUUID()}`;
+      const observations = worldWatchObservations(world, runId);
       const injectedRows: RunLedgerEntry[] = [];
       const scheduledInjections = worldInjectionEvents(world, runId, injectedRows);
       const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');

@@ -458,14 +458,14 @@ export function readKey(source: KeyTraceSource = 'main'): Promise<Key> {
 /** External key injection — push a synthetic key into the readKey
  *  queue. Wakes any in-flight `readKey` by emitting a dummy stdin
  *  `'data'` event so the awaiting handler drains the queue. Used
- *  by voice-chat's multi-turn auto-submit path to simulate the
+ *  by host-driven submit paths to simulate the
  *  user pressing Enter after a transcript lands in the input buffer
  *  (mirrors what a typed Enter would do without coupling voice to
  *  textInput's internal closure).
  *
  *  No-op outside raw TUI mode (`_raw === false`).
  *
- *  Reference: BACKLOG-voice-chat-multi-turn-plain-dispatch-extract
+ *  Reference: external-submit input routing
  *  §8.6 — "(A) auto-Enter via injectKey" approach. */
 export function injectKey(key: Key): boolean {
   if (!_raw) return false;

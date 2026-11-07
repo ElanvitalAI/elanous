@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, LLMMessage, LLMOpts, LLMProvider, LLMToolSpec, StreamWithToolsHandlers } from '../llm.js';
 import * as actualLlm from '../llm.js';
-import type { CoreTurnDispatchTool } from '../core-turn/index.js';
+import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../agent/terminal-surface.js';
 import * as actualMemory from '../memory.js';
 import * as actualSurfaceEvents from '../domains/surface-events.js';
@@ -63,7 +63,7 @@ afterAll(() => {
 });
 
 const { runTurn } = await import('./chat.js');
-const coreTurnModule = await import('../core-turn/index.js');
+const coreTurnModule = await import('../core-turn/run-core-turn.js');
 
 function tool(name: string): LLMToolSpec {
   return {

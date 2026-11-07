@@ -1313,7 +1313,7 @@ export const defaultTypecheckRemote = forbidFullTypecheckOnLocal;
 
 export function typecheckDispatchFlags(flags: GateRemoteFlags, env: NodeJS.ProcessEnv, host: string, cwd: string): GateRemoteFlags {
   return defaultTypecheckRemote(env, host, cwd) && flags.remote === undefined && !flags.local
-    ? { ...flags, remote: 'node-b' } : flags;
+    ? { ...flags, remote: env.ELANOUS_TYPECHECK_REMOTE?.trim() || 'node-b' } : flags;
 }
 
 // ── WSL-GATE-ENV (0.2.36) — base 환경 해석 · 원격 push 실패 «원인» 보고 ─────────────────────────

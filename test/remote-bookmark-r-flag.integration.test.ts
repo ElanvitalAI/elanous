@@ -36,6 +36,7 @@ function run(args: string[], timeoutMs = 90_000): { out: string; code: number | 
 }
 
 beforeAll(() => {
+  // Fixture writes and CLI state/config paths stay under mkdtemp(dir); only literal loopback URLs are referenced.
   dir = mkdtempSync(join(tmpdir(), 'elanous-r-int-'));
   mkdirSync(join(dir, 'remotes'), { recursive: true });
   writeFileSync(join(dir, 'remotes', 'probe.token'), 'tok-abc');
@@ -76,14 +77,12 @@ describe('`-r` through the REAL entrypoint', () => {
     expect(r.out).toMatch(/\d+\.\d+\.\d+/);
   });
 
-  test('수용기준 1 — `elanous -r <subcommand>` attaches AND the subcommand survives', () => {
-    const r = run(['-r', 'autopilot', '--help']);
-    // ⓐ -r 이 원격 해석기까지 «닿았다»
-    expect(r.out).toContain('attaching to remote: probe');
-    // ⓑ 그리고 `autopilot` 이 «먹히지 않았다» — 자기 도움말을 낸다.
-    //    ⛔ 옛 판은 여기서 "unknown bookmark: autopilot" 을 냈다.
-    expect(r.out).toContain('Usage: elanous autopilot');
-    expect(r.out).not.toContain('unknown bookmark');
+  test('수용기준 1 — `ops status -r` queries the default bookmark through the real CLI', () => {
+    const r = run(['ops', 'status', '-r', '--json']);
+    expect(r.code).toBe(1); // fixture host has no daemon; the request itself must still be attempted.
+    expect(r.out).toContain('remote bookmark probe');
+    expect(r.out).toContain('GET /v1/tasks at http://127.0.0.1:31999/v1/tasks');
+    expect(r.out).not.toContain('운영 상태 스냅샷');
   });
 
   // 🚨 리뷰 지적: 수용기준 1 의 «정확한 형태»는 대표 가 요청한 `elanous -r` «무인자»다.
@@ -134,14 +133,12 @@ describe('`-r` through the REAL entrypoint', () => {
     //    ⇒ 한 시험이 전부를 주장하지 않게 갈랐다(리뷰 지적).
   }, 90_000);
 
-  test('수용기준 3 — a subcommand own `-r` is NOT stolen', () => {
-    // `autopilot link` 의 `-r, --relation <kind>`. 미션이 없으니 "미션 없음" 이 정상 산출이다.
-    const r = run(['autopilot', 'link', '__nope_a', '__nope_b', '-r', 'friend']);
-    expect(r.out).toContain('미션 없음');
-    // ⛔ 탈취가 일어나면 여기서 원격 해석기 문면이 «대신» 나온다.
-    //    📏 실제로 확인했다: isLeadingFlag 를 `return true` 로 깨면
-    //       이 명령이 "no default remote bookmark" 를 낸다.
-    expect(r.out).not.toContain('no default remote bookmark');
+  test('수용기준 3 — command-local `ops status -r` remains the remote status route after JSON options', () => {
+    const r = run(['ops', 'status', '--json', '-r']);
+    expect(r.code).toBe(1); // Same isolated unreachable fixture, reached only through ops status -r.
+    expect(r.out).toContain('remote bookmark probe');
+    expect(r.out).toContain('GET /v1/tasks at http://127.0.0.1:31999/v1/tasks');
+    expect(r.out).not.toContain('운영 상태 스냅샷');
   });
 
   test('수용기준 4 — `--resume` still reaches the dashboard path, unchanged', () => {

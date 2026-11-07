@@ -61,6 +61,8 @@ export function startChildLivenessHeartbeat(opts: {
   env?: NodeJS.ProcessEnv;
   intervalMs?: number;
   nowMs?: () => number;
+  setIntervalImpl?: (callback: () => void, intervalMs: number) => NodeJS.Timeout;
+  clearIntervalImpl?: (timer: NodeJS.Timeout) => void;
 } = {}): () => void {
   const path = (opts.path ?? opts.env?.[CHILD_LIVENESS_HEARTBEAT_ENV] ?? process.env[CHILD_LIVENESS_HEARTBEAT_ENV])?.trim();
   if (!path) return () => {};
@@ -75,10 +77,10 @@ export function startChildLivenessHeartbeat(opts: {
     } catch { /* fail-soft — liveness must not slow or break the child's work */ }
   };
   write();
-  const timer = setInterval(write, intervalMs);
+  const timer = (opts.setIntervalImpl ?? setInterval)(write, intervalMs) as NodeJS.Timeout;
   timer.unref();
   return () => {
     stopped = true;
-    clearInterval(timer);
+    (opts.clearIntervalImpl ?? clearInterval)(timer);
   };
 }

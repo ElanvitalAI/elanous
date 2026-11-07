@@ -20,7 +20,7 @@
 
 import { Buffer } from 'node:buffer';
 import { debug } from '../../debug/log.js';
-import { createSentenceSegmenter } from '../../dashboard/auto-tts/sentence-segmenter.js';
+import { createSentenceSegmenter } from '../tts/sentence-segmenter.js';
 import {
   buildTurnOutputTextBlocks,
 } from '../../input/turn-output-block.js';

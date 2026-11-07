@@ -46,8 +46,8 @@ describe('Next TUI /loop command', () => {
 
   test('entry tears the timer down on new session, resume, and TUI exit', () => {
     const source = readFileSync(resolve(import.meta.dir, '../tui/entry.ts'), 'utf8');
-    expect(source.match(/loopCommand\?\.run\('stop'\)/g)).toHaveLength(2);
-    expect(source).toContain('loopCommand?.dispose();');
+    expect(source.match(/loopCommand(?: as [^)]+\))?\?\.run\('stop'\)/g)).toHaveLength(2);
+    expect(source).toMatch(/loopCommand(?: as [^)]+\))?\?\.dispose\(\);/);
   });
 
   test('rejects malformed interval or missing prompt without arming a timer', () => {

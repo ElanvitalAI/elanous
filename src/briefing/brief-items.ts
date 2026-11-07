@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
-import { dateKey } from '../time/format.js';
+import { dateKey } from '../time/calendar.js';
 import { readRequirementFunnel, type RequirementFunnelResult } from '../intake-plane/requirement-funnel.js';
 
 export const BRIEF_DOMAINS = ['운영', '판', '흡수', '시장', '행정', '코나투스'] as const;

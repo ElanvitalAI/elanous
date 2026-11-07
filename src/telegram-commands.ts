@@ -58,6 +58,49 @@ import type { ContextNowDeps } from './context-bus/context-now.js';
 import type { RunningRunsResult } from './self-implement/running-runs.js';
 import { checklistBoardSlash } from './release-loop/checklist-board.js';
 import type { Checklist } from './release-loop/checklist.js';
+import type { Message, MessageEnvelope } from './msg/msg-store.js';
+import { ASK_OP_COMMAND, formatAskOpQuestionEnvelope } from './session/channel-ask-op-envelope.js';
+import { debug } from './debug/log.js';
+
+export interface AskOpTelegramOptions {
+  allowedUserIds: readonly number[];
+  append: (message: MessageEnvelope, provenanceKey: string) => Message;
+}
+
+/** Register the durable Telegram → OP question path used by both the main bot and Nexus trigger bot. */
+export function createAskOpTelegramSlashCommand(options: AskOpTelegramOptions): TgSlashCommand {
+  return {
+    name: ASK_OP_COMMAND,
+    description: '운영 책임자에게 질문을 보냅니다',
+    handler: async (_args, ctx) => {
+      debug.log('telegram.op-direct', 'received', { updateId: ctx.updateId, botId: ctx.botId });
+      if (!options.allowedUserIds.includes(ctx.userId)) return '허용된 사용자만 OP에게 질문할 수 있습니다.';
+      const match = new RegExp(`^/(?:${ASK_OP_COMMAND}|ask-op)(?:@[-_a-z0-9]+)?(?:\\s+([\\s\\S]*))?$`, 'i').exec(ctx.text.trim());
+      const question = match?.[1]?.trim();
+      if (!question) return `사용법: /${ASK_OP_COMMAND} <질문>`;
+      if (!Number.isSafeInteger(ctx.updateId) || ctx.updateId < 0) {
+        debug.log('telegram.op-direct', 'forward-failed', { updateId: ctx.updateId, botId: ctx.botId, reason: 'invalid-update-id' });
+        return '질문은 받았지만 OP에게 전달하지 못했습니다 (Telegram 식별값 확인 실패). 다시 보내 주세요.';
+      }
+
+      const botId = (ctx.botId ?? 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+      try {
+        const message = options.append({
+          from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
+          body: formatAskOpQuestionEnvelope({
+            surface: 'telegram', botId, chatId: ctx.chatId, threadId: ctx.threadId,
+            messageId: ctx.messageId, updateId: ctx.updateId, question,
+          }),
+        }, `coord:tg-${botId}-${ctx.updateId}:COORDINATOR`);
+        debug.log('telegram.op-direct', 'forwarded', { updateId: ctx.updateId, botId, questionId: message.id });
+        return `OP에게 질문 #${message.id}로 전달했습니다. 답이 오면 이 대화로 보냅니다.`;
+      } catch {
+        debug.log('telegram.op-direct', 'forward-failed', { updateId: ctx.updateId, botId });
+        return '질문은 받았지만 OP에게 전달하지 못했습니다. 잠시 뒤 다시 보내 주세요.';
+      }
+    },
+  };
+}
 
 /** How many prior user/assistant turns to pass into `executeSkill` as
  *  the `## Recent conversation` block. Mirrors the dashboard default

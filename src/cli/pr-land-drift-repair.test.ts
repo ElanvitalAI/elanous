@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { classifyTypecheckDrift, executeDriftPlan, parseTscErrors, resolveDriftAutorepairMode, type TypecheckDriftDependencies } from './pr-land-drift-repair.js';
+import { debug } from '../debug/log.js';
 import type { GateReceipt } from '../self-implement/gate-receipt-registry.js';
 
 const head = '1'.repeat(40);
@@ -197,15 +198,34 @@ describe('classifyTypecheckDrift', () => {
     expect(classifyTypecheckDrift(input, { ...deps, git: () => ({ status: 1, stdout: '', stderr: 'missing object' }) }).verdict).toBe('drift-unmeasured');
   });
 
-  test('defaults to live launch and the off switch prevents launch', async () => {
+  test('defaults to a shadow repair plan; live launch is explicit and off prevents it', async () => {
     const plan = { action: 'launch' as const, goal: 'repair goal', boundaryFiles: ['src/feature.ts'] };
-    expect(resolveDriftAutorepairMode(undefined)).toBe('live');
+    expect(resolveDriftAutorepairMode(undefined)).toBe('shadow');
+    expect(resolveDriftAutorepairMode('invalid')).toBe('shadow');
+    expect(resolveDriftAutorepairMode('live')).toBe('live');
     expect(resolveDriftAutorepairMode('off')).toBe('off');
     let launches = 0;
     const launch = () => { launches++; };
     await executeDriftPlan(plan, resolveDriftAutorepairMode(undefined), launch, () => {});
+    expect(launches).toBe(0);
+    await executeDriftPlan(plan, resolveDriftAutorepairMode('live'), launch, () => {});
     expect(launches).toBe(1);
     await executeDriftPlan(plan, resolveDriftAutorepairMode('off'), launch, () => {});
     expect(launches).toBe(1);
+  });
+
+  test('records the exact bounded child goal in shadow mode without launching it', async () => {
+    const rows: Array<{ event: string; data?: unknown }> = [];
+    const off = debug.registerSink({ name: `drift-repair-shadow-${Math.random()}`, emit: (row) => {
+      if (row.event === 'drift-repair-planned') rows.push(row);
+    } });
+    try {
+      const goal = '대상 경로: src/feature.ts\n경계: 오류 줄 ±20';
+      await executeDriftPlan({ action: 'launch', goal, boundaryFiles: ['src/feature.ts'] }, 'shadow', () => {
+        throw new Error('shadow mode must not launch');
+      }, () => {});
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ event: 'drift-repair-planned', data: { goal, boundaryFiles: ['src/feature.ts'] } });
+    } finally { off(); }
   });
 });

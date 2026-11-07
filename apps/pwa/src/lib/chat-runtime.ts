@@ -543,7 +543,7 @@ const TUI_SLASH_NAMES = new Set([
   'tablet', 'surface', 'term', 'terminal', 'side', 'claude', 'codex', 'gemini',
   'acp', 'conv', 'handoff', 'agent-room', 'showroom', 'sr', 'reply',
   'capture', 'inject', 'relay', 'lane', 'control', 'default', 'qc',
-  'voice-chat', 'vc', 'auto-tts', 'tts', 'autotts', 'directive',
+  'directive',
 ]);
 const PWA_MODEL_ALIASES: Readonly<Record<string, string>> = {
   m: 'model', r: 'reasoning', think: 'reasoning', p: 'provider',

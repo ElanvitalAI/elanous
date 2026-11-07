@@ -16,6 +16,7 @@
  * 풀을 안 주면 종전처럼 «현재 컨텍스트» 하나다(동작 불변).
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -939,10 +940,48 @@ export function podImageBuildScript(cwd: string = process.cwd()): string | null 
 }
 
 /** packedTgz = 풀 동기화가 한 번 만든 패키지 묶음(있으면 build.sh 가 pack 을 다시 하지 않는다). */
-type RemoteBuild = (host: string, cluster: string, registry?: string, packedTgz?: string) => Promise<{ ok: boolean; detail: string }>;
+type RemoteBuild = (host: string, cluster: string, registry?: string, packedTgz?: string, sharedBuildId?: string) => Promise<{ ok: boolean; detail: string }>;
 
 /** 같은 트리의 패키지 묶음(tgz)을 «한 번» 만든다 — 멤버들이 같이 쓴다. cleanup 은 동기화가 끝나면 부른다. */
 type PoolPack = () => Promise<{ ok: boolean; tgz?: string; detail: string; cleanup?: () => void }>;
+
+interface PoolImageFreshnessProbe {
+  readonly fresh?: { readonly kind: 'registry-label' | 'registry-tag' | 'commit'; readonly detail: string; readonly imageRef?: string };
+  readonly before: string | null;
+  readonly refBefore: string | null;
+  readonly hasRegistry: boolean;
+  readonly registrySkillsSame: (ref: string) => boolean;
+  readonly skillsSame: boolean;
+}
+
+function probePoolImageFreshness(member: PodPoolMember, image: string, localCommit: string | null,
+  deps: { run: RemoteRun; localSkillsDigest?: string | null }): PoolImageFreshnessProbe {
+  const run = deps.run;
+  if (!member.sshHost) return { fresh: { kind: 'commit', detail: 'this machine' }, before: null, refBefore: null,
+    hasRegistry: false, registrySkillsSame: () => true, skillsSame: true };
+  if (localCommit && registryImageLabelsMatch(member, image, localCommit, { ...(deps.localSkillsDigest !== undefined ? { localSkillsDigest: deps.localSkillsDigest } : {}), run })) {
+    return { fresh: { kind: 'registry-label', detail: localCommit.slice(0, 12),
+      imageRef: `${memberRegistry(member)}/${podRegistryImageName(image)}:${podRegistryTag(localCommit)}` },
+      before: null, refBefore: null, hasRegistry: false,
+      registrySkillsSame: () => true, skillsSame: true };
+  }
+  const before = remoteImageCommit(member, image, run);
+  const refBefore = registryImageRef(member, localCommit, run, image);
+  const hasRegistry = run(member.sshHost, `docker inspect ${memberRegistry(member).split(':')[0]} >/dev/null 2>&1`).status === 0;
+  const skillsNow = deps.localSkillsDigest;
+  const registrySkillsSame = (ref: string) => skillsNow == null
+    || remoteImageSkillsDigest(member, `localhost:${memberRegistry(member).split(':')[1]}/${ref.slice(ref.indexOf('/') + 1)}`, run) === skillsNow;
+  const skillsSame = hasRegistry && refBefore ? registrySkillsSame(refBefore)
+    : skillsNow == null || remoteImageSkillsDigest(member, image, run) === skillsNow;
+  if (hasRegistry && refBefore && skillsSame) {
+    return { fresh: { kind: 'registry-tag', detail: localCommit?.slice(0, 12) ?? 'registry tag', imageRef: refBefore },
+      before, refBefore, hasRegistry, registrySkillsSame, skillsSame };
+  }
+  if (!hasRegistry && localCommit && before === localCommit && skillsSame) {
+    return { fresh: { kind: 'commit', detail: before.slice(0, 12) }, before, refBefore, hasRegistry, registrySkillsSame, skillsSame };
+  }
+  return { before, refBefore, hasRegistry, registrySkillsSame, skillsSame };
+}
 
 const BUILD_STDERR_TAIL_LINES = 80;
 const BUILD_STDERR_LINE_LIMIT = 2_048;
@@ -1024,8 +1063,9 @@ function defaultPoolPack(script: string): PoolPack {
 }
 
 function defaultRemoteBuild(script: string, image: string): RemoteBuild {
-  return (host, cluster, registry, packedTgz) => {
+  return (host, cluster, registry, packedTgz, sharedBuildId) => {
     const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_BUILD_REMOTE: host, ELANOUS_L2_CLUSTER: cluster, ELANOUS_BUILD_IMAGE: image === 'elanous-harness-lite:local' ? 'lite' : 'full' };
+    if (sharedBuildId) env.ELANOUS_BUILD_LOCAL_ID = sharedBuildId;
     delete env.ELANOUS_BUILD_REGISTRY;
     if (registry) env.ELANOUS_BUILD_REGISTRY = registry;
     delete env.ELANOUS_BUILD_PACK_ONLY;
@@ -1044,6 +1084,9 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
   const run = deps.run ?? defaultRemoteRun;
   const script = deps.buildScript === undefined ? podImageBuildScript() : deps.buildScript;
   const remoteBuild = deps.remoteBuild ?? (script ? defaultRemoteBuild(script, image) : null);
+  // A pool sync builds the same image on each remote host. Share only the ephemeral child label
+  // so the resulting image fingerprints match; standalone builds keep their unique label.
+  const sharedBuildId = randomUUID().replaceAll('-', '');
   // The registry-less build fallback below calls this ship path, including its remote import result check.
   const ship = deps.ship ?? ((m: PodPoolMember, img: string, commit: string | null, remote: RemoteRun) =>
     syncPoolImage(m, img, commit, { run: remote, inspect: deps.inspect, transfer: deps.transfer, lock: deps.lock }));
@@ -1052,34 +1095,32 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
   //   주입된 remoteBuild(시험)에는 진짜 pack 을 붙이지 않는다 — pack 도 주입해야 쓴다.
   const pack = deps.pack !== undefined ? deps.pack : (!deps.remoteBuild && script ? defaultPoolPack(script) : null);
   const sharePack = pack && members.filter((m) => m.sshHost).length >= 2 ? pack : null;
+  const probes = new Map(members.filter((member) => member.sshHost).map((member) => [member.context,
+    probePoolImageFreshness(member, image, localCommit, { run, ...(deps.localSkillsDigest !== undefined ? { localSkillsDigest: deps.localSkillsDigest } : {}) })]));
+  // A newly built image gets one shared child label. If any pool needs a rebuild, rebuild every
+  // reachable pool in this sync so a same-commit fresh image cannot retain an older child label.
+  const forceSharedBuild = !!remoteBuild && probes.size > 1 && [...probes.values()].some((probe) => !probe.fresh);
   let packed: ReturnType<PoolPack> | null = null;
   await Promise.all(members.map(async (m) => {
     const t0 = Date.now();
     if (!m.sshHost) { results.set(m.context, { ok: true, action: 'local', detail: 'this machine', ms: 0 }); return; }
+    const probe = probes.get(m.context)!;
     // ⭐ GATE-REGISTRY-IMAGE-FASTPATH (0.2.36 · OP): 레지스트리 커밋 태그의 config label(commit ⊕ pod-skills)이 이번 발사
     //   값과 같으면 노드 Docker 데몬을 «한 번도» 부르지 않고 그 커밋 ref 로 끝난다 — 데몬 조회가 느려도 gate 첫 Pod 이 뜬다.
     //   태그 결손 · label 불일치 · HTTP 오류면 아래 종전 경로(원격 inspect → 노드 빌드 → 통째 전송)가 그대로 판정한다.
-    if (localCommit && registryImageLabelsMatch(m, image, localCommit, { ...(deps.localSkillsDigest !== undefined ? { localSkillsDigest: deps.localSkillsDigest } : {}), run })) {
-      const imageRef = `${memberRegistry(m)}/${podRegistryImageName(image)}:${podRegistryTag(localCommit)}`;
-      debug.log('pod.pool', 'image-fresh-registry-label', { context: m.context, host: m.sshHost, commit: localCommit, imageRef, skills: deps.localSkillsDigest ?? null, waitedMs: 0 });
-      results.set(m.context, { ok: true, action: 'fresh', detail: localCommit.slice(0, 12), ms: Date.now() - t0, imageRef });
+    if (probe.fresh && !forceSharedBuild) {
+      if (probe.fresh.kind === 'registry-label') {
+        debug.log('pod.pool', 'image-fresh-registry-label', { context: m.context, host: m.sshHost, commit: localCommit,
+          imageRef: probe.fresh.imageRef, skills: deps.localSkillsDigest ?? null, waitedMs: 0 });
+      } else if (probe.fresh.kind === 'registry-tag') {
+        debug.log('pod.pool', 'image-fresh-registry-tag', { context: m.context, host: m.sshHost, commit: localCommit,
+          localLabel: probe.before, imageRef: probe.fresh.imageRef, waitedMs: 0 });
+      }
+      results.set(m.context, { ok: true, action: 'fresh', detail: probe.fresh.detail, ms: Date.now() - t0,
+        ...(probe.fresh.imageRef ? { imageRef: probe.fresh.imageRef } : {}) });
       return;
     }
-    const before = remoteImageCommit(m, image, run);
-    const skillsNow = deps.localSkillsDigest;
-    const refBefore = registryImageRef(m, localCommit, run, image);
-    const hasRegistry = run(m.sshHost, `docker inspect ${memberRegistry(m).split(':')[0]} >/dev/null 2>&1`).status === 0;
-    const registrySkillsSame = (ref: string) => skillsNow == null || remoteImageSkillsDigest(m, `localhost:${memberRegistry(m).split(':')[1]}/${ref.slice(ref.indexOf('/') + 1)}`, run) === skillsNow;
-    const skillsSame = hasRegistry && refBefore ? registrySkillsSame(refBefore) : skillsNow == null || remoteImageSkillsDigest(m, image, run) === skillsNow;
-    if (hasRegistry && refBefore && skillsSame) {
-      debug.log('pod.pool', 'image-fresh-registry-tag', { context: m.context, host: m.sshHost, commit: localCommit, localLabel: before, imageRef: refBefore, waitedMs: 0 });
-      results.set(m.context, { ok: true, action: 'fresh', detail: localCommit!.slice(0, 12), ms: Date.now() - t0, imageRef: refBefore });
-      return;
-    }
-    if (!hasRegistry && localCommit && before === localCommit && skillsSame) {
-      results.set(m.context, { ok: true, action: 'fresh', detail: before.slice(0, 12), ms: Date.now() - t0 });
-      return;
-    }
+    const { before, refBefore, hasRegistry, registrySkillsSame } = probe;
     if (remoteBuild) {
       // Build and publish under a separate per-host lock: a failed build can then enter ship's synchronous lock.
       const lockOpts = deps.lock ?? {};
@@ -1102,7 +1143,7 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
           lock = await acquireLockAsync(lockPath, { staleMs, retryBusyMs: retryMs, maxTries: lockOpts.maxTries ?? Math.ceil(staleMs / retryMs) + 10 });
         }
         try {
-          if (waited && hasRegistry) {
+          if (waited && hasRegistry && !forceSharedBuild) {
             const refNow = registryImageRef(m, localCommit, run, image);
             if (refNow && registrySkillsSame(refNow)) {
               debug.log('pod.pool', 'image-build-skipped-after-wait', { context: m.context, host: m.sshHost, commit: localCommit, localLabel: before, imageRef: refNow, waitedMs: Date.now() - lockStarted });
@@ -1115,7 +1156,7 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
           if (shared && !shared.ok) debug.log('self-implement.pod', 'pool-image-pack-failed', { context: m.context, detail: shared.detail });
           b = shared && !shared.ok
             ? { ok: false, detail: shared.detail }
-            : lock.stillHeld() ? await remoteBuild(m.sshHost, m.k3dCluster, m.registry, shared?.tgz) : { ok: false, detail: 'image build lock lost' };
+          : lock.stillHeld() ? await remoteBuild(m.sshHost, m.k3dCluster, m.registry, shared?.tgz, sharedBuildId) : { ok: false, detail: 'image build lock lost' };
           if (!lock.stillHeld()) b = { ok: false, detail: 'image build lock lost' };
         } finally { lock.release(); }
       } catch (error) {

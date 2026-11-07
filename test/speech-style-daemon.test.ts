@@ -4,11 +4,11 @@
 // 강제 첫 단계 abort 후 «정확히 1회» 재시도하고 원래 완료 경계(턴 완료·최종 답 surfacing)를
 // 보존함을 확인한다. 실물 CLI 를 spawn 하지 않는다(가짜 단계 실행기 경계).
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
-import * as core from '../src/core-turn/index.js';
+import * as core from '../src/core-turn/run-core-turn.js';
 import * as config from '../src/user-config.js';
 import { debug } from '../src/debug/log.js';
 import { bridgeCoreTurnToAcp } from '../src/acp/core-turn-bridge.js';
-import type { CoreTurnContext } from '../src/core-turn/index.js';
+import type { CoreTurnContext } from '../src/core-turn/types.js';
 import type { LLMMessage } from '../src/llm.js';
 import type { AcpTurnContext } from '../src/acp/server.js';
 

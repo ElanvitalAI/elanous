@@ -1,13 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { ClientSideConnection, ndJsonStream, type ClientCapabilities } from '@agentclientprotocol/sdk';
 import { createInProcessAcpBridge } from '../tui-client/acp-transport-local.js';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { PassThrough } from 'node:stream';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { debug } from '../debug/log.js';
 import { CodexAppServerAgent } from './codex-app-server-agent.js';
 import { AcpAgentManager } from './agent-manager.js';
 import { runAcpServer } from './server.js';
@@ -173,10 +174,51 @@ describe('HAND-CODEX-REMOTE-SHADOW', () => {
       'app-server', '--model', 'gpt-5-codex', '--listen', 'unix:///tmp/side.sock',
       '-c', 'features.code_mode_host=false',
     ]);
+    expect(buildCodexAppServerSpawnArgs({
+      remoteSocketPath: '/tmp/side.sock',
+      codeModeHostAvailable: true,
+    }).slice(-2)).toEqual(['-c', 'features.code_mode_host=true']);
     expect(() => buildCodexAppServerSpawnArgs({
       remoteSocketPath: '/tmp/side.sock',
       codexArgs: ['--listen', 'tcp://127.0.0.1:4444'],
     })).toThrow('remote socket path conflicts with codexArgs --listen');
+  });
+
+  test('production stdio spawn uses detected executable host and records the decision', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-host-spawn-'));
+    const codex = join(dir, process.platform === 'win32' ? 'codex.exe' : 'codex');
+    const host = join(dir, process.platform === 'win32' ? 'codex-code-mode-host.exe' : 'codex-code-mode-host');
+    writeFileSync(codex, 'test executable');
+    chmodSync(codex, 0o755);
+    writeFileSync(host, 'test host');
+    chmodSync(host, 0o755);
+    const child = mockChild();
+    const log = spyOn(debug, 'log');
+    let argv: string[] = [];
+    const spawned = spawnCodexAppServer({
+      codexBinary: codex,
+      cwd: dir,
+      requestTimeoutMs: null,
+      spawnImpl: ((_command: string, args: readonly string[]) => {
+        argv = [...args];
+        return child;
+      }) as unknown as typeof import('node:child_process').spawn,
+    });
+    try {
+      expect(argv.slice(-2)).toEqual(['-c', 'features.code_mode_host=true']);
+      expect(log).toHaveBeenCalledWith('acp.codex.code-mode-host', 'detected', {
+        binary: codex,
+        resolvedBinary: realpathSync(codex),
+        hostBinary: realpathSync(host),
+        available: true,
+        featureEnabled: true,
+      });
+    } finally {
+      await spawned.client.close();
+      spawned.child.kill();
+      log.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('drains the remote app-server child stdout pipe', async () => {

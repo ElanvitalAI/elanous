@@ -89,7 +89,7 @@ async function main(): Promise<void> {
   //     `exit 1` 로 «조용히» 죽는다(cron-path.ts 주석의 그 사고).
   const child = spawn(interpreter, [target, ...targetArgs], {
     stdio: ['ignore', 'inherit', 'pipe'],
-    env: { ...process.env },
+    env: { ...process.env, CRON_RUN_SCHEDULE_ID: id },
     // ⓐ detached — 자식이 프로세스 그룹 리더가 된다. 상한 초과 kill 은 그룹 전체
     // (자식의 자식까지)를 죽린다: process.kill(-pid).
     detached: true,

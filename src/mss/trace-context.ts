@@ -9,7 +9,7 @@
 // delineate work inside a turn without managing IDs manually.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { newUlid } from './identity.js';
+import { newUlid } from './ulid.js';
 
 export interface TraceContext {
   trace_id: string;

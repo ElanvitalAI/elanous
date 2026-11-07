@@ -1,6 +1,6 @@
-import { expect, setDefaultTimeout, test } from 'bun:test';
+import { describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { Command } from 'commander';
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gatherSeatInputs, runSeatLoopOnce, seatLedgerPath, type SeatDeps } from '../seat-loop/seat-loop.js';
@@ -10,10 +10,12 @@ import { getUserConfig, reloadUserConfig, saveUserConfig } from '../user-config.
 import { registerDecisionsCommands } from '../cli/decisions-cli.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 
-// Several cases spawn the real `decisions raise` CLI — slower than bun's 5 s default on a loaded host.
+// These cases exercise the real registered `decisions raise` command in-process. Keep version metadata
+// deterministic here; the production resolver walks origin/main history and is covered separately.
 setDefaultTimeout(60_000);
 
 const now = new Date('2026-10-03T02:00:00Z');
+const resolveTestVersion = () => ({ released: '0.2.9', dev: '0.2.9', codename: 'test' });
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'seat-questions-'));
   mkdirSync(join(root, 'seat-requests'));
@@ -362,7 +364,7 @@ test('human escalation command is accepted by the real decisions raise CLI and w
   try {
     const program = new Command();
     const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
+    registerDecisionsCommands(program, { stateDir: f.root, resolveVersion: resolveTestVersion }, { log: (line) => { output.push(String(line)); } });
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
       checklistItems: () => [{ id: 'T1', title: '근거 부족', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '사람 판단은?' }),
@@ -387,7 +389,7 @@ test('failed decisions raise leaves no card and retries the same human question'
   try {
     const program = new Command();
     const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
+    registerDecisionsCommands(program, { stateDir: f.root, resolveVersion: resolveTestVersion }, { log: (line) => { output.push(String(line)); } });
     let fail = true;
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
       checklistItems: () => [{ id: 'T1', title: '판단 부족', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
@@ -414,7 +416,7 @@ test('pre-send attempting human decision is retried when no card exists', async 
   try {
     const program = new Command();
     const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
+    registerDecisionsCommands(program, { stateDir: f.root, resolveVersion: resolveTestVersion }, { log: (line) => { output.push(String(line)); } });
     let interrupt = true;
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
       checklistItems: () => [{ id: 'T1', title: '사람 검토', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
@@ -455,7 +457,7 @@ test('interrupted ordinary human card delivery is reconciled without duplicate r
   try {
     const program = new Command();
     const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
+    registerDecisionsCommands(program, { stateDir: f.root, resolveVersion: resolveTestVersion }, { log: (line) => { output.push(String(line)); } });
     let calls = 0;
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
       checklistItems: () => [{ id: 'T1', title: '사람 판단', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
@@ -483,7 +485,7 @@ test('a reported decision id without a durable card cannot mark the question han
     let calls = 0;
     const program = new Command();
     const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
+    registerDecisionsCommands(program, { stateDir: f.root, resolveVersion: resolveTestVersion }, { log: (line) => { output.push(String(line)); } });
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
       checklistItems: () => [{ id: 'T1', title: '승인 보류', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '승인해도 되나요?' }),
@@ -622,7 +624,7 @@ test('a person question uses the existing decisions raise card, never a seat mes
     const calls: string[][] = [];
     const program = new Command();
     const output: string[] = [];
-    registerDecisionsCommands(program, { stateDir: f.root }, { log: (line) => { output.push(String(line)); } });
+    registerDecisionsCommands(program, { stateDir: f.root, resolveVersion: resolveTestVersion }, { log: (line) => { output.push(String(line)); } });
     const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
       checklistItems: () => [{ id: 'T1', title: '근거 부족', status: 'yellow', owner: 'TC', evidence: '검토 원장 기록' }],
       inquire: () => ({ to: 'CEO', question: '사람 판단은?' }),
@@ -662,4 +664,50 @@ test('a failing default judgment call falls back to no question instead of break
     expect(result.status).not.toBe('asked');
     expect(seatQuestions(f.root, 'UX')).toEqual([]);
   } finally { f.close(); }
+});
+
+describe('TEST-SEAT-QUESTIONS-HANG', () => {
+  test('raiseOnce reports resolver failure when no competing decision exists', () => {
+    const f = fixture();
+    try {
+      const ref = 'seat-question:resolver-race';
+      const input = {
+        title: 'Seat question decision', category: 'other' as const,
+        scqa: { s: 'Question received.', c: 'A decision is needed.' },
+        options: [
+          { key: 'a', label: 'Accept', consequence: 'Proceed' },
+          { key: 'b', label: 'Hold', consequence: 'Wait' },
+        ],
+        recommendation: { option: 'a', why: 'The evidence supports it.' },
+        raisedBy: { agent: 'TC' }, refs: [ref],
+      };
+      const ledger = new DecisionLedger({ stateDir: f.root, resolveVersion: () => { throw new Error('version metadata unavailable'); } });
+      expect(() => ledger.raiseOnce(input, ref)).toThrow('version metadata unavailable');
+      expect(ledger.list({ status: 'all' })).toHaveLength(0);
+    } finally { f.close(); }
+  });
+
+  test('the seat-loop decisions raise path serializes version metadata with the ledger append', async () => {
+    const f = fixture();
+    try {
+      const program = new Command();
+      const output: string[] = [];
+      const lockPath = join(f.root, 'decisions', 'decisions.jsonl.lock');
+      let lockHeldDuringVersionResolution: boolean | undefined;
+      registerDecisionsCommands(program, { stateDir: f.root, resolveVersion: () => {
+        lockHeldDuringVersionResolution = existsSync(lockPath);
+        return { released: '0.2.9', dev: '0.2.9', codename: 'test' };
+      } }, { log: (line) => { output.push(String(line)); } });
+      const deps: SeatDeps = { ...f.deps, config: { mode: 'on', questions: 'on', seats: ['TC'] },
+        checklistItems: () => [{ id: 'T1', title: '근거 부족', status: 'yellow', owner: 'TC', evidence: '검토 기록' }],
+        inquire: () => ({ to: 'CEO', question: '사람 판단은?' }),
+        run: async (args) => { output.length = 0; program.parse(args, { from: 'user' }); return output[0]!; } };
+      expect((await runSeatLoopOnce('TC', deps)).status).toBe('awaiting-xcheck');
+      answerCrossCheck(f.root, seatCrossChecks(f.root, 'OP')[0]!, { agree: true, note: '검토 기록 확인', resolves: false });
+      expect((await runSeatLoopOnce('TC', deps)).status).toBe('hitl');
+      expect(lockHeldDuringVersionResolution).toBe(true);
+      expect(new DecisionLedger({ stateDir: f.root, resolveVersion: () => ({ released: '0.2.9', dev: '0.2.9', codename: 'test' }) })
+        .list({ status: 'all' })).toHaveLength(1);
+    } finally { f.close(); }
+  });
 });

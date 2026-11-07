@@ -4,6 +4,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { parse as parseYaml } from 'yaml';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { acquireOpSeatFlock, opSeatFlockPath, resyncTickWithReleaseProbe } from '../../src/steward/resync-tick.js';
 import { planResumeReleaseRun, recoverLandingPartialOption, recoverReleaseRun, resumeReleaseRun, type RecoverReleaseDeps, type RecoverReleaseResult } from './resume-release.js';
@@ -16,8 +17,9 @@ import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
 import { runGraph, verifyReleaseCommandRoot } from '../../src/graph-runner/runner.js';
 import { createGateRunner, gateReceiptReuseKey, runGateNode, type GateRunner } from './gate-node.js';
 import { gateEnvFingerprint } from './gate-baseline-receipt.js';
-import { markGateShardUnmeasured, saveGateShardResult } from './gate-shard-receipts.js';
-import { planGateShardDispatch } from './gate-shard-dispatch.js';
+import { inspectGateShardReceipts, markGateShardUnmeasured, saveGateShardResult } from './gate-shard-receipts.js';
+import { gateShardRuntimeIdentityKey, planGateShardDispatch } from './gate-shard-dispatch.js';
+import { gateImagePinPath, writeGateImagePin } from './gate-image-pin.js';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 
 // SIGTERM lifecycle fixtures launch a real Bun child and can exceed Bun's 5 s default under parallel gate-test load.
@@ -91,13 +93,17 @@ function gitStub(args: string[]): string {
   return '';
 }
 
-function writeInterruptedShardReceipts(root: string, envKey = `${gateEnvFingerprint(process.env)}:sha256:${'c'.repeat(64)}`): void {
+function writeInterruptedShardReceipts(root: string, runtimeEnvFingerprint = gateEnvFingerprint(process.env)): void {
   const receiptRoot = join(root, 'release', VERSION, 'gate-logs', 'cut', 'receipts');
   mkdirSync(receiptRoot, { recursive: true });
-  saveGateShardResult(receiptRoot, { receipt: { version: VERSION, graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/complete.test.ts'], head40: SHA,
-    base40: 'b'.repeat(40), host: 'node-b', envKey, envFingerprint: envKey.split(':')[0], imageDigest: envKey.split(':').at(-1) === 'unmeasured' ? undefined : envKey.slice(envKey.indexOf('sha256:')),
-    runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64',
-      envFingerprint: /^[a-f0-9]{64}$/.test(envKey.split(':')[0] ?? '') ? envKey.split(':')[0]! : gateEnvFingerprint(process.env), baseImageDigest: 'sha256:' + 'a'.repeat(64) }, executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest: envKey.slice(envKey.indexOf('sha256:')), runtimeIdentity: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: /^[a-f0-9]{64}$/.test(envKey.split(':')[0] ?? '') ? envKey.split(':')[0]! : gateEnvFingerprint(process.env), baseImageDigest: 'sha256:' + 'a'.repeat(64) } }], status: 'complete', failureIds: [], errorIds: [],
+  const lockfileHash = '9'.repeat(64), imageDigest = `sha256:${'c'.repeat(64)}`;
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: runtimeEnvFingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) };
+  const files = ['src/complete.test.ts'];
+  const testedFileHashes = Object.fromEntries(files.map((file) => [file, createHash('sha256').update(file).digest('hex')]));
+  const envKey = gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!;
+  saveGateShardResult(receiptRoot, { receipt: { version: VERSION, graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files, head40: SHA,
+    base40: 'b'.repeat(40), host: 'node-b', envKey, envFingerprint: runtimeEnvFingerprint, imageDigest, lockfileHash, testedFileHashes, runtimeIdentity,
+    executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest, runtimeIdentity }], status: 'complete', failureIds: [], errorIds: [],
     evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: '2026-10-29T02:00:00.000Z', attempt: 1 },
     runs: [{ output: '1 pass', rc: 0, pass: 1, fail: 0, errors: 0, ran: 1, files: 1, passedIds: ['src/complete.test.ts > ok'] }] });
   markGateShardUnmeasured(receiptRoot, { version: VERSION, graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-1', files: ['src/stalled.test.ts'], head40: SHA,
@@ -119,24 +125,55 @@ async function sigtermActualGate(root: string): Promise<void> {
   const gateUrl = new URL('./gate-node.js', import.meta.url).href;
   const poolUrl = new URL('../../src/task-orchestrator/surfaces/pod-pool.js', import.meta.url).href;
   const script = `import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
 import { createGateRunner, runGateNode } from ${JSON.stringify(gateUrl)};
 import { PodPoolScheduler } from ${JSON.stringify(poolUrl)};
 import { setElanousConfigDir } from ${JSON.stringify(new URL('../../src/elanous-config-dir.js', import.meta.url).href)};
+import { gateImagePinPath, writeGateImagePin } from ${JSON.stringify(new URL('./gate-image-pin.js', import.meta.url).href)};
 import { gateEnvFingerprint } from ${JSON.stringify(new URL('./gate-baseline-receipt.js', import.meta.url).href)};
-const root = ${JSON.stringify(root)}, head40 = ${JSON.stringify(SHA)}, base40 = 'b'.repeat(40);
+const root = ${JSON.stringify(root)}, base40 = 'b'.repeat(40);
 const repo = join(root, 'fixture-repo');
 const files = ['src/complete.test.ts', 'src/stalled.test.ts'], imageDigest = 'sha256:' + 'c'.repeat(64);
+delete process.env.ELANOUS_CONFIG_DIR;
 setElanousConfigDir(root);
 process.env.ELANOUS_STATE_DIR = root;
-const context = JSON.stringify({ runId: 'r', nodeId: 'gate', input: { version: ${JSON.stringify(VERSION)}, previousVersion: '0.2.18', gatePodPool: 'pool-test', gatePodShards: 2 },
-  outputs: { 'version-release': { commit: head40 }, cutoff: { baseline: { sha: base40 } } } });
 mkdirSync(repo, { recursive: true });
+const sourceFiles = {
+  'bun.lock': 'lockfileVersion = 1\\n',
+  'apps/pwa/bun.lock': 'lockfileVersion = 1\\n',
+  'package.json': '{"name":"gate-runtime-source-fixture","version":"1.0.0"}\\n',
+  'apps/pwa/package.json': '{"name":"gate-runtime-source-pwa-fixture","version":"1.0.0"}\\n',
+  'docker/harness/Dockerfile': 'FROM ubuntu:24.04\\n',
+};
+for (const [path, contents] of Object.entries(sourceFiles)) {
+  const target = join(repo, path);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, contents);
+}
+for (const file of files) {
+  const target = join(repo, file);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, "import { expect, test } from 'bun:test'; test('fixture shard', () => expect(true).toBe(true));\\n");
+}
+const git = (args) => spawnSync('git', args, { cwd: repo, encoding: 'utf8',
+  env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
+for (const args of [['init', '-q'], ['add', '.'], ['-c', 'user.name=Gate fixture', '-c', 'user.email=gate-fixture@example.invalid', 'commit', '-qm', 'runtime source fixture']]) {
+  const result = git(args);
+  if (result.status !== 0) throw new Error('fixture source commit failed: ' + result.stderr);
+}
+const head40 = git(['rev-parse', 'HEAD']).stdout.trim();
+if (!/^[a-f0-9]{40}$/.test(head40)) throw new Error('fixture source commit was not measured');
+writeFileSync(join(root, 'fixture-head'), head40 + '\\n');
+writeGateImagePin(gateImagePinPath(root, ${JSON.stringify(VERSION)}, 'r'), 'r', imageDigest, 'elanous-harness:' + head40.slice(0, 12), head40);
+const context = JSON.stringify({ runId: 'r', nodeId: 'gate', input: { version: ${JSON.stringify(VERSION)}, previousVersion: '0.2.18', gatePodPool: 'pool-test', gatePodShards: 2, gateImagePin: 'cut-commit' },
+  outputs: { 'version-release': { commit: head40 }, cutoff: { baseline: { sha: base40 } } } });
 mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
 writeFileSync(join(root, 'release', '0.2.18', 'release.json'), JSON.stringify({ version: '0.2.18', sourceCommit: base40 }));
 writeFileSync(join(root, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: base40, failures: [], errors: [] }));
 const command = async (cmd, args) => cmd === 'git' && args[0] === 'rev-parse' ? { rc: 0, output: head40 + '\\n' }
   : cmd === 'git' && args[0] === 'ls-files' ? { rc: 0, output: files.join('\\n') + '\\n' }
+    : cmd === 'git' && args[0] === 'show' ? (() => { const result = spawnSync(cmd, args, { cwd: repo, encoding: 'utf8' }); return { rc: result.status ?? 2, output: result.stdout ?? '' }; })()
     : cmd === 'rg' ? { rc: 1, output: '' } : { rc: 0, output: '' };
 const kubectl = (args) => args.includes('get') && args.includes('ns')
   ? { status: 0, stdout: '{}', stderr: '' }
@@ -182,7 +219,9 @@ const podCommand = async (options) => {
 };
 const runner = createGateRunner(repo, undefined, command, podCommand, undefined, undefined, { kubectl, graphRecipePins: () => ({ graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 }) });
 await runGateNode(['--json'], { ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root }, runner, undefined, () => imageDigest);`;
-  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'ignore', stderr: 'pipe' });
+  const childEnv = { ...process.env };
+  delete childEnv.ELANOUS_CONFIG_DIR;
+  const child = Bun.spawn([process.execPath, '-e', script], { env: childEnv, stdout: 'ignore', stderr: 'pipe' });
   const deadline = Date.now() + 10_000;
   while (!existsSync(join(root, 'receipt-writer-ready')) && Date.now() < deadline) await Bun.sleep(10);
   if (!existsSync(join(root, 'receipt-writer-ready'))) { child.kill('SIGKILL'); await child.exited; throw new Error('receipt writer child did not become ready: ' + String(await new Response(child.stderr).text()).slice(-1200)); }
@@ -257,6 +296,7 @@ test('host-down from runGateNode is preserved through resume and switches the sa
     copyFileSync(join(releaseGraphDir, 'recipes.yaml'), join(snapshotDir, 'recipes.yaml'));
     const state = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { input: Record<string, unknown>; path: string[]; nodes: Array<Record<string, unknown>>; executed: number };
     state.input.gatePodPool = 'pool-test';
+    state.input.gateImagePin = 'cut-commit';
     state.input.previousVersion = '0.2.18';
     state.path = ['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate'];
     state.nodes = state.path.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true,
@@ -629,15 +669,16 @@ test('GATE-RESUME-STALLED-ONLY: moved-tip resume refuses partial reuse when a fo
   setElanousConfigDir(root);
   const moved = 'b'.repeat(40);
   await sigtermActualGate(root);
+  const head40 = readFileSync(join(root, 'fixture-head'), 'utf8').trim();
   const receiptDir = join(root, 'release', VERSION, 'gate-logs', 'cut', 'receipts');
   const completed = JSON.parse(readFileSync(join(receiptDir, 'pod-0.receipt.json'), 'utf8')) as { files: string[]; status: string };
   const stalled = JSON.parse(readFileSync(join(receiptDir, 'pod-1.receipt.json'), 'utf8')) as { files: string[]; status: string };
   expect(completed.status).toBe('complete');
   expect(stalled.status).toBe('unmeasured');
-  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: SHA,
+  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: head40,
     stalledShards: [{ shard: 1, files: stalled.files, reason: 'job-failed' }],
     partialSummary: { pass: 1, fail: 0, errors: 0, ran: 1, files: 1 },
-    partialFailures: { failures: [], errors: [] }, preservedShardCount: 1 }));
+    partialFailures: { failures: [], errors: [] }, preservedShardCount: 1 }), head40);
   const state = JSON.parse(readFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), 'utf8')) as { input: Record<string, unknown> };
   state.input.gatePodPool = 'pool-test';
   writeFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), JSON.stringify(state));
@@ -649,9 +690,9 @@ test('GATE-RESUME-STALLED-ONLY: moved-tip resume refuses partial reuse when a fo
       closureTree: () => ({ files: ['src/complete.test.ts', 'src/stalled.test.ts', 'src/changed.test.ts',
         'src/other-1.test.ts', 'src/other-2.test.ts'] }) as never });
     expect(resumed.partial).toMatchObject({ requested: true, applied: false, auto: true,
-      reason: expect.stringContaining('formal gate receipt') });
+      reason: expect.stringContaining('environment mismatch') });
     expect(resumed.gatePlan).toMatchObject({ mode: 'full' });
-    expect(resumed.tip).toMatchObject({ changed: true, from: SHA, to: moved });
+    expect(resumed.tip).toMatchObject({ changed: true, from: head40, to: moved });
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 }, 30_000);
 
@@ -668,8 +709,10 @@ test('RELEASE-GATE-POD-RADIUS-REUSE: production resume plan trusts complete rece
   const cutLogs = join(releaseDir, 'gate-logs', 'cut');
   const receiptRoot = join(cutLogs, 'receipts');
   const fingerprint = gateEnvFingerprint(process.env), imageDigest = `sha256:${'c'.repeat(64)}`;
+  const lockfileHash = '9'.repeat(64);
   const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: fingerprint, baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   const shards = tests.map((file, index) => ({ id: `pod-${index}`, files: [file] }));
+  const testedHashesByShard = Object.fromEntries(shards.map((shard) => [shard.id, Object.fromEntries(shard.files.map((file) => [file, 'a'.repeat(64)]))]));
   mkdirSync(cutLogs, { recursive: true });
   writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: SHA, failures: [], errors: [] }));
   writeFileSync(join(cutLogs, 'shards.json'), JSON.stringify({ v: 1, version: VERSION, updatedAt: new Date().toISOString(),
@@ -677,7 +720,9 @@ test('RELEASE-GATE-POD-RADIUS-REUSE: production resume plan trusts complete rece
   for (const shard of shards) {
     writeFileSync(join(cutLogs, `${shard.id}.json`), JSON.stringify({ commit: SHA, files: shard.files, imageDigest }));
     saveGateShardResult(receiptRoot, { receipt: { ...shard, version: VERSION, graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, head40: SHA, base40: 'b'.repeat(40), host: 'aws2',
-      envKey: `${fingerprint}:${imageDigest}`, envFingerprint: fingerprint, imageDigest, runtimeIdentity, executions: [{ branch: '', attemptId: `attempt-${shard.id}`, host: 'aws2', imageDigest, runtimeIdentity }], status: 'complete', failureIds: [], errorIds: [],
+      envKey: gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!, envFingerprint: fingerprint, imageDigest, lockfileHash, runtimeIdentity,
+      testedFileHashes: Object.fromEntries(shard.files.map((file) => [file, 'a'.repeat(64)])),
+      executions: [{ branch: '', attemptId: `attempt-${shard.id}`, host: 'aws2', imageDigest, runtimeIdentity }], status: 'complete', failureIds: [], errorIds: [],
       evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: new Date().toISOString(), attempt: 1 },
       runs: [{ output: `${shard.files.length} pass`, rc: 0, pass: shard.files.length, fail: 0, errors: 0,
         ran: shard.files.length, files: shard.files.length, passedIds: shard.files.map((file) => `${file} > passes`) }] });
@@ -685,6 +730,7 @@ test('RELEASE-GATE-POD-RADIUS-REUSE: production resume plan trusts complete rece
   const git = (args: string[]) => args[0] === 'ls-remote' ? `${moved}\trefs/heads/release/${VERSION}`
     : args[0] === 'rev-parse' ? moved : args[0] === 'diff' ? 'src/shared.ts\n' : '';
   const deps = { root, git, isAncestor: () => true, gateTestsAtCommit: () => tests, gateGraphPinsAtCommit: () => ({ graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64) }), gateShardRecipeAtCommit: () => ({ graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 }),
+    gateExecutionIdentityAtPool: () => ({ ...runtimeIdentity, imageDigest }), gateLockHashAtCommit: () => lockfileHash,
     closureTree: () => ({ files: [...tests, 'src/shared.ts'], preload: [],
       read: (path: string) => path === 'src/a.test.ts' ? "import './shared.ts';" : path === 'src/shared.ts' ? 'export const value = 1;' : '' }) };
   try {
@@ -695,13 +741,13 @@ test('RELEASE-GATE-POD-RADIUS-REUSE: production resume plan trusts complete rece
     const currentIdentity = { imageDigest, ...runtimeIdentity };
     expect(crossPoolReceipts.map((receipt) => gateReceiptReuseKey(receipt, VERSION, SHA, fingerprint, imageDigest,
       currentIdentity, { graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000 }).envKey))
-      .toEqual(tests.map(() => `${fingerprint}:${imageDigest}`));
+      .toEqual(tests.map(() => gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!));
     const unrelatedCommit = 'd'.repeat(40);
     const allReusable = planGateShardDispatch({ head40: unrelatedCommit, base40: 'b'.repeat(40), shards, receipts: crossPoolReceipts,
-      hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }], graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, environmentIdentity: currentIdentity, radiusUnchangedShardIds: ['pod-0', 'pod-1', 'pod-2'] });
+      hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }], graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, environmentIdentity: currentIdentity, lockfileHash, testedFileHashesByShard: testedHashesByShard, radiusUnchangedShardIds: ['pod-0', 'pod-1', 'pod-2'] });
     expect(allReusable.filter((action) => action.kind === 'reuse')).toHaveLength(3);
     const dispatched = planGateShardDispatch({ head40: unrelatedCommit, base40: 'b'.repeat(40), shards, receipts: crossPoolReceipts,
-      invalidatedShardIds: ['pod-0'], radiusUnchangedShardIds: ['pod-1', 'pod-2'], hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }], graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, environmentIdentity: currentIdentity });
+      invalidatedShardIds: ['pod-0'], radiusUnchangedShardIds: ['pod-1', 'pod-2'], hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }], graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, environmentIdentity: currentIdentity, lockfileHash, testedFileHashesByShard: testedHashesByShard });
     if (planned.partial?.requested !== true || planned.partial.applied !== true) throw new Error('expected an applied partial plan');
     const changedFiles = planned.partial.plannedFiles;
     const rerunShardIds = dispatched.filter((action) => action.kind === 'run' && action.files.some((file) => changedFiles.includes(file)));
@@ -711,21 +757,34 @@ test('RELEASE-GATE-POD-RADIUS-REUSE: production resume plan trusts complete rece
     expect(reusedShardIds).toHaveLength(2);
     const environmentDrift = planGateShardDispatch({ head40: unrelatedCommit, base40: 'b'.repeat(40), shards, receipts: crossPoolReceipts,
       hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }], graphEntry: 'gate-entry-v1',
-      recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, environmentIdentity: { ...currentIdentity, bunVersion: '1.4.3' }, radiusUnchangedShardIds: ['pod-0', 'pod-1', 'pod-2'] });
+      recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, environmentIdentity: { ...currentIdentity, bunVersion: '1.4.3' }, lockfileHash, testedFileHashesByShard: testedHashesByShard, radiusUnchangedShardIds: ['pod-0', 'pod-1', 'pod-2'] });
     expect(environmentDrift.map((action) => action.kind)).toEqual(['run', 'run', 'run']);
     expect(environmentDrift.map((action) => action.kind === 'run' ? action.reason : '')).toEqual(tests.map(() => 'environment-bunVersion-mismatch'));
     const recipeDrift = planGateShardDispatch({ head40: unrelatedCommit, base40: 'b'.repeat(40), shards, receipts: crossPoolReceipts,
       hosts: [{ id: 'node-b', platform: 'linux', available: true, reserved: false }], graphEntry: 'gate-entry-v1',
-      recipeCommand: 'bun scripts/release-loop/gate-node.ts --json --strict', recipeTimeoutMs: 14400000, environmentIdentity: currentIdentity,
+      recipeCommand: 'bun scripts/release-loop/gate-node.ts --json --strict', recipeTimeoutMs: 14400000, environmentIdentity: currentIdentity, lockfileHash, testedFileHashesByShard: testedHashesByShard,
       radiusUnchangedShardIds: ['pod-0', 'pod-1', 'pod-2'] });
     expect(recipeDrift.map((action) => action.kind)).toEqual(['run', 'run', 'run']);
     expect(recipeDrift.map((action) => action.kind === 'run' ? action.reason : '')).toEqual(tests.map(() => 'recipe-command-mismatch')); // 2/3 aws2→node-b receipts reused; only the changed import-radius shard reruns.
-    const receiptPath = join(receiptRoot, 'pod-0.receipt.json');
-    const receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) as Record<string, unknown>;
-    writeFileSync(receiptPath, JSON.stringify({ ...receipt, evidenceSha256: '0'.repeat(64) }));
+    const damagedReceipt = crossPoolReceipts[2]!;
+    const payloadPath = join(receiptRoot, damagedReceipt.evidencePath);
+    writeFileSync(payloadPath, `${readFileSync(payloadPath, 'utf8')}corrupt`);
+    const sim = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/gate-shard-receipt-payload-corrupt.yaml'), 'utf8')) as {
+      cases: Array<{ id: string; expect: { invalidatedShardIds: string[]; invalidatedFiles: string[]; remeasureFiles: string[]; reusableShardIds: string[] } }>;
+    };
+    const simCase = sim.cases.find((item) => item.id === 'one-payload-corrupt')!;
+    const inspected = inspectGateShardReceipts(receiptRoot, { version: VERSION, commit: SHA, base40: 'b'.repeat(40),
+      envFingerprint: fingerprint, runtimeIdentity, lockHash: lockfileHash,
+      graphPins: { graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64) },
+      graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
+      shards: shards.map((shard) => ({ id: shard.id, files: shard.files })), tests });
+    expect(inspected).toMatchObject({ kind: 'valid', invalidatedShardIds: simCase.expect.invalidatedShardIds,
+      invalidatedFiles: simCase.expect.invalidatedFiles });
+    if (inspected.kind === 'valid') expect(inspected.receipts.map((item) => item.id)).toEqual(simCase.expect.reusableShardIds);
     const damaged = await planResumeReleaseRun({ runId: 'r', from: 'gate' }, deps);
-    expect(damaged.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('formal gate receipt validation failed') });
-    expect(damaged.gatePlan.mode).toBe('full');
+    expect(damaged.partial).toMatchObject({ requested: true, applied: true, plannedFiles: simCase.expect.remeasureFiles,
+      invalidatedShardIds: simCase.expect.invalidatedShardIds });
+    expect(damaged.gatePlan).toEqual({ mode: 'partial' });
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -767,7 +826,7 @@ test('GATE-RESUME-STALLED-ONLY: moved tip falls back to full gate when a shard r
   const state = JSON.parse(readFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), 'utf8')) as { input: Record<string, unknown> };
   state.input.gatePodPool = 'pool-test';
   writeFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), JSON.stringify(state));
-  writeInterruptedShardReceipts(root, `${'f'.repeat(64)}:sha256:${'c'.repeat(64)}`);
+  writeInterruptedShardReceipts(root, 'f'.repeat(64));
   const git = (args: string[]) => args[0] === 'ls-remote' ? `${moved}\trefs/heads/release/${VERSION}`
     : args[0] === 'rev-parse' ? moved : args[0] === 'diff' ? 'src/changed.test.ts\n' : '';
   try {

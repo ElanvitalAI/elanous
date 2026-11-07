@@ -1,6 +1,6 @@
 /** LIGHT-RC (0.2.19) — a light release-candidate check between cuts: the changed-file self gate over everything that
  *  landed since the previous release's cut, plus an always-run test list (release/light-rc-always.txt), on the remote
- *  gate host (GATE-REMOTE). Read-only for the release ledger: it reads the previous published version and never writes.
+ *  gate host (GATE-REMOTE). It reads the previous published version and persists remote gate receipts in the release ledger.
  *  It does not touch the landing freeze or launch Pods. */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -214,7 +214,9 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
       const options: GateOptions = {
         commit: measuredCommit, version, baselineCommit: base40, ...(previous ? { baselineVersion: previous } : {}),
         executor: 'host', remote: opts.remote, full: true, rehearsalTui: opts.rehearsalTui,
-        repo: cwd, instanceRoot: scratch, ledgerRoot: scratch,
+        // Keep the gate's disposable instance state isolated, but persist its receipt in the release ledger so the
+        // cut gate can inherit same-head/changed-radius evidence after this rehearsal returns.
+        repo: cwd, instanceRoot: scratch, ...(opts.ledgerRoot ? { ledgerRoot: opts.ledgerRoot } : {}),
       };
       const gate = deps.runFormalHostGate
         ? await deps.runFormalHostGate(options, deps.formalHostGateRunner)

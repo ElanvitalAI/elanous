@@ -11,6 +11,11 @@ afterAll(() => {
 });
 
 const limit = { ok: false, out: '', err: 'GraphQL: API rate limit already exceeded for user ID 19355785.' };
+const projectCardsDeprecated = {
+  ok: false,
+  out: '',
+  err: 'GraphQL: Projects (classic) is being deprecated. Please use the new Projects API instead.',
+};
 const url = 'https://github.com/o/r/pull/17';
 const sha = 'a'.repeat(40);
 
@@ -42,7 +47,7 @@ function fake(failure: CmdResult = limit) {
   return { run, calls, options };
 }
 
-describe('GraphQL secondary-limit REST fallback', () => {
+describe('GraphQL REST fallback', () => {
   it('manager lookup → new PR → squash merge keeps the original outcome contracts and pins head sha', () => {
     const { run, calls, options } = fake();
     const log = spyOn(debug, 'log').mockImplementation(() => {});
@@ -82,6 +87,28 @@ describe('GraphQL secondary-limit REST fallback', () => {
     expect(calls).toContainEqual(['gh', 'api', '--method', 'POST', 'repos/o/r/pulls', '-f', 'head=feature/x', '-f', 'title=t', '-f', 'body=b', '-f', 'base=main', '-F', 'draft=true']);
     expect(wrapped('gh', ['pr', 'comment', '17', '--body', 'message'])).toEqual({ ok: true, out: '' });
     expect(calls).toContainEqual(['gh', 'api', '--method', 'POST', 'repos/o/r/issues/17/comments', '-f', 'body=message']);
+  });
+
+  it('retries a PR update over REST when old gh fails on deprecated Projects classic fields', () => {
+    const { run, calls } = fake(projectCardsDeprecated);
+    const wrapped = withGhRestFallback(run);
+
+    expect(wrapped('gh', ['pr', 'edit', url, '--title', 'updated title', '--body', 'updated body', '--base', 'release/1']))
+      .toEqual({ ok: true, out: '' });
+    expect(calls).toContainEqual([
+      'gh', 'api', '--method', 'PATCH', 'repos/o/r/pulls/17',
+      '-f', 'title=updated title', '-f', 'body=updated body', '-f', 'base=release/1',
+    ]);
+    expect(calls.filter((call) => call[0] === 'gh' && call[1] === 'api')).toHaveLength(1);
+  });
+
+  it('keeps unsupported PR edit options fail-closed for deprecated Projects classic errors', () => {
+    const { run, calls } = fake(projectCardsDeprecated);
+    const wrapped = withGhRestFallback(run);
+
+    expect(wrapped('gh', ['pr', 'edit', '17', '--title', 'updated title', '--body', 'updated body', '--add-label', 'label']))
+      .toBe(projectCardsDeprecated);
+    expect(calls.filter((call) => call[0] === 'gh' && call[1] === 'api')).toHaveLength(0);
   });
 
   it('missing REST fields and malformed REST responses fail closed without fabricating an output', () => {

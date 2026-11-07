@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   defaultLocalStorageDir,
@@ -42,6 +42,11 @@ describe('resolveStorageConfig', () => {
     expect(cfg.provider).toBe('gcs');
     expect(cfg.bucket).toBe('b');
     expect(cfg.gcs).toEqual({ project: 'p' });
+  });
+
+  test('app quota ledger path is normalized for shared remote writers', () => {
+    const cfg = resolveStorageConfig({ storage: { provider: 's3', quotaLedgerPath: '~/shared/app-quota.sqlite' } }, {});
+    expect(cfg.quotaLedgerPath).toBe(join(homedir(), 'shared', 'app-quota.sqlite'));
   });
 
   test('env 가 파일 버킷보다 우선 · storage.bucket 이 s3.bucket 보다 우선', () => {
@@ -192,6 +197,12 @@ describe('createObjectStore', () => {
     expect(calls[1]!.args).toContain('login');
     expect(store.head('k.txt')).toEqual({ exists: true, bytes: 2 });
     expect(store.list('k')).toEqual(['k.txt']);
+  });
+
+  test('azure list rejects malformed provider output instead of reporting an empty bucket', () => {
+    const cfg: StorageConfig = { provider: 'azure', localDir: '/tmp/x', bucket: 'cont', publicBucket: '', prefix: 'apps', azure: { account: 'acct' } };
+    const store = createObjectStore(cfg, { run: () => ({ stdout: 'not-json', stderr: '' }), which: () => 'az' });
+    expect(() => store.list('apps/notes/')).toThrow('azure storage blob list returned invalid JSON');
   });
 
   test('which 를 안 주면 resolveCliBin 경로를 쓰고, 없으면 이름 그대로', () => {

@@ -10,7 +10,6 @@ export interface ChatMainInputVisibilityState {
   chatMainAvailable?: boolean;
   pluginActive: boolean;
   chordArmed: boolean;
-  voiceModeActive?: boolean;
   vwLocalComposerActive?: boolean;
   overlayInputActive?: boolean;
   questionActive?: boolean;
@@ -70,6 +69,5 @@ export function shouldAutoEnterChatMainInput(
 ): boolean {
   return isChatMainInputForegroundActive(state)
     && !state.pluginActive
-    && !state.voiceModeActive
     && !state.chordArmed;
 }

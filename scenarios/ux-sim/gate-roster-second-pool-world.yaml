@@ -1,0 +1,9 @@
+world: gate-roster-second-pool
+seed: 35367
+devices: [world-runtime]
+events:
+  - { at: "+1s", id: gate-pools-pinned-sweep }
+  - { at: "+2s", id: gate-mshq-unavailable }
+  - { at: "+3s", id: gate-both-unavailable }
+  - { at: "+4s", id: gate-digest-mismatch }
+  - { at: "+5s", id: gate-no-pinned-image }

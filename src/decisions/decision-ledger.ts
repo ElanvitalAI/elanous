@@ -1,5 +1,6 @@
 import { closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { readPendingQuestionAnswer, readPendingQuestions, writePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
 import { debug, redactSecretText } from '../debug/log.js';
@@ -165,6 +166,7 @@ export class DecisionLedger {
   private readonly postDecisionNotice: NonNullable<DecisionLedgerOptions['postDecisionNotice']>;
   private readonly stateDir: string;
   private versionResolver?: (at: string) => Versions;
+  private resolverSnapshotHead?: string | null;
   private readonly versionOptions: DecisionLedgerOptions;
   constructor(options: DecisionLedgerOptions = {}) {
     this.stateDir = options.stateDir ?? elanousStateRoot();
@@ -178,11 +180,51 @@ export class DecisionLedger {
   }
   private version(at: string): Versions {
     if (!this.versionResolver) {
-      const release = getUserConfig().raw.release as { codenames?: Record<string, string> } | undefined;
-      this.versionResolver = createVersionResolver({ releaseRoot: this.versionOptions.releaseRoot, repoRoot: this.versionOptions.repoRoot,
-        codenames: this.versionOptions.codenames ?? release?.codenames });
+      this.prepareVersionResolver();
     }
-    return this.versionResolver(at);
+    return this.versionResolver!(at);
+  }
+  /** Build the default resolver's reflog snapshot outside the decision write lock. */
+  private prepareVersionResolver(): void {
+    if (this.versionResolver) return;
+    const snapshotHead = this.originMainHead();
+    if (snapshotHead === undefined) throw new Error('unable to read origin/main ref for decision version metadata');
+    const release = getUserConfig().raw.release as { codenames?: Record<string, string> } | undefined;
+    this.versionResolver = createVersionResolver({ releaseRoot: this.versionOptions.releaseRoot, repoRoot: this.versionOptions.repoRoot,
+      codenames: this.versionOptions.codenames ?? release?.codenames });
+    this.resolverSnapshotHead = snapshotHead;
+  }
+  private originMainHead(): string | null | undefined {
+    const cwd = this.versionOptions.repoRoot ?? process.cwd();
+    const repo = spawnSync('git', ['rev-parse', '--git-dir'], { cwd, encoding: 'utf8', timeout: 1000 });
+    if (repo.error) return undefined;
+    if (repo.status !== 0) {
+      // Isolated callers may intentionally have no repository context. An explicitly
+      // configured but invalid repoRoot, or any other Git failure, remains an error.
+      return this.versionOptions.repoRoot === undefined && /not a git repository/i.test(repo.stderr) ? null : undefined;
+    }
+    const result = spawnSync('git', ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin/main'], {
+      cwd, encoding: 'utf8', timeout: 1000,
+    });
+    if (result.error || result.status !== 0 || result.stderr.trim()) return undefined;
+    const exact = result.stdout.split('\n').map(line => line.trim().split(/\s+/))
+      .find(([ref]) => ref === 'refs/remotes/origin/main');
+    if (!exact) return null;
+    const commit = spawnSync('git', ['rev-parse', '--verify', `${exact[1]}^{commit}`], {
+      cwd, encoding: 'utf8', timeout: 1000,
+    });
+    if (commit.error || commit.status !== 0) return undefined;
+    return commit.stdout.trim() || undefined;
+  }
+  private resolverSnapshotIsCurrent(): boolean {
+    if (this.resolverSnapshotHead === undefined) return true;
+    const current = this.originMainHead();
+    return current !== undefined && current === this.resolverSnapshotHead;
+  }
+  private invalidateVersionResolver(): void {
+    if (this.resolverSnapshotHead === undefined) return;
+    this.versionResolver = undefined;
+    this.resolverSnapshotHead = undefined;
   }
   private locked<T>(fn: () => T): T {
     mkdirSync(join(this.path, '..'), { recursive: true });
@@ -295,16 +337,49 @@ export class DecisionLedger {
   show(id: string): DecisionEntry { const entry = this.list({ status: 'all' }).find(e => e.id === id); if (!entry) throw new Error(`decision not found: ${id}`); return entry; }
   raise(input: RaiseInput): DecisionEntry {
     const clean = validate(input);
-    return this.locked(() => this.raiseLocked(clean));
+    for (let attempt = 0; attempt < 3; attempt++) {
+      this.prepareVersionResolver();
+      const entry = this.locked(() => {
+        const at = utc(clean.raisedAt ?? this.now().toISOString());
+        if (!this.resolverSnapshotIsCurrent()) return null;
+        const version = this.version(at);
+        return this.raiseLocked(clean, at, version);
+      });
+      if (entry) return entry;
+      this.invalidateVersionResolver();
+    }
+    throw new Error('origin/main changed while preparing decision version metadata; retry the raise');
   }
   /** Reuse a card with the same source reference, including across competing raisers. */
   raiseOnce(input: RaiseInput, ref: string): DecisionEntry {
     const clean = validate(input);
     if (!clean.refs?.includes(ref)) throw new Error('decision source reference required');
-    return this.locked(() => this.list({ status: 'all' }).find(entry => entry.refs?.includes(ref)) ?? this.raiseLocked(clean));
+    const existing = this.locked(() => this.list({ status: 'all' }).find(entry => entry.refs?.includes(ref)));
+    if (existing) return existing;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        this.prepareVersionResolver();
+        const result = this.locked(() => {
+          const existing = this.list({ status: 'all' }).find(entry => entry.refs?.includes(ref));
+          if (existing) return { kind: 'entry' as const, entry: existing };
+          const at = utc(clean.raisedAt ?? this.now().toISOString());
+          if (!this.resolverSnapshotIsCurrent()) return { kind: 'stale' as const };
+          const version = this.version(at);
+          return { kind: 'entry' as const, entry: this.raiseLocked(clean, at, version) };
+        });
+        if (result.kind === 'entry') return result.entry;
+        this.invalidateVersionResolver();
+      } catch (error) {
+        const concurrent = this.locked(() => this.list({ status: 'all' }).find(entry => entry.refs?.includes(ref)));
+        if (concurrent) return concurrent;
+        throw error;
+      }
+    }
+    const concurrent = this.locked(() => this.list({ status: 'all' }).find(entry => entry.refs?.includes(ref)));
+    if (concurrent) return concurrent;
+    throw new Error('origin/main changed while preparing decision version metadata; retry the raise');
   }
-  private raiseLocked(clean: RaiseInput): DecisionEntry {
-    const at = utc(clean.raisedAt ?? this.now().toISOString());
+  private raiseLocked(clean: RaiseInput, at: string, version: Versions): DecisionEntry {
     const day = at.slice(0, 10).replaceAll('-', '');
     const prefix = `D-${day}-`;
     let next = 1;
@@ -312,7 +387,6 @@ export class DecisionLedger {
       if (entry.id.startsWith(prefix)) next = Math.max(next, Number(entry.id.slice(prefix.length)) + 1);
     }
     const id = `${prefix}${String(next).padStart(2, '0')}`;
-    const version = this.version(at);
     const entry: DecisionEntry = { ...clean, id, raisedAt: at, version, status: 'open', history: [{ type: 'raised', at, by: clean.raisedBy.agent, version }] };
     this.append({ type: 'raised', entry });
     debug.log('decisions', 'raised', { id, category: entry.category, by: entry.raisedBy.agent });

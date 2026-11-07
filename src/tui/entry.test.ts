@@ -14,6 +14,9 @@
  * 닫힌 턴의 줄은 실제 지연 emit(박동 두 번)까지 기다려 읽는다.
  */
 import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { writeCliStderr } from '../git-fs/cli-stderr.js';
 import {
@@ -37,6 +40,9 @@ import {
   type ControlSignal,
 } from '../input/control-signal.js';
 import { removePtyManifest, updatePtyManifestSession, upsertPtyManifest } from '../pty-shell/pty-manifest.js';
+import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
+import { createWorld } from '../ux-sim/world.js';
+import { appendSimWorldWatchEvents } from '../ux-sim/world-watch.js';
 import type { NextSidetabHandler } from './sidetab/nl-tool.js';
 
 // mock.module 복구용 원본 스냅샷 — 정적 import 가 먼저 실행되므로 mock 치환 전 실물이 담긴다.
@@ -52,6 +58,7 @@ const readKeyTicks: number[] = [];
 type FakeInterval = { callback: () => void; delayMs: number; active: boolean };
 const fakeIntervals: FakeInterval[] = [];
 const timerSnapshots: boolean[][] = [];
+let beforeFakeTimerTick: (() => void) | null = null;
 const loopEvents: Array<{ event: string; data: unknown }> = [];
 // 위임한 턴이 실행된 세션 키 — runLocalChatTurn 목격.
 const turnsSeen: string[] = [];
@@ -74,7 +81,11 @@ mock.module('../tui.js', () => ({
     if (key.ctrl && key.name === 'q') return Bun.sleep(10).then(() => key);
     const ticks = readKeyTicks.shift() ?? 0;
     for (let i = 0; i < ticks; i += 1) {
-      for (const timer of fakeIntervals) if (timer.active) timer.callback();
+      for (const timer of fakeIntervals) if (timer.active) {
+        beforeFakeTimerTick?.();
+        beforeFakeTimerTick = null;
+        timer.callback();
+      }
     }
     timerSnapshots.push(fakeIntervals.filter((timer) => timer.delayMs === 1_000).map((timer) => timer.active));
     return Promise.resolve(key);
@@ -141,7 +152,7 @@ mock.module('./chat/background-job-status.js', () => ({
 }));
 
 const { atPickerHeaderLines, showNextTui } = await import('./entry.js');
-const { appendMessage, createSession, setActiveSessionId } = await import('../session/index.js');
+const { appendMessage, createSession, loadSession, setActiveSessionId } = await import('../session/index.js');
 
 // 턴 경계 줄을 debug.log 진입에서 캡처한다 — 싱크 등록 여부와 무관하게 recorder 가 남긴 줄이 여기를 지난다.
 const rawDebugLog = debug.log;
@@ -162,6 +173,7 @@ afterEach(() => {
   submittedInputs.length = 0;
   readKeyTicks.length = 0;
   fakeIntervals.length = 0;
+  beforeFakeTimerTick = null;
   timerSnapshots.length = 0;
   loopEvents.length = 0;
   turnsSeen.length = 0;
@@ -193,6 +205,37 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       { label: 'README.md', absPath: '/work/README.md', isDir: false },
     ], 0, 1, (line) => line)).toEqual(['@ 1/1 · README.md']);
   });
+
+  test('registry routes built-in help at the real input boundary and leaves longer help requests as chat', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const session = createSession({ source: 'tui' });
+    setActiveSessionId(session.id);
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    try {
+      keys.push(
+        { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+        { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+      );
+      submittedInputs.push('/help');
+      await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+      expect(transcript.join('')).toContain('Next TUI: /side');
+      expect(turnsSeen).toEqual([]);
+
+      transcript.length = 0;
+      keys.push(
+        { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+        { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+      );
+      submittedInputs.push('도움말 문구를 작성해 줘');
+      await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+      expect(turnsSeen).toEqual([session.id]);
+    } finally {
+      process.stdout.write = output;
+    }
+  }, 10_000);
 
   test('추가 상태 행이 있어도 그래프 진행 줄과 입력 커서가 같은 화면 행을 쓰지 않는다', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
@@ -617,6 +660,73 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       timerHost.clearInterval = originalClearInterval;
       if (originalAutoturn === undefined) delete process.env.ELANOUS_TUI_AUTOTURN;
       else process.env.ELANOUS_TUI_AUTOTURN = originalAutoturn;
+    }
+  }, 10_000);
+
+  test('SIM-TUI resumes without duplicate events and stops safely if its world disappears', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-tui-world-'));
+    const priorTestRoot = getTestStateRoot();
+    const priorStateDir = process.env.ELANOUS_STATE_DIR;
+    const priorWorldId = process.env.ELANOUS_SIM_WORLD_ID;
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    const timerHost = globalThis as unknown as { setInterval: typeof globalThis.setInterval; clearInterval: typeof globalThis.clearInterval };
+    timerHost.setInterval = ((callback: () => void, delayMs = 0) => {
+      const timer: FakeInterval = { callback, delayMs, active: true };
+      fakeIntervals.push(timer);
+      return timer as unknown as ReturnType<typeof setInterval>;
+    }) as typeof timerHost.setInterval;
+    timerHost.clearInterval = ((handle: ReturnType<typeof setInterval>) => {
+      (handle as unknown as FakeInterval).active = false;
+    }) as typeof timerHost.clearInterval;
+    setTestStateRoot(root);
+    process.env.ELANOUS_STATE_DIR = root;
+    process.env.ELANOUS_SIM_WORLD_ID = 'watched-world';
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const worldFile = join(root, 'watched-world.yaml');
+    writeFileSync(worldFile, 'world: watched-world\ndevices: [fake-clock]\nevents: []\n', { mode: 0o600 });
+    const world = await createWorld(worldFile);
+    const legacyAt = '2026-11-06T16:00:00.000Z';
+    writeFileSync(join(world.root, 'watch-events.jsonl'), [
+      { runId: 'legacy-run', at: legacyAt, event: 'old-node', verdict: 'passed' },
+      { id: 'old-run:1', runId: 'old-run', sequence: 1, at: legacyAt, event: 'duplicate-node', verdict: 'passed' },
+      { id: 'old-run:1', runId: 'old-run', sequence: 1, at: legacyAt, event: 'duplicate-node', verdict: 'passed' },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n', { mode: 0o600 });
+    const session = createSession({ source: 'tui', title: 'SIM-TUI watched-world' });
+    appendMessage(session.id, { role: 'assistant', content: `SIM · [${legacyAt}] legacy-run · old-node · passed`, ts: legacyAt });
+    appendMessage(session.id, { role: 'assistant', content: `SIM · [${legacyAt}] old-run#1 · duplicate-node · passed`, ts: legacyAt });
+    appendSimWorldWatchEvents(world, 'run-sim-tui', [
+      { event: 'release-node', verdict: 'passed' },
+      { event: 'release-node', verdict: 'passed' },
+    ]);
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    const driveOneFrame = async (deleteWorld = false): Promise<void> => {
+      if (deleteWorld) beforeFakeTimerTick = () => rmSync(world.root, { recursive: true, force: true });
+      keys.push({ name: 'x', ctrl: false, shift: false, raw: 'x' }, { name: 'q', ctrl: true, shift: false, raw: '\x11' });
+      readKeyTicks.push(1, 0);
+      await showNextTui({ resumeSessionId: session.id, sidetabMode: 'collapsed' });
+    };
+    try {
+      await driveOneFrame();
+      expect(loadSession(session.id)?.messages.filter((message) => typeof message.content === 'string' && message.content.includes('release-node · passed'))).toHaveLength(2);
+      expect(loadSession(session.id)?.messages.filter((message) => typeof message.content === 'string' && message.content.includes('legacy-run · old-node · passed'))).toHaveLength(1);
+      expect(loadSession(session.id)?.messages.filter((message) => typeof message.content === 'string' && message.content.includes('duplicate-node · passed'))).toHaveLength(2);
+      await driveOneFrame();
+      expect(loadSession(session.id)?.messages.filter((message) => typeof message.content === 'string' && message.content.includes('release-node · passed'))).toHaveLength(2);
+      expect(loadSession(session.id)?.messages.filter((message) => typeof message.content === 'string' && message.content.includes('duplicate-node · passed'))).toHaveLength(2);
+      await driveOneFrame(true);
+      expect(transcript.join('')).toContain('SIM 관측 감시 중단');
+    } finally {
+      process.stdout.write = output;
+      timerHost.setInterval = originalSetInterval;
+      timerHost.clearInterval = originalClearInterval;
+      if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = priorStateDir;
+      if (priorWorldId === undefined) delete process.env.ELANOUS_SIM_WORLD_ID; else process.env.ELANOUS_SIM_WORLD_ID = priorWorldId;
+      setTestStateRoot(priorTestRoot ?? null);
+      rmSync(root, { recursive: true, force: true });
     }
   }, 10_000);
 });

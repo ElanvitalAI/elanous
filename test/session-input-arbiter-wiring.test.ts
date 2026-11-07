@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { bootAcpServer } from '../src/boot/acp-server.js';
 import { DaemonSessionHistory } from '../src/boot/daemon-runtime.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
 import { createDiscordAcpBridge } from '../src/discord-acp-bridge.js';
 import { startNexusHttpServer } from '../src/nexus/api/http-server.js';
 import { NexusEventBus } from '../src/nexus/api/event-bus.js';

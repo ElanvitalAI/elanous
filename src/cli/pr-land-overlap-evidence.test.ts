@@ -898,6 +898,41 @@ describe('official OP review waiver fixtures', () => {
     });
   };
 
+  const runPriorHeadFixedWaiver = (mutate?: (waiver: Record<string, unknown>, prior: Record<string, unknown>) => void,
+    options: { includePrior?: boolean; changedPath?: string } = {}) => {
+    const pr = 35341;
+    const priorHead = 'a'.repeat(40);
+    const currentHead = 'b'.repeat(40);
+    const failedName = `pr-${pr}-${priorHead.slice(0, 12)}.json`;
+    const selectedName = `opwaiver-${pr}-${currentHead.slice(0, 12)}.json`;
+    const failedPath = `${STD_DIR}/${failedName}`;
+    const selectedPath = `${STD_DIR}/${selectedName}`;
+    const evidencePath = '/evidence.json';
+    const prior = { pr, headCommit: priorHead, currentHeadCommit: priorHead, reviewed: true, verdict: 'fail',
+      model: 'gpt-6.1-terra', mustFix: ['Lifecycle observer can race the graph transition.'] };
+    const waiver: Record<string, unknown> = { by: 'OP', approvedBy: 'OP #77960', adjudicates: failedName,
+      headTestRun: { sha: currentHead, command: 'bun test src/cli/pr-land-overlap-evidence.test.ts', pass: 1, fail: 0, exit: 0 },
+      dispositions: [{ finding: 1, disposition: 'fixed-after-review', evidence: `src/fixed.ts: repaired the reviewed behavior` }] };
+    mutate?.(waiver, prior);
+    const selected = { pr, headCommit: currentHead, reviewed: true, verdict: 'pass', mustFix: [], reviewer: 'OP-waiver', model: 'none', waiver };
+    const evidence = JSON.stringify({ pr, head: currentHead, reviewResult: selectedPath });
+    const run: CmdRunner = (cmd, args) => {
+      if (cmd !== 'git') return { ok: false, out: '', err: 'unexpected command' };
+      if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return { ok: true, out: '', err: '' };
+      if (args[0] === 'diff' && args[1] === '--name-only') return { ok: true, out: `${options.changedPath ?? 'src/fixed.ts'}\n`, err: '' };
+      return { ok: false, out: '', err: `unexpected git command: ${args.join(' ')}` };
+    };
+    return verifyOverlapEvidence({
+      evidencePath, pr, expectedHead: currentHead, remote: 'origin', branch: 'main', cwd: '/repo', run,
+      readFile: (path) => path === evidencePath ? evidence
+        : path === selectedPath ? JSON.stringify(selected)
+          : path === failedPath ? JSON.stringify(prior) : (() => { throw new Error(`unexpected fixture read: ${path}`); })(),
+      reviewResultsDir: STD_DIR,
+      listDir: () => [selectedName, ...(options.includePrior === false ? [] : [failedName])],
+      reviewMtime: () => 20, reviewRealPath: (path) => path, overlappingLandings: ['abcdef1234567'],
+    });
+  };
+
   test('replays copied OP adjudications but accepts only the fixture with linked same-head FAIL evidence', () => {
     const sameHeadPair = 'opwaiver-33097-1cc85900413c.json';
     expect(runFixture(sameHeadPair)).toMatchObject({ ok: true, mode: 'already-ancestor' });
@@ -937,6 +972,27 @@ describe('official OP review waiver fixtures', () => {
       const waiver = value.waiver as Record<string, unknown>;
       (waiver.dispositions as unknown[]).pop();
     })).toMatchObject({ ok: false, reason: expect.stringContaining('review-attempt-not-superseded') });
+  });
+
+  test('accepts an OP waiver over a prior-head Terra FAIL only with exact-head pass and per-finding changed-path evidence', () => {
+    expect(runPriorHeadFixedWaiver()).toMatchObject({ ok: true, mode: 'already-ancestor' });
+    expect(runPriorHeadFixedWaiver(undefined, { includePrior: false }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-same-head-failure-missing' });
+    expect(runPriorHeadFixedWaiver((waiver) => {
+      (waiver.dispositions as Array<Record<string, unknown>>)[0]!.disposition = 'already-fixed';
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-same-head-failure-missing' });
+    expect(runPriorHeadFixedWaiver(undefined, { changedPath: 'src/unrelated.ts' }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-same-head-failure-missing' });
+    expect(runPriorHeadFixedWaiver((_waiver, prior) => { prior.model = 'gpt-6-sol'; }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-same-head-failure-missing' });
+    expect(runPriorHeadFixedWaiver((waiver) => {
+      (waiver.headTestRun as Record<string, unknown>).sha = 'c'.repeat(40);
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-head-test-missing' });
+    expect(runPriorHeadFixedWaiver((waiver) => {
+      (waiver.headTestRun as Record<string, unknown>).fail = 1;
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-head-test-missing' });
+    expect(runPriorHeadFixedWaiver((waiver) => { waiver.dispositions = []; }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-dispositions-missing' });
   });
 
   test('adjudicated review names require an exact filename token', () => {

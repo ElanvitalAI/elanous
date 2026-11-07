@@ -3,6 +3,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, rmSync } from 'node:fs';
 import { cleanAndReturnChildPod, type ChildPodLease, type ChildPodReuseOperations } from '../task-orchestrator/surfaces/pod-child-reuse.js';
 import { createPodReuseResidueFaultFixture } from './fault-pod-reuse-residue.js';
+import { createPodReuseSharedFakeBoundary } from './pod-reuse-shared-fake-boundary.js';
+import { runWarmSiReuseSimulation } from './warm-si-reuse-sim.js';
 
 const workerLease: ChildPodLease = {
   workerId: 'worker-1', podUid: 'pod-uid-1', leaseId: 'lease-round-1', generation: 1,
@@ -92,3 +94,66 @@ test('one simulated warm worker clears real Git, child-process and credential re
     fixture.cleanup();
   }
 }, 30_000);
+
+test('shared fake Kubernetes runs the production warm lease through two clean reuse generations', async () => {
+  const boundary = await createPodReuseSharedFakeBoundary();
+  const fixture = createPodReuseResidueFaultFixture();
+  const children = new Map<string, ChildProcess>();
+  const residueBeforeCleanup: Array<ReturnType<typeof fixture.residue>> = [];
+  const stopChild = async (child: ChildProcess) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise<void>((resolve, reject) => {
+      child.once('exit', () => resolve());
+      child.once('error', reject);
+    });
+    child.kill('SIGTERM');
+    await exited;
+  };
+  try {
+    const result = await runWarmSiReuseSimulation({ runId: 'clean-state-shared-k8s', boundary, residueFixture: fixture,
+      cleanResidueForReuse: true,
+      afterAcquireAtLease: 'each',
+      afterAcquire: async (_host, leaseIndex) => {
+        const seeded = fixture.inject(`round-${leaseIndex}`);
+        const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+        await new Promise<void>((resolve, reject) => {
+          child.once('spawn', resolve);
+          child.once('error', reject);
+        });
+        children.set(seeded.processId, child);
+        const observed = fixture.residue();
+        expect(observed.gitStatus).not.toBe('');
+        expect(observed.credentials).toEqual([fixture.runCredentialPath]);
+        expect(observed.processes).toEqual([seeded.processId]);
+        expect(child.pid).toBeDefined();
+        expect(child.exitCode).toBeNull();
+        residueBeforeCleanup.push(observed);
+      },
+      stopLiveChildProcesses: async () => {
+        for (const child of children.values()) await stopChild(child);
+        return [...children.values()].filter((child) => child.exitCode === null && child.signalCode === null).length;
+      },
+      readLiveChildProcessPids: () => [...children.values()]
+        .filter((child) => child.pid !== undefined && child.exitCode === null && child.signalCode === null)
+        .map((child) => child.pid!),
+    });
+    expect(result).toMatchObject({ leaseGenerations: [1, 2], leaseHosts: ['pool-host-a', 'pool-host-a'],
+      cleanupOutcomes: ['returned', 'returned'], finalPodState: 'idle' });
+    expect(result.podUids).toHaveLength(2);
+    expect(result.podUids[0]).toBe(result.podUids[1]);
+    expect(result.residueAtReturn).toEqual([
+      { gitStatus: '', credentials: [], processes: [] },
+      { gitStatus: '', credentials: [], processes: [] },
+    ]);
+    expect(result.liveChildPidsAtReturn).toEqual([[], []]);
+    expect(residueBeforeCleanup).toHaveLength(2);
+    expect(fixture.residue()).toEqual({ gitStatus: '', credentials: [], processes: [] });
+    expect(result.controlTransitions.filter((transition) => transition.endsWith(':200')).length).toBeGreaterThan(0);
+    expect(boundary.kubernetes.get('pool-host-a-context')?.getPod('warm-pool-host-a-si-1')?.metadata.uid)
+      .toBe('si-warm-pod-uid-1');
+  } finally {
+    for (const child of children.values()) await stopChild(child);
+    fixture.cleanup();
+    boundary.stop();
+  }
+});

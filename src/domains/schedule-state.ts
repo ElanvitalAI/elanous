@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { cronMatches, matchField } from './cron-match.js';
-import { calendarFields, resolveTimeZone } from '../time/format.js';
+import { calendarFields } from '../time/calendar.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 import { parseCronLine, unwrapCronCommand, type ScheduleRow } from './schedule-registry.js';
 
 export type ScheduleState = 'live' | 'firing' | 'stale' | 'off';

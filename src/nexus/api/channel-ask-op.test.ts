@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { MsgStore } from '../../msg/msg-store.js';
 import type { TgIncoming } from '../../telegram.js';
 import { createAskOpDiscordIngress, createAskOpTelegramSlashCommand } from './channel-ask-op.js';
+import { createTelegramChannelOpReplyTransport, deliverChannelOpReply } from '../../session/channel-op-reply-route.js';
 
 function incoming(overrides: Partial<TgIncoming> = {}): TgIncoming {
   return {
@@ -60,6 +61,51 @@ test('the same Telegram update is idempotent and preserves its first question', 
   } finally {
     store.close();
   }
+});
+
+test('ten simulated Telegram questions complete received → forwarded → OP answer → Telegram send', async () => {
+  const store = new MsgStore(':memory:');
+  const sent: Array<{ chatId: number; body: string; options?: unknown }> = [];
+  try {
+    const command = createAskOpTelegramSlashCommand({
+      allowedUserIds: [42],
+      append: (message, key) => store.appendWithProvenance(message, key),
+    });
+    const transport = createTelegramChannelOpReplyTransport({
+      botId: '987654', instance: 'test-instance',
+      bot: { async sendMessage(chatId: number, body: string, options?: unknown) {
+        sent.push({ chatId, body, options });
+        return { messageId: 900 + sent.length };
+      } } as never,
+    });
+
+    for (let index = 0; index < 10; index++) {
+      const updateId = 700 + index;
+      const ctx = incoming({ updateId, text: `/askop fake question ${index}`, messageId: 80 + index });
+      const received = await command.handler([], ctx, { userConfig: {} as never, allCommands: [command] });
+      expect(received).toContain('전달했습니다');
+      const question = store.listByRecipient('COORDINATOR').find((message) => message.body.includes(`updateId=${updateId}`));
+      expect(question).toBeDefined();
+      const answer = store.append({ from: 'OP', to: 'TELEGRAM', body: `fake answer ${index}`, replyTo: question!.id });
+      expect(await deliverChannelOpReply(store, answer.id, transport, { instance: 'test-instance' }))
+        .toMatchObject({ status: 'delivered' });
+    }
+
+    expect(store.listByRecipient('COORDINATOR')).toHaveLength(10);
+    expect(sent).toHaveLength(10);
+    expect(sent.map((entry) => entry.chatId)).toEqual(Array(10).fill(-100123));
+    expect(sent.map((entry) => entry.body)).toEqual(Array.from({ length: 10 }, (_, index) => `fake answer ${index}`));
+  } finally { store.close(); }
+});
+
+test('a forwarding failure tells the Telegram user which stage failed', async () => {
+  const command = createAskOpTelegramSlashCommand({
+    allowedUserIds: [42],
+    append: () => { throw new Error('store unavailable'); },
+  });
+  const reply = await command.handler([], incoming(), { userConfig: {} as never, allCommands: [command] });
+  expect(reply).toContain('OP에게 전달하지 못했습니다');
+  expect(reply).toContain('다시 보내');
 });
 
 test('non-allowlisted users and empty questions never reach the OP inbox', async () => {

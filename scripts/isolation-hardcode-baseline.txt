@@ -42,7 +42,7 @@
 1	src/llm/local-manager/preset-registry.ts
 1	src/mission-templates/devices-json-source.ts
 1	src/model-tier/router-decision-log.ts
-1	src/mss/identity.ts
+1	src/mss/identity-store.ts
 2	src/mss/logging/instance-registry.ts
 1	src/nexus/api/connect-info.ts
 1	src/nexus/api/dist.ts

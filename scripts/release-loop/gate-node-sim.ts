@@ -6,12 +6,13 @@
  * remeasurement, or a fail-closed full/HOLD path. Retry rows use the production shard-artifact reader
  * with distinct first-attempt and retry artifacts. Inputs describe test data, not real Pod lifecycle events.
  */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGateRunner, judgeGate, readShardArtifacts, type GateRunner, type GateTools } from './gate-node.js';
 import { planStalledShardRecheck } from './gate-partial.js';
-import { planGateShardDispatch, type GateShardReceipt } from './gate-shard-dispatch.js';
+import { gateShardRuntimeIdentityKey, planGateShardDispatch, type GateShardReceipt } from './gate-shard-dispatch.js';
 import { createFakeKubectl } from '../../src/ux-sim/fake-kubectl.js';
 import { createFakeGh } from '../../src/ux-sim/fake-gh.js';
 import { planPartialRegate } from './gate-partial.js';
@@ -66,7 +67,10 @@ export const GATE_NODE_SIM_SCENARIOS: readonly GateScenario[] = [
 function makeReceipt(id: string, files: string[], host: string): GateShardReceipt {
   const imageDigest = 'sha256:' + 'a'.repeat(64);
   const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'e'.repeat(64), baseImageDigest: 'sha256:' + 'a'.repeat(64) };
-  return { id, files, version: '0.2.46', graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, head40: H, base40: B, host, imageDigest, envFingerprint: runtimeIdentity.envFingerprint, runtimeIdentity, envKey: runtimeIdentity.envFingerprint + ':' + imageDigest, executions: [{ branch: '', attemptId: 'sim-' + id, host, imageDigest, runtimeIdentity }], status: 'complete',
+  const lockfileHash = 'f'.repeat(64);
+  const testedFileHashes = Object.fromEntries(files.map((file) => [file, createHash('sha256').update(file).digest('hex')]));
+  return { id, files, version: '0.2.46', graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, head40: H, base40: B, host, imageDigest, envFingerprint: runtimeIdentity.envFingerprint, runtimeIdentity,
+    lockfileHash, testedFileHashes, envKey: gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!, executions: [{ branch: '', attemptId: 'sim-' + id, host, imageDigest, runtimeIdentity }], status: 'complete',
     failureIds: [], errorIds: [], evidencePath: '/sim/pod-0.json', evidenceSha256: EVIDENCE,
     measuredAt: '2026-10-29T00:00:00.000Z', attempt: 1 };
 }
@@ -87,6 +91,8 @@ function plannerDecision(scenario: GateScenario, devices: { head40: string; mini
       hosts: [{ id: 'node-c', platform: 'linux', available: devices.minihAvailable, reserved: false },
         { id: 'node-b', platform: 'linux', available: devices.msb1Available, reserved: false }],
       graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
+      lockfileHash: 'f'.repeat(64), testedFileHashesByShard: Object.fromEntries(shards.map((shard) => [shard.id,
+        Object.fromEntries(shard.files.map((file) => [file, createHash('sha256').update(file).digest('hex')]))])),
       environmentIdentity: { imageDigest: 'sha256:' + 'a'.repeat(64), bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'e'.repeat(64), baseImageDigest: 'sha256:' + 'a'.repeat(64) },
       ...(input.rerouteShard ? { rerouteShard: input.rerouteShard } : {}),
     });
@@ -138,7 +144,7 @@ function output(ids: readonly string[]): string {
 }
 
 /** Run the production gate classifier with an injected, deterministic sweep outcome. */
-export async function judgeInjectedGateEvent(scenario: GateScenario): Promise<{
+export async function judgeInjectedGateEvent(scenario: GateScenario, bisectSimulation?: { onLaunch: (input: unknown, gateOutcome: string) => void | Promise<void>; introducedFiles?: string[] }): Promise<{
   outcome: string; action: GateScenarioAction; evidence: PlannerEvidence; error?: string; podCommandCalls: number;
 }> {
   const root = mkdtempSync(join(tmpdir(), 'gate-node-sim-'));
@@ -149,6 +155,7 @@ export async function judgeInjectedGateEvent(scenario: GateScenario): Promise<{
   writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: B, failures: [] }));
   const dispatchInput = scenario.dispatchInput ?? { receipts: 'complete' as const, minihAvailable: true };
   const minihDevice = createFakeKubectl({ context: dispatchInput.minihAvailable ? 'node-c' : 'node-c-offline', node: 'worker-sim' });
+  const gateDevice = createFakeKubectl({ context: 'pool-node-c', node: 'worker-sim' });
   const msb1Device = createFakeKubectl({ context: dispatchInput.msb1Available === false ? 'node-b-offline' : 'node-b', node: 'worker-sim' });
   const fakeGh = createFakeGh({ prs: [{ number: 1, title: 'simulated gate event', branch: 'sim', createdAt: '2026-10-29T00:00:00.000Z',
     updatedAt: '2026-10-29T00:00:00.000Z', head: dispatchInput.head40 ?? H }] });
@@ -158,6 +165,8 @@ export async function judgeInjectedGateEvent(scenario: GateScenario): Promise<{
   const planner = plannerDecision(scenario, { head40: pr.head?.sha ?? '', minihAvailable, msb1Available });
   let podCommandCalls = 0;
   const command: GateRunner['command'] = async (cmd, args, cwd) => {
+      if (cmd === 'git' && args[0] === 'rev-list' && args[1] === '--first-parent' && args[2] === '--parents')
+        return { rc: 0, output: `${H} ${'c'.repeat(40)}\n${'c'.repeat(40)} ${B}\n${B}\n` };
       if (cmd === 'bun' && args[0] === 'run') {
         const remainsFailing = scenario.gateInjection === 'regression' || scenario.retryResult === 'fail';
         const ids = cwd.endsWith('/cut') && remainsFailing ? [FAILURE] : [];
@@ -168,10 +177,21 @@ export async function judgeInjectedGateEvent(scenario: GateScenario): Promise<{
   };
   const tools: GateTools = {
     now: () => Date.now(),
+    ...(bisectSimulation ? { kubectl: gateDevice.kubectl } : {}),
     podCommand: async () => { podCommandCalls++; throw new Error('Pod command is outside the injected sweep seam'); },
     admission: { acquire: async () => () => {}, waitReason: () => null },
+    ...(bisectSimulation ? { startBisectSidecar: async (inputPath: string, gateOutcome: string) => {
+      await bisectSimulation.onLaunch(JSON.parse(readFileSync(inputPath, 'utf8')) as unknown, gateOutcome);
+    } } : {}),
   };
   const runner = createGateRunner(root, undefined, command, undefined, undefined, undefined, tools);
+  if (bisectSimulation) {
+    runner.recheckPodBatch = async (files, commit) => new Map(files.map((file) => {
+      const failing = commit === H && scenario.gateInjection === 'regression' && bisectSimulation.introducedFiles?.includes(file);
+      return [file, { rc: failing ? 1 : 0, output: failing ? `${file}:\n(fail) simulated regression [1.00ms]\n1 fail\nRan 1 test across 1 files.\n` : '1 pass\n0 fail\nRan 1 test across 1 files.\n' }];
+    }));
+    runner.recheckPod = async (file, commit) => (await runner.recheckPodBatch!([file], commit, { pool: 'pool-node-c@node-c:1' }, 30_000)).get(file)!;
+  }
   // Inject only the declared test outcome at the sweep boundary; this does not model Pod lifecycle.
   runner.sweep = async (tree) => {
     if (scenario.gateInjection === 'hold') throw new Error(`simulated HOLD: ${scenario.injectedInput}`);
@@ -199,11 +219,14 @@ export async function judgeInjectedGateEvent(scenario: GateScenario): Promise<{
         ...(read.loadFlaky ? { loadFlaky: read.loadFlaky } : {}),
         ...(read.loadFlakyAttemptedFiles ? { loadFlakyAttemptedFiles: read.loadFlakyAttemptedFiles } : {}) };
     }
-    const ids = tree.endsWith('/cut') && scenario.gateInjection === 'regression' ? [FAILURE] : [];
+    const ids = tree.endsWith('/cut') && scenario.gateInjection === 'regression'
+      ? bisectSimulation?.introducedFiles?.map((file) => `${file} > simulated regression`)
+        ?? (bisectSimulation ? [FAILURE, 'src/second.test.ts > simulated second failure'] : [FAILURE]) : [];
     return { rc: ids.length ? 1 : 0, output: output(ids) };
   };
   try {
-    const result = await judgeGate({ commit: H, version: '0.2.42', baselineVersion: '1.0.0', instanceRoot, ledgerRoot, repo: root }, runner);
+    const result = await judgeGate({ commit: H, version: '0.2.42', baselineVersion: '1.0.0', instanceRoot, ledgerRoot, repo: root,
+      ...(bisectSimulation ? { pod: { pool: 'pool-node-c@node-c:1' } } : {}) }, runner);
     return { outcome: result.outcome,
       action: result.outcome === 'ok' ? (scenario.planner ? planner.action : dispositionForOutcome(result.outcome)) : dispositionForOutcome(result.outcome),
       evidence: planner.evidence, ...(result.error ? { error: result.error } : {}), podCommandCalls };

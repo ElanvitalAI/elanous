@@ -7,16 +7,17 @@ import { userConfigPath } from '../user-config.js';
 import { debug } from '../debug/log.js';
 
 export type ReleaseStageState = 'start' | 'ok' | 'fail' | 'skip' | 'wait' | 'stall';
-export interface ReleaseStageMailInput { runId: string; nodeId: string; state: ReleaseStageState; recipient?: string }
+export interface ReleaseStageMailInput { runId: string; nodeId: string; state: ReleaseStageState; recipient?: string; eventId?: string }
 
 function eventKey(input: ReleaseStageMailInput): string {
-  return Buffer.from(JSON.stringify([input.runId, input.nodeId, input.state])).toString('base64url');
+  return Buffer.from(JSON.stringify(input.eventId === undefined
+    ? [input.runId, input.nodeId, input.state] : [input.eventId])).toString('base64url');
 }
 
 export function emitReleaseStageTransition(graphId: string, dryRun: boolean, input: ReleaseStageMailInput,
-  emit: (mail: ReleaseStageMailInput) => unknown = postReleaseStageMail): boolean {
+  emit: (mail: ReleaseStageMailInput) => unknown = postReleaseStageMail, deliveryId?: string): boolean {
   if (graphId !== 'release-loop' || dryRun) return true;
-  try { emit(input); return true; }
+  try { emit(deliveryId === undefined ? input : { ...input, eventId: deliveryId }); return true; }
   catch (error) {
     debug.log('release-loop.stage-mail', 'delivery-failed', { runId: input.runId, nodeId: input.nodeId, state: input.state, error: String(error).slice(0, 300) }, { level: 'warn' });
     return false;
@@ -36,15 +37,19 @@ export function postReleaseStageMail(input: ReleaseStageMailInput, deps: {
   configPath?: string;
   openStore?: () => MsgStore;
 } = {}): Message {
+  const store = (deps.openStore ?? openMsgStore)();
+  try { return appendReleaseStageMail(store, input, deps); }
+  finally { store.close(); }
+}
+
+/** Write through a run-owned store when several event subscribers share the same mailbox connection. */
+export function appendReleaseStageMail(store: MsgStore, input: ReleaseStageMailInput, deps: { configPath?: string } = {}): Message {
   const recipient = input.recipient ?? configuredRecipient(deps.configPath ?? (getElanousConfigDirOverride()
     ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath()));
   const identity = eventKey(input);
-  const store = (deps.openStore ?? openMsgStore)();
-  try {
-    const kind = input.state === 'fail' || input.state === 'stall' ? 'alert' : 'progress';
-    return store.appendWithProvenance({ from: 'TC', to: recipient, kind,
-      body: `release stage · run=${input.runId} · node=${input.nodeId} · state=${input.state}` }, `release-stage:${identity}:event`);
-  } finally { store.close(); }
+  const kind = input.state === 'fail' || input.state === 'stall' ? 'alert' : 'progress';
+  return store.appendWithProvenance({ from: 'TC', to: recipient, kind,
+    body: `release stage · run=${input.runId} · node=${input.nodeId} · state=${input.state}` }, `release-stage:${identity}:event`);
 }
 
 export function startReleaseStageStallWatch(input: Omit<ReleaseStageMailInput, 'state'>, deps: {

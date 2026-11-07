@@ -3,6 +3,11 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { loadMachineLedger, machineMarkdownPath, renderLedgerMarkdown, setMachineField } from '../machines/machine-ledger.js';
 import { MACHINE_NAME, resolveMachineName } from '../roles/machine-name.js';
 import { readMachineProfile, seatRank, validSeatRank, writeMachineProfile } from '../roles/machine-profile.js';
+import { registerMachineCaptureCommand } from './machine-capture.js';
+import { registerMachineSetupApplyCommand } from './machine-setup-apply.js';
+import { registerMachineApplyFromCaptureCommand } from './machine-apply-from-capture.js';
+import { registerMachineSetupPlanCommand } from './machine-setup-plan.js';
+import { registerMachineMembershipCommands } from './machine-membership.js';
 
 export function registerMachineCommands(program: Command, root?: string): void {
   const machine = program.command('machine').description('기계 식별자 · 맡은 일 · 자리 후보 순위');
@@ -27,7 +32,7 @@ export function registerMachineCommands(program: Command, root?: string): void {
         if (!match || !MACHINE_NAME.test(match[1]!) || !validSeatRank(Number(match[2]))) throw new Error(`invalid seat: ${entry}`);
         seats[match[1]!] = { rank: Number(match[2]) };
       }
-      writeMachineProfile({ id, duties, seats }, root);
+      writeMachineProfile({ id, duties, seats, ...(old?.id === id && old.membership ? { membership: old.membership } : {}) }, root);
       console.log(`machine · ${id} · ${duties.join(',') || '-'} · ${Object.entries(seats).map(([seat, value]) => `${seat}:${value.rank}`).join(',') || '-'}`);
     });
   machine.command('render').description('YAML 원장에서 Markdown 생성·검증')
@@ -58,4 +63,10 @@ export function registerMachineCommands(program: Command, root?: string): void {
       const result = { id: resolved.machine, source: resolved.source, duties: profile?.duties ?? [], seats: profile?.seats ?? {} };
       console.log(opts.json ? JSON.stringify(result) : `machine · ${result.id} · ${result.source} · ${result.duties.join(',') || '-'} · ${Object.entries(result.seats).map(([seat]) => `${seat}:${seatRank(profile, seat)}`).join(',') || '-'}`);
     });
+  const setup = machine.command('setup').description('Build a dry-run setup plan for a machine profile');
+  registerMachineSetupPlanCommand(setup.command('plan').description('Plan profile setup for macOS, Linux, or WSL without applying changes'));
+  registerMachineSetupApplyCommand(setup.command('apply').description('Apply a setup plan after explicit --yes confirmation'));
+  registerMachineApplyFromCaptureCommand(machine.command('apply').description('Apply a curated profile using a captured source machine profile'));
+  registerMachineCaptureCommand(machine.command('capture').description('Capture a machine profile without reading credential values'));
+  registerMachineMembershipCommands(machine, { root });
 }

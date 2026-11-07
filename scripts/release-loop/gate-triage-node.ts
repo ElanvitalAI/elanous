@@ -6,6 +6,7 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import type { GateResult } from './gate-node.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
+import { planAdaptiveGateHeal } from './adaptive-gate-heal.js';
 
 /** A shadow recommendation. No value here is a release waiver or a graph edge. */
 export type GateTriageClass = 'unmeasured' | 'load' | 'env' | 'regression' | 'clean' | 'exhausted';
@@ -26,6 +27,8 @@ export interface GateTriageEvidence {
 }
 
 export interface GateTriageShadow {
+  /** Exact gate execution this triage was computed from; absent only for legacy/direct offline inputs. */
+  gateExecutionId?: string;
   classification: GateTriageClass;
   reason: string;
   commit: string;
@@ -171,7 +174,13 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
   // The graph adapter maps a measured gate regression to `fail` for edge routing.
   // Restore the gate verdict before classifying the shadow; keep the context untouched.
   const gate = value.outcome === 'fail' ? { ...value, outcome: 'regression' } : value;
-  return classifyGateShadow(gate as unknown as GateResult, observed);
+  const expectedExecutionId = context.input.adaptiveGateExecutionId;
+  if (expectedExecutionId !== undefined && (typeof expectedExecutionId !== 'string' ||
+    typeof value.executionId !== 'string' || value.executionId !== expectedExecutionId)) {
+    throw new Error('gate triage input does not match the latest gate execution id');
+  }
+  return { ...classifyGateShadow(gate as unknown as GateResult, observed),
+    ...(typeof value.executionId === 'string' ? { gateExecutionId: value.executionId } : {}) };
 }
 
 export function logGateTriageShadow(result: GateTriageShadow, version: string): void {
@@ -227,10 +236,14 @@ export function gateTriageShadowFromSavedVerdict(value: unknown): { version: str
 
 if (import.meta.main) {
   await registerStandaloneLogSink('release-loop');
+  let context: GraphContext | undefined;
+  let errorVersion = 'unknown';
   try {
     const savedPath = process.argv[2] === '--gate-verdict' ? process.argv[3] : undefined;
     if (process.argv[2] && !savedPath) throw new Error('usage: gate-triage-node.ts [--gate-verdict <path>]');
-    const context = savedPath ? undefined : readGraphContext();
+    context = savedPath ? undefined : readGraphContext();
+    errorVersion = context?.input.version ?? 'unknown';
+    if (context && !context.outputs.gate) throw new Error('gate output is missing; adaptive triage is unmeasured');
     const history = context ? priorGateDecisionsFromLedger(context) : [];
     const { version, result } = savedPath
       ? gateTriageShadowFromSavedVerdict(JSON.parse(readFileSync(savedPath, 'utf8')))
@@ -238,8 +251,22 @@ if (import.meta.main) {
     logGateTriageShadow(result, version);
     const prescription = context ? chooseGatePrescription(context, result) : undefined;
     if (prescription) debug.log('release-loop.heal', 'prescribed-shadow', { version, ...prescription });
-    emitNodeResult({ ...result, ...(prescription ? { prescription } : {}), verdict: 'ok',
-      summary: `gate-triage shadow: ${result.classification} — ${result.reason}` });
+    const gateOutput = context?.outputs.gate;
+    const rawVisitState = context?.input.adaptiveHealVisitState;
+    const visitState = rawVisitState && typeof rawVisitState === 'object' && !Array.isArray(rawVisitState)
+      ? { gate: Number((rawVisitState as Record<string, unknown>).gate),
+        gateTriage: Number((rawVisitState as Record<string, unknown>).gateTriage) } : undefined;
+    const adaptiveHeal = context && gateOutput ? planAdaptiveGateHeal({ version, runId: context.runId ?? 'unknown',
+      gate: (gateOutput.outcome === 'fail' ? { ...gateOutput, outcome: 'regression' } : gateOutput) as unknown as GateResult,
+      triage: result, sourceOutcome: gateOutput.outcome as GateResult['outcome'] | 'fail',
+      ...(visitState ? { visitState } : {}),
+      gateExecutor: context.input.gateExecutor === 'host' ? 'host' : 'pod',
+      ...(typeof context.input.gatePodPool === 'string' ? { gatePodPool: context.input.gatePodPool } : {}) }) : undefined;
+    if (adaptiveHeal) for (const event of adaptiveHeal.events)
+      debug.log('release-loop.heal', event.name, { version, runId: context?.runId ?? null, ...event.data });
+    emitNodeResult({ ...result, ...(prescription ? { prescription } : {}), ...(adaptiveHeal ? { adaptiveHeal } : {}), verdict: result.outcome === 'ok' ? 'pass' : 'fail',
+      summary: adaptiveHeal ? `gate-triage live plan: ${adaptiveHeal.disposition.action}`
+        : `gate-triage shadow: ${result.classification} — ${result.reason}` });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const result: GateTriageShadow = { outcome: 'error', classification: 'unmeasured', reason,
@@ -247,7 +274,12 @@ if (import.meta.main) {
       evidence: { highLoad: null, isolatedReproductions: null, isolatedCheckedFailureIds: null,
         isolatedPassedFiles: null, environmentFailureIds: null, loadFlaky: null, stalledEnv: [] } };
     logGateTriageShadow(result, 'unknown');
-    emitNodeResult({ ...result, verdict: 'fail', summary: `gate-triage shadow: ${reason}` });
+    const adaptiveHeal = planAdaptiveGateHeal({ version: errorVersion, runId: context?.runId ?? 'unknown', sourceOutcome: 'error',
+      gate: { outcome: 'error', commit: 'unknown', introduced: [], preexisting: 0, fixed: null, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 0, error: reason }, triage: result });
+    for (const event of adaptiveHeal.events) debug.log('release-loop.heal', event.name, { version: errorVersion,
+      runId: context?.runId ?? null, ...event.data });
+    emitNodeResult({ ...result, adaptiveHeal, verdict: 'fail', summary: `gate-triage failed closed: ${reason}` });
     process.exitCode = 1;
   }
 }

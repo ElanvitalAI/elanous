@@ -13,7 +13,9 @@
 // opts the ACP agent into the shadow side-tab socket without changing stdio defaults.
 
 import { spawn as spawnChild, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { accessSync, constants, realpathSync, statSync } from 'node:fs';
 import { createConnection } from 'node:net';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { resolvePreferredCodexBinary } from './codex-auth.js';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
@@ -474,6 +476,8 @@ export interface SpawnCodexAppServerOpts {
   cwd?: string;
   /** Forwarded to `CodexAppServerClientOpts`. */
   requestTimeoutMs?: number | null;
+  /** Test seam for platform-specific executable resolution. */
+  platform?: NodeJS.Platform;
 }
 
 export interface SpawnedCodexAppServer {
@@ -555,40 +559,152 @@ function createUnixSocketStreams(socketPath: string, onDisconnect: (error: Error
 }
 
 
-/** Build the argv for `codex app-server`, always FORCING codex's
- *  `code_mode_host` feature OFF.
- *
- *  Why non-optional: codex 0.144.0's tool router spawns a separate
- *  `codex-code-mode-host` binary (looked up next to the codex binary /
- *  `CODEX_CODE_MODE_HOST_PATH`), but the single-binary Homebrew cask does
- *  NOT ship that host — so every file/shell tool fails with
- *  `failed to spawn code-mode host … No such file or directory`. Disabling
- *  the `code_mode_host` feature makes the router fall back to standard,
- *  host-less tool execution (verified: `-c features.code_mode_host=false`
- *  passes `--strict-config` AND actually creates files, whereas the broader
- *  `features.code_mode=false` is a valid key that does NOT stop the host
- *  spawn). Injected for EVERY elanous-driven spawn so `/cdx` never depends on
- *  the user's `~/.codex/config.toml`. */
-export function buildCodexAppServerArgs(codexArgs?: readonly string[]): string[] {
+/** Build the argv for `codex app-server` with the code-mode host feature
+ *  enabled only when its executable is adjacent to the resolved Codex CLI.
+ *  This handles distributions that omit `codex-code-mode-host` without
+ *  breaking file/shell tools on distributions that include it. The explicit
+ *  setting also keeps `/cdx` independent of the user's `~/.codex/config.toml`;
+ *  the broader `features.code_mode=false` does not prevent a host spawn. */
+export function buildCodexAppServerArgs(codexArgs?: readonly string[], codeModeHostAvailable = false): string[] {
   const supplied = codexArgs ?? [];
   const args = supplied[0] === 'app-server'
     ? [...supplied]
     : ['app-server', ...supplied];
-  args.push('-c', 'features.code_mode_host=false');
+  args.push('-c', `features.code_mode_host=${codeModeHostAvailable}`);
   return args;
+}
+
+/** Codex ships its optional code-mode host beside the selected CLI binary. */
+function isFile(path: string): boolean {
+  try { return statSync(path).isFile(); } catch { return false; }
+}
+
+function isExecutableFile(path: string, platform = process.platform): boolean {
+  if (platform === 'win32' && /\.(?:cmd|bat)$/i.test(path)) return false;
+  if (!isFile(path)) return false;
+  try { if (platform !== 'win32') accessSync(path, constants.X_OK); return true; }
+  catch { return false; }
+}
+
+function envValue(env: NodeJS.ProcessEnv, name: string, platform = process.platform): string | undefined {
+  const key = platform === 'win32'
+    ? Object.keys(env).find((candidate) => candidate.toUpperCase() === name.toUpperCase())
+    : name;
+  return key ? env[key] : undefined;
+}
+
+function mergeSpawnEnv(overrides: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  const merged = { ...process.env };
+  for (const [name, value] of Object.entries(overrides ?? {})) {
+    if (process.platform === 'win32') {
+      const existing = Object.keys(merged).find((candidate) => candidate.toUpperCase() === name.toUpperCase());
+      if (existing) delete merged[existing];
+    }
+    merged[name] = value;
+  }
+  return merged;
+}
+
+function findWindowsShellCommandCandidate(codexBinary: string, cwd: string, env: NodeJS.ProcessEnv): string | undefined {
+  const workingDirectory = resolve(process.cwd(), cwd);
+  const hasPath = codexBinary.includes('/') || codexBinary.includes('\\') || codexBinary.includes(':');
+  const directories = hasPath
+    ? [resolve(workingDirectory, codexBinary)]
+    : [workingDirectory, ...(envValue(env, 'PATH', 'win32') ?? '').split(';').map((directory) =>
+      resolve(workingDirectory, directory || '.')).filter((directory) => directory !== workingDirectory)];
+  const name = codexBinary.split(/[\\/]/).at(-1) ?? codexBinary;
+  const extension = name.slice(name.lastIndexOf('.')).toLowerCase();
+  const candidates = extension === '.cmd' || extension === '.bat'
+    ? directories.map((directory) => hasPath ? directory : resolve(directory, name))
+    : directories.flatMap((directory) => {
+      const prefix = hasPath ? directory : resolve(directory, name);
+      return [`${prefix}.cmd`, `${prefix}.bat`];
+    });
+  const candidate = candidates.find((path) => {
+    try { return statSync(path).isFile(); }
+    catch { return false; }
+  });
+  if (!candidate) return undefined;
+  try { return realpathSync(candidate); }
+  catch { return candidate; }
+}
+
+function resolveCodexBinaryPath(codexBinary: string, cwd: string, env: NodeJS.ProcessEnv, platform = process.platform): {
+  path: string;
+  found: boolean;
+  shellWrapperCandidate?: string;
+} {
+  const workingDirectory = resolve(process.cwd(), cwd);
+  const hasPath = codexBinary.includes('/') || (platform === 'win32' && (codexBinary.includes('\\') || codexBinary.includes(':')));
+  const windows = platform === 'win32';
+  const commandName = codexBinary.split(/[\\/]/).at(-1) ?? codexBinary;
+  const hasExtension = commandName.lastIndexOf('.') >= 0 && commandName.lastIndexOf('.') < commandName.length - 1;
+  const directories = hasPath
+    ? [isAbsolute(codexBinary) ? codexBinary : resolve(workingDirectory, codexBinary)]
+    : windows
+      // Node's Windows spawn (libuv) searches cwd before PATH. It does not
+      // use PATHEXT: after the exact name it only tries .com and .exe.
+      ? [workingDirectory, ...(envValue(env, 'PATH', platform) ?? '').split(';')
+        .filter(Boolean).map((directory) => resolve(workingDirectory, directory))]
+      : (envValue(env, 'PATH', platform) ?? '').split(delimiter).map((directory) =>
+        resolve(workingDirectory, directory || '.', codexBinary));
+  const candidates = windows
+    ? directories.flatMap((directory) => {
+      const exact = hasPath ? directory : resolve(directory, codexBinary);
+      return [...(hasExtension ? [exact] : []), `${exact}.com`, `${exact}.exe`];
+    })
+    : directories;
+  let executable: string | undefined;
+  let shellWrapperCandidate: string | undefined;
+  for (const candidate of candidates) {
+    if (windows && /\.(?:cmd|bat)$/i.test(candidate) && isFile(candidate)) {
+      try { shellWrapperCandidate = realpathSync(candidate); }
+      catch { shellWrapperCandidate = candidate; }
+      break;
+    }
+    if (isExecutableFile(candidate, platform)) {
+      executable = candidate;
+      break;
+    }
+  }
+  if (windows && !executable && !shellWrapperCandidate) {
+    shellWrapperCandidate = findWindowsShellCommandCandidate(codexBinary, cwd, env);
+  }
+  const selected = executable ?? shellWrapperCandidate ?? (windows
+    ? candidates[0] ?? resolve(workingDirectory, codexBinary)
+    : hasPath ? candidates[0] : resolve(workingDirectory, codexBinary));
+  try { return { path: realpathSync(selected), found: executable !== undefined, ...(shellWrapperCandidate ? { shellWrapperCandidate } : {}) }; }
+  catch { return { path: selected, found: executable !== undefined, ...(shellWrapperCandidate ? { shellWrapperCandidate } : {}) }; }
+}
+
+export function resolveCodexCodeModeHostBinary(
+  codexBinary: string,
+  cwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+  platform = process.platform,
+): { binaryPath: string; path: string; available: boolean; shellWrapperCandidate?: string } {
+  const name = platform === 'win32' ? 'codex-code-mode-host.exe' : 'codex-code-mode-host';
+  const resolved = resolveCodexBinaryPath(codexBinary, cwd, env, platform);
+  const path = join(dirname(resolved.path), name);
+  return {
+    binaryPath: resolved.path,
+    path,
+    available: (platform !== 'win32' || resolved.found) && isExecutableFile(path, platform),
+    ...(resolved.shellWrapperCandidate ? { shellWrapperCandidate: resolved.shellWrapperCandidate } : {}),
+  };
 }
 
 /** Build both command lines for the opt-in Codex remote shadow surface.
  *  The default app-server factory remains stdio-backed; callers must
  *  explicitly select these arguments to expose a Unix-domain endpoint. */
-export function buildCodexRemoteSideTabArgs(socketPath: string): {
+export function buildCodexRemoteSideTabArgs(socketPath: string, codeModeHostAvailable = false): {
   appServerArgs: string[];
   remoteTuiArgs: string[];
 } {
   if (!socketPath.trim()) throw new Error('socket path is required');
   const endpoint = `unix://${socketPath}`;
   return {
-    appServerArgs: ['app-server', '--listen', endpoint, '-c', 'features.code_mode_host=false'],
+    appServerArgs: ['app-server', '--listen', endpoint, '-c', `features.code_mode_host=${codeModeHostAvailable}`],
     remoteTuiArgs: ['--remote', endpoint],
   };
 }
@@ -597,8 +713,10 @@ export function buildCodexRemoteSideTabArgs(socketPath: string): {
 export function buildCodexAppServerSpawnArgs(opts: {
   codexArgs?: readonly string[];
   remoteSocketPath?: string;
+  codeModeHostAvailable?: boolean;
 }): string[] {
-  const args = buildCodexAppServerArgs(opts.codexArgs);
+  const codeModeHostAvailable = opts.codeModeHostAvailable ?? false;
+  const args = buildCodexAppServerArgs(opts.codexArgs, codeModeHostAvailable);
   if (!opts.remoteSocketPath) return args;
   if (args.some((arg) => arg === '--listen' || arg.startsWith('--listen='))) {
     throw new Error('remote socket path conflicts with codexArgs --listen');
@@ -634,16 +752,35 @@ export function spawnCodexAppServer(
   // models ("requires a newer version of Codex"). See
   // resolvePreferredCodexBinary.
   const binary = opts.codexBinary ?? resolvePreferredCodexBinary();
+  const effectiveEnv = mergeSpawnEnv(opts.env);
+  const codeModeHost = resolveCodexCodeModeHostBinary(
+    binary, opts.cwd ?? process.cwd(), effectiveEnv, opts.platform ?? process.platform,
+  );
+  if (codeModeHost.shellWrapperCandidate) {
+    debug.log('acp.codex.command-resolution', 'windows-shell-wrapper-required', {
+      binary,
+      candidate: codeModeHost.shellWrapperCandidate,
+      requiredInvocation: 'cmd.exe /d /s /c',
+    });
+  }
+  debug.log('acp.codex.code-mode-host', 'detected', {
+    binary,
+    resolvedBinary: codeModeHost.binaryPath,
+    hostBinary: codeModeHost.path,
+    available: codeModeHost.available,
+    featureEnabled: codeModeHost.available,
+  });
   const args = buildCodexAppServerSpawnArgs({
     codexArgs: opts.codexArgs,
     remoteSocketPath: opts.remoteSocketPath,
+    codeModeHostAvailable: codeModeHost.available,
   });
   // ⛔⭐ 테스트 심 — env 병합 «계약»(넘긴 값이 이기고 나머지 부모 env 는 보존)을 무는 유일한 방법이다.
   //   계정별 쿼터 측정이 이 병합에 걸려 있고, 여기가 틀리면 「B 를 재려다 A 를 잰다」가 된다.
   const spawnFn = opts.spawnImpl ?? spawnChild;
   const child = spawnFn(binary, args, {
     cwd: opts.cwd,
-    env: { ...process.env, ...(opts.env ?? {}) },
+    env: effectiveEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   // Remote mode speaks over the Unix socket, leaving the app-server child's

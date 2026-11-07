@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { marketSessions, type MarketSessions } from './finance.js';
 import { fetchTossQuote } from './toss-quote.js';
 import { isUsHoliday, US_MARKET_TIME_ZONE } from './market-holidays.js';
-import { dateKey } from '../time/format.js';
+import { dateKey } from '../time/calendar.js';
 
 // 미국 시장 캘린더 시간대는 market-holidays.ts 가 계약으로 내보낸다(로컬 재정의 금지).
 const US_MARKET_TZ = US_MARKET_TIME_ZONE;

@@ -1,5 +1,7 @@
 import { warmWorkerPodManifest, type WarmPodSpec } from '../task-orchestrator/surfaces/pod-warm-worker-pod.js';
 import { cleanAndReturnChildPod } from '../task-orchestrator/surfaces/pod-child-reuse.js';
+import { measurePoolLease, recommendConcurrency } from '../task-orchestrator/surfaces/pod-lease.js';
+import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { SiWarmPodProvider } from '../task-orchestrator/surfaces/pod-si-warm-provider.js';
 import { executeSiWarmTransport } from '../task-orchestrator/surfaces/pod-si-warm-transport.js';
 import { siWarmSha256, type SiWarmCommand } from '../task-orchestrator/surfaces/pod-si-warm-protocol.js';
@@ -7,6 +9,7 @@ import { appendRunLedgerEntry, runLedgerDir, type RunLedgerEntry } from '../self
 import { debug } from '../debug/log.js';
 import { createFakeKubectl } from './fake-kubectl.js';
 import { createFakePrimaryControl } from './warm-pool-reuse-sim.js';
+import type { PodReuseSharedFakeBoundary } from './pod-reuse-shared-fake-boundary.js';
 import type { PodReuseResidueFaultFixture } from './fault-pod-reuse-residue.js';
 
 const key = { context: 'pool-host-a-context', imageDigest: `sha256:${'d'.repeat(64)}`,
@@ -21,6 +24,7 @@ const spec: WarmPodSpec = { name: 'warm-pool-host-a-si-1', namespace: 'elanous-t
 
 export interface WarmSiReuseEvidence {
   runId: string;
+  coldAdmission: ReturnType<typeof recommendConcurrency> | null;
   leaseGenerations: number[];
   podUids: string[];
   leaseHosts: string[];
@@ -34,43 +38,68 @@ export interface WarmSiReuseEvidence {
   finalPodState: string | undefined;
   artifactCapRejected: boolean;
   artifactDecodeCalls: number;
+  residueAtReturn: Array<ReturnType<PodReuseResidueFaultFixture['residue']>>;
+  liveChildPidsAtReturn: number[][];
 }
 
 /**
  * Runs the production SI admission and child-return chain. Only the Kubernetes,
  * fixed-runner maintenance, and isolated primary-control boundaries are simulated.
+ * `exhaustColdJobSlots` seeds a Running cold-slot occupant Pod into this same Kubernetes boundary,
+ * measures it through production pool admission, then runs the warm lease path against that state.
  */
 export async function runWarmSiReuseSimulation(options: { runId: string; processResidue?: number; now?: () => number;
+  exhaustColdJobSlots?: boolean;
   stateRoot?: string; ledgerRunId?: string; ledgerRowPrefix?: string; residueFixture?: PodReuseResidueFaultFixture;
+  cleanResidueForReuse?: boolean;
   includeAlternateHost?: boolean; recoverOnAlternateHost?: boolean; hostAvailable?: (host: string) => boolean;
   hostArchitectures?: Readonly<Record<WarmPoolHost, 'arm64' | 'amd64'>>;
-  afterAcquireAtLease?: number; afterAcquire?: (host: string, leaseIndex: number) => Promise<void>;
-  injectOversizedArtifact?: boolean }) {
+  afterAcquireAtLease?: number | 'each'; afterAcquire?: (host: string, leaseIndex: number) => Promise<void>;
+  stopLiveChildProcesses?: () => Promise<number>;
+  readLiveChildProcessPids?: () => readonly number[];
+  injectOversizedArtifact?: boolean; boundary?: PodReuseSharedFakeBoundary }) {
   const now = options.now ?? (() => 0);
-  const specA: WarmPodSpec = { ...spec, key: { ...key, architecture: options.hostArchitectures?.['pool-host-a'] ?? key.architecture } };
+  const fixtureSourceSha = options.cleanResidueForReuse && options.residueFixture
+    ? options.residueFixture.remote.git(options.residueFixture.remote.checkout, ['rev-parse', 'HEAD']).trim()
+    : undefined;
+  const specA: WarmPodSpec = { ...spec, cutSha: fixtureSourceSha ?? spec.cutSha,
+    key: { ...key, architecture: options.hostArchitectures?.['pool-host-a'] ?? key.architecture } };
   const specB: WarmPodSpec = { ...specA, name: 'warm-pool-host-b-si-1', workerId: 'warm-pool-host-b-si-1-generation-1',
     kubectlContext: 'pool-host-b-context', nodeName: 'pool-host-b-server-0',
     key: { ...specA.key, context: 'pool-host-b-context', architecture: options.hostArchitectures?.['pool-host-b'] ?? 'arm64' } };
   const candidates: Array<{ host: WarmPoolHost; tier: 'standard'; spec: WarmPodSpec }> = options.includeAlternateHost
     ? [{ host: 'pool-host-a', tier: 'standard' as const, spec: specA }, { host: 'pool-host-b', tier: 'standard' as const, spec: specB }]
     : [{ host: 'pool-host-a', tier: 'standard' as const, spec: specA }];
-  const kubernetes = new Map(candidates.map(({ spec: candidateSpec }) => {
+  const kubernetes = options.boundary?.kubernetes ?? new Map(candidates.map(({ spec: candidateSpec }) => {
     const device = createFakeKubectl({ context: candidateSpec.kubectlContext, node: candidateSpec.nodeName!, podReadinessOnCreate: true });
-    const manifest = warmWorkerPodManifest(candidateSpec) as Record<string, any>;
-    manifest.metadata.uid = candidateSpec.kubectlContext === specA.kubectlContext ? 'si-warm-pod-uid-1' : 'si-warm-pod-uid-2';
-    manifest.metadata.resourceVersion = '1';
-    manifest.status = { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] };
-    device.putPod(manifest);
     return [candidateSpec.kubectlContext, device] as const;
   }));
-  const kubectl = (argv: readonly string[], input?: string) => {
+  for (const { spec: candidateSpec } of candidates) {
+    const device = kubernetes.get(candidateSpec.kubectlContext);
+    if (!device) throw new Error(`shared SI simulation boundary has no Kubernetes context: ${candidateSpec.kubectlContext}`);
+    const manifest = warmWorkerPodManifest(candidateSpec) as Record<string, any>;
+    const seeded = device.getPod(candidateSpec.name);
+    manifest.metadata.uid = seeded?.metadata.uid ?? (candidateSpec.kubectlContext === specA.kubectlContext ? 'si-warm-pod-uid-1' : 'si-warm-pod-uid-2');
+    manifest.metadata.resourceVersion = '1';
+    manifest.status = { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] };
+    if (!seeded) device.putPod(manifest);
+  }
+  if (options.exhaustColdJobSlots) {
+    const device = kubernetes.get(specA.kubectlContext)!;
+    device.putPod({ apiVersion: 'v1', kind: 'Pod', metadata: { namespace: specA.namespace,
+      name: 'cold-job-slot-occupant', labels: { 'elanous.substrate': 'pod', 'elanous.job': 'cold-job-slot-occupant' } },
+    status: { phase: 'Running' }, spec: { nodeName: specA.nodeName,
+      containers: [{ name: 'harness', resources: { requests: { cpu: '250m', memory: '1Gi' }, limits: { memory: '1Gi' } } }] } });
+  }
+  const kubectl = options.boundary?.kubectl ?? ((argv: readonly string[], input?: string) => {
     const contextIndex = argv.indexOf('--context');
     const context = contextIndex >= 0 ? argv[contextIndex + 1] : undefined;
     const device = context ? kubernetes.get(context) : undefined;
     return device ? device.kubectl(argv, input) : { status: 1, stdout: '', stderr: `unknown SI simulation context: ${context ?? '(missing)'}` };
-  };
+  });
 
-  const primary = await createFakePrimaryControl();
+  const primary = options.boundary?.primary ?? await createFakePrimaryControl();
+  const ownsPrimary = !options.boundary;
   let oversizedRunnerCommand: SiWarmCommand | undefined;
   let artifactDecodeCalls = 0;
   for (const candidate of candidates) {
@@ -82,16 +111,22 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
         key: candidate.spec.key, ttlMs: 300_000 }),
     });
     if (registered.status !== 200) {
-      primary.stop();
+      if (ownsPrimary) primary.stop();
       throw new Error(`fake primary worker registration failed: ${host}/${registered.status}`);
     }
   }
 
   const cleanupObservations: string[] = [];
   const ledgerRows: RunLedgerEntry[] = [];
+  const residueAtReturn: Array<ReturnType<PodReuseResidueFaultFixture['residue']>> = [];
+  const liveChildPidsAtReturn: number[][] = [];
   let ledgerRowSequence = 0;
   const observe = (event: string, data: Record<string, unknown>) => {
     cleanupObservations.push(event);
+    if (event === 'return-decision' && data.outcome === 'eligible') {
+      if (options.residueFixture) residueAtReturn.push(options.residueFixture.residue());
+      if (options.readLiveChildProcessPids) liveChildPidsAtReturn.push([...options.readLiveChildProcessPids()]);
+    }
     debug.log('pod.reuse', event, data, {
       level: event === 'return-decision' && (data.outcome === 'eligible' || data.outcome === 'returned') ? 'info' : 'warn',
     });
@@ -102,6 +137,7 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
     appendRunLedgerEntry(row, runLedgerDir(options.stateRoot));
     ledgerRows.push(row);
   };
+  let activeCommand: SiWarmCommand | undefined;
   const provider = new SiWarmPodProvider({ candidates,
     controlUrl: primary.url, memberToken: primary.memberToken, machineTokens: primary.machineTokens,
     kubectl, fetch: primary.fetch, now,
@@ -137,32 +173,62 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
             log: Buffer.from(log).toString('base64'), artifacts: [{ path: 'oversized.bin', bytes: oversized }] },
         })) };
       }
-      if (operation === '--stop') return { status: 0, stdout: new TextEncoder().encode(JSON.stringify({
-        remaining: host === 'pool-host-a' && options.residueFixture ? options.residueFixture.residue().processes.length
-          : host === 'pool-host-a' ? options.processResidue ?? 0 : 0 })) };
+      if (operation === '--stop') {
+        const liveRemaining = host === 'pool-host-a' && options.cleanResidueForReuse
+          ? await options.stopLiveChildProcesses?.() ?? 0 : 0;
+        if (host === 'pool-host-a' && options.cleanResidueForReuse) options.residueFixture?.processes.killHost('worker-1');
+        return { status: 0, stdout: new TextEncoder().encode(JSON.stringify({
+          remaining: host === 'pool-host-a' && options.residueFixture && options.cleanResidueForReuse
+            ? options.residueFixture.residue().processes.length + liveRemaining
+            : host === 'pool-host-a' && options.residueFixture
+              ? options.residueFixture.residue().processes.length
+              : host === 'pool-host-a' ? options.processResidue ?? liveRemaining : 0 })) };
+      }
       if (operation === '--revoke') {
         const remaining = host === 'pool-host-a' ? options.residueFixture?.revokeCredentials() ?? 0 : 0;
         return { status: 0, stdout: new TextEncoder().encode(JSON.stringify({ remaining })) };
       }
       if (operation === '--git-status') return { status: 0, stdout: new TextEncoder().encode(JSON.stringify({
         status: 0, stdout: host === 'pool-host-a' ? options.residueFixture?.residue().gitStatus ?? '' : '' })) };
-      if (operation === '--git-reset' || operation === '--git-clean')
-        return { status: 0, stdout: new TextEncoder().encode('{"status":0,"stdout":""}') };
+      if (operation === '--git-reset' || operation === '--git-clean') {
+        if (host !== 'pool-host-a' || !options.residueFixture || !options.cleanResidueForReuse) return { status: 0,
+          stdout: new TextEncoder().encode('{"status":0,"stdout":""}') };
+        try {
+          const args = operation === '--git-reset'
+            ? ['reset', '--hard', activeCommand?.sourceSha ?? '']
+            : ['clean', '-ffdx', '-e', 'node_modules', '-e', 'apps/pwa/node_modules', '-e', '*.tsbuildinfo'];
+          options.residueFixture.remote.git(options.residueFixture.remote.checkout, args);
+          return { status: 0, stdout: new TextEncoder().encode('{"status":0,"stdout":""}') };
+        } catch {
+          return { status: 0, stdout: new TextEncoder().encode('{"status":1,"stdout":""}') };
+        }
+      }
       throw new Error(`unexpected simulated runner operation: ${String(operation)}`);
     },
   });
-  const evidence: WarmSiReuseEvidence = { runId: options.runId, leaseGenerations: [], podUids: [],
+  const coldLeaseMeasure = options.exhaustColdJobSlots
+    ? measurePoolLease(parsePodPool(`${specA.kubectlContext}:1`), { kubectl, dns: () => 'ready', skipDnsProbe: true })
+    : null;
+  const evidence: WarmSiReuseEvidence = { runId: options.runId,
+    coldAdmission: coldLeaseMeasure ? recommendConcurrency(coldLeaseMeasure,
+      { capacity: 1, perGoalMemory: '1Gi', accounts: 1, perAccount: 1 }) : null,
+    leaseGenerations: [], podUids: [],
     leaseHosts: [], leaseArchitectures: [], recoveryHost: null, cleanupOutcomes: [], controlTransitions: [], cleanupObservations, ledgerRows,
-    retryAcquire: 'not-attempted', finalPodState: undefined, artifactCapRejected: false, artifactDecodeCalls: 0 };
+    retryAcquire: 'not-attempted', finalPodState: undefined, artifactCapRejected: false, artifactDecodeCalls: 0,
+    residueAtReturn, liveChildPidsAtReturn };
   try {
     const count = options.processResidue ? 1 : 2;
     for (let index = 1; index <= count; index++) {
+      const sourceSha = options.cleanResidueForReuse && options.residueFixture
+        ? options.residueFixture.remote.git(options.residueFixture.remote.checkout, ['rev-parse', 'HEAD']).trim()
+        : specA.cutSha;
       const acquired = await provider.acquire({ runId: `${options.runId}-${index}`, attemptId: `attempt-${index}`,
-        executionKey: 'a'.repeat(64), sourceSha: specA.cutSha, deadlineAt: now() + 60_000,
+        executionKey: 'a'.repeat(64), sourceSha, deadlineAt: now() + 60_000,
         payload: new TextEncoder().encode('simulated SI payload'),
         credentialBundle: new TextEncoder().encode('simulated credential bundle'), adopt: async () => {} });
       if (acquired.status !== 'acquired') throw new Error(`SI lease acquisition failed: ${acquired.status}/${acquired.reason}`);
       const command = acquired.attempt.command!;
+      activeCommand = command;
       if (options.injectOversizedArtifact) oversizedRunnerCommand = command;
       evidence.leaseGenerations.push(command.generation);
       evidence.podUids.push(command.podUid);
@@ -182,7 +248,7 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
         }
         throw new Error('oversized SI artifact was not quarantined');
       }
-      if (options.afterAcquire && index === (options.afterAcquireAtLease ?? 1)) {
+      if (options.afterAcquire && (options.afterAcquireAtLease === 'each' || index === (options.afterAcquireAtLease ?? 1))) {
         await options.afterAcquire(candidate.host, index);
       }
       const returned = await cleanAndReturnChildPod({ workerId: command.workerId, podUid: command.podUid,
@@ -192,8 +258,11 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
       if (returned.outcome === 'quarantined') break;
     }
     if (evidence.cleanupOutcomes.at(-1) === 'quarantined') {
+      const retrySourceSha = options.cleanResidueForReuse && options.residueFixture
+        ? options.residueFixture.remote.git(options.residueFixture.remote.checkout, ['rev-parse', 'HEAD']).trim()
+        : specA.cutSha;
       const retry = await provider.acquire({ runId: `${options.runId}-retry`, attemptId: 'attempt-retry',
-        executionKey: 'a'.repeat(64), sourceSha: specA.cutSha, deadlineAt: now() + 60_000,
+        executionKey: 'a'.repeat(64), sourceSha: retrySourceSha, deadlineAt: now() + 60_000,
         payload: new TextEncoder().encode('simulated SI payload'),
         credentialBundle: new TextEncoder().encode('simulated credential bundle'), adopt: async () => {} });
       if (retry.status === 'acquired' && options.recoverOnAlternateHost) {
@@ -229,6 +298,6 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
       : undefined;
     return evidence;
   } finally {
-    primary.stop();
+    if (ownsPrimary) primary.stop();
   }
 }

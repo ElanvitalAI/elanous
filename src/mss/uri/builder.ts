@@ -8,7 +8,7 @@
 // de-facto useless for deduplication. Callers may request a different
 // suffix length (4–12 chars) via the `shortLen` option.
 
-import { newUlid } from '../identity.js';
+import { newUlid } from '../ulid.js';
 import { isEntityKind, TIER1_ABBREV_REVERSE, type EntityKind, type ElanousUri, type AgentUri, type SessionUri, type MemoryUri, type SignalUri, type TurnUri, type RunUri, type PluginUri, type WidgetUri, type ModalUri } from './brand.js';
 import { isUlid, parseElanousUri, type ParsedElanousUri, type ParsedUriSegment } from './parser.js';
 

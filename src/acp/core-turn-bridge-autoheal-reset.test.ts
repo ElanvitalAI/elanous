@@ -2,10 +2,10 @@
 // 앞 턴이 폴백으로 grok 이 답했어도, 다음 «새» 턴의 ② 제외 목록에 grok 이 남아 있으면
 // 쓸 수 있는 대체 공급자를 빼 버려 «대체 공급자 없음» 으로 끝난다.
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
-import * as core from '../core-turn/index.js';
+import * as core from '../core-turn/run-core-turn.js';
 import * as llm from '../llm.js';
 import * as config from '../user-config.js';
-import type { CoreTurnContext } from '../core-turn/index.js';
+import type { CoreTurnContext } from '../core-turn/types.js';
 import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp } from './core-turn-bridge.js';
 import { autohealProviderFallbackMeta } from '../self-health/autoheal.js';

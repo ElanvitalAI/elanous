@@ -81,6 +81,11 @@ elif [ -z "${CI:-}" ] && [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
 fi
 
 # Consent covers installation, PATH changes, and the subsequent doctor repairs.
+# An unattended run over an existing installation is that installation updating itself (`elanous self-update`,
+# whose 0.3.5 and earlier builds did not pass --yes): the user consented when they first installed, so it proceeds.
+if [ "$ASSUME_YES" -ne 1 ] && [ "$INTERACTIVE" -ne 1 ] && [ -f "$PREFIX/install.json" ]; then
+  ASSUME_YES=1
+fi
 if [ "$ASSUME_YES" -ne 1 ]; then
   ANSWER=''
   if [ "$INTERACTIVE" -eq 1 ]; then

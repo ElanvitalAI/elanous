@@ -8,7 +8,7 @@ import { createSession } from '../../session/index.js';
 
 import { DaemonSessionHistory } from '../../boot/daemon-runtime.js';
 import { surfaceUxFromDispatchCtx } from '../../agent/surface-ux/build.js';
-import * as coreTurnModule from '../../core-turn/index.js';
+import * as coreTurnModule from '../../core-turn/run-core-turn.js';
 import * as providerSummary from '../../provider-summary.js';
 import { debug } from '../../debug/log.js';
 import { HudStore } from '../state/hud-store.js';

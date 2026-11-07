@@ -79,11 +79,15 @@ describe('GET /v1/inside/events', () => {
     try {
       const run = await runGraph(graph, { runId: 'inside-sse', deps: { root, processStartMs: () => null, runBash: async () => ({ stdout: 'ready', stderr: '', exitCode: 0 }) } });
       expect(run.status).toBe('done');
-      const events = await Promise.all(Array.from({ length: 7 }, () => nextFrame(reader)));
+      const events = await Promise.all(Array.from({ length: 15 }, () => nextFrame(reader)));
       const parsed = events.map(frame => JSON.parse(frame.split('data: ')[1]!));
       expect(parsed.map(ev => `${ev.kind}:${ev.nodeId ?? `${ev.from}->${ev.to}`}:${ev.phase ?? ev.verdict ?? ''}`)).toEqual([
-        'node:work:start', 'node:work:ok', 'verdict:work:ok', 'edge:work->done:',
+        'node.lifecycle:work:arrival', 'node.lifecycle:work:start',
+        'node:work:start', 'node:work:ok', 'verdict:work:ok',
+        'node.lifecycle:work:end', 'node.lifecycle:work:leave', 'edge:work->done:',
+        'node.lifecycle:done:arrival', 'node.lifecycle:done:start',
         'node:done:start', 'node:done:ok', 'verdict:done:ok',
+        'node.lifecycle:done:end', 'node.lifecycle:done:leave',
       ]);
       expect(parsed[0]).toMatchObject({ graphId: 'inside-live', runId: 'inside-sse', ts: expect.any(String) });
       expect(events.every(frame => frame.startsWith('event: ') && frame.includes('\ndata: '))).toBe(true);
@@ -118,17 +122,25 @@ describe('GET /v1/inside/events', () => {
       expect({ code, output: output.trim(), errors: errors.includes('error:') ? errors : '' }).toEqual({ code: 0, output: 'done', errors: '' });
       let streamText = '';
       const deadline = Date.now() + 5000;
-      while (streamText.split('event: ').length - 1 < 7 && Date.now() < deadline) {
+      while (streamText.split('event: ').length - 1 < 15 && Date.now() < deadline) {
         const { value, done } = await Promise.race([reader.read(), Bun.sleep(5000).then(() => { throw new Error('detached SSE frame timeout'); })]);
         if (done) throw new Error('detached SSE stream closed');
         streamText += new TextDecoder().decode(value);
       }
       const frames = streamText.split('\n\n').filter(frame => frame.startsWith('event: '));
-      expect(frames).toHaveLength(7);
+      expect(frames).toHaveLength(15);
       const events = frames.map(frame => JSON.parse(frame.split('data: ')[1]!));
+      expect(events.map(ev => `${ev.kind}:${ev.nodeId ?? `${ev.from}->${ev.to}`}:${ev.phase ?? ev.verdict ?? ''}`)).toEqual([
+        'node.lifecycle:work:arrival', 'node.lifecycle:work:start',
+        'node:work:start', 'node:work:ok', 'verdict:work:ok',
+        'node.lifecycle:work:end', 'node.lifecycle:work:leave', 'edge:work->done:',
+        'node.lifecycle:done:arrival', 'node.lifecycle:done:start',
+        'node:done:start', 'node:done:ok', 'verdict:done:ok',
+        'node.lifecycle:done:end', 'node.lifecycle:done:leave',
+      ]);
       expect(events.filter(ev => ev.kind === 'node' && ev.runId === events[0].runId).map(ev => `${ev.nodeId}:${ev.phase}`))
         .toEqual(['work:start', 'work:ok', 'done:start', 'done:ok']);
-      expect(events[0]).toMatchObject({ graphId: 'detached-live', runId: 'detached-run', kind: 'node' });
+      expect(events.find(ev => ev.kind === 'node')).toMatchObject({ graphId: 'detached-live', runId: 'detached-run', kind: 'node' });
       expect(await child.exited).toBe(0);
     } finally {
       await reader?.cancel();

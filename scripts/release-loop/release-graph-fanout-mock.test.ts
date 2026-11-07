@@ -94,6 +94,7 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
   const root = mkdtempSync(join(tmpdir(), 'release-graph-fanout-runner-'));
   const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const calls = new Map<string, number>();
+  const lifecycle: Array<{ event: string; graphId: string; runId: string; nodeId: string }> = [];
   let failDocsLand = true;
   let activeBranches = 0;
   let maxActiveBranches = 0;
@@ -116,10 +117,48 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
     return { stdout: JSON.stringify({ outcome: 'ok', ...extra }), stderr: '', exitCode: 0 };
   };
   try {
-    const first = await runGraph(graph, { input: { version: '0.2.44', branchCut: true }, deps: { root, runBash } });
+    const first = await runGraph(graph, { input: { version: '0.2.44', branchCut: true }, deps: { root, runBash,
+      log: (event, data) => {
+        if (event === 'node-start' || event === 'node-end') {
+          lifecycle.push({ event, graphId: String(data.graphId), runId: String(data.runId), nodeId: String(data.nodeId) });
+        }
+      } } });
     expect(first.status).toBe('failed');
     expect(maxActiveBranches).toBe(2);
-    expect(first.fanOuts?.['traffic-npm-published:ok']?.branches).toMatchObject({
+    const fanout = first.fanOuts?.['traffic-npm-published:ok'];
+    expect(fanout).toBeDefined();
+    const branchRunIds = new Set(Object.values(fanout!.branches).map((branch) => branch.runId));
+    const activeNodes = new Map<string, string>();
+    const lifecyclePairingErrors: string[] = [];
+    let maxConcurrentNodes = 0;
+    let maxConcurrentNodeIds: string[] = [];
+    for (const event of lifecycle) {
+      if (event.graphId !== first.graphId || !branchRunIds.has(event.runId)) continue;
+      const key = `${event.runId}:${event.nodeId}`;
+      if (event.event === 'node-start') {
+        if (activeNodes.has(key)) lifecyclePairingErrors.push(`duplicate start: ${key}`);
+        activeNodes.set(key, event.nodeId);
+        if (activeNodes.size > maxConcurrentNodes) {
+          maxConcurrentNodes = activeNodes.size;
+          maxConcurrentNodeIds = [...new Set(activeNodes.values())].sort();
+        }
+      } else {
+        if (!activeNodes.has(key)) lifecyclePairingErrors.push(`end without start: ${key}`);
+        activeNodes.delete(key);
+      }
+    }
+    expect(lifecyclePairingErrors).toEqual([]);
+    expect([...activeNodes.keys()]).toEqual([]);
+    const concurrencyMeasurement = { graphId: first.graphId, runId: first.runId, concurrentNodes: maxConcurrentNodes,
+      concurrentNodeIds: maxConcurrentNodeIds, branchRunIds: [...branchRunIds].sort() };
+    console.info(`[release-concurrency-measurement] ${JSON.stringify(concurrencyMeasurement)}`);
+    expect(branchRunIds.size).toBe(2);
+    const startedBranchRunIds = new Set(lifecycle
+      .filter((event) => event.event === 'node-start' && branchRunIds.has(event.runId)).map((event) => event.runId));
+    expect([...startedBranchRunIds].sort()).toEqual([...branchRunIds].sort());
+    expect(concurrencyMeasurement.concurrentNodes).toBe(2);
+    expect(concurrencyMeasurement.concurrentNodeIds).toEqual(['docs-land', 'version-dev-bump']);
+    expect(fanout?.branches).toMatchObject({
       'docs-land': { status: 'failed', output: expect.any(String), artifactSha256: expect.any(String) },
       'version-dev-bump': { status: 'done', output: expect.any(String), artifactSha256: expect.any(String) },
     });

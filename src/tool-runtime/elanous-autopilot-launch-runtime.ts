@@ -10,7 +10,7 @@
 // directly; this tool targets short pivots ("explore X" · "patch Y")
 // that complete within ~2 min.
 //
-// CRITICAL: the CLI runner (`src/cli/autopilot-run.ts`) writes agent
+// CRITICAL: the retired `elanous autopilot` CLI used to write agent
 // text to `process.stdout` and envelopes to `process.stderr`. Codex's
 // MCP transport uses stdio for JSON-RPC — bare process.stdout writes
 // would corrupt the channel. We bypass the CLI helper and drive the

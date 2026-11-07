@@ -302,7 +302,9 @@ export function createNexusTelegramTriggerBot(
   }
 
   const opReplyInstance = resolveInstanceName();
-  const opReplyRoute = !botWasInjected ? startChannelOpReplyRoute({
+  // botFromConfig owns the reply listener for its own poll-loop lifetime.
+  // The trigger-only fallback has no config bot, so it keeps this route here.
+  const opReplyRoute = !botWasInjected && !opts.userConfig ? startChannelOpReplyRoute({
     transport: createTelegramChannelOpReplyTransport({ bot, botId: thisBotId, instance: opReplyInstance }),
     botId: thisBotId,
     instance: opReplyInstance,

@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AcpTurnContext } from '../acp/server.js';
-import * as coreTurn from '../core-turn/index.js';
+import * as coreTurn from '../core-turn/run-core-turn.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { createProject } from '../project/project-store.js';

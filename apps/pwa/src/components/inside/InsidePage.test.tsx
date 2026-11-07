@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
+import { afterAll, afterEach, beforeEach, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { act, type ComponentProps } from 'react';
@@ -11,6 +11,7 @@ import { InsidePageContent } from './InsidePage';
 import { ArchitectureScene } from './ArchitectureScene';
 import { ARCHITECTURE_MAP } from './architecture-map';
 import { leaksInternal } from './public-text';
+import { closeInsideBrowserSession, insideBrowserSession } from './InsidePage.browser-test-support';
 
 let params = new URLSearchParams();
 
@@ -272,6 +273,7 @@ function nodePtyResolvable(): boolean {
   try { Bun.resolveSync('node-pty', join(import.meta.dir, '../../../../../src/preview')); return true; } catch { return false; }
 }
 const INSIDE_BUILD_BLOCKED = !exportedInsideIsFresh(join(import.meta.dir, '../../..')) && !nodePtyResolvable();
+afterAll(closeInsideBrowserSession);
 if (INSIDE_BUILD_BLOCKED) console.warn('[skip] fresh exported /inside browser checks — export is stale and next build cannot resolve node-pty (optional native dependency not installed)');
 if (!CHROMIUM) console.warn('[skip] fresh exported /inside browser check — no Chromium/Chrome found (CHROME_BIN · /usr/local/bin/chromium · Google Chrome.app)');
 test.skipIf(!CHROMIUM || INSIDE_BUILD_BLOCKED)('fresh exported /inside renders scene ①② at 375px, 1440px and 1920px in Chromium without overflow', async () => {
@@ -282,80 +284,30 @@ test.skipIf(!CHROMIUM || INSIDE_BUILD_BLOCKED)('fresh exported /inside renders s
   }
   const out = join(pwaDir, 'out');
   expect(existsSync(join(out, 'inside/index.html'))).toBe(true);
-  const server = Bun.serve({ port: 0, fetch: (request) => {
-    const pathname = new URL(request.url).pathname;
-    const relative = pathname.replace(/^\/app\//, '').replace(/\/$/, '/index.html') || 'index.html';
-    if (!pathname.startsWith('/app/') || relative.includes('..')) return new Response('not found', { status: 404 });
-    const path = join(out, relative);
-    if (!existsSync(path)) return new Response('not found', { status: 404 });
-    const type = path.endsWith('.html') ? 'text/html' : path.endsWith('.css') ? 'text/css'
-      : path.endsWith('.js') ? 'application/javascript' : path.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream';
-    return new Response(Bun.file(path), { headers: { 'content-type': type } });
-  } });
+  const { server, send } = await insideBrowserSession(CHROMIUM!, out);
   const initial = await (await fetch(`http://127.0.0.1:${server.port}/app/inside/?demo=0`)).text();
   expect(initial).toContain('베타 — 화면과 동작이 바뀔 수 있습니다.');
   expect(initial).toContain('엘라누스 안쪽');
-  const profile = mkdtempSync(join(tmpdir(), 'inside-browser-'));
-  const browser = spawn(CHROMIUM!, ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: 'ignore' });
-  let socket: WebSocket | undefined;
-  try {
-    let debuggerUrl = '';
-    for (let attempt = 0; attempt < 100 && !debuggerUrl; attempt++) {
-      if (!browser.pid || browser.exitCode !== null) throw Error('Chromium exited before exposing CDP');
-      if (existsSync(join(profile, 'DevToolsActivePort'))) {
-        const port = readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n')[0];
-        try {
-          const tabs = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() as Array<{ type: string; webSocketDebuggerUrl?: string }>;
-          debuggerUrl = tabs.find((tab) => tab.type === 'page')?.webSocketDebuggerUrl ?? '';
-        } catch { /* CDP endpoint not ready yet. */ }
-      }
-      if (!debuggerUrl) await Bun.sleep(100);
-    }
-    expect(debuggerUrl).not.toBe('');
-    socket = new WebSocket(debuggerUrl);
-    await new Promise<void>((resolve, reject) => { socket!.onopen = () => resolve(); socket!.onerror = () => reject(Error('CDP connection failed')); });
-    let id = 0;
-    const pending = new Map<number, (result: { result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown }) => void>();
-    socket.onmessage = (event) => {
-      const reply = JSON.parse(String(event.data)) as { id?: number; result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown };
-      if (reply.id && pending.has(reply.id)) { pending.get(reply.id)!(reply); pending.delete(reply.id); }
-    };
-    const send = (method: string, params: object = {}) => new Promise<{ result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown }>((resolve) => {
-      const next = ++id;
-      pending.set(next, resolve);
-      socket!.send(JSON.stringify({ id: next, method, params }));
-    });
-    await send('Page.enable');
-    await send('Runtime.enable');
-    await send('Page.addScriptToEvaluateOnNewDocument', { source: `
-      window.__insideStreams = [];
-      window.EventSource = class {
-        constructor(url) { this.url = url; this.handlers = {}; window.__insideStreams.push(this); }
-        addEventListener(name, fn) { (this.handlers[name] ||= []).push(fn); }
-        removeEventListener(name, fn) { this.handlers[name] = (this.handlers[name] || []).filter((handler) => handler !== fn); }
-        close() {}
-        emit(frame) { for (const handler of this.handlers.log || []) handler({ data: JSON.stringify(frame) }); }
-      };
-    ` });
-    const url = `http://127.0.0.1:${server.port}/app/inside/?demo=0`;
-    const demoUrl = `http://127.0.0.1:${server.port}/app/inside/?demo=1`;
-    await send('Page.navigate', { url: demoUrl });
-    let demoBanner: unknown;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      const response = await send('Runtime.evaluate', { expression: `(() => {
+  const url = `http://127.0.0.1:${server.port}/app/inside/?demo=0`;
+  const demoUrl = `http://127.0.0.1:${server.port}/app/inside/?demo=1`;
+  await send('Page.navigate', { url: demoUrl });
+  let demoBanner: unknown;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await send('Runtime.evaluate', { expression: `(() => {
         if (!document.querySelector('[data-inside-page] [aria-label="시연 모드"]')) return null;
         return document.body.innerText.includes('베타 — 화면과 동작이 바뀔 수 있습니다.');
-      })()`, returnByValue: true });
-      demoBanner = response.result?.result?.value;
-      if (demoBanner === false) break;
-      await Bun.sleep(100);
-    }
-    expect(demoBanner).toBe(false);
-    const frame = { category: 'graph.run', event: 'node', ts: '2026-10-03T00:00:00Z', data: { graphId: 'demo', runId: 'demo123', nodeId: 'alpha', phase: 'start' } };
-    for (const width of [375, 1440, 1920]) {
-      await send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: false });
-      await send('Page.navigate', { url });
-      for (const scene of [1, 2]) {
+    })()`, returnByValue: true });
+    demoBanner = response.result?.result?.value;
+    if (demoBanner === false) break;
+    await Bun.sleep(100);
+  }
+  expect(demoBanner).toBe(false);
+  const frame = { category: 'graph.run', event: 'node', ts: '2026-10-03T00:00:00Z', data: { graphId: 'demo', runId: 'demo123', nodeId: 'alpha', phase: 'start' } };
+  for (const [widthIndex, width] of [375, 1440, 1920].entries()) {
+    await send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: false });
+    if (widthIndex === 0) await send('Page.navigate', { url });
+    else await send('Runtime.evaluate', { expression: `document.querySelectorAll('[data-inside-page] nav button')[0].click()` });
+    for (const scene of [1, 2]) {
       let measured: Record<string, unknown> | undefined;
       for (let attempt = 0; attempt < 50; attempt++) {
         const response = await send('Runtime.evaluate', { expression: `(() => {
@@ -401,13 +353,7 @@ test.skipIf(!CHROMIUM || INSIDE_BUILD_BLOCKED)('fresh exported /inside renders s
         const injected = await send('Runtime.evaluate', { expression: `(() => { const stream = window.__insideStreams.find(s => s.url.includes('/v1/logs/stream') && /category=graph\\.run/.test(s.url)); if (!stream) return false; stream.emit(${JSON.stringify(frame)}); return true; })()`, returnByValue: true });
         expect(injected.result?.result?.value).toBe(true);
       }
-      }
     }
-  } finally {
-    socket?.close();
-    browser.kill();
-    server.stop(true);
-    rmSync(profile, { recursive: true, force: true });
   }
 }, BUILD_TIMEOUT_MS + BROWSER_TIMEOUT_MS);
 
@@ -420,52 +366,12 @@ test.skipIf(!CHROMIUM || INSIDE_BUILD_BLOCKED)('fresh exported /inside scenes 1�
   }
   const out = join(pwaDir, 'out');
   expect(existsSync(join(out, 'inside/index.html'))).toBe(true);
-  const server = Bun.serve({ port: 0, fetch: (request) => {
-    const pathname = new URL(request.url).pathname;
-    const relative = pathname.replace(/^\/app\//, '').replace(/\/$/, '/index.html') || 'index.html';
-    if (!pathname.startsWith('/app/') || relative.includes('..')) return new Response('not found', { status: 404 });
-    const path = join(out, relative);
-    if (!existsSync(path)) return new Response('not found', { status: 404 });
-    const type = path.endsWith('.html') ? 'text/html' : path.endsWith('.css') ? 'text/css'
-      : path.endsWith('.js') ? 'application/javascript' : path.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream';
-    return new Response(Bun.file(path), { headers: { 'content-type': type } });
-  } });
-  const profile = mkdtempSync(join(tmpdir(), 'inside-fold-browser-'));
-  const browser = spawn(CHROMIUM!, ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], { stdio: 'ignore' });
-  let socket: WebSocket | undefined;
-  try {
-    let debuggerUrl = '';
-    for (let attempt = 0; attempt < 100 && !debuggerUrl; attempt++) {
-      if (!browser.pid || browser.exitCode !== null) throw Error('Chromium exited before exposing CDP');
-      if (existsSync(join(profile, 'DevToolsActivePort'))) {
-        const port = readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n')[0];
-        try {
-          const tabs = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() as Array<{ type: string; webSocketDebuggerUrl?: string }>;
-          debuggerUrl = tabs.find((tab) => tab.type === 'page')?.webSocketDebuggerUrl ?? '';
-        } catch { /* CDP endpoint not ready yet. */ }
-      }
-      if (!debuggerUrl) await Bun.sleep(100);
-    }
-    expect(debuggerUrl).not.toBe('');
-    socket = new WebSocket(debuggerUrl);
-    await new Promise<void>((resolve, reject) => { socket!.onopen = () => resolve(); socket!.onerror = () => reject(Error('CDP connection failed')); });
-    let id = 0;
-    const pending = new Map<number, (result: { result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown }) => void>();
-    socket.onmessage = (event) => {
-      const reply = JSON.parse(String(event.data)) as { id?: number; result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown };
-      if (reply.id && pending.has(reply.id)) { pending.get(reply.id)!(reply); pending.delete(reply.id); }
-    };
-    const send = (method: string, params: object = {}) => new Promise<{ result?: { result?: { value?: unknown }; exceptionDetails?: unknown }; error?: unknown }>((resolve) => {
-      const next = ++id;
-      pending.set(next, resolve);
-      socket!.send(JSON.stringify({ id: next, method, params }));
-    });
-    await send('Page.enable');
-    await send('Runtime.enable');
-    const url = `http://127.0.0.1:${server.port}/app/inside/?demo=0`;
-    for (const width of [344, 884, 1920]) {
+  const { server, send } = await insideBrowserSession(CHROMIUM!, out);
+  const url = `http://127.0.0.1:${server.port}/app/inside/?demo=0`;
+    for (const [widthIndex, width] of [344, 884, 1920].entries()) {
       await send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: false });
-      await send('Page.navigate', { url });
+      if (widthIndex === 0) await send('Page.navigate', { url });
+      else await send('Runtime.evaluate', { expression: `document.querySelectorAll('[data-inside-page] nav button')[0].click()` });
       for (const scene of [1, 2, 3, 4, 5, 6]) {
         let measured: { scrollWidth: number; clientWidth: number; navLeft: number; navRight: number; navVisible: boolean; contentVisible: boolean; clipped: string[] } | undefined;
         for (let attempt = 0; attempt < 100; attempt++) {
@@ -551,12 +457,6 @@ test.skipIf(!CHROMIUM || INSIDE_BUILD_BLOCKED)('fresh exported /inside scenes 1�
         }
       }
     }
-  } finally {
-    socket?.close();
-    browser.kill();
-    server.stop(true);
-    rmSync(profile, { recursive: true, force: true });
-  }
 }, BUILD_TIMEOUT_MS + BROWSER_TIMEOUT_MS);
 
 test('architecture cells expand to show documented paths with at least 18px base text', async () => {

@@ -195,12 +195,12 @@ test('recorded events reach the installed CLI facts JSON', async () => {
     } finally {
       unregister?.();
     }
-    const action = { taskId: 'retro-cli-ta', kind: 'review', rationale: 'review passed', pr: 4201, runId: 'retro-run', original: 'review', checklistId: 'retro-check' };
-    const ta = Bun.spawnSync([process.execPath, 'bin/elanous.mjs', '--test-state-dir', stateDir, 'autopilot', 'task-agent-action', JSON.stringify(action)], {
-      cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'development', ELANOUS_STATE_DIR: stateDir }, stdout: 'pipe', stderr: 'pipe',
-    });
-    expect(ta.exitCode).toBe(0);
-    expect(new TextDecoder().decode(ta.stdout)).toContain('shadow');
+    const actionLog = new LogStore(join(stateDir, 'logs', 'logs.db'));
+    actionLog.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'task-agent', event: 'action', data: {
+      taskId: 'retro-cli-ta', kind: 'review', result: 'shadow', rationale: 'review passed', pr: 4201,
+      runId: 'retro-run', original: 'review', checklistId: 'retro-check',
+    } }, surface: 'test' }]);
+    actionLog.close();
     const run = Bun.spawnSync([process.execPath, 'bin/elanous.mjs', '--test-state-dir', stateDir, 'retro', 'facts', '--since', '24h', '--json'], {
       cwd: process.cwd(), env: { ...process.env, ELANOUS_STATE_DIR: stateDir }, stdout: 'pipe', stderr: 'pipe',
     });
@@ -227,9 +227,7 @@ test('recorded events reach the installed CLI facts JSON', async () => {
     else process.env.ELANOUS_POD_NAME = podName;
     rmSync(dir, { recursive: true, force: true });
   }
-  // Two real CLI spawns (task-agent-action, then retro facts): a cold `bin/elanous.mjs` boot takes several seconds in a
-  // gate Pod, so bun's 5 s default timed this out (0.2.20 gate «introduced 1» · 10-08 08:1x). Same budget class as the
-  // other real-spawn tests.
+  // The action event is seeded in logs.db; the installed CLI must read it back as a retro fact.
 }, 120_000);
 
 test('retro facts command is registered and produces JSON', async () => {

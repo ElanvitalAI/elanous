@@ -188,7 +188,7 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
     gate.elapsedMs = Date.now() - started;
     return { exitCode: gate.code, stdout: `${gate.printed.join('\n')}\n`, stderr: '' };
   };
-  const first = await runGraph(graphPath, { input: { version: '9.9.97', branchCut: true, previousVersion: '9.9.96', gatePodPool: 'pool-test' }, deps: { root: ledger, runBash } });
+  const first = await runGraph(graphPath, { input: { version: '9.9.97', branchCut: true, previousVersion: '9.9.96', gatePodPool: 'pool-test', gateImagePin: 'cut-commit' }, deps: { root: ledger, runBash } });
   expect(gate.body).toContain('gate-node.ts --json');
   // The direct gate entry test above checks the 15s stop bound; this full graph test checks only the persisted verdict.
   expect(gate.code).toBe(2);

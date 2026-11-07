@@ -809,56 +809,15 @@ describe('harness ask production entry wiring', () => {
     },
   });
 
-  test('production harness help exposes ask, say, and mission after the index-level handler injection', async () => {
+  test('production harness help exposes ask and say without the retired mission entry', async () => {
     const { program } = await import('./index.js');
     const harness = program.commands.find((command) => command.name() === 'harness')!;
 
     const help = harness.helpInformation();
-    expect(harness.commands.map((command) => command.name())).toEqual(expect.arrayContaining(['ask', 'say', 'mission']));
+    expect(harness.commands.map((command) => command.name())).toEqual(expect.arrayContaining(['ask', 'say']));
+    expect(harness.commands.map((command) => command.name())).not.toContain('mission');
     expect(help).toMatch(/^\s+ask \[options\] <goal-path>/m);
     expect(help).toMatch(/^\s+say \[options\] <sentence\.\.\.>/m);
-    expect(help).toMatch(/^\s+mission \[options\] <mission-ids\.\.\.>/m);
-  });
-
-  test('production harness mission parser routes multiple IDs to the loop and renders each returned outcome', async () => {
-    const { program, setHarnessMissionLoopDepsForTesting } = await import('./index.js');
-    const received: unknown[] = [];
-    const lines: string[] = [];
-    const originalLog = console.log;
-    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
-    try {
-      setHarnessMissionLoopDepsForTesting({
-        runMissionSolveLoop: (async (input: unknown) => {
-          received.push(input);
-          return [
-            { missionId: 'apm-one', status: 'solved', terminal: 'deployed' },
-            { missionId: 'apm-two', status: 'not-found', detail: '미션 미존재' },
-          ];
-        }) as never,
-        openAutopilotMissionsDb: (() => ({ close: () => {} })) as never,
-        getMission: (() => null) as never,
-        defaultSeams: (() => ({ })) as never,
-        childInstanceScope: (() => ({ })) as never,
-        surfaceUxFromDispatchCtx: (() => ({ })) as never,
-        solveMissionViaHarness: (async () => ({ })) as never,
-      });
-
-      await program.parseAsync(['node', 'elanous', 'harness', 'mission', 'apm-one', 'apm-two', '--executor', 'self-implement']);
-
-      expect(received).toEqual([expect.objectContaining({
-        missionIds: ['apm-one', 'apm-two'],
-        solve: expect.any(Function),
-      })]);
-      const loopInput = received[0] as { solve: (input: unknown) => Promise<unknown> };
-      expect(await loopInput.solve({ mission: {} })).toEqual({});
-      expect(lines).toEqual([
-        "🧩 미션 'apm-one' — solved: deployed",
-        "🧩 미션 'apm-two' — not-found: 미션 미존재",
-      ]);
-    } finally {
-      console.log = originalLog;
-      setHarnessMissionLoopDepsForTesting(undefined);
-    }
   });
 
   test('production harness ask and say expose the explicit preflight bypass but not decomposition control', async () => {
@@ -4562,7 +4521,6 @@ describe('harness orchestrate canonical entrance capability', () => {
     'incidents',
     'launch-requests',
     'map',
-    'mission',
     'orchestrate',
     'plan',
     'processes',
@@ -5478,12 +5436,11 @@ describe('decide / ax-screen / decide-recipe JSON stdout completion', () => {
     const source = indexSource();
     expect(source).not.toMatch(/console\.log\(JSON\.stringify/);
     expect(source).toContain('import { writeStdoutJson } from \'./cli/stdout-json.js\';');
-    // agent / ops / publish / autopilot call sites now live in their registration modules; count them together.
+    // agent / ops / publish call sites now live in their registration modules; count them together.
     const jsonSources = source
       + readFileSync(new URL('./cli/agent-cli.ts', import.meta.url), 'utf8')
       + readFileSync(new URL('./cli/ops-cli.ts', import.meta.url), 'utf8')
-      + readFileSync(new URL('./cli/publish-cli.ts', import.meta.url), 'utf8')
-      + readFileSync(new URL('./cli/autopilot-cli.ts', import.meta.url), 'utf8');
+      + readFileSync(new URL('./cli/publish-cli.ts', import.meta.url), 'utf8');
     expect((jsonSources.match(/writeStdoutJson/g) ?? []).length).toBeGreaterThan(102);
 
     const extracted = new Command();

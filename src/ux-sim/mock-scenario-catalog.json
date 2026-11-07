@@ -16,6 +16,38 @@
       {
         "path": "src/ux-sim/aside-feedback-loop.ts",
         "reason": "DEMO1104-ASIDE-FEEDBACK-LOOP mock regression for the live feedback-cycle trial."
+      },
+      {
+        "path": "src/release-loop/macrophage-heal.ts",
+        "reason": "RLA-MACROPHAGE-HEAL planner registered with the release graph simulation scenario."
+      },
+      {
+        "path": "scripts/release-loop/gate-bisect.ts",
+        "reason": "Post-inventory implementation for GATE-FAIL-BISECT-SIDECAR shadow-to-operational simulation."
+      },
+      {
+        "path": "scripts/release-loop/gate-bisect.test.ts",
+        "reason": "Post-inventory simulation coverage for GATE-FAIL-BISECT-SIDECAR."
+      },
+      {
+        "path": "scripts/release-loop/gate-bisect-sidecar.ts",
+        "reason": "Post-inventory detached sidecar runner and persisted shadow-to-operational transition for GATE-FAIL-BISECT-SIDECAR."
+      },
+      {
+        "path": "src/ux-sim/pod-reuse-world.ts",
+        "reason": "POD-REUSE-SIM-METHOD landed integrated world; register its runtime module in the source inventory."
+      },
+      {
+        "path": "src/ux-sim/pr-land-drift-gate-device.ts",
+        "reason": "LAND-DRIFT-GATE-PRODUCER simulation device uses production pinned-base drift parsing and refusal classification."
+      },
+      {
+        "path": "src/ux-sim/app-contract-secret-entropy.ts",
+        "reason": "APP-CONTRACT-SECRET-ENTROPY: safe synthetic credential corpus measures the production parser false-positive rate."
+      },
+      {
+        "path": "src/ux-sim/app-contract-secret-entropy.test.ts",
+        "reason": "APP-CONTRACT-SECRET-ENTROPY: safe synthetic credential corpus measures the production parser false-positive rate."
       }
     ],
     "excludedPaths": 27,
@@ -94,6 +126,50 @@
         "deviceId": "release-graph-rig",
         "scenarioIds": [
           "UX-MS-02"
+        ]
+      },
+      {
+        "path": "scripts/release-loop/gate-bisect.ts",
+        "disposition": "device",
+        "entryCommand": "bun test scripts/release-loop/gate-bisect.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Production bisect planner and shadow-to-operational transition are asserted in the release simulation tests.",
+        "deviceId": "release-graph-rig",
+        "scenarioIds": [
+          "UX-MS-02"
+        ]
+      },
+      {
+        "path": "scripts/release-loop/gate-bisect.test.ts",
+        "disposition": "device",
+        "entryCommand": "bun test scripts/release-loop/gate-bisect.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Simulated two-file regression bisect, three shadow agreements, and unchanged release verdict.",
+        "deviceId": "release-graph-rig",
+        "scenarioIds": [
+          "UX-MS-02"
+        ]
+      },
+      {
+        "path": "scripts/release-loop/gate-bisect-sidecar.ts",
+        "disposition": "device",
+        "entryCommand": "bun test scripts/release-loop/gate-bisect.test.ts",
+        "logsRecorded": "yes",
+        "logsDetail": "Detached release sidecar emits bisect plan, step, transition and repair-card events.",
+        "deviceId": "release-graph-rig",
+        "scenarioIds": [
+          "UX-MS-02"
+        ]
+      },
+      {
+        "path": "src/release-loop/macrophage-heal.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/release-loop/macrophage-heal.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Planner decisions and simulation-only cleanup are asserted by the macrophage release scenario tests.",
+        "deviceId": "release-graph-rig",
+        "scenarioIds": [
+          "RELEASE-MACROPHAGE-HEAL"
         ]
       },
       {
@@ -212,7 +288,8 @@
         "deviceId": "release-graph-rig",
         "scenarioIds": [
           "UX-MS-02",
-          "RELEASE-GRAPH-PREPUB-FANOUT"
+          "RELEASE-GRAPH-PREPUB-FANOUT",
+          "RELEASE-MACROPHAGE-HEAL"
         ]
       },
       {
@@ -360,10 +437,48 @@
         "logsRecorded": "no",
         "logsDetail": "No runtime logs; real secretary runtime and topic subscription functions run with injected external edges.",
         "deviceId": "aside-feedback-loop"
+      },
+      {
+        "path": "src/ux-sim/pod-reuse-world.ts",
+        "disposition": "already-indexed",
+        "entryCommand": "bun test src/ux-sim/pod-reuse-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Integrated deterministic pod reuse world result asserted by test.",
+        "deviceId": "pod-reuse-residue-fault"
+      },
+      {
+        "path": "src/ux-sim/pr-land-drift-gate-device.ts",
+        "disposition": "already-indexed",
+        "entryCommand": "bun test src/ux-sim/pr-land-drift-gate-device.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Synthetic remote output exercises production assessment and refusal classification without SSH.",
+        "deviceId": "pr-land-drift-gate"
+      },
+      {
+        "path": "src/ux-sim/app-contract-secret-entropy.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/app-contract-secret-entropy.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Synthetic candidate values stay in memory; only case IDs and aggregate metrics are returned.",
+        "deviceId": "app-contract-secret-entropy",
+        "scenarioIds": [
+          "APP-CONTRACT-SECRET-ENTROPY"
+        ]
+      },
+      {
+        "path": "src/ux-sim/app-contract-secret-entropy.test.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/app-contract-secret-entropy.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Synthetic candidate values stay in memory; only case IDs and aggregate metrics are returned.",
+        "deviceId": "app-contract-secret-entropy",
+        "scenarioIds": [
+          "APP-CONTRACT-SECRET-ENTROPY"
+        ]
       }
     ]
   },
-  "deviceCatalogVersion": 6,
+  "deviceCatalogVersion": 11,
   "devices": [
     {
       "id": "SIM-FAKE-PROVIDERS-AV",
@@ -563,6 +678,33 @@
       "entryCommands": [
         "bun test src/ux-sim/fake-fetch.test.ts",
         "bun test apps/pwa/src/lib/daemon-client.seat-request.test.ts apps/pwa/src/lib/daemon-client-tool-meta.test.ts apps/pwa/src/lib/task-api.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-data-guard-boundary",
+      "name": "Fake data-guard public and local HTTP boundary",
+      "implementation": [
+        "src/ux-sim/fake-data-guard-boundary.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-data-guard-boundary.test.ts"
+      ],
+      "target": "Public, approved local-LLM, and unknown HTTP destinations in DATA-GUARD simulations; never falls through to the network",
+      "inputs": [
+        "explicit local and public origins",
+        "HTTP method, headers, and body",
+        "scripted public and local responses"
+      ],
+      "observations": [
+        "per-call destination classification, headers, and request body text",
+        "local, public, and unknown attempt counts",
+        "unknown destination refusal"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-data-guard-boundary.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -1063,7 +1205,8 @@
         "bun test src/ux-sim/world.test.ts src/ux-sim/world-chaos-runtime.test.ts src/ux-sim/event-monkey.test.ts",
         "bun test src/ux-sim/world-host-chaos.test.ts",
         "bun test src/ux-sim/warm-si-reuse-sim.test.ts",
-        "bun test src/ux-sim/fake-app-host.test.ts"
+        "bun test src/ux-sim/fake-app-host.test.ts",
+        "bun test src/ux-sim/gate-roster-second-pool.test.ts"
       ],
       "eventNames": [
         "pod.reuse/uncertain-exec-injected"
@@ -1085,7 +1228,9 @@
         "scenarios/ux-sim/warm-pool-reuse-world.yaml",
         "src/ux-sim/hq-move-sim.ts",
         "scenarios/ux-sim/sim-hq-move.yaml",
-        "src/ux-sim/fake-app-host.ts"
+        "src/ux-sim/fake-app-host.ts",
+        "src/ux-sim/gate-roster-second-pool.ts",
+        "src/ux-sim/world-watch.ts"
       ],
       "inputs": [
         "world YAML",
@@ -1095,7 +1240,9 @@
         "declared monkey schedule, injection schedule and recovery budget",
         "warm SI timeout, connection loss, missing result, and uncertain cleanup",
         "dead-pid-lock or hq-move event",
-        "optional migration fault"
+        "optional migration fault",
+        "gate-roster-world scenarios",
+        "pool image pin, cross-pool shard placement, host outage and retry"
       ],
       "logsRecorded": "yes",
       "name": "Isolated simulation world assembly and lifecycle",
@@ -1107,10 +1254,12 @@
         "per-world run code paths, event kinds, device fingerprints, and coverage report",
         "SI reconcile-only classification, no duplicate cold Job, quarantine, and preserved verified PR disposition",
         "lease generation and old/new host fences",
-        "state-copy result and migrated pool owner"
+        "state-copy result and migrated pool owner",
+        "actual judgeGate outcome and error",
+        "same-file mshq failure to node-b completion"
       ],
       "recentUse": null,
-      "target": "named catalog-device assembly, test-root world lifecycle, OS-enforced network denial, declared monkey faults on a shared fake-time timeline, and arbitrary world injections through the production ledger writer; SI uncertain-exec injection uses L0 fault records through production host transport and reconcile-only boundary; named catalog-device assembly, test-root lifecycle and OS-enforced network denial; dead-pid-lock and HQ transfer scenarios under fake host/clock edges; shared-timeline monkey faults, ledger/log injections, and app-host deploy/rollback",
+      "target": "named catalog-device assembly, test-root world lifecycle, OS-enforced network denial, declared monkey faults on a shared fake-time timeline, and arbitrary world injections through the production ledger writer; SI uncertain-exec injection uses L0 fault records through production host transport and reconcile-only boundary; named catalog-device assembly, test-root lifecycle and OS-enforced network denial; dead-pid-lock and HQ transfer scenarios under fake host/clock edges; shared-timeline monkey faults, ledger/log injections, and app-host deploy/rollback; production gate roster cut, pinned image and same-shard host failover",
       "tests": [
         "src/ux-sim/world.test.ts",
         "src/ux-sim/world-snapshot.test.ts",
@@ -1118,7 +1267,8 @@
         "src/ux-sim/event-monkey.test.ts",
         "src/ux-sim/world-host-chaos.test.ts",
         "src/ux-sim/warm-si-reuse-sim.test.ts",
-        "src/ux-sim/fake-app-host.test.ts"
+        "src/ux-sim/fake-app-host.test.ts",
+        "src/ux-sim/gate-roster-second-pool.test.ts"
       ]
     },
     {
@@ -1147,6 +1297,36 @@
       ],
       "entryCommands": [
         "bun test src/ux-sim/secret-canary.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "app-contract-secret-entropy",
+      "name": "App contract credential entropy corpus",
+      "checklistCells": [
+        "APP-CONTRACT-SECRET-ENTROPY"
+      ],
+      "implementation": [
+        "src/ux-sim/app-contract-secret-entropy.ts"
+      ],
+      "tests": [
+        "src/ux-sim/app-contract-secret-entropy.test.ts"
+      ],
+      "target": "Measure unprefixed high-entropy credential detection against synthetic secret values, benign hashes and UUID-shaped identifiers through the production app contract parser.",
+      "inputs": [
+        "synthetic base64url credential values",
+        "benign SHA-256 and UUID-shaped identifiers",
+        "valid cred:<slot> references"
+      ],
+      "observations": [
+        "true positives and false negatives",
+        "false positives and false-positive rate",
+        "accepted references and diagnostic value leakage"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/app-contract-secret-entropy.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -1298,22 +1478,49 @@
       "name": "Release graph simulation rig",
       "implementation": [
         "src/ux-sim/release-sim-rig.ts",
+        "src/ux-sim/release-event-trace.ts",
+        "src/ux-sim/release-publish-devices.ts",
+        "src/release-loop/macrophage-heal.ts",
+        "src/release-loop/macrophage-heal-node.ts",
+        "src/release-loop/macrophage-safe-cleanup.ts",
         "scripts/release-loop/gate-node-sim.ts",
+        "scripts/release-loop/gate-bisect.ts",
+        "scripts/release-loop/gate-bisect-sidecar.ts",
         "scripts/release-loop/gate-autoheal-sim-evidence.ts",
-        "scenarios/ux-sim/release-sim-rig.yaml"
+        "scripts/release-loop/gate-triage-node.ts",
+        "scripts/release-loop/adaptive-gate-heal.ts",
+        "scripts/release-loop/adaptive-gate-heal.sim.test.ts",
+        "scenarios/ux-sim/rla-arg-adaptive-heal.yaml",
+        "scenarios/ux-sim/rla-rehearsal-incident-sim-b.yaml",
+        "scenarios/ux-sim/release-sim-rig.yaml",
+        "src/ux-sim/release-event-trace.ts",
+        "src/ux-sim/release-publish-devices.ts"
       ],
       "tests": [
         "src/ux-sim/release-sim-rig.test.ts",
+        "src/ux-sim/release-event-trace.test.ts",
+        "src/release-loop/macrophage-heal.test.ts",
+        "src/release-loop/macrophage-heal-node.test.ts",
+        "src/release-loop/macrophage-safe-cleanup.test.ts",
         "scripts/release-loop/release-graph-fanout-mock.test.ts",
         "scripts/release-loop/gate-flow-sim.test.ts",
-        "scripts/release-loop/gate-node-sim.test.ts"
+        "scripts/release-loop/gate-node-sim.test.ts",
+        "scripts/release-loop/gate-bisect.test.ts",
+        "scripts/release-loop/adaptive-gate-heal.sim.test.ts",
+        "src/ux-sim/release-event-trace.test.ts",
+        "src/ux-sim/release-incident-events.test.ts",
+        "scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts"
       ],
-      "target": "release graph routing, fan-out joins and resume failures; the cutoff notes-empty case runs the version-release, graph cutoff and cutoff CLIs against an isolated local Git world",
+      "target": "release graph routing, fan-out joins and resume failures; the live gate-triage node consumes attributed gate results and emits a bounded repair node, graph append and resume plan; SIM-B drives the real release.gate.failed adapter through durable append, interruption and resume; the cutoff notes-empty case runs the version-release, graph cutoff and cutoff CLIs against an isolated local Git world",
       "inputs": [
         "node outcomes",
         "branch overlap delays",
         "evidence",
-        "resume state"
+        "resume state",
+        "attributed gate failures",
+        "repeat decisions",
+        "hard-rehearsal gate failure",
+        "real release.gate.failed event"
       ],
       "observations": [
         "visited nodes",
@@ -1321,15 +1528,32 @@
         "start-time overlap",
         "unexpected edges",
         "ledger events",
-        "final graph state"
+        "final graph state",
+        "repair node plan",
+        "append and resume decision",
+        "ordered adaptive heal events",
+        "dynamic repair append and resumed gate visits"
       ],
       "entryCommands": [
         "bun test scripts/release-loop/release-graph-fanout-mock.test.ts",
         "bun test src/ux-sim/release-sim-rig.test.ts",
+        "bun test scripts/release-loop/adaptive-gate-heal.sim.test.ts",
+        "bun test scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts",
         "bun bin/elanous.mjs --test sim run scenarios/ux-sim/release-sim-rig.yaml"
       ],
       "logsRecorded": "conditional",
-      "eventNames": [],
+      "eventNames": [
+        "gate.result.received",
+        "gate.failures.attributed",
+        "heal.classified",
+        "heal.repair-node.planned",
+        "heal.graph-append.planned",
+        "heal.resume.decided",
+        "heal.pod-retry.decided",
+        "heal.hitl.decided",
+        "heal.noop.decided",
+        "release.gate.failed"
+      ],
       "recentUse": null
     },
     {
@@ -1703,7 +1927,8 @@
         "src/publishing/markdown-publisher.ts",
         "src/publishing/markdown-renderer.ts",
         "src/publishing/artifact-store.ts",
-        "src/debug/log.ts"
+        "src/debug/log.ts",
+        "src/ux-sim/fake-app-db-world.ts"
       ],
       "tests": [
         "src/ux-sim/aimock-local.test.ts",
@@ -1714,7 +1939,8 @@
         "test/telegram-surface-hitl.test.ts",
         "src/ux-sim/safe-public-copy-publish.test.ts",
         "src/ux-sim/install-consent-device.test.ts",
-        "test/nexus/api/markdown-publish.test.ts"
+        "test/nexus/api/markdown-publish.test.ts",
+        "src/ux-sim/fake-app-db-world.test.ts"
       ],
       "target": "local fake LLM server, browser/linear fakes, service-key setup, terminal slash device and test CLI instance; safe launch-copy redaction and real Markdown publish/serve handlers with isolated storage",
       "inputs": [
@@ -1739,7 +1965,8 @@
         "bun test src/ux-sim/aimock-local.test.ts",
         "bun test test/telegram-surface-hitl.test.ts",
         "bun test src/ux-sim/safe-public-copy-publish.test.ts test/nexus/api/markdown-publish.test.ts",
-        "bun test src/ux-sim/install-consent-device.test.ts"
+        "bun test src/ux-sim/install-consent-device.test.ts",
+        "bun test src/ux-sim/fake-app-db-world.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -2064,25 +2291,36 @@
         "src/ux-sim/fake-kubectl.ts",
         "src/task-orchestrator/surfaces/pod-si-warm-provider.ts",
         "src/task-orchestrator/surfaces/pod-child-reuse.ts",
-        "src/ux-sim/warm-pool-reuse-switch-sim.ts"
+        "src/ux-sim/warm-pool-reuse-switch-sim.ts",
+        "src/ux-sim/pod-reuse-world.ts",
+        "src/ux-sim/pod-reuse-shared-fake-boundary.ts"
       ],
       "tests": [
-        "src/ux-sim/warm-si-reuse-sim.test.ts"
+        "src/ux-sim/warm-si-reuse-sim.test.ts",
+        "src/ux-sim/pod-reuse-world.test.ts",
+        "src/ux-sim/pod-reuse-shared-fake-k8s.test.ts"
       ],
-      "target": "Production SI warm lease acquisition and child cleanup/return against isolated fake Kubernetes and primary control boundaries",
+      "target": "Production SI warm lease acquisition and cleanup/return against a reusable shared fake Kubernetes and primary-control boundary; production Pod source script selects a shared read-only host mirror and is compared with a non-hardlinked copy by bytes, setup time, content digest, and mount byte counter under production read-only flags",
       "inputs": [
         "isolated runId",
         "registered SI worker",
         "fixed runner maintenance receipt",
-        "optional child process residue"
+        "optional child process residue",
+        "production Pod source script",
+        "production hostPath and read-only volume mount contract",
+        "temporary local Git origin and host mirror"
       ],
       "observations": [
         "lease generation and Pod UID",
         "release and sanitize transitions",
-        "returned or quarantined cleanup result"
+        "returned or quarantined cleanup result",
+        "selected source route and read/write content equivalence",
+        "checkout-local Git object payload bytes (not network bytes) and local setup duration"
       ],
       "entryCommands": [
-        "bun test src/ux-sim/warm-si-reuse-sim.test.ts"
+        "bun test src/ux-sim/warm-si-reuse-sim.test.ts",
+        "bun test src/ux-sim/pod-reuse-world.test.ts",
+        "bun test src/ux-sim/pod-reuse-shared-fake-k8s.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -2095,7 +2333,8 @@
         "src/ux-sim/fault-pod-reuse-residue.ts",
         "src/ux-sim/temp-git-remote.ts",
         "src/ux-sim/fake-ps.ts",
-        "src/task-orchestrator/surfaces/pod-child-reuse.ts"
+        "src/task-orchestrator/surfaces/pod-child-reuse.ts",
+        "src/ux-sim/pod-reuse-world.ts"
       ],
       "tests": [
         "src/ux-sim/fault-pod-reuse-residue.test.ts",
@@ -2252,6 +2491,97 @@
       "logsRecorded": "no",
       "eventNames": [],
       "recentUse": null
+    },
+    {
+      "id": "rla-event-response-scorecard",
+      "name": "RLA event response scorecard",
+      "implementation": [
+        "src/ux-sim/rla-event-response-scorecard.ts"
+      ],
+      "tests": [
+        "src/ux-sim/mock-scenario-catalog.test.ts"
+      ],
+      "target": "Inject the ten RFC §A12 incident classes into an isolated Nexus world and compare observed response timings and recovery outcomes against each 0.3.5 baseline and 0.3.6 target over three samples per incident.",
+      "inputs": [
+        "registered RLA-ER-01 through RLA-ER-10 world events",
+        "a responder fixture returning detection, judgment, recovery, action, and success observations",
+        "fake clock and isolated Nexus state root"
+      ],
+      "observations": [
+        "RFC §A12 0.3.5 hand-operated baseline alongside measured 0.3.6 response",
+        "four ordered response stages per sample in run ledger and logs.db",
+        "per-incident mean detection, judgment, attribution, and recovery times",
+        "detection and recovery mode, verified success count/rate, and per-sample target verdict"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/mock-scenario-catalog.test.ts"
+      ],
+      "logsRecorded": "yes",
+      "eventNames": [
+        "rla-event-response-stage",
+        "release-loop.event-response injected/detected/judged/recovered"
+      ],
+      "recentUse": null
+    },
+    {
+      "id": "pod-reuse-world",
+      "name": "POD reuse lifecycle world",
+      "implementation": [
+        "src/ux-sim/pod-reuse-world.ts"
+      ],
+      "tests": [
+        "src/ux-sim/pod-reuse-world.test.ts"
+      ],
+      "target": "Run shared Pod reuse lifecycle, warm worker selection and mismatch, read-only source reference/copy measurements, and production admission and Job boundaries in the isolated test universe",
+      "inputs": [
+        "safe simulation run ID",
+        "shared fake Kubernetes world",
+        "production warm-worker compatibility inputs"
+      ],
+      "observations": [
+        "world scenario result",
+        "worker provider hit and mismatch",
+        "reference and copy bytes, digest, and local setup time",
+        "admission recommendation and production Job manifest"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/pod-reuse-world.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "pr-land-drift-gate",
+      "name": "Pinned main TSC drift refusal simulation",
+      "checklistCells": [
+        "LAND-DRIFT-GATE-PRODUCER"
+      ],
+      "implementation": [
+        "src/ux-sim/pr-land-drift-gate-device.ts",
+        "src/cli/pr-land-heavy-remote.ts",
+        "src/cli/pr-land-refusal.ts"
+      ],
+      "tests": [
+        "src/ux-sim/pr-land-drift-gate-device.test.ts"
+      ],
+      "target": "Pinned main typecheck delta producer and refusal classification",
+      "inputs": [
+        "expected main SHA",
+        "remote delta summary and diagnostics",
+        "heavy-gate refusal line"
+      ],
+      "observations": [
+        "drift only for matching base SHA with explicit positive diagnostics",
+        "zero new diagnostics classified unrelated",
+        "missing or mismatched base proof remains unmeasured"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/pr-land-drift-gate-device.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
     }
   ],
   "discovery": {
@@ -2281,6 +2611,25 @@
   },
   "scenarios": [
     {
+      "id": "APP-CONTRACT-SECRET-ENTROPY",
+      "name": "App contract credential entropy corpus",
+      "kind": "credential-value-detection",
+      "device": "app-contract-secret-entropy",
+      "implementation": [
+        "src/ux-sim/app-contract-secret-entropy.ts"
+      ],
+      "tests": [
+        "src/ux-sim/app-contract-secret-entropy.test.ts"
+      ],
+      "trigger": "Synthetic credential candidates, benign hashes and UUID-shaped identifiers are parsed as app manifest credential references.",
+      "observe": [
+        "secret recall and false positives",
+        "accepted cred references",
+        "diagnostic value leakage"
+      ],
+      "expected": "High-entropy unprefixed values are rejected without false positives in the measured benign corpus or exposing candidate values."
+    },
+    {
       "id": "UX-MS-01",
       "name": "Child report deficit with later harvest",
       "kind": "report-deficit",
@@ -2307,6 +2656,8 @@
       "implementation": [
         "src/ux-sim/release-sim-rig.ts",
         "scripts/release-loop/gate-node-sim.ts",
+        "scripts/release-loop/gate-bisect.ts",
+        "scripts/release-loop/gate-bisect-sidecar.ts",
         "scripts/release-loop/gate-autoheal-sim-evidence.ts",
         "scenarios/ux-sim/release-sim-rig.yaml"
       ],
@@ -2314,6 +2665,7 @@
         "src/ux-sim/release-sim-rig.test.ts",
         "scripts/release-loop/release-graph-fanout-mock.test.ts",
         "scripts/release-loop/gate-node-sim.test.ts",
+        "scripts/release-loop/gate-bisect.test.ts",
         "scripts/release-loop/gate-flow-sim.test.ts"
       ],
       "trigger": "Inject release node outcomes including concurrent warning and required branches.",
@@ -2325,6 +2677,34 @@
         "terminal status"
       ],
       "expected": "warning failures remain visible but pass the join; required failures route to failed"
+    },
+    {
+      "id": "RELEASE-MACROPHAGE-HEAL",
+      "name": "Release-loop macrophage shadow and simulated healing",
+      "kind": "release-macrophage-heal",
+      "device": "release-graph-rig",
+      "implementation": [
+        "src/release-loop/macrophage-heal.ts",
+        "src/release-loop/macrophage-heal-node.ts",
+        "src/release-loop/macrophage-safe-cleanup.ts",
+        "src/ux-sim/release-sim-rig.ts",
+        "scenarios/ux-sim/release-sim-rig.yaml"
+      ],
+      "tests": [
+        "src/release-loop/macrophage-heal.test.ts",
+        "src/release-loop/macrophage-heal-node.test.ts",
+        "src/release-loop/macrophage-safe-cleanup.test.ts",
+        "src/ux-sim/release-sim-rig.test.ts"
+      ],
+      "trigger": "Inject each A11 scrap type at real release node-end phase boundaries, including inactive merged worktrees and merged land-queue rows.",
+      "observe": [
+        "active phase defers all work",
+        "shadow mode writes one evidence/action/result line per scrap and applies none",
+        "simulation removes only evidence-approved items from its in-memory inventory",
+        "live runs and unverified ownership/receipts remain",
+        "only merged exact queue rows and clean inactive merged worktrees under HQ work are eligible for live cleanup"
+      ],
+      "expected": "Live cleanup is limited to the two verified safe scopes; all other cleanup remains a plan and simulation mutations stay in memory."
     },
     {
       "id": "RELEASE-GRAPH-PREPUB-FANOUT",
@@ -2696,6 +3076,31 @@
         "stale lock leaves pending entries unchanged"
       ],
       "expected": "the production queue performs enqueue, integration, gate attribution and verdict disposition; stale lock refuses before integration; no simulated copy of queue/train/disposition logic is used"
+    },
+    {
+      "id": "UX-MS-13",
+      "name": "Second release-gate pool pin and host failover",
+      "kind": "gate-roster-failover",
+      "device": "fault-injection",
+      "implementation": [
+        "src/ux-sim/gate-roster-second-pool.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-image-pin.ts",
+        "src/task-orchestrator/surfaces/pod-pool.ts",
+        "src/task-orchestrator/surfaces/gate-pod-pool-policy.ts"
+      ],
+      "tests": [
+        "src/ux-sim/gate-roster-second-pool.test.ts",
+        "src/task-orchestrator/surfaces/gate-pod-pool-policy.test.ts"
+      ],
+      "trigger": "Run the gate with node-b and mshq image fingerprints, then inject one host loss or both host losses.",
+      "observe": [
+        "same pinned digest eligibility across both pools",
+        "surviving pool receives retried shards after one host loss",
+        "both-host loss ends as measurement unavailable",
+        "gate hosts are excluded from the concurrent harness task pool"
+      ],
+      "expected": "both matching pools participate; one failed host is removed and the other completes the sweep; two failed hosts never produce a reduced-roster pass; image digest mismatch is refused"
     }
   ],
   "sourceModules": [
@@ -2861,6 +3266,16 @@
       "integrityCertificatePath": null
     },
     {
+      "id": "MD-UX-SIM-FAKE-APP-DB-WORLD-TS",
+      "path": "src/ux-sim/fake-app-db-world.ts",
+      "boundary": "Creates isolated in-memory SQLite app tables and runs declared RPCs with role and parameter checks.",
+      "deviceIds": [
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
       "id": "MD-UX-SIM-FAKE-APP-HOST-TS",
       "path": "src/ux-sim/fake-app-host.ts",
       "boundary": "Serves declared in-memory app versions through the simulated app-host fetch boundary, including deploy, rollback, content type and content digest behavior.",
@@ -2939,6 +3354,16 @@
       "boundary": "Models image-based VM create/resume/stop, lease draining, powered-on cost and capacity-tier choice using deterministic state transitions; it never calls a cloud provider.",
       "deviceIds": [
         "fake-cloud-vm"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-DATA-GUARD-BOUNDARY-TS",
+      "path": "src/ux-sim/fake-data-guard-boundary.ts",
+      "boundary": "Captures scripted public and local HTTP calls, records unknown destinations, refuses anything unregistered, and restores global fetch without network fallback.",
+      "deviceIds": [
+        "fake-data-guard-boundary"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
@@ -3247,6 +3672,16 @@
       "integrityCertificatePath": null
     },
     {
+      "id": "MD-UX-SIM-GATE-ROSTER-SECOND-POOL-TS",
+      "path": "src/ux-sim/gate-roster-second-pool.ts",
+      "boundary": "Runs production judgeGate, createGateRunner.sweep, PodPoolScheduler and runPodCommand in an isolated world; only repository, image and kubectl remote edges are simulated.",
+      "deviceIds": [
+        "world-runtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
       "id": "MD-UX-SIM-GATE-SHARD-HOST-REROUTE-TS",
       "path": "src/ux-sim/gate-shard-host-reroute.ts",
       "boundary": "gate shard host reroute: S1 device for a release gate's shard dispatch. It replaces host execution, not planning or reduction.",
@@ -3287,9 +3722,9 @@
       "integrityCertificatePath": null
     },
     {
-      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-WORKER-TS",
-      "path": "src/ux-sim/graph-runtime-overlay-event-path-worker.ts",
-      "boundary": "Isolated child runs the real self-implement graph overlay, persists observer events to the selected test log DB and can inject a dropped-event fault.",
+      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-TS",
+      "path": "src/ux-sim/graph-runtime-overlay-event-path.ts",
+      "boundary": "graph runtime overlay event path: Run the real graph runtime in an isolated process, then relay its production observer event.",
       "deviceIds": [
         "sim-event-log-path"
       ],
@@ -3297,9 +3732,9 @@
       "integrityCertificatePath": null
     },
     {
-      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-TS",
-      "path": "src/ux-sim/graph-runtime-overlay-event-path.ts",
-      "boundary": "graph runtime overlay event path: Run the real graph runtime in an isolated process, then relay its production observer event.",
+      "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-WORKER-TS",
+      "path": "src/ux-sim/graph-runtime-overlay-event-path-worker.ts",
+      "boundary": "Isolated child runs the real self-implement graph overlay, persists observer events to the selected test log DB and can inject a dropped-event fault.",
       "deviceIds": [
         "sim-event-log-path"
       ],
@@ -3539,6 +3974,26 @@
       "integrityCertificatePath": null
     },
     {
+      "id": "MD-UX-SIM-RELEASE-EVENT-TRACE-TS",
+      "path": "src/ux-sim/release-event-trace.ts",
+      "boundary": "Checks declared production release events as an ordered subsequence against explicit phase expectations, rejecting missing, reordered, or misattributed events and handling explicitly concurrent groups.",
+      "deviceIds": [
+        "release-graph-rig"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-RELEASE-PUBLISH-DEVICES-TS",
+      "path": "src/ux-sim/release-publish-devices.ts",
+      "boundary": "Provides isolated test-world command, npm registry, publish, artifact, and receipt boundaries used by production release-publish graph nodes without external publishing.",
+      "deviceIds": [
+        "release-graph-rig"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
       "id": "MD-UX-SIM-RELEASE-SIM-RIG-TS",
       "path": "src/ux-sim/release-sim-rig.ts",
       "boundary": "Parses release rehearsal cases and runs production release-decision stages against injected records without publishing a release.",
@@ -3574,6 +4029,16 @@
       "boundary": "resume picker device: `picker` (default): the list → pick flow. `boot-resume`: start with `--resume <id>` on a synthetic 379-row session.",
       "deviceIds": [
         "product-devices"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-RLA-EVENT-RESPONSE-SCORECARD-TS",
+      "path": "src/ux-sim/rla-event-response-scorecard.ts",
+      "boundary": "Writes a concrete per-incident fault fixture into the private simulation world, lets a responder inspect and update that state, verifies event-specific recovery postconditions from persisted world state, and records response stages through world-runtime; the fixture is simulation evidence, not a production RLA observation.",
+      "deviceIds": [
+        "rla-event-response-scorecard"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
@@ -3875,6 +4340,57 @@
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-WORLD-WATCH-TS",
+      "path": "src/ux-sim/world-watch.ts",
+      "boundary": "Appends and reads simulation-world observation rows under the explicit test root for the production sim watch CLI.",
+      "deviceIds": [
+        "world-runtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-POD-REUSE-SHARED-FAKE-BOUNDARY-TS",
+      "path": "src/ux-sim/pod-reuse-shared-fake-boundary.ts",
+      "boundary": "Shares one isolated primary-control server and host-keyed fake Kubernetes stores across production SI warm leases; host-mirror adapter reads the production Job manifest readOnly flag, counts simulated mount reads, and rejects writes.",
+      "deviceIds": [
+        "warm-si-reuse-sim"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-POD-REUSE-WORLD-TS",
+      "path": "src/ux-sim/pod-reuse-world.ts",
+      "boundary": "Runs the integrated production Pod reuse scenario with real Job manifest and lease logic, isolated fake Kubernetes boundaries, production read-only hostPath checks, and source mount byte measurements compared with a non-hardlinked clone.",
+      "deviceIds": [
+        "warm-si-reuse-sim",
+        "pod-reuse-residue-fault"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-PR-LAND-DRIFT-GATE-DEVICE-TS",
+      "path": "src/ux-sim/pr-land-drift-gate-device.ts",
+      "boundary": "Calls the production pinned-main delta assessment and refusal classifier with synthetic remote output; no SSH is opened.",
+      "deviceIds": [
+        "pr-land-drift-gate"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-APP-CONTRACT-SECRET-ENTROPY-TS",
+      "path": "src/ux-sim/app-contract-secret-entropy.ts",
+      "boundary": "Feeds synthetic credential candidates through the production app contract parser; records only case IDs and rates, never candidate values.",
+      "deviceIds": [
+        "app-contract-secret-entropy"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
     }
   ],
   "version": 2,
@@ -3893,6 +4409,81 @@
       "id": "hq-move",
       "name": "HQ host move",
       "description": "Run the real HQ lease, promotion, fence, and pool-capacity paths against isolated host boundaries."
+    },
+    {
+      "id": "RLA-ER-01",
+      "name": "Gate regression introduced>0",
+      "description": "Detect gate regressions and measure automatic attribution, judgment, and recovery."
+    },
+    {
+      "id": "RLA-ER-02",
+      "name": "Receipt shard corruption",
+      "description": "Measure isolated rerun of a damaged receipt shard."
+    },
+    {
+      "id": "RLA-ER-03",
+      "name": "Stale generated artifact",
+      "description": "Measure detection and regeneration commit behavior."
+    },
+    {
+      "id": "RLA-ER-04",
+      "name": "Worker death (STOP_AT)",
+      "description": "Measure next-tick worker restart."
+    },
+    {
+      "id": "RLA-ER-05",
+      "name": "Host outage or load",
+      "description": "Measure automatic cell and pool adjustment."
+    },
+    {
+      "id": "RLA-ER-06",
+      "name": "GitHub server push rejection",
+      "description": "Measure transient classification and backoff."
+    },
+    {
+      "id": "RLA-ER-07",
+      "name": "Unmeasured rehearsal stage",
+      "description": "Measure full-run downgrade and receipt issuance."
+    },
+    {
+      "id": "RLA-ER-08",
+      "name": "Gate waiver",
+      "description": "Measure waiver event ledger and graph visibility."
+    },
+    {
+      "id": "RLA-ER-09",
+      "name": "Normal release blocked",
+      "description": "Measure emergency release switch judgment."
+    },
+    {
+      "id": "RLA-ER-10",
+      "name": "TA Pod gate host intrusion",
+      "description": "Measure reservation and blocking through event hook."
+    },
+    {
+      "id": "gate-pools-pinned-sweep",
+      "name": "Gate sweep across pinned pools",
+      "description": "Run the production gate image-pin resolver and shard runner across both pools with one pinned digest."
+    },
+    {
+      "id": "gate-mshq-unavailable",
+      "name": "Gate sweep with mshq unavailable",
+      "description": "Inject an mshq host outage and observe production gate execution continue on the surviving pool."
+    },
+    {
+      "id": "gate-both-unavailable",
+      "name": "Gate pools unavailable",
+      "description": "Inject outages on both pools and observe production gate execution classify the sweep as unmeasured."
+    },
+    {
+      "id": "gate-digest-mismatch",
+      "name": "Gate pool image digest mismatch",
+      "description": "Inject a differing pool image digest and observe production gate pin validation refuse the roster."
+    },
+    {
+      "id": "gate-no-pinned-image",
+      "name": "Gate image pin unavailable",
+      "description": "Inject missing image digests from both pools and observe production gate image-pin resolution fail closed."
     }
   ]
 }

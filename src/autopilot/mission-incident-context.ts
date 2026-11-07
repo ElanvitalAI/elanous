@@ -10,7 +10,8 @@
 
 import { opsMissionDetail, type OpsMissionDetail } from '../domains/ops-status.js';
 import { attemptsForPhase, type PhaseAttemptFact } from './se-build-registry.js';
-import { formatDateTime, resolveTimeZone } from '../time/format.js';
+import { formatDateTime } from '../time/calendar.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 
 /** 페이즈 1건의 사건 사실(진단 + 시도 트레일). */
 export interface IncidentPhaseFact {

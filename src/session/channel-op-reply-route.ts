@@ -187,6 +187,18 @@ export function startChannelOpReplyRoute(options: StartChannelOpReplyRouteOption
       const store = (options.openWriteStore ?? (() => openMsgStore()))();
       try {
         const result = await deliverChannelOpReply(store, message.id, options.transport, { instance: options.instance });
+        if (result.status !== 'rejected') {
+          debug.log('telegram.op-direct', 'answered', { questionId: message.replyTo, answerId: message.id });
+        }
+        if (result.status === 'delivered' || result.status === 'already-delivered') {
+          debug.log('telegram.op-direct', 'sent', {
+            questionId: message.replyTo, answerId: message.id, receiptId: result.receiptId,
+          });
+        } else if (result.status === 'unknown' || result.status === 'held' || result.status === 'failed-permanent') {
+          debug.log('telegram.op-direct', 'send-failed', {
+            questionId: message.replyTo, answerId: message.id, stage: 'send', status: result.status,
+          });
+        }
         if (result.status === 'unknown' || result.status === 'rejected' || result.status === 'held' || result.status === 'failed-permanent') {
           debug.log('channel-op-reply-route', result.status, {
             answerId: message.id,

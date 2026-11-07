@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { RunFn } from '../storage/object-store.js';
+import { createObjectStore, type RunFn } from '../storage/object-store.js';
+import { createAppUpload } from '../nexus/apps/app-upload.js';
 import {
   APP_STORAGE_CONTRACT_CASES,
   createFakeAppStorage,
@@ -32,6 +33,21 @@ const factory: AppStorageContractPortFactory = {
   },
 };
 
+test('SIM-APPSTORAGE production app upload enforces scope, type, and per-file size', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sim-production-app-upload-'));
+  const upload = createAppUpload({
+    store: createObjectStore({ provider: 'local', localDir: root, bucket: 'private', publicBucket: '', prefix: 'apps' }),
+    maxUploadBytes: 5,
+  });
+  try {
+    expect(upload.upload({ appSlug: 'notes', key: 'audio/a.wav', body: new TextEncoder().encode('abc'), contentType: 'audio/wav' }).status).toBe(201);
+    expect(upload.upload({ appSlug: 'notes', key: '../outside.wav', body: new TextEncoder().encode('x'), contentType: 'audio/wav' }).status).toBe(400);
+    expect(upload.upload({ appSlug: 'notes', key: 'audio/b.wav', body: new TextEncoder().encode('123456'), contentType: 'audio/wav' }).status).toBe(413);
+    expect(upload.upload({ appSlug: 'notes', key: 'audio/script.js', body: new TextEncoder().encode('x'), contentType: 'application/javascript' }).status).toBe(415);
+    expect(upload.list('notes')).toEqual(['audio/a.wav']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 for (const contract of APP_STORAGE_CONTRACT_CASES) {
   test(`SIM-APPSTORAGE ${contract.id}: ${contract.name}`, () => {
     const result = runAppStorageContractCase(contract, factory);
@@ -43,6 +59,25 @@ for (const contract of APP_STORAGE_CONTRACT_CASES) {
 test('SIM-APPSTORAGE exported contract matrix runs through the object-store reference adapter', () => {
   const results = runAppStorageContractMatrix(factory);
   expect(results.map(({ id, passed }) => ({ id, passed }))).toEqual(APP_STORAGE_CONTRACT_CASES.map(({ id }) => ({ id, passed: true })));
+});
+
+test('SIM-APPSTORAGE injected provider runner receives the stable command name', () => {
+  const commands: string[] = [];
+  const port = createFakeAppStorage({
+    provider: 's3',
+    run: (bin, args) => {
+      commands.push(bin);
+      if (args[0] === 's3' && args[1] === 'ls') return { stdout: '', stderr: '' };
+      if (args[0] === 's3api' && args[1] === 'head-object') throw new Error('404 Not Found');
+      if (args[0] === 's3' && args[1] === 'cp') throw new Error('503 Service Unavailable');
+      throw new Error(`unexpected fake S3 command: ${bin} ${args.join(' ')}`);
+    },
+  });
+  try {
+    const response = port.upload({ appSlug: 'notes', key: 'result.json', body: new TextEncoder().encode('{}'), contentType: 'application/json' });
+    expect(response).toMatchObject({ status: 503, retryable: true });
+    expect(commands).toEqual(['aws', 'aws', 'aws']);
+  } finally { port.close(); }
 });
 
 test('SIM-APPSTORAGE shared path contract detects writes outside its storage root', () => {

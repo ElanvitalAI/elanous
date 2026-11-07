@@ -376,7 +376,7 @@ describe('elanous pr land', () => {
     try {
       expect(await runPrLand({}, { ...baseDeps, run, manager, out: sink.out })).toBe(0);
       expect(calls).toEqual(['find', 'upsert', 'merge']);
-      expect(viewCalls).toEqual([]);
+      expect(viewCalls).toEqual([['pr', 'view', '42', '--json', 'title,headRefOid,baseRefName,mergedAt,mergeCommit']]);
       expect(upserts).toEqual([expect.objectContaining({
         branch: 'feat/land', worktreePath: process.cwd(), base: 'origin/main', draft: false,
       })]);
@@ -872,6 +872,9 @@ describe('elanous pr land', () => {
     expect(viewCalls).toEqual([{
       cmd: 'gh',
       args: ['pr', 'view', 'https://github.com/example/repo/pull/42', '--json', 'labels', '--jq', '.labels[].name'],
+    }, {
+      cmd: 'gh',
+      args: ['pr', 'view', '42', '--json', 'title,headRefOid,baseRefName,mergedAt,mergeCommit'],
     }, {
       cmd: 'gh',
       args: ['pr', 'view', 'https://github.com/example/repo/pull/42', '--json', 'baseRefName', '--jq', '.baseRefName'],

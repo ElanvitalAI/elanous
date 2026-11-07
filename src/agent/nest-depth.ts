@@ -10,7 +10,7 @@
 // 2026-07-21 대표 상향: 조율자→executor→하위 위임 체인에 헤드룸. config 로 재조정 가능).
 // ④ runGoalLoop.maxIterations(턴 내 루프)와 직교 — 이건 프로세스 중첩(spawn) 상한.
 
-import { debug } from '../debug/log.js';
+import { logDiagnostic } from '../mss/logging/diagnostic-sink.js';
 import { originObservationFields } from './origin-observation.js';
 
 let bootObserved = false;
@@ -58,7 +58,7 @@ export function nestInfo(): { depth: number; max: number; capReached: boolean } 
 export function observeNestAtBoot(): void {
   if (bootObserved) return;
   bootObserved = true;
-  try { debug.log('substrate.nest', 'boot', { ...nestInfo(), ...originObservationFields() }); } catch { /* fail-soft */ }
+  try { logDiagnostic('substrate.nest', 'boot', { ...nestInfo(), ...originObservationFields() }); } catch { /* fail-soft */ }
 }
 
 /** 테스트에서 프로세스 단발 관측 상태를 격리한다. */

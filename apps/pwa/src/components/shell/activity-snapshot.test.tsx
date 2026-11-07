@@ -385,7 +385,7 @@ describe('preservation — fabric breadcrumb and observatory API stay themselves
   test('FabricStageHeader is still a Mission Fabric breadcrumb, not activity', () => {
     const html = renderToStaticMarkup(<FabricStageHeader active="tasks" />);
     expect(html).toContain('Mission Fabric');
-    expect(html).toContain('href="/autopilot"');
+    expect(html).not.toContain('href="/autopilot"');
     expect(html).toContain('href="/tasks"');
     expect(html).toContain('href="/scheduler"');
     expect(html).not.toContain('data-elanous-component="topbar-activity"');

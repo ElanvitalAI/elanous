@@ -8,8 +8,8 @@ import * as llmModule from '../src/llm.js';
 import type { LLMMessage, StreamWithToolsHandlers } from '../src/llm.js';
 import * as daemonToolsModule from '../src/boot/daemon-tools/index.js';
 import type { DaemonToolDispatchCtx } from '../src/boot/daemon-tools/types.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
-import type { CoreTurnContext, CoreTurnResult } from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
+import type { CoreTurnContext, CoreTurnResult } from '../src/core-turn/types.js';
 import { debug } from '../src/debug/log.js';
 import {
   buildDaemonInputSourceLine,

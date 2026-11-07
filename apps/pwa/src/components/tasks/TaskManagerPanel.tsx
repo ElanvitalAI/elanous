@@ -4,7 +4,6 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { Button } from '@/components/ui/button';
 import { TaskApi, type TaskBoardCard, type TaskDetail } from '@/lib/task-api';
-import { AutopilotApi, type FrontMissionArc } from '@/lib/autopilot-api';
 import { debugLog } from '@/lib/debug';
 import { toast } from 'sonner';
 // W9d-FU Z13-a / Z13-c · TaskCard chip mounts. Substrate: #2438 + #2440 + #2447 + #2448.
@@ -115,21 +114,12 @@ function groupByMission(tasks: readonly TaskBoardCard[]): MissionGroupData[] {
   });
 }
 
-function MissionGroup({
-  group, selectedId, onSelect, arcDetail,
-}: { group: MissionGroupData; selectedId: string | null; onSelect: (id: string) => void; arcDetail?: FrontMissionArc[] }) {
+function MissionGroup({ group, selectedId, onSelect }: { group: MissionGroupData; selectedId: string | null; onSelect: (id: string) => void }) {
   const pct = group.total > 0 ? Math.round((group.doneCount / group.total) * 100) : 0;
-  const [expanded, setExpanded] = useState(false);
-  const hasArcDetail = (arcDetail?.length ?? 0) > 0;
   return (
     <section className="rounded-2xl border border-border bg-muted/20 p-3">
       <div className="mb-2 flex flex-wrap items-center gap-2">
         {!group.isStandalone && <span className="text-xs">🎯</span>}
-        {hasArcDetail && (
-          <button type="button" onClick={() => setExpanded((v) => !v)} className="text-xs text-muted-foreground hover:text-foreground" title="아크 상세">
-            {expanded ? '▾' : '▸'}
-          </button>
-        )}
         <h2 className="text-sm font-semibold" title={group.missionTitle}>{group.missionTitle}</h2>
         <span className="rounded-full bg-background px-2 py-0.5 text-[11px] text-muted-foreground">
           {group.doneCount}/{group.total} · {pct}%
@@ -156,39 +146,6 @@ function MissionGroup({
               </span>
             </span>
           ))}
-        </div>
-      )}
-      {/* 아크 상세 펼침(③·2026-07-14) — 각 아크의 배리어 상태·통합검증(verifyResult)·arc-revise. */}
-      {expanded && hasArcDetail && (
-        <div className="mb-3 space-y-1.5 rounded-xl border border-border bg-background/40 p-2">
-          {arcDetail!.map((arc, i) => {
-            const failed = arc.status === 'failed' || arc.verifyResult?.ok === false;
-            return (
-              <div key={arc.arcId} className="text-[11px]">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-muted-foreground">아크 {i + 1}</span>
-                  <span className={`rounded-full px-2 py-0.5 ring-1 ${ARC_STATUS_TONE[arc.status] ?? ARC_STATUS_TONE.pending}`}>⬡ {arc.name} · {arc.status}</span>
-                  {arc.dependsOnArcs.length > 0 && <span className="text-muted-foreground">← 선행 {arc.dependsOnArcs.length}</span>}
-                </div>
-                <div className="mt-0.5 pl-1 text-muted-foreground">{arc.intent}</div>
-                {/* 통합검증 결과 — 실패면 미충족(dead-code/미배선) + arc-revise 안내 */}
-                {failed && arc.verifyResult?.missing && (
-                  <div className="mt-0.5 rounded-md bg-red-500/10 px-2 py-1 text-red-300">
-                    🔒 아크 통합검증 실패: {arc.verifyResult.missing}
-                    <div className="text-red-400/70">→ arc-revise 초안 카드가 발송됩니다(페이즈는 완료돼도 아크로는 미충족).</div>
-                  </div>
-                )}
-                {arc.verifyResult?.ok && <div className="mt-0.5 pl-1 text-emerald-400/70">✓ 통합검증 통과: {arc.verifyResult.evidence.slice(0, 80)}</div>}
-                {/* 정의 시점 pre-flight 판정(A7-L2) — 허상/과대 아크 경고(HITL 검토 권장) */}
-                {arc.preflightVerdict && arc.preflightVerdict.verdict !== 'founded' && (
-                  <div className="mt-0.5 rounded-md bg-amber-500/10 px-2 py-1 text-amber-300">
-                    ⚠️ pre-flight: {arc.preflightVerdict.verdict === 'mirage' ? '허상 의심' : '과대 범위'} → {arc.preflightVerdict.action}
-                    <div className="text-amber-400/70">{arc.preflightVerdict.reason.slice(0, 120)}</div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
         </div>
       )}
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
@@ -402,13 +359,7 @@ function DetailBlock({ label, value }: { label: string; value: ReactNode }) {
 export function TaskManagerPanel() {
   const { client } = useDaemon();
   const api = useMemo(() => new TaskApi(client), [client]);
-  const autopilotApi = useMemo(() => new AutopilotApi(client), [client]);
-  // Create Task 폐루프(2026-07-14) — Linear식으로 사람이 태스크(골) 부여 → 미션 fabric 이 플랜화
-  //   (분해)→HITL 승인→구현→DONE. 별도 시스템 아님(commitMission 재사용).
-  const [createGoal, setCreateGoal] = useState('');
-  const [creating, setCreating] = useState(false);
   // 미션별 아크 상세(③·2026-07-14) — 미션 그룹 펼침에서 배리어·통합검증 표시.
-  const [missionArcMap, setMissionArcMap] = useState<Map<string, { apmStatus?: string; arcs: FrontMissionArc[] }>>(new Map());
   const [tasks, setTasks] = useState<TaskBoardCard[]>([]);
   const [summary, setSummary] = useState<{ total: number; open: number; terminal: number; linkedScheduler: number } | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -435,8 +386,6 @@ export function TaskManagerPanel() {
       const res = await api.list();
       setTasks(res.tasks);
       setSummary(res.summary);
-      // 아크 상세 로드(펼침용·fail-soft·태스크 로드를 막지 않음).
-      autopilotApi.missionArcMap().then(setMissionArcMap).catch(() => {});
       // 사용자가 카드를 직접 클릭하기 전엔 자동 선택하지 않는다. 기존 선택이
       // 여전히 유효하면 유지, 사라진 태스크면 해제(자동 첫선택 금지).
       setSelectedId((cur) => (cur && res.tasks.some((t) => t.id === cur) ? cur : null));
@@ -445,7 +394,7 @@ export function TaskManagerPanel() {
     } finally {
       setBusy(false);
     }
-  }, [api, autopilotApi]);
+  }, [api]);
 
   // next-fluent 칩 1-클릭 → 페이즈 액션 dispatch + board refresh(2026-07-15). toast 로 결과 피드백.
   const onChipAction = useCallback(async (refId: string, action: string): Promise<void> => {
@@ -458,26 +407,6 @@ export function TaskManagerPanel() {
     }
     await refresh();
   }, [refresh]);
-
-  const onCreateTask = useCallback(async (): Promise<void> => {
-    const goal = createGoal.trim();
-    if (!goal || creating) return;
-    setCreating(true);
-    try {
-      const r = await autopilotApi.commitMission(goal, 'intake');
-      if (r.ok) {
-        toast.success(`태스크 생성 → 미션 fabric 이 플랜화 중${r.missionId ? ` (${r.missionId})` : ''}`);
-        setCreateGoal('');
-        setTimeout(() => void refresh(), 1200); // 분해가 태스크로 나타날 시간.
-      } else {
-        toast.error('태스크 생성 실패');
-      }
-    } catch (err) {
-      toast.error(`태스크 생성 실패: ${err instanceof Error ? err.message : err}`);
-    } finally {
-      setCreating(false);
-    }
-  }, [createGoal, creating, autopilotApi, refresh]);
 
   useEffect(() => {
     void refresh();
@@ -583,23 +512,6 @@ export function TaskManagerPanel() {
         </div>
       </header>
 
-      {/* Create Task 폐루프(2026-07-14) — Linear식: 골 입력 → 미션 fabric 이 플랜화→구현→DONE. */}
-      <div className="flex items-center gap-2 rounded-xl border border-border bg-card p-2">
-        <span className="pl-1 text-sm text-muted-foreground">＋</span>
-        <input
-          type="text"
-          value={createGoal}
-          onChange={(e) => setCreateGoal(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') void onCreateTask(); }}
-          placeholder="새 태스크(골)를 입력하면 미션 fabric 이 플랜화→구현→DONE… 예: 'README 중복 정리 리포트 만들어줘'"
-          className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60"
-          disabled={creating}
-        />
-        <Button size="sm" onClick={() => void onCreateTask()} disabled={creating || !createGoal.trim()}>
-          {creating ? '생성 중…' : 'Create Task'}
-        </Button>
-      </div>
-
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start">
         <section className="min-w-0 flex-1 space-y-3">
           {viewMode === 'mission' ? (
@@ -607,7 +519,7 @@ export function TaskManagerPanel() {
             <div className="space-y-3">
               {missionGroups.length > 0 ? (
                 missionGroups.map((group) => (
-                  <MissionGroup key={group.key} group={group} selectedId={selectedId} onSelect={setSelectedId} arcDetail={missionArcMap.get(group.key)?.arcs} />
+                  <MissionGroup key={group.key} group={group} selectedId={selectedId} onSelect={setSelectedId} />
                 ))
               ) : (
                 <div className="rounded-xl border border-dashed border-border px-3 py-12 text-center text-sm text-muted-foreground">

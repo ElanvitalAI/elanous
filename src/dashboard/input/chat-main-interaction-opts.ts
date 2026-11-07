@@ -28,24 +28,6 @@ export interface CreateDashboardChatMainInteractionOptsDeps {
   modalSink: NonNullable<DashboardChatMainInteractionOpts['modalSink']>;
   shouldSyncPickers?: DashboardChatMainInteractionOpts['shouldSyncPickers'];
   onPasteImage: NonNullable<DashboardChatMainInteractionOpts['onPasteImage']>;
-  routeVoiceKey?: (key: Key) => 'consumed' | 'passthrough' | Promise<'consumed' | 'passthrough'>;
-  /** PR-S1V.D4 (2026-04-29) — long-press Space dictation pre-key hook.
-   *  Dashboard wires this to a `space-longpress-detector` that watches
-   *  the OS key-repeat stream and fires `voice-input-host.startDictation`
-   *  / `stopDictation` at the right moments. The detector itself decides
-   *  consumed vs passthrough — typically `'passthrough'` so the first
-   *  Space char still lands in the input buffer (long-press does not
-   *  cancel that), and `'consumed'` only after the long-press has fired
-   *  (to swallow the OS key-repeat stream so dictation isn't typed in
-   *  alongside the transcript). Optional — when omitted, no long-press
-   *  detection happens and Space behaves exactly as it did pre-D4.
-   *
-   *  Async return so the cancel-by-other-key path can `await
-   *  host.stopDictation()` before the terminator key reaches the chat
-   *  input — without that await the transcript insert can race the
-   *  terminator and produce out-of-order buffer like "a<transcript>"
-   *  instead of "<transcript>a" (PR #1109 review fix). */
-  routeLongPressDictation?: (key: Key) => 'consumed' | 'passthrough' | Promise<'consumed' | 'passthrough'>;
   routeInputKey: NonNullable<DashboardChatMainInteractionOpts['onKey']>;
   routeQuitChord?: NonNullable<DashboardChatMainInteractionOpts['onQuitChord']>;
   shouldRouteInputDispatcherKey?: (key: Key) => boolean;
@@ -77,20 +59,6 @@ export function createDashboardChatMainInteractionOpts(
     },
     onQuitChord: deps.routeQuitChord,
     onPreKey: async (key) => {
-      if (deps.routeVoiceKey) {
-        const voiceRoute = await deps.routeVoiceKey(key);
-        if (voiceRoute === 'consumed') return 'consumed';
-      }
-      // PR-S1V.D4 — Long-press Space dictation hook. Sits between the
-      // explicit voice chord (Ctrl+Shift+V) and the modal/popup pre-key
-      // path so a long Space hold becomes dictation regardless of
-      // whether a popup or terminal modal is active. The detector
-      // decides consumed (post-fire OS repeats / final release) vs
-      // passthrough (first Space char before threshold).
-      if (deps.routeLongPressDictation) {
-        const dictationRoute = await deps.routeLongPressDictation(key);
-        if (dictationRoute === 'consumed') return 'consumed';
-      }
       if (deps.shouldRouteForegroundModalKey?.(key) === false) {
         return 'passthrough';
       }

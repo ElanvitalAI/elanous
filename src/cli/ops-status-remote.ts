@@ -4,7 +4,6 @@ import { bookmarkAttachDefaults, readRemoteFlag } from './remote-resolve.js';
 /** ⛔ 상한이 없으면 무응답 원격을 「느리다」로 읽게 된다. */
 const DEFAULT_REMOTE_OPS_STATUS_TIMEOUT_MS = 20_000;
 
-export const REMOTE_OPS_MISSIONS_PATH = '/v1/missions';
 export const REMOTE_OPS_TASKS_PATH = '/v1/tasks';
 export const REMOTE_OPS_ARMING_PATH = '/v1/autopilot/arming';
 
@@ -44,11 +43,6 @@ interface OpsStatusRemoteOpts {
   timeoutMs?: number;
   remotesStore?: () => RemotesStore;
   out?: { log: (line: string) => void; error: (line: string) => void };
-}
-
-interface RemoteMissionsView {
-  total: number;
-  byStatus: Record<string, number>;
 }
 
 interface RemoteTasksView {
@@ -157,18 +151,15 @@ export async function runOpsStatusRemote(opts: OpsStatusRemoteOpts): Promise<Ops
     );
   }
 
-  const missionsUrl = `${origin}${REMOTE_OPS_MISSIONS_PATH}`;
   const tasksUrl = `${origin}${REMOTE_OPS_TASKS_PATH}`;
   const armingUrl = `${origin}${REMOTE_OPS_ARMING_PATH}`;
 
-  const [missionsGot, tasksGot, armingGot] = await Promise.all([
-    liveGetJson(missionsUrl, token, timeoutMs),
+  const [tasksGot, armingGot] = await Promise.all([
     liveGetJson(tasksUrl, token, timeoutMs),
     liveGetJson(armingUrl, token, timeoutMs),
   ]);
 
   const failed = firstFailedFetch([
-    { path: REMOTE_OPS_MISSIONS_PATH, url: missionsUrl, got: missionsGot },
     { path: REMOTE_OPS_TASKS_PATH, url: tasksUrl, got: tasksGot },
     { path: REMOTE_OPS_ARMING_PATH, url: armingUrl, got: armingGot },
   ]);
@@ -180,11 +171,9 @@ export async function runOpsStatusRemote(opts: OpsStatusRemoteOpts): Promise<Ops
     );
   }
 
-  let missions: RemoteMissionsView;
   let tasks: RemoteTasksView;
   let arming: RemoteArmingView;
   try {
-    missions = parseMissionsBody((missionsGot as JsonGetOk).body);
     tasks = parseTasksBody((tasksGot as JsonGetOk).body);
     arming = parseArmingBody((armingGot as JsonGetOk).body);
   } catch (err) {
@@ -198,7 +187,6 @@ export async function runOpsStatusRemote(opts: OpsStatusRemoteOpts): Promise<Ops
   const message = opts.json === true
     ? JSON.stringify({
       bookmark: label,
-      missions: { total: missions.total, byStatus: missions.byStatus, route: REMOTE_OPS_MISSIONS_PATH },
       tasks: {
         total: tasks.total,
         open: tasks.open,
@@ -210,7 +198,7 @@ export async function runOpsStatusRemote(opts: OpsStatusRemoteOpts): Promise<Ops
       loops: { unavailable: true, reason: REMOTE_OPS_LOOPS_UNAVAILABLE },
       health: { unavailable: true, reason: REMOTE_OPS_HEALTH_UNAVAILABLE },
     }, null, 2)
-    : formatRemoteOpsStatus({ bookmark: label, missions, tasks, arming });
+    : formatRemoteOpsStatus({ bookmark: label, tasks, arming });
   out.log(message);
   return { exitCode: 0, classification: 'ok', message };
 }
@@ -260,13 +248,9 @@ async function liveGetJson(
 
 function formatRemoteOpsStatus(view: {
   bookmark: string;
-  missions: RemoteMissionsView;
   tasks: RemoteTasksView;
   arming: RemoteArmingView;
 }): string {
-  const missionStatus = Object.keys(view.missions.byStatus).length > 0
-    ? `  ${JSON.stringify(view.missions.byStatus)}`
-    : '';
   const taskBits = [
     view.tasks.open !== undefined ? `open ${view.tasks.open}` : undefined,
     view.tasks.terminal !== undefined ? `terminal ${view.tasks.terminal}` : undefined,
@@ -280,34 +264,11 @@ function formatRemoteOpsStatus(view: {
   ].join(' ');
   return [
     `원격 운영 상태 북마크 ${view.bookmark}`,
-    `  미션    ${view.missions.total}건${missionStatus}  · GET ${REMOTE_OPS_MISSIONS_PATH}`,
     `  태스크  ${view.tasks.total}건${taskExtra}  · GET ${REMOTE_OPS_TASKS_PATH}`,
     `  arming  ${armingBits}  · GET ${REMOTE_OPS_ARMING_PATH}`,
     `  루프    ${REMOTE_OPS_LOOPS_UNAVAILABLE}`,
     `  건강    ${REMOTE_OPS_HEALTH_UNAVAILABLE}`,
   ].join('\n');
-}
-
-function parseMissionsBody(body: unknown): RemoteMissionsView {
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    throw new Error(`remote ${REMOTE_OPS_MISSIONS_PATH} response is not an object`);
-  }
-  const rec = body as Record<string, unknown>;
-  if (typeof rec.total !== 'number' || !Number.isFinite(rec.total)) {
-    throw new Error(`remote ${REMOTE_OPS_MISSIONS_PATH} response is missing a numeric total`);
-  }
-  if (!Array.isArray(rec.missions)) {
-    throw new Error(`remote ${REMOTE_OPS_MISSIONS_PATH} response is missing a missions array`);
-  }
-  const byStatus: Record<string, number> = {};
-  for (const item of rec.missions) {
-    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
-    const status = (item as { status?: unknown }).status;
-    if (typeof status === 'string' && status.length > 0) {
-      byStatus[status] = (byStatus[status] ?? 0) + 1;
-    }
-  }
-  return { total: rec.total, byStatus };
 }
 
 function parseTasksBody(body: unknown): RemoteTasksView {

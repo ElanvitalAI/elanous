@@ -187,18 +187,18 @@ type ResearchTimer = ReturnType<typeof setTimeout>;
 
 type AbortRace<T> = { aborted: true } | { aborted: false; value: T };
 
-function settleBeforeAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<AbortRace<T>> {
+function settleBeforeAbort<T>(work: Promise<T>, signal: AbortSignal, timers: NonNullable<RunCoreTurnOptions['timers']> = globalThis): Promise<AbortRace<T>> {
   return new Promise((resolve, reject) => {
     let abortGraceTimer: ReturnType<typeof setTimeout> | undefined;
     const onAbort = () => {
       signal.removeEventListener('abort', onAbort);
       // Let work handlers that synchronously settle in response to abort
       // expose their final partial result before taking the deadline path.
-      abortGraceTimer = setTimeout(() => resolve({ aborted: true }), 50);
+      abortGraceTimer = timers.setTimeout(() => resolve({ aborted: true }), 50);
     };
     work.then(
-      value => { signal.removeEventListener('abort', onAbort); if (abortGraceTimer) clearTimeout(abortGraceTimer); resolve({ aborted: false, value }); },
-      error => { signal.removeEventListener('abort', onAbort); if (abortGraceTimer) clearTimeout(abortGraceTimer); reject(error); },
+      value => { signal.removeEventListener('abort', onAbort); if (abortGraceTimer !== undefined) timers.clearTimeout(abortGraceTimer); resolve({ aborted: false, value }); },
+      error => { signal.removeEventListener('abort', onAbort); if (abortGraceTimer !== undefined) timers.clearTimeout(abortGraceTimer); reject(error); },
     );
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
@@ -957,7 +957,7 @@ export async function runCoreTurn(
         });
       }
       if (researchResultPromise) {
-        const racedResearch = await settleBeforeAbort(researchResultPromise, researchDeadlineSignal ?? ctx.signal);
+        const racedResearch = await settleBeforeAbort(researchResultPromise, researchDeadlineSignal ?? ctx.signal, timers);
         if (racedResearch.aborted && ctx.signal.aborted) {
           commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
           return { stopReason: 'aborted', finalText };

@@ -8,7 +8,7 @@
 
 import cron from 'node-cron';
 import type { ScheduleEntry } from './registry.js';
-import { resolveTimeZone } from '../../time/format.js';
+import { resolveTimeZone } from '../../time/time-zone.js';
 import '../../user-config.js'; // Standalone cron entry registers the config timezone source.
 
 export interface CronTaskLike {

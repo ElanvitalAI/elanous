@@ -85,7 +85,8 @@ function widgetRequest(body: unknown): Request {
 /** 시험 전용 시간 상한 — 실물 180초와 «다른 값»이다. 시간 예산 정책만 잰다. */
 const TEST_POLL_MAX_ELAPSED_MS = 10_000;
 
-function routeOptions(dispatch: (context: ToolRuntimeContext) => Promise<unknown>, getFeedbackEmitter?: (sessionId: string) => ((env: FeedbackEnvelope) => void) | undefined) {
+function routeOptions(dispatch: (context: ToolRuntimeContext) => Promise<unknown>, getFeedbackEmitter?: (sessionId: string) => ((env: FeedbackEnvelope) => void) | undefined,
+  pollLimits: NonNullable<Parameters<typeof handleMcpWidgetCall>[1]['_pollLimitsForTest']> = { maxElapsedMs: TEST_POLL_MAX_ELAPSED_MS }) {
   return {
     authorize: () => true,
     getTrustedServerId: () => 'trusted',
@@ -94,7 +95,30 @@ function routeOptions(dispatch: (context: ToolRuntimeContext) => Promise<unknown
     ...(getFeedbackEmitter ? { getFeedbackEmitter } : {}),
     // ⭐ 시험은 «규칙»을 재지 «실물 시간»을 재지 않는다 — 상한을 작게 주입한다.
     //   ⛔ 실제 시간 상한(180초)은 실측에서 온 값이고, 그것을 시험이 기다리면 한 파일이 수 분이 된다.
-    _pollLimitsForTest: { maxElapsedMs: TEST_POLL_MAX_ELAPSED_MS },
+    _pollLimitsForTest: pollLimits,
+  };
+}
+
+function fakeClock() {
+  let current = 0;
+  let nextId = 0;
+  const timers = new Map<number, { at: number; callback: () => void }>();
+  return {
+    now: () => current,
+    setTimeout: (callback: () => void, ms: number) => {
+      const id = ++nextId;
+      timers.set(id, { at: current + ms, callback });
+      return id;
+    },
+    clearTimeout: (timer: unknown) => { timers.delete(timer as number); },
+    advance: (ms: number) => {
+      current += ms;
+      for (const [id, timer] of timers) {
+        if (timer.at > current) continue;
+        timers.delete(id);
+        timer.callback();
+      }
+    },
   };
 }
 
@@ -502,12 +526,24 @@ describe('MCP widget call route · feedback context', () => {
   //     ***관측과 행동이 어긋난 상태***가 된다. emitter 를 해지해 그것을 막는다.
   test('상한 뒤 «늦게» 끝난 폴링은 봉투를 «내지 못한다»', async () => {
     const emitted: FeedbackEnvelope[] = [];
+    const clock = fakeClock();
+    const maxElapsedMs = 50;
     let lateEmit: ((env: FeedbackEnvelope) => void) | undefined;
     let calls = 0;
+    let signalPollStarted!: () => void;
+    const pollStarted = new Promise<void>(resolve => { signalPollStarted = resolve; });
+    let signalPollEnded!: () => void;
+    const pollEnded = new Promise<void>(resolve => { signalPollEnded = resolve; });
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      originalLog.call(debug, category, event, data);
+      if (category === 'mcp.widget' && event === 'poll-gave-up' && data?.jobId === 'job-late') signalPollEnded();
+    }) as typeof debug.log;
 
-    const res = await handleMcpWidgetCall(
-      widgetRequest({ toolName: 'generate_image', args: {}, sessionId: 'sess-late' }),
-      routeOptions(
+    try {
+      const res = await handleMcpWidgetCall(
+        widgetRequest({ toolName: 'generate_image', args: {}, sessionId: 'sess-late' }),
+        routeOptions(
         async (context) => {
           calls += 1;
           if (calls === 1) {
@@ -520,24 +556,28 @@ describe('MCP widget call route · feedback context', () => {
           }
           // 폴링 호출 — ⭐ 그 «폴링 컨텍스트의» emitter 를 붙잡아 두고 «영원히» 안 끝난다.
           lateEmit = context.emitFeedback;
+          signalPollStarted();
           return await new Promise(() => {});
         },
         () => (env) => { emitted.push(env); },
+        { maxElapsedMs, now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
       ),
-    );
+      );
 
-    expect(res.status).toBe(200);
-    // 폴링이 시작돼 emitter 를 받았는지 — 이 시험이 «뜻을 갖는» 전제다.
-    await Bun.sleep(30);
-    expect(typeof lateEmit).toBe('function');
+      expect(res.status).toBe(200);
+      await pollStarted;
+      expect(typeof lateEmit).toBe('function');
 
-    // 상한이 지나 포기한 «뒤», 늦게 끝난 호출이 emit 을 시도한다.
-    await Bun.sleep(TEST_POLL_MAX_ELAPSED_MS + 200);
-    lateEmit!({ kind: 'media.image', blockId: 'b', phase: 'end', seq: 1, asciiFallback: ['x'] } as never);
+      // 상한을 fake clock으로 넘긴 뒤, 실제 응답이 늦게 와도 봉투가 나가지 않는다.
+      clock.advance(maxElapsedMs);
+      await pollEnded;
+      lateEmit!({ kind: 'media.image', blockId: 'b', phase: 'end', seq: 1, asciiFallback: ['x'] } as never);
 
-    // ⛔ 그 봉투는 «나가지 않는다».
-    expect(emitted.filter((e) => e.kind === 'media.image')).toHaveLength(0);
-  }, 20_000);
+      expect(emitted.filter((e) => e.kind === 'media.image')).toHaveLength(0);
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+    }
+  });
 });
 
 describe('MCP widget call route · trusted server binding', () => {

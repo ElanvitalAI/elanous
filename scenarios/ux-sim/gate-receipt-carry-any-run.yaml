@@ -1,0 +1,25 @@
+version: 1
+kind: release-gate-shard-receipt-skip
+id: gate-receipt-carry-any-run-0306
+isolation: test
+source: scripts/release-loop/gate-node.ts
+cases:
+  - id: append-test-file
+    event: descendant-commit-adds-one-test
+    expect: { carried: [pod-0, pod-1, pod-2], rerun: [pod-3], totalPods: 1 }
+  - id: append-document-referenced-by-one-test
+    event: descendant-commit-appends-one-document-read-by-one-test
+    expect: { carried: 80, rerun: [pod-0], totalPods: 1 }
+  - id: same-commit-resume
+    event: resumed-after-append-with-identical-input
+    expect: { carried: [pod-0, pod-1, pod-2, pod-3], rerun: [], totalPods: 0 }
+  - id: host-replacement
+    event: identical-receipts-read-from-a-different-eligible-host
+    expect: { carried: [pod-0, pod-1, pod-2, pod-3], rerun: [], totalPods: 0 }
+  - id: shard-payload-corruption
+    event: one-result-payload-digest-mismatch
+    corrupt: pod-1
+    expect: { carried: [pod-0, pod-2, pod-3], rerun: [pod-1], totalPods: 1 }
+  - id: base-image-change
+    event: current-execution-base-image-digest-changes
+    expect: { carried: [], rerun: [pod-0, pod-1, pod-2, pod-3], totalPods: 4 }

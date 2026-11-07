@@ -40,7 +40,6 @@ test('the banner follows beta and broken route changes without hiding other rout
   for (const [path, message] of [
     ['/settings', '베타 — 화면과 동작이 바뀔 수 있습니다.'],
     ['/morning', '이 화면은 지금 고치는 중입니다.'],
-    ['/missions/123', '베타 — 화면과 동작이 바뀔 수 있습니다.'],
   ]) {
     pathname = path;
     expect(renderToStaticMarkup(<MaturityBanner />)).toContain(message);

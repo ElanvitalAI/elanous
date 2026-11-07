@@ -9,7 +9,7 @@ import { listChecklist, setItem, type ChecklistItem } from '../release-loop/chec
 import { placeCell, type PlacementDeps } from '../release-loop/placement.js';
 import { listSchedules } from '../release-loop/release-schedule.js';
 import { getUserConfig } from '../user-config.js';
-import { dateKey } from '../time/format.js';
+import { dateKey } from '../time/calendar.js';
 import { cardIndexPath, CardStore, type TaskCard } from '../task-cards/card-store.js';
 import { loadIntakeLedger, type IntakeItem } from './items.js';
 import { alreadyBuiltHints, type AlreadyBuiltFeature, type AlreadyBuiltRefusedPair } from './already-built-hint.js';

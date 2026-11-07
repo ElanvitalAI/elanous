@@ -6,7 +6,7 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import * as registry from './registry.js';
 import { cronMatches } from '../domains/cron-match.js';
-import { resolveTimeZone } from '../time/format.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 import type { ScheduleRow } from '../domains/schedule-registry.js';
 import type { LoopEntry, LoopRun } from './registry.js';
 

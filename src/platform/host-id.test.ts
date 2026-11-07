@@ -2,7 +2,7 @@ import { afterAll, afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { __setIdentityFileForTests } from '../mss/identity.js';
+import { __setIdentityFileForTests } from '../mss/identity-store.js';
 import { ensureHostId, resolveHostId } from './host-id.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'elanous-host-id-'));

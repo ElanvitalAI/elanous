@@ -72,7 +72,7 @@ import type { UrlRoutingConfig } from './skills/url-router.js';
 import { migrateLegacyXdgUserConfig } from './storage/legacy-elanous-config-migrate.js';
 import { withFileLockSync } from './storage/file-lock.js';
 import { debug } from './debug/log.js';
-import { setConfigTimeZoneSource } from './time/format.js';
+import { setConfigTimeZoneSource } from './time/time-zone.js';
 import { parseGeminiServerTools } from './user-config/gemini-server-tools.js';
 import { clampNum, numArray, positiveIntOr, str, strArray, stringRecord } from './user-config/coercion.js';
 import type { FoldMode } from './log-entry.js';

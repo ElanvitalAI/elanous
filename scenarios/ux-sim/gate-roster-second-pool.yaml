@@ -1,0 +1,26 @@
+world: gate-roster-second-pool
+steps:
+  - inject:
+      id: gate-roster-second-pool
+  - observe: gate-roster-second-pool
+expect:
+  observations:
+    - { event: "gate-pools-pinned-sweep:injected", verdict: injected, gateOutcome: not-run }
+    - { event: gate-pools-pinned-sweep, verdict: pass, gateOutcome: ok, gateError: null }
+    - { event: "gate-mshq-unavailable:injected", verdict: injected, gateOutcome: not-run }
+    - event: gate-mshq-unavailable
+      verdict: pass
+      gateOutcome: ok
+      gateError: null
+      placements:
+        - { context: pool-mshq, files: [src/roster-00.test.ts], available: false }
+        - { context: pool-node-b, files: [src/roster-00.test.ts], available: true }
+      reassignments:
+        - { from: pool-mshq, to: pool-node-b, files: [src/roster-00.test.ts] }
+      completedFiles: [src/roster-00.test.ts]
+    - { event: "gate-both-unavailable:injected", verdict: injected, gateOutcome: not-run }
+    - { event: gate-both-unavailable, verdict: measurement-unavailable, gateOutcome: error, gateError: "pod sweep incomplete: stalled shards 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7" }
+    - { event: "gate-digest-mismatch:injected", verdict: injected, gateOutcome: not-run }
+    - { event: gate-digest-mismatch, verdict: image-fingerprint-mismatch, gateOutcome: error, gateError: "gate image pin refused: pool image digest mismatch (pool-mshq)" }
+    - { event: "gate-no-pinned-image:injected", verdict: injected, gateOutcome: not-run }
+    - { event: gate-no-pinned-image, verdict: measurement-unavailable, gateOutcome: error, gateError: "gate image pin refused: initial-image-digest-missing" }

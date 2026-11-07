@@ -12,6 +12,13 @@ export function createEmptySecretCliMock() {
     isInteractive: () => true,
     promptSecret: async () => 'mock-secret-value',
     saveSecret: async (id, value) => { values.set(id, value); },
+    revokeAppSecrets: async (app, name) => {
+      const prefix = `app/${app}/`;
+      const targets = name === undefined ? [...values.keys()].filter((id) => id.startsWith(prefix)) : [`${prefix}${name}`];
+      let count = 0;
+      for (const id of targets) if (values.delete(id)) count += 1;
+      return { revoked: count, alreadyAbsent: targets.length === 0 && count === 0 };
+    },
     getSecret: async (id) => values.get(id),
     listSecrets: async () => [...values.keys()].sort(),
     removeSecret: async (id) => values.delete(id),

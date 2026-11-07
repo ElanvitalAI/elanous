@@ -64,8 +64,11 @@ test('validated event is 200 with Primary unavailable, deduped, and retried thro
   const root = mkdtempSync(join(tmpdir(), 'hooks-linear-'));
   let calls = 0;
   let success = 0;
+  let releaseFirstForward!: () => void;
+  const firstForward = new Promise<void>(resolve => { releaseFirstForward = resolve; });
   const server = startHookReceiver({ port: 0, root, now: () => now, retryBaseMs: 10, secrets: { linear: 'key' }, forward: async () => {
     calls++;
+    if (calls === 1) await firstForward;
     if (calls < 3) return 503;
     success++;
     return 201;
@@ -75,9 +78,11 @@ test('validated event is 200 with Primary unavailable, deduped, and retried thro
     const send = () => fetch(new URL('/hooks/linear', server.url), { method: 'POST', headers: { 'Linear-Signature': signature(raw, 'key'), 'Linear-Delivery': 'delivery-1' }, body: raw });
     expect((await send()).status).toBe(200);
     expect(server.queue.count()).toBe(1);
-    expect(calls).toBe(0);
     expect((await send()).status).toBe(200);
     expect(server.queue.count()).toBe(1);
+    await waitFor(() => calls === 1);
+    expect(calls).toBe(1);
+    releaseFirstForward();
     await waitFor(() => calls === 3 && server.queue.count() === 0);
     expect(success).toBe(1);
     expect(server.queue.lastDelivered()).toBe(new Date(now).toISOString());
@@ -89,7 +94,7 @@ test('validated event is 200 with Primary unavailable, deduped, and retried thro
       headers: { 'Linear-Signature': signature(old, 'key'), 'Linear-Delivery': 'delivery-old' }, body: old });
     expect(stale.status).toBe(401);
     expect(server.queue.count()).toBe(0);
-  } finally { server.stop(); rmSync(root, { recursive: true, force: true }); }
+  } finally { releaseFirstForward(); server.stop(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('a signed non-issue Linear event is answered 200 and never queued or forwarded', async () => {

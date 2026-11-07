@@ -19,6 +19,8 @@ export interface StorageConfig {
   bucket: string;
   publicBucket: string;
   prefix: string;
+  /** Shared SQLite path used to coordinate app quota reservations across remote-store writers. */
+  quotaLedgerPath?: string;
   gcs?: { project: string };
   azure?: { account: string };
   s3?: { region?: string; profile?: string };
@@ -45,6 +47,19 @@ export interface ObjectStore {
   publicUrl(key: string): string | null;
 }
 
+/** Build a validated app-scoped key without accepting a caller supplied prefix. */
+export function appObjectKey(appSlug: string, key: string): string {
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(appSlug)
+    || !key || key.startsWith('/') || key.includes('\\') || key.includes('\0') || key.startsWith('apps/')) {
+    throw new Error('invalid app slug or app-relative object key');
+  }
+  const parts = key.split('/');
+  if (parts.some((part) => !part || part === '.' || part === '..' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(part))) {
+    throw new Error('invalid app slug or app-relative object key');
+  }
+  return `apps/${appSlug}/${parts.join('/')}`;
+}
+
 /** 주입 가능한 CLI 실행. 기본은 execFileSync. 올리기 60초 · 내리기 30초. */
 export type RunFn = (bin: string, args: string[], opts?: { input?: Uint8Array | string; timeoutMs?: number }) => { stdout: string; stderr: string };
 
@@ -62,6 +77,7 @@ interface RawStorage {
   publicBucket?: unknown;
   prefix?: unknown;
   localDir?: unknown;
+  quotaLedgerPath?: unknown;
   gcs?: { project?: unknown };
   azure?: { account?: unknown };
   s3?: { bucket?: unknown; publicBucket?: unknown; region?: unknown; profile?: unknown };
@@ -111,6 +127,7 @@ export function resolveStorageConfig(
   if (env.ELANOUS_S3_DISABLED === '1') provider = 'local';
 
   const cfg: StorageConfig = { provider, localDir, bucket, publicBucket, prefix };
+  if (str(storage.quotaLedgerPath)) cfg.quotaLedgerPath = expandHome(str(storage.quotaLedgerPath));
   const project = str(storage.gcs?.project);
   if (project) cfg.gcs = { project };
   const account = str(storage.azure?.account);
@@ -416,7 +433,7 @@ export function createObjectStore(config: StorageConfig, deps: ObjectStoreDeps =
           const arr = JSON.parse(out.stdout) as Array<{ name?: string }>;
           return arr.map((o) => o.name ?? '').filter(Boolean);
         } catch {
-          return [];
+          throw new Error('azure storage blob list returned invalid JSON');
         }
       }
       return [];

@@ -112,6 +112,7 @@ test('standalone entrypoint succeeds with structured classification', () => {
   expect(run.status).toBe(0);
   const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as Record<string, unknown>;
   expect(result).toMatchObject({ outcome: 'ok', classification: 'regression',
+    verdict: 'pass',
     prescription: { action: 'repair-card', runId: 'run-shadow', failureIds: ['src/a.test.ts: fails'] } });
 });
 
@@ -218,6 +219,18 @@ test('malformed graph context exits with error outcome', () => {
   });
   expect(run.status).toBe(1);
   expect(JSON.parse(run.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'error', verdict: 'fail' });
+});
+
+test('successful gate triage emits the graph success verdict', () => {
+  const run = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
+    cwd: process.cwd(), encoding: 'utf8', timeout: 20_000,
+    env: { ...process.env, ELANOUS_GRAPH_CONTEXT: JSON.stringify({
+      input: { version: '0.2.40', previousVersion: '0.2.39' },
+      outputs: { gate: gate() },
+    }) },
+  });
+  expect(run.status).toBe(0);
+  expect(JSON.parse(run.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'ok', verdict: 'pass' });
 });
 
 if (process.env.ELANOUS_GATE_HOST_LEDGER_0239) test('recorded host gate ledger produces rerun-pod and its prior triage is readable', () => {

@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { GATE_DEPS_TREES, gateDepsInstallScript, parseGateDeps, projectDepsManifest, stageGateDeps } from './pod-gate-deps.js';
 import { gateShardShell } from '../../../scripts/release-loop/gate-node.js';
 
@@ -29,8 +30,8 @@ function fixture() {
   // A bun that is real for `-e` (the projection) and fake for `install` (records the tree · prints bun's summary).
   const bin = join(root, 'bin');
   mkdirSync(bin);
-  writeFileSync(join(bin, 'bun'), `#!/bin/bash
-if [ "$1" = install ]; then echo "$PWD" >> '${root}/installs'; [ -e '${root}/install-fails' ] && exit 7; echo "5 packages installed [750ms]"; exit 0; fi
+writeFileSync(join(bin, 'bun'), `#!/bin/bash
+if [ "$1" = install ]; then echo "$PWD" >> '${root}/installs'; [ -e '${root}/install-fails' ] && exit 7; if grep -Fq '"postinstall": "node scripts/npm-postinstall.cjs"' package.json; then [ -f scripts/npm-postinstall.cjs ] || { echo "Cannot find module scripts/npm-postinstall.cjs" >&2; exit 9; }; '${process.execPath}' scripts/npm-postinstall.cjs || exit $?; fi; case "$PWD" in '${deps}'*) mkdir -p node_modules/marker ;; esac; echo "5 packages installed [750ms]"; exit 0; fi
 exec '${process.execPath}' "$@"
 `);
   chmodSync(join(bin, 'bun'), 0o755);
@@ -41,6 +42,17 @@ exec '${process.execPath}' "$@"
 function bake(f: ReturnType<typeof fixture>) {
   const staged = stageGateDeps(f.source, f.deps);
   for (const tree of GATE_DEPS_TREES) mkdirSync(join(f.deps, tree, 'node_modules', 'marker'), { recursive: true });
+  return staged;
+}
+
+/** Dockerfile boundary: use the staged package and the real local postinstall; only Bun's dependency install is faked. */
+function bakeThroughDockerfileBoundary(f: ReturnType<typeof fixture>) {
+  const staged = stageGateDeps(f.source, f.deps);
+  for (const tree of GATE_DEPS_TREES) {
+    const result = spawnSync(join(f.bin, 'bun'), ['install', '--frozen-lockfile'], { cwd: join(f.deps, tree), encoding: 'utf8',
+      env: { PATH: `${f.bin}:/usr/bin:/bin`, HOME: f.root, npm_config_global: 'false' } });
+    if (result.status !== 0) throw new Error(`simulated Docker dependency bake failed for ${tree}: ${result.stderr}`);
+  }
   return staged;
 }
 
@@ -158,4 +170,49 @@ test('the full harness image bakes the gate deps before the per-commit package l
   expect(build).toContain('pod-gate-deps.ts stage "$CTX/gate-deps"');
   expect(build).toContain('elanous.gate-deps=$GATE_DEPS_DIGEST');
   expect(readFileSync(resolve(import.meta.dir, '../../../docker/harness/Dockerfile.lite'), 'utf8')).not.toContain('gate-deps');
+});
+
+test('GATE-DEPS-ROOT-BAKE sim: stage the root lifecycle input, bake it, then link baked deps in the production shard path', () => {
+  const world = parseYaml(readFileSync(resolve(import.meta.dir, '../../../scenarios/ux-sim/gate-deps-root-bake.yaml'), 'utf8')) as {
+    kind: string; isolation: string; case: { packageScript: string; expectedLog: string; expectedDriftLog: string; installSlots: number };
+  };
+  expect(world).toMatchObject({ kind: 'gate-deps-root-bake', isolation: 'test' });
+  const f = fixture();
+  const script = readFileSync(resolve(import.meta.dir, '../../../scripts/npm-postinstall.cjs'));
+  for (const tree of [f.source, f.repo]) {
+    const packagePath = join(tree, 'package.json');
+    const manifest = JSON.parse(readFileSync(packagePath, 'utf8')) as typeof ROOT_PKG;
+    writeFileSync(packagePath, JSON.stringify({ ...manifest, scripts: { ...manifest.scripts, postinstall: world.case.packageScript } }, null, 2));
+    mkdirSync(join(tree, 'scripts'), { recursive: true });
+    copyFileSync(resolve(import.meta.dir, '../../../scripts/npm-postinstall.cjs'), join(tree, 'scripts/npm-postinstall.cjs'));
+  }
+  const staged = bakeThroughDockerfileBoundary(f);
+  const sourceScript = join(f.source, 'scripts/npm-postinstall.cjs');
+  const shardScript = join(f.repo, 'scripts/npm-postinstall.cjs');
+  const imageScript = join(f.deps, 'scripts/npm-postinstall.cjs');
+  expect(existsSync(imageScript)).toBe(true);
+  expect(readFileSync(imageScript)).toEqual(script);
+  expect(staged.digest).toMatch(/^[a-f0-9]{12}$/);
+  writeFileSync(sourceScript, Buffer.concat([script, Buffer.from('\n// digest input changed\n')]));
+  expect(stageGateDeps(f.source, join(f.root, 'different-image')).digest).not.toBe(staged.digest);
+  writeFileSync(sourceScript, script);
+  rmSync(sourceScript);
+  expect(() => stageGateDeps(f.source, join(f.root, 'missing-input-image'))).toThrow('gate deps lifecycle input missing');
+  writeFileSync(sourceScript, script);
+  writeFileSync(join(f.root, 'installs'), '');
+  const shard = runInstall(f, world.case.installSlots);
+  expect(shard.status).toBe(0);
+  expect(shard.installs).toEqual([]);
+  expect(parseGateDeps(shard.log)).toMatchObject({ '.': world.case.expectedLog, 'apps/pwa': 'baked' });
+  expect(readlinkSync(join(f.repo, 'node_modules'))).toBe(join(f.deps, 'node_modules'));
+  expect(readlinkSync(join(f.repo, 'apps/pwa/node_modules'))).toBe(join(f.deps, 'apps/pwa/node_modules'));
+
+  rmSync(join(f.repo, 'node_modules'));
+  rmSync(join(f.repo, 'apps/pwa/node_modules'));
+  writeFileSync(shardScript, Buffer.concat([script, Buffer.from('\n// shard lifecycle drift\n')]));
+  const drifted = runInstall(f, world.case.installSlots);
+  expect(drifted.status).toBe(0);
+  expect(parseGateDeps(drifted.log)).toMatchObject({ '.': world.case.expectedDriftLog, 'apps/pwa': 'baked' });
+  expect(drifted.installs).toEqual([resolve(f.repo)]);
+  expect(drifted.slots).toEqual(['acquire', 'release']);
 });

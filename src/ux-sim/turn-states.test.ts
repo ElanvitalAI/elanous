@@ -7,7 +7,7 @@ import { simEscGate } from './interaction.js';
 import { TURN_ABORT_TURN_ONLY } from '../turn-abort-scope.js';
 import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import type { CoreTurnContext } from '../core-turn/types.js';
-import * as core from '../core-turn/index.js';
+import * as core from '../core-turn/run-core-turn.js';
 import { debug } from '../debug/log.js';
 import { bridgeCoreTurnToAcp } from '../acp/core-turn-bridge.js';
 import type { AcpTurnContext } from '../acp/server.js';
@@ -118,7 +118,7 @@ describe('simRenderLogFrame — 실제 위젯 render 를 탄다', () => {
   });
 
   test('TUI-HIDE-ROUTING-NOTICE — production route decision is logged but absent from the rendered turn', async () => {
-    let coreContext: core.CoreTurnContext | undefined;
+    let coreContext: CoreTurnContext | undefined;
     spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
       coreContext = ctx;
       return { stopReason: 'end_turn', finalText: '' };

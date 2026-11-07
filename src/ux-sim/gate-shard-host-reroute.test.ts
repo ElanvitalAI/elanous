@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { gateShardRerouteScenario, simGateShardHostReroute } from './gate-shard-host-reroute.js';
+import { gateShardRuntimeIdentityKey } from '../../scripts/release-loop/gate-shard-dispatch.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -18,7 +20,9 @@ const shards = [
 function receipt(id: string, files: string[], host: string, overrides: Record<string, unknown> = {}) {
   const imageDigest = 'sha256:' + 'a'.repeat(64);
   const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: SHA , baseImageDigest: 'sha256:' + 'a'.repeat(64) };
-  return { id, files, version: '0.2.46', graphSha: '0'.repeat(64), recipeSha: '0'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun gate', recipeTimeoutMs: 1000, head40: HEAD, base40: BASE, host, imageDigest, envFingerprint: SHA, runtimeIdentity, envKey: `${SHA}:${imageDigest}`, executions: [{ branch: '', attemptId: `sim-${id}`, host, imageDigest, runtimeIdentity }], status: 'complete' as const,
+  const lockfileHash = 'd'.repeat(64);
+  const testedFileHashes = Object.fromEntries(files.map((file) => [file, createHash('sha256').update(file).digest('hex')]));
+  return { id, files, version: '0.2.46', graphSha: '0'.repeat(64), recipeSha: '0'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun gate', recipeTimeoutMs: 1000, head40: HEAD, base40: BASE, host, imageDigest, envFingerprint: SHA, runtimeIdentity, lockfileHash, testedFileHashes, envKey: gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!, executions: [{ branch: '', attemptId: `sim-${id}`, host, imageDigest, runtimeIdentity }], status: 'complete' as const,
     failureIds: [], errorIds: [], evidencePath: `gate-logs/${id}-${host}.json`, evidenceSha256: SHA,
     measuredAt: '2026-10-27T00:00:00.000Z', attempt: 1, ...overrides };
 }
@@ -59,10 +63,12 @@ describe('gate shard host reroute S1 device', () => {
       { shardId: 'pod-1', host: 'node-b', status: 'complete', failureIds: [], errorIds: [] },
     ]);
     const observed = simGateShardHostReroute(scenario);
-    expect(observed.actions.map((a) => a.kind)).toEqual(['reuse', 'run', 'reuse']);
-    expect(observed.hostCalls.map((c) => [c.shardId, c.host, c.files])).toEqual([['pod-1', 'node-b', shards[1]!.files]]);
-    expect(observed.reduction).toMatchObject({ status: 'complete', failureIds: ['src/c.test.ts > existing'] });
-    expect(observed.receipts.map((r) => r.host)).toEqual(['wsl', 'node-b', 'node-c']);
+    expect(observed.actions.map((a) => a.kind)).toEqual(['reuse', 'run', 'run']);
+    expect(observed.hostCalls.map((c) => [c.shardId, c.host, c.files])).toEqual([
+      ['pod-1', 'node-b', shards[1]!.files], ['pod-2', 'wsl', shards[2]!.files],
+    ]);
+    expect(observed.reduction).toMatchObject({ status: 'unmeasured', reason: 'pod-2: expected one complete receipt, found 0' });
+    expect(observed.receipts.map((r) => r.host)).toEqual(['wsl', 'node-b']);
   });
 
   test('auto does not remeasure a complete macOS shard just because it has a mac-pass policy tag', () => {

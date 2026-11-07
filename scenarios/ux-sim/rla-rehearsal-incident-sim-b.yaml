@@ -1,0 +1,29 @@
+id: rla-rehearsal-incident-sim-b
+version: 1
+purpose: Run the release loop's real gate.failed → ARG adapter → durable append/wake route in one active run for a hard-rehearsal regression.
+fault:
+  source: hard-5h rehearsal gate
+  firstGateOutcome: regression
+  repairOutcome: ok
+sameRun:
+  processRestart: false
+  resumeCli: false
+expected:
+  event: release.gate.failed
+  sourceNode: gate-triage
+  pathContains:
+    - gate
+    - gate-triage
+    - gate-repair
+    - gate
+  gateVisits: 2
+  gateExecutions: 2
+  gateExecutionIdsDistinct: true
+  priorGateInvalidated: true
+  repairVisits: 1
+  status: done
+  shadowTriageVisits: 0
+boundaries:
+  injectedCommandsOnly: true
+  externalPublish: false
+  externalCloud: false

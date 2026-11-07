@@ -321,7 +321,11 @@ describe('Secrets API', () => {
     setSecret('b', 'BBB');
     const res = await call('/v1/config/secrets');
     expect(res.status).toBe(200);
-    expect(res.body.secrets.map((s: { id: string }) => s.id).sort()).toEqual(['a', 'b']);
+    // Runtime-managed secrets (for example the app-auth signing key) share
+    // this store, so assert the caller's ids without fixing the full list.
+    const ids = res.body.secrets.map((s: { id: string }) => s.id);
+    expect(ids).toContain('a');
+    expect(ids).toContain('b');
     // No `value` field anywhere
     for (const s of res.body.secrets) expect((s as Record<string, unknown>).value).toBeUndefined();
   });

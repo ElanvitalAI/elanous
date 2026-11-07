@@ -13,6 +13,10 @@ import { ProjectStore } from '../project/project-store.js';
 import { createSession } from '../session/index.js';
 import { handleCreateTab } from './api/tabs-mutations.js';
 import { createRegistryBackend } from './webterm/pty.js';
+import { createFakeStt } from '../ux-sim/fake-stt.js';
+import { fakeElevenLabsAudioBytes, startFakeElevenLabs } from '../ux-sim/fake-elevenlabs.js';
+import { appSecretId } from './config/secrets/app-secret-ledger.js';
+import { deleteAppSecretValue, fileBackend, setAppSecretValue } from './config/secrets/file-backend.js';
 import type { StartOpts } from '../pty-shell/registry.js';
 import { setTestStateRoot } from './paths.js';
 import type { PwaShareDeps, PwaShareResult } from '../cli/pwa-share.js';
@@ -175,6 +179,142 @@ describe('Nexus startup bearer token', () => {
       expect(nexus.runtime.httpAuth).toBe('on');
     } finally { nexus.release(); }
   });
+
+  test('live Nexus dispatches manifest STT through the app route registry and closed secret boundary', async () => {
+    const appDir = join(isolated, 'nexus', 'apps', 'voice-note');
+    mkdirSync(join(appDir, 'out'), { recursive: true });
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend:\n  kind: static-export\n  out: out\nroles:\n  owner: {}\nactions:\n  transcribe:\n    builtin: stt\n    uses: [cred:openai.api_key]\nstorage:\n  prefix: apps/voice-note/\n  quotaBytes: 1024\n  upload:\n    allow: [owner]\n    types: [audio/wav]\n    maxBytes: 512\n`);
+    writeFileSync(join(appDir, 'out', 'index.html'), '<main>voice note</main>');
+    writeFileSync(join(isolated, 'acp-token'), `${CONFIGURED_TOKEN}\n`);
+    await fileBackend.set('cred:openai.api_key', 'shared-openai-must-not-be-used');
+    await setAppSecretValue(appSecretId('other-app', 'OPENAI_API_KEY'), 'other-app-must-not-be-used');
+    const fakeStt = createFakeStt();
+    const observedApiKeys: string[] = [];
+    const nexus = await runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      httpStartPort: 49000 + Math.floor(Math.random() * 2000), toolCwd: isolated,
+      skipSupervisor: true, mcpEnabled: false, cleanGhostTailscaleServeFn: async () => {},
+      skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+      skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+      appActionDepsForTesting: {
+        transcribe: async input => {
+          observedApiKeys.push(input.apiKey);
+          const result = await fakeStt.transcribe({ audio: input.audio, language: input.language as 'ko' | 'en' | undefined });
+          return { text: result.text, language: result.language, durationMs: 12 };
+        },
+      },
+    });
+    if (!nexus?.httpServer) throw new Error('Nexus did not bind');
+    try {
+      const url = `${nexus.httpServer.url}/v1/apps/voice-note/actions/transcribe`;
+      const audio = Buffer.from('fake-stt-contract-audio');
+      const headers = { 'content-type': 'audio/wav', 'x-audio-filename': 'sample.wav' };
+      const unauthorized = await fetch(url, { method: 'POST', headers, body: audio });
+      expect(unauthorized.status).toBe(401);
+      const authorizedHeaders = { ...headers, authorization: `Bearer ${CONFIGURED_TOKEN}` };
+      const denied = await fetch(url, { method: 'POST', headers: authorizedHeaders, body: audio });
+      expect(denied.status).toBe(503);
+      expect(await denied.json()).toEqual({ error: 'credential-unavailable' });
+      await setAppSecretValue(appSecretId('voice-note', 'OPENAI_API_KEY'), 'simulated-openai-key');
+      const succeeded = await fetch(url, { method: 'POST', headers: authorizedHeaders, body: audio });
+      expect(succeeded.status).toBe(200);
+      expect(await succeeded.json()).toMatchObject({ ok: true, text: '안녕하세요', language: 'ko' });
+      expect(observedApiKeys).toEqual(['simulated-openai-key']);
+
+      const storageUrl = `${nexus.httpServer.url}/v1/apps/voice-note/storage`;
+      expect((await fetch(storageUrl)).status).toBe(401);
+      const signedResponse = await fetch(`${storageUrl}/uploads`, {
+        method: 'POST', headers: { authorization: `Bearer ${CONFIGURED_TOKEN}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'audio/entry.wav', expiresInMs: 60_000 }),
+      });
+      expect(signedResponse.status).toBe(200);
+      const signedUrl = (await signedResponse.json() as { url: string }).url;
+      expect(new URL(signedUrl).origin).toBe(nexus.httpServer.url);
+      const uploadedBytes = Buffer.from('fake-stt-contract-audio');
+      const uploaded = await fetch(signedUrl, { method: 'PUT', headers: { 'content-type': 'audio/wav' }, body: uploadedBytes });
+      expect(uploaded.status).toBe(201);
+      const listed = await fetch(storageUrl, { headers: { authorization: `Bearer ${CONFIGURED_TOKEN}` } });
+      expect(listed.status).toBe(200);
+      expect(await listed.json()).toEqual({ files: ['audio/entry.wav'] });
+      const read = await fetch(`${storageUrl}?key=audio%2Fentry.wav`, { headers: { authorization: `Bearer ${CONFIGURED_TOKEN}` } });
+      expect(read.status).toBe(200);
+      expect(read.headers.get('content-type')).toBe('audio/wav');
+      expect(new Uint8Array(await read.arrayBuffer())).toEqual(uploadedBytes);
+
+      const storedAudioRequest = JSON.stringify({ audio: 'audio/entry.wav', language: 'ko' });
+      const unauthorizedAfterStorage = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: storedAudioRequest,
+      });
+      expect(unauthorizedAfterStorage.status).toBe(401);
+      expect(await deleteAppSecretValue(appSecretId('voice-note', 'OPENAI_API_KEY'))).toBe(true);
+      const missingCredentialAfterStorage = await fetch(url, {
+        method: 'POST', headers: { ...authorizedHeaders, 'content-type': 'application/json' }, body: storedAudioRequest,
+      });
+      expect(missingCredentialAfterStorage.status).toBe(503);
+      expect(await missingCredentialAfterStorage.json()).toEqual({ error: 'credential-unavailable' });
+      await setAppSecretValue(appSecretId('voice-note', 'OPENAI_API_KEY'), 'simulated-openai-key');
+      const transcribedStoredAudio = await fetch(url, {
+        method: 'POST', headers: { ...authorizedHeaders, 'content-type': 'application/json' }, body: storedAudioRequest,
+      });
+      expect(transcribedStoredAudio.status).toBe(200);
+      expect(await transcribedStoredAudio.json()).toMatchObject({ ok: true, text: '안녕하세요' });
+      expect(observedApiKeys).toEqual(['simulated-openai-key', 'simulated-openai-key']);
+    } finally { nexus.release(); }
+  }, 30_000);
+
+  test('live Nexus dispatches manifest TTS through fake ElevenLabs and closed secret boundary', async () => {
+    const appDir = join(isolated, 'nexus', 'apps', 'voice-note');
+    mkdirSync(join(appDir, 'out'), { recursive: true });
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend:\n  kind: static-export\n  out: out\nactions:\n  speak:\n    builtin: tts\n    uses: [cred:elevenlabs.api_key]\n`);
+    writeFileSync(join(appDir, 'out', 'index.html'), '<main>voice note</main>');
+    writeFileSync(join(isolated, 'acp-token'), `${CONFIGURED_TOKEN}\n`);
+    await fileBackend.set('cred:elevenlabs.api_key', 'shared-elevenlabs-must-not-be-used');
+    const fake = await startFakeElevenLabs({ apiKey: 'sim-elevenlabs-key' });
+    const originalFetch = globalThis.fetch;
+    const nexus = await runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      httpStartPort: 49000 + Math.floor(Math.random() * 2000), toolCwd: isolated,
+      skipSupervisor: true, mcpEnabled: false, cleanGhostTailscaleServeFn: async () => {},
+      skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+      skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+    });
+    if (!nexus?.httpServer) {
+      await fake.close();
+      throw new Error('Nexus did not bind');
+    }
+    try {
+      let providerUrl = '';
+      let providerInit: RequestInit | undefined;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const requestedUrl = String(input);
+        if (!requestedUrl.startsWith('https://api.elevenlabs.io/')) return originalFetch(input, init);
+        providerUrl = requestedUrl;
+        providerInit = init;
+        const parsed = new URL(requestedUrl);
+        return originalFetch(`${fake.baseUrl}${parsed.pathname}${parsed.search}`, init);
+      }) as typeof fetch;
+      const url = `${nexus.httpServer.url}/v1/apps/voice-note/actions/speak`;
+      const headers = { 'content-type': 'application/json', authorization: `Bearer ${CONFIGURED_TOKEN}` };
+      const body = JSON.stringify({ text: 'Hello from app TTS', voiceId: 'fake-voice' });
+      const unauthorized = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+      expect(unauthorized.status).toBe(401);
+      const denied = await fetch(url, { method: 'POST', headers, body });
+      expect(denied.status).toBe(503);
+      expect(await denied.json()).toEqual({ error: 'credential-unavailable' });
+      await setAppSecretValue(appSecretId('voice-note', 'ELEVENLABS_API_KEY'), 'sim-elevenlabs-key');
+      const succeeded = await fetch(url, { method: 'POST', headers, body });
+      expect(succeeded.status).toBe(200);
+      expect(await succeeded.json()).toEqual({
+        ok: true, audioBase64: fakeElevenLabsAudioBytes('Hello from app TTS').toString('base64'), mimeType: 'audio/pcm',
+      });
+      expect(providerUrl).toBe('https://api.elevenlabs.io/v1/text-to-speech/fake-voice?output_format=mp3_44100_128');
+      expect(providerInit?.redirect).toBe('error');
+      expect(new Headers(providerInit?.headers).get('xi-api-key')).toBe('sim-elevenlabs-key');
+      expect(fake.requests()).toEqual([{
+        method: 'POST', path: '/v1/text-to-speech/fake-voice?output_format=mp3_44100_128', text: 'Hello from app TTS', status: 200,
+      }]);
+    } finally { globalThis.fetch = originalFetch; nexus.release(); await fake.close(); }
+  }, 30_000);
 
   test('existing token is reused without modifying its file contents', async () => {
     const path = join(isolated, 'acp-token');

@@ -24,12 +24,9 @@ import { dispatchSessionQuery } from '../src/domains/session-query-tool.js';
 import { DashboardSession } from '../src/tui-client/dashboard-session.js';
 import type { AcpTurnContext } from '../src/acp/server.js';
 import { debug } from '../src/debug/log.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
 import * as userConfigModule from '../src/user-config.js';
-import type {
-  CoreTurnContext,
-  CoreTurnResult,
-} from '../src/core-turn/index.js';
+import type { CoreTurnContext, CoreTurnResult } from '../src/core-turn/types.js';
 
 type RunCoreTurnCall = {
   ctx: CoreTurnContext;

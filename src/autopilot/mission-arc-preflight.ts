@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { MissionArc } from '../task-orchestrator/mission.js';
-import { adaptiveGround, extractSymbols } from './mission-grounding-ladder.js';
+import { adaptiveGround, extractSymbols, type GroundingDeps } from './mission-grounding-ladder.js';
 
 export type ArcPreflightVerdict = NonNullable<MissionArc['preflightVerdict']>;
 
@@ -38,6 +38,8 @@ export interface ArcPreflightDeps {
   readFiles?: (files: string[], repoRoot: string) => string;
   /** LLM 판정(기본 streamLLM·sol). 테스트 주입·NODE_ENV=test 는 미주입 시 founded 폴백. */
   judge?: (prompt: string) => Promise<string>;
+  /** adaptiveGround의 외부 경계 주입. 공유 구현과 기본 생산 배선은 유지한다. */
+  groundingDeps?: Partial<GroundingDeps>;
   repoRoot?: string;
 }
 
@@ -196,7 +198,10 @@ export async function preflightArc(
       groundContext = g.context;
       code = g.files.length ? (deps.readFiles ?? defaultReadFiles)(g.files, repoRoot) : '';
     } else {
-      const r = await adaptiveGround(query, { seedFiles: refs, symbols: extractSymbols(`${arc.intent}\n${phaseText}`) }, { repoRoot });
+      const r = await adaptiveGround(query, { seedFiles: refs, symbols: extractSymbols(`${arc.intent}\n${phaseText}`) }, {
+        repoRoot,
+        ...deps.groundingDeps,
+      });
       groundContext = r.context;
       // ★ (B) 컨텍스트 유실 수복(라이브 8cd731) — adaptiveGround 가 실독한 파일 본문을 sol 로 전달. 종전엔
       //   code='' 방치로 "관련 코드 실독"(6000자) 슬롯이 비어, sol 이 실재 파일을 "없는 전제"로 mirage 오판.

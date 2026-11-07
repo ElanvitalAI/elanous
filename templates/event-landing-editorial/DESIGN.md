@@ -281,3 +281,15 @@ assets/hero.svg   assets/venue.svg   assets/logo.svg
 ### 교체하는 법
 `content.json` 의 `brand.logo.src` · `hero.image.src` · `sections.venue.image.src` 를 자기 파일로 바꾼다.
 플레이스홀더는 화면에서 **스스로 「자기 사진으로 교체」라고 말한다** — 지우는 것을 잊어도 배포본에서 보인다.
+
+## Template reuse — voice notes
+
+`next-app-voice-note` uses this design seed for its editorial typography, spacing, palette, and
+reduced-motion behavior. Its recording, saving, and processing controls must keep the seed's
+contrast and visible focus treatment so each state remains clear and operable.
+
+## Template reuse — translator
+
+`next-app-translator` uses this design seed for its editorial typography, spacing, palette, and
+reduced-motion behavior. Recording, language selection, translation progress, and playback controls
+must keep the seed's contrast and visible focus treatment so each state remains clear and operable.

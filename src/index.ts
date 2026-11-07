@@ -188,9 +188,6 @@ const registerOutputsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'outputs
 const registerPublishCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'publish'
   ? (() => undefined)
   : (require('./cli/publish-cli.js') as typeof import('./cli/publish-cli.js')).registerPublishCommands) as typeof import('./cli/publish-cli.js').registerPublishCommands;
-const registerAutopilotCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
-  ? (() => undefined)
-  : (require('./cli/autopilot-cli.js') as typeof import('./cli/autopilot-cli.js')).registerAutopilotCommands) as typeof import('./cli/autopilot-cli.js').registerAutopilotCommands;
 const registerRoleCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'role'
   ? (() => undefined)
   : (require('./cli/role-cli.js') as typeof import('./cli/role-cli.js')).registerRoleCommands) as typeof import('./cli/role-cli.js').registerRoleCommands;
@@ -2338,7 +2335,6 @@ program
     }
   });
 
-registerAutopilotCommands(program);
 registerRetroCommands(program);
 
 // ── memory ──
@@ -2643,70 +2639,6 @@ program
     process.stdout.write(formatBuzzBriefing(briefing) + '\n');
   });
 
-// ── harness (dev-harness 유지보수) ──
-type HarnessMissionLoopDeps = {
-  runMissionSolveLoop: typeof import('./harness/mission-solve-loop.js').runMissionSolveLoop;
-  openAutopilotMissionsDb: typeof import('./autopilot/mission-registry.js').openAutopilotMissionsDb;
-  getMission: typeof import('./autopilot/mission-registry.js').getMission;
-  defaultSeams: typeof import('./self-implement/seams.js').defaultSeams;
-  childInstanceScope: typeof import('./instance/child-scope.js').childInstanceScope;
-  surfaceUxFromDispatchCtx: typeof import('./agent/surface-ux/build.js').surfaceUxFromDispatchCtx;
-  solveMissionViaHarness: typeof import('./harness/mission-harness.js').solveMissionViaHarness;
-};
-
-let harnessMissionLoopDepsForTesting: HarnessMissionLoopDeps | undefined;
-
-export function setHarnessMissionLoopDepsForTesting(deps: HarnessMissionLoopDeps | undefined): void {
-  harnessMissionLoopDepsForTesting = deps;
-}
-
-async function loadHarnessMissionLoopDeps(): Promise<HarnessMissionLoopDeps> {
-  if (harnessMissionLoopDepsForTesting) return harnessMissionLoopDepsForTesting;
-  const [
-    { runMissionSolveLoop },
-    { openAutopilotMissionsDb, getMission },
-    { defaultSeams },
-    { childInstanceScope },
-    { surfaceUxFromDispatchCtx },
-    { solveMissionViaHarness },
-  ] = await Promise.all([
-    import('./harness/mission-solve-loop.js'),
-    import('./autopilot/mission-registry.js'),
-    import('./self-implement/seams.js'),
-    import('./instance/child-scope.js'),
-    import('./agent/surface-ux/build.js'),
-    import('./harness/mission-harness.js'),
-  ]);
-  return { runMissionSolveLoop, openAutopilotMissionsDb, getMission, defaultSeams, childInstanceScope, surfaceUxFromDispatchCtx, solveMissionViaHarness };
-}
-
-async function runHarnessMissionLoop(
-  missionIds: readonly string[],
-  opts: { executor?: 'self-implement' },
-) {
-  const {
-    runMissionSolveLoop,
-    openAutopilotMissionsDb,
-    getMission,
-    defaultSeams,
-    childInstanceScope,
-    surfaceUxFromDispatchCtx,
-    solveMissionViaHarness,
-  } = await loadHarnessMissionLoopDeps();
-  const store = openAutopilotMissionsDb();
-  try {
-    return await runMissionSolveLoop({
-      missionIds,
-      readMission: (missionId) => getMission(store, missionId),
-      seams: defaultSeams(childInstanceScope()),
-      ux: surfaceUxFromDispatchCtx({}),
-      solve: (input) => solveMissionViaHarness({ ...input, ...opts }),
-    });
-  } finally {
-    store.close();
-  }
-}
-
 const harnessCmd = (INDEX_FAST_ROOT ? new Command('harness')
   : (require('./harness/harness-cli-command.js') as typeof import('./harness/harness-cli-command.js')).installHarnessCliCommand(program, {
   registerSink: async (surface) => { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink(surface); },
@@ -2721,10 +2653,6 @@ const harnessCmd = (INDEX_FAST_ROOT ? new Command('harness')
   //   🩸 여기에 `runDevPlanFromWords` 를 주면 그것이 «항상» 이겨서 RFC 문은 운영에서 «절대 안 돈다»
   //     (그 함수는 planStaged dispatch → 대표 2026-09-04 은퇴한 staged 하니스로 간다).
   //   ⇒ 즉 이 «한 줄»이 은퇴를 되돌린다. 주입 자리는 시험용으로 남는다.
-  mission: async (missionId, opts) => {
-    await (await import('./skills/tools/solve-mission.js')).dispatchSolveMission({ mission_id: missionId, ...opts });
-  },
-  missionLoop: runHarnessMissionLoop,
 }));
 
 let podAskSnapshot: string | undefined;

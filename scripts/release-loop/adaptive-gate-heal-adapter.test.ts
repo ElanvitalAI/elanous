@@ -1,0 +1,343 @@
+import { expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
+import { createGraphEventBus, type GraphEventBus } from '../../src/graph-runner/graph-events.js';
+import { runGraph, type GraphRunOptions } from '../../src/graph-runner/runner.js';
+import type { GateResult } from './gate-node.js';
+import { parseOptions } from './gate-node.js';
+import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest } from './adaptive-gate-heal-adapter.js';
+import { classifyGateShadow } from './gate-triage-node.js';
+import { readGraphContext } from './node-verdict.js';
+import { runGateImageRepairNode } from './gate-image-repair-node.js';
+import { gateImagePinPath } from './gate-image-pin.js';
+import { syncPoolImages } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import type { GateRunner } from './gate-node.js';
+
+const gateFailure = (): GateResult => ({ outcome: 'regression', commit: 'a'.repeat(40),
+  introduced: ['src/release.test.ts > introduced failure'], preexisting: 0, fixed: null, knownEnv: 0,
+  knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10 });
+
+function gateFailedEvent(runId: string, gate: GateResult, withVisits = true) {
+  return { graphId: 'release-loop', runId, type: RELEASE_GATE_FAILED_EVENT,
+    source: { kind: 'node' as const, nodeId: 'gate-triage' },
+    data: { version: '0.3.6', gate, triage: classifyGateShadow(gate), gateExecutor: 'pod',
+      ...(withVisits ? { visitState: { gate: 1, gateTriage: 1 } } : {}) } };
+}
+
+test('RLA-ARG-ADAPTIVE-HEAL sim: gate.failed plan sends dynamic appendNode and resume requests', async () => {
+  const world = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/release-incident-events.yaml'), 'utf8')) as {
+    cases: Array<{ id: string; fault: { event: string }; expect: { events: Array<Record<string, string>> } }>;
+  };
+  const scenario = world.cases.find(({ id }) => id === 'subscription-gate-failure-appends-arg-repair')!;
+  const bus = createGraphEventBus();
+  const trace: Array<Record<string, string>> = [];
+  const requests: AdaptiveGateHealAppendNodeRequest[] = [];
+  let planAction = '';
+  bus.subscribe((event) => {
+    if (event.type === scenario.fault.event) trace.push({ event: 'subscription-delivered', subscriber: 'arg-adaptive-heal', source: event.type });
+  });
+  const dispose = registerAdaptiveGateHealAdapter(bus, { graphId: 'release-loop', runId: 'sim-arg-append' }, {
+    onPlan: (plan) => {
+      planAction = plan.disposition.action;
+      trace.push({ event: 'arg-plan', action: plan.disposition.action });
+    },
+    appendNode: async (request) => {
+      // This stub is the pending GRAPH-OPS append boundary; it records the request, not a durable append or execution.
+      requests.push(request);
+      trace.push({ event: 'appendNode-request', nodeId: request.node.nodeId, after: request.afterNodeId });
+      trace.push({ event: 'resume-request', from: request.resumeFrom, then: request.rerunGateAt });
+      return { disposition: 'appended', graphRevision: 2 };
+    },
+  });
+  try {
+    await bus.publish({ ...gateFailedEvent('sim-arg-append', gateFailure()), eventId: 'sim-arg-event-1', sequence: 1,
+      emittedAt: '2026-11-06T00:00:00.000Z' });
+    expect(planAction).toBe('append-repair-and-resume');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ graphId: 'release-loop', runId: 'sim-arg-append', eventId: 'sim-arg-event-1',
+      afterNodeId: 'gate-triage', node: { nodeId: expect.stringMatching(/^gate-repair-[a-f0-9]{12}$/), maxVisits: 1 },
+      resumeFrom: expect.stringMatching(/^gate-repair-[a-f0-9]{12}$/), rerunGateAt: 'gate',
+      visitState: { gate: 1, gateTriage: 1 }, visitLimits: { gate: 2, gateTriage: 2 }, maxRepairRetries: 1 });
+    expect(trace).toEqual(scenario.expect.events);
+  } finally { dispose(); }
+});
+
+test('RLA-ARG-ADAPTIVE-HEAL normalizes the graph gate fail alias and preserves its source outcome', async () => {
+  const bus = createGraphEventBus();
+  const gate = { ...gateFailure(), outcome: 'fail' } as unknown as GateResult;
+  let planEvents: Array<{ name: string; data: Record<string, unknown> }> = [];
+  const dispose = registerAdaptiveGateHealAdapter(bus, { graphId: 'release-loop', runId: 'fail-alias' }, {
+    onPlan: (plan) => { planEvents = plan.events; },
+    appendNode: async () => ({ disposition: 'appended', graphRevision: 2 }),
+  });
+  try {
+    await bus.publish(gateFailedEvent('fail-alias', gate));
+    expect(planEvents[0]).toMatchObject({ name: 'gate.result.received', data: { outcome: 'fail' } });
+    expect(planEvents[1]).toMatchObject({ name: 'gate.failures.attributed', data: { failureIds: gate.introduced } });
+  } finally { dispose(); }
+});
+
+test('RLA-ARG-ADAPTIVE-HEAL sim: unknown visits fail closed and do not append or resume', async () => {
+  const bus = createGraphEventBus();
+  let appendCalls = 0;
+  let action = '';
+  const dispose = registerAdaptiveGateHealAdapter(bus, { graphId: 'release-loop', runId: 'unknown-visits' }, {
+    onPlan: (plan) => { action = plan.disposition.action; },
+    appendNode: async () => { appendCalls++; return { disposition: 'appended', graphRevision: 2 }; },
+  });
+  try {
+    await bus.publish({ ...gateFailedEvent('unknown-visits', gateFailure(), false) });
+    expect(action).toBe('decision-required');
+    expect(appendCalls).toBe(0);
+  } finally { dispose(); }
+});
+
+test('RLA-ARG-ADAPTIVE-HEAL sim: append persistence failure rejects the bus delivery and cannot schedule a retry', async () => {
+  const bus = createGraphEventBus();
+  let appendCalls = 0;
+  const dispose = registerAdaptiveGateHealAdapter(bus, { graphId: 'release-loop', runId: 'append-error' }, {
+    appendNode: async () => { appendCalls++; throw new Error('append persistence unavailable'); },
+  });
+  try {
+    await expect(bus.publish(gateFailedEvent('append-error', gateFailure()))).rejects.toThrow('delivery failed');
+    expect(appendCalls).toBe(1);
+  } finally { dispose(); }
+});
+
+test('RLA-ARG-ADAPTIVE-HEAL sim: adapter ignores foreign-run and dry-run gate.failed events', async () => {
+  const bus = createGraphEventBus();
+  let appendCalls = 0;
+  const dispose = registerAdaptiveGateHealAdapter(bus, { graphId: 'release-loop', runId: 'scoped' }, {
+    appendNode: async () => { appendCalls++; return { disposition: 'appended', graphRevision: 2 }; },
+  });
+  try {
+    await bus.publish(gateFailedEvent('foreign', gateFailure()));
+    const dryRun = gateFailedEvent('scoped', gateFailure());
+    await bus.publish({ ...dryRun, data: { ...dryRun.data, dryRun: true } });
+    await bus.publish({ ...gateFailedEvent('scoped', gateFailure()), source: { kind: 'runner' as const } });
+    expect(appendCalls).toBe(0);
+  } finally { dispose(); }
+});
+
+test('RLA-ARG-ADAPTIVE-HEAL runner: real release event appends, runs once, and resumes gate', async () => {
+  const root = mkdtempSync(join('/tmp', 'arg-runner-integration-'));
+  const commit = 'b'.repeat(40);
+  let gateVisits = 0;
+  let triageCompleted = false;
+  const commands: string[] = [];
+  try {
+    const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+    const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
+      commands.push(body);
+      if (body.includes('gate-node.ts --json')) {
+        gateVisits++;
+        return gateVisits === 1
+          ? { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail', commit, introduced: ['src/example.test.ts > introduced regression'] }), stderr: '' }
+          : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit, introduced: [] }), stderr: '' };
+      }
+      if (body.includes('gate-triage-node.ts')) {
+        const triage = classifyGateShadow({ ...gateFailure(), commit });
+        triageCompleted = true;
+        const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { input: Record<string, unknown> };
+        return { exitCode: 0, stdout: JSON.stringify({ ...triage, gateExecutionId: context.input.adaptiveGateExecutionId }), stderr: '' };
+      }
+      if (body.includes('gate-repair-node.ts')) return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+    };
+    const deps = { root, runBash };
+    await expect(runGraph(graphPath, {
+      runId: 'arg-runner-integration',
+      input: { version: '0.3.6', previousVersion: '0.3.5', gateExecutor: 'pod' },
+      deps: { ...deps, beforeNode: () => { if (triageCompleted) { triageCompleted = false; throw new Error('simulated interruption before appended node'); } } },
+    })).rejects.toThrow('simulated interruption before appended node');
+    expect(commands.some((body) => body.includes('gate-repair-node.ts'))).toBe(false);
+    const state = await runGraph(graphPath, { resumeRunId: 'arg-runner-integration', deps });
+    expect(state.path.some((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId))).toBe(true);
+    expect(state.path.filter((nodeId) => nodeId === 'gate')).toHaveLength(2);
+    expect(gateVisits).toBe(2);
+    expect(commands.filter((body) => body.includes('gate-repair-node.ts'))).toHaveLength(1);
+    expect(state.adaptiveGateNodeAppends).toHaveLength(1);
+    expect(state.adaptiveGateNodeAppends?.[0]).toMatchObject({ graphRevision: 2,
+      request: { runId: 'arg-runner-integration', visitState: { gate: 1, gateTriage: 1 }, maxRepairRetries: 1 } });
+    expect(state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId)).toBe(state.path.indexOf('gate') + 2);
+    expect(state.path[state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId) + 1]).toBe('gate');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('RELEASE-RUN-HEAL-IMAGE-MISSING sim: same run builds and pins cut image, then reruns gate', async () => {
+  const root = mkdtempSync(join('/tmp', 'release-image-missing-heal-'));
+  const runId = 'release-image-missing-same-run';
+  const version = '0.3.6';
+  const cut = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8' }).stdout.trim();
+  expect(cut).toMatch(/^[0-9a-f]{40}$/);
+  const pool = 'pool-node-b@node-b:1';
+  const digest = `sha256:${'9'.repeat(64)}`;
+  const imageBuildCommits: string[] = [];
+  const imageSourceGitCommands: Array<{ args: string[]; cwd: string }> = [];
+  const commands: string[] = [];
+  let gateVisits = 0;
+  let imageReady = false;
+  const gateRunner = {
+    async localCommand(cmd: string, args: string[], cwd: string) {
+      if (cmd === 'git' && (args[0] === 'clone' || args[0] === 'checkout')) {
+        imageSourceGitCommands.push({ args, cwd });
+        return { rc: 0, output: '' };
+      }
+      const result = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
+      return { rc: result.status ?? 2, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+    },
+  } as unknown as GateRunner;
+  const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
+    commands.push(body);
+    const env = opts.env!;
+    if (body.includes('version-node.ts release'))
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: cut }), stderr: '' };
+    if (body.includes('gate-node.ts --json')) {
+      gateVisits++;
+      const context = readGraphContext(env);
+      if (gateVisits === 1) return { exitCode: 2, stdout: JSON.stringify({ outcome: 'error', commit: cut, introduced: [],
+        preexisting: 0, fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1,
+        error: 'gate pod refused to start without a scoped cut image pin (pod-gate-missing-cut-image-pin)' }), stderr: '' };
+      const parsed = parseOptions(['--json'], env);
+      expect(parsed).not.toBe('help');
+      if (parsed !== 'help') expect(parsed.imagePin).toBe('cut-commit');
+      expect(Object.entries(context.outputs).some(([nodeId, output]) => /^gate-image-repair-[a-f0-9]{12}$/.test(nodeId)
+        && output.imagePinRunId === runId && output.imagePinDigest === digest)).toBe(true);
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: cut, introduced: [] }), stderr: '' };
+    }
+    if (body.includes('gate-triage-node.ts')) {
+      const context = readGraphContext(env);
+      const gate = context.outputs.gate as unknown as GateResult;
+      return { exitCode: 0, stdout: JSON.stringify({ ...classifyGateShadow(gate),
+        gateExecutionId: context.input.adaptiveGateExecutionId }), stderr: '' };
+    }
+    if (body.includes('gate-image-repair-node.ts')) {
+      const context = readGraphContext(env);
+      const result = await runGateImageRepairNode(context, {
+        instanceRoot: root,
+        runner: gateRunner,
+        imageProbe: (_pool, commit) => commit === cut && imageReady ? digest : null,
+        syncImages: async (members, _image, commit, options) => {
+          imageBuildCommits.push(commit ?? '');
+          expect(commit).toBe(cut);
+          expect(members.map((member) => member.context)).toEqual(['pool-node-b']);
+          expect(options?.buildScript).toContain('/docker/harness/build.sh');
+          imageReady = true;
+          return new Map(members.map((member) => [member.context, { ok: true, action: 'built', detail: 'simulated registry build', ms: 1 }])) as Awaited<ReturnType<typeof syncPoolImages>>;
+        },
+      });
+      return { exitCode: 0, stdout: JSON.stringify(result), stderr: '' };
+    }
+    return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+  };
+  try {
+    const state = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), {
+      runId,
+      input: { version, previousVersion: '0.3.5', gateExecutor: 'pod', gatePodPool: pool },
+      deps: { root, runBash },
+    });
+    expect(state.status).toBe('done');
+    expect(gateVisits).toBe(2);
+    expect(imageBuildCommits).toEqual([cut]);
+    expect(state.path.filter((nodeId) => nodeId === 'gate')).toHaveLength(2);
+    const repairNode = state.path.find((nodeId) => /^gate-image-repair-[a-f0-9]{12}$/.test(nodeId));
+    expect(repairNode).toBeTruthy();
+    expect(state.path.indexOf(repairNode!)).toBe(state.path.indexOf('gate') + 2);
+    expect(state.path[state.path.indexOf(repairNode!) + 1]).toBe('gate');
+    expect(imageSourceGitCommands).toHaveLength(2);
+    expect(imageSourceGitCommands[0]).toMatchObject({
+      args: ['clone', '--quiet', '--shared', '--no-checkout', imageSourceGitCommands[0]!.cwd, expect.any(String)],
+    });
+    expect(imageSourceGitCommands[1]).toEqual({
+      args: ['checkout', '--quiet', '--detach', cut], cwd: imageSourceGitCommands[0]!.args[5],
+    });
+    const pin = JSON.parse(readFileSync(gateImagePinPath(root, version, runId), 'utf8')) as { commit: string; digest: string; runId: string };
+    expect(pin).toEqual({ version: 2, runId, digest, image: expect.any(String), commit: cut });
+    expect(commands.some((body) => body.includes('gate-image-repair-node.ts'))).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RLA-ARG-ADAPTIVE-HEAL runner: failed repair routes to failed without rerunning gate', async () => {
+  const root = mkdtempSync(join('/tmp', 'arg-runner-fail-closed-'));
+  let gateVisits = 0;
+  try {
+    const state = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), {
+      runId: 'arg-runner-fail-closed',
+      input: { version: '0.3.6', previousVersion: '0.3.5', gateExecutor: 'pod' },
+      deps: { root, runBash: async (body: string, opts) => {
+        if (body.includes('gate-node.ts --json')) {
+          gateVisits++;
+          return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail', commit: 'c'.repeat(40), introduced: ['src/example.test.ts > introduced regression'] }), stderr: '' };
+        }
+        if (body.includes('gate-triage-node.ts')) {
+          const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { input: Record<string, unknown> };
+          return { exitCode: 0, stdout: JSON.stringify({ ...classifyGateShadow({ ...gateFailure(), commit: 'c'.repeat(40) }),
+            gateExecutionId: context.input.adaptiveGateExecutionId }), stderr: '' };
+        }
+        if (body.includes('gate-repair-node.ts')) return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail' }), stderr: 'repair failed' };
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+      } },
+    });
+    const repairIndex = state.path.findIndex((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId));
+    expect(state.status).toBe('failed');
+    expect(gateVisits).toBe(1);
+    expect(repairIndex).toBeGreaterThan(-1);
+    expect(state.path[repairIndex + 1]).toBe('failed');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('RLA-ARG-ADAPTIVE-HEAL runner: gate-triage outbox replays after dispatch interruption', async () => {
+  const root = mkdtempSync(join('/tmp', 'arg-runner-outbox-replay-'));
+  let interruptDispatch = true;
+  let gateVisits = 0;
+  const backingBus = createGraphEventBus();
+  const eventBus: GraphEventBus = {
+    registerType: (type) => backingBus.registerType(type),
+    hasType: (type) => backingBus.hasType(type),
+    publish: (input) => {
+      if (input.type === RELEASE_GATE_FAILED_EVENT && interruptDispatch) {
+        interruptDispatch = false;
+        return Promise.reject(new Error('simulated event dispatch interruption'));
+      }
+      return backingBus.publish(input);
+    },
+    flush: (scope) => backingBus.flush(scope),
+    subscribe: (handler, filter) => backingBus.subscribe(handler, filter),
+  };
+  const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
+    if (body.includes('gate-node.ts --json')) {
+      gateVisits++;
+      return gateVisits === 1
+        ? { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail', commit: 'd'.repeat(40), introduced: ['src/example.test.ts > introduced regression'] }), stderr: '' }
+        : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: 'd'.repeat(40), introduced: [] }), stderr: '' };
+    }
+    if (body.includes('gate-triage-node.ts')) {
+      const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { input: Record<string, unknown> };
+      return { exitCode: 0, stdout: JSON.stringify({ ...classifyGateShadow({ ...gateFailure(), commit: 'd'.repeat(40) }),
+        gateExecutionId: context.input.adaptiveGateExecutionId }), stderr: '' };
+    }
+    return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+  };
+  try {
+    const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+    await expect(runGraph(graphPath, { runId: 'arg-runner-outbox-replay', eventBus,
+      input: { version: '0.3.6', previousVersion: '0.3.5', gateExecutor: 'pod' }, deps: { root, runBash } }))
+      .rejects.toThrow('simulated event dispatch interruption');
+    const savedPath = join(root, 'graph-runs', 'release-loop', 'arg-runner-outbox-replay.json');
+    const saved = JSON.parse(readFileSync(savedPath, 'utf8')) as { pendingGraphEvents?: Array<{ type: string }> };
+    expect(saved.pendingGraphEvents?.map(({ type }) => type)).toContain(RELEASE_GATE_FAILED_EVENT);
+    const resumed = await runGraph(graphPath, { resumeRunId: 'arg-runner-outbox-replay', deps: { root, runBash } });
+    expect(resumed.status).toBe('done');
+    expect(resumed.path.filter((nodeId) => nodeId === 'gate')).toHaveLength(2);
+    expect(resumed.adaptiveGateNodeAppends).toHaveLength(1);
+    expect(gateVisits).toBe(2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -39,20 +39,29 @@ function baseCtx(): CoreTurnContext {
 }
 
 describe('startChildLivenessHeartbeat — 갈림 ① ㉢ workspace file', () => {
-  test('overwrites a fixed file on an unref schedule, writes no screen, and stops cleanly', async () => {
+  test('overwrites a fixed file on an unref schedule, writes no screen, and stops cleanly', () => {
     const dir = mkdtempSync(join(tmpdir(), 'child-liveness-'));
     dirs.push(dir);
     const path = join(dir, 'liveness.hb');
     let now = 1_000;
-    const stop = startChildLivenessHeartbeat({ path, intervalMs: 20, nowMs: () => now });
+    let tick: (() => void) | undefined;
+    let unrefCalled = false;
+    let cleared = false;
+    const timer = { unref: () => { unrefCalled = true; } } as unknown as NodeJS.Timeout;
+    const stop = startChildLivenessHeartbeat({ path, intervalMs: 20, nowMs: () => now,
+      setIntervalImpl: (callback, intervalMs) => { expect(intervalMs).toBe(20); tick = callback; return timer; },
+      clearIntervalImpl: (handle) => { expect(handle).toBe(timer); cleared = true; },
+    });
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ at: 1_000 });
+    expect(unrefCalled).toBe(true);
     now = 2_000;
-    await Bun.sleep(55);
+    tick!();
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ at: 2_000 });
     stop();
+    expect(cleared).toBe(true);
     const frozen = readFileSync(path, 'utf8');
     now = 3_000;
-    await Bun.sleep(55);
+    tick!();
     expect(readFileSync(path, 'utf8')).toBe(frozen);
   });
 

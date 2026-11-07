@@ -89,9 +89,6 @@ interface FakeCtxState {
   chatOnlyMode: boolean;
   chatOnlyLayoutCalls: { value: boolean; opts: { announce: boolean } }[];
   enterSyncCalls: number;
-  voiceChatCalls: { state: unknown; args: string[] }[];
-  voiceChatStatus: string;
-  voiceChatStateValue: unknown;
   reloadSkillCalls: number;
   reloadSkillResult: number;
 
@@ -105,11 +102,6 @@ interface FakeCtxState {
   // B-1.d
   drawCalls: number;
 
-  // B-1.e — auto-tts controller is mocked enough to satisfy
-  // handleAutoTtsSlash's enable/disable/toggle calls; we capture each
-  // sub-method invocation to verify the slash router wired through.
-  autoTtsControllerEnabled: boolean;
-  autoTtsControllerLog: string[];
 
   // B-1.f — companion-popup state. Each popup has an open flag; helpers
   // append a string to the log. Slash-runtime line builders return
@@ -161,9 +153,6 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
     chatOnlyMode: true,
     chatOnlyLayoutCalls: [],
     enterSyncCalls: 0,
-    voiceChatCalls: [],
-    voiceChatStatus: 'started',
-    voiceChatStateValue: { tag: 'voice-chat' },
     reloadSkillCalls: 0,
     reloadSkillResult: 7,
     blockStorePinned: new Map(),
@@ -172,8 +161,6 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
     blockAttachCount: 0,
     blockAttachLog: [],
     drawCalls: 0,
-    autoTtsControllerEnabled: false,
-    autoTtsControllerLog: [],
     companionOpen: { clipboard: false, memo: false, detail: false },
     companionLog: [],
     previewLog: [],
@@ -246,8 +233,6 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
     getChatOnlyMode: () => state.chatOnlyMode,
     setChatOnlyLayout: (value, opts) => { state.chatOnlyLayoutCalls.push({ value, opts }); state.chatOnlyMode = value; },
     enterSyncMode: () => { state.enterSyncCalls++; },
-    handleVoiceChatSlash: async (s, a) => { state.voiceChatCalls.push({ state: s, args: [...a] }); return state.voiceChatStatus; },
-    voiceChatStateRef: { value: state.voiceChatStateValue },
     reloadSkillIndex: () => { state.reloadSkillCalls++; return state.reloadSkillResult; },
     blockStore: {
       getLatest: (target) => {
@@ -289,20 +274,6 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
       },
     },
     draw: () => { state.drawCalls++; },
-    autoTtsRef: {
-      controller: {
-        enable: () => { state.autoTtsControllerEnabled = true; state.autoTtsControllerLog.push('enable'); },
-        disable: () => { state.autoTtsControllerEnabled = false; state.autoTtsControllerLog.push('disable'); },
-        toggle: () => {
-          state.autoTtsControllerEnabled = !state.autoTtsControllerEnabled;
-          state.autoTtsControllerLog.push('toggle');
-          return state.autoTtsControllerEnabled;
-        },
-        isEnabled: () => state.autoTtsControllerEnabled,
-        isSpeaking: () => false,
-      },
-      providerId: 'fake-provider',
-    } as unknown as DashboardSlashContext['autoTtsRef'],
     controlSignalSlashRuntime: {
       usageLines: () => ['[cs:usage]'],
       statusLines: () => ['[cs:status]'],
@@ -931,32 +902,6 @@ describe('B-1.b · 6 tiny standalone case migrations', () => {
     }
   });
 
-  test('voice-chat / vc → calls handleVoiceChatSlash + 3 chat lines', async () => {
-    const reg = buildDashboardSlashRegistry();
-    for (const name of ['voice-chat', 'vc'] as const) {
-      const { ctx, state } = makeFakeCtx();
-      state.voiceChatStatus = 'started';
-      const r = await reg.dispatch(name, ['start'], ctx);
-      expect(r.kind).toBe('continue');
-      expect(state.voiceChatCalls.length).toBe(1);
-      expect(state.voiceChatCalls[0]?.state).toBe(state.voiceChatStateValue);
-      expect(state.voiceChatCalls[0]?.args).toEqual(['start']);
-      expect(ctx.chatLines.length).toBe(3);
-      expect(ctx.chatLines[0]).toBe('');
-      expect(ctx.chatLines[1]).toContain('[accent]');
-      expect(ctx.chatLines[1]).toContain('/voice-chat start');
-      expect(ctx.chatLines[2]).toBe('[muted]  started');
-      expect(state.scrollOffset).toBe(-1);
-    }
-  });
-
-  test('voice-chat with no args → header shows default "start"', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx } = makeFakeCtx();
-    await reg.dispatch('voice-chat', [], ctx);
-    expect(ctx.chatLines[1]).toContain('/voice-chat start');
-  });
-
   test('skill-reload / skills-reload → reloadSkillIndex + chat-line announcement', async () => {
     const reg = buildDashboardSlashRegistry();
     for (const name of ['skill-reload', 'skills-reload'] as const) {
@@ -1245,40 +1190,6 @@ describe('B-1.e · 4 tiny standalone toggles / state-mutation cases', () => {
     expect(ctx.chatLines[1]).toContain('intent: fix the bug');
   });
 
-  test('auto-tts (and aliases) on → controller.enable + status banner', async () => {
-    const reg = buildDashboardSlashRegistry();
-    for (const name of ['auto-tts', 'autotts', 'tts'] as const) {
-      const { ctx, state } = makeFakeCtx();
-      const r = await reg.dispatch(name, ['on'], ctx);
-      expect(r.kind).toBe('continue');
-      expect(state.autoTtsControllerLog).toEqual(['enable']);
-      expect(state.autoTtsControllerEnabled).toBe(true);
-      expect(ctx.chatLines.length).toBe(3);
-      expect(ctx.chatLines[2]).toContain('auto-TTS on');
-    }
-  });
-
-  test('auto-tts off → controller.disable + status banner', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    state.autoTtsControllerEnabled = true;
-    const r = await reg.dispatch('auto-tts', ['off'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.autoTtsControllerLog).toEqual(['disable']);
-    expect(state.autoTtsControllerEnabled).toBe(false);
-    expect(ctx.chatLines[2]).toContain('auto-TTS off');
-  });
-
-  test('auto-tts toggle → controller.toggle + reflects new state in banner', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    state.autoTtsControllerEnabled = false;
-    const r = await reg.dispatch('auto-tts', ['toggle'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.autoTtsControllerLog).toEqual(['toggle']);
-    expect(state.autoTtsControllerEnabled).toBe(true);
-    expect(ctx.chatLines[2]).toMatch(/auto-TTS on \(provider: fake-provider\)/);
-  });
 });
 
 describe('B-1.f · 3 companion-popup cases (clipboard · memo · detail)', () => {

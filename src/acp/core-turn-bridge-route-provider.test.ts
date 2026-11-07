@@ -3,9 +3,9 @@
 // 다리(core-turn-bridge)는 그 마지막 값을 사용량에 실어, 대시보드 완료 배지가 폴백을 «A → B» 로 보이게 한다
 // (상태줄·/model 판독기 교체는 후속 TUI-MODEL-BADGE-SOURCE).
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
-import * as core from '../core-turn/index.js';
+import * as core from '../core-turn/run-core-turn.js';
 import * as config from '../user-config.js';
-import type { CoreTurnContext } from '../core-turn/index.js';
+import type { CoreTurnContext } from '../core-turn/types.js';
 import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp } from './core-turn-bridge.js';
 

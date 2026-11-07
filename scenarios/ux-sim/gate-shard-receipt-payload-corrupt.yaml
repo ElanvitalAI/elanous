@@ -1,0 +1,14 @@
+kind: gate-shard-receipt-recovery
+isolation: test
+source: scripts/release-loop/gate-shard-receipts.ts
+consumer: scripts/release-loop/resume-release.ts
+cases:
+  - id: one-payload-corrupt
+    event: read one previously saved shard result whose payload digest no longer matches
+    corruptedShard: pod-2
+    expect:
+      invalidatedShardIds: [pod-2]
+      invalidatedFiles: [src/c.test.ts]
+      remeasureFiles: [src/a.test.ts, src/c.test.ts]
+      reusableShardIds: [pod-0, pod-1]
+      otherShards: carried

@@ -17,6 +17,7 @@ export interface LinearSecretaryRuntimeDeps {
   }>;
   fetch?: typeof fetch;
   repositoryRoot?: string;
+  now?: () => Date;
 }
 
 function repositoryUrl(root: string): { base: string; revision: string } | null {
@@ -163,11 +164,11 @@ export async function runLinearSecretaryRequest(request: string, deps: LinearSec
   const root = resolve(deps.repositoryRoot ?? config.harness?.defaultRepo ?? process.cwd());
   const evidence = await collectEvidence(request, root);
   if (!evidence.length) throw new Error('저장소·문서·기억에서 확인된 근거가 없어 등록을 보류했습니다.');
-  const allowedDates = explicitLinearDueDates(request, new Date());
+  const now = (deps.now ?? (() => new Date()))();
+  const allowedDates = explicitLinearDueDates(request, now);
   if (!allowedDates.length) throw new Error('요청에 마감일이 없어 등록을 보류했습니다. 요청에 YYYY-MM-DD 날짜를 넣어 주세요.');
   const projectId = projectName ? await resolveLinearProjectId({ apiKey, project: projectName, fetch: fetchFn }) : undefined;
   const assigneeId = await resolveLinearViewerId({ apiKey, fetch: fetchFn });
-  const now = new Date();
   const draft = await (deps.plan ?? planFromGrounding)(request, evidence, now, allowedDates);
   if (!allowedDates.includes(draft.dueDate) || draft.tasks.some(task => !allowedDates.includes(task.dueDate))) {
     throw new Error('Linear secretary planner used a due date that was not present in the request or retrieved evidence');

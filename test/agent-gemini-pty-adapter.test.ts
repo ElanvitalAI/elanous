@@ -1,11 +1,7 @@
 // H5 Phase 3 · Gemini-CLI PTY adapter smoke.
 
 import { describe, test, expect, afterEach } from 'bun:test';
-import {
-  createGeminiPtyAdapter,
-  registerDefaultGeminiPtyAdapter,
-} from '../src/agent/adapters/gemini-pty.js';
-import { AdapterRegistry } from '../src/agent/adapter-registry.js';
+import { createGeminiPtyAdapter } from '../src/agent/adapters/gemini-pty.js';
 import {
   resetForTesting,
   setPtyAdapterForTesting,
@@ -26,7 +22,6 @@ afterEach(() => {
   resetForTesting();
   setPtyAdapterForTesting(null);
 });
-
 describe('createGeminiPtyAdapter · supports()', () => {
   test('matches gemini + gemini-cli brand with PTY modes', () => {
     const a = createGeminiPtyAdapter();
@@ -63,15 +58,5 @@ describe('createGeminiPtyAdapter · launch()', () => {
     const a = createGeminiPtyAdapter({ binary: '/opt/gemini' });
     await a.launch({ brand: 'gemini-cli' });
     expect(listPty().some((h) => h.cmd === '/opt/gemini')).toBe(true);
-  });
-});
-
-describe('registerDefaultGeminiPtyAdapter', () => {
-  test('registers into a registry · returns disposer', () => {
-    const r = new AdapterRegistry();
-    const off = registerDefaultGeminiPtyAdapter(r);
-    expect(r.list().map((x) => x.id)).toEqual(['gemini-pty']);
-    off();
-    expect(r.list()).toEqual([]);
   });
 });

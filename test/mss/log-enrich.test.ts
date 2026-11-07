@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { __resetFlagsForTests } from '../../src/mss/feature-flags.js';
-import { __resetIdentityForTests, __setIdentityFileForTests } from '../../src/mss/identity.js';
+import { __resetIdentityForTests, __setIdentityFileForTests } from '../../src/mss/identity-store.js';
 import { enrichLogRecord } from '../../src/mss/log-enrich.js';
 import { startTurnTrace, withSpan } from '../../src/mss/trace-context.js';
 

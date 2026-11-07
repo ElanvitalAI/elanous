@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Command } from 'commander';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { runSelfGateCli, selectGateTestFiles, type SelfGateCliOptions, type SelfGateCliResult } from '../self-implement/gate-cli.js';
 import { GATE_CALLER_TEST_LIMIT } from '../self-implement/gate-scope.js';
 import { GATE_REMOTE_DEFAULTS, type DispatchDeps, type DispatchOptions, type GateRemoteRunner } from '../self-implement/gate-remote.js';
@@ -131,9 +132,10 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
       return { outcome: 'ok', commit: MAIN_SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
         knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
     } });
-    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', log: () => {} }, setup.deps);
+    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', ledgerRoot: '/release-ledger', log: () => {} }, setup.deps);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ commit: MAIN_SHA, baselineCommit: MAIN_SHA, executor: 'host', remote: 'minim5', full: true, repo: REPO });
+    expect(calls[0]).toMatchObject({ commit: MAIN_SHA, baselineCommit: MAIN_SHA, executor: 'host', remote: 'minim5', full: true,
+      repo: REPO, instanceRoot: expect.stringContaining('elanous-light-rc-host-gate-'), ledgerRoot: '/release-ledger' });
     expect(setup.dispatched).toHaveLength(0);
     expect(result).toMatchObject({ version: '0.2.19', base: MAIN_SHA, measuredCommit: MAIN_SHA, introduced: 0,
       preexisting: 0, unclassified: 0, remote: 'minim5', gateExitCode: 0, ok: true, unmeasured: null });
@@ -148,6 +150,8 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
   });
 
   test('explicit remote reaches judgeGate host recipe and carries rehearsal TUI through the gate runner', async () => {
+    const explicitLedger = tempRepo();
+    const defaultLedger = tempRepo();
     const ids = ['boot', 'prompt', 'status-bar', 'help-opens', 'help-closes', 'no-error-text'];
     const runner: GateRunner = {
       command: async (cmd, args) => cmd === 'sh' ? { rc: 0, output: '/home/remote\n' }
@@ -166,8 +170,21 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     const actualJudgeGate = judgeGate;
     const deps: LightRcDeps = { ...localDeps().deps, formalHostGateRunner: runner,
       runFormalHostGate: (options, injectedRunner) => actualJudgeGate(options, injectedRunner) };
-    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', rehearsalTui: true, log: () => {} }, deps);
+    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', rehearsalTui: true,
+      ledgerRoot: explicitLedger, log: () => {} }, deps);
     expect(result).toMatchObject({ remote: 'minim5', gateExitCode: 0, ok: true, rehearsalTui: { outcome: 'ok' } });
+    expect(JSON.parse(readFileSync(join(explicitLedger, 'release', '0.2.19', 'gate-verdict.json'), 'utf8')))
+      .toMatchObject({ commit: MAIN_SHA, outcome: 'ok', baselineReceipt: { valid: false, commit: MAIN_SHA,
+        reason: 'pinned graph or recipe SHA absent' } });
+
+    setElanousConfigDir(defaultLedger);
+    try {
+      const defaultResult = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', log: () => {} }, deps);
+      expect(defaultResult).toMatchObject({ remote: 'minim5', gateExitCode: 0, ok: true });
+      expect(JSON.parse(readFileSync(join(defaultLedger, 'release', '0.2.19', 'gate-verdict.json'), 'utf8')))
+        .toMatchObject({ commit: MAIN_SHA, outcome: 'ok', baselineReceipt: { valid: false, commit: MAIN_SHA,
+          reason: 'pinned graph or recipe SHA absent' } });
+    } finally { resetElanousConfigDir(); }
   });
 
   test('rehearsal opt-in invokes screen check on measured commit and blocks failed or unmeasured screens', async () => {

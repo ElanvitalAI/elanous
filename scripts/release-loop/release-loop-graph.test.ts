@@ -120,7 +120,7 @@ test('serial release baseline: RFC #24935 recorded figures (not a live measureme
       { nodeId: 'publish', startedAt: '2026-10-08T00:11:03Z' }] } as GraphRunState)).toEqual({ totalSeconds: 4500, gateToPublishSeconds: 663 });
   expect(releaseDurations({ nodes: [{ nodeId: 'gate' }, { nodeId: 'publish' }] } as GraphRunState)).toEqual({ totalSeconds: null, gateToPublishSeconds: null });
   const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
-    nodes: Array<{ node_id: string; recipe?: string }>;
+    nodes: Array<{ node_id: string; recipe?: string; needs?: string[] }>;
     edges: Array<{ from: string; map?: Record<string, string>; branches?: Record<string, string[]>; join?: string; warning_branches?: string[] }>;
   };
   expect(graph.nodes.find((node) => node.node_id === 'prefetch')?.recipe).toBe('cmd:docs');
@@ -130,16 +130,21 @@ test('serial release baseline: RFC #24935 recorded figures (not a live measureme
     const edge = graph.edges.find((candidate) => candidate.from === from);
     return edge?.map?.ok ?? null;
   };
+  // The historical RFC figures remain a serial measurement; current concurrency is declared on join-node needs.
   expect(next('traffic-gate-passed')).toBeNull();
   expect(['gate', 'pre-gate-join', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve']
     .map(next)).toEqual(['traffic-gate-passed', 'gate', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish']);
   expect(graph.edges.find((edge) => edge.from === 'export-check')).toMatchObject({
     map: { fail: 'traffic-failed-restore', error: 'traffic-failed-restore' },
-    branches: { ok: ['checklist-gate', 'prefetch'] }, join: 'pre-gate-join', warning_branches: ['prefetch'],
+    warning_branches: ['prefetch'],
   });
+  expect(graph.nodes.find((node) => node.node_id === 'pre-gate-join')?.needs).toEqual(['checklist-gate', 'prefetch']);
   expect(graph.edges.find((edge) => edge.from === 'pre-gate-join')?.map).toEqual({ ok: 'gate', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
   expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'traffic-gate-passed', fail: 'gate-triage', error: 'gate-triage' });
-  expect(graph.edges.find((edge) => edge.from === 'traffic-gate-passed')?.branches).toEqual({ ok: ['mac-smoke', 'pwa'], fail: ['mac-smoke', 'pwa'], error: ['mac-smoke', 'pwa'] });
+  expect(graph.edges.find((edge) => edge.from === 'traffic-gate-passed')).toMatchObject({
+    warning_branches: ['mac-smoke'],
+  });
+  expect(graph.nodes.find((node) => node.node_id === 'pre-prepare-join')?.needs).toEqual(['mac-smoke', 'pwa']);
   expect(graph.edges.find((edge) => edge.from === 'pre-prepare-join')?.map).toEqual({ ok: 'prepare', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
   expect(graph.edges.find((edge) => edge.from === 'tui')?.map).toEqual({ ok: 'docs', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
   expect(graph.edges.find((edge) => edge.from === 'docs')?.map).toEqual({ ok: 'known-issues', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
@@ -150,13 +155,16 @@ test('serial release baseline: RFC #24935 recorded figures (not a live measureme
 
 test('cutoff routes through checklist-gate before the costly gate', () => {
   const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
-    nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number }>;
-    edges: Array<{ from: string; map: Record<string, string>; branches?: Record<string, string[]> }>;
+    nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number; needs?: string[] }>;
+    edges: Array<{ from: string; map: Record<string, string>; branches?: Record<string, string[]>; warning_branches?: string[] }>;
   };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(graph.nodes.find((node) => node.node_id === 'checklist-gate')).toMatchObject({ kind: 'gate', recipe: 'cmd:checklist-gate', max_visits: 1 });
   expect(graph.edges.find((edge) => edge.from === 'cutoff')?.map).toEqual({ ok: 'export-check', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
-  expect(graph.edges.find((edge) => edge.from === 'export-check')?.branches?.ok).toEqual(['checklist-gate', 'prefetch']);
+  expect(graph.edges.find((edge) => edge.from === 'export-check')).toMatchObject({
+    map: { fail: 'traffic-failed-restore', error: 'traffic-failed-restore' }, warning_branches: ['prefetch'],
+  });
+  expect(graph.nodes.find((node) => node.node_id === 'pre-gate-join')?.needs).toEqual(['checklist-gate', 'prefetch']);
   expect(graph.edges.find((edge) => edge.from === 'checklist-gate')).toBeUndefined();
   expect(recipes['checklist-gate']).toEqual({ command: 'bun scripts/release-loop/checklist-gate-node.ts', timeout_ms: 600000 });
 });
@@ -198,14 +206,16 @@ test('RELEASE-GRAPH-FANOUT: checklist gate overlaps prefetch and its failure res
 test('public export check fails before prefetch and gate', async () => {
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const graph = yaml(readFileSync(graphPath, 'utf8')) as {
-    nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number }>;
-    edges: Array<{ from: string; map: Record<string, string>; branches?: Record<string, string[]> }>;
+    nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number; needs?: string[] }>;
+    edges: Array<{ from: string; map: Record<string, string>; branches?: Record<string, string[]>; warning_branches?: string[] }>;
   };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(graph.nodes.find((node) => node.node_id === 'export-check')).toMatchObject({ kind: 'gate', recipe: 'cmd:export-check', max_visits: 1 });
   expect(graph.nodes.find((node) => node.node_id === 'mac-smoke')).toMatchObject({ kind: 'gate', recipe: 'cmd:mac-smoke', max_visits: 1 });
-  expect(graph.edges.find((edge) => edge.from === 'export-check')?.branches?.ok).toEqual(['checklist-gate', 'prefetch']);
-  expect(graph.edges.find((edge) => edge.from === 'export-check')?.map).toEqual({ fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
+  expect(graph.edges.find((edge) => edge.from === 'export-check')).toMatchObject({
+    map: { fail: 'traffic-failed-restore', error: 'traffic-failed-restore' }, warning_branches: ['prefetch'],
+  });
+  expect(graph.nodes.find((node) => node.node_id === 'pre-gate-join')?.needs).toEqual(['checklist-gate', 'prefetch']);
   expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'traffic-gate-passed', fail: 'gate-triage', error: 'gate-triage' });
   expect(recipes['mac-smoke']).toEqual({ command: 'bun scripts/release-loop/mac-smoke-node.ts', timeout_ms: 1_800_000 });
   expect(recipes['export-check']).toEqual({ command: 'bun scripts/release-loop/export-check-node.ts', timeout_ms: 1_800_000 });
@@ -362,10 +372,12 @@ test('ops-upgrade runs after verify and a failed host does not undo publication 
 
 test('RELEASE-GRAPH-FANOUT: docs-land and version bump run together; join failures report after both branches finish', async () => {
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
-  const graph = yaml(readFileSync(graphPath, 'utf8')) as { edges: Array<{ from: string; map?: Record<string, string>; branches?: Record<string, string[]>; join?: string }> };
-  expect(graph.edges.find((edge) => edge.from === 'traffic-npm-published')).toMatchObject({
-    join: 'release-post-publish-join', branches: { ok: ['docs-land', 'version-dev-bump'] },
-  });
+  const graph = yaml(readFileSync(graphPath, 'utf8')) as {
+    nodes: Array<{ node_id: string; needs?: string[] }>;
+    edges: Array<{ from: string; map?: Record<string, string>; branches?: Record<string, string[]>; join?: string }>;
+  };
+  expect(graph.edges.find((edge) => edge.from === 'traffic-npm-published')?.map).toBeUndefined();
+  expect(graph.nodes.find((node) => node.node_id === 'release-post-publish-join')?.needs).toEqual(['docs-land', 'version-dev-bump']);
   expect(graph.edges.find((edge) => edge.from === 'release-post-publish-join')?.map).toEqual({ ok: 'verify', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
   expect(graph.edges.find((edge) => edge.from === 'verify')?.map).toEqual({ ok: 'traffic-verify-complete', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
   expect(graph.edges.find((edge) => edge.from === 'traffic-verify-complete')?.map).toEqual({ ok: 'vault-note', fail: 'vault-note', error: 'vault-note' });
@@ -486,7 +498,7 @@ function notifyOnValues(notify: GraphNotifySetting | undefined): string[] {
 test('graph recipes carry fail notices and measured long-node timeouts', () => {
   const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { nodes: ReleaseGraphNode[] };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { timeout_ms?: number; command?: string; approval?: string }>;
-  for (const node of graph.nodes) expect(node.max_visits).toBe(1);
+  expect(graph.nodes.filter((node) => node.max_visits !== 1).map((node) => [node.node_id, node.max_visits])).toEqual([['gate', 2], ['gate-triage', 2]]);
   expect(graph.nodes.filter((node) => notifyOnValues(node.notify).length > 0 && notifyOnValues(node.notify).every((value) => value === 'fail')).map((node) => node.node_id)).toEqual(['gate', 'pwa', 'prepare']);
   expect(recipes.gate?.timeout_ms).toBe(14_400_000);
   expect(recipes.pwa?.timeout_ms).toBe(1_800_000);
@@ -965,7 +977,11 @@ const tool = path.basename(process.argv[1]);
 fs.appendFileSync(path.join(root, 'calls'), tool + ' ' + args.join(' ') + '\\n');
 const sha = 'a'.repeat(40);
 if (tool === 'git') {
-  if (args[0] === 'rev-parse') console.log(args.includes('v0.2.3^{commit}') ? 'b'.repeat(40) : fs.existsSync(path.join(root,'dev-bump.done')) ? 'd'.repeat(40) : fs.existsSync(path.join(root,'release.done')) ? sha : 'c'.repeat(40));
+  if (args[0] === 'rev-parse') {
+    const revision = args.includes('v0.2.3^{commit}') ? 'b'.repeat(40) : fs.existsSync(path.join(root,'dev-bump.done')) ? 'd'.repeat(40) : fs.existsSync(path.join(root,'release.done')) ? sha : 'c'.repeat(40);
+    if (args[1] === 'HEAD' && JSON.parse(fs.readFileSync(path.join(process.cwd(),'package.json'),'utf8')).version === '0.2.5-dev.0') fs.writeFileSync(path.join(root,'dev-bump-head'), revision);
+    console.log(revision);
+  }
   else if (args[0] === 'show-ref') process.exit(1); // first docs attempt has no local release-docs branch
   else if (args[0] === 'ls-remote') {} // first docs attempt has no remote release-docs branch
   else if (args[0] === 'diff') console.log('release/public/docs/releases/0.2.4.md');
@@ -997,8 +1013,16 @@ if (tool === 'git') {
     if (!fs.readFileSync(args[args.indexOf('--notes-file')+1],'utf8').includes('https://docs.elanous.ai/using-elanous/tasks-and-intake')) process.exit(1);
     console.log(JSON.stringify({ok:true,published:true,tag:'v0.2.4'}));
   } else if (args.includes('verify')) console.log(JSON.stringify({ok:true,notesPage:'ok'}));
-  else if (args.includes('land')) {
+  else if (args[1] === 'gh' && args[2] === 'pr' && args[3] === 'ready') console.log('✓ ready: 42');
+  else if (args.includes('land') && args.includes('--hold')) console.log('✓ find: NONE\\n✓ upsert-ready: https://github.com/example/repo/pull/42 (새 PR)\\n✓ hold: https://github.com/example/repo/pull/42');
+  else if (args.includes('land') && args.includes('--pr')) {
+    const expectedHead = args[args.indexOf('--expected-head') + 1];
+    if (expectedHead !== fs.readFileSync(path.join(root,'dev-bump-head'),'utf8')) process.exit(1);
     if (args.includes('--commit-message')) fs.writeFileSync(path.join(root,args[args.indexOf('--commit-message')+1] === 'release: 0.2.4' ? 'release.done' : 'dev-bump.done'),'yes');
+    console.log('✓ merge: squash https://github.com/example/repo/pull/42');
+  }
+  else if (args.includes('land')) {
+    if (args.includes('--commit-message')) fs.writeFileSync(path.join(root,'release.done'),'yes');
     console.log('✓ find: NONE\\n✓ upsert-ready: https://github.com/example/repo/pull/42 (새 PR)\\n✓ merge: squash https://github.com/example/repo/pull/42');
   }
   else if (args[0] !== 'install' && !args.some((arg) => arg.endsWith('deploy-pages.ts'))) process.exit(1);
@@ -1054,7 +1078,14 @@ if (tool === 'git') {
     expect(resumed.status).toBe('done');
     const transcript = readFileSync(calls, 'utf8');
     expect(transcript).toContain('pr land --commit-message release: 0.2.4');
-    expect(transcript).toContain('pr land --commit-message version: 0.2.5-dev.0');
+    const devBumpHold = transcript.split('\n').find((line) => line.includes('pr land --commit-message version: 0.2.5-dev.0'));
+    expect(devBumpHold).toContain('--hold');
+    const devBumpHead = readFileSync(join(root, 'dev-bump-head'), 'utf8');
+    const readyIndex = transcript.indexOf('gh pr ready 42');
+    const pinnedLandIndex = transcript.indexOf('pr land --pr 42 --expected-head');
+    expect(readyIndex).toBeGreaterThan(transcript.indexOf(devBumpHold!));
+    expect(pinnedLandIndex).toBeGreaterThan(readyIndex);
+    expect(transcript.slice(pinnedLandIndex).split('\n')[0]).toContain(`--expected-head ${devBumpHead}`);
     expect(transcript).toContain(`--candidate ${outputs.prepare.candidate}`);
     expect(transcript).toContain(`--cwd ${outputs.docs.worktree}`);
     expect(transcript).toContain('pr land --cwd');

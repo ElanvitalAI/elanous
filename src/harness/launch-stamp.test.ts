@@ -67,6 +67,10 @@ describe('launch stamp', () => {
     expect(doorFromEntrance('not-a-door')).toBe('unknown');
   });
 
+  test('retired harness mission stamps remain readable in historical ledgers', () => {
+    expect(doorFromEntrance('cli-harness-mission')).toBe('agent-mission');
+  });
+
   test('door table totals equal the run count', () => {
     const dir = ledgerDir();
     write(dir, 'run-say', 'run-origin', { launch: { entrance: 'harness-say', actor: 'OP', viaQueue: false } }, INSIDE);

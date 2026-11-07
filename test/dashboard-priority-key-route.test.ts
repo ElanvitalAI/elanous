@@ -5,6 +5,9 @@ import {
   type DashboardPriorityKeyRouteDeps,
 } from '../src/dashboard/input/dashboard-priority-key-route.js';
 import type { Key } from '../src/tui.js';
+import { tuiSourceText } from './helpers/dashboard-source.js';
+
+const dashboardSource = tuiSourceText();
 
 function key(name: string, mods: Partial<Key> = {}): Key {
   return { name, ctrl: false, shift: false, ...mods };
@@ -14,13 +17,6 @@ function createDeps(overrides: Partial<DashboardPriorityKeyRouteDeps<string>> = 
   const calls: string[] = [];
   const deps: DashboardPriorityKeyRouteDeps<string> = {
     isForceQuitChord: () => { calls.push('force-quit-check'); return false; },
-    // PR-S1V.4-wiring · Step 0x voice entry chord (idle → fire) and
-    // Step 0c voice active dispatch (active → host.maybeHandleKey).
-    // Default mocks return false so existing tests are unaffected.
-    routeVoiceEnterChord: () => { calls.push('voice-enter'); return false; },
-    routeVoiceModeKey: () => { calls.push('voice-active'); return false; },
-    routeVoiceChatRealtimeChord: () => { calls.push('voice-chat-chord'); return false; },
-    routeVoiceChatActiveKey: async () => { calls.push('voice-chat-active'); return false; },
     routeBellKey: () => { calls.push('bell'); return false; },
     dispatchPreKey: () => { calls.push('pre'); return false; },
     routeExclusiveTerminalModalKey: () => { calls.push('terminal'); return false; },
@@ -44,7 +40,7 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('x'), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);
+    expect(calls).toEqual(['force-quit-check', 'bell', 'terminal']);
   });
 
   test('returns quit before global action or layout routing', async () => {
@@ -56,7 +52,7 @@ describe('routeDashboardPriorityKey', () => {
 
     expect(result).toEqual({ type: 'quit' });
     expect(calls).toEqual([
-      'force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal', 'pre', 'chord', 'arm', 'quit-check',
+      'force-quit-check', 'bell', 'terminal', 'pre', 'chord', 'arm', 'quit-check',
     ]);
   });
 
@@ -70,10 +66,10 @@ describe('routeDashboardPriorityKey', () => {
     expect(result).toEqual({ type: 'handled' });
     expect(calls).toEqual([
       'force-quit-check',
-      'voice-enter',
-      'voice-active',
-      'voice-chat-chord',
-      'voice-chat-active',
+      
+      
+      
+      
       'bell',
       'terminal',
       'pre',
@@ -93,10 +89,10 @@ describe('routeDashboardPriorityKey', () => {
     expect(result).toEqual({ type: 'passthrough' });
     expect(calls).toEqual([
       'force-quit-check',
-      'voice-enter',
-      'voice-active',
-      'voice-chat-chord',
-      'voice-chat-active',
+      
+      
+      
+      
       'bell',
       'terminal',
       'pre',
@@ -132,7 +128,7 @@ describe('routeDashboardPriorityKey', () => {
     expect(result).toEqual({ type: 'handled' });
     expect(dispatched).toEqual(['question-view']);
     expect(calls).toEqual([
-      'force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal', 'pre',
+      'force-quit-check', 'bell', 'terminal', 'pre',
     ]);
   });
 
@@ -161,7 +157,7 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('x'), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);
+    expect(calls).toEqual(['force-quit-check', 'bell', 'terminal']);
   });
 
   test('terminal modal claim wins over input-core dispatchPreKey (regression)', async () => {
@@ -173,7 +169,7 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('b', { ctrl: true }), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);  // 'pre' never runs
+    expect(calls).toEqual(['force-quit-check', 'bell', 'terminal']);  // 'pre' never runs
   });
 
   // The bell-then-terminal order matters: a notification bell modal
@@ -189,7 +185,7 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('1'), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell']);  // 'terminal' never runs
+    expect(calls).toEqual(['force-quit-check', 'bell']);  // 'terminal' never runs
   });
 
   test('Alt+W no longer closes a popup before bell routing', async () => {
@@ -200,7 +196,7 @@ describe('routeDashboardPriorityKey', () => {
 
     const result = await routeDashboardPriorityKey(key('w', { alt: true }), deps);
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell']);
+    expect(calls).toEqual(['force-quit-check', 'bell']);
   });
 
   // Regression: Ctrl+Shift+Q (force-quit chord) wins over EVERYTHING,
@@ -246,5 +242,39 @@ describe('routeDashboardPriorityKey', () => {
 
     expect(result).toEqual({ type: 'handled' });
     expect(calls).toEqual(['classic-guidance:backslash']);
+  });
+
+  test('dashboard wires classic sidetab routing into the non-voice priority input path', () => {
+    const priorityStart = dashboardSource.indexOf('const priorityRoute = await routeDashboardPriorityKey(key, {');
+    const dispatchStart = dashboardSource.indexOf('dispatchPreKey: (routeKey, targetHandlerName) => {', priorityStart);
+    const routeDecl = dashboardSource.lastIndexOf('const routeClassicSidetabInputKey = (routeKey: Key): boolean =>', priorityStart);
+    expect(priorityStart).toBeGreaterThan(-1);
+    expect(dispatchStart).toBeGreaterThan(priorityStart);
+    expect(routeDecl).toBeGreaterThan(-1);
+    expect(routeDecl).toBeLessThan(priorityStart);
+
+    const routeBody = dashboardSource.slice(routeDecl, priorityStart);
+    const priorityDeps = dashboardSource.slice(priorityStart, dispatchStart);
+    expect(routeBody).toContain('classicSidetabRuntime.routeKey(routeKey)');
+    expect(priorityDeps).toContain('inputOwner: chatMainVisibility.inputOwnership?.owner');
+    expect(priorityDeps).toContain('routeSidetabKey: routeClassicSidetabInputKey');
+    expect(priorityDeps).not.toContain('routeVoiceKey');
+  });
+
+  test('dashboard initializes opt-in PFC screenshot attachment independently of voice boot', () => {
+    const screenshotStart = dashboardSource.indexOf('// ── X4 (Bundle 2) — PFC auto-screenshot attachment ──');
+    const feedbackStart = dashboardSource.indexOf('const pfcFeedbackRuntime = createDashboardPfcFeedbackRuntime({');
+    const nextRuntimeStart = dashboardSource.indexOf('const statusShellPostureRuntime = createStatusShellPostureRuntime({', feedbackStart);
+    expect(feedbackStart).toBeGreaterThan(-1);
+    expect(screenshotStart).toBeGreaterThan(-1);
+    expect(screenshotStart).toBeLessThan(feedbackStart);
+    expect(nextRuntimeStart).toBeGreaterThan(feedbackStart);
+
+    const screenshotInit = dashboardSource.slice(screenshotStart, feedbackStart);
+    const feedbackBoot = dashboardSource.slice(feedbackStart, nextRuntimeStart);
+    expect(screenshotInit).toContain("process.env.ELANOUS_PFC_AUTO_SCREENSHOT === '1'");
+    expect(screenshotInit).toContain('pfcScreenshotAttacherRef.current = createPfcScreenshotAttacher({');
+    expect(feedbackBoot).toContain('const attacher = pfcScreenshotAttacherRef.current;');
+    expect(screenshotInit + feedbackBoot).not.toContain('pfcVoiceRuntimeRef');
   });
 });

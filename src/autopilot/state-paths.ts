@@ -13,6 +13,7 @@
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { logDiagnostic } from '../mss/logging/diagnostic-sink.js';
 
 /** `ELANOUS_STATE_DIR ?? ~/.elanous` — autopilot 계열 경로의 단일 루트. */
 export function elanousStateRoot(): string {
@@ -26,8 +27,7 @@ export function elanousStateRoot(): string {
     // ⚠️ 조용한 prod 폴백은 '격리 해석 실패 → 운영을 만짐' 이라는 fail-open 경로다.
     //    부팅 불침몰은 유지하되 **반드시 관측을 남긴다**(제1원칙).
     try {
-      const { debug } = require('../debug/log.js') as typeof import('../debug/log.js');
-      debug.log('instance.identity', 'state-root-resolver-failed', {
+      logDiagnostic('instance.identity', 'state-root-resolver-failed', {
         error: e instanceof Error ? e.message : String(e),
         envStateDir: stateDir ?? null,
         why: '리졸버 실패 — prod 로 폴백(격리를 의도했다면 운영 오염 위험이므로 조사 필요)',

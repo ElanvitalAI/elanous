@@ -40,7 +40,7 @@ import { TabRegistry } from '../src/nexus/state/tab-registry.js';
 import { createChatTabSpec } from '../src/nexus/kinds/chat.js';
 import { DaemonSessionHistory } from '../src/boot/daemon-runtime.js';
 import { toolSurface } from '../src/boot/daemon-tools/index.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
 import * as userConfigModule from '../src/user-config.js';
 
 let tmpRoot: string;

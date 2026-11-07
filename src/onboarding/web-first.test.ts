@@ -9,6 +9,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { renderTerminalQr, runWebFirstSetup, type WebFirstSetupDeps } from './web-first.js';
 import type { NexusShowResult } from '../cli/nexus-show.js';
 import { debug } from '../debug/log.js';
+import { withSimClock } from '../ux-sim/fake-clock.js';
 
 const cli = resolve(import.meta.dir, '../../bin/elanous.mjs');
 
@@ -353,42 +354,50 @@ test('daemon absent or registered but dead starts background and waits for healt
 });
 
 test('registered daemon still starting retries health beyond 500ms before issuing a token', async () => {
-  for (const show of [daemon(), { ...daemon(), status: 'registered', instance: { alive: true } } as NexusShowResult]) {
-    const calls: string[] = [];
-    let probes = 0;
-    const { deps, lines } = fixture({
-      showNexus: async () => { calls.push('show'); return show; },
-      startDaemon: async () => { calls.push('start'); return { exitCode: 0 }; },
-      probeHealth: async (url, timeoutMs) => {
-        calls.push(`${url} ${timeoutMs}`);
-        if (++probes === 1) { await Bun.sleep(600); return false; }
-        return true;
-      },
-      issueSetupLinkToken: async () => { calls.push('issue'); return { token: 'secret' }; },
-    });
-    expect(await runWebFirstSetup(deps)).toBe('link-shown');
-    expect(calls).not.toContain('start');
-    expect(probes).toBe(2);
-    expect(calls.at(-1)).toBe('issue');
-    expect(calls).toContain('http://127.0.0.1:4321/v1/health 500');
-    expect(lines).toContain('http://127.0.0.1:4321/app/setup/#t=secret');
-  }
-}, 5_000);
+  await withSimClock(0, async clock => {
+    for (const show of [daemon(), { ...daemon(), status: 'registered', instance: { alive: true } } as NexusShowResult]) {
+      const calls: string[] = [];
+      let probes = 0;
+      const { deps, lines } = fixture({
+        now: clock.now, sleep: async ms => { clock.tick(ms); },
+        showNexus: async () => { calls.push('show'); return show; },
+        startDaemon: async () => { calls.push('start'); return { exitCode: 0 }; },
+        probeHealth: async (url, timeoutMs) => {
+          calls.push(`${url} ${timeoutMs}`);
+          if (++probes === 1) { clock.tick(600); return false; }
+          return true;
+        },
+        issueSetupLinkToken: async () => { calls.push('issue'); return { token: 'secret' }; },
+      });
+      expect(await runWebFirstSetup(deps)).toBe('link-shown');
+      expect(calls).not.toContain('start');
+      expect(probes).toBe(2);
+      expect(calls.at(-1)).toBe('issue');
+      expect(calls).toContain('http://127.0.0.1:4321/v1/health 500');
+      expect(lines).toContain('http://127.0.0.1:4321/app/setup/#t=secret');
+    }
+  });
+});
 
 test('registered daemon that never becomes healthy falls back without issuing a token', async () => {
-  let issued = false;
-  let probes = 0;
-  const { deps, lines } = fixture({
-    probeHealth: async () => { probes++; return false; },
-    startDaemon: async () => { throw Error('must not relaunch registered daemon'); },
-    issueSetupLinkToken: async () => { issued = true; return { token: 'secret' }; },
+  await withSimClock(0, async clock => {
+    let issued = false;
+    let probes = 0;
+    const { deps, lines } = fixture({
+      now: clock.now, sleep: async ms => { clock.tick(ms); },
+      probeHealth: async () => { probes++; return false; },
+      startDaemon: async () => { throw Error('must not relaunch registered daemon'); },
+      issueSetupLinkToken: async () => { issued = true; return { token: 'secret' }; },
+    });
+    expect(await runWebFirstSetup(deps)).toBe('fallback');
+    expect(probes).toBeGreaterThan(1);
+    // Keep the twelve-second user-facing startup bound without spending it in wall-clock time.
+    expect(clock.now()).toBe(12_000);
+    expect(issued).toBe(false);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('daemon-health-unavailable');
   });
-  expect(await runWebFirstSetup(deps)).toBe('fallback');
-  expect(probes).toBeGreaterThan(1);
-  expect(issued).toBe(false);
-  expect(lines).toHaveLength(1);
-  expect(lines[0]).toContain('daemon-health-unavailable');
-}, 16_000);
+});
 
 test('daemon inspection failure still launches and retries until health responds', async () => {
   const calls: string[] = [];
@@ -410,23 +419,34 @@ test('daemon inspection failure still launches and retries until health responds
 });
 
 test('daemon launch failure or unhealthy daemon falls back with one reason and no token', async () => {
-  for (const [launch, expected] of [[1, 'daemon-start-failed'], [0, 'daemon-health-timeout']] as const) {
-    let issued = false;
-    let inspected = 0;
-    const { deps, lines } = fixture({
-      showNexus: async () => inspected++ === 0 ? { exitCode: 0, status: 'absent' } : daemon(),
-      startDaemon: async () => ({ exitCode: launch }),
-      probeHealth: async () => false,
-      issueSetupLinkToken: async () => { issued = true; return { token: 'secret' }; },
-    });
-    expect(await runWebFirstSetup(deps)).toBe('fallback');
-    expect(lines).toEqual([
-      '웹 셋업을 위해 데몬을 시작합니다.',
-      expect.stringContaining(expected),
-    ]);
-    expect(issued).toBe(false);
-  }
-}, 16_000);
+  await withSimClock(0, async clock => {
+    for (const [launch, expected] of [[1, 'daemon-start-failed'], [0, 'daemon-health-timeout']] as const) {
+      let issued = false;
+      let inspected = 0;
+      let probes = 0;
+      const { deps, lines } = fixture({
+        now: clock.now, sleep: async ms => { clock.tick(ms); },
+        showNexus: async () => inspected++ === 0 ? { exitCode: 0, status: 'absent' } : daemon(),
+        startDaemon: async () => ({ exitCode: launch }),
+        probeHealth: async () => { probes++; return false; },
+        issueSetupLinkToken: async () => { issued = true; return { token: 'secret' }; },
+      });
+      expect(await runWebFirstSetup(deps)).toBe('fallback');
+      expect(lines).toEqual([
+        '웹 셋업을 위해 데몬을 시작합니다.',
+        expect.stringContaining(expected),
+      ]);
+      if (launch === 0) {
+        // Successful launch must consume the same full startup window and keep retrying health.
+        expect(clock.now()).toBe(12_000);
+        expect(probes).toBeGreaterThan(1);
+      } else {
+        expect(probes).toBe(0);
+      }
+      expect(issued).toBe(false);
+    }
+  });
+});
 
 test('unavailable issuer falls back without displaying a link', async () => {
   const { deps, lines } = fixture({ issueSetupLinkToken: async () => { throw Error('missing'); } });

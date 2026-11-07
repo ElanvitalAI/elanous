@@ -52,6 +52,10 @@ describe('compareCommandEntranceBaseline', () => {
     expect(entrances.find(entrance => entrance.path.join(' ') === 'tasks')?.aliases).toContain('task');
     expect(CLI_ENTRANCE_BASELINE).toContain('tasks list');
     expect(CLI_ENTRANCE_BASELINE).not.toContain('task');
+    expect(CLI_ENTRANCE_BASELINE).not.toContain('autopilot');
+    expect(CLI_ENTRANCE_BASELINE).not.toContain('harness mission');
+    expect(CLI_ENTRANCE_BASELINE).not.toContain('ops mission');
+    expect(CLI_ENTRANCE_BASELINE).toContain('ops mission-log');
   });
 
   test('derives nonzero exit status from missing paths rather than a fixed result', () => {

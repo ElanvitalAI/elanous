@@ -24,6 +24,7 @@ import { runNexus, type RunNexusHandle } from '../src/nexus/index.js';
 import { ensureAuthToken } from '../src/auth/acp-token.js';
 import { makeTestSpawnBackend } from '../src/nexus/supervisor/spawn.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+import { expectMalformedJson400 } from './helpers/http-error-contract';
 
 // Each test boots a real in-process NEXUS (runNexus). On a loaded release-gate Pod that
 // boot took 5-12 s (event-loop stalls logged), so bun's default 5 s hook/test budget timed
@@ -404,8 +405,7 @@ describe('HTTP /v1/registry/bindings', () => {
     const res = await call('/v1/registry/bindings/pushcut/k', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{not json',
     });
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe('invalid-json');
+    await expectMalformedJson400(res, 'invalid-json');
   });
 
   test('channelDescription set via POST surfaces in list', async () => {

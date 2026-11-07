@@ -16,7 +16,7 @@ import { openAutopilotMissionsDb, getMission, getChildMissionIds, type MissionRo
 import { latestMissionRouteDecision } from './mission-route-decision.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 import type { RouteDecision } from '../llm/route-decision.js';
-import { formatDateTime } from '../time/format.js';
+import { formatDateTime } from '../time/calendar.js';
 import { conatusPath } from '../domains/conatus-data-dir.js';
 
 export type DerivedKind = 'cron' | 'task' | 'action' | 'mission';

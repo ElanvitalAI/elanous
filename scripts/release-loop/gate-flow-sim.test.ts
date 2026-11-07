@@ -10,7 +10,7 @@
 // 생산 진입점은 그대로다: 그래프 노드 → deps.runBash → `runGateNode(['--json'], env, runner)`.
 import { afterEach, expect, setDefaultTimeout, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGateRunner, runGateNode, type GateRunner, type GateTools } from './gate-node';
@@ -32,6 +32,7 @@ const RUN_ID = 'run-1e3d9b2a-2ca0-4c29-8703-242f751c4c1d';
 /** Wall time the fake Pod reports for every Job; the fake clock advances exactly this much per Pod. */
 const POD_SECONDS = 90;
 const SIM_EPOCH = Date.parse('2026-10-16T00:00:00.000Z');
+const REPOSITORY_ROOT = join(import.meta.dir, '../..');
 
 const dirs: string[] = [];
 const spies: Array<{ mockRestore(): void }> = [];
@@ -218,11 +219,19 @@ edges:
         runId: RUN_ID,
         pinChildUniverse: true,
         input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gatePodPool: 'pool-sim:1', gatePodShards: 1,
+          gateImagePin: 'cut-commit',
           gatePodInstallSlots: 0, gatePodStallSeconds: 0, gatePodMidRunStallSeconds: 0 },
         deps: {
           root: instanceRoot,
           runBash: async (_body, opts) => {
-            const rc = await runGateNode(['--json'], opts.env!, runner, undefined, () => IMAGE_DIGEST);
+            const previousProgressFile = process.env.ELANOUS_GATE_PROGRESS_FILE;
+            if (opts.env?.ELANOUS_GATE_PROGRESS_FILE) process.env.ELANOUS_GATE_PROGRESS_FILE = opts.env.ELANOUS_GATE_PROGRESS_FILE;
+            let rc: number;
+            try { rc = await runGateNode(['--json'], opts.env!, runner, undefined, () => IMAGE_DIGEST); }
+            finally {
+              if (previousProgressFile === undefined) delete process.env.ELANOUS_GATE_PROGRESS_FILE;
+              else process.env.ELANOUS_GATE_PROGRESS_FILE = previousProgressFile;
+            }
             return { exitCode: rc, stdout: JSON.stringify(emitted.at(-1) ?? {}), stderr: '' };
           },
         },
@@ -232,6 +241,14 @@ edges:
       // ── the gate node transition, verbatim ──────────────────────────────────────────────────────────────
       expect(run.status).toBe('failed');
       expect(run.path).toEqual(['gate', 'failed']);
+      const phaseNames = progressLogSpy.mock.calls
+        .filter(([category, event]) => category === 'release-loop.gate' && typeof event === 'string' && event.startsWith('phase-'))
+        .map(([, event]) => String(event).slice('phase-'.length));
+      for (const phaseName of ['shard-planning', 'shards-running', 'collection', 'classification', 'verdict'])
+        expect(phaseNames).toContain(phaseName);
+      expect(phaseNames.indexOf('shard-planning')).toBeLessThan(phaseNames.indexOf('shards-running'));
+      expect(phaseNames.indexOf('collection')).toBeLessThan(phaseNames.indexOf('classification'));
+      expect(phaseNames.indexOf('classification')).toBeLessThan(phaseNames.indexOf('verdict'));
       const gateRecord = run.nodes.find((node) => node.nodeId === 'gate')!;
       expect(gateRecord).toMatchObject({ nodeId: 'gate', ok: false, exit: 1, executed: true });
       const line = emitted.at(-1)!;
@@ -242,11 +259,12 @@ edges:
         introduced: [FAILURE], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [],
         autoheal: { action: 'hitl', cause: 'true-regression', shardKey: 'gate', reason: 'measured regression requires a human decision', shardElapsedMs: POD_SECONDS * 1000 * 3, overallElapsedMs: POD_SECONDS * 1000 * 3 },
         stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], abortedShards: 0, rcNonzeroNoFailures: [],
+        reusedWarmPods: 0,
         // ① exactly three Pods, each ninety seconds on the injected clock: no real (or global) clock produces this.
         durationMs: POD_SECONDS * 1000 * 3,
         baselineSource: 'instance', baselineCache: { hits: 0, misses: 1 }, selectionMs: 0,
         trainReceiptReuse: { carried: 0, total: 2, receipts: 0, reasons: ['gate receipt registry empty'] },
-        summary: '게이트 regression: 1 new regressions · 환경 알려진 실패 0',
+        summary: '게이트 regression: 1 new regressions · 환경 알려진 실패 0 · 재활용 웜 Pod 0',
         executor: 'pod', host: null,
       });
       expect(signature).toMatch(/^[0-9a-f]{64}$/);
@@ -260,6 +278,10 @@ edges:
       expect(progress.every((event) => event.runId === RUN_ID && event.executor === 'pod' && event.total === 1)).toBe(true);
       expect(progressLogSpy.mock.calls.some(([category, event, data]) => category === 'release-loop.gate' && event === 'progress'
         && (data as Record<string, unknown> | undefined)?.runId === RUN_ID)).toBe(true);
+      expect(progressLogSpy.mock.calls.some(([category, event, data]) => category === 'release-loop.gate'
+        && event === 'entry-guard-evaluated'
+        && (data as Record<string, unknown> | undefined)?.path === 'graph'
+        && (data as Record<string, unknown> | undefined)?.decision === 'allow')).toBe(true);
 
       // ── the Pod stage this scenario ran, and the ledger it left ────────────────────────────────────────
       expect(podCalls).toEqual([
@@ -292,4 +314,63 @@ test('GATE-FLOW-SIM: an absent seam keeps the real tools — the production defa
   expect(runner.now).toBe(Date.now);
   expect(runner.recheckPod).toBeFunction();
   expect(runner.recheckPodBatch).toBeFunction();
+});
+
+test('RELEASE-SIM-REAL-GATE-ENTRY: graph launches the real gate CLI and records its graph-path guard decision', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-sim-real-gate-entry-'));
+  dirs.push(root);
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  const instanceRoot = join(root, 'instance');
+  mkdirSync(instanceRoot, { recursive: true });
+  const graph = join(root, 'real-gate-entry.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'gate:\n  command: "gate-node"\n');
+  writeFileSync(graph, `graph_id: release-sim-real-gate-entry
+version: 1
+entry_node: gate
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: gate, kind: agent, recipe: 'cmd:gate', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - from: gate
+    on: outcome
+    map: { ok: done, fail: failed }
+`);
+
+  const previousCwd = process.cwd();
+  process.chdir(repo);
+  let run: Awaited<ReturnType<typeof runGraph>>;
+  try {
+    run = await runGraph(graph, {
+      runId: RUN_ID,
+      pinChildUniverse: true,
+      input: { commit: 'a'.repeat(40), version: '0.3.7-rc.1', previousVersion: '0.3.6',
+        gateExecutor: 'pod', gatePodPool: 'pool-sim:1', gatePodShards: 1, gateImagePin: 'cut-commit' },
+      deps: {
+        root: instanceRoot,
+        runBash: async (_body, options) => {
+          const bun = Bun.which('bun');
+          if (!bun) throw new Error('Bun executable unavailable for real gate CLI simulation');
+          const child = spawnSync(bun, [join(REPOSITORY_ROOT, 'scripts/release-loop/gate-node.ts'), '--json'], {
+            cwd: repo, encoding: 'utf8', timeout: 30_000,
+            env: { ...process.env, ...options.env, ELANOUS_STATE_DIR: instanceRoot, ELANOUS_POD_POOL: 'pool-sim:1' },
+          });
+          return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
+        },
+      },
+    });
+  } finally { process.chdir(previousCwd); }
+
+  expect(run!.status).toBe('failed');
+  expect(run!.path).toEqual(['gate', 'failed']);
+  const debugDir = join(repo, '.elanous/debug');
+  const events = readdirSync(debugDir).filter((name) => /^debug-.*\.log$/.test(name))
+    .flatMap((name) => readFileSync(join(debugDir, name), 'utf8').trim().split('\n'))
+    .filter(Boolean).map((line) => JSON.parse(line) as { category?: string; event?: string; data?: { path?: string; decision?: string } });
+  expect(events.some((event) => event.category === 'release-loop.gate' && event.event === 'entry-guard-evaluated'
+    && event.data?.path === 'graph' && event.data.decision === 'allow')).toBe(true);
+  const gateNode = run!.nodes.find((node) => node.nodeId === 'gate')!;
+  expect(String(gateNode.output)).toContain('host-not-in-pod-pool');
 });

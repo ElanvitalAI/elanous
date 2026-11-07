@@ -2,12 +2,12 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { newUlid } from '../../src/mss/ulid.js';
 import {
   __resetIdentityForTests,
   __setIdentityFileForTests,
   getOrCreateElanousId,
-  newUlid,
-} from '../../src/mss/identity.js';
+} from '../../src/mss/identity-store.js';
 
 describe('mss identity', () => {
   let dir: string;

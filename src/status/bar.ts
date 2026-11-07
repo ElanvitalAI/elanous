@@ -539,49 +539,6 @@ export function modeSegment(
   return text(`◆ ${mode}`, tone, opts);
 }
 
-/** PR-S1V.5 (2026-04-29) — Voice cost telemetry segment.
- *
- *  Renders the month-to-date STT/TTS USD spend so the user sees a
- *  running total above the chat input. `usdMonth <= 0` returns ''
- *  (typical when voice mode is unused this month) so the secondary
- *  status row stays uncluttered. Mauve flat text — same family as
- *  `voiceSegment` so the voice-related pills cluster visually.
- *
- *  Reference: PLAN-pr-s1v5-pwa-voice-wiring-2026-04-29.md §4.3.3.
- */
-export function voiceCostSegment(
-  usdMonth: number,
-  opts: StatusBarRenderOptions = {},
-): string {
-  if (!Number.isFinite(usdMonth) || usdMonth <= 0) return '';
-  const formatted = usdMonth < 0.01 ? '<$0.01' : `$${usdMonth.toFixed(2)}`;
-  return text(`🎙 ${formatted}/mo`, 'mauve', opts);
-}
-
-/** PR-S1V.4-wiring (2026-04-29) — Voice mode indicator segment.
- *
- *  Receives a label such as "🎙 Voice mode" / "🔴 Recording" /
- *  "✨ Transcribing" / "✖ send failed" already chosen by the dashboard
- *  (which owns the voiceInputHost.onIndicatorChange subscription) and
- *  renders it as flat colored text. `null` / empty string → returns ''
- *  so the caller can splice into the pill row unconditionally and the
- *  segment disappears when voice mode is idle.
- *
- *  Tone choice: mauve text — same family as the `vw` pill so voice +
- *  vw read as "runtime activity" cluster. The `✖ send failed` label is
- *  intentionally rendered in the same tone as the rest of the segment;
- *  the X glyph carries the "something went wrong" signal without us
- *  reaching for a red background that would clash with the rest of the
- *  status row's flat-text aesthetic.
- */
-export function voiceSegment(
-  label: string | null | undefined,
-  opts: StatusBarRenderOptions = {},
-): string {
-  if (!label) return '';
-  return text(label, 'mauve', opts);
-}
-
 /** Running child-agent count. Hidden when no agents are running so the
  * status line only spends space on active background work. */
 export function runningAgentsSegment(

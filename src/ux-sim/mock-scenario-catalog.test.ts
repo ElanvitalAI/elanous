@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { expect, test } from 'bun:test';
 import { podChildResultScenario, renderPodChildResult } from './fault-pod-child-result.js';
@@ -10,6 +11,12 @@ import { createFakeKubectl } from './fake-kubectl.js';
 import { measurePoolLease, recommendConcurrency } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { loadMockScenarioCatalog, parseMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioDeviceMarkdownTable, renderMockScenarioDevices, renderMockScenarioList } from './mock-scenario-catalog.js';
+import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
+import { LogStore } from '../mss/logging/log-store.js';
+import { assembleWorld, createWorld, destroyWorld } from './world.js';
+import { withSimClock } from './fake-clock.js';
+import { runLedgerDir, runLedgerPath } from '../self-implement/run-ledger.js';
+import { encodeRlaRunIdForFixturePath, RLA_EVENT_RESPONSE_EVENTS, RLA_EVENT_RESPONSE_SAMPLE_COUNT, runRlaEventResponseScorecard, type RlaEventResponseRuntime } from './rla-event-response-scorecard.js';
 
 const REPO = resolve(import.meta.dir, '../..');
 const catalog = loadMockScenarioCatalog();
@@ -17,12 +24,15 @@ const catalog = loadMockScenarioCatalog();
 test('catalog schema, scenario/device links, evidence contract, and all ux-sim runtime modules are indexed', () => {
   expect(parseMockScenarioCatalog(catalog)).toEqual(catalog);
   expect(catalog.scenarios.map((scenario) => scenario.id)).toEqual([
-    'UX-MS-01', 'UX-MS-02', 'RELEASE-GRAPH-PREPUB-FANOUT', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
+    'APP-CONTRACT-SECRET-ENTROPY', 'UX-MS-01', 'UX-MS-02', 'RELEASE-MACROPHAGE-HEAL', 'RELEASE-GRAPH-PREPUB-FANOUT', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
     'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11', 'UX-MS-12', 'NIGHT-TRAIN-DEAD-PID-LOCK', 'AUTHOR-PRECHECK-APPLIED',
     'AUTHOR-PRECHECK-REJECTED-UNPROVABLE', 'SAFE-PUBLIC-COPY-PUBLISH-REDACTION', 'SW-FREEZE', 'SIM-HQ-MOVE', 'SIM-CHAIN-LAND',
+    'UX-MS-13',
   ]);
   expect(catalog.runEvidence.scope).toContain('ScenarioV0 YAML runs only');
-  expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107', 'hq-move']);
+  expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107', 'hq-move',
+    ...RLA_EVENT_RESPONSE_EVENTS.map(({ id }) => id), 'gate-pools-pinned-sweep', 'gate-mshq-unavailable',
+    'gate-both-unavailable', 'gate-digest-mismatch', 'gate-no-pinned-image']);
 
   const implementation = new Set(catalog.devices.flatMap((device) => device.implementation));
   for (const path of implementation) expect(existsSync(join(REPO, path))).toBe(true);
@@ -34,10 +44,14 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
   expect(catalog.candidateAudit.sourceRows).toBe(36);
   expect(catalog.candidateAudit.existingPaths).toBe(35);
   expect(catalog.candidateAudit.excludedPaths).toBe(catalog.candidateAudit.candidates.filter((candidate) => candidate.disposition === 'excluded').length);
-  expect(catalog.candidateAudit.candidates).toHaveLength(38);
+  expect(catalog.candidateAudit.candidates).toHaveLength(46);
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/safe-public-copy-publish.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/seminar-rehearsal.test.ts' }));
-  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(38);
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect.test.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect-sidecar.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/release-loop/macrophage-heal.ts' }));
+  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(46);
   expect(catalog.candidateAudit.sourceExclusions).toHaveLength(1);
   expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
   expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
@@ -110,6 +124,16 @@ test('SW-FREEZE catalogs the persisted three-pass rehearsal device and focused e
   const device = catalog.devices.find((entry) => entry.id === 'first-run-and-seminar');
   expect(device?.entryCommands).toContain('bun test src/ux-sim/mock-authoring-first-run.test.ts src/ux-sim/seminar-rehearsal.test.ts src/ux-sim/classic-tui-seat-scenarios.test.ts src/ux-sim/next-tui-seat-scenarios.test.ts');
   expect(catalog.candidateAudit.candidates).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/seminar-rehearsal.test.ts', scenarioIds: ['SW-FREEZE'] }));
+});
+
+test('APP-CONTRACT-SECRET-ENTROPY catalogs the production-parser corpus device', () => {
+  const device = catalog.devices.find((entry) => entry.id === 'app-contract-secret-entropy');
+  expect(device).toMatchObject({
+    checklistCells: ['APP-CONTRACT-SECRET-ENTROPY'],
+    implementation: ['src/ux-sim/app-contract-secret-entropy.ts'],
+    tests: ['src/ux-sim/app-contract-secret-entropy.test.ts'],
+  });
+  expect(device?.entryCommands).toContain('bun test src/ux-sim/app-contract-secret-entropy.test.ts');
 });
 
 test('world event registry rejects duplicate IDs and missing descriptions', () => {
@@ -270,7 +294,7 @@ test('candidate audit rejects duplicate paths, invalid dispositions, missing exc
   expect(() => parseMockScenarioCatalog(unknownDevice)).toThrow('references unknown device');
 
   const wrongOwner = structuredClone(catalog);
-  const scenarioCandidate = wrongOwner.candidateAudit.candidates.find((candidate) => candidate.scenarioIds?.length)!;
+  const scenarioCandidate = wrongOwner.candidateAudit.candidates.find((candidate) => candidate.scenarioIds?.length && candidate.deviceId !== 'scenario-runner')!;
   scenarioCandidate.deviceId = 'scenario-runner';
   wrongOwner.devices.find((device) => device.id === 'scenario-runner')!.implementation.push(scenarioCandidate.path);
   expect(() => parseMockScenarioCatalog(wrongOwner)).toThrow('does not own scenario');
@@ -334,7 +358,7 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
 
 test('list and show render registered scenarios and unknown ids fail closed', () => {
   expect(renderMockScenarioList(catalog).join('\n')).toContain('UX-MS-01\treport-deficit');
-  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 38/39');
+  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 46/47');
   expect(renderMockScenarioDetails(catalog, 'UX-MS-11').join('\n')).toContain('request-shape 400');
   expect(() => renderMockScenarioDetails(catalog, 'UX-MS-99')).toThrow('unknown mock scenario id');
 });
@@ -346,7 +370,7 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(list.stdout).toContain('UX-MS-07');
   expect(list.stdout).toContain('UX-MS-11');
   expect(list.stdout).toContain('UX-MS-12');
-  expect(list.stdout).toContain('후보 감사 38/39');
+  expect(list.stdout).toContain('후보 감사 46/47');
 
   const show = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-11'], { cwd: REPO, encoding: 'utf8' });
   expect(show.status).toBe(0);
@@ -376,3 +400,139 @@ test('eln sim devices --json exposes the full catalog through the CLI entry poin
   expect(payload.scenarios).toEqual(catalog.scenarios);
   expect(payload.runEvidence).toEqual(catalog.runEvidence);
 }, 35000);
+
+test('RLA-EVENT-RESPONSE-SCORECARD records ten event traces in the isolated Nexus ledger and fails unsafe responses', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rla-response-scorecard-'));
+  const previousRoot = getTestStateRoot();
+  setTestStateRoot(root);
+  const worldFile = join(root, 'world.yaml');
+  writeFileSync(worldFile, JSON.stringify({
+    world: 'rla-event-response-scorecard', seed: 0, devices: ['world-runtime'],
+    clock: { start: '2026-11-06T00:00:00.000Z', speed: 1 },
+    events: RLA_EVENT_RESPONSE_EVENTS.map(({ id }) => ({ at: '+0ms', id })),
+  }));
+  let world: Awaited<ReturnType<typeof createWorld>> | undefined;
+  try {
+    world = await createWorld(worldFile);
+    const assembled = assembleWorld(world);
+    const runtime = assembled.devices.get('world-runtime') as { inject: RlaEventResponseRuntime['inject'] };
+    expect(encodeRlaRunIdForFixturePath('run.1').join('/')).not.toBe(encodeRlaRunIdForFixturePath('run_1').join('/'));
+    expect(encodeRlaRunIdForFixturePath('\ud800').join('/')).not.toBe(encodeRlaRunIdForFixturePath('\ud801').join('/'));
+    expect(encodeRlaRunIdForFixturePath('x'.repeat(128)).every((segment) => segment.length <= 240)).toBe(true);
+    const collidingRunIds = ['run.1', 'run_1'] as const;
+    const runId = 'run-1';
+    const fixtureRunId = collidingRunIds[0];
+    const injectWithCanonicalLedgerId: RlaEventResponseRuntime['inject'] = (options) => runtime.inject({
+      ...options, runId: options.runId === fixtureRunId ? runId : options.runId,
+    });
+    const result = await withSimClock(Date.parse('2026-11-06T00:00:00.000Z'), (clock) => runRlaEventResponseScorecard(world!, {
+      clock, inject: injectWithCanonicalLedgerId, runId: fixtureRunId,
+      responder: async ({ eventId, incident }, observe) => {
+        expect(incident.readState()).toMatchObject({ eventId, status: 'injected', facts: RLA_EVENT_RESPONSE_EVENTS.find((event) => event.id === eventId)!.facts });
+        clock.tick(1_000);
+        observe.detected(true);
+        clock.tick(eventId === 'RLA-ER-01' ? 599_000 : 1_000);
+        observe.judged(RLA_EVENT_RESPONSE_EVENTS.find((event) => event.id === eventId)!.target);
+        incident.writeRecoveryState({ ...RLA_EVENT_RESPONSE_EVENTS.find((event) => event.id === eventId)!.expectedRecovery });
+        clock.tick(eventId === 'RLA-ER-02' ? 300_000 : 1_000);
+        observe.recovered('automatic');
+      },
+    }));
+
+    expect(result.pass).toBe(true);
+    expect(result.evidenceBasis).toBe('isolated-world-state');
+    expect(result.scores).toHaveLength(10);
+    expect(result.scores.every((score) => score.samples === RLA_EVENT_RESPONSE_SAMPLE_COUNT && score.successRate === 1)).toBe(true);
+    expect(result.scores.find((score) => score.eventId === 'RLA-ER-01')).toMatchObject({ baseline: 'immediate detection; attribution 9m; repair/land ≈90m; 4 human resumes', averageDetectionMs: 1_000, averageJudgmentMs: 599_000, averageAttributionMs: 600_000 });
+    expect(result.scores.find((score) => score.eventId === 'RLA-ER-02')?.averageRecoveryMs).toBe(300_000);
+
+    const ledgerPath = runLedgerPath(runId, runLedgerDir(world.root));
+    const ledgerRows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { event: string; timestamp: string; data: Record<string, unknown> });
+    const stages = ledgerRows.filter((row) => row.event === 'rla-event-response-stage');
+    expect(stages).toHaveLength(10 * RLA_EVENT_RESPONSE_SAMPLE_COUNT * 4);
+    expect(stages.slice(0, 4).map((row) => row.data.stage)).toEqual(['injected', 'detected', 'judged', 'recovered']);
+    expect(stages.every((row) => row.data.injected === true && row.data.level === 'L0')).toBe(true);
+    const phaseTimes = stages.slice(0, 4).map((row) => Date.parse(row.timestamp));
+    expect(phaseTimes.every((time, index) => index === 0 || time > phaseTimes[index - 1]!)).toBe(true);
+    expect(phaseTimes[2]! - phaseTimes[0]!).toBe(600_000);
+    expect(result.scores[0]!.averageAttributionMs).toBe(600_000);
+    expect(phaseTimes[3]! - phaseTimes[2]!).toBe(1_000);
+    expect(result.scores[0]!.averageRecoveryMs).toBe(1_000);
+    expect(stages[3]?.data).toMatchObject({ postconditionsMet: true, failedConditions: [], recoveryEvidence: { attributed: true, repairNodeCreated: true, autoResumed: true } });
+    const incidentFixturePath = String(stages[0]?.data.incidentFixture);
+    expect(existsSync(incidentFixturePath)).toBe(true);
+    expect(JSON.parse(readFileSync(incidentFixturePath, 'utf8'))).toMatchObject({ status: 'recovered', facts: { introducedRegressions: 1 } });
+
+    const failedRunId = collidingRunIds[1];
+    const failed = await withSimClock(Date.parse('2026-11-06T00:00:00.000Z'), (clock) => runRlaEventResponseScorecard(world!, {
+      clock, inject: runtime.inject, runId: failedRunId,
+      responder: async ({ eventId, sample, incident }, observe) => {
+        if (eventId === 'RLA-ER-07' && sample === 1) return;
+        clock.tick(1_000);
+        observe.detected(true);
+        if (eventId === 'RLA-ER-06' && sample === 1) return;
+        clock.tick(eventId === 'RLA-ER-01' && sample === 3 ? 599_001 : 1_000);
+        observe.judged(eventId === 'RLA-ER-04' ? 'incorrect response' : RLA_EVENT_RESPONSE_EVENTS.find((event) => event.id === eventId)!.target);
+        incident.writeRecoveryState({ ...RLA_EVENT_RESPONSE_EVENTS.find((event) => event.id === eventId)!.expectedRecovery });
+        clock.tick(1_000);
+        observe.recovered(eventId === 'RLA-ER-03' ? 'manual' : eventId === 'RLA-ER-05' ? 'none' : 'automatic');
+        if (eventId === 'RLA-ER-08' && sample === 1) throw new Error('post-recovery fixture error');
+      },
+    }));
+    expect(failed.pass).toBe(false);
+    expect(failed.scores.find((score) => score.eventId === 'RLA-ER-01')?.pass).toBe(false);
+    expect(failed.scores.find((score) => score.eventId === 'RLA-ER-03')).toMatchObject({ recovery: 'manual', pass: false });
+    expect(failed.scores.find((score) => score.eventId === 'RLA-ER-04')).toMatchObject({ successRate: 0, pass: false });
+    expect(failed.scores.find((score) => score.eventId === 'RLA-ER-05')).toMatchObject({ successRate: 0, pass: false });
+    expect(failed.scores).toHaveLength(10);
+    expect(failed.scores.find((score) => score.eventId === 'RLA-ER-06')).toMatchObject({
+      samples: 3, measuredDetectionSamples: 3, measuredJudgmentSamples: 2, measuredRecoverySamples: 2,
+      averageJudgmentMs: 1_000, successCount: 2, successRate: 2 / 3, pass: false,
+    });
+    expect(failed.scores.find((score) => score.eventId === 'RLA-ER-07')).toMatchObject({ detection: 'unmeasured', measuredDetectionSamples: 2, successCount: 2, successRate: 2 / 3, pass: false });
+    expect(failed.scores.find((score) => score.eventId === 'RLA-ER-08')).toMatchObject({ successCount: 2, successRate: 2 / 3, pass: false });
+    const failedRows = readFileSync(runLedgerPath(failedRunId, runLedgerDir(world.root)), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+    const failedAction = failedRows.find((row) => row.event === 'rla-event-response-stage' && row.data.eventId === 'RLA-ER-04' && row.data.stage === 'recovered');
+    expect(failedAction?.data).toMatchObject({ postconditionsMet: true, failedConditions: [], failureReasons: ['response-action-mismatch'] });
+    const failedRecovery = failedRows.find((row) => row.event === 'rla-event-response-stage' && row.data.eventId === 'RLA-ER-05' && row.data.stage === 'recovered');
+    expect(failedRecovery?.data).toMatchObject({ postconditionsMet: true, failedConditions: [], recoveryLevel: 'none', failureReasons: ['recovery-not-achieved'] });
+    expect(failedRows.find((row) => row.event === 'rla-event-response-sample-verdict' && row.data.eventId === 'RLA-ER-04' && row.data.sample === 1)?.data)
+      .toMatchObject({ success: false, failureReasons: ['recovery-postconditions-failed'] });
+    const incomplete = failedRows.find((row) => row.event === 'rla-event-response-stage' && row.data.eventId === 'RLA-ER-06' && row.data.stage === 'incomplete');
+    expect(incomplete).toBeDefined();
+    expect(JSON.parse(readFileSync(String(incomplete?.data.incidentFixture), 'utf8'))).toMatchObject({ status: 'incomplete' });
+    const sampleVerdicts = failedRows.filter((row) => row.event === 'rla-event-response-sample-verdict');
+    expect(sampleVerdicts).toHaveLength(30);
+    expect(sampleVerdicts.find((row) => row.data.eventId === 'RLA-ER-08' && row.data.sample === 1)?.data).toMatchObject({ success: false, responseError: 'post-recovery fixture error', failureReasons: ['responder-error'] });
+    const secondRunFixturePath = String(failedRows.find((row) => row.data.eventId === 'RLA-ER-01' && row.data.stage === 'injected')?.data.incidentFixture);
+    expect(secondRunFixturePath).not.toBe(incidentFixturePath);
+    expect(JSON.parse(readFileSync(incidentFixturePath, 'utf8'))).toMatchObject({ status: 'recovered' });
+
+    const store = new LogStore(join(world.root, 'logs', 'logs.db'), { readonly: true });
+    try {
+      const logs = store.query({ categories: ['release-loop.event-response'], limit: 300 });
+      expect(logs.length).toBeGreaterThanOrEqual(20 * RLA_EVENT_RESPONSE_SAMPLE_COUNT * 4 - 1);
+      expect(logs.filter((row) => row.event === 'sample-verdict')).toHaveLength(2 * RLA_EVENT_RESPONSE_EVENTS.length * RLA_EVENT_RESPONSE_SAMPLE_COUNT);
+      expect(logs.every((row) => {
+        const data = typeof row.data === 'string' ? JSON.parse(row.data) as Record<string, unknown>
+          : row.data && typeof row.data === 'object' ? row.data as Record<string, unknown> : {};
+        return data.injected === true && data.level === 'L0';
+      })).toBe(true);
+    } finally { store.close(); }
+
+    const longFixtureRunId = 'x'.repeat(128);
+    const injectLongIdWithCanonicalLedgerId: RlaEventResponseRuntime['inject'] = (options) => runtime.inject({
+      ...options, runId: options.runId === longFixtureRunId ? 'run-128' : options.runId,
+    });
+    await withSimClock(Date.parse('2026-11-06T00:00:00.000Z'), (clock) => runRlaEventResponseScorecard(world!, {
+      clock, inject: injectLongIdWithCanonicalLedgerId, runId: longFixtureRunId, responder: async () => {},
+    }));
+    const longFixturePath = join(world.root, 'fixtures', 'rla-event-response', ...encodeRlaRunIdForFixturePath(longFixtureRunId), 'rla-er-01-1.json');
+    expect(existsSync(longFixturePath)).toBe(true);
+    expect(readFileSync(longFixturePath, 'utf8')).toContain('introducedRegressions');
+  } finally {
+    if (world) await destroyWorld(world);
+    setTestStateRoot(previousRoot ?? null);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);

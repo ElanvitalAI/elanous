@@ -2,7 +2,7 @@ import { describe, expect, test, spyOn } from 'bun:test';
 
 import { runDaemonPromptTurn } from '../src/boot/daemon-prompt-turn.js';
 import { DaemonSessionHistory } from '../src/boot/daemon-runtime.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
 import * as acpServerModule from '../src/acp/server.js';
 import {
   PWA_TOOL_RESULT_MAX_BYTES,

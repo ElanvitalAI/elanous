@@ -17,7 +17,7 @@
  * `--with-costly` adds scenarios that call a real model (C1).
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, openSync, readFileSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { decideVerdict, exitCodeFor, idsToRerun, type CellRun, type NodeVerdict } from './pwa-node-verdict';
@@ -95,6 +95,7 @@ async function main(): Promise<number> {
   let nexusPid: number | undefined;
   let verdict: NodeVerdict | undefined;
   let failure: string | undefined;
+  let costlySkipped = 0;
   try {
     const add = run('git', ['worktree', 'add', '--detach', worktree, opts.commit], repo);
     if (add.rc !== 0) throw new Error(`worktree add failed: ${add.stderr.trim()}`);
@@ -127,7 +128,9 @@ async function main(): Promise<number> {
 
     const list = run('bun', ['-e', `import('./scripts/lib/pwa-scenarios/scenarios.ts').then(m=>console.log(JSON.stringify(m.createScenarios().map(s=>({id:s.id,costly:!!s.costly})))))`], worktree);
     const all = JSON.parse(list.stdout.trim()) as Array<{ id: string; costly: boolean }>;
+    costlySkipped = all.filter((s) => s.costly && !opts.withCostly).length;
     const ids = all.filter((s) => opts.withCostly || !s.costly).map((s) => s.id);
+    if (costlySkipped > 0) log(`costly scenarios skipped: explicit --with-costly opt-in required (${costlySkipped})`);
 
     log('warm-up (discarded)');
     scenarioRun(worktree, baseUrl, ids.filter((id) => !all.find((s) => s.id === id)?.costly));
@@ -150,9 +153,11 @@ async function main(): Promise<number> {
     if (existsSync(worktree)) run('bun', ['bin/elanous.mjs', '--test', 'nexus', 'run', '--stop'], worktree, 60_000);
     if (nexusPid) { try { process.kill(nexusPid, 'SIGTERM'); } catch { /* already gone */ } }
     run('git', ['worktree', 'remove', '--force', worktree], repo);
+    rmSync(work, { recursive: true, force: true });
   }
 
-  const out = { verdict: verdict?.verdict ?? 'error', commit: opts.commit, withCostly: opts.withCostly, cells: verdict?.cells ?? [], ...(failure ? { error: failure } : {}) };
+  const out = { verdict: verdict?.verdict ?? 'error', commit: opts.commit, withCostly: opts.withCostly, cells: verdict?.cells ?? [],
+    ...(costlySkipped > 0 ? { warning: 'costly scenarios skipped: explicit --with-costly opt-in required' } : {}), ...(failure ? { error: failure } : {}) };
   if (opts.json) console.log(JSON.stringify(out));
   else {
     console.log(`pwa-node: ${out.verdict} · ${opts.commit.slice(0, 10)}`);

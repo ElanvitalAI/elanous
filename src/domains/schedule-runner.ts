@@ -25,7 +25,7 @@ import type { Database } from 'bun:sqlite';
 import { openSchedulesDb, listSchedules, readCrontab, parseCronLine, scriptName, getLastStatus, type ScheduleRow } from './schedule-registry.js';
 import { recordScheduledExecution } from './schedule-observability.js';
 import { prevScheduledFire } from './cron-match.js';
-import { resolveTimeZone } from '../time/format.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 import '../user-config.js'; // Register the saved timezone before selecting the firing and catch-up clock.
 import { debug } from '../debug/log.js';
 

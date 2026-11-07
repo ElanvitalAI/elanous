@@ -1,0 +1,45 @@
+version: 1
+kind: release-adaptive-gate-heal
+id: rla-arg-adaptive-heal-0306
+isolation: test
+source: scripts/release-loop/adaptive-gate-heal.ts
+cases:
+  - id: introduced-regression
+    inject: { outcome: regression, introduced: [src/release.test.ts > new failure] }
+    expect:
+      action: append-repair-and-resume
+      events: [gate.result.received, gate.failures.attributed, heal.classified, heal.repair-node.planned, heal.graph-append.planned, heal.resume.decided]
+  - id: unmeasured-gate
+    inject: { outcome: error, stalledShards: [{ shard: 1, files: [src/release.test.ts], reason: incomplete }] }
+    expect:
+      action: decision-required
+      events: [gate.result.received, gate.failures.attributed, heal.classified, heal.hitl.decided]
+  - id: incident-0306-image-missing-cut-pin
+    incident: { runId: 912e5d70, version: 0.3.6, cut: c4f67fee }
+    inject: { outcome: error, executor: pod, gatePodPool: pool-node-b@node-b:4, error: "pod-gate-missing-cut-image-pin" }
+    expect:
+      classification: unmeasured
+      action: append-image-repair-and-resume
+      events: [gate.result.received, gate.failures.attributed, heal.classified, heal.image-repair-node.planned, heal.graph-append.planned, heal.resume.decided]
+  - id: incident-0306-run-scope-missing
+    incident: { runId: 912e5d70, version: 0.3.6, cut: c4f67fee }
+    inject: { outcome: error, executor: pod, gatePodPool: pool-node-b@node-b:4, error: "pod-gate-missing-run-scope" }
+    expect:
+      classification: unmeasured
+      action: append-image-repair-and-resume
+      events: [gate.result.received, gate.failures.attributed, heal.classified, heal.image-repair-node.planned, heal.graph-append.planned, heal.resume.decided]
+  - id: host-attribution-gap
+    inject: { outcome: error, executor: host, error: cut host sweep failure attribution incomplete }
+    expect:
+      action: rerun-pod
+      events: [gate.result.received, gate.failures.attributed, heal.classified, heal.pod-retry.decided]
+  - id: clean-gate
+    inject: { outcome: ok }
+    expect:
+      action: no-op
+      events: [gate.result.received, gate.failures.attributed, heal.classified, heal.noop.decided]
+  - id: repeated-signature
+    inject: { outcome: regression, introduced: [src/release.test.ts > new failure], repeat: 2 }
+    expect:
+      action: decision-required
+      events: [gate.result.received, gate.failures.attributed, heal.classified, heal.hitl.decided]

@@ -1482,7 +1482,7 @@ function configuredDriftMode(): 'off' | 'shadow' | 'live' {
   try {
     const config = getUserConfig() as unknown as { raw?: { land?: { driftAutorepair?: { mode?: unknown } } } };
     return resolveDriftAutorepairMode(config.raw?.land?.driftAutorepair?.mode);
-  } catch { return 'live'; }
+  } catch { return 'shadow'; }
 }
 async function launchDriftRepairThroughTaskCard(input: { pr: number; head: string; repo: string; branch: string; goal: string }): Promise<void> {
   const { cardPrNumber, readTaskAgentState, taskAgentStatePath } = await import('../task-agent/task-hand.js');
@@ -2723,6 +2723,24 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   if (opts.forceFreeze) debug.log('release-loop.freeze', 'force-merge', { pr: prNumber, reason: opts.forceFreeze.trim() });
   record('merge', true, { result: merged.kind, ...(merged.remoteBranchDeletion ? { remoteBranchDeletion: merged.remoteBranchDeletion.detail } : {}) });
+  if (!branch.startsWith('release-docs/')) {
+    try {
+      const landed = run('gh', ['pr', 'view', String(prNumber), '--json', 'title,headRefOid,baseRefName,mergedAt,mergeCommit'], { cwd });
+      const value = landed.ok ? JSON.parse(landed.out) as Record<string, unknown> : undefined;
+      const mergeCommit = value?.mergeCommit && typeof value.mergeCommit === 'object'
+        ? (value.mergeCommit as Record<string, unknown>).oid : undefined;
+      const repairRunId = typeof value?.title === 'string' ? /^RLA-GATE-REPAIR ([^ ]+) /.exec(value.title)?.[1] : undefined;
+      if (repairRunId && typeof value?.headRefOid === 'string' && typeof value.baseRefName === 'string' &&
+        typeof mergeCommit === 'string' && typeof value.mergedAt === 'string') {
+        const { publishRepairPrLanded } = await import('../../scripts/release-loop/repair-pr-landed.js');
+        publishRepairPrLanded({ schema: 1, prNumber, repairRunId, head: value.headRefOid, mergeSha: mergeCommit,
+          base: value.baseRefName, mergedAt: value.mergedAt });
+      }
+    } catch (error) {
+      try { debug.log('pr.land', 'graph-pr-land-event-unavailable', { pr: prNumber, error: String(error).slice(0, 240) }, { level: 'warn' }); }
+      catch { /* event publication cannot undo a confirmed merge */ }
+    }
+  }
   if (Number.isSafeInteger(prNumber) && prNumber > 0 && deps.onMergedSupersede) {
     try { await deps.onMergedSupersede(prNumber, cwd); }
     catch (error) {

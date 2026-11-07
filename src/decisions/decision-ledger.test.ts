@@ -2,10 +2,10 @@ import type { AskUserQuestionRequest } from '../ask-user-question/types.js';
 import { createPendingQuestion, readPendingQuestionAnswer, writePendingQuestion, writePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
 import { debug } from '../debug/log.js';
 import { setDefaultTimeout, test, expect, spyOn } from 'bun:test';
-import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, realpathSync, chmodSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createVersionResolver } from '../directives/version-at.js';
 import { DecisionLedger, importDecisionMarkdown, type RaiseInput } from './decision-ledger.js';
 import { resolveSeat } from '../seat-address/seat-address.js';
@@ -54,6 +54,140 @@ test('raised-crosscheck observation records seats and skipped reason without the
   } finally { spy.mockRestore(); }
 });
 
+test('raiseOnce reuses an existing same-ref decision without resolving version metadata', () => {
+  const stateDir = root();
+  const ref = 'graph-growth:version-resolution-race';
+  const competing = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions });
+  const existing = competing.raiseOnce({ ...base, refs: [ref] }, ref);
+  const racing = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: () => {
+    throw new Error('version metadata should not be resolved for an existing ref');
+  } });
+
+  expect(racing.raiseOnce({ ...base, refs: [ref] }, ref)).toEqual(existing);
+  expect(competing.list({ status: 'all' })).toHaveLength(1);
+  expect(readFileSync(competing.path, 'utf8').trim().split('\n')).toHaveLength(1);
+});
+test('slow default resolver preparation does not block a competing raise or reorder ledger timestamps', async () => {
+  const rootDir = mkdtempSync(join(tmpdir(), 'decision-lock-competition-'));
+  const repoRoot = join(rootDir, 'repo');
+  const fakeBin = join(rootDir, 'bin');
+  const stateDir = join(rootDir, 'state');
+  const marker = join(rootDir, 'resolver-show-started');
+  mkdirSync(repoRoot); mkdirSync(fakeBin); mkdirSync(stateDir);
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const git = (args: string[], env?: NodeJS.ProcessEnv) => {
+    const result = spawnSync(realGit, args, { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, ...env } });
+    if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+    return result.stdout;
+  };
+  git(['init', '--quiet']);
+  writeFileSync(join(repoRoot, 'package.json'), JSON.stringify({ version: '0.2.9' }));
+  git(['add', 'package.json']);
+  git(['-c', 'user.name=NT-2', '-c', 'user.email=nt2@example.invalid', 'commit', '--quiet', '-m', 'fixture']);
+  git(['update-ref', '--create-reflog', 'refs/remotes/origin/main', 'HEAD']);
+  const shim = join(fakeBin, 'git');
+  writeFileSync(shim, '#!/bin/sh\nif [ "$1" = "show" ] && [ ! -e "$NT2_GIT_SHOW_MARKER" ]; then : > "$NT2_GIT_SHOW_MARKER"; sleep 6; fi\nexec "$NT2_REAL_GIT" "$@"\n');
+  chmodSync(shim, 0o755);
+
+  const moduleUrl = new URL('./decision-ledger.ts', import.meta.url).href;
+  const input = { title: 'slow resolver', category: 'other', scqa: { s: 'fixture', c: 'fixture' },
+    options: [{ key: 'a', label: 'A', consequence: 'A' }, { key: 'b', label: 'B', consequence: 'B' }],
+    recommendation: { option: 'a', why: 'fixture' }, raisedBy: { agent: 'NT-2' } };
+  const slowSource = `import { DecisionLedger } from ${JSON.stringify(moduleUrl)}; const ledger = new DecisionLedger({stateDir: process.env.NT2_STATE_DIR, repoRoot: process.env.NT2_REPO_ROOT}); ledger.raise(${JSON.stringify(input)}); console.log('slow raise complete');`;
+  const fastSource = `import { DecisionLedger } from ${JSON.stringify(moduleUrl)}; const ledger = new DecisionLedger({stateDir: process.env.NT2_STATE_DIR, resolveVersion: () => ({released:'0.2.9',dev:'0.2.9',codename:null})}); ledger.raise({...${JSON.stringify(input)}, title:'fast competing raise'}); console.log('fast raise complete');`;
+  const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}`, NT2_REAL_GIT: realGit,
+    NT2_GIT_SHOW_MARKER: marker, NT2_STATE_DIR: stateDir, NT2_REPO_ROOT: repoRoot };
+  const slow = spawn(process.execPath, ['-e', slowSource], { cwd: process.cwd(), env, detached: process.platform !== 'win32' });
+  let slowExited = false;
+  slow.once('exit', () => { slowExited = true; });
+  try {
+    const markerDeadline = Date.now() + 10_000;
+    while (!existsSync(marker) && !slowExited && Date.now() < markerDeadline) await Bun.sleep(20);
+    expect(existsSync(marker)).toBe(true);
+    const fast = spawnSync(process.execPath, ['-e', fastSource], { cwd: process.cwd(), env,
+      encoding: 'utf8', timeout: 3_000 });
+    expect(fast.status).toBe(0);
+    expect(fast.stdout).toContain('fast raise complete');
+    expect(slowExited).toBe(false);
+    writeFileSync(join(repoRoot, 'package.json'), JSON.stringify({ version: '0.3.0' }));
+    git(['add', 'package.json']);
+    git(['-c', 'user.name=NT-2', '-c', 'user.email=nt2@example.invalid', 'commit', '--quiet', '-m', 'release snapshot moved during resolver preparation']);
+    git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    await new Promise<void>((resolveExit, reject) => {
+      const timeout = setTimeout(() => reject(new Error('slow resolver child did not finish')), 10_000);
+      slow.once('exit', (code) => { clearTimeout(timeout); code === 0 ? resolveExit() : reject(new Error(`slow raise exited ${code}`)); });
+    });
+    const store = new DecisionLedger({ stateDir, resolveVersion: versions });
+    const entries = store.list({ status: 'all' });
+    const fastEntry = entries.find(entry => entry.title === 'fast competing raise');
+    const slowEntry = entries.find(entry => entry.title === 'slow resolver');
+    expect(fastEntry).toBeDefined();
+    expect(slowEntry).toBeDefined();
+    expect(fastEntry!.id).not.toBe(slowEntry!.id);
+    expect(Date.parse(fastEntry!.raisedAt!)).toBeLessThanOrEqual(Date.parse(slowEntry!.raisedAt!));
+    expect(slowEntry!.version?.dev).toBe('0.3.0');
+    const appendOrder = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { type: string; entry?: { title: string } })
+      .filter(event => event.type === 'raised').map(event => event.entry!.title);
+    expect(appendOrder).toEqual(['fast competing raise', 'slow resolver']);
+  } finally {
+    if (!slowExited && slow.pid) {
+      try { process.kill(process.platform === 'win32' ? slow.pid : -slow.pid, 'SIGTERM'); } catch { /* the child may have exited */ }
+    }
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+test('raise rejects an unreadable repository ref snapshot before taking the ledger lock', () => {
+  const repoRoot = mkdtempSync(join(tmpdir(), 'decision-unreadable-ref-'));
+  const store = new DecisionLedger({ stateDir: root(), repoRoot });
+  expect(() => store.raise(base)).toThrow('unable to read origin/main');
+  expect(existsSync(store.path)).toBe(false);
+});
+test('raise permits isolated callers with no implicit repository context', () => {
+  const stateDir = root();
+  const cwd = mkdtempSync(join(tmpdir(), 'decision-no-repo-context-'));
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(cwd);
+    const raised = new DecisionLedger({ stateDir }).raise(base);
+    expect(raised.version?.dev).toBeNull();
+    expect(existsSync(join(stateDir, 'decisions', 'decisions.jsonl'))).toBe(true);
+  } finally {
+    process.chdir(previousCwd);
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+test('raise rejects a malformed origin/main ref before taking the ledger lock', () => {
+  const stateDir = root();
+  const repoRoot = join(stateDir, 'repo');
+  mkdirSync(repoRoot);
+  const init = spawnSync('git', ['init', '-q'], { cwd: repoRoot, encoding: 'utf8' });
+  if (init.status !== 0) throw new Error(init.stderr);
+  const refPath = join(repoRoot, '.git', 'refs', 'remotes', 'origin', 'main');
+  mkdirSync(join(repoRoot, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
+  writeFileSync(refPath, 'not-a-valid-object-id\n');
+  const store = new DecisionLedger({ stateDir, repoRoot });
+  expect(() => store.raise(base)).toThrow('unable to read origin/main');
+  expect(existsSync(store.path)).toBe(false);
+});
+test('origin/main lookup ignores nested refs that only share its prefix', () => {
+  const stateDir = root();
+  const repoRoot = join(stateDir, 'repo');
+  mkdirSync(repoRoot);
+  const git = (args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+  };
+  git(['init', '-q']);
+  git(['config', 'user.name', 'NT-2']);
+  git(['config', 'user.email', 'nt2@example.invalid']);
+  writeFileSync(join(repoRoot, 'package.json'), JSON.stringify({ version: '0.3.0' }));
+  git(['add', 'package.json']);
+  git(['commit', '--quiet', '-m', 'nested remote ref fixture']);
+  git(['update-ref', 'refs/remotes/origin/main/child', 'HEAD']);
+  const store = new DecisionLedger({ stateDir, repoRoot, releaseRoot: join(stateDir, 'release') });
+  expect(store.raise(base).version?.dev).toBeNull();
+});
 test('raiseOnce atomically reuses the same growth source even after a human decision', () => {
   const store = ledger();
   const ref = 'graph-growth:same-proposal';
@@ -185,12 +319,16 @@ test('version filter uses actual release ledger and origin/main git snapshot via
 
 test('two separate processes raise concurrently without ID collision', () => {
   const stateDir = root();
+  const repoRoot = join(stateDir, 'repo');
+  mkdirSync(repoRoot);
+  const init = spawnSync('git', ['init', '-q'], { cwd: repoRoot, encoding: 'utf8' });
+  if (init.status !== 0) throw new Error(init.stderr);
   const modulePath = join(process.cwd(), 'src/decisions/decision-ledger.ts');
-  const code = `import { DecisionLedger } from ${JSON.stringify(modulePath)}; new DecisionLedger({stateDir: ${JSON.stringify(stateDir)}, releaseRoot: '/nonexistent', repoRoot: '/nonexistent'}).raise(${JSON.stringify(base)});`;
+  const code = `import { DecisionLedger } from ${JSON.stringify(modulePath)}; new DecisionLedger({stateDir: ${JSON.stringify(stateDir)}, releaseRoot: '/nonexistent', repoRoot: ${JSON.stringify(repoRoot)}}).raise(${JSON.stringify(base)});`;
   const children = [Bun.spawn(['bun', '-e', code], { stdout: 'pipe', stderr: 'pipe' }), Bun.spawn(['bun', '-e', code], { stdout: 'pipe', stderr: 'pipe' })];
   return Promise.all(children.map(c => c.exited)).then(codes => {
     expect(codes).toEqual([0, 0]);
-    const ids = new DecisionLedger({ stateDir, releaseRoot: '/nonexistent', repoRoot: '/nonexistent' }).list().map(e => e.id);
+    const ids = new DecisionLedger({ stateDir, releaseRoot: '/nonexistent', repoRoot }).list().map(e => e.id);
     expect(ids).toHaveLength(2);
     expect(new Set(ids).size).toBe(2);
   });

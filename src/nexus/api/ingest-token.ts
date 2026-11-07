@@ -3,7 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFi
 import { dlopen, FFIType } from 'bun:ffi';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { debug } from '../../debug/log.js';
+import { logDiagnostic } from '../../mss/logging/diagnostic-sink.js';
 
 /** `flock` lives in a different library per platform — `libc.so.6` alone made issue/match die on macOS (#21048 was gated only in a Linux Pod). */
 const LIBC_CANDIDATES: Readonly<Partial<Record<NodeJS.Platform, readonly string[]>>> = {
@@ -75,7 +75,7 @@ function withTokenStoreLock<T>(root: string, update: () => T): T {
   const lock = join(directory, '.ingest-tokens.lock');
   const fd = openSync(lock, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
   const libc = openFlock();
-  if (!libc) debug.log('nexus.ingest-token', 'lock-unavailable', { platform: process.platform });
+  if (!libc) logDiagnostic('nexus.ingest-token', 'lock-unavailable', { platform: process.platform });
   let locked = false;
   try {
     const stat = fstatSync(fd);

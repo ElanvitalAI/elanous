@@ -4,7 +4,7 @@
 import { lstatSync, readFileSync, readlinkSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { debug } from '../debug/log.js';
+import { logDiagnostic } from '../mss/logging/diagnostic-sink.js';
 
 export class TestOpsWriteRefusedError extends Error {
   constructor(what: string, path: string, signal: string) {
@@ -121,7 +121,7 @@ function accountOpsRoots(): string[] {
     let user = '';
     try { user = userInfo().username; } catch { /* unknown user */ }
     homes = [...(user ? [`/Users/${user}`, `/home/${user}`] : []), ...(process.getuid?.() === 0 ? ['/root'] : []), homedir()];
-    try { debug.log('test-guard', 'account-home-unresolved', { protected: homes.length }); } catch { /* observation only */ }
+    try { logDiagnostic('test-guard', 'account-home-unresolved', { protected: homes.length }); } catch { /* observation only */ }
   }
   accountHomeUnresolved = !home;
   cachedOpsRoots = [...new Set(homes.map((h) => physicalPath(join(h, '.elanous'))))];
@@ -143,7 +143,7 @@ export function isInsideOpsRoot(path: string, roots: string[] = opsRoots()): boo
 }
 
 function refuse(what: string, path: string, signal: string): never {
-  try { debug.log('test-guard', 'ops-write-refused', { what, path, signal }); } catch { /* the refusal stands */ }
+  try { logDiagnostic('test-guard', 'ops-write-refused', { what, path, signal }); } catch { /* the refusal stands */ }
   throw new TestOpsWriteRefusedError(what, path, signal);
 }
 

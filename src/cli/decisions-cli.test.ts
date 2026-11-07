@@ -1,6 +1,6 @@
 import { test, expect, spyOn } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { resetUserConfig } from '../user-config.js';
 import { renderCardText } from '../decisions/decision-cards.js';
@@ -17,6 +17,12 @@ import { registerDecisionsCommands } from './decisions-cli.js';
 import { openMsgStore } from '../msg/msg-store.js';
 
 const root = () => mkdtempSync(join(tmpdir(), 'decisions-cli-'));
+const emptyGitRepo = (path: string) => {
+  mkdirSync(path, { recursive: true });
+  const result = spawnSync('git', ['init', '-q'], { cwd: path, encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(result.stderr);
+  return path;
+};
 const judgmentArgs = ['--pending-question', '근거: 시험 자료\n무엇이 바뀌나: 선택한 경로가 적용됨\n기본값 시 결과: 현재 경로 유지'] as const;
 const withJudgment = (args: string[]) => args[0] === 'raise' && !args.includes('--pending-question') ? [...args, ...judgmentArgs] : args;
 
@@ -301,6 +307,7 @@ test('raise requires all judgment fields and routes seat proposals to the OP inb
 
 test('decisions CLI fences raise/decide at generation, permits observed override and pre-lease bootstrap without altering reads', () => {
   const stateDir = root();
+  const repoRoot = emptyGitRepo(join(stateDir, 'repo'));
   const store = fileLeaseStore(join(stateDir, 'lease.json'), () => 100);
   const logs: string[] = [];
   const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(stateDir, 'hq-local.json'), seenPath: join(stateDir, 'seen-generation'), now: () => 100,
@@ -311,7 +318,7 @@ test('decisions CLI fences raise/decide at generation, permits observed override
   const oldError = console.error;
   console.error = (line: string) => { errors.push(line); };
   const cli = new Command();
-  registerDecisionsCommands(cli, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot: join(stateDir, 'missing') }, { log: (s) => lines.push(s) }, hq);
+  registerDecisionsCommands(cli, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot }, { log: (s) => lines.push(s) }, hq);
   const run = (...args: string[]) => { lines.length = 0; cli.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]; };
   const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
   try {
@@ -361,9 +368,10 @@ test('actual isolated decisions CLI writes despite a foreign lease without overr
 
 test('CLI raises, filters, shows and records human/AUTO decisions; validation errors do not append', () => {
   const stateDir = root();
+  const repoRoot = emptyGitRepo(join(stateDir, 'repo'));
   const lines: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot: join(stateDir, 'missing') }, { log: s => lines.push(s) });
+  registerDecisionsCommands(program, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot }, { log: s => lines.push(s) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const raise = ['raise', '--agent', 'codex', '--title', 'Publish?', '--category', 'publish', '--s', 'Draft exists.', '--c', 'Decision needed.', '--option', 'a=Publish:Public', '--option', 'b=Hold:Private', '--skip-recommend', 'Research takes time', '--json'];
   const entry = JSON.parse(run(...raise));

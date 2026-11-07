@@ -25,6 +25,7 @@ import {
   _resetDefaultLogStoreForTest,
 } from './log-store.js';
 import { debug } from '../../debug/log.js';
+import { registerDiagnosticSink } from './diagnostic-sink.js';
 import { resetNestBootObservationForTest } from '../../agent/nest-depth.js';
 import * as nestDepth from '../../agent/nest-depth.js';
 import { prodInstanceRoot, resetEffectiveInstanceRoot, setTreeDerivedTestForTesting } from '../../instance/resolve.js';
@@ -209,17 +210,18 @@ describe('LogStore busy retry', () => {
     }
   });
 
-  it('bun CLI exits within baseline plus two seconds during logs.db lock contention', async () => {
+  it('writer process exits within baseline plus two seconds during logs.db lock contention', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'elanous-log-busy-retry-cli-'));
     const repoRoot = join(import.meta.dir, '../../..');
     const dbPath = join(dir, 'logs', 'logs.db');
     const seed = new LogStore(dbPath);
     seed.close();
-    const action = JSON.stringify({
-      kind: 'retry', variant: 'wait', taskId: 'busy-cli-test', rationale: 'busy retry process exit',
-      pr: 0, runId: 'busy-cli-run', original: 'test', checklistId: '',
-    });
-    const command = [process.execPath, join(repoRoot, 'bin/elanous.mjs'), `--test=${dir}`, 'autopilot', 'task-agent-action', action];
+    const writerSource = `import { LogStore } from ${JSON.stringify(join(repoRoot, 'src/mss/logging/log-store.ts'))};
+const store = new LogStore(process.argv[1]);
+try { store.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'busy-process-test', event: 'write', data: {} }, surface: 'test' }]); }
+catch { /* caller observes a fail-soft busy loss and exits without keeping the process alive */ }
+store.close();`;
+    const command = [process.execPath, '-e', writerSource, dbPath];
     const env = { ...process.env, NODE_ENV: 'development' };
     const runCli = async (): Promise<{ ms: number; stderr: string }> => {
       const started = Date.now();
@@ -1372,15 +1374,22 @@ describe('경로/싱글톤 격리', () => {
     const stateDir = process.env.ELANOUS_STATE_DIR;
     const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
     const stdout = spyOn(process.stdout, 'write').mockImplementation(() => true);
-    const debugLog = spyOn(debug, 'log').mockImplementation(() => undefined);
+    const diagnosticEvents: Array<{ category: string; event: string; data?: unknown }> = [];
+    const unregisterDiagnostics = registerDiagnosticSink({
+      log: (category, event, data) => diagnosticEvents.push({ category, event, data }),
+      flush: () => {},
+    });
     const dir = mkdtempSync(join(tmpdir(), 'elanous-logstore-unavailable-'));
     try {
       process.env.NODE_ENV = 'test';
       _resetDefaultLogStoreForTest();
       expect(getDefaultLogStore()).toBeNull();
       expect(getDefaultLogStore()).toBeNull();
-      expect(debugLog).toHaveBeenCalledTimes(1);
-      expect(debugLog).toHaveBeenCalledWith('mss.log-store', 'default log store unavailable', { detail: 'disabled because NODE_ENV=test' });
+      expect(diagnosticEvents).toEqual([{
+        category: 'mss.log-store',
+        event: 'default log store unavailable',
+        data: { detail: 'disabled because NODE_ENV=test' },
+      }]);
       expect(stderr).not.toHaveBeenCalled();
 
       process.env.NODE_ENV = 'production';
@@ -1393,7 +1402,7 @@ describe('경로/싱글톤 격리', () => {
       expect(String(stderr.mock.calls[0]![0])).toContain('could not be opened');
       expect(stdout).not.toHaveBeenCalled();
     } finally {
-      debugLog.mockRestore();
+      unregisterDiagnostics();
       stderr.mockRestore();
       stdout.mockRestore();
       _resetDefaultLogStoreForTest();

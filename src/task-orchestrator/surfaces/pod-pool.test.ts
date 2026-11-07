@@ -1189,7 +1189,8 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     const labels = new Map<string, string>([['node-b', 'old'], ['node-c', 'old']]);
     const run: RemoteRun = (host, cmd) => (cmd.includes('k3d-elanous-registry') ? { status: 1, stdout: '', stderr: '' } : { status: 0, stdout: `${labels.get(host)}\n`, stderr: '' });
     const tgzSeen: (string | undefined)[] = [];
-    const remoteBuild = async (host: string, _cluster: string, _registry?: string, tgz?: string) => { tgzSeen.push(tgz); labels.set(host, 'new'); return { ok: true, detail: 'built' }; };
+    const buildIdsSeen: (string | undefined)[] = [];
+    const remoteBuild = async (host: string, _cluster: string, _registry?: string, tgz?: string, buildId?: string) => { tgzSeen.push(tgz); buildIdsSeen.push(buildId); labels.set(host, 'new'); return { ok: true, detail: 'built' }; };
     let packs = 0, cleanups = 0;
     const pack = async () => { packs++; await new Promise((r) => setTimeout(r, 10)); return { ok: true, tgz: '/shared/elanous.tgz', detail: '✓ pack', cleanup: () => { cleanups++; } }; };
     const members = parsePodPool('pool-node-b@node-b:2,pool-node-c@node-c:1');
@@ -1198,6 +1199,9 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(r.get('pool-node-c')).toMatchObject({ ok: true, action: 'built' });
     expect(packs).toBe(1);
     expect(tgzSeen).toEqual(['/shared/elanous.tgz', '/shared/elanous.tgz']);
+    expect(buildIdsSeen).toHaveLength(2);
+    expect(buildIdsSeen[0]).toMatch(/^[a-f0-9]{32}$/u);
+    expect(buildIdsSeen[1]).toBe(buildIdsSeen[0]);
     expect(cleanups).toBe(1);
     // 이미 같은 판이면 pack 도 없다.
     const fresh = await syncPoolImages(members, 'img', 'new', { run, remoteBuild, pack });
@@ -1219,6 +1223,29 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       expect(failed.get(ctx)).toMatchObject({ ok: true, action: 'shipped' });
       expect(failed.get(ctx)!.detail).toContain('packed-revision.json');
     }
+  });
+
+  test('mixed fresh and stale pools rebuild together with one shared image fingerprint', async () => {
+    const labels = new Map<string, string>([['node-b', 'new'], ['node-c', 'old']]);
+    const run: RemoteRun = (host, cmd) => {
+      if (cmd.includes('k3d-elanous-registry') || cmd.startsWith('curl -fsS')) return { status: 1, stdout: '', stderr: '' };
+      return { status: 0, stdout: `${labels.get(host)}\n`, stderr: '' };
+    };
+    const builds: Array<{ host: string; sharedBuildId?: string }> = [];
+    const remoteBuild = async (host: string, _cluster: string, _registry?: string, _packedTgz?: string, sharedBuildId?: string) => {
+      builds.push({ host, sharedBuildId });
+      labels.set(host, 'new');
+      return { ok: true, detail: 'built' };
+    };
+
+    const result = await syncPoolImages(parsePodPool('pool-node-b@node-b:2,pool-node-c@node-c:1'), 'img', 'new',
+      { run, remoteBuild, waitMaxMs: 0 });
+
+    expect(result.get('pool-node-b')).toMatchObject({ ok: true, action: 'built' });
+    expect(result.get('pool-node-c')).toMatchObject({ ok: true, action: 'built' });
+    expect(builds.map(({ host }) => host).sort()).toEqual(['node-c', 'node-b']);
+    expect(builds[0]?.sharedBuildId).toMatch(/^[a-f0-9]{32}$/u);
+    expect(builds[1]?.sharedBuildId).toBe(builds[0]?.sharedBuildId);
   });
 
   // 델타(대표 2026-09-26): 레지스트리 노드는 «커밋 ⊕ 스킬 해시 ⊕ 레지스트리 태그»가 다 맞아야 fresh — 셋 중 하나라도 어긋나면 다시 굽는다.

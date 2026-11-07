@@ -5,11 +5,7 @@
 // registration into an AdapterRegistry.
 
 import { describe, test, expect, afterEach } from 'bun:test';
-import {
-  createClaudePtyAdapter,
-  registerDefaultClaudePtyAdapter,
-} from '../src/agent/adapters/claude-pty.js';
-import { AdapterRegistry } from '../src/agent/adapter-registry.js';
+import { createClaudePtyAdapter } from '../src/agent/adapters/claude-pty.js';
 import {
   resetForTesting,
   setPtyAdapterForTesting,
@@ -30,7 +26,6 @@ afterEach(() => {
   resetForTesting();
   setPtyAdapterForTesting(null);
 });
-
 describe('createClaudePtyAdapter · supports()', () => {
   test('matches claude + claude-code brand with PTY modes', () => {
     const a = createClaudePtyAdapter();
@@ -67,15 +62,5 @@ describe('createClaudePtyAdapter · launch()', () => {
     const a = createClaudePtyAdapter({ binary: '/opt/claude-code' });
     await a.launch({ brand: 'claude-code' });
     expect(listPty().some((h) => h.cmd === '/opt/claude-code')).toBe(true);
-  });
-});
-
-describe('registerDefaultClaudePtyAdapter', () => {
-  test('registers into a registry · returns disposer', () => {
-    const r = new AdapterRegistry();
-    const off = registerDefaultClaudePtyAdapter(r);
-    expect(r.list().map((x) => x.id)).toEqual(['claude-pty']);
-    off();
-    expect(r.list()).toEqual([]);
   });
 });

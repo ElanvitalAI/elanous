@@ -15,7 +15,9 @@ import {
   currentBackend,
   currentBackendId,
 } from './registry.js';
-import { importSecretsFileRaw } from './file-backend.js';
+import { deleteLegacyAppSecretValueSync, importSecretsFileRaw } from './file-backend.js';
+import { assertSharedSecretId } from './types.js';
+import { hasAppSecretEventForId } from './app-secret-ledger.js';
 
 export * from './types.js';
 export * from './registry.js';
@@ -34,10 +36,12 @@ export async function getSecretAsync(id: string): Promise<string | undefined> {
 }
 
 export async function setSecretAsync(id: string, value: string): Promise<void> {
+  assertSharedSecretId(id);
   await currentBackend().set(id, value);
 }
 
 export async function deleteSecretAsync(id: string): Promise<boolean> {
+  if (id.startsWith('app/') && hasAppSecretEventForId(id)) throw new Error('ELANOUS_APP_SECRET_LEDGER_REQUIRED');
   return currentBackend().delete(id);
 }
 
@@ -52,6 +56,9 @@ export async function importSecretBatchAsync(
   expectedConflicts?: readonly string[],
 ): Promise<{ imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean }> {
   if (currentBackendId() !== 'file') throw new Error('ELANOUS_IMPORT_BACKEND_UNSUPPORTED');
+  // App-scoped credentials require their lifecycle ledger; bulk import must not
+  // create or overwrite values outside that audited path.
+  if (Object.keys(secrets).some((id) => id.startsWith('app/'))) throw new Error('ELANOUS_APP_SECRET_IMPORT_UNSUPPORTED');
   return importSecretsFileRaw(secrets, overwrite, expectedConflicts);
 }
 
@@ -80,6 +87,7 @@ export function listSecretIds(): string[] {
 /** Sync set/delete — file backend only. Backed by the underlying file
  *  read/write so it stays compat with the pre-PR σ semantics. */
 export function setSecret(id: string, value: string): string {
+  assertSharedSecretId(id);
   // Use the async backend's set under the hood (file backend's set is
   // synchronous internally · the await resolves immediately).
   void currentBackend().set(id, value);
@@ -89,6 +97,10 @@ export function setSecret(id: string, value: string): string {
 export function deleteSecret(id: string): boolean {
   // Probe sync first (file backend); if not supported, fail loud.
   const b = syncOrThrow();
+  if (id.startsWith('app/')) {
+    if (hasAppSecretEventForId(id)) throw new Error('ELANOUS_APP_SECRET_LEDGER_REQUIRED');
+    return deleteLegacyAppSecretValueSync(id);
+  }
   const exists = b.syncReadable!.getSync(id) !== undefined;
   if (!exists) return false;
   void currentBackend().delete(id);

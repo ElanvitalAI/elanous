@@ -1,0 +1,37 @@
+kind: rehearsal-hard-2h-mandatory
+isolation: test
+source: src/release-loop/rehearsal.ts
+cases:
+  - id: missing-file-memory
+    plan:
+      shards: 4
+      testFiles: 18
+      gatePlanShards: 12
+      resources: { cpus: 8, freeBytes: 17179869184, totalBytes: 34359738368 }
+      unmeasured: "selected file memory not measured: 2/18"
+      planningGaps: ["selected file memory not measured: 2/18"]
+  - id: missing-persisted-shard-plan
+    plan:
+      shards: 4
+      testFiles: 18
+      gatePlanShards: null
+      resources: { cpus: 8, freeBytes: 17179869184, totalBytes: 34359738368 }
+      unmeasured: persisted gate shard plan unavailable
+      planningGaps: [persisted gate shard plan unavailable]
+  - id: unknown-test-inventory
+    plan:
+      shards: 4
+      testFiles: null
+      gatePlanShards: 4
+      resources: { cpus: 8, freeBytes: 17179869184, totalBytes: 34359738368 }
+      unmeasured: selected test inventory unavailable
+      planningGaps: [selected test inventory unavailable]
+  - id: remote-capacity-verified-by-completed-run
+    plan:
+      shards: 4
+      testFiles: 18
+      gatePlanShards: 4
+      resources: { cpus: 8, freeBytes: 17179869184, totalBytes: 34359738368 }
+      unmeasured: remote gate host resources unmeasured before RC
+      remoteCapacityPending: true
+      planningGaps: []

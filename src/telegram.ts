@@ -22,6 +22,9 @@ import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { openMsgStore } from './msg/msg-store.js';
+import { createTelegramChannelOpReplyTransport, startChannelOpReplyRoute } from './session/channel-op-reply-route.js';
+import { resolveInstanceName } from './instance-identity.js';
 import { buildTurnOutputTextBlocks } from './input/turn-output-block.js';
 import { selectTurnOutputTextForSink } from './input/turn-output-sink-registry.js';
 import { debug } from './debug/log.js';
@@ -53,6 +56,7 @@ import {
   buildUnknownSlashReply,
   toTelegramBotCommands,
   defaultTelegramCommands,
+  createAskOpTelegramSlashCommand,
   runAcpViaSlash,
   type TgSlashCommand,
   type TgSlashParse,
@@ -206,6 +210,8 @@ export interface TelegramBotOpts {
      *  the bridge module (cyclic import otherwise). */
     daemonBridge?: unknown;
   };
+  /** Start the durable OP-reply mailbox route alongside this bot's poll loop. */
+  channelOpReply?: { instance: string };
   /** Phase 8 (2026-04-30) — voice msg adapter. When supplied + the
    *  incoming msg has a `voice` attachment, the bot:
    *    1. Downloads the .ogg via downloadFile()
@@ -373,6 +379,8 @@ export class TelegramBot {
   private readonly contextNowDeps?: ContextNowDeps;
   private readonly contextFirstGate: ReturnType<typeof createContextFirstGate>;
   private seatAskTimer: ReturnType<typeof setInterval> | null = null;
+  private channelOpReplyRoute?: ReturnType<typeof startChannelOpReplyRoute>;
+  private readonly channelOpReplyInstance?: string;
   /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
   private readonly fieldGroups = new Map<string, {
     event: string; mode?: 'instant'; at: number; chatId: number; threadId?: number; replyTo: number; count: number;
@@ -426,6 +434,7 @@ export class TelegramBot {
         if (!posted) throw new Error('Telegram seat ask reply was not posted');
       }),
     } };
+    this.channelOpReplyInstance = opts.channelOpReply?.instance;
 
     if (opts.onTriggerTap) {
       // Assign through `as unknown` to bypass `readonly` + private —
@@ -1191,6 +1200,13 @@ export class TelegramBot {
   /** Main long-poll loop. Runs until stop() is called. */
   async start(): Promise<void> {
     this.running = true;
+    if (this.channelOpReplyInstance && !this.channelOpReplyRoute) {
+      this.channelOpReplyRoute = startChannelOpReplyRoute({
+        transport: createTelegramChannelOpReplyTransport({ bot: this, botId: this.botId, instance: this.channelOpReplyInstance }),
+        botId: this.botId,
+        instance: this.channelOpReplyInstance,
+      });
+    }
     this.log(`telegram bot starting (allowlist size ${this.allowedUsers.size})`);
     this.seatAskTimer = setInterval(() => {
       void deliverSeatAnswers(this.seatWorkDeps.askDeps!).catch((error) => this.log(`seat ask delivery failed: ${String(error)}`));
@@ -1394,6 +1410,8 @@ export class TelegramBot {
     // Drain any in-flight / queued turns so `stop()` (and tests that
     // `await bot.start()`) observe turns finishing before we return.
     await this.turnChain;
+    await this.channelOpReplyRoute?.stop();
+    this.channelOpReplyRoute = undefined;
     this.log('telegram bot stopped');
   }
 
@@ -1913,8 +1931,9 @@ export class TelegramBot {
           debug.log('telegram.command', 'received', { token, argumentCount: args.length, branch: 'match' });
           let result = 'handler-completed';
           let handlerCompleted = false;
+          let commandReply: string | void = undefined;
           try {
-            const reply = await slashParse.cmd.handler(slashParse.args, ctx, {
+            commandReply = await slashParse.cmd.handler(slashParse.args, ctx, {
               userConfig: this.slashContext.userConfig,
               allCommands: this.slashCommands,
               sendButtons: async (text, buttons) => { await this.sendInlineKeyboard(ctx.chatId, text, buttons, { replyTo: ctx.messageId, threadId: ctx.threadId }); },
@@ -1925,17 +1944,22 @@ export class TelegramBot {
               fileSink: this.fileSinkForChat(ctx.chatId, ctx.threadId),
             });
             handlerCompleted = true;
-            if (reply) {
-              await this.sendMessage(ctx.chatId, reply, {
+            if (commandReply) {
+              await this.sendMessage(ctx.chatId, commandReply, {
                 replyTo: ctx.messageId, threadId: ctx.threadId, markdown: true,
               });
             }
           } catch (err: any) {
             result = handlerCompleted ? 'reply-send-failed' : 'handler-failed';
+            if (handlerCompleted && slashParse.cmd.name === 'askop') {
+              debug.log('telegram.op-direct', 'ack-send-failed', { updateId: ctx.updateId, botId: ctx.botId });
+            }
             try {
               await this.sendMessage(
                 ctx.chatId,
-                `Error running /${slashParse.cmd.name}: ${err?.message ?? err}`,
+                handlerCompleted && slashParse.cmd.name === 'askop'
+                  ? commandReply ?? '질문 처리 결과를 확인할 수 없습니다.'
+                  : `Error running /${slashParse.cmd.name}: ${err?.message ?? err}`,
                 { replyTo: ctx.messageId, threadId: ctx.threadId },
               );
             } catch {
@@ -3014,9 +3038,27 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
     // / provider — plus a hook for consumers to extend (cron push,
     // tests). setMyCommands is called on bot.start() so clients
     // auto-pick-up the menu without any re-install.
-    slashCommands: opts.extraSlashCommands
-      ? [...defaultTelegramCommands(), ...opts.extraSlashCommands]
-      : defaultTelegramCommands(),
+    slashCommands: (() => {
+      const askOpCommand = createAskOpTelegramSlashCommand({
+        allowedUserIds: tg.allowedUsers,
+        append: (message, provenanceKey) => {
+          const store = openMsgStore();
+          try { return store.appendWithProvenance(message, provenanceKey); }
+          finally { store.close(); }
+        },
+      });
+      const defaults = [...defaultTelegramCommands(), askOpCommand];
+      const extras = opts.extraSlashCommands ?? [];
+      const overriddenNames = new Set(extras.map((command) => command.name.toLowerCase()));
+      const seen = new Set<string>();
+      const uniqueExtras = extras.filter((command) => {
+        const name = command.name.toLowerCase();
+        if (seen.has(name)) return false;
+        seen.add(name);
+        return true;
+      });
+      return [...defaults.filter((command) => !overriddenNames.has(command.name.toLowerCase())), ...uniqueExtras];
+    })(),
     slashContext: {
       userConfig: opts.userConfig,
       ...(opts.daemonBridge !== undefined ? { daemonBridge: opts.daemonBridge } : {}),
@@ -3027,6 +3069,7 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
       ? { contextFirstStore: createContextFirstFileStore(joinPath(getElanousConfigDir(), 'telegram-context-first.json')) }
       : {}),
     ...opts.telegramBotOpts,
+      channelOpReply: opts.telegramBotOpts?.channelOpReply ?? { instance: resolveInstanceName() },
   });
   // Register the surface-HITL callback subscription up front so the
   // poll loop requests `callback_query` from the first getUpdates —

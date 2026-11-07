@@ -16,12 +16,13 @@ git config user.email test@example.invalid
 git config user.name test
 echo node_modules/ > .gitignore
 print base > readme.txt
+mkdir -p src
 git add .gitignore readme.txt
 git commit -qm base
 base=$(git rev-parse HEAD)
 git switch -qc feature/land-test
-print change > change.txt
-git add change.txt
+print change > src/change.ts
+git add src/change.ts
 git commit -qm change
 head=$(git rev-parse HEAD)
 git update-ref refs/remotes/origin/main $base
@@ -51,10 +52,23 @@ print -r -- $'# pr\thead\n9001\told-head' > "$queue_dir/land-queue.front.tsv"
 output=$(GH_STUB="$tmp/gh" GH_FIXTURE="$tmp/pr.json" LAND_PRODUCT_STUB="$tmp/product" \
   LAND_Q="$queue_dir/land-queue.tsv" LAND_EVDIR="$tmp/ev" LAND_RR_DIR="$rr" \
   LAND_SEAT_TREE="$repo" LAND_GATE_ROOT="$tmp/gates" LAND_NO_FETCH=1 \
-  zsh "$root/land-enqueue.sh" 9001 "$repo" --expected-head "$head" --front 2>&1)
+  LAND_TIER_CLASSIFIER="$root/seat-state/OP/tools/gate-tier.py" \
+  zsh "$root/land-enqueue.sh" 9001 "$repo" --expected-head "$head" --front --tier T2 2>&1)
 print -r -- "$output"
 [[ "$output" == *"review-error-ignored=card-error-9001-${head[1,12]}.json"* ]]
+[[ "$output" == *"tier=T2"* ]]
 [[ $(grep -c "^9001[[:space:]]" "$queue_dir/land-queue.front.tsv") == 1 ]]
 [[ $(cut -f2 "$queue_dir/land-queue.front.tsv" | tail -1) == "$head" ]]
 [[ $(grep -c "^9001[[:space:]]" "$queue_dir/land-queue.tsv") == 1 ]]
-print 'PASS land-enqueue review-error NOTES and --front re-registration'
+awk -F '\t' '!/^#/ { if(NF != 4) exit 1; count++ } END { if(count != 1) exit 1 }' "$queue_dir/land-queue.tsv"
+jq -e '.gateTier.tier=="T2" and (.gateTier.rules|index("op-raised-tier"))!=null and .gateTier.changedFiles==1 and .gateTier.changedLines==1' "$tmp/ev/overlap-evidence-9001.json" >/dev/null
+if lower=$(GH_STUB="$tmp/gh" GH_FIXTURE="$tmp/pr.json" LAND_PRODUCT_STUB="$tmp/product" \
+  LAND_Q="$queue_dir/land-queue.tsv" LAND_EVDIR="$tmp/ev" LAND_RR_DIR="$rr" \
+  LAND_SEAT_TREE="$repo" LAND_GATE_ROOT="$tmp/gates" LAND_NO_FETCH=1 \
+  LAND_TIER_CLASSIFIER="$root/seat-state/OP/tools/gate-tier.py" \
+  zsh "$root/land-enqueue.sh" 9001 "$repo" --expected-head "$head" --tier T0 2>&1); then
+  print -u2 -r -- "expected lower-tier override refusal, got: $lower"
+  exit 1
+fi
+[[ "$lower" == *"gate-tier-lowering-requires-waiver"* ]]
+print 'PASS land-enqueue classifier evidence, raise-only override, and four-column row'

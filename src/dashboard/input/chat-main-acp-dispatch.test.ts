@@ -16,6 +16,7 @@ test('dashboard ACP goal boundary folds each unfinished reply but preserves inte
         handlers.pushToolCall('도구: Read');
         handlers.appendChunk('최종 영상: /tmp/final.mp4');
         handlers.onDone('end_turn');
+        done.resolve();
       },
     },
     backend: 'claude', message: 'n8n 영상 만들기', attachments: [], debugEnabled: false,
@@ -24,7 +25,6 @@ test('dashboard ACP goal boundary folds each unfinished reply but preserves inte
     formatAssistantPrefix: () => '엘라누스:', formatUserLine: (_display, text) => text,
     formatMutedLine: (text) => text, formatToolLine: (text) => text,
     formatDebugLine: () => '', formatErrorLine: (_display, text) => text,
-    onTurnDone: () => done.resolve(),
   });
   await done.promise;
   expect(lines).toEqual([
@@ -42,6 +42,7 @@ test('dashboard ACP replaces provisional assistant text in place with the final 
         handlers.appendChunk('선답은 아직 검증되지 않았습니다.');
         handlers.replaceText?.('최종 답변 하나만 남습니다.');
         handlers.onDone('end_turn');
+        done.resolve();
       },
     },
     backend: 'claude', message: '분석해줘', attachments: [], debugEnabled: false,
@@ -50,7 +51,6 @@ test('dashboard ACP replaces provisional assistant text in place with the final 
     formatAssistantPrefix: () => '엘라누스:', formatUserLine: (_display, text) => text,
     formatMutedLine: (text) => text, formatToolLine: (text) => text,
     formatDebugLine: () => '', formatErrorLine: (_display, text) => text,
-    onTurnDone: () => done.resolve(),
   });
   await done.promise;
   expect(lines).toEqual(['분석해줘', '엘라누스: 최종 답변 하나만 남습니다.']);

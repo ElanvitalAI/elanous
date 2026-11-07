@@ -209,7 +209,7 @@ export function createFakeAppStorage(options: AppStorageOptions = {}): AppStorag
     try { return options.run!(bin, args, runOptions); }
     catch (error) { providerError = error; throw error; }
   }) : undefined;
-  const store = createObjectStore(storeConfig, { run });
+  const store = createObjectStore(storeConfig, { run, which: (name) => name });
   const now = options.now ?? Date.now;
   const signingKey = options.signingKey ?? randomBytes(32).toString('base64url');
   const appQuotaBytes = options.appQuotaBytes ?? 10 * 1024 * 1024;

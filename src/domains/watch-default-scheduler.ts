@@ -5,7 +5,7 @@ import { getUserConfig } from '../user-config.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { listSources, runDue } from '../intake-plane/intake-sources.js';
 import { runIntakeDigestCli } from '../cli/intake-cli.js';
-import { resolveTimeZone } from '../time/format.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 import { inventoryInternalSchedules, openSchedulesDb } from './schedule-registry.js';
 import type { Database } from 'bun:sqlite';
 

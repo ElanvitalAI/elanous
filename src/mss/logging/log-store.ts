@@ -29,7 +29,7 @@ import { LOG_LEVEL_ORDER, type LogLevel, type LogRecord } from './record.js';
 import type { LogSink } from './sink.js';
 import { setInstanceName, resolveInstanceName } from '../../instance-identity.js';
 import * as nestDepth from '../../agent/nest-depth.js';
-import { debug } from '../../debug/log.js';
+import { logDiagnostic } from './diagnostic-sink.js';
 import { DebugLogBatchQueue, defaultDebugBatchScheduler, type DebugBatchScheduler } from '../../debug/batch-queue.js';
 import { assertNotTestWritingOps } from '../../instance/test-write-guard.js';
 
@@ -104,6 +104,7 @@ export const STORE_SAFETY_MAX = 100_000;
 /** Read-only federation waits briefly for a concurrent writer before surfacing an unreadable store. */
 export const LOG_STORE_READONLY_BUSY_TIMEOUT_MS = 2_000;
 const LOG_STORE_WRITE_BUSY_TIMEOUT_MS = 5_000;
+const LOG_STORE_OPEN_BUSY_TIMEOUT_MS = 250;
 const LOG_STORE_OPEN_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600] as const;
 const LOG_STORE_BUSY_RETRY_MAX_ATTEMPTS = 3;
 const LOG_STORE_BUSY_RETRY_BUFFER_MAX_ROWS = 2_000;
@@ -117,7 +118,7 @@ function sqliteBusy(error: unknown): boolean {
 
 function emitInsertBusyLost(data: Record<string, unknown>): void {
   try { process.stderr.write(`[store.sqlite] busy-lost ${JSON.stringify(data)}\n`); } catch { /* diagnostics must not block callers */ }
-  try { debug.log('store.sqlite', 'busy-lost', data); } catch { /* diagnostics must not block callers */ }
+  try { logDiagnostic('store.sqlite', 'busy-lost', data); } catch { /* diagnostics must not block callers */ }
 }
 
 function topCategories(rows: readonly LogStoreInsertRow[]): string[] {
@@ -242,9 +243,10 @@ export class LogStore {
       let db: Database | undefined;
       try {
         db = new Database(path);
-        db.run(`PRAGMA busy_timeout = ${LOG_STORE_WRITE_BUSY_TIMEOUT_MS}`);
+        db.run(`PRAGMA busy_timeout = ${LOG_STORE_OPEN_BUSY_TIMEOUT_MS}`);
         this.db = db;
         this.initializeWriter();
+        db.run(`PRAGMA busy_timeout = ${LOG_STORE_WRITE_BUSY_TIMEOUT_MS}`);
         break;
       } catch (error) {
         db?.close();
@@ -261,14 +263,15 @@ export class LogStore {
     for (const item of pendingBusyOpenLosses.filter((entry) => entry.path === path)) {
       try {
         this.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'store.sqlite', event: 'busy-lost', data: item.loss }, surface: 'nexus' }]);
-        debug.log('store.sqlite', 'busy-lost', item.loss);
+        logDiagnostic('store.sqlite', 'busy-lost', item.loss);
         pendingBusyOpenLosses.splice(pendingBusyOpenLosses.indexOf(item), 1);
       } catch { /* retain the observation for the next writable connection */ }
     }
   }
 
   private initializeWriter(): void {
-    this.db.run('PRAGMA journal_mode = WAL');
+    const journalMode = this.db.query('PRAGMA journal_mode').get() as { journal_mode?: string } | null;
+    if (journalMode?.journal_mode?.toLowerCase() !== 'wal') this.db.run('PRAGMA journal_mode = WAL');
     this.db.run(`CREATE TABLE IF NOT EXISTS logs(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts TEXT NOT NULL,
@@ -376,7 +379,7 @@ export class LogStore {
       insertAll(allRows);
       this.busyRetryBuffer = [];
       for (const batch of retrying) {
-        try { debug.log('store.sqlite', 'busy-recovered', { rows: batch.rows.length, attempts: batch.attempts + 1 }); }
+        try { logDiagnostic('store.sqlite', 'busy-recovered', { rows: batch.rows.length, attempts: batch.attempts + 1 }); }
         catch { /* diagnostics must not affect writes */ }
       }
     } catch (error) {
@@ -453,7 +456,7 @@ export class LogStore {
           const neededShare = 1 - policy.maxDbMb / sizeMb;
           const outsideShare = split.allBytes > 0 ? split.outsideBytes / split.allBytes : 0;
           if (outsideShare < neededShare) {
-            debug.log('mss.logging', 'retention-floor-held', {
+            logDiagnostic('mss.logging', 'retention-floor-held', {
               totalMb: Math.round(sizeMb * 10) / 10, maxTotalMb: policy.maxDbMb, floorHours,
               neededShare: Math.round(neededShare * 1000) / 1000, outsideShare: Math.round(outsideShare * 1000) / 1000,
               deletedRows: deletedBySize,
@@ -470,7 +473,7 @@ export class LogStore {
     }
     if (deletedByAge > 0 || deletedBySize > 0) {
       const oldest = (this.db.query('SELECT MIN(ts_ms) AS t FROM logs').get() as { t: number | null }).t;
-      debug.log('log-store.retention', 'deleted', { deletedByAge, deletedBySize, oldestTs: oldest === null ? null : new Date(oldest).toISOString() });
+      logDiagnostic('log-store.retention', 'deleted', { deletedByAge, deletedBySize, oldestTs: oldest === null ? null : new Date(oldest).toISOString() });
     }
     return { deletedByAge, deletedBySize };
   }
@@ -792,7 +795,7 @@ function reportDefaultStoreUnavailable(reason: 'disabled-for-test' | 'open-faile
     ? 'disabled because NODE_ENV=test'
     : 'could not be opened; continuing without the log store';
   if (reason === 'disabled-for-test') {
-    debug.log('mss.log-store', 'default log store unavailable', { detail });
+    logDiagnostic('mss.log-store', 'default log store unavailable', { detail });
     return;
   }
   try { process.stderr.write(`[mss] default log store unavailable: ${detail}\n`); } catch { /* diagnostics must not affect callers */ }
@@ -1239,7 +1242,7 @@ export function alertStaleLogDbOpeners(
       const relation = opener.revisionSha && marker.sha
         ? revisionRelation(opener.revisionSha, marker.sha, deps.installedRoot) : undefined;
       if (relation === 'different') {
-        debug.log('log-store.retention', 'different-opener-alert', {
+        logDiagnostic('log-store.retention', 'different-opener-alert', {
           pid: opener.pid, db: dbPath, openerSha: opener.revisionSha, installedSha: marker.sha,
           reason: 'checkout revision ancestry unavailable or divergent',
         }, { level: 'warn' });
@@ -1249,7 +1252,7 @@ export function alertStaleLogDbOpeners(
       if (!reason) continue;
       const startedAt = opener.startedAtMs === null ? null : new Date(opener.startedAtMs).toISOString();
       alerts.push({ pid: opener.pid, start: opener.start, startedAt, reason });
-      debug.log('log-store.retention', 'stale-opener-alert', {
+        logDiagnostic('log-store.retention', 'stale-opener-alert', {
         pid: opener.pid, start: opener.start, startedAt, reason,
         db: dbPath, installedSha: marker.sha, openerSha: opener.revisionSha ?? null, installedAtMs,
         marker: marker.marker, via: 'procfs-fd+stat',
@@ -1357,7 +1360,7 @@ function runStampedRetention(store: LogStore, retention: LogStoreRetention, owne
     alertStaleLogDbOpeners(store.path);
     store.enforceRetention(retention);
     try { store.reclaimFreePages(); }
-    catch (error) { debug.log('log-store.retention', 'reclaim-failed', { reason: error instanceof Error ? error.message : String(error) }); }
+    catch (error) { logDiagnostic('log-store.retention', 'reclaim-failed', { reason: error instanceof Error ? error.message : String(error) }); }
     const temporary = `${stampPath}.${process.pid}.${randomUUID()}.tmp`;
     try {
       writeFileSync(temporary, String(Date.now()));
@@ -1389,7 +1392,7 @@ export function registerLogStoreSink(
   const owner = opts.retentionOwner ?? surface === 'nexus';
   const runRetention = (): void => {
     try { runStampedRetention(store, retention, owner); }
-    catch (error) { debug.log('log-store.retention', 'failed', { reason: error instanceof Error ? error.message : String(error) }); }
+    catch (error) { logDiagnostic('log-store.retention', 'failed', { reason: error instanceof Error ? error.message : String(error) }); }
   };
   const startup = setImmediate(runRetention);
   const h = owner ? setInterval(runRetention, RETENTION_INTERVAL_MS) : null;

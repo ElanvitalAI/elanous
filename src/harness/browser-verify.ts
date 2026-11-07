@@ -25,7 +25,7 @@ const DEFAULT_ASIDE_TIMEOUT_MS = 30_000;
 const ASIDE_SHOT_MAX_BYTES = 8 * 1024 * 1024;
 const ASIDE_SHOT_MARKER = 'ELANOUS_SHOT_BASE64:';
 // Observed load events and complete page content arrive within this window; timeout remains non-blocking.
-const CDP_LOAD_WAIT_TIMEOUT_MS = 3_000;
+export const CDP_LOAD_WAIT_TIMEOUT_MS = 3_000;
 
 type CdpLoadWaitOutcome = 'event' | 'timeout' | 'unavailable';
 

@@ -11,6 +11,7 @@ import { parseSimWorld } from '../ux-sim/world-schema.js';
 import { listMockDeviceRequests, renderMockDeviceRequests, requestMockDevice } from '../ux-sim/mock-device-requests.js';
 import { compareDeviceRecording, deviceFidelityStatus } from '../ux-sim/device-fidelity.js';
 import { readSimCoverage } from '../ux-sim/sim-coverage.js';
+import { readSimWorldWatchEvents, renderSimWorldWatchEvent } from '../ux-sim/world-watch.js';
 
 export function registerSimCommands(program: Command): void {
   const sim = program.command('sim').description('격리 시나리오를 실행하고 화면·로그 기대값을 대조한다');
@@ -144,6 +145,37 @@ export function registerSimCommands(program: Command): void {
       }
     });
   const world = sim.command('world').description('test 우주 안에서 독립 시뮬레이션 작업공간과 선언형 세계를 다룬다');
+  sim.command('watch <world-id>')
+    .description('시뮬 월드의 실행 중 관측 사건을 실시간으로 읽는다(test 우주 전용)')
+    .option('--once', '현재까지 기록된 사건만 출력하고 종료한다')
+    .action(async (worldId: string, opts: { once?: boolean }) => {
+      try {
+        if (!getTestStateRoot()) throw new Error('sim watch requires --test isolated mode');
+        const current = loadWorld(worldId);
+        let offset = 0;
+        const drain = () => {
+          const batch = readSimWorldWatchEvents(current, offset);
+          offset = batch.offset;
+          for (const event of batch.events) console.log(renderSimWorldWatchEvent(event));
+        };
+        drain();
+        if (opts.once) return;
+        const stop = new AbortController();
+        const onInterrupt = () => stop.abort();
+        process.once('SIGINT', onInterrupt);
+        try {
+          while (!stop.signal.aborted) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            drain();
+          }
+        } finally {
+          process.removeListener('SIGINT', onInterrupt);
+        }
+      } catch (error) {
+        console.error(`sim watch: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 2;
+      }
+    });
   world.command('validate <world-yaml>')
     .description('선언형 world YAML을 mock catalog에 대조해 검증한다')
     .action((worldYaml: string) => {

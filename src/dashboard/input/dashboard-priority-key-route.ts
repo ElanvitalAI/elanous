@@ -40,38 +40,6 @@ export interface DashboardPriorityKeyRouteDeps<Action> {
    *  fires; the route then short-circuits to `{type:'quit'}`
    *  regardless of any other state. */
   isForceQuitChord: (key: Key) => boolean;
-  /** PR-S1V.4-wiring · Step 0x — Voice mode entry chord
-   *  (Ctrl+Shift+V). Fires from ANYWHERE (popup terminal · VW
-   *  terminal · bell modal · dashboard) so the user always has a
-   *  single chord to enter voice mode. Returns true only when voice
-   *  mode is currently `idle` and the chord matches; active /
-   *  recording / processing states defer to `routeVoiceModeKey`
-   *  below. */
-  routeVoiceEnterChord: (key: Key) => boolean;
-  /** PR-S1V.4-wiring · Step 0c — Voice mode active key dispatch.
-   *  When voice mode is active/recording/processing, every key flows
-   *  through the host's `maybeHandleKey` (modal A invariant — the
-   *  host swallows everything that isn't an explicit voice action so
-   *  bell · terminal · editor primitives never see release/repeat
-   *  artefacts of the kitty `>3u` protocol). Escape hatches (Force
-   *  quit) are above this step so the user can
-   *  always escape. */
-  routeVoiceModeKey: (key: Key) => boolean;
-  /** experiment/voice-chat-realtime-rebind (2026-04-30) — Step 0r:
-   *  Ctrl+Shift+R chord toggles continuous voice-chat mode (Phase 4-5).
-   *  Sits at the same priority tier as `routeVoiceEnterChord` so the
-   *  user can enter/exit from anywhere (popup terminal · VW terminal ·
-   *  bell modal · dashboard). The handler claims the key, kicks off
-   *  the async toggle, and returns true synchronously. */
-  routeVoiceChatRealtimeChord: (key: Key) => boolean;
-  /** experiment/voice-chat-realtime-rebind · Step 0s — voice-chat
-   *  modal-A swallow. When the voice-chat mode controller is active
-   *  (listening / processing / speaking), every key not explicitly
-   *  handled above (chord toggle, force-quit, ESC) is swallowed so
-   *  typing doesn't leak into the chat input or bell modal. ESC fires
-   *  the controller's exit hook before swallow. Returns false when
-   *  the controller is idle so legacy dispatch paths stay reachable. */
-  routeVoiceChatActiveKey: (key: Key) => boolean | Promise<boolean>;
   routeBellKey: (key: Key) => boolean | Promise<boolean>;
   /** Classic sidetab prefix keys must be seen before an exclusive shell modal. */
   routeSidetabKey?: (key: Key) => boolean;
@@ -115,30 +83,6 @@ export async function routeDashboardPriorityKey<Action>(
   if (deps.isForceQuitChord(key)) {
     if (tracing) trace('isForceQuitChord', key, 'quit');
     return { type: 'quit' };
-  }
-
-  // Step 0x: Voice mode entry chord (Ctrl+Shift+V).
-  if (deps.routeVoiceEnterChord(key)) {
-    if (tracing) trace('routeVoiceEnterChord', key, true);
-    return { type: 'handled' };
-  }
-
-  // Step 0c: Voice mode active dispatch (modal A invariant).
-  if (deps.routeVoiceModeKey(key)) {
-    if (tracing) trace('routeVoiceModeKey', key, true);
-    return { type: 'handled' };
-  }
-
-  // Step 0r: voice-chat continuous toggle chord (Alt+R).
-  if (deps.routeVoiceChatRealtimeChord(key)) {
-    if (tracing) trace('routeVoiceChatRealtimeChord', key, true);
-    return { type: 'handled' };
-  }
-
-  // Step 0s: voice-chat modal-A swallow.
-  if (await deps.routeVoiceChatActiveKey(key)) {
-    if (tracing) trace('routeVoiceChatActiveKey', key, true);
-    return { type: 'handled' };
   }
 
   // Step 1: notification bell modal — when open, claims keys above

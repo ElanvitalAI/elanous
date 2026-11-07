@@ -1,0 +1,17 @@
+kind: gate-deps-root-bake
+isolation: test
+production:
+  stage: src/task-orchestrator/surfaces/pod-gate-deps.ts
+  imageBoundary: docker/harness/Dockerfile
+  shardInstall: scripts/release-loop/gate-node.ts
+case:
+  id: root-postinstall-script-is-present-in-image-context
+  packageScript: node scripts/npm-postinstall.cjs
+  fault: staged manifest includes lifecycle command but its local script is absent
+  expectedLog: baked
+  expectedDriftLog: miss:lifecycle input differs
+  installSlots: 4
+  expect:
+    imageBuild: root and apps/pwa node_modules present
+    shard: root and apps/pwa use baked node_modules symlinks
+    rootInstallSlot: unused

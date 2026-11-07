@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync, readlinkSync, readdirSync } from 'node:fs';
 import { cronMatches } from '../domains/cron-match.js';
-import { resolveTimeZone } from '../time/format.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 
 export interface CliProcess { pid: number; ppid: number; ageSeconds: number; cpuSeconds: number; command: string }
 export interface OrphanCandidate { process: CliProcess; tree: CliProcess[]; periodMinutes: number }

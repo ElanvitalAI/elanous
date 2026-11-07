@@ -211,8 +211,7 @@ export interface TextInputHost {
   control?: {
     repaint: () => void;
     insertAtCursor?: (text: string) => void;
-    /** External submit trigger — voice multi-turn auto-Enter, mouse
-     *  surface actions, etc. When `text` is provided, replaces the
+    /** External submit trigger for host-driven actions. When `text` is provided, replaces the
      *  buffer; then injects a synthetic Enter key into the readKey
      *  queue so the textInput main loop returns the submit outcome
      *  exactly as if the user had typed Enter. Reset to undefined on
@@ -543,8 +542,6 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   // dispatch by argument (immediate slash-executor for panes, registry for LLM surfaces).
   // They are documented in the single merged '/surface' entry to keep names unique.
   { name: 'qc',      aliases: [],          description: 'Quick-control — arm one-shot control mode; next message runs as control, then auto-return to chat.' },
-  { name: 'voice-chat', aliases: ['vc'], description: 'Continuous voice chat mode — speak, elanous replies in voice (Phase 4-5). Subcommands: start / stop / cancel / status. Chord: Alt+R toggles enter/exit anywhere.', subcommands: ['start', 'stop', 'cancel', 'status'] },
-  { name: 'auto-tts', aliases: ['tts', 'autotts'], description: 'Auto-TTS for chat responses (Phase 2) — speaks LLM replies sentence-by-sentence. Subcommands: on / off / toggle / status.', subcommands: ['on', 'off', 'toggle', 'status'] },
   { name: 'directive', aliases: [], description: '(운영) 지시를 Linear 이슈로 기록' },
 ]).map((command) => ({ ...command, hidden: !FIRST_USE_SLASH_COMMANDS.has(command.name) }));
 
@@ -1512,9 +1509,7 @@ export async function textInput(opts: {
       onUserBufferEdit();
       drawAll();
     };
-    // 2026-04-30 — external auto-submit hook. Voice multi-turn's
-    // sticky-less dictate-fallback uses this to simulate a typed
-    // Enter after the transcript lands in the buffer. When `text`
+    // External submit hook. When `text`
     // is provided, replace the buffer; then inject a synthetic
     // Enter into the readKey queue so the main loop returns the
     // submit outcome exactly like a typed Enter. Reset to

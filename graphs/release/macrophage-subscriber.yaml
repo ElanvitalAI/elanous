@@ -1,0 +1,17 @@
+graph_id: release-macrophage-subscriber
+version: 1
+entry_node: macrophage-heal
+terminal_nodes: [done]
+nodes:
+  - node_id: macrophage-heal
+    kind: agent
+    recipe: none
+    max_visits: 1
+    subscribes:
+      - { event: node-end, match: { nodeId: pre-gate-join }, action: wake }
+      - { event: node-end, match: { nodeId: pre-prepare-join }, action: wake }
+      - { event: node-end, match: { nodeId: release-post-publish-join }, action: wake }
+      - { event: node-end, match: { nodeId: traffic-failed-restore }, action: wake }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: macrophage-heal, on: outcome, map: { ok: done, fail: done, error: done } }

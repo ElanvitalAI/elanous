@@ -48,14 +48,18 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     });
     const done = Promise.withResolvers<void>();
     dispatchDashboardChatMainAcpSend({
-      dashboardAcpChat: chat,
+      dashboardAcpChat: {
+        send: async (...args) => {
+          await chat.send(...args);
+          done.resolve();
+        },
+      },
       backend: 'claude', message: userInput, attachments: [], debugEnabled: false,
       chatLines: lines, setChatScrollToTail: () => {}, redraw: () => {},
       formatAssistantLines: (text) => text.split('\n'), formatUserLine: (_display, text) => text,
       formatMutedLine: (line) => line, formatToolLine: (line) => line,
       formatDebugLine: () => '', formatErrorLine: (_display, text) => text,
       formatAssistantPrefix: () => '엘라누스:',
-      onTurnDone: () => done.resolve(),
     });
     await done.promise;
     const screen = lines.join('\n');

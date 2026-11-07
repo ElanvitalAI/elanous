@@ -14,6 +14,7 @@ import {
   handleModelTierPut,
 } from '../../src/nexus/api/config-model-tier.js';
 import { __resetXdgDeprecationWarningForTests, reloadUserConfig, userConfigPath } from '../../src/user-config.js';
+import { expectMalformedJson400 } from '../helpers/http-error-contract';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 
 let tmpDir: string;
@@ -163,8 +164,7 @@ describe('M1-2b · PUT /v1/config/model-tier', () => {
       headers: { 'content-type': 'application/json' },
       body: '{ not json',
     }));
-    expect(res.status).toBe(400);
     const body = await asJson(res);
-    expect(body.error).toBe('invalid-json');
+    await expectMalformedJson400({ status: res.status, body }, 'invalid-json');
   });
 });

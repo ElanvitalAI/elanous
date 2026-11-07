@@ -21,7 +21,7 @@ import { collectSemisView, type SemisView } from './kg-semis.js';
 import { readLatestClosePulse } from './us-pulse.js';
 import { collectSignalBoard } from '../nexus/api/signal-board-api.js';
 import type { SignalBoard } from './signal-board.js';
-import { dateKey } from '../time/format.js';
+import { dateKey } from '../time/calendar.js';
 
 export interface MorningSources {
   nowIso: string;

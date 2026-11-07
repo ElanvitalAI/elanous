@@ -15,8 +15,8 @@ import {
   routeAgentSessionUpdate,
 } from '../src/acp/multi-llm-bridge.js';
 import type { AcpTurnContext } from '../src/acp/server.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
-import type { CoreTurnContext } from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
+import type { CoreTurnContext } from '../src/core-turn/types.js';
 
 describe('readMultiLlmHint (DM-1)', () => {
   it('returns null when promptMeta is undefined', () => {

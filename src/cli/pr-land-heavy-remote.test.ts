@@ -3,7 +3,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensurePrLandHeavyRemote, PR_LAND_HEAVY_HOSTS, validatePrLandRemoteGitReceipt, type PrLandRemoteGitRequest } from './pr-land-heavy-remote.js';
+import { assessPrLandTypecheckDrift, ensurePrLandHeavyRemote, PR_LAND_HEAVY_HOSTS, validatePrLandRemoteGitReceipt, type PrLandRemoteGitRequest } from './pr-land-heavy-remote.js';
+import { classifyPrLandRefusal } from './pr-land-refusal.js';
 import { GATE_REMOTE_DEFAULTS, type RemoteRunOptions } from '../self-implement/gate-remote.js';
 import { runBunShard } from '../self-dev/shard-run.js';
 import { runSelfGateCli } from '../self-implement/gate-cli.js';
@@ -15,6 +16,51 @@ const HEAD = 'a'.repeat(40);
 const MAIN = 'b'.repeat(40);
 const NEXT_MAIN = 'c'.repeat(40);
 const extraPass = Buffer.from('[pr-land-extra-gates] pass global=measured interference=measured files=2\n');
+
+test('pinned typecheck delta is classified only from one matching-main summary', () => {
+  const drift = `[tsc-main-delta] base=${MAIN} base_rc=1 head=${HEAD} head_rc=1 baseline_errors=3 head_errors=5 new_errors=2\nerror: main-baseline tsc introduced 2 TypeScript diagnostic(s)`;
+  expect(assessPrLandTypecheckDrift(drift, MAIN)).toBe('drift');
+  expect(assessPrLandTypecheckDrift(drift, NEXT_MAIN)).toBe('drift-unmeasured');
+  expect(assessPrLandTypecheckDrift(`[tsc-main-delta] base=${MAIN} base_rc=0 head=${HEAD} head_rc=0 baseline_errors=0 head_errors=0 new_errors=0`, MAIN)).toBe('drift-unrelated');
+  expect(assessPrLandTypecheckDrift(`[tsc-main-delta] base=${MAIN} new_errors=2`, MAIN)).toBe('drift-unmeasured');
+  expect(assessPrLandTypecheckDrift(`${drift}\n${drift}`, MAIN)).toBe('drift-unmeasured');
+  expect(assessPrLandTypecheckDrift(`${drift}\n[tsc-main-delta]base=${MAIN} new_errors=2`, MAIN)).toBe('drift-unmeasured');
+  expect(assessPrLandTypecheckDrift(`${drift}\nerror: main-baseline tsc introduced 2 TypeScript diagnostic(s)`, MAIN)).toBe('drift-unmeasured');
+  expect(assessPrLandTypecheckDrift(`${drift}\nerror: main-baseline tsc introduced 1 TypeScript diagnostic(s)`, MAIN)).toBe('drift-unmeasured');
+  expect(assessPrLandTypecheckDrift(`[tsc-main-delta] base=${MAIN} base_rc=0 head=${HEAD} head_rc=0 baseline_errors=0 head_errors=0 new_errors=0\nerror: main-baseline tsc introduced 1 TypeScript diagnostic(s)`, MAIN)).toBe('drift-unmeasured');
+});
+
+test('a matching remote heavy-gate failure carries its pinned typecheck drift verdict', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-drift-'));
+  try {
+    const result = ensurePrLandHeavyRemote({ pr: 92, head: HEAD, main: MAIN, repo: '/repo', evidenceDir }, {
+      settings: GATE_REMOTE_DEFAULTS, observe: () => {},
+      runRemote: () => ({ kind: 'ran', rc: 1, commit: HEAD, host: 'node-b', ms: 3,
+        stdout: Buffer.from(`[tsc-main-delta] base=${MAIN} base_rc=1 head=${HEAD} head_rc=1 baseline_errors=3 head_errors=5 new_errors=2\n`),
+        stderr: Buffer.from('error: main-baseline tsc introduced 2 TypeScript diagnostic(s)\n') }),
+    });
+    expect(result).toMatchObject({ ok: false, typecheckDrift: 'drift' });
+    expect(classifyPrLandRefusal(`✗ heavy-remote: 원격 게이트 ${result.reason} — 로컬 게이트로 폴백하지 않는다.`, {
+      typecheckDrift: result.typecheckDrift,
+    })).toBe('typecheck-drift');
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
+test('typecheck drift evidence does not cross a remote head or host identity mismatch', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-drift-identity-'));
+  try {
+    const output = Buffer.from(`[tsc-main-delta] base=${MAIN} base_rc=1 head=${HEAD} head_rc=1 baseline_errors=3 head_errors=5 new_errors=2\nerror: main-baseline tsc introduced 2 TypeScript diagnostic(s)`);
+    for (const runRemote of [
+      () => ({ kind: 'ran' as const, rc: 1, commit: NEXT_MAIN, host: 'node-b', ms: 1, stdout: output, stderr: Buffer.alloc(0) }),
+      () => ({ kind: 'ran' as const, rc: 1, commit: HEAD, host: 'node-c', ms: 1, stdout: output, stderr: Buffer.alloc(0) }),
+    ]) {
+      const result = ensurePrLandHeavyRemote({ pr: 93, head: HEAD, main: MAIN, repo: '/repo', evidenceDir }, {
+        settings: GATE_REMOTE_DEFAULTS, observe: () => {}, runRemote,
+      });
+      expect(result.typecheckDrift).toBeUndefined();
+    }
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
 
 test('remote git receipt contract requires matching pinned identity and result SHAs', () => {
   const request: PrLandRemoteGitRequest = {

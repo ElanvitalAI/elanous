@@ -3,6 +3,7 @@
 import { describe, expect, test } from 'bun:test';
 import { handleOutboundTokens } from '../../../src/nexus/api/outbound-tokens';
 import { InMemoryDeviceTokenStore } from '../../../src/showroom/outbound/token-store';
+import { expectMalformedJson400 } from '../../helpers/http-error-contract';
 
 function jsonRequest(method: string, body?: unknown): Request {
   const init: RequestInit = { method };
@@ -90,6 +91,6 @@ describe('handleOutboundTokens', () => {
       headers: { 'content-type': 'application/json' },
     });
     const res = await handleOutboundTokens(bad, { tokenStore: store });
-    expect(res.status).toBe(400);
+    await expectMalformedJson400(res);
   });
 });

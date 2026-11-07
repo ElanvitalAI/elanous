@@ -874,7 +874,7 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
   } catch { /* shadow observation cannot change the install decision */ }
   try { debug.log('self-update.rail-safe', 'shadow', railSafe); } catch { /* shadow observation never changes update decisions */ }
   try {
-    const install = run('bash', ['-s', '--', '--no-modify-path', '--prefix', prefix], prefix, installer, envLiteral({ ELANOUS_VERSION: version ?? '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: base }));
+    const install = run('bash', ['-s', '--', '--yes', '--no-modify-path', '--prefix', prefix], prefix, installer, envLiteral({ ELANOUS_VERSION: version ?? '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: base }));
     if (install.status !== 0) return fail(1, `설치 실패: ${install.stderr.trim() || install.status}`);
     const metadata: unknown = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8'));
     const installedVersion = typeof metadata === 'object' && metadata !== null && 'version' in metadata && typeof metadata.version === 'string'

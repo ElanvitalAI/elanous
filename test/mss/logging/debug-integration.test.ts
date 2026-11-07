@@ -13,7 +13,7 @@ import { __resetFlagsForTests } from '../../../src/mss/feature-flags.js';
 import {
   __resetIdentityForTests,
   __setIdentityFileForTests,
-} from '../../../src/mss/identity.js';
+} from '../../../src/mss/identity-store.js';
 import { startTurnTrace, withSpan } from '../../../src/mss/trace-context.js';
 
 function mostRecentEvent(): DebugEvent | undefined {

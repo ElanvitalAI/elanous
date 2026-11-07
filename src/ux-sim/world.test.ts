@@ -19,6 +19,7 @@ import { createSimWorld } from './world-store.js';
 import { assembleWorld, createWorld, destroyWorld, destroyWorldById, executeWorldScenario, loadWorld, runInWorld, runWorldScenario, verifyWorldNetworkIsolation, type SimMailbox } from './world.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { activeResourceLeases, readResourceLedger } from '../resource-ledger/resource-ledger.js';
+import { readSimWorldWatchEvents } from './world-watch.js';
 
 const scenarioPath = join(import.meta.dir, '../../scenarios/ux-sim/night-train-dead-pid-lock.yaml');
 const worldPath = join(import.meta.dir, '../../scenarios/ux-sim/night-train-world.yaml');
@@ -280,6 +281,10 @@ test.skipIf(process.platform !== 'darwin')('night-train injects a dead-pid run l
         { event: 'live-pid-lock', verdict: 'already-running' },
         { event: 'dead-pid-lock', verdict: 'ready' },
       ]);
+      const observed = readSimWorldWatchEvents(world);
+      expect(observed.events.map(({ event, verdict }) => ({ event, verdict }))).toEqual(result.observations);
+      expect(observed.events.every((row) => row.runId.startsWith('run-'))).toBe(true);
+      expect(observed.events.map((row) => row.sequence)).toEqual([1, 2]);
       expect(result.devices).toEqual(['fake-kubectl:node-b', 'fake-kubectl:gcp2', 'fake-llm', 'fake-gh', 'fake-clock', 'mail']);
       expect(world.networkEvents).toEqual([]);
       expect((await runWorldScenario(world, scenarioPath)).pass).toBe(true);

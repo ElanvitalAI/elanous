@@ -30,6 +30,9 @@ describe('MAT1a CLI root maturity', () => {
     for (const command of commands) expect(cliRootMaturity(command.name())).toBeDefined();
     expect(cliRootMaturity('mission')).toBe('beta');
     expect(cliRootMaturity('resource')).toBe('beta');
+    expect(names).not.toContain('autopilot');
+    expect(commands.find(command => command.name() === 'ops')?.commands.map(command => command.name())).not.toContain('mission');
+    expect(commands.find(command => command.name() === 'harness')?.commands.map(command => command.name())).not.toContain('mission');
     for (const name of absentPrivateLedger) expect(names).not.toContain(name);
     expect(Object.keys(grades).sort()).toEqual([...names, ...system.filter(name => !names.includes(name)), ...absentPrivateLedger].sort());
     const doc = readFileSync(join(import.meta.dir, '../../release/public/docs/commands.md'), 'utf8');

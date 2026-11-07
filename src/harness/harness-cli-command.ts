@@ -62,7 +62,6 @@ import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harnes
 import { podChildProviderRefusal } from '../task-orchestrator/surfaces/pod-child-providers.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import { classifyGarbage, isGarbageProcessTarget, type GarbageProcess } from './process-garbage.js';
-import type { MissionSolveOutcome } from './mission-solve-loop.js';
 import { formatAxis, formatAxisObservations, inspectAskMarkers, inspectUnpressedDecisionSignals } from '../../scripts/ask-marker-check.js';
 import { enterJourneyNode, ensureJourneyKey, exitJourneyNode, JOURNEY_KEY_ENV, passJourneyNode, withJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { intakeTakesQueue, readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
@@ -180,16 +179,6 @@ export interface HarnessPlanOptions extends HarnessAskSayOptions {
 export type HarnessAskHandler = (goalPath: string, opts: HarnessAskSayChildLlmOptions) => Promise<void>;
 export type HarnessSayHandler = (words: string[], opts: HarnessAskSayChildLlmOptions) => Promise<void>;
 export type HarnessPlanHandler = (words: string[], opts: HarnessPlanOptions) => Promise<void>;
-export type HarnessMissionHandler = (missionId: string, opts: { executor?: 'self-implement' }) => Promise<void>;
-export type HarnessMissionLoopHandler = (missionIds: readonly string[], opts: { executor?: 'self-implement' }) => Promise<readonly MissionSolveOutcome[]>;
-
-function renderHarnessMissionOutcomes(outcomes: readonly MissionSolveOutcome[]): void {
-  for (const outcome of outcomes) {
-    const detail = outcome.detail ?? outcome.terminal;
-    console.log(`🧩 미션 '${outcome.missionId}' — ${outcome.status}${detail ? `: ${detail}` : ''}`);
-  }
-}
-
 function humanErrorLine(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const humanMessage = message
@@ -330,12 +319,6 @@ function registerHarnessPlanOptions(command: Command): Command {
       '⭐ 역할별 LLM (반복 가능 · implement|review|research|planning|audit|classify) 예: implement=grok/best · review=anthropic · planning=/best',
       (value: string, previous: string[] = []) => [...previous, value],
     );
-}
-
-function registerHarnessMissionOptions(command: Command): Command {
-  return command
-    .addOption(new Option('--executor <executor>', '실행기 (self-implement; 생략 시 self-implement)').choices(['self-implement']))
-    .option('--dry-run', '변경 없이 발사 계획만 출력');
 }
 
 function normalizeHarnessCommonOptions(opts: HarnessAskSayOptions): HarnessAskSayOptions {
@@ -3579,8 +3562,6 @@ export interface HarnessCliCommandDeps {
   /** ⭐ `plan` 주입이 «없을 때» 가는 기본 분기. 시험이 이 자리로 «CLI 의 기본 배선»을 문다
    *  (⛔ 주입된 `plan` 이 파일을 스스로 만들면 그 시험은 배선을 «못 답한다» — 무인 리뷰 GOODHART 지적). */
   planRfc?: typeof runHarnessPlanRfc;
-  mission?: HarnessMissionHandler;
-  missionLoop?: HarnessMissionLoopHandler;
   /** `harness progress` 가 도는 런 관측을 읽는 자리(시험 주입). 기본은 queryRunningRuns. */
   progress?: {
     /** 하위 조회. 값 또는 약속을 돌려줄 수 있고, 시간 상한은 `timeoutMs` 가 정한다. */
@@ -4130,38 +4111,5 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
       });
     });
 
-  const mission = deps.mission;
-  const missionLoop = deps.missionLoop;
-  if (mission) {
-    registerHarnessMissionOptions(harnessCmd.command('mission <mission-ids...>').description('기존 미션 하나 또는 여러 개를 읽어 하니스로 해결한다'))
-      .action(async (missionIds: string[], opts: { executor?: 'self-implement' } & HarnessDryRunOpts) => {
-        if (isHarnessDryRun(opts)) {
-          printHarnessLaunchDryRun({
-            input: missionIds.join(' '),
-            entrance: 'cli-harness-mission',
-            wouldStart: missionIds.length === 1
-              ? '기존 미션 read · 워크트리 · 하니스 실행기'
-              : `기존 미션 ${missionIds.join(', ')} read · 순차 하니스 실행기`,
-          });
-          return;
-        }
-        const missionOpts = { ...(opts.executor !== undefined ? { executor: opts.executor } : {}) };
-        if (missionIds.length === 1) {
-          await runInjectedHarnessHandler(() => mission(missionIds[0]!, missionOpts));
-          return;
-        }
-        if (!missionLoop) {
-          console.error('❌ harness mission 다건 실행기를 사용할 수 없음');
-          process.exitCode = 1;
-          return;
-        }
-        try {
-          renderHarnessMissionOutcomes(await missionLoop(missionIds, missionOpts));
-        } catch (error) {
-          console.error(humanErrorLine(error));
-          process.exitCode = 1;
-        }
-      });
-  }
   return harnessCmd;
 }

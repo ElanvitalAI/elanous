@@ -190,7 +190,10 @@ export async function tick(options: CoordinatorShadowTickOptions = {}): Promise<
   const evidence = evidences[0] ?? null;
   if (!evidence) return { checked: today, evidence: null };
 
-  const ledger = new DecisionLedger({ ...(options.stateDir ? { stateDir: options.stateDir } : {}), now, repoRoot: root });
+  // `root` is the coordinator journal root, which may be a disposable simulation
+  // directory rather than a Git checkout. Decision version metadata follows the
+  // process checkout; do not make an isolated journal root an explicit repoRoot.
+  const ledger = new DecisionLedger({ ...(options.stateDir ? { stateDir: options.stateDir } : {}), now });
   const outcomes = evidences.map(item => {
     const stamp = retirementCardStamp(item);
     const alreadyRaised = ledger.list({ status: 'all' }).some(entry =>

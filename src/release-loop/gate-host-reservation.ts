@@ -175,6 +175,11 @@ const claimsDir = (root: string) => join(root, 'release', 'gate-host-reservation
 /** The release graph's pinned child state and the self gate CLI's selected universe resolve through this same entry. */
 export function gateHostReservationRoot(): string { return effectiveInstanceRoot(); }
 
+/** Fresh instances have no claims yet; initialize the ledger before a gate asks whether a host is reserved. */
+export function ensureGateHostReservationDirectory(root: string): void {
+  mkdirSync(claimsDir(root), { recursive: true, mode: 0o700 });
+}
+
 function claimAlive(claim: GateHostClaim): 'alive' | 'dead' | 'unknown' {
   try { process.kill(claim.pid, 0); }
   catch (error) {

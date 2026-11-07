@@ -2,8 +2,8 @@ import { describe, expect, it, spyOn } from 'bun:test';
 
 import { runDaemonPromptTurn } from '../src/boot/daemon-prompt-turn.js';
 import { DaemonSessionHistory } from '../src/boot/daemon-runtime.js';
-import * as coreTurnModule from '../src/core-turn/index.js';
-import type { CoreTurnContext } from '../src/core-turn/index.js';
+import * as coreTurnModule from '../src/core-turn/run-core-turn.js';
+import type { CoreTurnContext } from '../src/core-turn/types.js';
 import type { DaemonToolSurface } from '../src/boot/daemon-tools/types.js';
 import * as notifyTurnEndModule from '../src/web-push/notify-turn-end.js';
 

@@ -13,7 +13,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
-import { getOrCreateElanousId } from '../mss/identity.js';
+import { getOrCreateElanousId } from '../mss/identity-store.js';
 import {
   getParentSpanId,
   getSpanId,

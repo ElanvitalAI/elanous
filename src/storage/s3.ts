@@ -40,7 +40,7 @@
 import { execSync, execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { getOrCreateElanousId } from '../mss/identity.js';
+import { getOrCreateElanousId } from '../mss/identity-store.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 

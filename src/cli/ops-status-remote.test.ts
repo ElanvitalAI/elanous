@@ -10,14 +10,12 @@ import {
   REMOTE_OPS_ARMING_PATH,
   REMOTE_OPS_HEALTH_UNAVAILABLE,
   REMOTE_OPS_LOOPS_UNAVAILABLE,
-  REMOTE_OPS_MISSIONS_PATH,
   REMOTE_OPS_TASKS_PATH,
   resolveOpsStatusRemoteFlag,
   runOpsStatusRemote,
 } from './ops-status-remote.js';
 import { readRemoteFlag } from './remote-resolve.js';
 import { TaskStore } from '../task-orchestrator/store.js';
-import { createMission } from '../task-orchestrator/mission.js';
 import { createTask } from '../task-orchestrator/types.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -54,21 +52,19 @@ function writeBookmark(cfg: string, name: string, port: string, token: string, s
   }));
 }
 
-function seedRealOpsStore(tasksDir: string): { missionTotal: number; taskTotal: number } {
+function seedRealOpsStore(tasksDir: string): { taskTotal: number } {
   mkdirSync(tasksDir, { recursive: true });
   const prev = process.env.ELANOUS_TASKS_DIR;
   process.env.ELANOUS_TASKS_DIR = tasksDir;
   const store = new TaskStore();
   try {
-    store.saveMission(createMission({ title: 'Remote ops alpha', source: { kind: 'manual' } }));
-    store.saveMission(createMission({ title: 'Remote ops beta', source: { kind: 'manual' } }));
     for (let i = 0; i < 5; i += 1) {
       store.saveTask(createTask({
         title: `Remote ops task ${i}`,
         surface: { kind: 'llm-direct', prompt: `seed ${i}` },
       }));
     }
-    return { missionTotal: 2, taskTotal: 5 };
+    return { taskTotal: 5 };
   } finally {
     store.close();
     if (prev === undefined) delete process.env.ELANOUS_TASKS_DIR;
@@ -77,22 +73,15 @@ function seedRealOpsStore(tasksDir: string): { missionTotal: number; taskTotal: 
 }
 
 async function independentOpsCounts(origin: string, token: string): Promise<{
-  missionTotal: number;
   taskTotal: number;
 }> {
-  const missionsRes = await fetch(`${origin}${REMOTE_OPS_MISSIONS_PATH}`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
   const tasksRes = await fetch(`${origin}${REMOTE_OPS_TASKS_PATH}`, {
     headers: { authorization: `Bearer ${token}` },
   });
-  if (!missionsRes.ok) throw new Error(`independent GET ${REMOTE_OPS_MISSIONS_PATH} HTTP ${missionsRes.status}`);
   if (!tasksRes.ok) throw new Error(`independent GET ${REMOTE_OPS_TASKS_PATH} HTTP ${tasksRes.status}`);
-  const missions = await missionsRes.json() as { total?: unknown };
   const tasks = await tasksRes.json() as { summary?: { total?: unknown } };
-  if (typeof missions.total !== 'number') throw new Error('independent GET /v1/missions missing total');
   if (typeof tasks.summary?.total !== 'number') throw new Error('independent GET /v1/tasks missing summary.total');
-  return { missionTotal: missions.total, taskTotal: tasks.summary.total };
+  return { taskTotal: tasks.summary.total };
 }
 
 /**
@@ -101,7 +90,7 @@ async function independentOpsCounts(origin: string, token: string): Promise<{
  *
  * ✅ 이것이 답하는 것: CLI 가 «별도 프로세스의 HTTP» 와 말하는가 · 어떤 method/path 를 보내는가
  * ⛔ 이것이 «못» 답하는 것: 실제 데몬의 부팅·인증·미들웨어 구성이 그렇게 도는가
- *    ⇒ 그 축은 라이브의 몫이다(실측 2026-09-01: 원격에서 미션 11·태스크 76 이 데몬 직접 조회와 일치).
+ *    ⇒ 그 축은 라이브의 몫이다(실측 2026-09-01: 원격에서 태스크 조회가 데몬 직접 조회와 일치).
  * 📏 실제 데몬을 여기서 띄우려 «두 번» 시도했고 둘 다 구조로 막혔다:
  *    ⑴ `nexus run` 격리 기동 ⇒ 45초 내 미응답(대화형 셋업 마법사 의존)
  *    ⑵ `runNexus({ detachForTesting: true })` ⇒ 그 파일이 적어 둔 대로 httpServer 가 undefined
@@ -231,7 +220,7 @@ describe('runOpsStatusRemote classification/message', () => {
 });
 
 describe('bin/elanous.mjs ops status -r', () => {
-  test('진입점 spawn: out-of-process HTTP API GET /v1/missions and /v1/tasks counts match ops status -r stdout, with route provenance and unavailable loops/health', async () => {
+  test('진입점 spawn: out-of-process HTTP API GET /v1/tasks count matches ops status -r stdout, with route provenance and unavailable loops/health', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ops-status-live-r-'));
     dirs.push(home);
     const tasksDir = join(home, 'tasks');
@@ -243,16 +232,18 @@ describe('bin/elanous.mjs ops status -r', () => {
     let server: Awaited<ReturnType<typeof startOutOfProcessHttpApi>> | undefined;
     try {
       server = await startOutOfProcessHttpApi({ home, token, tasksDir, stateDir });
+      const removedMissionRoute = await fetch(`${server.origin}/v1/missions`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(removedMissionRoute.status).toBe(404);
       const independent = await independentOpsCounts(server.origin, token);
-      expect(independent.missionTotal).toBe(2);
       expect(independent.taskTotal).toBe(5);
       writeBookmark(cfg, 'mbp', server.port, token);
       const res = spawnOpsStatus(cfg, home, ['-r']);
       const out = `${res.stdout ?? ''}${res.stderr ?? ''}`;
       expect(res.status).toBe(0);
-      expect(out).toContain(`${independent.missionTotal}건`);
       expect(out).toContain(`${independent.taskTotal}건`);
-      expect(out).toContain(`GET ${REMOTE_OPS_MISSIONS_PATH}`);
+      expect(out).not.toContain('/v1/missions');
       expect(out).toContain(`GET ${REMOTE_OPS_TASKS_PATH}`);
       expect(out).toContain(`GET ${REMOTE_OPS_ARMING_PATH}`);
       expect(out).toContain(REMOTE_OPS_LOOPS_UNAVAILABLE);
@@ -266,7 +257,7 @@ describe('bin/elanous.mjs ops status -r', () => {
     }
   }, SPAWN_TIMEOUT_MS);
 
-  test('진입점 spawn: repeating ops status -r without restarting NEXUS yields the same mission/task counts as independent GET', async () => {
+  test('진입점 spawn: repeating ops status -r without restarting NEXUS yields the same task counts as independent GET', async () => {
     const home = mkdtempSync(join(tmpdir(), 'ops-status-live-repeat-'));
     dirs.push(home);
     const tasksDir = join(home, 'tasks');
@@ -284,9 +275,7 @@ describe('bin/elanous.mjs ops status -r', () => {
       const second = spawnOpsStatus(cfg, home, ['-r']);
       expect(first.status).toBe(0);
       expect(second.status).toBe(0);
-      expect(first.stdout).toContain(`${independent.missionTotal}건`);
       expect(first.stdout).toContain(`${independent.taskTotal}건`);
-      expect(second.stdout).toContain(`${independent.missionTotal}건`);
       expect(second.stdout).toContain(`${independent.taskTotal}건`);
       expect(first.stdout).toBe(second.stdout);
       const after = await independentOpsCounts(server.origin, token);
@@ -341,7 +330,7 @@ describe('bin/elanous.mjs ops status -r', () => {
       expect(res.status).toBe(0);
       expect(out).toContain('운영 상태 스냅샷');
       expect(out).not.toContain('Remote ops alpha');
-      expect(out).not.toContain(`GET ${REMOTE_OPS_MISSIONS_PATH}`);
+      expect(out).not.toContain('/v1/missions');
       expect(out).not.toContain(REMOTE_OPS_LOOPS_UNAVAILABLE);
     } finally {
       server?.stop();
@@ -368,7 +357,7 @@ describe('bin/elanous.mjs ops status -r', () => {
       const res = spawnOpsStatus(cfg, home, ['-r']);
       expect(res.status).toBe(0);
       const out = `${res.stdout ?? ''}`;
-      expect(out).toContain(`GET ${REMOTE_OPS_MISSIONS_PATH}`);
+      expect(out).not.toContain('/v1/missions');
       expect(out).toContain(`GET ${REMOTE_OPS_TASKS_PATH}`);
       expect(out).toContain(`GET ${REMOTE_OPS_ARMING_PATH}`);
       expect(out).not.toMatch(/\bPOST\b|\bPUT\b|\bPATCH\b|\bDELETE\b/);
@@ -377,7 +366,6 @@ describe('bin/elanous.mjs ops status -r', () => {
         .split(String.fromCharCode(10)).filter(Boolean).length;
       const after = await independentOpsCounts(server.origin, token);
       expect(after).toEqual(before);
-      expect(out).toContain(`${before.missionTotal}건`);
       expect(out).toContain(`${before.taskTotal}건`);
 
       // ⭐ stdout 문면이 아니라 ***서버가 «실제로 받은» 요청***으로 판정한다.
@@ -390,7 +378,7 @@ describe('bin/elanous.mjs ops status -r', () => {
       const cliSlice = readLog().slice(logOffsetBeforeCli, logOffsetAfterCli);
       expect(cliSlice.every((r) => r.method === 'GET')).toBe(true);
       expect(cliSlice.map((r) => r.path).sort()).toEqual(
-        [REMOTE_OPS_MISSIONS_PATH, REMOTE_OPS_TASKS_PATH, REMOTE_OPS_ARMING_PATH].sort(),
+        [REMOTE_OPS_TASKS_PATH, REMOTE_OPS_ARMING_PATH].sort(),
       );
     } finally {
       server?.stop();
@@ -413,7 +401,7 @@ describe('bin/elanous.mjs ops status -r', () => {
       const res = spawnOpsStatus(cfg, home, ['-r']);
       const out = `${res.stdout ?? ''}${res.stderr ?? ''}`;
       expect(res.status).toBe(1);
-      expect(out).toContain(`GET ${REMOTE_OPS_MISSIONS_PATH}`);
+      expect(out).toContain(`GET ${REMOTE_OPS_TASKS_PATH}`);
       expect(out).toMatch(/HTTP 401/);
     } finally {
       server?.stop();
@@ -428,19 +416,17 @@ describe('bin/elanous.mjs ops status -r', () => {
  * 실제 데몬 진입점(`nexus run`)이 아니다. 그래서 그 시험들은 ***「내 클라이언트가 «내가 세운» 서버와 말한다」***
  * 까지만 증명하고, ***「진짜 데몬이 그 경로를 «실제로» 제공한다」는 못 증명한다.***
  *
- * 그 구멍 중 «값싸게 닫히는 절반»이 ***경로 드리프트***다 — 서버가 `/v1/missions` 를 다른 이름으로 바꾸면
- * 위 시험들은 «여전히 통과»한다(테스트 서버가 옛 이름을 계속 제공하므로). 아래가 그것을 문다.
+ * 그 구멍 중 «값싸게 닫히는 절반»이 ***경로 드리프트***다 — 서버가 ops status 가 읽는 태스크 경로를 바꾸면
+ * 아래 시험이 실제 `http-server` 진입점과의 연결을 문다.
  *
  * ⚠️ 나머지 절반(데몬의 «구성»·인증·미들웨어가 실제로 그렇게 도는가)은 이 시험이 «못 답한다».
- *    그 축은 라이브 검증의 몫이다 — 실측 2026-09-01: 원격에서 미션 11건·태스크 76건이
- *    데몬 직접 조회와 «일치»했다(grokb1 x86_64 → Mac 데몬).
+ *    그 축은 라이브 검증의 몫이다 — 2026-09-01 원격 직접 데몬 관측은 별도 수동 레일의 근거다.
  */
 describe('ops status -r 이 부르는 경로는 «진짜» NEXUS 서버에 실재한다', () => {
-  test('리터럴로 매칭되는 둘이 http-server 의 핸들러에 «그대로» 있다', () => {
+  test('태스크 경로가 http-server 핸들러에 있고 mission list route 는 없다', () => {
     const serverSource = readFileSync(join(REPO_ROOT, 'src/nexus/api/http-server.ts'), 'utf8');
-    for (const path of [REMOTE_OPS_MISSIONS_PATH, REMOTE_OPS_TASKS_PATH]) {
-      expect(serverSource).toContain(`'${path}'`);
-    }
+    expect(serverSource).toContain(`'${REMOTE_OPS_TASKS_PATH}'`);
+    expect(serverSource).not.toContain("'/v1/missions'");
   });
 
   // ⛔ arming 은 «리터럴이 아니다» — http-server 가 parseAutopilotPath 로 «접두 디스패치»한다.

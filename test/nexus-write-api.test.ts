@@ -11,6 +11,7 @@ import { createDefaultHealthProbeBackend } from '../src/nexus/supervisor/health.
 import { createDaemonTabSpec } from '../src/nexus/kinds/daemon.js';
 import type { PtyBackend } from '../src/nexus/webterm/pty.js';
 import { getElanousConfigDir, setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+import { expectMalformedJson400 } from './helpers/http-error-contract';
 
 let tmpRoot: string;
 let prevHome: string | undefined;
@@ -418,8 +419,7 @@ describe('POST /v1/nexus/tabs · create', () => {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: '{not json',
     });
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe('invalid-json');
+    await expectMalformedJson400(res, 'invalid-json');
   });
 });
 

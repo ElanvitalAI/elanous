@@ -396,8 +396,6 @@ import { resolveDashboardChatMainEntryPrelude } from './input/chat-main-entry-pr
 import { CHAT_MAIN_AUTO_ENTRY_KEY_NAME } from './input/entry-mode.js';
 import { resolveDashboardChatMainPostTurn } from './input/chat-main-post-turn.js';
 import { resolveDashboardChatMainSubmitIntent } from './input/chat-main-submit-route.js';
-import { maybeEmitDashboardSubmitQuickPass } from './input/chat-main-submit-control.js';
-import { attachDashboardQuickPassConsumers } from './input/control-signal-consumers.js';
 import { resolveDashboardChatMainSlashCommand } from './input/chat-main-slash-command.js';
 import { isClassicSigquitChord, registerClassicSigquitHandler } from './classic-sigquit.js';
 import { TuiChatPersonaSelection, tuiChatPersonaMessages } from './slash-runtime/chat-persona.js';
@@ -458,23 +456,8 @@ import {
   isChatMainInputForegroundActive,
   shouldAutoEnterChatMainInput,
 } from './input/chat-main-visibility.js';
-import { createDashboardVoiceRuntime } from './voice-runtime.js';
-import { setDaemonInputHost } from '../voice/daemon-input-host-singleton.js';
 import { defaultControlSignalBus } from '../input/control-signal.js';
 import { defaultControlSignalObserver } from '../input/control-signal-observer.js';
-import {
-  bootDashboardVoiceHost,
-  reportDashboardVoiceBootError,
-} from './voice-host-boot.js';
-import {
-  bootDashboardAutoTts,
-} from './auto-tts/auto-tts-host-boot.js';
-import {
-  bootDashboardVoiceChat,
-  handleVoiceChatSlash,
-  toggleVoiceChatRealtime,
-} from './voice-chat/voice-chat-host-boot.js';
-import { describeVoiceChatPhase } from './voice-chat/voice-chat-mode-controller.js';
 import { hasOverlayInputOwner } from './input/overlay-input.js';
 import { deriveInputOwnershipSnapshot } from './input/input-owner.js';
 import { createDashboardInputPrefixState } from './input/input-prefix-state.js';
@@ -798,7 +781,6 @@ import {
   getUserConfig, reloadUserConfig, saveUserConfig,
   rotateNextProvider, jumpToRotationEntry, rotationEntryLabel, applyRotationEntry,
   resolveAcpHopCapFromConfig, resolveTuiUnattended,
-  VOICE_HARDCODED_DEFAULTS,
 } from '../user-config.js';
 import { streamLLM, anyProviderAvailable, getProviderForConfig, nextReasoningLevel, reasoningLevelLabel, effectiveReasoningLevel, modelSupportsReasoning, type LLMMessage, type LLMToolSpec } from '../llm.js';
 import { currentRouteDecision, formatRouteDecisionSummary } from '../llm/route-decision.js';
@@ -816,10 +798,6 @@ import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import {
   type GitSegmentState,
 } from '../status/bar.js';
-// PR-S1V.5 — voice month-to-date USD pill on the secondary status row.
-// The tracker is process-wide so the same singleton is read here and
-// updated by `voice-input-bridge.transcribe` (TUI path) + daemon REST
-// handler (PWA path).
 import { createDashboardMouseWiring } from './input/mouse-wiring.js';
 import { createMouseConversationPopupRuntime } from './input/mouse-conversation-popup-runtime.js';
 import { createMouseModalHitRuntime } from './input/mouse-modal-hit-runtime.js';
@@ -948,7 +926,6 @@ import {
   type CaretContextStore,
 } from './terminal/caret-context-store.js';
 import { createPfcMouseActionRuntime, type PfcMouseActionRuntime } from './terminal/pfc-mouse-action-runtime.js';
-import { createPfcVoiceRuntime, type PfcVoiceRuntime } from './auto-tts/pfc-voice-runtime.js';
 import { createPfcScreenshotAttacher, type PfcScreenshotAttacher } from '../conductor/pfc-screenshot-attachment.js';
 import { createStatusShellPostureRuntime } from './status-shell-posture-runtime.js';
 import { createTerminalHostFacade } from '../shell-runner/terminal-host-facade.js';
@@ -1501,23 +1478,6 @@ import { listSessionCards } from '../session/card.js';
 // on the manager singleton so production code shares one registry
 // instance across the dispatcher, the sidebar, and LLM tools.
 import { globalDualRoleManager, setAcpHopCapResolver } from '../acp/dual-role-manager.js';
-// PR-S1V.4-wiring (sprint 21-Parallel-Voice · 2026-04-29) — voice input.
-// Boot the STTProvider lazily (gated on OPENAI_API_KEY) and wire the
-// voice-input host into the priority key route + status bar. PLAN
-// canonical: PLAN-voice-wiring-s1v4w-2026-04-29.md.
-import { globalAcpEventRouter } from '../acp/event-router.js';
-import { createSTTProvider } from '../voice/stt-provider.js';
-import {
-  createVoiceInputHost,
-  type VoiceInputHost,
-} from './voice-input-host.js';
-import {
-  createSpaceLongPressDetector,
-  isDictationHoldKey,
-  isPlainSpaceHoldKey,
-  type SpaceLongPressDetector,
-} from './input/space-longpress-detector.js';
-import { isAllowlistedDictationSurface } from './input/dictation-surface-allowlist.js';
 import { createDashboardExternalInputHost, stopTurnViaEscGate, updateDashboardExternalInputQueueNotice } from './input/external-input-host.js';
 import { registerTuiForceStopHandler } from '../capture/tui-self-report.js';
 import { createInlineAskUserQuestionResolver, resolveUnattendedInlineChoiceTimeoutMs, UNATTENDED_INLINE_CHOICE_TIMEOUT_MS } from '../ask-user-question/index.js';
@@ -3603,7 +3563,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const hud = createHud();
 
   // Reasoning HUD segment — provider-agnostic emoji + label that
-  // sits in the top transient HUD row (next to voice / streaming
+  // sits in the top transient HUD row (next to streaming
   // indicators), NOT the bottom status bar. Capability-driven: pill
   // auto-shows for reasoning-capable models (gpt-5 family + claude-4
   // / 3.7) at the model's effective level. Models that don't support
@@ -3756,12 +3716,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           layoutMode: conversationSnapshot.layoutMode,
         },
         mode: inputCoreActiveMode(),   // A1 — ◆ mode pill (sync/control)
-        // experiment/voice-chat-realtime-rebind — voice / dictation /
-        // voice-chat indicators are unified into the HUD `voice-state`
-        // segment (see hud.setSegment calls in onIndicatorChange and
-        // dashboardVoiceChat.onPhaseChange). The status-bar pill is
-        // intentionally null so we don't render the same state twice.
-        voiceLabel: null,
         runningBuild: runningBuildStatus(),
         theme,
       });
@@ -3877,32 +3831,38 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const { getShellRegistry: pfcGetShellRegistry } = await import(
     '../shell-runner/registry.js'
   );
-  // V1 + X4 (Bundle 2) — late-bound voice + screenshot attachment.
-  // Both runtimes depend on resources (auto-tts controller +
-  // dispatchScreenshot import) that come up later in boot. The PFC
-  // feedback runtime forwards `onNotification` to these refs so V1
-  // / X4 attach without re-plumbing the T1 boot order.
-  const pfcVoiceRuntimeRef: { current: PfcVoiceRuntime | null } = { current: null };
+  // X4 (Bundle 2) — late-bound screenshot attachment.
   const pfcScreenshotAttacherRef: { current: PfcScreenshotAttacher | null } = { current: null };
+  // ── X4 (Bundle 2) — PFC auto-screenshot attachment ──
+  // Screenshot capture is independent of dashboard voice support.
+  // Opt-in via `ELANOUS_PFC_AUTO_SCREENSHOT=1`.
+  if (process.env.ELANOUS_PFC_AUTO_SCREENSHOT === '1') {
+    const { dispatchScreenshot: pfcDispatchScreenshot } = await import(
+      '../capture/capture-tools.js'
+    );
+    pfcScreenshotAttacherRef.current = createPfcScreenshotAttacher({
+      resolveScreenshotTarget: () => null,
+      dispatchScreenshot: async (args) => {
+        const out = await pfcDispatchScreenshot(args);
+        return {
+          ...(out.bodyBase64 !== undefined ? { bodyBase64: out.bodyBase64 } : {}),
+          ...(out.bytes !== undefined ? { bytes: out.bytes } : {}),
+          ...(out.note !== undefined ? { note: out.note } : {}),
+        };
+      },
+      logDebug: (category, event, data) => debug.log(category, event, data),
+    });
+  }
+  // Install the optional screenshot sink before the watcher subscribes,
+  // so the first shell notification cannot race ahead of its setup.
   const pfcFeedbackRuntime = createDashboardPfcFeedbackRuntime({
     registry: pfcGetShellRegistry(),
     pushChatLine: (line) => { pushChatLine(C.muted(line)); },
     enabled: pfcReverseFeedbackEnabled,
     logDebug: (category, event, data) => debug.log(category, event, data),
     onNotification: (notification) => {
-      // X4 attaches first (async screenshot capture inside its own
-      // budget), then V1 fires voice on the augmented notification.
       const attacher = pfcScreenshotAttacherRef.current;
-      const voice = pfcVoiceRuntimeRef.current;
-      if (!attacher && !voice) return;
-      const finalize = (final: typeof notification): void => {
-        try { voice?.onNotification(final); } catch { /* isolate */ }
-      };
-      if (attacher) {
-        void attacher.attach(notification).then(finalize, () => finalize(notification));
-      } else {
-        finalize(notification);
-      }
+      if (attacher) void attacher.attach(notification).catch(() => {});
     },
   });
   if (debug.enabled) {
@@ -5322,536 +5282,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     draw: () => { draw(); },
   });
 
-  // ── PR-S1V.4-wiring · Voice input host (2026-04-29) ────────────────
-  //
-  // Lazy boot: only construct the STTProvider + host when the user has
-  // an OpenAI key set. Without one the host stays `null` and the
-  // priority-route deps below short-circuit so voice paths are entirely
-  // inactive (no kitty toggles, no key swallowing). Production users
-  // opt in by exporting OPENAI_API_KEY before launching elanous. Status
-  // bar segment also stays empty because `voiceIndicatorLabel` never
-  // transitions away from null.
-  //
-  // PLAN §4.5 — resolveSession is alias-normalized via BRAND_ALIASES so
-  // "claude" voice prefix matches a "claude-code" launch brand. Focused
-  // fallback uses (a) conversationPopupHost.snapshot().focusedSessionId
-  // and (c) the focused VW pane → findLiveSessionByPaneId chain. When
-  // both miss the resolveSession returns null and the bridge drops the
-  // transcript with reason='no-stream'.
-  //
-  // PLAN §4.5 — submitToSession is transport-aware: embodied PTY
-  // sessions go through `entry.session.send` with the reply.ts:150
-  // newline append pattern. ACP live sessions echo via
-  // `globalAcpEventRouter().noteUserSubmit` then `clientSessionSend`
-  // (matching the chat input submit pattern in vw-live-bridge.ts:325).
-  let voiceInputHost: VoiceInputHost | null = null;
-  let voiceIndicatorLabel: string | null = null;
-  let voiceUnsubscribeIndicator: (() => void) | null = null;
-  // PR-S1V.D4 (2026-04-29) — long-press Space dictation detector. Runs
-  // alongside the voice host but mutually exclusive (one sox subprocess
-  // at a time, enforced by `host.startDictation` returning false when
-  // voice mode is active). The detector reconstructs hold/release from
-  // the OS key-repeat stream so a long Space hold becomes dictation
-  // without depending on kitty `>3u` release events at idle. resolveSession
-  // / submitToSession / dictateTranscript live in `createDashboardVoiceRuntime`
-  // (extracted from this file in the dashboard refactor); the detector
-  // wires the host startDictation/stopDictation pair only.
-  let voiceLongPressDetector: SpaceLongPressDetector | null = null;
-  // TEMP DEBUG TRIAL (2026-04-29 · fix/voice-runtime-tdz-2) — toggle-mode
-  // dictation chord. Bypasses the long-press detector entirely for the
-  // trial chord (Ctrl+Shift+D). First press starts dictation, second
-  // press stops. Debounce ignores OS auto-repeat keystrokes from
-  // pile-up-toggling within ~300 ms. Plain Space (Branch 2) keeps the
-  // detector path so we can A/B compare both UX patterns in dogfood.
-  let lastDictationToggleAt = 0;
-  const DICTATION_TOGGLE_DEBOUNCE_MS = 300;
-  function toggleDictationFromChord(source: string, keyName: string | undefined): boolean {
-    if (!voiceInputHost) {
-      if (debug.enabled) debug.log('voice.toggle.skip', 'no-host', { source, keyName });
-      return false;
-    }
-    if (voiceInputHost.getState().kind !== 'idle') {
-      if (debug.enabled) {
-        debug.log('voice.toggle.skip', 'voice-mode-active', {
-          source, keyName, voiceState: voiceInputHost.getState().kind,
-        });
-      }
-      return false;
-    }
-    const nowMs = Date.now();
-    const sinceLast = nowMs - lastDictationToggleAt;
-    if (sinceLast < DICTATION_TOGGLE_DEBOUNCE_MS) {
-      if (debug.enabled) {
-        debug.log('voice.toggle.debounced', 'os-repeat', {
-          source, keyName, sinceLast, debounceMs: DICTATION_TOGGLE_DEBOUNCE_MS,
-        });
-      }
-      return false;
-    }
-    lastDictationToggleAt = nowMs;
-    const dictState = voiceInputHost.getDictationState();
-    if (dictState === 'idle') {
-      const ok = voiceInputHost.startDictation();
-      if (debug.enabled) debug.log('voice.toggle.start', source, { keyName, ok });
-    } else if (dictState === 'recording') {
-      void voiceInputHost.stopDictation();
-      if (debug.enabled) debug.log('voice.toggle.stop', source, { keyName, dictState });
-    } else {
-      if (debug.enabled) {
-        debug.log('voice.toggle.skip', 'processing', { source, keyName, dictState });
-      }
-    }
-    return true;
-  }
-  const voiceRuntime = createDashboardVoiceRuntime({
-    listLiveSessions: listLiveEmbodiedSessions,
-    findLiveSessionById,
-    findLiveSessionByPaneId,
-    getFocusedConversationSessionId: () => conversationPopupHost.snapshot().focusedSessionId,
-    getFocusedVirtualWindowPane: () => ({ vwId: null, paneId: null, paneKind: null }),
-    noteUserSubmit: (sessionId, text) => globalAcpEventRouter().noteUserSubmit(sessionId, text),
-    clientSessionSend: (opts) => globalDualRoleManager().clientSessionSend(opts),
-    getWorkingFocus: () => workingDir.focus,
-    getChatMainInputVisibilityState: () => chatMainInputVisibilityState(),
-    chatMainPromptLive: () => typeof promptCtl.insertAtCursor === 'function',
-    insertIntoChatMainPrompt: (text) => {
-      promptCtl.insertAtCursor?.(text);
-    },
-    appendInputPrefixInline: (text) => inputPrefixState.appendInline(text),
-    // Lazy wrappers — `applyFocusToInputTransition` is `const`-declared
-    // further down (~line 6896), so a shorthand reference here triggers
-    // a TDZ ReferenceError when `createDashboardVoiceRuntime` evaluates
-    // its deps object during boot. The arrow defers the name lookup
-    // until dictation actually runs — by that time the dashboard scope
-    // is fully initialized. `draw` is a `let` placeholder at line 2475
-    // that's later reassigned (~10665); the shorthand would otherwise
-    // capture the placeholder no-op so dictation-driven redraws never
-    // ran. Same lazy lookup fixes both.
-    applyFocusToInputTransition: (transition) => applyFocusToInputTransition(transition),
-    setPendingInputEntryModePlain: () => focusTransitionState.setPendingInputEntryMode('plain'),
-    draw: () => draw(),
-  });
-  // 2026-04-30 — expose dictateTranscript for the PWA voice
-  // `tui-bridge` dispatch mode. When the daemon and dashboard share a
-  // process (e.g. `elanous start --http-port`), users with
-  // `voice.pwa.dispatch: 'tui-bridge'` will see their phone transcripts
-  // injected into the focused dashboard input via this hook. The
-  // singleton stays unset in dashboard-less daemons (`elanous serve`),
-  // and the dispatcher short-circuits gracefully there.
-  setDaemonInputHost({
-    dictateTranscript: (text: string) => voiceRuntime.dictateTranscript(text),
-  });
-  // Phase 2 auto-TTS — config priority: user-config > env > default.
-  // Provider is created lazily on first sentence so a missing
-  // OPENAI_API_KEY (or absence of any TTS dep) doesn't crash the
-  // dashboard for users who never opt in.
-  const dashboardAutoTts = (() => {
-    const voiceCfg = getUserConfig().voice;
-    return bootDashboardAutoTts({
-      ...(voiceCfg.tts.provider ? { providerId: voiceCfg.tts.provider } : {}),
-      ...(typeof voiceCfg.tts.auto === 'boolean' ? { initiallyEnabled: voiceCfg.tts.auto } : {}),
-      ...(typeof voiceCfg.tts.maxSentenceChars === 'number'
-        ? { maxSentenceChars: voiceCfg.tts.maxSentenceChars }
-        : {}),
-    });
-  })();
-  // ── V1 (Bundle 2) — PFC voice TTS report ──
-  // Wires the PFC notification sink to the auto-tts controller. Opt-in
-  // via `ELANOUS_PFC_VOICE_REPORT=1` so first dogfood doesn't surprise.
-  pfcVoiceRuntimeRef.current = createPfcVoiceRuntime({
-    getController: () => dashboardAutoTts.controller,
-    initiallyEnabled: process.env.ELANOUS_PFC_VOICE_REPORT === '1',
-    logDebug: (category, event, data) => debug.log(category, event, data),
-  });
-  // ── X4 (Bundle 2) — PFC auto-Screenshot attachment ──
-  // Async PNG capture for screenshot-capable surfaces; result attached
-  // to the PfcReverseFeedbackNotification before downstream sinks
-  // (voice + future vision LLM proposers in Bundle 3 X7) consume it.
-  // Opt-in via `ELANOUS_PFC_AUTO_SCREENSHOT=1`.
-  if (process.env.ELANOUS_PFC_AUTO_SCREENSHOT === '1') {
-    const { dispatchScreenshot: pfcDispatchScreenshot } = await import(
-      '../capture/capture-tools.js'
-    );
-    pfcScreenshotAttacherRef.current = createPfcScreenshotAttacher({
-      resolveScreenshotTarget: () => null,
-      dispatchScreenshot: async (args) => {
-        const out = await pfcDispatchScreenshot(args);
-        return {
-          ...(out.bodyBase64 !== undefined ? { bodyBase64: out.bodyBase64 } : {}),
-          ...(out.bytes !== undefined ? { bytes: out.bytes } : {}),
-          ...(out.note !== undefined ? { note: out.note } : {}),
-        };
-      },
-      logDebug: (category, event, data) => debug.log(category, event, data),
-    });
-  }
-  if (debug.enabled) {
-    debug.log('pfc.bundle2.boot', 'ready', {
-      voiceReport: pfcVoiceRuntimeRef.current.isEnabled(),
-      autoScreenshot: pfcScreenshotAttacherRef.current !== null,
-    });
-  }
   const dashboardControlSignals = defaultControlSignalBus();
-  // Phase 4 voice-chat — late-bound submit closure. The actual
-  // dispatch helper (dispatchAcpSend) is defined inside the input
-  // loop, so we hold a mutable reference and bind it on every iter.
-  let voiceChatSubmitImpl: ((text: string) => void) | null = null;
-  // Voice-chat error display — three surfaces fire in concert:
-  //   1. HUD `voice-error` segment (3s banner) — distinct emoji + color
-  //      so the user can tell at a glance the system is in error state,
-  //      not normal idle/listening.
-  //   2. chatLines warning — permanent record (user can scroll back).
-  //   3. Toast popup (bottom-right transient, 5s) — separate surface
-  //      so the user notices even if their attention isn't on the HUD.
-  // The `voice-error` segment uses 🔴 + "ERROR" prefix so it is
-  // unmistakably an error state (not the same accent ⚠ as the
-  // chord-toggle mutex warning, which is a softer "rejected" message).
-  let voiceErrorTimer: ReturnType<typeof setTimeout> | null = null;
-  const showVoiceError = (err: Error): void => {
-    const summary = err.message.length > 120
-      ? err.message.slice(0, 117) + '…'
-      : err.message;
-    // 1. chatLines — permanent record.
-    chatLines.push('');
-    chatLines.push(C.error(`🔴 [voice-chat ERROR] ${summary}`));
-    chatScrollOffset = -1;
-    // 2. HUD — error state distinct from any normal phase color.
-    setSegment(hud, 'voice-error', C.error(`🔴 voice ERROR · ${summary}`), 7);
-    if (voiceErrorTimer) clearTimeout(voiceErrorTimer);
-    voiceErrorTimer = setTimeout(() => {
-      clearSegment(hud, 'voice-error');
-      voiceErrorTimer = null;
-      requestDashboardRender();
-    }, 3000);
-    // 3. Toast popup — bottom-right, 5s. Separate group so it doesn't
-    // collide with regular toast notifications. Lines wrapped at ~52
-    // cells (toast max is 56). Long messages split across lines.
-    try {
-      const { cols: tc, rows: tr } = termSize();
-      const wrapAt = 52;
-      const lines: string[] = [];
-      let remaining = summary;
-      while (remaining.length > wrapAt) {
-        lines.push(remaining.slice(0, wrapAt));
-        remaining = remaining.slice(wrapAt);
-      }
-      if (remaining) lines.push(remaining);
-      lines.push('');
-      lines.push('ESC to dismiss');
-      showToast({
-        title: '🔴 voice-chat ERROR',
-        lines,
-        coordinator: display,
-        termCols: tc,
-        termRows: tr,
-        ttlMs: 5000,
-        group: 'voice-error',
-      });
-    } catch (showErr) {
-      if (debug.enabled)
-        debug.log('voice.chat.error', 'toast.exception', {
-          err: showErr instanceof Error ? showErr.message : String(showErr),
-        }, { level: 'error' });
-    }
-    requestDashboardRender();
-  };
-  attachDashboardQuickPassConsumers({
-    signalBus: dashboardControlSignals,
-    cancelOutput: () => dashboardAutoTts.hooks.cancel(),
-    onConsumed: ({ kind, urgency, surface }) => {
-      if (debug.enabled) {
-        debug.log('input.control', 'quick-pass.consume', {
-          signalKind: kind,
-          urgency,
-          surface,
-        });
-      }
-    },
-    onError: ({ kind }, err) => {
-      if (debug.enabled) {
-        debug.log('input.control', 'quick-pass.consume.error', {
-          signalKind: kind,
-          error: err instanceof Error ? err.message : String(err),
-        }, { level: 'error' });
-      }
-    },
-  });
-  function emitVoiceChatStopQuickPass(reason: 'esc' | 'alt-s' | 'barge-in'): void {
-    dashboardControlSignals.emit({
-      kind: 'voice-chat-stop',
-      urgency: 'quick-pass',
-      source: 'system',
-      mayPreempt: true,
-      scope: { surface: 'voice-chat', channel: 'dashboard' },
-      payload: {
-        reason,
-        phase: dashboardVoiceChat.controller.getPhase(),
-      },
-    });
-  }
-  // Voice user-config snapshot at boot. Each field is sparse —
-  // only present when the user explicitly set it in config.json.
-  // host-boot sees `undefined` and falls back to env (backward
-  // compat) → hardcoded default.
-  const voiceCfgAtBoot = getUserConfig().voice;
-  const dashboardVoiceChat = bootDashboardVoiceChat({
-    ...(voiceCfgAtBoot.stt.provider ? { providerId: voiceCfgAtBoot.stt.provider } : {}),
-    ...(voiceCfgAtBoot.vad.mode ? { vadMode: voiceCfgAtBoot.vad.mode } : {}),
-    ...(typeof voiceCfgAtBoot.chat.multiTurn === 'boolean'
-      ? { multiTurn: voiceCfgAtBoot.chat.multiTurn }
-      : {}),
-    ...((typeof voiceCfgAtBoot.vad.threshold === 'number'
-        || typeof voiceCfgAtBoot.vad.silenceMs === 'number'
-        || typeof voiceCfgAtBoot.vad.minSpeechMs === 'number')
-      ? {
-          vadOpts: {
-            ...(typeof voiceCfgAtBoot.vad.threshold === 'number'
-              ? { threshold: voiceCfgAtBoot.vad.threshold } : {}),
-            ...(typeof voiceCfgAtBoot.vad.silenceMs === 'number'
-              ? { silenceMs: voiceCfgAtBoot.vad.silenceMs } : {}),
-            ...(typeof voiceCfgAtBoot.vad.minSpeechMs === 'number'
-              ? { minSpeechMs: voiceCfgAtBoot.vad.minSpeechMs } : {}),
-          },
-        }
-      : {}),
-    submitTranscript: (text) => {
-      // 2026-04-30 — UX revision: route the transcript through D5
-      // PTT's `dictateTranscript` so the user SEES their words in
-      // the chat input, but DON'T auto-submit in single-turn mode.
-      // User feedback: "열심히 받아 적은 보이스 텍스트가 ctrl+l 다시
-      // 인풋 모드 들어가자 마자 클리어 되버렸어요." — the previous
-      // double-action (inject + submit) raced with the input pane's
-      // ESC handler and made the text disappear when the user tried
-      // to exit.
-      //
-      // Phase transition policy (post-2026-04-30 host-boot change):
-      //   - single-turn OFF → dictate to the input buffer, then
-      //     controller.exit so the user owns submit timing.
-      //   - multi-turn ON → delegate to `voiceChatSubmitImpl`. That
-      //     closure decides between (a) sticky-armed auto-submit
-      //     (transition → speaking) vs (b) sticky-less plain
-      //     auto-submit via the textInput host's external submit
-      //     hook.
-      //   - multi-turn OFF (single-turn default) → controller.exit
-      //     so HUD clears; user reads transcript + presses Enter
-      //     for a normal LLM turn.
-      if (dashboardVoiceChat.multiTurn && voiceChatSubmitImpl) {
-        voiceChatSubmitImpl(text);
-        return;
-      }
-      try { voiceRuntime.dictateTranscript(text); } catch { /* ignore */ }
-      // Single-turn (or multi-turn pre-init) — voice-chat ends here;
-      // the user owns submit timing via the chat input.
-      try { dashboardVoiceChat.controller.exit('user-cancel'); } catch { /* ignore */ }
-    },
-    onPartialTranscript: (text) => {
-      if (debug.enabled)
-        debug.log('voice.chat.partial', 'tick', { snip: text.slice(0, 60) });
-    },
-    onBargeIn: () => {
-      emitVoiceChatStopQuickPass('barge-in');
-    },
-    onError: showVoiceError,
-    onPhaseChange: (next, prev) => {
-      // experiment/voice-chat-realtime-rebind — phase indicator goes
-      // to the HUD status bar segment ONLY (NOT chatLines). The chat
-      // log shows just start + end events (pushed by the chord/ESC
-      // handlers) so it stays uncluttered; the HUD carries the
-      // moment-to-moment phase. Each phase has a distinct emoji +
-      // color in the HUD.
-      //
-      //   inactive   → segment cleared (no indicator)
-      //   listening  → 🎙 voice · 듣는 중 (accent · prominent)
-      //   processing → 💭 voice · 생각 중 (info)
-      //   speaking   → 🗣  voice · 말하는 중 (success · green)
-      //   stopping   → ⏹ voice · 정리 (muted · fading)
-      //
-      // priority 6 puts it above the agent-activity segment (3) but
-      // below the copied/toast segments (10) so it never hides the
-      // higher-priority transient banners.
-      if (next === 'inactive') {
-        // Don't wipe a fresh dictation indicator if D5 voice mode is
-        // also active mid-transition (mutex normally prevents this,
-        // but the race window is real during exit cleanup).
-        if (voiceIndicatorLabel === null) {
-          clearSegment(hud, 'voice-state');
-        }
-        // 2026-04-30 — sync pipeline lifecycle with controller.
-        //
-        // Several controller.exit call sites (single-turn submitTranscript
-        // dictate-only, voiceChatSubmitImpl dictate-fallback, error
-        // recovery in onFinalTranscript catch) used to flip the
-        // controller to `inactive` WITHOUT calling pipeline.cancel().
-        // That left `pipeline.listening = true` + the STT WebSocket
-        // session + the sox capture subprocess alive as residue.
-        // Next `Alt+R` enter then hit pipeline.startListening's guard
-        // (`if (listening) return false`) and the toggle reported
-        // "voice-chat: failed to start listening — check audio device
-        // + STT provider" with no real cause.
-        //
-        // Rather than patch every exit call site, we hook the
-        // pipeline cleanup to the controller's terminal phase: the
-        // controller is the source of truth for "voice-chat is over",
-        // and pipeline.cancel() is idempotent (its own guard at
-        // line 264 returns early when nothing is live), so this
-        // wire is safe even when an explicit cancel already ran
-        // (handleEsc / toggleVoiceChatRealtime exit path).
-        try {
-          void dashboardVoiceChat.pipeline.cancel();
-        } catch (err) {
-          if (debug.enabled)
-            debug.log('voice.chat.error', 'inactive.pipeline.cancel.exception', {
-              err: err instanceof Error ? err.message : String(err),
-            }, { level: 'error' });
-        }
-      } else {
-        type Spec = { emoji: string; label: string; color: (s: string) => string };
-        const specs: Record<Exclude<typeof next, 'inactive'>, Spec> = {
-          listening:  { emoji: '🎙', label: '듣는 중',     color: C.accent },
-          processing: { emoji: '💭', label: '생각 중',     color: C.info },
-          speaking:   { emoji: '🗣',  label: '말하는 중',   color: C.success },
-          stopping:   { emoji: '⏹',  label: '정리',         color: C.muted },
-        };
-        const spec = specs[next];
-        setSegment(hud, 'voice-state', spec.color(`${spec.emoji} voice · ${spec.label}`), 6);
-      }
-      requestDashboardRender();
-      // Phase transition trail. Always-on (gated by debug.enabled) so
-      // a freeze report can be diagnosed from log/latest alone.
-      if (debug.enabled) {
-        debug.log('voice.chat.phase', next, {
-          prev,
-          desc: describeVoiceChatPhase(next) || null,
-          ts: new Date().toISOString(),
-        });
-      }
-    },
-  });
-  // Boot snapshot — env vars governing voice-chat behavior. One log
-  // line per dashboard boot so support sessions can compare expected
-  // vs actual without grepping multiple categories.
-  if (debug.enabled) {
-    debug.log('voice.chat.boot', 'env', {
-      vad: process.env.ELANOUS_VOICE_VAD || '(default:server)',
-      multiTurn: process.env.ELANOUS_VOICE_CHAT_MULTI_TURN || '(default:off)',
-      autoTts: process.env.ELANOUS_AUTO_TTS || '(default:off)',
-      sttProvider: process.env.STREAMING_STT_PROVIDER || '(default:openai-realtime-stt)',
-      ttsProvider: process.env.TTS_PROVIDER || '(default:openai-tts)',
-      providerId: dashboardVoiceChat.providerId,
-      hasOpenaiKey: !!process.env.OPENAI_API_KEY,
-    });
-  }
-  if (process.env.OPENAI_API_KEY) {
-    void (async () => {
-      try {
-        const booted = await bootDashboardVoiceHost({
-          voiceRuntime,
-          createSttProvider: () => createSTTProvider({ id: 'openai-whisper' }),
-          createVoiceInputHost: (deps) => createVoiceInputHost(deps),
-          createLongPressDetector: (deps) => createSpaceLongPressDetector(deps),
-          onIndicatorChange: (label) => {
-            voiceIndicatorLabel = label;
-            // experiment/voice-chat-realtime-rebind — D5 voice/dictation
-            // state now flows into the same HUD segment as voice-chat
-            // continuous mode. Single source of truth for "what is
-            // elanous doing with audio right now".
-            //
-            //   label === null         → segment cleared
-            //   label like "🎤 hold…"  → dictation pending
-            //   label like "🎙 0.8s"   → recording in progress
-            //   label like "💭 STT"    → processing
-            //
-            // The voice-chat-mode-controller writes to the same key
-            // (priority 6) when Alt+R is active. Mutex between D5 voice
-            // and voice-chat is enforced upstream so the two sources
-            // never overlap; whichever is active owns the segment.
-            if (label) {
-              setSegment(hud, 'voice-state', C.accent(`${label}  ·  dictation`), 6);
-            } else {
-              // Only clear when voice-chat is also inactive — a race
-              // between D5 voice exit and voice-chat enter could
-              // otherwise wipe the chat phase indicator.
-              if (!dashboardVoiceChat.controller.isActive()) {
-                clearSegment(hud, 'voice-state');
-              }
-            }
-          },
-          requestRender: () => { requestDashboardRender(); },
-          onLongReleasePreShiftFocus: () => {
-            // PR-S1V.D5+ smoothness — focus shift is dashboard-scope so
-            // the boot module just calls this closure on detector
-            // release, before STT runs. Skipped when chord toggle was
-            // used from inside chat-main (focus already in input).
-            if (workingDir.focus === 'input') return;
-            applyFocusToInputTransition(resolveFocusToInputTransition({
-              sourcePane: workingDir.focus,
-              rememberPane: true,
-              mode: 'plain',
-              reason: 'voice-dictation-pre-shift',
-            }));
-          },
-        });
-        voiceInputHost = booted.host;
-        voiceUnsubscribeIndicator = booted.unsubscribeIndicator;
-        voiceLongPressDetector = booted.detector;
-      } catch (err) {
-        chatLines.push(C.warning(reportDashboardVoiceBootError(err)));
-        chatScrollOffset = -1;
-      }
-    })();
-  } else if (debug.enabled) {
-    debug.log('voice.host', 'boot.skip', { reason: 'no-openai-key' });
-  }
-  /** PR-S1V.4-wiring · Ctrl+Shift+V chord — fires from anywhere
-   *  (popup terminal · VW terminal · bell modal · dashboard) so the
-   *  user always has a single entry chord. Korean shifted ㅍ (V on
-   *  2-bul) accepts ctrl-only because the shift bit may be implicit
-   *  in the codepoint. Mirrors the isForceQuitChord pattern below. */
-  const matchesVoiceEnterChord = (
-    routeKey: import('../tui.js').Key,
-  ): boolean => {
-    if (!routeKey.ctrl) return false;
-    if (routeKey.shift && (routeKey.name === 'v' || routeKey.name === 'V' || routeKey.name === 'ㅍ')) return true;
-    if (routeKey.name === 'ㅍ' && routeKey.ctrl) return true;
-    return false;
-  };
-  /** experiment/voice-chat-realtime-rebind (2026-04-30) — Alt+R toggles
-   *  continuous voice-chat mode (Phase 4-5). Switched off Ctrl+Shift+R
-   *  to avoid colliding with Ctrl+R (chat input reverse-history search).
-   *  Korean ㄱ (R on 2-bul layout) is also accepted so the chord works
-   *  with the IME engaged. macOS users may need to set their terminal
-   *  to "Option as Meta/Alt" so Option+R reaches elanous as `alt+r` (the
-   *  default Terminal.app sends ® instead). */
-  const matchesVoiceChatRealtimeChord = (
-    routeKey: import('../tui.js').Key,
-  ): boolean => {
-    // 2026-05-03 — Alt+R was reassigned to reasoning cycle (which
-    // mnemonically owns 'R'). Streaming voice-chat moves to Alt+S
-    // (S = Streaming). Korean ㄴ (S on 2-bul layout) accepted so the
-    // chord works with the IME engaged. macOS users may need to set
-    // their terminal to "Option as Meta/Alt" so Option+S reaches
-    // elanous as `alt+s`.
-    const isCandidate =
-      routeKey.name === 's' || routeKey.name === 'S'
-      || routeKey.name === 'ㄴ' /* 한글 s on 2-bul */;
-    if (debug.enabled && isCandidate) {
-      debug.log('voice.chat.matcher', 'eval', {
-        keyName: routeKey.name,
-        alt: !!routeKey.alt,
-        ctrl: !!routeKey.ctrl,
-        shift: !!routeKey.shift,
-        meta: !!(routeKey as { meta?: boolean }).meta,
-        kind: (routeKey as { kind?: string }).kind ?? 'press',
-      });
-    }
-    if (!routeKey.alt) return false;
-    if (routeKey.ctrl) return false; // Ctrl+Alt+S is a different chord by convention
-    return isCandidate;
-  };
-
-  /** Alt+R reasoning cycle matcher — V/D/R mnemonic with V=voice
-   *  control (Ctrl+Shift+V), D=batch dictation (Space-longpress),
-   *  R=reasoning. Korean ㄱ (R on 2-bul) accepted with IME. */
+  /** Alt+R reasoning cycle matcher. Korean ㄱ (R on 2-bul) accepted with IME. */
   const matchesReasoningCycleChord = (
     routeKey: import('../tui.js').Key,
   ): boolean => {
@@ -7487,7 +6919,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         chatMainAvailable,
         pluginActive: !!pluginHost.active(),
         chordArmed: isChordArmed(chord),
-        voiceModeActive: !!voiceInputHost && voiceInputHost.getState().kind !== 'idle',
         vwLocalComposerActive,
         overlayInputActive,
         questionActive: approvalModalRouter.currentKind() === 'askUser',
@@ -7506,8 +6937,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           chatMainAvailable,
           pluginActive: !!pluginHost.active(),
           chordArmed: isChordArmed(chord),
-          voiceModeActive: !!voiceInputHost && voiceInputHost.getState().kind !== 'idle',
-          vwLocalComposerActive,
+            vwLocalComposerActive,
           overlayInputActive,
           owner: state.inputOwnership?.owner ?? 'none',
           chatMainSuppressed: state.inputOwnership?.chatMainSuppressed ?? false,
@@ -15860,174 +15290,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       // no mutation happened.
       recomputeViewMode();
 
-      // PR-S1V.D4-γ (2026-04-29 · review-revised) — outside-chat-main
-      // dictation chord routing. PR #1115 review pinpointed that plain
-      // `Space` hold globally collides with too many existing Space-
-      // binding surfaces (browser/obsidian/skill-file selection,
-      // scheduler form input, preview pager, popup/VW terminal, modals
-      // /pickers). The reviewer's recommended split:
-      //
-      //   - **`Ctrl+Shift+Space`** = global dictation chord. Modifier-
-      //     only carries no char-input role; safe across browse/pane/
-      //     popup/terminal because surface Space bindings live on
-      //     plain `Space`. Wired here as the always-on outer hook —
-      //     chat-main onPreKey already owns it inside input focus
-      //     (D4-β), so the two paths are mutually exclusive at the
-      //     dispatch level (chat textInput's own readKey loop never
-      //     reaches this outer hook).
-      //
-      //   - **plain `Space`** = scoped allowlist only. Default deny;
-      //     point-of-truth `isAllowlistedDictationSurface()` will
-      //     return `true` only for surfaces explicitly verified to
-      //     have no native Space semantics. Initial allowlist is
-      //     intentionally empty — every existing PaneFocus value is
-      //     a known consumer (selection toggle / pager next-page /
-      //     form input / log scroll / etc.). The seam stays so we
-      //     can opt specific surfaces in after they're cleared by
-      //     dogfood; until then the plain-Space branch is inert.
-      //
-      // Both branches share the same skip rules: voice host must be
-      // booted + idle, chat-main must not own the working focus
-      // (D4-β scope), and PTY/terminal panes still defer the *plain*
-      // Space path entirely (Ctrl+Shift+Space stays alive there per
-      // the reviewer's note "충돌 보이면 그때 예외 surface 추가").
-      // TEMP DEBUG (2026-04-29 · fix/voice-runtime-tdz-2 branch) — log
-      // the gate evaluation so dogfood logs show *why* the chord did or
-      // didn't fire instead of just "no dictation event". Remove with
-      // the chord-trial revert.
-      if (debug.enabled && !key.mouse && key.ctrl && key.shift) {
-        const hostStateKind = voiceInputHost ? voiceInputHost.getState().kind : null;
-        debug.log('voice.outer-hook.gate', 'eval', {
-          keyName: key.name,
-          ctrl: !!key.ctrl,
-          shift: !!key.shift,
-          alt: !!key.alt,
-          hasVoiceHost: !!voiceInputHost,
-          hasDetector: !!voiceLongPressDetector,
-          hostState: hostStateKind,
-          focus: workingDir.focus,
-          willEnter:
-            !!voiceInputHost
-            && !!voiceLongPressDetector
-            && hostStateKind === 'idle'
-            && workingDir.focus !== 'input',
-        });
-      }
-      // These two vars are assigned only inside the async boot IIFE
-      // (a closure) and reset to null at the bottom of this `while(true)`
-      // loop, so TS's loop-carried flow analysis collapses them to
-      // `never` here (a false positive — the runtime value is the booted
-      // host). Assert the true declared type so the guards below narrow.
-      const voiceHostFlow = voiceInputHost as VoiceInputHost | null;
-      const voiceDetectorFlow = voiceLongPressDetector as SpaceLongPressDetector | null;
-      if (
-        voiceHostFlow
-        && voiceDetectorFlow
-        && voiceHostFlow.getState().kind === 'idle'
-        && workingDir.focus !== 'input'
-      ) {
-        const focusedTerminalPane = false;
-
-        // Branch 1 — Ctrl+Shift+D trial chord. TEMP DEBUG (2026-04-29):
-        // toggle pattern instead of long-press detector. First press
-        // starts dictation, second press stops. Debounce in
-        // toggleDictationFromChord swallows OS auto-repeat duplicates.
-        // Restore detector wiring once chord question is settled.
-        if (isDictationHoldKey(key)) {
-          if (debug.enabled) {
-            debug.log('voice.outer-hook.dictation.hit', 'branch-1-chord-toggle', {
-              keyName: key.name,
-              kind: key.kind ?? 'press',
-              dictState: voiceHostFlow.getDictationState(),
-            });
-          }
-          // Release events are ignored under toggle — only press toggles.
-          if (key.kind !== 'release') {
-            toggleDictationFromChord('outer-hook', key.name);
-          }
-          // Always consume — chord is a deliberate user signal, not
-          // ordinary input.
-          continue;
-        }
-
-        // Branch 2 — plain Space (scoped allowlist). Currently the
-        // allowlist is empty so every plain Space passes through to
-        // the priority route untouched, matching the "global plain
-        // Space 비추천" finding from the PR review. As surfaces are
-        // verified safe via dogfood, add their PaneFocus values to
-        // `isAllowlistedDictationSurface` below.
-        if (isPlainSpaceHoldKey(key)) {
-          // TEMP DEBUG (2026-04-29 · fix/voice-runtime-tdz-2 trial) —
-          // log Branch 2 decision so dogfood can prove plain Space hits
-          // the allowlist + non-terminal-pane gate.
-          const allowlistHit = isAllowlistedDictationSurface(workingDir.focus);
-          if (debug.enabled) {
-            debug.log('voice.outer-hook.branch2', 'eval', {
-              keyName: key.name,
-              kind: key.kind ?? 'press',
-              focus: workingDir.focus,
-              focusedTerminalPane,
-              allowlistHit,
-              willEnter: !focusedTerminalPane && allowlistHit,
-            });
-          }
-          if (!focusedTerminalPane && allowlistHit) {
-            if (debug.enabled) {
-              debug.log('voice.outer-hook.dictation.hit', 'branch-2-plain-space', {
-                focus: workingDir.focus,
-                kind: key.kind ?? 'press',
-                detectorState: voiceDetectorFlow.getState(),
-              });
-            }
-            if (key.kind === 'release') {
-              voiceDetectorFlow.noteRelease();
-            } else {
-              voiceDetectorFlow.noteSpaceKey();
-            }
-            continue;
-          }
-        }
-
-        // Cancel-by-other-key — same race-fix pattern as the chat-
-        // main onPreKey wire (PR #1109 review fix #1). Only await
-        // when we're actually terminating an in-flight dictation.
-        if (voiceDetectorFlow.getState() !== 'idle') {
-          const preState = voiceDetectorFlow.getState();
-          voiceDetectorFlow.noteOtherKey();
-          if (preState === 'fired') {
-            while (voiceHostFlow.getDictationState() !== 'idle') {
-              await new Promise<void>((resolve) => setTimeout(resolve, 10));
-            }
-          }
-          // The terminator key still flows through the priority route
-          // below — only the ordering shifts so the transcript inserts
-          // before the terminator is dispatched.
-        }
-
-        // TEMP DEBUG TRIAL — ESC stops a toggle-mode dictation. Without
-        // this the user could get stuck in `recording` if they forgot
-        // the chord. Detector path above handles long-press cancel; this
-        // covers the toggle path which doesn't use the detector.
-        if (
-          key.name === 'escape'
-          && !key.ctrl && !key.shift && !key.alt
-          && voiceHostFlow.getDictationState() === 'recording'
-        ) {
-          if (debug.enabled) debug.log('voice.toggle.stop', 'esc-cancel', {});
-          void voiceHostFlow.stopDictation();
-          while (voiceHostFlow.getDictationState() !== 'idle') {
-            await new Promise<void>((resolve) => setTimeout(resolve, 10));
-          }
-          // Continue dispatch — ESC still flows through (modal close,
-          // input clear, etc.) so we don't `continue` here.
-        }
-      }
-
-      // PR-S1V.D5 — kitty `>3u` release/repeat event guard. The voice
-      // outer-hook block above is the only path that legitimately needs
-      // non-press events (chord toggle skips them, plain-Space detector
-      // explicitly handles `kind === 'release'` for explicit release
-      // timing). Everything below — priority route, widget routing,
+      // kitty `>3u` release/repeat event guard. Everything below — priority route, widget routing,
       // chat-input dispatcher — was written when `>1u` was the only
       // mode and treats every key as a press. So a kitty release event
       // would otherwise re-fire the press handler and double-dispatch
@@ -16050,6 +15313,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         continue;
       }
 
+      // Keep classic sidetab keys on the normal input route, independent of
+      // chat-main voice handling and before modal/input dispatch.
+      const routeClassicSidetabInputKey = (routeKey: Key): boolean =>
+        classicSidetabRuntime.routeKey(routeKey);
       const priorityRoute = await routeDashboardPriorityKey(key, {
         inputOwner: chatMainVisibility.inputOwnership?.owner,
         routeClassicSigquitChord: (routeKey) => {
@@ -16104,7 +15371,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           draw();
           return true;
         },
-        routeSidetabKey: (routeKey) => classicSidetabRuntime.routeKey(routeKey),
+        routeSidetabKey: routeClassicSidetabInputKey,
         dispatchPreKey: (routeKey, targetHandlerName) => {
           const questionViewHandler = {
             name: 'question-view',
@@ -16216,156 +15483,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           if (routeKey.name === 'ㅃ') return true;
           return false;
         },
-        // PR-S1V.4-wiring · Step 0x — voice mode entry chord.
-        // Fires only when voice mode is currently `idle`; once active
-        // the next step (routeVoiceModeKey) takes over. Skipping when
-        // voiceInputHost is null keeps the chord inert until the
-        // STTProvider has finished booting (or stays inert forever
-        // when OPENAI_API_KEY is absent).
-        routeVoiceEnterChord: (routeKey) => {
-          if (!voiceInputHost) return false;
-          if (voiceInputHost.getState().kind !== 'idle') return false;
-          if (!matchesVoiceEnterChord(routeKey)) return false;
-          if (debug.enabled) debug.log('voice.host', 'enter.chord', {});
-          voiceInputHost.requestEnter();
-          return true;
-        },
-        // PR-S1V.4-wiring · Step 0c — voice mode active dispatch.
-        // Modal A invariant: while the host is non-idle, every key
-        // flows through `maybeHandleKey` which terminates the dispatch
-        // (escape exits, space drives the recording lifecycle, every
-        // other key is swallowed no-op). Idle state returns false so
-        // legacy dispatchers stay reachable.
-        routeVoiceModeKey: (routeKey) => {
-          if (!voiceInputHost) return false;
-          if (voiceInputHost.getState().kind === 'idle') return false;
-          return voiceInputHost.maybeHandleKey(routeKey);
-        },
-        // experiment/voice-chat-realtime-rebind · Step 0r —
-        // Ctrl+Shift+R chord (continuous voice-chat toggle). Same
-        // outer-hook tier as routeVoiceEnterChord so it reaches
-        // anywhere (popup terminal / VW terminal / bell modal). The
-        // mutex check + state machine transition + chatLines status
-        // line live in the same handler to keep the wire 1-place.
-        // experiment/voice-chat-realtime-rebind · Step 0s — modal-A
-        // swallow while voice-chat is active. Returns true when the
-        // controller is non-idle so any key not already claimed above
-        // (force-quit · Alt+W · chord toggle) is consumed
-        // — typing doesn't leak into chat input, Space doesn't toggle
-        // pickers, etc. ESC explicitly exits. Idle controller returns
-        // false so legacy dispatch is reachable.
-        routeVoiceChatActiveKey: async (routeKey) => {
-          if (!dashboardVoiceChat.controller.isActive()) return false;
-          // ESC: exit voice-chat (mode-level cancel), do not pass to
-          // dispatch chain so no other surface acts on the ESC.
-          if (routeKey.name === 'escape') {
-            try {
-              await dashboardVoiceChat.handleEsc();
-            } catch (err) {
-              if (debug.enabled) {
-                debug.log('voice.chat.error', 'esc.handle.exception', { err: String(err) }, { level: 'error' });
-              }
-            }
-            emitVoiceChatStopQuickPass('esc');
-            chatLines.push('');
-            chatLines.push(C.accent('🎙 [voice-chat] stopped (ESC)'));
-            chatScrollOffset = -1;
-            if (debug.enabled) {
-              debug.log('voice.chat.phase', 'esc.exit', {
-                phase: dashboardVoiceChat.controller.getPhase(),
-              });
-            }
-            draw();
-            return true;
-          }
-          // Everything else: swallow.
-          if (debug.enabled) {
-            debug.log('voice.chat.swallow', routeKey.name || '(anon)', {
-              ctrl: !!routeKey.ctrl,
-              shift: !!routeKey.shift,
-              alt: !!routeKey.alt,
-              phase: dashboardVoiceChat.controller.getPhase(),
-            });
-          }
-          return true;
-        },
-        routeVoiceChatRealtimeChord: (routeKey) => {
-          // Alt+R reasoning cycle — handled here at the same outer
-          // tier as voice-chat so it claims the key before any other
-          // surface (chat input, modal, etc) interprets it. Returns
-          // true ⇒ key consumed, no further dispatch.
-          if (matchesReasoningCycleChord(routeKey)) {
-            cycleReasoningLevel();
-            return true;
-          }
-          if (!matchesVoiceChatRealtimeChord(routeKey)) return false;
-          if (debug.enabled) {
-            debug.log('voice.chat.chord', 'press', {
-              keyName: routeKey.name,
-              alt: !!routeKey.alt,
-              shift: !!routeKey.shift,
-              ctrl: !!routeKey.ctrl,
-              kind: (routeKey as { kind?: string }).kind ?? 'press',
-              wasActive: dashboardVoiceChat.controller.isActive(),
-              priorPhase: dashboardVoiceChat.controller.getPhase(),
-            });
-          }
-          // Defer to async runtime — outer-hook tier expects sync
-          // boolean, so we kick off the toggle and claim the key.
-          void (async () => {
-            const startedAt = Date.now();
-            if (debug.enabled) {
-              debug.log('voice.chat.toggle.begin', 'await', {
-                wasActive: dashboardVoiceChat.controller.isActive(),
-                d5State: voiceInputHost?.getState().kind ?? null,
-              });
-            }
-            try {
-              const result = await toggleVoiceChatRealtime(dashboardVoiceChat, {
-                // NOTE: a `|| getState().kind === 'committing'` clause was
-                // removed here — 'committing' is not a VoiceModeState.kind
-                // ('idle'|'active'|'recording'|'processing'), so the check
-                // was always false (dead). Behavior is unchanged.
-                d5VoiceActive: () =>
-                  voiceInputHost?.getState().kind === 'recording',
-              });
-              if (debug.enabled) {
-                debug.log('voice.chat.toggle.resolve', result.action, {
-                  status: result.status,
-                  phase: dashboardVoiceChat.controller.getPhase(),
-                  elapsedMs: Date.now() - startedAt,
-                });
-              }
-              // 2026-04-30 — HUD `voice-state` segment is the single
-              // source of truth for entry/exit status. Chord toggle
-              // no longer pushes lines into chatLines (per user
-              // request: "다시 챗로그에 나타나네요"). Only mutex
-              // (D5 voice ↔ voice-chat conflict) is exceptional and
-              // worth a chatLines warning so the user knows the
-              // chord was REJECTED, not silently no-op'd.
-              if (result.action === 'mutex') {
-                chatLines.push('');
-                chatLines.push(C.warning(`🎙 [voice-chat] ${result.status}`));
-                chatScrollOffset = -1;
-              } else if (result.action === 'exit' && result.status === 'voice-chat exited') {
-                emitVoiceChatStopQuickPass('alt-s');
-              }
-              draw();
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              chatLines.push(C.warning(`🎙 [voice-chat] toggle failed: ${msg}`));
-              chatScrollOffset = -1;
-              if (debug.enabled) {
-                debug.log('voice.chat.error', 'toggle.exception', {
-                  err: msg,
-                  elapsedMs: Date.now() - startedAt,
-                }, { level: 'error' });
-              }
-              draw();
-            }
-          })();
-          return true;
-        },
         // Step 6 hard-quit — only reached when no popup terminal is
         // active. Plain Ctrl+Q stays as the dashboard-mode shortcut
         // so muscle memory survives outside the popup. Inside the
@@ -16418,19 +15535,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         },
       });
       if (priorityRoute.type === 'quit') {
-        // PR-S1V.4-wiring — dispose the voice host before closeTui so
-        // the kitty `>1u` restore + onIndicator listeners run while
-        // stdout is still open.
-        // Same loop-carried `never` false positive as the dictation
-        // block above — assert the true declared types before dispose.
-        const voiceUnsubForQuit = voiceUnsubscribeIndicator as (() => void) | null;
-        const voiceHostForQuit = voiceInputHost as VoiceInputHost | null;
-        const voiceDetectorForQuit = voiceLongPressDetector as SpaceLongPressDetector | null;
-        try { voiceUnsubForQuit?.(); } catch { /* best-effort */ }
-        try { voiceHostForQuit?.dispose(); } catch { /* best-effort */ }
-        try { voiceDetectorForQuit?.dispose(); } catch { /* best-effort */ }
-        voiceInputHost = null;
-        voiceLongPressDetector = null;
         closeDashboardTui();
         return 'quit';
       }
@@ -16971,237 +16075,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 shouldSyncPickers: () =>
                   chatMainInputVisibilityState().inputOwnership?.owner === 'chat-main',
                 onPasteImage: attachClipboardImage,
-                routeVoiceKey: async (routeKey) => {
-                if (classicSidetabRuntime.routeKey(routeKey)) return 'consumed';
-                // 2026-04-30 — voice-chat ESC: when the controller is
-                // active and the user hits ESC inside chat-main, take
-                // it as a "exit voice mode" gesture and DO NOT let
-                // the chat input pane's default ESC handler fire
-                // (which would clear the freshly-injected transcript
-                // buffer). User feedback: "프롬프트에 발화를 소중히
-                // 다뤄야 함. … ESC 를 눌러도 보이스 모드가 종료되는
-                // 것이지 인풋 모드 클리어를 의미하는 것이 아님."
-                if (
-                  routeKey.name === 'escape'
-                  && dashboardVoiceChat.controller.isActive()
-                ) {
-                  if (debug.isKeyTraceEnabled()) {
-                    debug.log('key.trace.dispatch', 'chat-main.routeVoiceKey.esc-exit', {
-                      name: routeKey.name,
-                      claimed: 'voice-chat-exit',
-                      phase: dashboardVoiceChat.controller.getPhase(),
-                    });
-                  }
-                  try { await dashboardVoiceChat.handleEsc(); } catch { /* swallow */ }
-                  emitVoiceChatStopQuickPass('esc');
-                  // 2026-04-30 — Unified `🎙 [voice-chat] stopped
-                  // (ESC)` line so the chat log lifecycle stays
-                  // coherent regardless of which dispatch path
-                  // (chat-main vs outer-tier) claimed the ESC.
-                  chatLines.push('');
-                  chatLines.push(C.accent('🎙 [voice-chat] stopped (ESC)'));
-                  chatScrollOffset = -1;
-                  return 'consumed';
-                }
-                // experiment/voice-chat-realtime-rebind — Alt+R chord
-                // is routed BEFORE the D5 voice path so chat-input
-                // doesn't swallow it. priority-key-route also handles
-                // Alt+R (step 0r) but only fires when the input loop
-                // is NOT the active reader; from inside chat-main
-                // textInput.readKey, this is the only place that runs
-                // first. Mirror dashboard outer-hook behavior: log,
-                // claim, kick off async toggle.
-                //
-                // Alt+R reasoning cycle — same chat-main inner tier so
-                // it claims the chord before voice-chat. Mnemonic
-                // V/D/R: V=voice control, D=batch dictation,
-                // R=reasoning.
-                if (matchesReasoningCycleChord(routeKey)) {
-                  cycleReasoningLevel();
-                  // Chord handled — claim it ('consumed'); the route
-                  // contract is 'consumed' | 'passthrough', not boolean.
-                  return 'consumed';
-                }
-                if (matchesVoiceChatRealtimeChord(routeKey)) {
-                  if (debug.isKeyTraceEnabled()) {
-                    debug.log('key.trace.dispatch', 'chat-main.routeVoiceKey.realtime', {
-                      name: routeKey.name,
-                      alt: !!routeKey.alt,
-                      ctrl: !!routeKey.ctrl,
-                      shift: !!routeKey.shift,
-                      claimed: 'realtime',
-                    });
-                  }
-                  if (debug.enabled) {
-                    debug.log('voice.chat.chord', 'press.chat-main', {
-                      keyName: routeKey.name,
-                      alt: !!routeKey.alt,
-                      ctrl: !!routeKey.ctrl,
-                      shift: !!routeKey.shift,
-                      kind: (routeKey as { kind?: string }).kind ?? 'press',
-                      wasActive: dashboardVoiceChat.controller.isActive(),
-                    });
-                  }
-                  void (async () => {
-                    const startedAt = Date.now();
-                    if (debug.enabled)
-                      debug.log('voice.chat.toggle.begin', 'chat-main.await', {
-                        d5State: voiceInputHost?.getState().kind ?? null,
-                      });
-                    try {
-                      const result = await toggleVoiceChatRealtime(dashboardVoiceChat, {
-                        // NOTE: dead `=== 'committing'` clause removed (not a
-                        // VoiceModeState.kind → always false). Unchanged behavior.
-                        d5VoiceActive: () =>
-                          voiceInputHost?.getState().kind === 'recording',
-                      });
-                      if (debug.enabled)
-                        debug.log('voice.chat.toggle.resolve', result.action, {
-                          status: result.status,
-                          phase: dashboardVoiceChat.controller.getPhase(),
-                          elapsedMs: Date.now() - startedAt,
-                          source: 'chat-main',
-                        });
-                      // 2026-04-30 — Unified format: `🎙 [voice-chat]
-                      // <verb> (<trigger>)`. Same emoji + tag + accent
-                      // color across start/stop so the chat log reads
-                      // as a coherent voice-chat lifecycle stream.
-                      // Mutex/failed-start fall through to warning
-                      // color but keep the same prefix.
-                      chatLines.push('');
-                      if (result.action === 'mutex') {
-                        chatLines.push(C.warning(`🎙 [voice-chat] ${result.status}`));
-                      } else if (result.action === 'enter') {
-                        chatLines.push(C.accent(
-                          `🎙 [voice-chat] started (provider: ${dashboardVoiceChat.providerId}) — Alt+S or ESC to exit`,
-                        ));
-                      } else if (result.status === 'voice-chat exited') {
-                        emitVoiceChatStopQuickPass('alt-s');
-                        chatLines.push(C.accent('🎙 [voice-chat] stopped (Alt+S)'));
-                      } else {
-                        // 'exit' action with diagnostic status
-                        // (e.g. failed-to-start guard).
-                        chatLines.push(C.warning(`🎙 [voice-chat] ${result.status}`));
-                      }
-                      chatScrollOffset = -1;
-                      draw();
-                    } catch (err) {
-                      const msg = err instanceof Error ? err.message : String(err);
-                      chatLines.push(C.warning(`🎙 [voice-chat] toggle failed: ${msg}`));
-                      chatScrollOffset = -1;
-                      if (debug.enabled)
-                        debug.log('voice.chat.error', 'chat-main.toggle.exception', {
-                          err: msg,
-                          elapsedMs: Date.now() - startedAt,
-                        }, { level: 'error' });
-                      draw();
-                    }
-                  })();
-                  return 'consumed';
-                }
-                if (!voiceInputHost) return 'passthrough';
-                if (voiceInputHost.getState().kind !== 'idle') {
-                  return voiceInputHost.maybeHandleKey(routeKey) ? 'consumed' : 'passthrough';
-                }
-                if (!matchesVoiceEnterChord(routeKey)) return 'passthrough';
-                if (debug.enabled) debug.log('voice.host', 'enter.chord.chat-main', {});
-                voiceInputHost.requestEnter();
-                return 'consumed';
-              },
-              // PR-S1V.D4 — Long-press Space dictation pre-key. The
-              // detector lives at dashboard scope (see line ~4585) and
-              // gets fed every keystroke routed here. The first Space
-              // press is `passthrough` so the OS char lands in the chat
-              // input buffer; once the threshold fires (`onLongPress`
-              // → host.startDictation), subsequent OS repeats are
-              // swallowed (`consumed`) so they don't pile " " chars on
-              // top of the dictated transcript. Final release (or
-              // cancel-by-other-key) flushes via host.stopDictation.
-                routeLongPressDictation: async (routeKey) => {
-                // TEMP DEBUG (2026-04-29 · fix/voice-runtime-tdz-2) —
-                // mirror of the outer-hook gate log at the chat-input
-                // route. Same chord-trial reasons as detector.
-                if (debug.enabled && !routeKey.mouse && routeKey.ctrl && routeKey.shift) {
-                  debug.log('voice.chat-input-route.gate', 'eval', {
-                    keyName: routeKey.name,
-                    kind: routeKey.kind ?? 'press',
-                    hasVoiceHost: !!voiceInputHost,
-                    hasDetector: !!voiceLongPressDetector,
-                    hostState: voiceInputHost ? voiceInputHost.getState().kind : null,
-                  });
-                }
-                if (!voiceLongPressDetector || !voiceInputHost) return 'passthrough';
-                // Voice mode active → defer to its own modal; long-press
-                // detector stays out so press/release events serve the
-                // recording lifecycle there.
-                if (voiceInputHost.getState().kind !== 'idle') return 'passthrough';
-
-                if (isDictationHoldKey(routeKey)) {
-                  if (debug.enabled) {
-                    debug.log('voice.chat-input-route.dictation.hit', 'chord-match-toggle', {
-                      keyName: routeKey.name,
-                      kind: routeKey.kind ?? 'press',
-                      dictState: voiceInputHost.getDictationState(),
-                    });
-                  }
-                  // TEMP DEBUG TRIAL (2026-04-29) — toggle pattern via
-                  // shared dashboard helper. Release events ignored
-                  // under toggle; only press toggles. Restore detector
-                  // wiring once chord question is settled.
-                  if (routeKey.kind !== 'release') {
-                    toggleDictationFromChord('chat-input-route', routeKey.name);
-                  }
-                  return 'consumed';
-                }
-
-                // TEMP DEBUG TRIAL — ESC stops a toggle-mode dictation
-                // from inside chat-main input. Mirror of the outer-hook
-                // ESC-cancel; the detector path below covers long-press
-                // mode but not toggle.
-                if (
-                  routeKey.name === 'escape'
-                  && !routeKey.ctrl && !routeKey.shift && !routeKey.alt
-                  && voiceInputHost.getDictationState() === 'recording'
-                ) {
-                  if (debug.enabled) {
-                    debug.log('voice.toggle.stop', 'esc-cancel-chat-input', {});
-                  }
-                  void voiceInputHost.stopDictation();
-                  while (voiceInputHost.getDictationState() !== 'idle') {
-                    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-                  }
-                  return 'passthrough';
-                }
-
-                // Cancel-by-other-key path — the user pressed something
-                // other than Space while a long-press was pending or a
-                // dictation was active. PR #1109 review fix: when this
-                // terminates an in-flight dictation we MUST await
-                // `stopDictation()` before returning, otherwise the
-                // terminator key races ahead of the transcript insert
-                // and the chat-main buffer ends up with "a<transcript>"
-                // instead of "<transcript>a". Sentinel: capture the
-                // pre-call state so we can decide whether to await.
-                const preState = voiceLongPressDetector.getState();
-                if (preState === 'idle') return 'passthrough';
-
-                voiceLongPressDetector.noteOtherKey();
-                if (preState === 'fired') {
-                  // `noteOtherKey` already kicked the host's
-                  // stopDictation via the onLongRelease callback (the
-                  // detector calls it synchronously). Await the host's
-                  // dictation pipeline so the chat input handler that
-                  // runs after us sees the transcript already inserted.
-                  // We still return 'passthrough' so the terminator key
-                  // itself is delivered to the chat input as the user
-                  // intended — only the *ordering* shifts.
-                  while (voiceInputHost.getDictationState() !== 'idle') {
-                    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-                  }
-                }
-                return 'passthrough';
-              },
-              routeInputKey: async (key) => {
+                routeInputKey: async (key) => {
                 if (await handleLogPaneCopyAction(key)) return 'consumed';
                 // A-5b.2 · dispatcher-level key hook (routeInputEventAsync
                 // · ViewMode='input'). Runs AFTER onPreKey and BEFORE
@@ -17480,109 +16354,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               formatDebugLine: (display, reason, chars) => C.muted(`  -- acp:${display} ${reason} (${chars} chars) --`),
               formatErrorLine: (display, message) => C.error(`  acp:${display} error: ${message}`),
               formatAssistantPrefix: (display) => C.accent(`  [${display}]`),
-              autoTtsHooks: {
-                pushChunk: dashboardAutoTts.hooks.pushChunk,
-                commit: () => dashboardAutoTts.hooks.commit(),
-                cancel: () => dashboardAutoTts.hooks.cancel(),
-              },
-              // 2026-04-30 — voice-chat controller's notifyResponseDone
-              // used to live inside `autoTtsHooks.commit/cancel` wrappers,
-              // which meant ELANOUS_AUTO_TTS=off (the default) skipped the
-              // call entirely → speaking phase stuck → ESC needed → ESC
-              // close triggered "WebSocket closed unexpectedly" warning.
-              // Wiring through `onTurnDone` (auto-TTS-independent) makes
-              // the speaking → inactive transition unconditional.
-              onTurnDone: () => {
-                dashboardVoiceChat.notifyResponseDone();
-              },
-              signalBus: dashboardControlSignals,
-              drainCooldownMs: getUserConfig().voice.tts.drainCooldownMs
-                ?? VOICE_HARDCODED_DEFAULTS.ttsDrainCooldownMs,
             });
-          };
-
-          // Phase 4 voice-chat — bind the late submit closure now that
-          // `dispatchAcpSend` is in scope. The boot helper holds a
-          // mutable reference (set above with the `submitTranscript`
-          // hook) so the controller can invoke this on final transcripts.
-          //
-          // 2026-04-30 — auto-submit destination is now decided by the
-          // SAME state the chat-input router uses (sticky ACP backend).
-          // Previously this closure unconditionally fell back to
-          // `'claude'` when sticky was null, which sent multi-turn
-          // voice transcripts to the claude-code ACP binary even when
-          // the user never armed it — surfacing as `[-32603] Internal
-          // error` because no claude-code session existed.
-          //
-          //   sticky armed (`/acp codex --multi` etc.)
-          //     → dispatchAcpSend(sticky, text, [])
-          //     → external ACP backend, voice multi-turn fully hands-free
-          //
-          //   sticky null
-          //     → replace the live chat-main buffer via the textInput
-          //       host's external submit hook and inject Enter
-          //     → main chat's normal `'plain'` dispatch path handles
-          //       in-process ACP / elanous LLM
-          //     → multi-turn's auto-relisten still kicks in via
-          //       notifyResponseDone after that turn ends
-          //
-          // This keeps the routed plain path canonical while avoiding
-          // the old dictate-then-submit two-step, which left transcript
-          // residue in the live prompt buffer.
-          voiceChatSubmitImpl = (text) => {
-            const sticky = dashboardAcpChat.getSticky();
-            if (sticky) {
-              // sticky armed — auto-submit is real, response stream
-              // expected. Transition to `speaking` so the HUD's
-              // voice-state segment reflects the assistant's turn
-              // (prev: `processing`).
-              dispatchAcpSend(sticky, text, []);
-              try { dashboardVoiceChat.controller.transition('speaking'); }
-              catch { /* swallow — controller may have raced into stopping */ }
-              return;
-            }
-            // 2026-04-30 — sticky null but multi-turn ON. Route the
-            // transcript through textInput's external submit hook with
-            // the transcript payload itself. textInput replaces the
-            // live buffer, injects a synthetic Enter, and the main
-            // readKey loop returns through the normal `'plain'`
-            // dispatch path (in-process ACP / elanous LLM). Auto-TTS
-            // hooks fire there, and notifyResponseDone re-listens on
-            // multi-turn.
-            //
-            // Phase: stay in `processing` until plain dispatch's
-            // `onText` first chunk transitions to `speaking` — that
-            // matches the user's intent ("실제 보이스 나오기 시작
-            // 하면 표시").
-            if (debug.enabled)
-              debug.log('voice.chat.submit', 'plain.auto-submit', {
-                chars: text.length,
-                hasPromptCtl: typeof promptCtl.submit === 'function',
-              });
-            if (typeof promptCtl.submit === 'function') {
-              promptCtl.submit({
-                text,
-                source: {
-                  kind: 'voice',
-                  surface: 'dashboard-chat-main',
-                  mode: 'multi-turn',
-                  transcriptSource: 'voice',
-                  channel: 'dashboard',
-                },
-              });
-              return;
-            }
-            // textInput is not currently live (boot race / pane
-            // mode) — we can't auto-submit. Fall back to dictate-only
-            // and exit voice-chat so the HUD doesn't lock at
-            // `processing`.
-            try { voiceRuntime.dictateTranscript(text); } catch { /* ignore */ }
-            chatLines.push(C.muted(
-              '  ℹ [voice-chat] 입력창이 활성화 안 됨 — transcript 가 채워짐, Enter 로 submit',
-            ));
-            chatScrollOffset = -1;
-            try { dashboardVoiceChat.controller.exit('user-cancel'); }
-            catch { /* swallow */ }
           };
 
           // ── Sticky multi-turn passthrough ──
@@ -17622,13 +16394,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 ...submitIntent,
                 sessionId: submitIntent.sessionId ?? dashboardAcpSession.currentSessionId,
               }),
-              beforeExecute: (submit) => {
-                maybeEmitDashboardSubmitQuickPass({
-                  submit,
-                  isOutputSpeaking: dashboardAutoTts.controller.isSpeaking(),
-                  signalBus: dashboardControlSignals,
-                });
-              },
               runStickyAcpDispatch: ({ target, text }) => {
                 const attachments = attachmentsToNormalized(ctxList(contextRegistry));
                 if (debug.enabled) {
@@ -17716,14 +16481,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               getChatOnlyMode: () => chatOnlyMode,
               setChatOnlyLayout: (next, opts) => { setChatOnlyLayout(next, opts); },
               enterSyncMode: () => { void enterSyncMode(); },
-              handleVoiceChatSlash: (state, args2) =>
-                handleVoiceChatSlash(state as Parameters<typeof handleVoiceChatSlash>[0], args2),
-              voiceChatStateRef: { value: dashboardVoiceChat },
               reloadSkillIndex,
               blockStore,
               blockAttach,
               draw,
-              autoTtsRef: dashboardAutoTts,
               controlSignalSlashRuntime,
               browserCdpSlashRuntime,
               widgetHost,
@@ -18650,8 +17411,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               }
               // B-1.g migrated: /browser-cdp /bcdp → registry handler.
               // B-2.q migrated: /sim /simulator → registry handler.
-              // B-1.e migrated: /auto-tts /autotts /tts — moved to the registry
-              // (autoTtsRef threaded through DashboardSlashContext).
               // B-1.g migrated: /widget /widgets /w → registry handler.
               // B-2.y migrated: /plugin /plugins \u2192 registry handler.
               // (/p alias dropped \u2014 collided with /provider's /p which
@@ -19369,16 +18128,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             control: {
               signalBus: dashboardControlSignals,
             },
-            autoTts: {
-              pushChunk: (chunk) => dashboardAutoTts.hooks.pushChunk(chunk),
-              commit: () => dashboardAutoTts.hooks.commit(),
-              cancel: () => dashboardAutoTts.hooks.cancel(),
-            },
-            voiceChat: {
-              getPhase: () => dashboardVoiceChat.controller.getPhase(),
-              transitionToSpeaking: () => { dashboardVoiceChat.controller.transition('speaking'); },
-              notifyResponseDone: () => dashboardVoiceChat.notifyResponseDone(),
-            },
             finalizeStreamLifecycle: (cleanupEsc, aborted, currentStatus) =>
               finalizeDashboardStreamLifecycle(cleanupEsc, aborted, currentStatus),
             recordTurnMetrics: async (fullResponse) => {
@@ -19529,13 +18278,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   ? submitIntent.sessionId ?? dashboardAcpSession.currentSessionId
                   : dashboardAcpSession.currentSessionId,
               }),
-              beforeExecute: (submit) => {
-                maybeEmitDashboardSubmitQuickPass({
-                  submit,
-                  isOutputSpeaking: dashboardAutoTts.controller.isSpeaking(),
-                  signalBus: dashboardControlSignals,
-                });
-              },
               runStickyAcpDispatch: async () => {},
               runPlainTurn: runPlainSubmitTurn,
             });

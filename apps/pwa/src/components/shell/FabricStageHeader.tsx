@@ -2,26 +2,20 @@
 
 // ── Mission Fabric 단계 헤더 (일관성 F3 · 2026-07-09) ─────────────────────
 //
-// autopilot·tasks·scheduler 3 표면이 "한 파이프라인의 단계"임을 눈에 보이게 하는
-// 공유 브레드크럼. 각 단계는 링크 → 표면 간 이동 + 현재 단계 강조.
-//   ① Autopilot 미션(포착) → ② Tasks 실행 → ③ Scheduler 트리거
-// narrow-waist V3(2026-07-09): 구 "Intake 포착" 단계 제거 — 포착은 장소가 아니라
-// "말하면 미션이 된다"(Autopilot 골던지기 컴포저 + 텔레그램 "미션:" 마커)로 흡수.
-// 설계: 내부 문서 `DESIGN-intent-narrow-waist-2026-07-09` §3.
+// 작업 실행과 스케줄 트리거를 잇는 간단한 브레드크럼.
 
 import Link from 'next/link';
 
 /** 파이프라인 단계 표(순서 = 데이터 흐름). 테스트가 이 표 shape 를 검증(Next 훅 의존 0). */
 export const FABRIC_STAGES = [
-  { key: 'autopilot', href: '/autopilot', num: '①', label: '미션', sub: 'Autopilot' },
-  { key: 'tasks', href: '/tasks', num: '②', label: '작업', sub: 'Tasks' },
-  { key: 'scheduler', href: '/scheduler', num: '③', label: '스케줄', sub: 'Schedules' },
+  { key: 'tasks', href: '/tasks', num: '①', label: '작업', sub: 'Tasks' },
+  { key: 'scheduler', href: '/scheduler', num: '②', label: '스케줄', sub: 'Schedules' },
 ] as const;
 const STAGES = FABRIC_STAGES;
 
 export type FabricStage = (typeof STAGES)[number]['key'];
 
-/** 3 표면 상단 공유 헤더 — Mission Fabric 파이프라인 위치 + 인접 단계 크로스링크. */
+/** 작업·스케줄 간 이동 헤더. */
 export function FabricStageHeader({ active }: { active: FabricStage }) {
   return (
     <nav

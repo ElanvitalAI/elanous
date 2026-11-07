@@ -12,13 +12,13 @@ test('GATE-MOCK-EVENT-SCENARIOS: distinct injected evidence pins gate judgements
       rows.push({ scenario: scenario.id, injectedInput: scenario.injectedInput,
         expected: scenario.action, actual: judged.action, outcome: judged.outcome });
       expect(judged.outcome).toBe(scenario.expectedOutcome);
-      expect(judged.action).toBe(scenario.action);
+      expect(judged.action, scenario.id).toBe(scenario.action);
       expect(judged.podCommandCalls).toBe(0);
       if (scenario.expectedError) expect(judged.error).toBe(scenario.expectedError);
       if (scenario.planner === 'dispatch') {
         expect(judged.evidence.kind).toBe('dispatch');
         if (judged.evidence.kind !== 'dispatch' || !scenario.expectedDispatchKinds) throw new Error(`${scenario.id} needs dispatch evidence`);
-        expect(judged.evidence.actions.map((item) => item.kind)).toEqual(scenario.expectedDispatchKinds);
+        expect(judged.evidence.actions.map((item) => item.kind), scenario.id).toEqual(scenario.expectedDispatchKinds);
       }
       if (scenario.planner === 'partial') {
         expect(judged.evidence.kind).toBe('partial');

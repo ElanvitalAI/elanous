@@ -121,14 +121,6 @@ describe('createLocalLlmSshPtyAdapter · launch()', () => {
 });
 
 describe('registerDefaultLocalLlmSshPtyAdapter', () => {
-  test('registers into a registry · returns disposer', () => {
-    const r = new AdapterRegistry();
-    const off = registerDefaultLocalLlmSshPtyAdapter(r);
-    expect(r.list().map((x) => x.id)).toEqual(['local-llm-ssh-pty']);
-    off();
-    expect(r.list()).toEqual([]);
-  });
-
   test('pick() routes remote brand to the registered adapter', () => {
     const r = new AdapterRegistry();
     registerDefaultLocalLlmSshPtyAdapter(r);

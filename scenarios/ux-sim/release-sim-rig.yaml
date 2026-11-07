@@ -6,17 +6,26 @@ input:
   version: '0.3.1'
   previousVersion: '0.3.0'
 cases:
+  - id: macrophage-scrap-live-and-simulation
+    mode: macrophage-heal
+    expect:
+      status: done
+      mustVisit: []
+      mustNotVisit: [failed]
   - id: baseline-full-graph
     mode: baseline
     expect:
       status: done
       mustVisit: [version-release, gate, publish, npm-publish, done]
       mustNotVisit: [failed]
+      events:
+        - { event: node-start, nodeId: version-release }
+        - { event: node-end, nodeId: version-release, ok: true }
   - id: gate-attribution-incomplete
     fault:
       node: gate
-      outcome: fail
-      evidence: { summaryFailures: 39, identifiedOccurrences: 78, uniqueFailures: 39, baselineRecheck: true }
+      outcome: error
+      evidence: { realGateTriage: true, error: failure-attribution-incomplete, summaryFailures: 39, identifiedOccurrences: 78, uniqueFailures: 39, baselineRecheck: true }
     expect:
       status: failed
       mustVisit: [gate, gate-triage, traffic-failed-restore, failed]
@@ -25,7 +34,7 @@ cases:
     fault:
       node: gate
       outcome: fail
-      evidence: { introducedFailures: 3, baselineRecheck: true }
+      evidence: { realGateTriage: true, introduced: [scripts/release-loop/gate-node.test.ts > rejects unmeasured gate output, scripts/release-loop/gate-bisect.test.ts > attributes first-parent failures, scripts/release-loop/gate-triage-node.test.ts > classifies measured regression], introducedFailures: 3, baselineRecheck: true, introducedFiles: [scripts/release-loop/gate-node.test.ts, scripts/release-loop/gate-bisect.test.ts], firstParentPrs: [101, 102], sidecar: gate-fail-bisect }
     expect:
       status: failed
       mustVisit: [gate, gate-triage, failed]
@@ -34,17 +43,23 @@ cases:
     fault:
       node: gate
       outcome: error
-      evidence: { host: node-b, reservation: occupied, executor: pod }
+      evidence: { realGateTriage: true, error: host reservation occupied, host: node-b, reservation: occupied, executor: pod }
     expect:
       status: failed
       mustVisit: [gate, gate-triage, failed]
       mustNotVisit: [publish]
-  - id: gate-measured-regression-waive
-    mode: gate-waive-introduced-regression
+  - id: gate-measured-regression-adaptive-repair
+    fault:
+      node: gate
+      outcome: fail
+      evidence: { realGateTriage: true, introduced: [src/example.test.ts > reports the known regression] }
     expect:
-      status: done
-      mustVisit: [gate, known-issues, publish, npm-publish, done]
-      mustNotVisit: [gate-triage, failed]
+      status: failed
+      mustVisit: [gate, gate-triage, failed]
+      mustNotVisit: [known-issues, publish, npm-publish]
+      events:
+        - { event: node-start, nodeId: gate }
+        - { event: node-end, nodeId: gate, ok: false }
   - id: release-version-skip
     fault:
       node: cutoff
@@ -100,6 +115,16 @@ cases:
       mustVisit: [checklist-gate, prefetch, pre-gate-join, gate, publish, done]
       mustNotVisit: [failed]
       overlap: [checklist-gate, prefetch]
+  - id: needs-prep-required-failure-preserves-sibling
+    mode: baseline
+    nodeOutcomes:
+      checklist-gate: { outcome: error, delayMs: 60 }
+      prefetch: { outcome: ok, delayMs: 40 }
+    expect:
+      status: failed
+      mustVisit: [checklist-gate, prefetch, pre-gate-join, traffic-failed-restore, failed]
+      mustNotVisit: [gate, publish]
+      overlap: [checklist-gate, prefetch]
   - id: mac-smoke-warning-failure-overlaps-pwa
     mode: baseline
     nodeOutcomes:
@@ -128,22 +153,70 @@ cases:
       status: failed
       mustVisit: [mac-smoke, pwa, pre-prepare-join, traffic-failed-restore, failed]
       mustNotVisit: [prepare, publish]
+  - id: pwa-failure-preserves-mac-smoke-result
+    mode: baseline
+    nodeOutcomes:
+      mac-smoke: { outcome: ok, delayMs: 60 }
+      pwa: { outcome: fail, delayMs: 40 }
+    expect:
+      status: failed
+      mustVisit: [mac-smoke, pwa, pre-prepare-join, traffic-failed-restore, failed]
+      mustNotVisit: [prepare, publish]
+      overlap: [mac-smoke, pwa]
+      events:
+        - concurrent:
+            - { event: node-start, nodeId: mac-smoke }
+            - { event: node-start, nodeId: pwa }
+        - concurrent:
+            - { event: node-end, nodeId: mac-smoke }
+            - { event: node-end, nodeId: pwa }
+        - { event: node-start, nodeId: pre-prepare-join }
 
-  - id: owner-waive-malformed-gate-schema
-    mode: owner-waive-missing-schema
+  - id: owner-waive-unmeasured-gate
+    mode: owner-waive-unmeasured-gate
     expect:
       status: done
       mustVisit: [gate, known-issues, publish, npm-publish, done]
-      mustNotVisit: [gate-triage, failed]
+      mustNotVisit: [failed]
+  - id: owner-waive-stopped-gate
+    mode: owner-waive-unmeasured-gate
+    unmeasuredGateShape: stopped
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [failed]
+  - id: owner-waive-killed-gate
+    mode: owner-waive-unmeasured-gate
+    unmeasuredGateShape: killed
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [failed]
+  - id: waive-sweep-incomplete-gate
+    mode: owner-waive-unmeasured-gate
+    unmeasuredGateShape: sweep-incomplete
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [failed]
   - id: owner-waive-0246-verdict-fixture
     mode: owner-waive-0246-fixture
     expect:
       status: done
       mustVisit: [gate, known-issues, publish, npm-publish, verify, done]
-      mustNotVisit: [gate-triage, failed]
+      mustNotVisit: [failed]
+  - id: appended-tip-regate-before-waiver
+    mode: appended-tip-regate-before-waiver
+    expect:
+      status: done
+      mustVisit: [version-release, gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [failed]
   - id: append-receipt-set-absent-and-continuous-radius
     mode: append-receipt-continuity
     expect:
       status: done
       mustVisit: [cut, gate-cut, append-a, resume-a, gate-a, append-b, resume-b, gate-b, publish, done]
       mustNotVisit: [failed]
+      events:
+        - { event: node-start, nodeId: cut }
+        - { event: node-end, nodeId: cut, ok: true }

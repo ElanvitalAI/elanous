@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
@@ -16,6 +17,8 @@ import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKin
 import { publishAtError } from './publish-at.js';
 import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 import { readReleaseGateRehearsal, readReleaseOpsPolicy, selectReleaseGateMethod } from './gate-method.js';
+import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
+import { createMacrophageSafeCleanup } from '../../src/release-loop/macrophage-safe-cleanup.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -209,7 +212,12 @@ async function runUnattendedReleaseLocked(
   // Resume and fresh runs share the OP-seat flock. Recheck under that flock so a
   // resume that began after CLI preflight cannot slip between the ledger scan and graph start.
   if (!opts.forceNew && findActiveReleaseRun(version, root)) throw new ReleaseRunClaimConflict();
-  const state = await (deps.graph ?? runGraph)(GRAPH, { input, pinChildUniverse: true, deps: { root } });
+  const runId = randomUUID();
+  const safeCleanup = createMacrophageSafeCleanup({ repoRoot: process.cwd() });
+  const macrophage = createMacrophageRuntime({ runId, inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
+  let state: GraphRunState;
+  try { state = await (deps.graph ?? runGraph)(GRAPH, { runId, input, pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root } }); }
+  finally { macrophage.dispose(); }
   // A freeze switched on while the graph ran stops gate or publish inside it. Only a failed gate/publish node whose own
   // record is the freeze refusal is reported as the freeze; any other failure keeps its own reason.
   if (state.status === 'failed' && !opts.forceFreeze) {

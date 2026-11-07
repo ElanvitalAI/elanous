@@ -10,12 +10,15 @@ import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { acquireLockAsync } from '../../src/storage/file-lock.js';
 import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
+import type { GraphEventBus } from '../../src/graph-runner/graph-events.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { readGateShards } from '../../src/release-loop/gate-shards.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, planPartialRegate, planSameCommitRecheck, planStalledShardRecheck, testFileOfId, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
-import { gateAssignableTestsAtCommit, gateEnvFingerprint, gateShardRecipeIdentityAtCommit, gateSourcePins } from './gate-baseline-receipt.js';
+import { gateAssignableTestsAtCommit, gateEnvFingerprint, gateShardRecipeIdentityAtCommit, gateSourcePins, type GatePodRuntimeIdentity } from './gate-baseline-receipt.js';
+import { preflightGateExecutionIdentity } from './gate-radius-live.js';
+import { gateLockfileHashAtCommit } from './gate-reuse-identity.js';
 import { inspectGateShardReceipts, readGateShardManifest, readGateShardResult } from './gate-shard-receipts.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateWaiverCoverage, gateUnmeasuredDetail, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
@@ -23,6 +26,8 @@ import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
 import { releaseLoopConfig } from './unattended-release.js';
 import { trafficOptionsFromConfig } from './traffic-transition.js';
+import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
+import { createMacrophageSafeCleanup } from '../../src/release-loop/macrophage-safe-cleanup.js';
 import type { GateAutohealDecision } from './gate-autoheal.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -36,6 +41,8 @@ function sameRealPath(left: unknown, right: unknown): boolean {
 
 export interface ResumeReleaseDeps {
   root?: string;
+  /** Optional structured graph-event sink, used by simulations and in-process release observers. */
+  eventBus?: GraphEventBus;
   repo?: string;
   /** Runs git and returns stdout (throws on failure). */
   git?: (args: string[]) => string;
@@ -55,6 +62,8 @@ export interface ResumeReleaseDeps {
   gateTestsAtCommit?: (commit: string) => string[] | null;
   gateGraphPinsAtCommit?: (commit: string) => { graphSha: string; recipeSha: string } | null;
   gateShardRecipeAtCommit?: (commit: string) => { graphEntry: string; recipeCommand: string; recipeTimeoutMs: number } | null;
+  gateExecutionIdentityAtPool?: (pool: string, env: NodeJS.ProcessEnv, commit: string) => (GatePodRuntimeIdentity & { imageDigest: string }) | null;
+  gateLockHashAtCommit?: (commit: string) => string | null;
   /** Source observation before the first resumed node. */
   onSource?: (line: string) => void;
   /** Test seam; production resolves this from ELANOUS_RELEASE_TRAFFIC_FILE / release.loop.trafficFile. */
@@ -375,7 +384,7 @@ function verifyResumePreflight(run: GraphRunState, opts: ResumeReleaseOptions, d
 /** GATE-PARTIAL outcome of a resume — applied (with its exact remeasure selection) or the reason it fell back to a full gate.
  *  `auto` marks the default plan of `--from gate` (GATE-REUSE-BY-DIFF); `closure` is set when code changes were followed. */
 export type PartialOutcome = { requested: false }
-  | { requested: true; applied: true; files: number; plannedFiles: string[]; priorCommit: string; auto?: true; closure?: { reached: number; opaque: number } }
+  | { requested: true; applied: true; files: number; plannedFiles: string[]; priorCommit: string; auto?: true; closure?: { reached: number; opaque: number }; invalidatedShardIds?: string[] }
   | { requested: true; applied: false; reason: string; auto?: true };
 
 /** Build (or clear) the partial re-gate plan for the new tip. Fail-closed: any doubt leaves a full gate.
@@ -477,7 +486,7 @@ function stalledGateEvidence(input: { version: string; commit: string; repo: str
   return { ok: true, evidence: { stalledShards, partialSummary, partialFailures, preservedShardCount } };
 }
 
-function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean; gateExecutor?: string }, deps: ResumeReleaseDeps, dryRun = false): PartialOutcome {
+function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean; gateExecutor?: string; gatePodPool?: string }, deps: ResumeReleaseDeps, dryRun = false): PartialOutcome {
   const root = deps.root ?? effectiveInstanceRoot();
   // Any resume starts from no plan: one without a partial plan (from whatever node) never inherits an older plan.
   if (!dryRun) clearPartialPlan(root, tip.version);
@@ -633,6 +642,8 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
   const hasFormalReceipts = !!formalReceiptDir && existsSync(formalReceiptDir)
     && readdirSync(formalReceiptDir).some((name) => name.endsWith('.receipt.json'));
   let priorShards: Array<{ imageDigest: string | null }> | undefined;
+  let invalidatedShardIds: string[] = [];
+  let invalidatedFiles: string[] = [];
   if (hasFormalReceipts) {
     const cutoffRecord = saved.nodes.find((node) => node.nodeId === 'cutoff');
     const cutoffOutput = cutoffRecord ? lastJsonObject(cutoffRecord.output) as Record<string, unknown> | undefined : undefined;
@@ -652,14 +663,24 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     if (typeof expectedBase40 !== 'string' || !/^[a-f0-9]{40}$/i.test(expectedBase40) || !expectedTests || !expectedGraphPins || !currentShardRecipe
       || expectedShards.length !== expectedIds.length || expectedShards.some((shard) => !shard))
       return fallback('formal gate receipt inventory or cutoff baseline is unavailable');
+    const currentPool = opts.gatePodPool ?? (typeof savedInput.gatePodPool === 'string' ? savedInput.gatePodPool : undefined);
+    const currentRuntime = currentPool
+      ? (deps.gateExecutionIdentityAtPool ?? preflightGateExecutionIdentity)(currentPool, process.env, tip.to) : null;
+    const currentLockHash = (deps.gateLockHashAtCommit ?? ((commit) => gateLockfileHashAtCommit(deps.repo ?? process.cwd(), commit)))(tip.to);
+    if (!currentRuntime || !currentLockHash)
+      return fallback('current gate runtime identity or lock hash is unmeasured — full gate');
+    const runtimeIdentity = { ...currentRuntime };
     const inspected = inspectGateShardReceipts(formalReceiptDir!, { version: tip.version, commit: tip.from, base40: expectedBase40, graphPins: expectedGraphPins, ...currentShardRecipe,
-      envFingerprint: gateEnvFingerprint(process.env), shards: expectedShards as Array<{ id: string; files: string[] }>, tests: expectedTests });
+      envFingerprint: gateEnvFingerprint(process.env), runtimeIdentity, lockHash: currentLockHash,
+      shards: expectedShards as Array<{ id: string; files: string[] }>, tests: expectedTests });
     if (inspected.kind !== 'valid')
       return fallback(`formal gate receipt validation failed: ${inspected.kind === 'invalid' ? inspected.reason : 'receipt set absent'}`);
+    invalidatedShardIds = inspected.invalidatedShardIds;
+    invalidatedFiles = inspected.invalidatedFiles;
     priorShards = inspected.images.map((image) => ({ imageDigest: image.imageDigest ?? null }));
   } else if (priorCutLogs) priorShards = collectExecutedPodShardImages(priorCutLogs, tip.from).map((image) => ({ imageDigest: image.imageDigest ?? null }));
   const stalledFiles = movedStalledEvidence?.stalledShards.flatMap((shard) => shard.files) ?? [];
-  const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: [...changed, ...stalledFiles],
+  const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: [...changed, ...stalledFiles, ...invalidatedFiles],
     priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[],
     existsAtTip: (file) => tracked.has(file),
     ...((podGate || movedStalledEvidence) ? { priorShards: priorShards ?? [] } : {}),
@@ -683,7 +704,8 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
   debug.log('release-loop.resume', 'partial-planned', { version: tip.version, priorCommit: tip.from, commit: tip.to, files: planned.plan.files.length,
     tests: tests.length, auto, ...(path ? { path } : {}), dryRun, ...(planned.closure ? { reached: planned.closure.reached, opaque: planned.closure.opaque } : {}) });
   return { requested: true, applied: true, files: planned.plan.files.length, plannedFiles: [...planned.plan.files], priorCommit: tip.from,
-    ...(auto ? { auto: true as const } : {}), ...(planned.closure ? { closure: planned.closure } : {}) };
+    ...(auto ? { auto: true as const } : {}), ...(planned.closure ? { closure: planned.closure } : {}),
+    ...(invalidatedShardIds.length ? { invalidatedShardIds } : {}) };
 }
 
 /** The graph file the run started from — a snapshot run refuses any other path (the installed CLI's own copy differs). */
@@ -826,7 +848,11 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
   const savedSource = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
   deps.onSource?.(`레시피 출처: graph=${graphPath} · graph sha=${savedSource.graphSnapshot?.graphSha?.slice(0, 12) ?? 'legacy'} · recipes sha=${savedSource.graphSnapshot?.recipesSha?.slice(0, 12) ?? 'legacy'} · command-root=${commandRoot} · 컷 tip=${tip.to.slice(0, 12)}`);
-  const state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true,
+  const safeCleanup = createMacrophageSafeCleanup({ repoRoot: process.cwd() });
+  const macrophage = createMacrophageRuntime({ runId: opts.runId, eventBus: deps.eventBus,
+    inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
+  let state: GraphRunState;
+  try { state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true, eventBus: macrophage.eventBus,
     releaseCommandSource: { root: commandRoot, cutTip: tip.to, ...(deps.git ? { git: deps.git } : {}) },
     ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [] } } : {}),
     ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
@@ -835,7 +861,8 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     ...(shardReroute || automaticShardReroute ? { releaseGateShardReroute: { shard: (shardReroute ?? automaticShardReroute)!.set.gateRerouteShard,
       ...((shardReroute ?? automaticShardReroute)!.set.gateShardHost ? { host: (shardReroute ?? automaticShardReroute)!.set.gateShardHost } : {}),
       ...(opts.shardOs ? { os: opts.shardOs } : {}) } } : {}),
-    deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
+    deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } }); }
+  finally { macrophage.dispose(); }
   return { tip, partial, state };
 }
 

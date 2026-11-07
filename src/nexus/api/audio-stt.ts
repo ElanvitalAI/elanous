@@ -27,6 +27,15 @@ export interface AudioSttRouteOpts {
   /** Override the model id (e.g. `gpt-4o-transcribe`). Default
    *  inherits from the provider. */
   model?: string;
+  /** Provider seam for loopback/fake-provider simulation. */
+  transcribe?: (input: { audio: Buffer; mimeType: string; filename: string; apiKey?: string; model?: string; language?: string }) => Promise<STTResult>;
+}
+
+export async function transcribeAudioFile(input: { audio: Buffer; mimeType: string; filename: string; apiKey?: string; model?: string; language?: string }): Promise<STTResult> {
+  const cfg: { id: 'openai-whisper'; apiKey?: string; model?: string } = { id: 'openai-whisper' };
+  if (input.apiKey) cfg.apiKey = input.apiKey;
+  if (input.model) cfg.model = input.model;
+  return new OpenAIWhisperProvider(cfg).transcribeFile(input.audio, input.mimeType, input.filename, { ...(input.language ? { language: input.language } : {}) });
 }
 
 function jsonResponse(body: unknown, status: number): Response {
@@ -129,25 +138,18 @@ export async function handleAudioStt(
   const requestedModel = queryModel || formModel || '';
   const arrayBuffer = await file.arrayBuffer();
   const audio = Buffer.from(arrayBuffer);
-  let provider: OpenAIWhisperProvider;
-  try {
-    const cfg: { id: 'openai-whisper'; apiKey?: string; model?: string } = {
-      id: 'openai-whisper',
-    };
-    if (opts.apiKey) cfg.apiKey = opts.apiKey;
-    // request override > route opts default (test-supplied).
-    if (requestedModel) cfg.model = requestedModel;
-    else if (opts.model) cfg.model = opts.model;
-    provider = new OpenAIWhisperProvider(cfg);
-  } catch (e) {
+  if (!opts.transcribe && !opts.apiKey && !process.env.OPENAI_API_KEY) {
     return jsonResponse({
       error: 'provider-config',
-      detail: e instanceof Error ? e.message : String(e),
+      detail: 'OpenAI API key not provided.',
     }, 500);
   }
   let result: STTResult;
   try {
-    result = await provider.transcribeFile(audio, mimeType, filename, {
+    result = await (opts.transcribe ?? transcribeAudioFile)({
+      audio, mimeType, filename,
+      ...(opts.apiKey ? { apiKey: opts.apiKey } : {}),
+      ...(requestedModel ? { model: requestedModel } : opts.model ? { model: opts.model } : {}),
       ...(language ? { language } : {}),
     });
   } catch (e) {

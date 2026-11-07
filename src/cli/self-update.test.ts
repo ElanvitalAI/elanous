@@ -173,7 +173,7 @@ describe('runReleaseUpdate — release installer', () => {
     try {
       const result = await runReleaseUpdate({}, f.deps);
       expect(f.urls).toEqual(['https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh']);
-      expect(f.calls).toEqual([{ command: 'bash', args: ['-s', '--', '--no-modify-path', '--prefix', f.prefix], cwd: f.prefix, input: 'echo verified installer', env: { ELANOUS_VERSION: '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases' } }]);
+      expect(f.calls).toEqual([{ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path', '--prefix', f.prefix], cwd: f.prefix, input: 'echo verified installer', env: { ELANOUS_VERSION: '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases' } }]);
       expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0', restarted: false });
     } finally { f.cleanup(); }
   });

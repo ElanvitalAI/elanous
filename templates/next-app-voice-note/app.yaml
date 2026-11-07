@@ -1,0 +1,88 @@
+apiVersion: elanous.app/v0
+slug: voice-note
+title: 나만의 음성 노트
+template: next-app-voice-note
+
+frontend:
+  kind: static-export
+  out: out/
+
+tables:
+  notes:
+    columns:
+      id: { type: text, primary: true }
+      title: { type: text }
+      transcript: { type: text }
+      summary: { type: text }
+      todos: { type: json }
+      tags: { type: json }
+      audio: { type: object-ref }
+      created_at: { type: timestamp, default: now }
+    realtime: true
+
+roles:
+  owner: { via: nexus-session }
+  viewer: { via: share-link }
+
+rpc:
+  listNotes:
+    sql: SELECT id, title, summary, created_at FROM notes ORDER BY created_at DESC LIMIT :limit
+    params:
+      limit: { type: int, max: 200, default: 50 }
+    allow: [owner, viewer]
+  addNote:
+    sql: INSERT INTO notes (id, title, transcript, summary, todos, tags, audio, created_at) VALUES (:id, :title, :transcript, :summary, :todos, :tags, :audio, :created_at)
+    params:
+      id: { type: text }
+      title: { type: text }
+      transcript: { type: text }
+      summary: { type: text }
+      todos: { type: json }
+      tags: { type: json }
+      audio: { type: object-ref }
+      created_at: { type: timestamp }
+    allow: [owner]
+
+actions:
+  transcribe:
+    builtin: stt
+    input: { audio: object-ref }
+    uses: [cred:openai.api_key]
+  summarize:
+    builtin: summarize
+    input: { text: text }
+    uses: [cred:openai.api_key]
+  readAloud:
+    builtin: tts
+    input: { text: text }
+    uses: [cred:elevenlabs.api_key]
+    optional: true
+
+storage:
+  prefix: apps/voice-note/
+  upload:
+    allow: [owner]
+    types: [audio/webm, audio/wav]
+
+credentials:
+  - cred:openai.api_key
+  - cred:elevenlabs.api_key
+
+simulate:
+  seed: 7
+  clock: { start: 2026-11-05T09:00:00+09:00, speed: 60 }
+  connectors:
+    transcribe: { fake: stt, profile: ok }
+    readAloud: { fake: tts, profile: ok }
+    storage: { fake: object-store, profile: ok }
+    auth: { fake: share-link, profile: ok }
+  scenarios:
+    - name: 녹음에서 공유 가능한 노트까지
+      steps:
+        - { action: transcribe, as: owner }
+        - { action: summarize, as: owner }
+        - { rpc: addNote, as: owner }
+        - { action: readAloud, as: owner }
+      expect:
+        - { table: notes, rows: 1 }
+        - { screen-text: 노트가 저장되었습니다 }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withFakeBins } from '../ux-sim/fake-bin.js';
@@ -473,6 +473,33 @@ describe('onRemoteOutcome hook (self gate --artifact-dir fetch)', () => {
 });
 
 describe('self gate explicit remote placement', () => {
+  test('a fresh selected state root initializes its empty reservation directory before remote placement', async () => {
+    const root = slotDir();
+    const runner = fakeRunner();
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'mshq' },
+      explicitRemoteOnly: true, reservationRoot: root, remoteArgv: ['x'], runLocal: () => { throw new Error('must stay remote'); } },
+    { runner, settings, env: {}, load1: 1, write: sink().write });
+    expect(rc).toBe(0);
+    const reservations = join(root, 'release', 'gate-host-reservations');
+    expect(readdirSync(reservations)).toEqual([]);
+    expect(statSync(reservations).mode & 0o777).toBe(0o700);
+    expect(runner.calls).toContainEqual(['ssh', 'mshq']);
+  });
+
+  test('reservation directory initialization failure stays unmeasured and never starts the remote runner', async () => {
+    const parent = slotDir();
+    const root = join(parent, 'not-a-directory');
+    writeFileSync(root, 'file blocks ledger parent');
+    const runner = fakeRunner();
+    const io = sink();
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'mshq' },
+      explicitRemoteOnly: true, reservationRoot: root, remoteArgv: ['x'], runLocal: () => { throw new Error('must stay remote'); } },
+    { runner, settings, env: {}, load1: 1, write: io.write });
+    expect(rc).toBe(1);
+    expect(io.err.join('')).toContain('remote unmeasured — reservation directory initialization failed:');
+    expect(runner.calls.some(([kind]) => kind === 'ssh')).toBe(false);
+  });
+
   test('production probe resolves the configured Pod pool and reads its ledger without an injected runner', async () => {
     const root = slotDir();
     const release = reserveReleaseGateHosts(root, 'production-probe-seed', ['node-b']);

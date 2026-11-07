@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { parseAppManifest } from './app-contract.js';
 
 const validYaml = `apiVersion: elanous.app/v0
@@ -37,7 +38,7 @@ const errorsOf = (result: ParseResult) => result.ok ? [] : result.errors;
 const warningsOf = (result: ParseResult) => result.ok ? result.warnings : [];
 
 describe('NEXUS-APP-CONTRACT', () => {
-  test('NEXUS-APP-CONTRACT: RFC 정본의 적용 범위를 §2꼴·§2 «검증 규칙» 표·§3내장 동작 넷·§4', () => {
+  test('NEXUS-APP-CONTRACT: RFC 정본의 적용 범위를 §2꼴·§2 «검증 규칙» 표·§3내장 동작 다섯·§4', () => {
     expect(errorsOf(parseAppManifest(validYaml))).toEqual([]);
     const checks = [
       replaceOnce('kind: static-export', 'kind: server'),
@@ -56,6 +57,44 @@ describe('NEXUS-APP-CONTRACT', () => {
     expect(warningsOf(result)).toEqual([]);
     expect(result.ok && result.manifest.slug).toBe('voice-note');
     expect(errorsOf(parseAppManifest(validYaml, ['voice-note'])).map(issue => issue.path)).toContain('/slug');
+  });
+
+  test('validates app storage quota and upload role/content-type declarations', () => {
+    const source = validYaml.replace(
+      'storage:\n  prefix: apps/voice-note/\n',
+      'storage:\n  prefix: apps/voice-note/\n  quotaBytes: 1024\n  upload: { allow: [owner], types: [audio/wav], maxBytes: 512 }\n',
+    );
+    expect(errorsOf(parseAppManifest(source))).toEqual([]);
+    expect(parseAppManifest(source.replace('maxBytes: 512', 'maxBytes: 512, anonymous: true')).ok).toBe(true);
+    for (const invalid of [
+      source.replace('quotaBytes: 1024', 'quotaBytes: 0'),
+      source.replace('allow: [owner]', 'allow: [missing-role]'),
+      source.replace('types: [audio/wav]', 'types: [not-a-mime]'),
+      source.replace('maxBytes: 512', 'maxBytes: -1'),
+      source.replace('maxBytes: 512', 'maxBytes: 512, anonymous: "yes"'),
+    ]) {
+      expect(errorsOf(parseAppManifest(invalid)).length).toBeGreaterThan(0);
+    }
+  });
+
+  test('accepts translate as a builtin with text and source/target language declarations', () => {
+    const source = replaceOnce(
+      '  summarize: { builtin: summarize, uses: [cred:openai.api_key] }',
+      '  translate: { builtin: translate, input: { text: text, sourceLanguage: text, targetLanguage: text }, uses: [cred:openai.api_key] }',
+    );
+    const result = parseAppManifest(source);
+    expect(result.ok).toBe(true);
+    expect(errorsOf(result)).toEqual([]);
+  });
+
+  test('parses the translator template action input/output declaration', () => {
+    const source = readFileSync('templates/next-app-translator/app.yaml', 'utf8');
+    const result = parseAppManifest(source);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const actions = result.manifest.actions as Record<string, { input?: unknown; output?: { text?: string } }>;
+    expect(actions.translate?.input).toEqual({ text: 'text', sourceLanguage: 'text', targetLanguage: 'text' });
+    expect(actions.translate?.output).toEqual({ text: 'text' });
   });
 
   test('reports malformed YAML without echoing the source', () => {

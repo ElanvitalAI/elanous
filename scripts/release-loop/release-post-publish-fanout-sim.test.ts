@@ -25,6 +25,102 @@ function child(command: string, env: NodeJS.ProcessEnv, cwd: string): Promise<{ 
   });
 }
 
+const fakeLandCliSource = [
+  "const fs = require('node:fs');",
+  "const argv = process.argv.slice(2);",
+  "const action = argv.shift();",
+  "const { FAKE_LAND_STATE: statePath, FAKE_LAND_MAIN_VERSION: mainVersionPath, FAKE_LAND_DOCS_LANDED: docsLandedPath, FAKE_LAND_BUMPED_MAIN: bumpedVersion } = process.env;",
+  "const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : {};",
+  "function fail(message) { process.stderr.write(message + '\\n'); process.exit(1); }",
+  "function option(name) { const index = argv.indexOf(name); return index < 0 ? undefined : argv[index + 1]; }",
+  "function writeState() { fs.writeFileSync(statePath, JSON.stringify(state)); }",
+  "function land(branch, pr, expectedHead) { const target = state[branch]; if (!target || !target.held || !target.ready || target.pr !== pr) fail('land requires this ready held PR'); if (!expectedHead || target.head !== expectedHead) fail('expected-head mismatch'); if (branch === 'version-dev-bump' || branch.startsWith('release-version-dev-bump-')) fs.writeFileSync(mainVersionPath, bumpedVersion + '\\n'); else fs.writeFileSync(docsLandedPath, 'landed\\n'); }",
+  "if (action === 'hold') { const [branch, pr, head] = argv; if (!branch || !pr || !head) fail('hold requires branch, PR, and head'); state[branch] = { held: true, head, ready: false, pr }; writeState(); process.exit(0); }",
+  "if (action === 'ready') { const pr = option('--pr') || argv[0]; const target = Object.values(state).find(value => value.pr === pr); if (!target || !target.held) fail('ready requires a held PR'); target.ready = true; writeState(); process.exit(0); }",
+  "if (action === 'land') { land(argv[0], argv[1], argv[2]); process.exit(0); }",
+  "fail('unknown fake land action: ' + action);",
+].join('\n');
+
+function makeFakeLandHarness(initialMain = DEV,
+  initialState: Record<string, { held: boolean; head: string; ready: boolean; pr: string }> = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'fake-land-state-'));
+  const statePath = join(root, 'state.json');
+  const mainVersionPath = join(root, 'main-version.txt');
+  const docsLandedPath = join(root, 'docs-landed');
+  const cliPath = join(root, 'fake-land-cli.cjs');
+  writeFileSync(cliPath, fakeLandCliSource);
+  writeFileSync(statePath, JSON.stringify(initialState));
+  writeFileSync(mainVersionPath, initialMain);
+  const env = { ...process.env, FAKE_LAND_STATE: statePath, FAKE_LAND_MAIN_VERSION: mainVersionPath,
+    FAKE_LAND_DOCS_LANDED: docsLandedPath, FAKE_LAND_BUMPED_MAIN: NEXT_DEV };
+  const run = async (...args: string[]) => child('node ' + JSON.stringify(cliPath) + ' ' + args.map((arg) => JSON.stringify(arg)).join(' '), env, root);
+  const snapshot = () => ({ state: JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, { held: boolean; head: string; ready: boolean; pr: string }>,
+    main: readFileSync(mainVersionPath, 'utf8').trim(), docsLanded: existsSync(docsLandedPath) });
+  return { run, snapshot, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+async function runFakeLandCase(action: string, branch: string, pr: string, expectedHead: string,
+  initialMain = DEV, existingState: Record<string, { held: boolean; head: string; ready: boolean; pr: string }> = {}) {
+  const harness = makeFakeLandHarness(initialMain, existingState);
+  const result = await harness.run(action, branch, pr, expectedHead);
+  return { ...result, ...harness.snapshot(), cleanup: harness.cleanup };
+}
+
+test('fake pr land hold records branch state without changing main or docs', async () => {
+  const harness = makeFakeLandHarness();
+  try {
+    const held = await harness.run('hold', 'release-docs/0.3.1', '99101', MAIN);
+    expect(held.exitCode).toBe(0);
+    expect(harness.snapshot().state['release-docs/0.3.1']).toEqual({ held: true, head: MAIN, ready: false, pr: '99101' });
+    expect(harness.snapshot().main).toBe(DEV);
+    expect(harness.snapshot().docsLanded).toBe(false);
+  } finally { harness.cleanup(); }
+});
+
+test('fake pr land rejects ready for a PR that was not held', async () => {
+  const harness = makeFakeLandHarness();
+  try {
+    const ready = await harness.run('ready', '--pr', '99102');
+    expect(ready.exitCode).not.toBe(0);
+    expect(ready.stderr).toContain('ready requires a held PR');
+  } finally { harness.cleanup(); }
+});
+
+test('fake pr land rejects a held branch that was not made ready', async () => {
+  const result = await runFakeLandCase('land', 'version-dev-bump', '99103', MAIN,
+    DEV, { 'version-dev-bump': { held: true, head: MAIN, ready: false, pr: '99103' } });
+  try {
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('ready held PR');
+    expect(result.main).toBe(DEV);
+    expect(result.docsLanded).toBe(false);
+  } finally { result.cleanup(); }
+});
+
+test('fake pr land rejects an expected-head mismatch after ready', async () => {
+  const result = await runFakeLandCase('land', 'version-dev-bump', '99104', CUT,
+    DEV, { 'version-dev-bump': { held: true, head: MAIN, ready: true, pr: '99104' } });
+  try {
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('expected-head mismatch');
+    expect(result.main).toBe(DEV);
+    expect(result.docsLanded).toBe(false);
+  } finally { result.cleanup(); }
+});
+
+test('fake pr land accepts hold, ready, and the same pinned branch head in order', async () => {
+  const harness = makeFakeLandHarness();
+  try {
+    expect((await harness.run('hold', 'version-dev-bump', '99105', MAIN)).exitCode).toBe(0);
+    expect(harness.snapshot().main).toBe(DEV);
+    expect(harness.snapshot().docsLanded).toBe(false);
+    expect((await harness.run('ready', '--pr', '99105')).exitCode).toBe(0);
+    expect((await harness.run('land', 'version-dev-bump', '99105', MAIN)).exitCode).toBe(0);
+    expect(harness.snapshot().main).toBe(NEXT_DEV);
+    expect(harness.snapshot().docsLanded).toBe(false);
+  } finally { harness.cleanup(); }
+});
+
 test('SIM-RELEASE-CHAIN: post-publish fan-out runs the graph CLIs concurrently, preserves both results at join, then enters verify', async () => {
   const root = mkdtempSync(join(tmpdir(), 'sim-release-post-publish-'));
   const bin = join(root, 'bin');
@@ -104,9 +200,10 @@ process.stderr.write('unexpected fake git: ' + args.join(' ') + '\\n'); process.
 if [ "$1" = "scripts/release-loop/docs-land-node.ts" ] || [ "$1" = "scripts/release-loop/version-node.ts" ] || [ "$1" = "scripts/release-loop/verify-node.ts" ]; then
   exec ${JSON.stringify(bun)} --preload ${JSON.stringify(preload)} "$@"
 fi
+if [ "$1" = "bin/elanous.mjs" ] && [ "$2" = "gh" ] && [ "$3" = "pr" ] && [ "$4" = "ready" ]; then [ "$5" = "99999" ] && [ "$(cat ${JSON.stringify(mainVersion)})" = ${JSON.stringify(DEV)} ] && [ -f ${JSON.stringify(docsLanded)}.held-$5 ] && touch ${JSON.stringify(docsLanded)}.ready-$5 || exit 1; exit 0; fi
 if [ "$1" = "bin/elanous.mjs" ] && [ "$2" = "pr" ] && [ "$3" = "land" ]; then
-  case "$*" in *"version: ${NEXT_DEV}"*) echo ${JSON.stringify(NEXT_DEV)} > ${JSON.stringify(mainVersion)} ;; *) touch ${JSON.stringify(docsLanded)} ;; esac
-  echo '✓ merge: #99999'
+  case "$*" in *"--hold"*) [ "$(cat ${JSON.stringify(mainVersion)})" = ${JSON.stringify(DEV)} ] || exit 1; touch ${JSON.stringify(docsLanded)}.held-99999 ;; *"version: ${NEXT_DEV}"*) case "$*" in *"--pr 99999"*"--expected-head ${MAIN}"*) test -f ${JSON.stringify(docsLanded)}.ready-99999 || exit 1; echo ${JSON.stringify(NEXT_DEV)} > ${JSON.stringify(mainVersion)} ;; *) exit 1 ;; esac ;; *) touch ${JSON.stringify(docsLanded)} ;; esac
+  case "$*" in *"--hold"*) echo '✓ upsert-ready: https://github.com/example/repo/pull/99999'; echo '✓ hold: #99999' ;; *) echo '✓ merge: #99999' ;; esac
   exit 0
 fi
 if [ "$1" = "bin/elanous.mjs" ] && [ "$2" = "release" ] && [ "$3" = "verify" ]; then

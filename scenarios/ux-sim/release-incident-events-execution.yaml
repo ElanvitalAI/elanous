@@ -1,0 +1,114 @@
+version: 1
+kind: release-graph
+id: release-incident-events-execution-035
+isolation: test
+input:
+  version: '0.3.5'
+  previousVersion: '0.3.4'
+cases:
+  - id: incident-01-tip-moved
+    mode: cut-tip-moved-after-resume
+    expect:
+      status: resume-refused
+      mustVisit: [version-release]
+      mustNotVisit: [cutoff, gate, publish]
+      events:
+        - { event: node-start, nodeId: version-release }
+        - { event: node-end, nodeId: version-release, ok: true }
+  - id: incident-02-pod-4-receipt-corrupt
+    mode: append-receipt-continuity
+    expect:
+      status: done
+      mustVisit: [cut, gate-cut, append-a, resume-a, gate-a, append-b, resume-b, gate-b, publish, done]
+      mustNotVisit: [failed]
+      events:
+        - { event: node-start, nodeId: cut }
+        - { event: node-end, nodeId: cut, ok: true }
+  - id: incident-03-gate-waiver-approval-mismatch
+    mode: owner-waive-unmeasured-gate
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [gate-triage, failed]
+      events:
+        - { event: node-start, nodeId: gate }
+        - { event: node-end, nodeId: gate, ok: false }
+  - id: incident-04-approval-graph-path-mismatch
+    mode: approval-graph-path-mismatch
+    expect:
+      status: resume-refused
+      mustVisit: [auto-approve, approve-publish]
+      mustNotVisit: [publish, done]
+      refusalIncludes: approval source changed
+      events:
+        - { event: node-start, nodeId: auto-approve }
+        - { event: node-end, nodeId: auto-approve, ok: false }
+  - id: incident-05-known-issues-ascii-fixed
+    fault:
+      node: known-issues
+      outcome: error
+      evidence: { claim: 'ASCII fixed without evidence' }
+    expect:
+      status: failed
+      mustVisit: [known-issues, traffic-failed-restore, failed]
+      mustNotVisit: [publish]
+      events:
+        - { event: node-start, nodeId: known-issues }
+        - { event: node-end, nodeId: known-issues, ok: false }
+  - id: incident-06-pwa-costly-opt-in
+    mode: pwa-costly-opt-in-required
+    expect:
+      status: done
+      mustVisit: [pwa, pre-prepare-join, prepare, publish, done]
+      mustNotVisit: [failed]
+      events:
+        - { event: node-start, nodeId: pwa }
+        - { event: node-end, nodeId: pwa, ok: true }
+  - id: incident-07-install-consent-missing-prepare
+    fault:
+      node: prepare
+      outcome: fail
+      evidence: { consent: false, source: prepare-e2e }
+    expect:
+      status: failed
+      mustVisit: [prepare, traffic-failed-restore, failed]
+      mustNotVisit: [upgrade, publish]
+      events:
+        - { event: node-start, nodeId: prepare }
+        - { event: node-end, nodeId: prepare, ok: false }
+  - id: incident-07-install-consent-missing-upgrade
+    fault:
+      node: upgrade
+      outcome: fail
+      evidence: { consent: false, source: upgrade }
+    expect:
+      status: failed
+      mustVisit: [prepare, upgrade, traffic-failed-restore, failed]
+      mustNotVisit: [publish]
+      events:
+        - { event: node-start, nodeId: upgrade }
+        - { event: node-end, nodeId: upgrade, ok: false }
+  - id: incident-08-version-dev-merge-marker-missing
+    fault:
+      node: version-dev-bump
+      outcome: fail
+      evidence: { mergeMarker: missing }
+    expect:
+      status: failed
+      mustVisit: [version-dev-bump, traffic-failed-restore, failed]
+      mustNotVisit: [verify, done]
+      events:
+        - { event: node-start, nodeId: version-dev-bump }
+        - { event: node-end, nodeId: version-dev-bump, ok: false }
+  - id: incident-09-verify-self-update-consent
+    fault:
+      node: verify
+      outcome: fail
+      evidence: { exitCode: 1, reason: installer-consent-required }
+    expect:
+      status: failed
+      mustVisit: [verify, traffic-failed-restore, failed]
+      mustNotVisit: [vault-note, release-story, done]
+      events:
+        - { event: node-start, nodeId: verify }
+        - { event: node-end, nodeId: verify, ok: false }

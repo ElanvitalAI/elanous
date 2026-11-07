@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  openKnowledgeDb, ingestKnowledge, queryKnowledge, chunkReport,
+  openKnowledgeDb, ingestKnowledge, ingestText, queryKnowledge, chunkReport,
   renderKnowledgeMatches, knowledgeStats, type EmbedFn,
 } from '../src/domains/knowledge.js';
 import { openSignalsDb } from '../src/domains/breaking-signals.js';
@@ -117,6 +117,36 @@ describe('knowledge layer (R3)', () => {
     const db = openKnowledgeDb(kdbPath);
     const r = await queryKnowledge(db, '에너지', { embed: otherModelEmbed });
     expect(r.length).toBe(0); // fake-8d 문서는 other-model 질의와 안 섞임
+    db.close();
+  });
+
+  test('query: candidate pool restricts vector reranking and excludeId keeps the full requested result count', async () => {
+    const db = openKnowledgeDb(join(dir, 'candidate-pool.db'));
+    const doc = (id: string, text: string) => ingestText(db, {
+      id, ts: '2026-11-06T00:00:00.000Z', kind: 'memory', domain: 'candidate-pool', text,
+    }, fakeEmbed);
+    await doc('case:query', '에너지 수요와 가격');
+    await doc('case:bm25-candidate', '에너지 공급 전망');
+    await doc('case:outside-pool', '에너지 정책 요약');
+
+    const restricted = await queryKnowledge(db, '에너지', {
+      embed: fakeEmbed,
+      kind: 'memory',
+      domain: 'candidate-pool',
+      candidateIds: ['case:bm25-candidate'],
+      excludeId: 'case:query',
+    });
+    expect(restricted.map((hit) => hit.id)).toEqual(['case:bm25-candidate']);
+
+    const neighbors = await queryKnowledge(db, '에너지', {
+      embed: fakeEmbed,
+      kind: 'memory',
+      domain: 'candidate-pool',
+      k: 2,
+      excludeId: 'case:query',
+    });
+    expect(neighbors).toHaveLength(2);
+    expect(neighbors.some((hit) => hit.id === 'case:query')).toBe(false);
     db.close();
   });
 

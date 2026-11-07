@@ -26,7 +26,7 @@
 
 import type { LogRecord } from '../record.js';
 import type { LogSink } from '../sink.js';
-import { debug as debugLog } from '../../../debug/log.js';
+import { logDiagnostic } from '../diagnostic-sink.js';
 
 const DEFAULT_SERVICE_NAME = 'monad-agent';
 const DEFAULT_BATCH_SIZE = 50;
@@ -210,7 +210,7 @@ export class OtelGenAISink implements LogSink {
       .catch((err) => {
         this.dropped += spans.length;
         try {
-          debugLog.log('otel.genai-sink', 'send-fail', {
+          logDiagnostic('otel.genai-sink', 'send-fail', {
             endpoint: this.endpoint,
             spans: spans.length,
             error: err instanceof Error ? err.message : String(err),

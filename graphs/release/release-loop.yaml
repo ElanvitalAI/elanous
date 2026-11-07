@@ -9,6 +9,7 @@ loop:
 triggers:
   schedule: { type: cron, cron: '* * * * *' }
 version: 1
+max_parallel_nodes: 2
 entry_node: version-release
 dry_run_await_approval: true
 terminal_nodes: [done, failed]
@@ -16,20 +17,20 @@ nodes:
   - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
   - { node_id: traffic-cut-start, kind: gate, recipe: 'cmd:traffic-cut-start', max_visits: 1 }
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
-  - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1 }
+  - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1, needs: [export-check] }
   # cmd:docs dispatches by graph node ID: bounded prefetch before gate, TUI join after upgrade, docs write after both.
   # Public export is checked before expensive prefetch/gate work; a leak stops the release immediately.
   - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1 }
-  - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
-  - { node_id: pre-gate-join, kind: gate, recipe: none, max_visits: 1 }
-  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: { on: [fail] } }
+  - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1, needs: [export-check] }
+  - { node_id: pre-gate-join, kind: gate, recipe: none, max_visits: 1, needs: [checklist-gate, prefetch] }
+  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 2, notify: { on: [fail] } }
   # Deterministic, best-effort traffic transition; it never changes the release verdict.
   - { node_id: traffic-gate-passed, kind: gate, recipe: 'cmd:traffic-gate-passed', max_visits: 1 }
-  # S1 shadow: classify and record only; all exits still terminate through the existing failed node.
-  - { node_id: gate-triage, kind: judge, recipe: 'cmd:gate-triage', max_visits: 1 }
-  - { node_id: mac-smoke, kind: gate, recipe: 'cmd:mac-smoke', max_visits: 1 }
-  - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: { on: [fail] } }
-  - { node_id: pre-prepare-join, kind: gate, recipe: none, max_visits: 1 }
+  # Live ARG planning records a bounded repair/append/resume plan; this release remains fail-closed until a later graph run executes it.
+  - { node_id: gate-triage, kind: judge, recipe: 'cmd:gate-triage', max_visits: 2 }
+  - { node_id: mac-smoke, kind: gate, recipe: 'cmd:mac-smoke', max_visits: 1, needs: [traffic-gate-passed] }
+  - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: { on: [fail] }, needs: [traffic-gate-passed] }
+  - { node_id: pre-prepare-join, kind: gate, recipe: none, max_visits: 1, needs: [mac-smoke, pwa] }
   - { node_id: prepare, kind: agent, recipe: 'cmd:prepare', max_visits: 1, notify: { on: [fail] } }
   - { node_id: upgrade, kind: gate, recipe: 'cmd:upgrade', max_visits: 1 }
   - { node_id: tui, kind: gate, recipe: 'cmd:docs', max_visits: 1 }
@@ -45,17 +46,17 @@ nodes:
   - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: npm-publish, kind: git, recipe: 'cmd:npm-publish', max_visits: 1 }
   - { node_id: traffic-npm-published, kind: gate, recipe: 'cmd:traffic-npm-published', max_visits: 1 }
-  - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1 }
-  - { node_id: release-post-publish-join, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1, needs: [traffic-npm-published] }
+  - { node_id: release-post-publish-join, kind: gate, recipe: none, max_visits: 1, needs: [docs-land, version-dev-bump] }
   - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: traffic-verify-complete, kind: gate, recipe: 'cmd:traffic-verify-complete', max_visits: 1 }
   - { node_id: vault-note, kind: gate, recipe: 'cmd:vault-note', max_visits: 1 }
   - { node_id: release-story, kind: gate, recipe: 'cmd:release-story', max_visits: 1 }
   - { node_id: ops-upgrade, kind: agent, recipe: 'cmd:ops-upgrade', max_visits: 1 }
-  - { node_id: version-dev-bump, kind: git, recipe: 'cmd:version-dev-bump', max_visits: 1 }
+  - { node_id: version-dev-bump, kind: git, recipe: 'cmd:version-dev-bump', max_visits: 1, needs: [traffic-npm-published] }
   - { node_id: traffic-failed-restore, kind: gate, recipe: 'cmd:traffic-failed-restore', max_visits: 1 }
-  - { node_id: done, kind: gate, max_visits: 1 }
-  - { node_id: failed, kind: gate, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
 edges:
   - { from: version-release, on: outcome, map: { ok: traffic-cut-start, fail: failed, error: failed } }
   # Advisory traffic writes report failure to OP; release steps still proceed on fail/error.
@@ -64,22 +65,15 @@ edges:
   - from: export-check
     on: outcome
     map: { fail: traffic-failed-restore, error: traffic-failed-restore }
-    # This single edge launches checklist-gate and prefetch concurrently; the join routes checklist failures to restore.
-    branches: { ok: [checklist-gate, prefetch] }
+    # checklist-gate and prefetch declare needs: [export-check]; the scheduler fans ready nodes out and joins at pre-gate-join.
     warning_branches: [prefetch]
-    join: pre-gate-join
-  # Export is required before fanout; checklist and prefetch then run together, with prefetch warning-only.
+  # Export is required before needs-based fanout; prefetch remains warning-only.
   - { from: pre-gate-join, on: outcome, map: { ok: gate, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: gate, on: outcome, map: { ok: traffic-gate-passed, fail: gate-triage, error: gate-triage } }
   # Warning-only: the transition result stays truthful; every outcome continues to the next release node.
   - from: traffic-gate-passed
     on: outcome
-    branches:
-      ok: [mac-smoke, pwa]
-      fail: [mac-smoke, pwa]
-      error: [mac-smoke, pwa]
     warning_branches: [mac-smoke]
-    join: pre-prepare-join
   - { from: gate-triage, on: outcome, map: { ok: traffic-failed-restore, fail: traffic-failed-restore, error: traffic-failed-restore } }
   # Warning-only: a macOS failure or unmeasured run never blocks publishing — auto-approve shows it as a warning row.
   - { from: pre-prepare-join, on: outcome, map: { ok: prepare, fail: traffic-failed-restore, error: traffic-failed-restore } }
@@ -100,11 +94,6 @@ edges:
   # After npm publish these writes have independent ledgers and run together; the join keeps either result and gates verify.
   - from: traffic-npm-published
     on: outcome
-    branches:
-      ok: [docs-land, version-dev-bump]
-      fail: [docs-land, version-dev-bump]
-      error: [docs-land, version-dev-bump]
-    join: release-post-publish-join
   - { from: release-post-publish-join, on: outcome, map: { ok: verify, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: verify, on: outcome, map: { ok: traffic-verify-complete, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: traffic-verify-complete, on: outcome, map: { ok: vault-note, fail: vault-note, error: vault-note } }

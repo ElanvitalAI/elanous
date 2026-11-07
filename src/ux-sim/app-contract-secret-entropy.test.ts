@@ -1,0 +1,30 @@
+import { expect, test } from 'bun:test';
+import { runAppContractCredentialCorpus } from './app-contract-secret-entropy.js';
+
+test('APP-CONTRACT-SECRET-ENTROPY measures secret recall and false positives through the production parser', () => {
+  const result = runAppContractCredentialCorpus();
+  expect(result.secretCount).toBe(32);
+  expect(result.benignCount).toBe(48);
+  expect(result.referenceCount).toBe(13);
+  expect(result.actualFixtureCount).toBe(5);
+  expect(result.actualFixturesAccepted).toBe(result.actualFixtureCount);
+  expect(result.actualFixtureFalsePositives).toBe(0);
+  expect(result.actualFixtureFalsePositiveRate).toBe(0);
+  expect(result.truePositives).toBe(result.secretCount);
+  expect(result.falseNegatives).toBe(0);
+  expect(result.falsePositives).toBe(0);
+  expect(result.trueNegatives).toBe(result.benignCount);
+  expect(result.falsePositiveRate).toBe(0);
+  expect(result.acceptedReferences).toBe(result.referenceCount);
+  expect(result.observations.filter(({ kind }) => kind === 'benign').every(({ benignRejectionExpected }) => benignRejectionExpected)).toBe(true);
+  expect(result.observations.filter(({ kind }) => kind === 'boundary-benign').every(({ benignRejectionExpected }) => benignRejectionExpected)).toBe(true);
+  expect(result.observations.find(({ id }) => id === 'boundary-length-31-high-entropy')?.secretDetected).toBe(false);
+  expect(result.observations.find(({ id }) => id === 'boundary-length-32-low-entropy')?.secretDetected).toBe(false);
+  expect(result.observations.find(({ id }) => id === 'boundary-entropy-4.1875')?.secretDetected).toBe(false);
+  expect(result.observations.find(({ id }) => id === 'boundary-entropy-4.25')?.secretDetected).toBe(true);
+  expect(result.observations.find(({ id }) => id === 'boundary-long-valid-reference')?.validReferenceAccepted).toBe(true);
+  expect(result.observations.find(({ id }) => id === 'legacy-prefix-reference-remains-rejected')?.secretDetected).toBe(true);
+  expect(result.observations.find(({ id }) => id === 'legacy-prefix-reference-remains-rejected')?.validReferenceAccepted).toBe(false);
+  expect(result.observations.every((observation) => !observation.diagnosticLeaksValue)).toBe(true);
+  expect(JSON.stringify(result)).not.toMatch(/app-contract-secret-corpus|sha256:[0-9a-f]{64}/);
+});
